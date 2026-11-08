@@ -1756,8 +1756,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // seconds and replacing a view under a finger cancels its tap.
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
-        for (int h = 0; h < savedHosts.size(); h++) {
-            SavedRemoteHost host = savedHosts.get(h);
+        // The machine this terminal is on leads the rail; the others follow in
+        // saved order, so the top of the rail always names where you are.
+        java.util.List<SavedRemoteHost> hosts = new java.util.ArrayList<>(savedHosts);
+        for (int h = 0; h < hosts.size(); h++) {
+            if (hosts.get(h).id.equals(currentHostId)) { hosts.add(0, hosts.remove(h)); break; }
+        }
+        for (int h = 0; h < hosts.size(); h++) {
+            SavedRemoteHost host = hosts.get(h);
             boolean live = host.id.equals(currentHostId);
             HostSample sample = hostSamples.get(host.id);
             JSONArray workspaces = live && current != null ? current.workspaces
@@ -1765,7 +1771,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             JSONArray panes = live && current != null ? current.panes
                     : sample == null ? null : sample.panes;
             addHostRows(host, live, sample, workspaces, panes, current, order, keep);
-            if (h + 1 < savedHosts.size()) order.add(railRule(host.id, keep));
+            if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
         }
         pruneRailRows(keep);
         commitRailOrder(order);

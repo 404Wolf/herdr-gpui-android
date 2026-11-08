@@ -79,6 +79,9 @@ public final class HomeActivity extends Activity {
     private final ExecutorService worker = Executors.newFixedThreadPool(4);
     private final Map<String, Machine> machines = new LinkedHashMap<>();
     private final Set<String> collapsed = new HashSet<>();
+    /** Spaces whose idle and finished agents Wolf asked to see on a busy machine. */
+    private final Set<String> expandedQuiet = new HashSet<>();
+    private static final int BUSY_MACHINE = 30;
     private RemoteHostStore store;
     private RemoteIdentityStore identityStore;
     private GpuiChrome chrome;
@@ -330,10 +333,11 @@ public final class HomeActivity extends Activity {
             Agent agent = new Agent();
             agent.machine = machine;
             agent.id = id;
-            agent.title = GpuiTerminalProtocol.title(pane.optString("title", agent.id));
+            agent.title = cleanTitle(GpuiTerminalProtocol.title(pane.optString("title", agent.id)), agent.id);
             agent.status = pane.optString("status", "");
             agent.space = pane.optString("workspace_id", "loose");
             agent.spaceLabel = labels.containsKey(agent.space) ? labels.get(agent.space) : agent.space;
+            if (agent.spaceLabel == null || agent.spaceLabel.trim().isEmpty()) agent.spaceLabel = "Other terminals";
             agent.parent = pane.optString("parent", "");
             agent.role = pane.optString("role", "");
             agent.project = pane.optString("project", "");
@@ -354,7 +358,8 @@ public final class HomeActivity extends Activity {
             if (!agent.parent.isEmpty() && byId.containsKey(agent.parent) && !agent.parent.equals(agent.id)) {
                 children.computeIfAbsent(agent.parent, key -> new ArrayList<>()).add(agent);
             } else {
-                roots.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
+                // Sections are per space name: two spaces with one name are one place to Wolf.
+                roots.computeIfAbsent(agent.spaceLabel, key -> new ArrayList<>()).add(agent);
             }
         }
         Set<String> seen = new HashSet<>();
@@ -368,7 +373,7 @@ public final class HomeActivity extends Activity {
         for (Agent agent : agents) {
             if (seen.add(agent.id)) {
                 agent.depth = 0;
-                result.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
+                result.computeIfAbsent(agent.spaceLabel, key -> new ArrayList<>()).add(agent);
             }
         }
         // Busiest spaces first: waiting on Wolf, then failing, then working.
@@ -378,6 +383,25 @@ public final class HomeActivity extends Activity {
         for (Map.Entry<String, List<Agent>> entry : sorted) ordered.put(entry.getKey(), entry.getValue());
         result = ordered;
         return result;
+    }
+
+    /**
+     * Agents put a spinner or progress glyph in front of their title ("⠂: Implement
+     * lane 1"); the tree has its own status dot, so only the words stay.
+     */
+    static String cleanTitle(String title, String fallback) {
+        int start = 0;
+        while (start < title.length()) {
+            int c = title.codePointAt(start);
+            boolean glyph = (c >= 0x2800 && c <= 0x28ff) // braille spinners
+                    || Character.isWhitespace(c) || c == ':' || c == '·' || c == '•' || c == '*'
+                    || c == '✳' || c == '✶' || c == '✻' || c == '✽' || c == '✢' || c == '⋯' || c == '…'
+                    || Character.getType(c) == Character.OTHER_SYMBOL;
+            if (!glyph) break;
+            start += Character.charCount(c);
+        }
+        String clean = title.substring(start).trim();
+        return clean.isEmpty() ? fallback : clean;
     }
 
     /** Lower is busier: the most urgent status present, then fewer idle agents. */
@@ -493,7 +517,7 @@ public final class HomeActivity extends Activity {
     /** Rebuilds the tree and the Fleet only when what they show changed. */
     private void render(boolean force) {
         if (tree == null || destroyed) return;
-        StringBuilder key = new StringBuilder(String.valueOf(collapsed)).append(note);
+        StringBuilder key = new StringBuilder(String.valueOf(collapsed)).append(expandedQuiet).append(note);
         for (Machine machine : machines.values()) {
             key.append(machine.host.id).append(machine.state).append(machine.status);
             if (machine.view != null) key.append(machine.view.optJSONArray("panes"))
@@ -599,7 +623,24 @@ public final class HomeActivity extends Activity {
             });
             tree.addView(header);
             if (spaceClosed) continue;
-            for (Agent agent : list) tree.addView(agentRow(agent, true));
+            // On a busy machine the quiet agents fold into one row per space, so
+            // what is waiting or working stands out; the hierarchy's managers stay.
+            boolean fold = agents > BUSY_MACHINE && !expandedQuiet.contains(spaceKey);
+            int quiet = 0;
+            for (Agent agent : list) {
+                boolean anchor = "deacon".equals(agent.role) || "pm".equals(agent.role);
+                if (fold && statusPriority(agent.status) > 2 && !anchor) { quiet++; continue; }
+                tree.addView(agentRow(agent, true));
+            }
+            if (quiet > 0) {
+                LinearLayout more = row();
+                more.setPadding(dp(20), dp(2), dp(4), dp(2));
+                more.setMinimumHeight(dp(24));
+                more.addView(text("+" + quiet + " idle", 11, chrome.onSurfaceVariant));
+                more.setContentDescription("Show " + quiet + " idle or finished agents in " + list.get(0).spaceLabel);
+                more.setOnClickListener(v -> { expandedQuiet.add(spaceKey); render(true); });
+                tree.addView(more);
+            }
         }
     }
 
@@ -622,8 +663,7 @@ public final class HomeActivity extends Activity {
         row.setPadding(dp(indent), dp(2), dp(4), dp(2));
         row.setMinimumHeight(dp(26));
         row.addView(dot(statusColor(agent.status)));
-        TextView title = text(inTree ? agent.title : agent.machine.host.name + " › " + agent.spaceLabel
-                + " › " + agent.title, 12, chrome.onSurface);
+        TextView title = text(inTree ? agent.title : breadcrumb(agent), 12, chrome.onSurface);
         title.setSingleLine(true);
         title.setEllipsize(TextUtils.TruncateAt.END);
         row.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
@@ -638,6 +678,15 @@ public final class HomeActivity extends Activity {
                 + (tag.isEmpty() ? "" : ", " + tag));
         row.setOnClickListener(v -> openAgent(agent));
         return row;
+    }
+
+    /** machine › space › agent, without empty segments. */
+    private static String breadcrumb(Agent agent) {
+        List<String> parts = new ArrayList<>();
+        for (String part : new String[] {agent.machine.host.name, agent.spaceLabel, agent.title}) {
+            if (part != null && !part.trim().isEmpty()) parts.add(part.trim());
+        }
+        return TextUtils.join(" › ", parts);
     }
 
     /** What needs Wolf: agents waiting on him or failing, across every machine. */
