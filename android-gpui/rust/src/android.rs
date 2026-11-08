@@ -33,6 +33,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeStart<'
         );
         gpui_mobile::android::jni::install_panic_hook();
         gpui_mobile::android::host::start(|cx: &mut App| {
+            surface_fence::install(cx);
             // Android does not promise desktop generic aliases or GPUI's
             // fallback families. Install our fonts before any window can paint.
             if let Err(error) = crate::fonts::install(cx.text_system()) {
@@ -70,6 +71,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSurface
         unsafe { ndk::native_window::NativeWindow::from_surface(env.get_raw(), surface.as_raw()) };
     if let Some(window) = window {
         gpui_mobile::android::host::surface_created(window, scale);
+        surface_fence::posted();
     }
 }
 
@@ -79,7 +81,75 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSurface
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) {
+    // The upstream release wait trusts a flag that only the render thread
+    // clears when it takes a surface. A surface handed over moments ago (the
+    // unlock that immediately re-shows the keyguard) left it stale: the wait
+    // returned at once, Android abandoned the buffers, and the render thread
+    // then built a Vulkan surface on them and aborted inside wgpu-hal
+    // (ERROR_NATIVE_WINDOW_IN_USE_KHR). Let it take the surface first.
+    surface_fence::wait_until_taken();
     gpui_mobile::android::host::surface_destroyed();
+}
+
+/// Proof that the render thread has consumed every surface handed to it.
+mod surface_fence {
+    use gpui::App;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static POSTED: AtomicU64 = AtomicU64::new(0);
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    static PROBE: OnceLock<async_channel::Sender<u64>> = OnceLock::new();
+
+    /// Runs on the render thread once the first surface is attached.
+    pub(super) fn install(cx: &mut App) {
+        let (sender, receiver) = async_channel::unbounded::<u64>();
+        if PROBE.set(sender).is_err() {
+            return;
+        }
+        // The first surface was consumed by the time this runs.
+        TAKEN.fetch_max(POSTED.load(Ordering::SeqCst), Ordering::SeqCst);
+        let timers = cx.background_executor().clone();
+        cx.foreground_executor()
+            .spawn(async move {
+                while let Ok(seq) = receiver.recv().await {
+                    // The render loop drains surface commands, then promotes due
+                    // timers, then runs tasks. A timer armed from a task only
+                    // fires in a later pass, after a later drain, so every
+                    // surface posted before the probe has been taken by then.
+                    timers.timer(Duration::from_millis(1)).await;
+                    TAKEN.fetch_max(seq, Ordering::SeqCst);
+                }
+            })
+            .detach();
+    }
+
+    pub(super) fn posted() {
+        POSTED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Bounded: a stuck render thread must not turn surface teardown into an ANR.
+    pub(super) fn wait_until_taken() {
+        let posted = POSTED.load(Ordering::SeqCst);
+        if TAKEN.load(Ordering::SeqCst) >= posted {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut probed = false;
+        while TAKEN.load(Ordering::SeqCst) < posted {
+            if !probed {
+                if let Some(probe) = PROBE.get() {
+                    probed = probe.try_send(posted).is_ok();
+                }
+            }
+            if Instant::now() >= deadline {
+                log::error!("surface fence: render thread did not take the surface in time");
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(250));
+        }
+    }
 }
 
 #[allow(unsafe_code)]
