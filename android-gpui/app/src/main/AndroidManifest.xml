@@ -18,14 +18,20 @@
         android:supportsRtl="true">
         <!-- The device's fold reports (tabletop posture); absent on most phones. -->
         <uses-library android:name="androidx.window.extensions" android:required="false" />
-        <activity android:name="dev.herdr.android.RemoteHostsActivity" android:exported="true"
+        <!-- Home: every machine's agents as one tree. Folding only re-lays it out,
+             so the background sessions survive (configChanges). -->
+        <activity android:name="dev.herdr.android.HomeActivity" android:exported="true"
             android:theme="@style/GpuiTheme"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name="dev.herdr.android.RemoteHostsActivity" android:exported="false"
+            android:theme="@style/GpuiTheme"
+            android:windowSoftInputMode="adjustResize" />
         <activity android:name="dev.herdr.android.DeviceDiagnosticsActivity" android:exported="false" />
         <activity android:name="dev.herdr.android.AboutActivity" android:exported="false"
             android:theme="@style/AboutTheme" />
