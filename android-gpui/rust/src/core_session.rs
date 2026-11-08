@@ -540,7 +540,24 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             .unwrap_or("loose");
         let tab = terminal["labels"]["herdr.tab"].as_str().unwrap_or(id);
         if !spaces.iter().any(|s| s["id"] == space) {
-            spaces.push(json!({"id":space,"label":if space=="loose" {"Other terminals"} else {space},"focused":false,"status":""}));
+            // A space missing from the app document is named as the desktop
+            // shows it: the `where` label's space part, else the folder.
+            let named = terminal["labels"]["where"]
+                .as_str()
+                .and_then(|w| w.split(" / ").next())
+                .filter(|w| !w.is_empty())
+                .or_else(|| {
+                    terminal["cwd"]
+                        .as_str()
+                        .and_then(|cwd| cwd.trim_end_matches('/').rsplit('/').next())
+                        .filter(|name| !name.is_empty())
+                });
+            let label = if space == "loose" {
+                "Other terminals"
+            } else {
+                named.unwrap_or(space)
+            };
+            spaces.push(json!({"id":space,"label":label,"focused":false,"status":""}));
         }
         if !tabs
             .iter()
@@ -559,13 +576,11 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
         let label = |key: &str| {
             labels[key]
                 .as_str()
-                .filter(|v| !v.is_empty() && v.len() <= 128)
+                .filter(|v| !v.is_empty() && *v != "none" && v.len() <= 128)
         };
-        let kind = label("agent.kind").or_else(|| {
-            terminal["argv"][0]
-                .as_str()
-                .and_then(|program| program.rsplit('/').next())
-        });
+        // Only a harness the agent hook named (claude, codex, ...): a shell's
+        // own program name says nothing about an agent.
+        let kind = label("agent.kind");
         panes.push(json!({
             "id": id,
             "title": title,
@@ -710,7 +725,7 @@ mod tests {
         let mut view = json!({"revision":0});
         project(
             &mut view,
-            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{},"parent":"t1","argv":["/usr/bin/claude"]}]),
+            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{"role":"none"},"parent":"t1","argv":["/usr/bin/claude"]},{"id":"t3","state":"live","cwd":"/home/w/botd","labels":{"herdr.space":"sp9","where":"botd / w1-backend"}},{"id":"t4","state":"live","cwd":"/home/w/zulip/","labels":{"herdr.space":"sp8"}}]),
             &json!({"spaces":[{"id":"s1","name":"Code","tabs":[{"id":"a","name":"Fix"}]}]}),
         )?;
         assert_eq!(view["workspaces"][0]["label"], "Code");
@@ -725,9 +740,21 @@ mod tests {
             ["pm", "billing", "codex"]
         );
         assert_eq!(
-            [&view["panes"][1]["parent"], &view["panes"][1]["kind"]],
-            ["t1", "claude"]
+            [
+                &view["panes"][1]["parent"],
+                &view["panes"][1]["kind"],
+                &view["panes"][1]["role"]
+            ],
+            ["t1", "", ""]
         );
+        let label = |id: &str| {
+            view["workspaces"]
+                .as_array()
+                .and_then(|spaces| spaces.iter().find(|s| s["id"] == id))
+                .map(|s| s["label"].clone())
+        };
+        assert_eq!(label("sp9"), Some(json!("botd")));
+        assert_eq!(label("sp8"), Some(json!("zulip")));
         assert_eq!(view["panes"][1]["workspace_id"], "loose");
         assert_eq!(view["panes"][1]["role"], "");
         Ok(())
