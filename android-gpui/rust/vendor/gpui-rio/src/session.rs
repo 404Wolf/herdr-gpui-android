@@ -274,7 +274,20 @@ impl Session {
     /// input queue is full.
     pub fn key(&self, key: &KeyPress) -> bool {
         let mode = self.grid.lock().mode();
-        let Some(bytes) = key_bytes(key, mode.contains(Mode::APP_CURSOR)) else {
+        // Shift+Enter is a newline that does not submit, as desktop terminals
+        // send it: the kitty keyboard protocol's CSI 13;2u when the program
+        // turned the protocol on, else ESC CR (Alt+Enter), which Claude Code
+        // and Codex read as a newline.
+        let bytes = if key.key == "enter" && key.shift && !key.control && !key.alt {
+            Some(if mode.intersects(Mode::KITTY_KEYBOARD_PROTOCOL) {
+                b"\x1b[13;2u".to_vec()
+            } else {
+                b"\x1b\r".to_vec()
+            })
+        } else {
+            key_bytes(key, mode.contains(Mode::APP_CURSOR))
+        };
+        let Some(bytes) = bytes else {
             return false;
         };
         self.follow_input();

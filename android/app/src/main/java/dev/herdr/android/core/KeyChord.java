@@ -21,7 +21,7 @@ public final class KeyChord {
         String key = input.trim().toLowerCase(Locale.ROOT);
         if (key.equals("escape")) key = "esc";
         if (key.equals("return")) key = "enter";
-        if (NAMED.contains(key) || key.equals("shift+tab") || key.equals("y") || key.equals("n")
+        if (NAMED.contains(key) || key.equals("shift+tab") || key.equals("shift+enter") || key.equals("y") || key.equals("n")
                 || key.matches("[1-9]") || key.matches("(?:ctrl|alt)\\+[a-z]")
                 || key.matches("f(?:[1-9]|1[0-2])")) return key;
         throw invalid();
@@ -56,6 +56,8 @@ public final class KeyChord {
         }
         if (shift) {
             if (base.equals("tab")) return "shift+tab";
+            // A newline without submitting, as agents read it (Claude Code, Codex).
+            if (base.equals("enter") || base.equals("return")) return "shift+enter";
             throw invalid();
         }
         return normalize(base);

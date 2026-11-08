@@ -687,6 +687,7 @@ pub fn valid_key(key: &str) -> bool {
             | "left"
             | "right"
             | "shift+tab"
+            | "shift+enter"
             | "y"
             | "n"
             | "1"
@@ -736,10 +737,10 @@ pub fn physical_key(
     let key = if control || alt {
         format!("{}+{key}", if control { "ctrl" } else { "alt" })
     } else if shift {
-        if key != "tab" {
+        if key != "tab" && key != "enter" {
             return None;
         }
-        "shift+tab".into()
+        format!("shift+{key}")
     } else {
         // Digits and y/n are printable, even though they are accepted by the API.
         if key.chars().count() == 1 {
@@ -1538,6 +1539,18 @@ mod tests {
     use super::*;
     fn text(value: &str) -> Command {
         Command::Text { text: value.into() }
+    }
+
+    #[test]
+    fn shift_enter_is_a_key_and_other_shifted_keys_stay_text() {
+        assert!(valid_key("shift+enter"));
+        assert_eq!(
+            physical_key("enter", false, false, true, false),
+            Some(Command::Keys {
+                keys: vec!["shift+enter".into()]
+            })
+        );
+        assert_eq!(physical_key("a", false, false, true, false), None);
     }
 
     #[test]
