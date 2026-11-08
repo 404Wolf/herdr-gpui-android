@@ -89,6 +89,8 @@ public final class HomeActivity extends Activity {
     private TextView summary;
     private String signature = "";
     private boolean resumed, destroyed, opening;
+    /** Hidden (onStop): no background sessions until the next onResume. */
+    private boolean stopped;
     private String note;
 
     private final Runnable poll = new Runnable() {
@@ -143,6 +145,7 @@ public final class HomeActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        stopped = false;
         resumed = true;
         opening = false;
         loadMachines();
@@ -154,6 +157,22 @@ public final class HomeActivity extends Activity {
         resumed = false;
         main.removeCallbacks(poll);
         super.onPause();
+    }
+
+    /**
+     * Hidden behind a terminal, Home's sessions kept polling every machine
+     * (and the terminal's rail opens its own), so each host was refreshed two
+     * or three times over, every quarter second while agents worked. Close
+     * them; returning reconnects (onResume → loadMachines).
+     */
+    @Override protected void onStop() {
+        stopped = true;
+        for (Machine machine : machines.values()) {
+            if (machine.handle > 0) RemoteNative.close(machine.handle);
+            machine.handle = 0;
+            if (!machine.connecting) machine.state = "connecting";
+        }
+        super.onStop();
     }
 
     @Override protected void onDestroy() {
@@ -248,7 +267,7 @@ public final class HomeActivity extends Activity {
             final String reason = failure;
             main.post(() -> {
                 machine.connecting = false;
-                if (destroyed || machines.get(host.id) != machine) {
+                if (destroyed || stopped || machines.get(host.id) != machine) {
                     if (ready > 0) RemoteNative.close(ready);
                     return;
                 }
@@ -562,10 +581,19 @@ public final class HomeActivity extends Activity {
     private void render(boolean force) {
         if (tree == null || destroyed) return;
         StringBuilder key = new StringBuilder(String.valueOf(collapsed)).append(expandedQuiet).append(note);
+        // Keyed on what the tree shows, not the raw pane list: agents retitle
+        // themselves with spinner glyphs many times a second, and rebuilding
+        // the whole tree for each made it flicker and dropped taps.
         for (Machine machine : machines.values()) {
-            key.append(machine.host.id).append(machine.state).append(machine.status);
-            if (machine.view != null) key.append(machine.view.optJSONArray("panes"))
-                    .append(machine.view.optJSONArray("workspaces"));
+            key.append(machine.host.id).append(machine.state).append(machine.status).append('\n');
+            for (Map.Entry<String, List<Agent>> space : spaces(machine).entrySet()) {
+                key.append(space.getKey()).append('\n');
+                for (Agent agent : space.getValue()) {
+                    key.append(agent.id).append('\t').append(agent.title).append('\t').append(agent.status)
+                            .append('\t').append(agent.depth).append('\t').append(agent.role)
+                            .append('\t').append(agent.kind).append('\n');
+                }
+            }
         }
         String next = key.toString();
         if (!force && next.equals(signature)) return;
@@ -647,6 +675,18 @@ public final class HomeActivity extends Activity {
             render(true);
         });
         row.setContentDescription(machine.host.name + ", " + detail);
+        row.setOnLongClickListener(v -> {
+            new ActionSheet(this, chrome, machine.host.name)
+                    .add("Reconnect", () -> {
+                        if (machine.handle > 0) RemoteNative.close(machine.handle);
+                        machine.handle = 0;
+                        if (!machine.connecting) connect(machine);
+                        render(true);
+                    })
+                    .add("Hosts and keys…", this::openHosts)
+                    .show();
+            return true;
+        });
         tree.addView(row);
         if (closed) return;
         for (Map.Entry<String, List<Agent>> space : spaces.entrySet()) {
@@ -721,6 +761,13 @@ public final class HomeActivity extends Activity {
         row.setContentDescription(agent.title + ", " + (agent.status.isEmpty() ? "no status" : agent.status)
                 + (tag.isEmpty() ? "" : ", " + tag));
         row.setOnClickListener(v -> openAgent(agent));
+        row.setOnLongClickListener(v -> {
+            ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent))
+                    .add("Open", () -> openAgent(agent));
+            if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
+            sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
+            return true;
+        });
         return row;
     }
 
