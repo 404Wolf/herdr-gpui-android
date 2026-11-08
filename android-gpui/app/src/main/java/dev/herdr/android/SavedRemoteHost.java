@@ -1,6 +1,5 @@
 package dev.herdr.android;
 
-import dev.herdr.android.core.OmpQuickCommands;
 import dev.herdr.android.core.QuickCommand;
 import dev.herdr.android.core.Shortcut;
 import java.util.ArrayList;
@@ -61,7 +60,7 @@ final class SavedRemoteHost {
     static SavedRemoteHost create(String name, String transport, String host, int port,
             String endpointId, String endpointTicket, String relayUrl, String username, String session) {
         return new SavedRemoteHost(null, name, transport, host, port, endpointId, endpointTicket,
-                relayUrl, username, session, "", SavedHost.DEFAULT_KEYS, OmpQuickCommands.defaults(), null);
+                relayUrl, username, session, "", SavedHost.DEFAULT_KEYS, java.util.Collections.emptyList(), null);
     }
 
     /**

@@ -29,8 +29,6 @@
         <activity android:name="dev.herdr.android.DeviceDiagnosticsActivity" android:exported="false" />
         <activity android:name="dev.herdr.android.AboutActivity" android:exported="false"
             android:theme="@style/AboutTheme" />
-        <activity android:name="dev.herdr.android.MainActivity" android:exported="false"
-            android:windowSoftInputMode="adjustResize" />
         <activity android:name="dev.herdr.android.GpuiTerminalActivity" android:exported="false"
             android:theme="@style/GpuiTheme"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale"

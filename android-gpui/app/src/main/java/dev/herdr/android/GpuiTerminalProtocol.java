@@ -113,12 +113,6 @@ final class GpuiTerminalProtocol {
                 .put("type", shortcut.isText() ? "text" : "keys").toString();
     }
 
-    static String quickCommand(String text, boolean submit) throws JSONException {
-        QuickCommand.validateText(text);
-        return new JSONObject().put("type", submit ? "submit" : "text")
-                .put("text", text).toString();
-    }
-
     static String shortcuts(String configuration) throws JSONException {
         JSONArray result = new JSONArray();
         for (Shortcut shortcut : Shortcut.parseConfiguration(configuration)) {

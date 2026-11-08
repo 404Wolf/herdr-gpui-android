@@ -88,7 +88,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean destroyed;
     private long imeSession;
     private boolean imeComposing;
-    private QuickCommandPalette commandPalette;
     private boolean initialImeHidden;
     private boolean keyboardRequested;
     private boolean allowNextKeyboardShow;
@@ -123,7 +122,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private volatile boolean sidebarOpen;
     private final BackOwner backOwner = new BackOwner(this, this::hideSidebar);
     private String sidebarSignature = "";
-    private QuickCommandPalette.Owner paletteOwner;
     private volatile java.util.List<SavedRemoteHost> savedHosts = java.util.Collections.emptyList();
     private volatile String currentHostId;
     private volatile boolean switchingHost;
@@ -218,16 +216,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         try {
             shortcuts = Shortcut.parseConfiguration(launch.shortcuts());
-            paletteOwner = new QuickCommandPalette.Owner() {
-                public void show(AlertDialog dialog) { showLocalDialog(dialog); }
-                public boolean isCurrentDialog(AlertDialog dialog) {
-                    return !destroyed && !isFinishing() && displayDialog == dialog && dialog.isShowing();
-                }
-                public int dialogTheme() { return chrome.dialogTheme(); }
-            };
-            commandPalette = launch.remoteHost == null
-                    ? new QuickCommandPalette(this, launch.host, launch.title, paletteOwner)
-                    : new QuickCommandPalette(this, launch.remoteHost, launch.title, paletteOwner);
             currentHostId = launch.remoteHost == null ? null : launch.remoteHost.id;
             // Remote-mutating controls live on the Java UI thread, never a deferred GPUI click.
             shortcutJson = "[]";
@@ -702,8 +690,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Input controls resolve on touch-up, in order with the keys they sit by.
         synchronousTouch(keyboard);
         pinned.addView(keyboard);
-        pinned.addView(iconButton(R.drawable.ic_bar_commands, "Commands",
-                "Quick commands for this host", view -> showQuickCommands()));
         if (compact) {
             // A compact bar keeps frequent controls and the keys in view; the
             // rest live in one overflow menu, as platform toolbars do.
@@ -1561,8 +1547,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             publish(next, "Connecting to " + host.name + "…");
             next.poll = worker.scheduleWithFixedDelay(() -> pump(next), 0, COMMAND_POLL_MS, TimeUnit.MILLISECONDS);
         }
-        if (commandPalette != null) commandPalette.close();
-        commandPalette = new QuickCommandPalette(this, host, host.name, paletteOwner);
         switchingHost = false;
         switchingTo = null;
         sidebarSignature = "";
@@ -2313,37 +2297,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return label;
     }
 
-    private void showQuickCommands() {
-        if (destroyed || isFinishing() || commandPalette == null || displayDialog != null && displayDialog.isShowing()) return;
-        final Connection target;
-        synchronized (stateLock) {
-            target = connection;
-            if (target != null && compositionBlocksInput(target)) return;
-        }
-        clearControl();
-        allowNextKeyboardShow = false;
-        super.gpuiHideKeyboard(imeSession);
-        commandPalette.open(new QuickCommandPalette.Sender() {
-            public boolean canSend() {
-                synchronized (stateLock) {
-                    return !destroyed && !isFinishing() && target != null && connection == target && target.ready && !target.isClosed();
-                }
-            }
-            public boolean send(AlertDialog dialog, String text, boolean submit) {
-                synchronized (stateLock) {
-                    if (displayDialog != dialog || !dialog.isShowing() || !canSend()) return false;
-                    try {
-                        if (nativeSendCommand(target.generation, GpuiTerminalProtocol.quickCommand(text, submit))) return true;
-                        fail(target, "Command was not queued; reopen and check the terminal before retrying");
-                    } catch (JSONException | IllegalArgumentException invalid) {
-                        publish(target, "Invalid quick command; edit it before sending");
-                    }
-                    return false;
-                }
-            }
-        });
-    }
-
     private void sendShortcut(Shortcut shortcut) {
         if (displayDialog != null && displayDialog.isShowing()) return;
         clearControl();
@@ -2549,8 +2502,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         launch = null;
         shortcutJson = null;
         shortcuts = Collections.emptyList();
-        if (commandPalette != null) commandPalette.close();
-        commandPalette = null;
         lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
         terminalRoot = null;
         super.onDestroy();

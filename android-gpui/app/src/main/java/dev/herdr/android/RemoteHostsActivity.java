@@ -753,10 +753,6 @@ public final class RemoteHostsActivity extends Activity {
         card.addView(linkRow(R.drawable.ic_home_import_export, "Hosts file",
                 "Export your hosts to a file, or import them from one", this::showHostFile));
         card.addView(divider());
-        card.addView(linkRow(R.drawable.ic_home_link, "Companion hosts",
-                "The HTTPS workflow with a companion token",
-                () -> startActivity(new android.content.Intent(this, MainActivity.class))));
-        card.addView(divider());
         card.addView(linkRow(R.drawable.ic_home_diagnostics, "Local device diagnostics",
                 "Model, Android version, battery and storage, read on request",
                 () -> startActivity(new android.content.Intent(this, DeviceDiagnosticsActivity.class))));
@@ -1266,7 +1262,7 @@ public final class RemoteHostsActivity extends Activity {
     private void deleteProfile(SavedRemoteHost host) {
         generation++;
         showDialog(sheet().setTitle("Delete remote profile?")
-                .setMessage("Remove " + host.name + " and its saved SSH trust and quick commands from this device?")
+                .setMessage("Remove " + host.name + " and its saved SSH trust from this device?")
                 .setNegativeButton("Cancel", null).setPositiveButton("Delete", (which, index) -> {
                     int token = generation;
                     run(token, () -> { store.delete(host); return true; }, ignored -> showProfiles());
@@ -1276,7 +1272,7 @@ public final class RemoteHostsActivity extends Activity {
     /** What a hosts file holds, before either picker opens. */
     private void showHostFile() {
         showDialog(sheet().setTitle("Hosts file")
-                .setMessage("Export saves every host's address, user, session, extra keys, quick commands "
+                .setMessage("Export saves every host's address, user, session, extra keys "
                         + "and trusted host key to a file you choose. Passwords and the device SSH key are "
                         + "never in it.\n\nImport adds the hosts from such a file, after showing you which.")
                 .setNegativeButton("Cancel", null)
