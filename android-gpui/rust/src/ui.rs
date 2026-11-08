@@ -120,7 +120,14 @@ impl TerminalView {
             .map(|session| {
                 let style = self.shell_style(self.viewport.width);
                 let terminal = crate::rio::Terminal::attach(session, style, cx);
-                terminal.update(cx, |terminal, _| terminal.set_host_input(true));
+                terminal.update(cx, |terminal, _| {
+                    terminal.set_host_input(true);
+                    #[cfg(target_os = "android")]
+                    terminal.set_link_handler(|url| {
+                        let generation = model::mailbox().state().generation;
+                        crate::android::open_link(generation, &url);
+                    });
+                });
                 (handle, terminal)
             });
     }

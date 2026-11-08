@@ -8,6 +8,8 @@
 mod adapter;
 mod error;
 mod keys;
+#[doc(hidden)]
+pub mod links;
 mod options;
 mod session;
 

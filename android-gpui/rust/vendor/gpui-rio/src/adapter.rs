@@ -42,6 +42,12 @@ macro_rules! __bind_gpui {
                 scroll_delta: f32,
                 marked: String,
                 host_input: bool,
+                /// Opens a tapped link; without one, links are plain text.
+                link_handler: Option<std::rc::Rc<dyn Fn(String)>>,
+                /// Where the finger went down, while it may still be a tap.
+                press: Option<Point<Pixels>>,
+                /// The link under that finger: its row, columns and target.
+                pressed_link: Option<(Line, Range<usize>, String)>,
                 _poll: Task<()>,
             }
 
@@ -86,6 +92,9 @@ macro_rules! __bind_gpui {
                             scroll_delta: 0.,
                             marked: String::new(),
                             host_input: false,
+                            link_handler: None,
+                            press: None,
+                            pressed_link: None,
                             _poll: poll,
                         }
                     })
@@ -109,6 +118,38 @@ macro_rules! __bind_gpui {
                 /// its cursor without focus.
                 pub fn set_host_input(&mut self, host_input: bool) {
                     self.host_input = host_input;
+                }
+                /// Tapping a link (OSC 8, or a plain http(s) URL in the text) calls `handler`.
+                pub fn set_link_handler(&mut self, handler: impl Fn(String) + 'static) {
+                    self.link_handler = Some(std::rc::Rc::new(handler));
+                }
+                /// The link at `pos` on screen, with its columns.
+                fn link_at(&self, pos: Pos) -> Option<(Line, Range<usize>, String)> {
+                    let grid = self.session.grid().lock();
+                    let line = pos.row;
+                    let columns = grid.columns();
+                    if let Some(link) = grid.cell_hyperlink(line, pos.col) {
+                        let id = grid.cell_hyperlink_id(line, pos.col);
+                        let mut start = pos.col.0;
+                        while start > 0 && grid.cell_hyperlink_id(line, Column(start - 1)) == id {
+                            start -= 1;
+                        }
+                        let mut end = pos.col.0 + 1;
+                        while end < columns && grid.cell_hyperlink_id(line, Column(end)) == id {
+                            end += 1;
+                        }
+                        return Some((line, start..end, link.uri().to_owned()));
+                    }
+                    let text: Vec<char> = (0..columns)
+                        .map(|col| grid.grid[line][Column(col)].c())
+                        .map(|c| if c == '\0' { ' ' } else { c })
+                        .collect();
+                    let (range, url) = $crate::links::url_at(&text, pos.col.0)?;
+                    Some((line, range, url))
+                }
+                fn cancel_press(&mut self) -> bool {
+                    self.press = None;
+                    self.pressed_link.take().is_some()
                 }
                 /// Applies colors and font settings to the running session.
                 /// The host should notify its view after changing the style.
@@ -257,6 +298,22 @@ macro_rules! __bind_gpui {
                                     rgb_color(bg),
                                 ));
                             }
+                            if let Some((line, range, _)) = &self.pressed_link
+                                && *line == pos.row
+                                && range.contains(&col)
+                            {
+                                // Pressed link: a soft wash and a rule under it.
+                                let mut wash = rgb_color(theme.foreground);
+                                wash.a = 0.16;
+                                window.paint_quad(fill(Bounds::new(origin, size(width, self.cell.height)), wash));
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        origin + point(px(0.), self.cell.height - px(1.5)),
+                                        size(width, px(1.5)),
+                                    ),
+                                    rgb_color(fg),
+                                ));
+                            }
                             let text: String = grid
                                 .grid
                                 .cell_text(pos)
@@ -396,6 +453,12 @@ macro_rules! __bind_gpui {
                                     this.focus(window, cx);
                                 }
                                 let pos = this.position(event.position);
+                                this.press = Some(event.position);
+                                this.pressed_link = if this.link_handler.is_some() {
+                                    this.link_at(pos)
+                                } else {
+                                    None
+                                };
                                 this.session.grid().lock().selection =
                                     Some(Selection::new(SelectionType::Simple, pos, Side::Left));
                                 this.selecting = true;
@@ -403,6 +466,16 @@ macro_rules! __bind_gpui {
                             }),
                         )
                         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                            // A finger that travels is a scroll or a selection, not a tap.
+                            if let Some(start) = this.press {
+                                let moved = event.position - start;
+                                let slop = this.cell.width.max(px(8.));
+                                if moved.x.abs() > slop || moved.y.abs() > slop {
+                                    if this.cancel_press() {
+                                        cx.notify();
+                                    }
+                                }
+                            }
                             if this.selecting && event.pressed_button == Some(MouseButton::Left) {
                                 let pos = this.position(event.position);
                                 if let Some(selection) = &mut this.session.grid().lock().selection {
@@ -415,9 +488,21 @@ macro_rules! __bind_gpui {
                         }))
                         .on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(|this, _, _, _| this.selecting = false),
+                            cx.listener(|this, _, _, cx| {
+                                this.selecting = false;
+                                this.press = None;
+                                if let Some((_, _, url)) = this.pressed_link.take() {
+                                    // A tap on a link opens it and selects nothing.
+                                    this.session.grid().lock().selection = None;
+                                    if let Some(handler) = this.link_handler.clone() {
+                                        handler(url);
+                                    }
+                                    cx.notify();
+                                }
+                            }),
                         )
                         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                            this.cancel_press();
                             let delta = event.delta.pixel_delta(this.cell.height).y;
                             this.scroll_delta += f32::from(delta) / f32::from(this.cell.height);
                             let lines = this.scroll_delta.trunc() as i32;
