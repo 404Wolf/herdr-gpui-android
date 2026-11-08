@@ -2146,6 +2146,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         for (int h = 0; h < hosts.size(); h++) {
             if (hosts.get(h).id.equals(currentHostId)) { hosts.add(0, hosts.remove(h)); break; }
         }
+        // One machine at a time, as the mockup's machine picker has it: the
+        // rail is the machine on screen; its header (name ▾) picks another.
+        boolean picker = currentHostId != null && current != null && hosts.size() > 1
+                && hosts.get(0).id.equals(currentHostId);
+        if (picker) hosts = hosts.subList(0, 1);
         for (int h = 0; h < hosts.size(); h++) {
             SavedRemoteHost host = hosts.get(h);
             boolean live = host.id.equals(currentHostId);
@@ -2206,6 +2211,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 repoNames.add(workspace.optString("label", ""));
             }
         }
+        // Repos with worktrees under them fold; the path to the window on
+        // screen always stays open.
+        java.util.Map<String, Integer> worktreeCounts = new java.util.HashMap<>();
+        for (String repoName : repos.values()) {
+            if (repoNames.contains(repoName)) worktreeCounts.merge(repoName, 1, Integer::sum);
+        }
+        String activeGroup = null;
+        if (live && current != null) {
+            for (int q = 0; q < panes.length(); q++) {
+                JSONObject pane = panes.optJSONObject(q);
+                if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
+                String space = pane.optString("workspace_id", "");
+                String r = repos.get(space);
+                if (r != null) activeGroup = r;
+                for (int w = 0; w < workspaces.length() && activeGroup == null; w++) {
+                    JSONObject item = workspaces.optJSONObject(w);
+                    if (item != null && space.equals(item.optString("id"))) activeGroup = item.optString("label", "");
+                }
+            }
+        }
+        // Arriving at a window (a tap, Home's needs-you list, a notification)
+        // opens its folded repo once; folding it again afterwards sticks.
+        if (live && current != null && activeGroup != null && !current.paneId.equals(unfoldedFor)) {
+            unfoldedFor = current.paneId;
+            if (collapsedRepos().remove(host.id + "/" + activeGroup)) {
+                getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                        .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
+            }
+        }
         for (JSONObject workspace : ordered) {
             String workspaceId = workspace.optString("id", "");
             String workspaceLabel = chromeTitle(labels.getOrDefault(workspaceId,
@@ -2213,6 +2247,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String repo = repos.get(workspaceId);
             // Indented only under a repo the rail actually shows.
             boolean nested = repo != null && repoNames.contains(repo);
+            String group = repo != null ? repo : workspace.optString("label", "");
+            String groupKey = host.id + "/" + group;
+            int worktreesUnder = repo == null ? worktreeCounts.getOrDefault(group, 0) : 0;
+            boolean folded = (nested || worktreesUnder > 0) && collapsedRepos().contains(groupKey);
+            if (nested && folded) continue;
             String workspaceKey = "ws:" + host.id + "/" + workspaceId;
             keep.add(workspaceKey);
             RailWorkspaceRow workspaceRow = railWorkspaces.get(workspaceKey);
@@ -2239,7 +2278,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             updateRailWorkspaceRow(workspaceRow, host, workspaceLabel, live, current, workspaceId,
                     firstPane, holdsSelection, nested, windows.size(), waiting, working);
+            workspaceRow.foldKey = worktreesUnder > 0 ? groupKey : null;
+            String mark = nested ? "⑂" : worktreesUnder > 0 ? (folded ? "▸" : "▾") : "▪";
+            if (!mark.contentEquals(workspaceRow.mark.getText())) workspaceRow.mark.setText(mark);
+            String folds = folded ? "  +" + worktreesUnder + " wt" : "";
+            if (!folds.isEmpty() && !workspaceRow.meta.getText().toString().endsWith(folds)) {
+                workspaceRow.meta.append(folds);
+            }
             order.add(workspaceRow.row);
+            if (folded) continue;
             for (int p = 0; p < panes.length(); p++) {
                 JSONObject pane = panes.optJSONObject(p);
                 if (pane == null || !workspaceId.equals(pane.optString("workspace_id", ""))) continue;
@@ -2327,6 +2374,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.host = host;
         holder.row.setContentDescription("Connect to " + host.name);
         holder.row.setOnClickListener(view -> {
+            if (holder.live && savedHosts.size() > 1) {
+                showMachinePicker();
+                return;
+            }
             switchHost(holder.host);
             closeRailDrawer();
         });
@@ -2373,7 +2424,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // Secondary text is only guaranteed on the bare surface.
             holder.state.setTextColor(live ? chrome.onSurface : chrome.onSurfaceVariant);
         }
-        if (!host.name.contentEquals(holder.name.getText())) holder.name.setText(host.name);
+        String shown = live && savedHosts.size() > 1 ? host.name + "  ▾" : host.name;
+        if (!shown.contentEquals(holder.name.getText())) holder.name.setText(shown);
         int count = workspaces == null ? 0 : workspaces.length();
         if (count != holder.counted) {
             // Workspaces are enumerated below; keep the count for screen readers.
@@ -2395,10 +2447,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row.setSaveFromParentEnabled(false);
         holder.row.setFocusable(true);
         holder.row.setClickable(true);
-        holder.mark = railText("", 11, chrome.onSurfaceVariant);
-        holder.mark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        holder.mark = railText("", 12, chrome.onSurfaceVariant);
+        // The chevron is its own target (fold the repo); the rest of the row opens it.
+        holder.mark.setGravity(android.view.Gravity.CENTER);
+        holder.mark.setMinWidth(dp(22));
+        holder.mark.setMinHeight(dp(28));
+        holder.mark.setOnClickListener(v -> {
+            if (holder.foldKey != null) toggleRepo(holder.foldKey);
+            else holder.row.performClick();
+        });
         LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(-2, -2);
-        markParams.setMarginEnd(dp(5));
+        markParams.setMarginEnd(dp(3));
         holder.row.addView(holder.mark, markParams);
         holder.label = railText("", 12, chrome.primary);
         holder.label.setTypeface(android.graphics.Typeface.create("sans-serif-medium",
@@ -2444,8 +2503,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (holder.nested != Boolean.valueOf(nested)) {
             holder.nested = nested;
             // Worktrees sit one step in, under their repo.
-            holder.row.setPadding(dp(nested ? 18 : 8), dp(4), dp(4), dp(4));
-            holder.mark.setText(nested ? "⑂" : "▪");
+            holder.row.setPadding(dp(nested ? 14 : 2), dp(4), dp(4), dp(4));
             holder.label.setTextSize(nested ? 12 : 12.5f);
         }
         StringBuilder meta = new StringBuilder();
@@ -2466,6 +2524,55 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 ? "" : holder.row.getContentDescription())) {
             holder.row.setContentDescription(described);
         }
+    }
+
+    /** Machines, each with how many of its agents wait on Wolf; picking one switches to it. */
+    private void showMachinePicker() {
+        ActionSheet sheet = new ActionSheet(this, chrome, "Machine");
+        for (SavedRemoteHost host : savedHosts) {
+            boolean live = host.id.equals(currentHostId);
+            JSONArray panes;
+            if (live) {
+                Connection current;
+                synchronized (stateLock) { current = connection; }
+                panes = current == null ? null : current.panes;
+            } else {
+                HostSample sample = hostSamples.get(host.id);
+                panes = sample == null ? null : sample.panes;
+            }
+            int waiting = 0;
+            for (int i = 0; panes != null && i < panes.length(); i++) {
+                JSONObject pane = panes.optJSONObject(i);
+                String status = pane == null ? "" : pane.optString("status");
+                if ("blocked".equals(status) || "error".equals(status)) waiting++;
+            }
+            String label = (live ? "● " : "○ ") + host.name
+                    + (waiting > 0 ? "   " + waiting + " need" + (waiting == 1 ? "s" : "") + " you" : "")
+                    + (live ? "   (here)" : "");
+            sheet.add(label, () -> { if (!live) { switchHost(host); closeRailDrawer(); } });
+        }
+        sheet.show();
+    }
+
+    private java.util.Set<String> railCollapsed;
+    /** The window whose repo was last unfolded on arrival. */
+    private String unfoldedFor = "";
+
+    /** Collapsed repos, per machine and repo, kept across launches. */
+    private java.util.Set<String> collapsedRepos() {
+        if (railCollapsed == null) {
+            railCollapsed = new java.util.HashSet<>(getSharedPreferences("terminal-display", MODE_PRIVATE)
+                    .getStringSet("rail_collapsed", java.util.Collections.emptySet()));
+        }
+        return railCollapsed;
+    }
+
+    private void toggleRepo(String key) {
+        java.util.Set<String> collapsed = collapsedRepos();
+        if (!collapsed.remove(key)) collapsed.add(key);
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsed)).apply();
+        refreshSidebar(true);
     }
 
     private String paneCwd(Connection target, String paneId) {
@@ -2660,6 +2767,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String firstPane = "";
         boolean live;
         Boolean nested, selected;
+        /** Machine/repo this header folds, or null when it has no worktrees. */
+        String foldKey;
     }
 
     private static final class RailPaneRow {
