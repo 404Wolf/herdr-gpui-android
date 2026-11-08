@@ -3701,6 +3701,62 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /** When Enter last went to this pane alone, for the double-Enter "send now". */
+    private long lastEnterAt;
+    private String lastEnterPane = "";
+
+    /**
+     * Enter twice in quick succession, with nothing typed between, sends a
+     * message Claude Code has queued while it works right away: its Ctrl+Enter
+     * ("ctrl+enter to send now", checked on Claude Code 2.1.319). Codex needs
+     * nothing: its Enter already sends while it works. Shells are untouched.
+     * The window is the "double_enter_ms" display preference (0 turns it off).
+     */
+    private String doubleEnter(Connection current, GpuiTerminalProtocol.Command command, String raw) {
+        boolean enter = "keys".equals(command.type) && command.keys.size() == 1
+                && "enter".equals(command.keys.get(0));
+        long now = SystemClock.uptimeMillis();
+        if (!enter) {
+            lastEnterAt = 0;
+            return raw;
+        }
+        long window = getSharedPreferences("terminal-display", MODE_PRIVATE).getInt("double_enter_ms", 700);
+        boolean second = window > 0 && lastEnterAt > 0 && now - lastEnterAt <= window
+                && current.paneId.equals(lastEnterPane) && "claude".equals(agentKind(current))
+                && "working".equals(paneStatus(current));
+        lastEnterPane = current.paneId;
+        if (!second) {
+            lastEnterAt = now;
+            return raw;
+        }
+        lastEnterAt = 0;
+        main.post(() -> { if (!destroyed) Toast.makeText(this, "Sent now", Toast.LENGTH_SHORT).show(); });
+        return "{\"type\":\"keys\",\"keys\":[\"ctrl+enter\"]}";
+    }
+
+    private static String paneStatus(Connection current) {
+        JSONArray panes = current.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane != null && current.paneId.equals(pane.optString("id"))) return pane.optString("status", "");
+        }
+        return "";
+    }
+
+    /** "claude" or "codex" for the pane on screen, from its agent.kind label or title. */
+    private static String agentKind(Connection current) {
+        JSONArray panes = current.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
+            String kind = pane.optString("kind", "").toLowerCase(java.util.Locale.ROOT);
+            if (kind.contains("claude")) return "claude";
+            if (kind.contains("codex")) return "codex";
+            return kind;
+        }
+        return "";
+    }
+
     private void pumpRemote(Connection current) {
         boolean mutation = false;
         try {
@@ -3719,6 +3775,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 if (!current(current) || !current.ready) return;
                 mutation = true;
+                raw = doubleEnter(current, command, raw);
                 String result = RemoteNative.input(current.remoteHandle, current.paneId, raw);
                 if (!new JSONObject(result).optBoolean("queued", false)) throw new IOException("Input was not queued");
                 // Keep full-speed polling briefly after typing so echo stays immediate.

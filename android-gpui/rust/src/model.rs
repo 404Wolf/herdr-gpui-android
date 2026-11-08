@@ -693,6 +693,7 @@ pub fn valid_key(key: &str) -> bool {
             | "right"
             | "shift+tab"
             | "shift+enter"
+            | "ctrl+enter"
             | "y"
             | "n"
             | "1"

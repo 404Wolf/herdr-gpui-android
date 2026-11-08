@@ -278,7 +278,16 @@ impl Session {
         // send it: the kitty keyboard protocol's CSI 13;2u when the program
         // turned the protocol on, else ESC CR (Alt+Enter), which Claude Code
         // and Codex read as a newline.
-        let bytes = if key.key == "enter" && key.shift && !key.control && !key.alt {
+        // Ctrl+Enter is Claude Code's "send now" for a message queued while
+        // it works: CSI 13;5u under the kitty protocol, else xterm's
+        // modifyOtherKeys form, which it reads the same.
+        let bytes = if key.key == "enter" && key.control && !key.shift && !key.alt {
+            Some(if mode.intersects(Mode::KITTY_KEYBOARD_PROTOCOL) {
+                b"\x1b[13;5u".to_vec()
+            } else {
+                b"\x1b[27;5;13~".to_vec()
+            })
+        } else if key.key == "enter" && key.shift && !key.control && !key.alt {
             Some(if mode.intersects(Mode::KITTY_KEYBOARD_PROTOCOL) {
                 b"\x1b[13;2u".to_vec()
             } else {
