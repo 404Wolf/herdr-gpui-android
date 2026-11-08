@@ -465,3 +465,67 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_generateIdentity(
     };
     result_string(&mut env, remote::generate_identity(&comment))
 }
+
+// JNI requires these unique, Java-declared export names, as with the other
+// RemoteNative methods. Their bodies use only the safe JNI wrapper API.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_reviewList(
+    mut env: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+) -> jstring {
+    result_string(&mut env, remote::review_list(handle as u64))
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_reviewWatch(
+    mut env: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+    id: JString<'_>,
+) -> jstring {
+    let id = match bounded_string(&mut env, &id, 128) {
+        Ok(Some(id)) => id,
+        _ => return result_string(&mut env, Err(remote::Error::Config)),
+    };
+    result_string(&mut env, remote::review_watch(handle as u64, &id))
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_reviewPoll(
+    mut env: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+    watch: jlong,
+) -> jstring {
+    result_string(&mut env, remote::review_poll(handle as u64, watch as u64))
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_reviewSend(
+    mut env: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+    watch: jlong,
+    message: JString<'_>,
+) -> jstring {
+    let message = match bounded_string(&mut env, &message, 64 * 1024) {
+        Ok(Some(message)) => message,
+        _ => return result_string(&mut env, Err(remote::Error::Config)),
+    };
+    result_string(
+        &mut env,
+        remote::review_send(handle as u64, watch as u64, &message),
+    )
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_reviewStop(
+    _: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+    watch: jlong,
+) {
+    remote::review_stop(handle as u64, watch as u64);
+}

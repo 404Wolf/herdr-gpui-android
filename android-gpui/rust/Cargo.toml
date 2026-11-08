@@ -28,6 +28,7 @@ rio-vt = { path = "vendor/rio-vt", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
 zeroize = { version = "1.9", features = ["serde"] }
 ndk-context = "0.1"
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 [package]
 name = "herdr-gpui-android"
@@ -45,7 +46,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 # UI is host-checkable; only the actual activity/backend is Android-specific.
 android-ui = ["remote", "dep:async-channel", "dep:gpui", "dep:gpui-mobile", "dep:gpui-wgpu", "dep:jni", "dep:jni-mobile", "dep:ndk", "dep:android-activity", "dep:android_logger", "dep:log"]
-remote = ["dep:herdr-remote-transport", "dep:gpui-rio", "dep:tokio", "dep:zeroize", "dep:jni", "dep:ndk-context", "dep:rio-vt"]
+remote = ["dep:herdr-remote-transport", "dep:gpui-rio", "dep:tokio", "dep:zeroize", "dep:jni", "dep:ndk-context", "dep:rio-vt", "dep:tungstenite"]
 
 [dependencies]
 serde = { workspace = true }
@@ -62,6 +63,7 @@ log = { workspace = true, optional = true }
 herdr-remote-transport = { workspace = true, optional = true }
 gpui-rio = { workspace = true, optional = true }
 rio-vt = { workspace = true, optional = true }
+tungstenite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 

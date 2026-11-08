@@ -20,6 +20,8 @@ struct Fixture {
     password_attempts: Arc<AtomicUsize>,
     publickey_attempts: Arc<AtomicUsize>,
     disconnected: Arc<tokio::sync::Notify>,
+    #[cfg(unix)]
+    channel_closed: Arc<tokio::sync::Notify>,
     stop: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -44,11 +46,13 @@ impl Fixture {
         let password_attempts = Arc::new(AtomicUsize::new(0));
         let publickey_attempts = Arc::new(AtomicUsize::new(0));
         let disconnected = Arc::new(tokio::sync::Notify::new());
+        let channel_closed = Arc::new(tokio::sync::Notify::new());
         let stop = CancellationToken::new();
         let task_stop = stop.clone();
         let attempts = password_attempts.clone();
         let key_attempts = publickey_attempts.clone();
         let ended = disconnected.clone();
+        let closed = channel_closed.clone();
         let task = tokio::spawn(async move {
             let mut sessions = tokio::task::JoinSet::new();
             loop {
@@ -57,7 +61,7 @@ impl Fixture {
                     _ = task_stop.cancelled() => break,
                     connection = listener.accept() => {
                         let Ok((stream, _)) = connection else { break };
-                        let handler = TestServer { password_attempts: attempts.clone(), publickey_attempts: key_attempts.clone(), disconnected: ended.clone(), echo: false, pty: None, auth };
+                        let handler = TestServer { password_attempts: attempts.clone(), publickey_attempts: key_attempts.clone(), disconnected: ended.clone(), channel_closed: closed.clone(), echo: false, pty: None, auth };
                         let server_config = server_config.clone();
                         let connection_stop = task_stop.clone();
                         sessions.spawn(async move {
@@ -86,6 +90,8 @@ impl Fixture {
             password_attempts,
             publickey_attempts,
             disconnected,
+            #[cfg(unix)]
+            channel_closed,
             stop,
             task,
         }
@@ -112,6 +118,7 @@ struct TestServer {
     password_attempts: Arc<AtomicUsize>,
     publickey_attempts: Arc<AtomicUsize>,
     disconnected: Arc<tokio::sync::Notify>,
+    channel_closed: Arc<tokio::sync::Notify>,
     echo: bool,
     /// The terminal type and size of the last PTY request.
     pty: Option<(String, u32, u32)>,
@@ -123,6 +130,14 @@ impl Drop for TestServer {
 }
 impl server::Handler for TestServer {
     type Error = russh::Error;
+    async fn channel_close(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut server::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        self.channel_closed.notify_one();
+        Ok(())
+    }
     async fn auth_password(
         &mut self,
         user: &str,
@@ -176,6 +191,21 @@ impl server::Handler for TestServer {
         reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
     ) -> std::result::Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        host: &str,
+        port: u32,
+        origin: &str,
+        _origin_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut server::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        assert_eq!((host, port, origin), ("127.0.0.1", 3433, "127.0.0.1"));
+        self.echo = true;
         reply.accept().await;
         Ok(())
     }
@@ -698,4 +728,40 @@ fn generated_identity_is_an_openssh_ed25519_key_matching_its_public_line() {
     assert!(public.starts_with("ssh-ed25519 AAAA") && public.ends_with(" phone"));
     let (other, _) = generate_ed25519("phone").expect("generate");
     assert_ne!(*private, *other, "every key gets a fresh seed");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_channels_share_auth_and_closing_one_keeps_the_session_alive() {
+    let fixture = Fixture::new().await;
+    let mut session = fixture.session().await;
+    let connector = session.loopback(3433);
+    for _ in 0..2 {
+        let mut stream = tokio::net::UnixStream::from_std({
+            let stream = connector.open().await.unwrap();
+            stream.set_nonblocking(true).unwrap();
+            stream
+        })
+        .unwrap();
+        stream.write_all(b"diffd").await.unwrap();
+        let mut bytes = [0; 5];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"diffd");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), fixture.channel_closed.notified())
+            .await
+            .expect("dropping a local stream must close its channel even without remote EOF");
+    }
+    assert_eq!(fixture.password_attempts.load(Ordering::SeqCst), 1);
+    let result = session
+        .exec_bounded("hello", ExecLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(result.stdout, b"hello");
+    session.shutdown().await;
+    assert!(matches!(connector.open().await, Err(Error::Cancelled)));
+    fixture.finish().await;
 }

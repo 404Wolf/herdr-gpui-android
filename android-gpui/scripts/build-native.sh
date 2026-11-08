@@ -69,7 +69,8 @@ mv "$RECORD" "$ROOT/build/native-build$BUILD_SUFFIX.json"
 if "$BIN/llvm-readelf" -d "$LIB" | grep -q 'Shared library: \[libc++_shared.so\]'; then
     CPP="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/sysroot/usr/lib/$TARGET/libc++_shared.so"
     python3 "$ROOT/scripts/verify-native-library.py" --abi "$ABI" --runtime "$CPP"
-    cp "$CPP" "$DEST/libc++_shared.so"
+    # Nix NDK files are read-only; install also replaces an earlier read-only copy.
+    install -m 755 "$CPP" "$DEST/libc++_shared.so"
 fi
 sha256sum "$DEST/libherdr_gpui_android.so"
 printf '\nBuilt actual GPUI %s Android library: %s\n' "$ABI" "$DEST/libherdr_gpui_android.so"

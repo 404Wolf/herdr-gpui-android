@@ -27,6 +27,32 @@ the terminal activity is rendered by **Rust GPUI and its wgpu Android backend**.
 It is not a WebView. The original `android/` application can still be built
 without the GPUI native library.
 
+## Agent code reviews
+
+When an agent shares a diffd review, its terminal's **Session / Review** tabs
+open that exact review and return to the same session in one tap. **Files** lists
+changed files; tap a file for a highlighted, horizontally scrollable diff, then
+tap a line to comment. **Threads** shows discussions with Reply, Resolve/Reopen
+and Show line. **Chat** sends review-wide messages. New shares get a badge and
+an in-app notice; Android notifications also appear when permission is granted.
+
+Run diffd normally on the host's loopback port 3433. The app opens SSH
+`direct-tcpip` channels through its existing trusted connection, including over
+Iroh. SSH forwarding must be permitted by that host. There is no extra login,
+phone-side listener or public diffd binding. Raw shells and HTTPS companion
+sessions do not have review tabs. Closing a review ends only its WebSocket;
+the agent terminal stays attached.
+
+The authoritative association is `hc label <terminal> diffd.review=<review-id>`.
+The coordinated diffd integration sets this on share using `HC_TERMINAL_ID`.
+Older unlabelled reviews match only when exactly one agent's working directory
+exactly equals the review's `repoPath`. Shared directories never guess an owner.
+If diffd is unavailable, the review shows **Reconnect**; comments are never
+automatically replayed. **Queued** means local mailbox admission; **Sent** follows
+diffd's acknowledgement. Diffs page through 160 aligned rows at a time and very
+long displayed lines/messages are capped to bound UI work; comment anchors keep
+the original line. See [native review QA](review-tests/README.md).
+
 ## Raw SSH shell
 
 A trusted host's ⋮ menu in **Remote hosts** offers **Open shell** when a device

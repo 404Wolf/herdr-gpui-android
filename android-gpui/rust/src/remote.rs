@@ -1,5 +1,9 @@
 //! herdr-core sessions over embedded SSH. No TUI bridge or binary projection.
 use crate::model;
+pub use crate::review::{
+    Error as ReviewError, list as review_list, poll as review_poll, send as review_send,
+    stop as review_stop, watch as review_watch,
+};
 use herdr_remote_transport::{CancellationToken, Config, Credentials, IrohTarget, Transport};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,6 +34,8 @@ pub enum Error {
     StaleTarget,
     #[error("herdr-core protocol: {0}")]
     Protocol(String),
+    #[error(transparent)]
+    Review(#[from] ReviewError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -196,6 +202,7 @@ pub(crate) struct Session {
     pub(crate) state: Mutex<State>,
     pub(crate) cancel: CancellationToken,
     pub(crate) commands: mpsc::SyncSender<Operation>,
+    pub(crate) reviews: Mutex<crate::review::Client>,
 }
 pub(crate) enum Operation {
     Focus(String),
@@ -213,7 +220,7 @@ pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 fn sessions() -> &'static Mutex<HashMap<u64, Arc<Session>>> {
     SESSIONS.get_or_init(Mutex::default)
 }
-fn session(id: u64) -> Result<Arc<Session>> {
+pub(crate) fn session(id: u64) -> Result<Arc<Session>> {
     lock(sessions()).get(&id).cloned().ok_or(Error::Closed)
 }
 pub fn renderer(id: u64) -> Option<Arc<gpui_rio::Session>> {
@@ -256,6 +263,7 @@ pub fn connect_credentials_grid(
         }),
         cancel: CancellationToken::new(),
         commands: tx,
+        reviews: Mutex::new(crate::review::Client::default()),
     });
     let worker = owner.clone();
     std::thread::Builder::new()
@@ -422,6 +430,11 @@ fn run(
         credentials,
         owner.cancel.clone(),
     ))?;
+    lock(&owner.reviews).connect(
+        ssh.loopback(3433),
+        runtime.handle().clone(),
+        owner.cancel.clone(),
+    );
     let bridge = runtime.block_on(ssh.into_bridge("herdr-core connect"))?;
     let (socket, guard) = bridge.into_parts();
     let result = crate::core_session::run(owner, socket, cols, rows, active, commands);

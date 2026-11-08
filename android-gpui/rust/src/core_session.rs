@@ -607,6 +607,7 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "status": terminal["status"]["state"].as_str().unwrap_or(""),
             "parent": label("parent").or(terminal["parent"].as_str()).unwrap_or(""),
             "role": label("role").unwrap_or(""),
+            "review_id": label("diffd.review").unwrap_or(""),
             "project": label("project").unwrap_or(""),
             "kind": kind.unwrap_or(""),
         }));
@@ -742,7 +743,7 @@ mod tests {
         let mut view = json!({"revision":0});
         project(
             &mut view,
-            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{"role":"none"},"parent":"t1","argv":["/usr/bin/claude"]},{"id":"t3","state":"live","cwd":"/home/w/botd","labels":{"herdr.space":"sp9","where":"botd / w1-backend"}},{"id":"t4","state":"live","cwd":"/home/w/zulip/","labels":{"herdr.space":"sp8"}}]),
+            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex","diffd.review":"r_test"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{"role":"none"},"parent":"t1","argv":["/usr/bin/claude"]},{"id":"t3","state":"live","cwd":"/home/w/botd","labels":{"herdr.space":"sp9","where":"botd / w1-backend"}},{"id":"t4","state":"live","cwd":"/home/w/zulip/","labels":{"herdr.space":"sp8"}}]),
             &json!({"spaces":[{"id":"s1","name":"Code","tabs":[{"id":"a","name":"Fix"}]}]}),
         )?;
         assert_eq!(view["workspaces"][0]["label"], "Code");
@@ -772,6 +773,7 @@ mod tests {
         };
         assert_eq!(label("sp9"), Some(json!("botd")));
         assert_eq!(label("sp8"), Some(json!("zulip")));
+        assert_eq!(view["panes"][0]["review_id"], "r_test");
         assert_eq!(view["panes"][1]["workspace_id"], "loose");
         assert_eq!(view["panes"][1]["role"], "");
         Ok(())
@@ -848,6 +850,7 @@ mod connection_tests {
             }),
             cancel: CancellationToken::new(),
             commands,
+            reviews: Mutex::new(crate::review::Client::default()),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));

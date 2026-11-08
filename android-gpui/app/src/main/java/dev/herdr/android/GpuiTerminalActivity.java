@@ -94,6 +94,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private GpuiDisplayOptions displayOptions;
     private boolean compactDisplay;
     private FrameLayout terminalRoot;
+    private FrameLayout terminalViewport;
+    private DiffReviewController reviews;
+    private final Runnable reviewTick = new Runnable() {
+        @Override public void run() {
+            if (destroyed) return;
+            synchronized (stateLock) {
+                Connection c = connection;
+                if (reviews != null && hostResumed && c != null && c.ready && c.remoteHandle > 0) {
+                    reviews.update(c.remoteHandle, currentHostId == null ? "" : currentHostId, c.paneId, c.panes);
+                }
+            }
+            main.postDelayed(this, 1000);
+        }
+    };
     private LinearLayout sidebar, sidebarRows;
     /** Reused rail rows, so a sampler refresh never replaces the view under a finger. */
     private final java.util.Map<String, RailHostRow> railHostRows = new java.util.HashMap<>();
@@ -120,7 +134,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Colors for every surface outside the painted grid, from the current palette. */
     private GpuiChrome chrome;
     private volatile boolean sidebarOpen;
-    private final BackOwner backOwner = new BackOwner(this, this::hideSidebar);
+    private final BackOwner backOwner = new BackOwner(this, () -> {
+        if (sidebarOpen && compactWindow()) hideSidebar();
+        else if (reviews != null && reviews.showing()) { reviews.show(false); placeRail(); }
+    });
     private String sidebarSignature = "";
     private volatile java.util.List<SavedRemoteHost> savedHosts = java.util.Collections.emptyList();
     private volatile String currentHostId;
@@ -267,6 +284,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Repaints every Android surface for a newly chosen theme. */
     private void applyChrome() {
+        if (reviews != null) reviews.theme(chrome);
         applySystemBars();
         styleRail();
         rebuildShortcutBar();
@@ -334,7 +352,38 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabStrip.setPadding(dp(6), 0, dp(6), 0);
         tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
         content.addView(tabScroll, new LinearLayout.LayoutParams(-1, dp(30)));
-        content.addView(surface, new LinearLayout.LayoutParams(-1, 0, 1));
+        reviews = new DiffReviewController(this, chrome, show -> {
+            if (show) {
+                allowNextKeyboardShow = false;
+                keyboardRequested = false;
+                ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                        .hideSoftInputFromWindow(surface.getWindowToken(), 0);
+                if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null)
+                    getWindow().getInsetsController().hide(WindowInsets.Type.ime());
+                surface.clearFocus();
+                clearControl();
+                capturedKeys.clear();
+            }
+            if (shortcutBar != null) shortcutBar.setVisibility(show ? View.GONE : View.VISIBLE);
+            if (show && keyDeck != null) keyDeck.setVisibility(View.GONE);
+            if (!show) surface.requestFocus();
+            if (sidebar != null) placeRail();
+            applyPosture();
+        }, (pane, title) -> {
+            String name = title.isEmpty() ? pane : title.length() > 160 ? title.substring(0, 160) : title;
+            Toast.makeText(this, "New review · " + name, Toast.LENGTH_SHORT).show();
+            postNotice("New review · " + name, "Open the agent’s Review tab to comment", pane);
+        });
+        content.addView(reviews.tabs, new LinearLayout.LayoutParams(-1, dp(36)));
+        FrameLayout reviewStack = new FrameLayout(this);
+        terminalViewport = reviewStack;
+        reviewStack.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
+            if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
+        });
+        reviewStack.addView(surface, new FrameLayout.LayoutParams(-1, -1));
+        reviewStack.addView(reviews.panel, new FrameLayout.LayoutParams(-1, -1));
+        content.addView(reviewStack, new LinearLayout.LayoutParams(-1, 0, 1));
+        main.post(reviewTick);
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));
         keyDeck = new android.widget.ScrollView(this);
@@ -457,8 +506,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             styleRail();
         }
         railScrim.setVisibility(drawer && sidebarOpen ? View.VISIBLE : View.GONE);
-        // An open drawer is the only thing Back closes here; otherwise Back leaves the terminal.
-        backOwner.setOwned(drawer && sidebarOpen);
+        // Back closes the drawer first, then returns from Review to Session.
+        backOwner.setOwned(drawer && sidebarOpen || reviews != null && reviews.showing());
     }
 
     /** Choosing a destination in the drawer closes it, as Android's drawers do. */
@@ -468,6 +517,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
+        if (!(sidebarOpen && compactWindow()) && reviews != null && reviews.showing()) { reviews.show(false); placeRail(); return; }
         if (sidebarOpen && compactWindow()) {
             hideSidebar();
             return;
@@ -810,17 +860,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * room under the fold - an open keyboard, say - the normal layout returns.
      */
     private void applyPosture() {
-        if (terminalContent == null || terminalSurface == null || keyDeck == null) return;
-        int[] origin = new int[2];
-        terminalContent.getLocationInWindow(origin);
-        int above = posture.heightAbove(origin[1], origin[1] + terminalContent.getHeight(),
+        if (terminalContent == null || terminalViewport == null || keyDeck == null) return;
+        int[] origin = new int[2], contentOrigin = new int[2];
+        terminalViewport.getLocationInWindow(origin);
+        terminalContent.getLocationInWindow(contentOrigin);
+        int above = posture.heightAbove(origin[1], contentOrigin[1] + terminalContent.getHeight(),
                 dp(200), dp(48 + 2 * 56 + 16));
-        boolean deck = above >= 0;
+        boolean deck = above >= 0 && !(reviews != null && reviews.showing());
         int height = deck ? above : 0;
         float weight = deck ? 0f : 1f;
-        LinearLayout.LayoutParams surfaceParams = (LinearLayout.LayoutParams) terminalSurface.getLayoutParams();
+        LinearLayout.LayoutParams surfaceParams = (LinearLayout.LayoutParams) terminalViewport.getLayoutParams();
         if (surfaceParams.height != height || surfaceParams.weight != weight) {
-            terminalSurface.setLayoutParams(new LinearLayout.LayoutParams(-1, height, weight));
+            terminalViewport.setLayoutParams(new LinearLayout.LayoutParams(-1, height, weight));
         }
         LinearLayout.LayoutParams deckParams = (LinearLayout.LayoutParams) keyDeck.getLayoutParams();
         int hinge = deck ? posture.foldBottom - posture.foldTop : 0;
@@ -842,6 +893,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         terminalContent.removeView(shortcutBar);
         shortcutBar = createShortcutBar();
         terminalContent.addView(shortcutBar, index, new LinearLayout.LayoutParams(-1, dp(48)));
+        shortcutBar.setVisibility(reviews != null && reviews.showing() ? View.GONE : View.VISIBLE);
     }
 
     /** Actions a compact toolbar keeps out of view, with the labels the wide one tooltips. */
@@ -2646,6 +2698,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onPause() {
         hostResumed = false;
+        if (reviews != null) reviews.pause();
         // Mirrors are only useful on screen; three SSH sessions polling in the
         // background would spend battery for a rail nobody can see.
         stopHostSampling();
@@ -2682,6 +2735,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
+        main.removeCallbacks(reviewTick);
+        if (reviews != null) reviews.close();
         stopHostSampling();
         stopConnection();
         worker.shutdownNow();
@@ -2927,6 +2982,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override public void gpuiShowKeyboard(int keyboardType, long session) {
         runOnUiThread(() -> {
+            if (reviews != null && reviews.showing()) return;
             if (!allowNextKeyboardShow || session < imeSession
                     || displayDialog != null && displayDialog.isShowing()) return;
             allowNextKeyboardShow = false;
@@ -2966,6 +3022,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     @Override protected void gpuiIme(long session, int kind, String text, int start, int end) {
+        if (reviews != null && reviews.showing()) return;
         clearControl();
         if (displayDialog != null && displayDialog.isShowing()) return;
         synchronized (stateLock) {
@@ -3000,6 +3057,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (reviews != null && reviews.showing()) return super.dispatchKeyEvent(event);
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
         boolean physical = imeKeyInFlight || event.isFromSource(InputDevice.SOURCE_KEYBOARD)
                 && event.getDevice() != null && !event.getDevice().isVirtual()

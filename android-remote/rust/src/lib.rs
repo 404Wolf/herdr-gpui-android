@@ -407,7 +407,7 @@ async fn inspect_with_target(
 }
 
 pub struct Session {
-    handle: client::Handle<HostKeyHandler>,
+    handle: Arc<client::Handle<HostKeyHandler>>,
     guard: ConnectionGuard,
 }
 
@@ -492,7 +492,10 @@ async fn connect_with_target(
         guard.shutdown().await;
         return Err(error);
     }
-    Ok(Session { handle, guard })
+    Ok(Session {
+        handle: Arc::new(handle),
+        guard,
+    })
 }
 
 fn append_bounded(
@@ -509,6 +512,17 @@ fn append_bounded(
 }
 
 impl Session {
+    /// A connector to one loopback service, reusing this authenticated SSH session.
+    /// It cannot outlive the session's cancellation token and never opens a listener.
+    #[cfg(unix)]
+    pub fn loopback(&self, port: u16) -> LoopbackService {
+        LoopbackService {
+            handle: self.handle.clone(),
+            token: self.guard.0.clone(),
+            port,
+        }
+    }
+
     /// Close and drain transport resources before destroying the caller's runtime.
     /// Call this on a background thread; ordinary Drop remains nonblocking.
     pub async fn shutdown(mut self) {
@@ -698,6 +712,47 @@ pub struct Bridge {
 impl Bridge {
     pub fn into_parts(self) -> (std::os::unix::net::UnixStream, BridgeGuard) {
         (self.socket, self.guard)
+    }
+}
+
+/// Opens byte streams to a fixed remote loopback port. No credential copy or local
+/// TCP listener is needed. Each stream's pump ends on EOF or session cancellation.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct LoopbackService {
+    handle: Arc<client::Handle<HostKeyHandler>>,
+    token: CancellationToken,
+    port: u16,
+}
+#[cfg(unix)]
+impl LoopbackService {
+    pub async fn open(&self) -> Result<std::os::unix::net::UnixStream> {
+        bounded(&self.token, CHANNEL_TIMEOUT, async {
+            let channel = self
+                .handle
+                .channel_open_direct_tcpip("127.0.0.1", u32::from(self.port), "127.0.0.1", 0)
+                .await?;
+            let (socket, peer) = std::os::unix::net::UnixStream::pair()?;
+            peer.set_nonblocking(true)?;
+            let mut peer = tokio::net::UnixStream::from_std(peer)?;
+            let cancel = self.token.clone();
+            tokio::spawn(async move {
+                let stream = channel.into_stream();
+                let (mut incoming, mut outgoing) = tokio::io::split(stream);
+                let (mut local_read, mut local_write) = peer.split();
+                // These service streams do not use half-close. Local EOF means
+                // the caller dropped its request/review: close the SSH channel
+                // immediately even when the remote peer stays silent.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {},
+                    _ = tokio::io::copy(&mut local_read, &mut outgoing) => {},
+                    _ = tokio::io::copy(&mut incoming, &mut local_write) => {},
+                }
+            });
+            Ok(socket)
+        })
+        .await
     }
 }
 

@@ -13,6 +13,8 @@ pub mod remote;
 #[cfg(all(feature = "remote", target_os = "android"))]
 mod remote_jni;
 #[cfg(all(feature = "remote", unix))]
+mod review;
+#[cfg(all(feature = "remote", unix))]
 pub mod shell;
 
 #[cfg(all(feature = "android-ui", target_os = "android"))]

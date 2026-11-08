@@ -42,6 +42,13 @@ final class RemoteNative {
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);
     static native void close(long handle);
+    /** diffd traffic uses this handle's pinned SSH connection; requests/polls run on workers.
+     * Send and stop only touch bounded mailboxes/cancellation and are UI-safe. */
+    static native String reviewList(long handle);
+    static native String reviewWatch(long handle, String reviewId);
+    static native String reviewPoll(long handle, long watch);
+    static native String reviewSend(long handle, long watch, String message);
+    static native void reviewStop(long handle, long watch);
 
     /** A raw login shell on a remote PTY, drawn by the Rio terminal. Blocks for SSH: worker only. */
     static native long openShell(String configJson, String credentialJson, int columns, int rows);
