@@ -67,7 +67,7 @@ configure_tools() {
 read_app_settings() {
     local work="$1"
     python3 - "$ROOT" "$work" <<'PY'
-import pathlib, re, sys, xml.etree.ElementTree as ET
+import os, pathlib, re, sys, xml.etree.ElementTree as ET
 root, work = map(pathlib.Path, sys.argv[1:])
 gradle = (root / 'app/build.gradle').read_text(encoding='utf-8')
 if re.search(r'^\s*(?:implementation|api|compileOnly|runtimeOnly|kapt|annotationProcessor)\b', gradle, re.MULTILINE):
@@ -81,6 +81,7 @@ settings = [value('applicationId', r"['\"]([A-Za-z0-9_.]+)['\"]"),
             value('minSdk', r'(\d+)'), value('targetSdk', r'(\d+)'),
             value('versionCode', r'(\d+)'), value('versionName', r"['\"]([^'\"]+)['\"]"),
             value('compileSdk', r'(\d+)'), value('namespace', r"['\"]([A-Za-z0-9_.]+)['\"]")]
+settings[3] = os.environ.get('HERDR_VERSION_CODE', settings[3])
 if settings[5] != '36':
     raise SystemExit('The pinned framework is Android API 36; use Gradle for another compileSdk.')
 work.mkdir(parents=True, exist_ok=True)

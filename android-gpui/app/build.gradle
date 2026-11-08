@@ -10,11 +10,11 @@ android {
     compileSdk 36
     buildToolsVersion "35.0.0"
     defaultConfig {
-        applicationId 'ch.robitzs.herdr'
+        applicationId 'dev.wolf.herdrgpui'
         minSdk 29
         targetSdk 36
-        versionCode 5
-        versionName '0.5.0-gpui-remote'
+        versionCode 6
+        versionName '0.6.0-core'
         ndk { abiFilters herdrAndroidAbi }
     }
     sourceSets {
