@@ -332,7 +332,7 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollLocal(
         return std::ptr::null_mut();
     };
     let paint = remote::UiPaint {
-        generation: generation as i64,
+        generation,
         title: &title,
         status: &status,
         shortcuts: &shortcuts,

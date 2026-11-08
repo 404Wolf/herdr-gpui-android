@@ -332,7 +332,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeRequest
     _class: JClass<'_>,
     generation: jlong,
 ) {
-    request_keyboard(generation as i64);
+    request_keyboard(generation);
 }
 
 #[allow(unsafe_code)]
@@ -344,7 +344,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeShowKey
 ) {
     // Grant first, then ask the platform to raise the IME: the grant alone only
     // records intent and never shows a keyboard.
-    if request_keyboard(generation as i64) {
+    if request_keyboard(generation) {
         gpui_mobile::show_keyboard();
     }
 }
