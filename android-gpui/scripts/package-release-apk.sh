@@ -47,7 +47,8 @@ PY
 # 16 KiB pages for native libraries (Android 15+ devices), 4 bytes for the rest.
 "$TOOLS/zipalign" -P 16 -f 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
 python3 "$ROOT/scripts/verify-apk-structure.py" --abi "$ABI" "$WORK/aligned.apk"
-"$AAPT2" dump badging "$WORK/aligned.apk" | head -n 1
+# sed reads to the end: head would SIGPIPE aapt2 and fail under pipefail.
+"$AAPT2" dump badging "$WORK/aligned.apk" | sed -n 1p
 mkdir -p "$(dirname -- "$OUT")"
 cp "$WORK/aligned.apk" "$OUT"
 printf 'Built unsigned release APK %s; sign it before installing.\n' "$OUT"
