@@ -196,10 +196,12 @@ pub(crate) struct Session {
     pub(crate) state: Mutex<State>,
     pub(crate) cancel: CancellationToken,
     pub(crate) commands: mpsc::SyncSender<Operation>,
+    /// The latest window switch asked for and not yet made. A slot, not the
+    /// queue: a switch can never be refused because terminal output filled
+    /// the queue, and quick taps collapse into the last one.
+    pub(crate) focus: Mutex<Option<(String, std::time::Instant)>>,
 }
 pub(crate) enum Operation {
-    /// The pane to attach, and when the phone asked for it.
-    Focus(String, std::time::Instant),
     Discover(mpsc::SyncSender<Result<String>>),
     Action(String, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
@@ -248,7 +250,9 @@ pub fn connect_credentials_grid(
         return Err(Error::Capacity);
     }
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = mpsc::sync_channel(256);
+    // Terminal output acknowledges every read through this queue; a busy
+    // pane overran 256 while a slow refresh held the session thread.
+    let (tx, rx) = mpsc::sync_channel(4096);
     let owner = Arc::new(Session {
         state: Mutex::new(State {
             view: json!({"state":"connecting","status":"Connecting to herdr-core over SSH","boot_id":"","pane_id":"","focused_pane":"","panes":[],"workspaces":[],"tabs":[],"title":"Herdr Core","token":1,"chrome_token":1,"revision":1,"fetch":null,"scroll":{"offset":0,"max":0,"rows":0}}),
@@ -257,6 +261,7 @@ pub fn connect_credentials_grid(
         }),
         cancel: CancellationToken::new(),
         commands: tx,
+        focus: Mutex::new(None),
     });
     let worker = owner.clone();
     std::thread::Builder::new()
@@ -328,17 +333,14 @@ pub fn poll_terminal(
     Ok(view.to_string())
 }
 pub fn focus(id: u64, terminal: &str) -> Result<String> {
-    let owner = session(id)?;
-    if !lock(&owner.state).view["panes"]
-        .as_array()
-        .is_some_and(|panes| panes.iter().any(|p| p["id"] == terminal))
-    {
+    if terminal.is_empty() || terminal.len() > 128 {
         return Err(Error::StaleTarget);
     }
-    owner
-        .commands
-        .try_send(Operation::Focus(terminal.into(), std::time::Instant::now()))
-        .map_err(|_| Error::Capacity)?;
+    let owner = session(id)?;
+    // Not checked against the view: the phone's list may be newer or older
+    // than this copy. A window that is gone fails its attach, which the
+    // session recovers from by staying on the window it was showing.
+    *lock(&owner.focus) = Some((terminal.into(), std::time::Instant::now()));
     Ok(json!({"queued":true}).to_string())
 }
 pub fn focus_tab(id: u64, tab: &str) -> Result<String> {

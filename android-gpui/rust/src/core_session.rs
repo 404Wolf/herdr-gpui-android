@@ -724,17 +724,6 @@ pub(crate) fn run(
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
                 }
-                Ok(Operation::Focus(terminal, asked)) => {
-                    let queued = asked.elapsed();
-                    connection.attach(&terminal, cols, rows)?;
-                    #[cfg(feature = "android-ui")]
-                    log::warn!(
-                        "switch {terminal}: queued {queued:?}, attached after {:?}",
-                        asked.elapsed()
-                    );
-                    #[cfg(not(feature = "android-ui"))]
-                    let _ = (queued, asked);
-                }
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
                     // current size, not the size it connected with.
@@ -749,6 +738,37 @@ pub(crate) fn run(
                 Ok(_) => {}
                 Err(_) => break,
             }
+        }
+        let switch = lock(&owner.focus).take();
+        if let Some((terminal, asked)) = switch {
+            let previous = lock(&owner.state).view["pane_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            match connection.attach(&terminal, cols, rows) {
+                Ok(()) => {
+                    #[cfg(feature = "android-ui")]
+                    log::warn!("switch {terminal}: attached after {:?}", asked.elapsed());
+                }
+                // herdr-core refused (the window closed, an agent restarted
+                // under a new id): stay on the window that was showing and
+                // refresh, instead of ending the session.
+                Err(Error::Protocol(reason)) => {
+                    #[cfg(feature = "android-ui")]
+                    log::warn!("switch {terminal} refused: {reason}");
+                    #[cfg(not(feature = "android-ui"))]
+                    let _ = reason;
+                    connection.refresh()?;
+                    if !previous.is_empty() && previous != terminal {
+                        if let Err(Error::Protocol(_)) = connection.attach(&previous, cols, rows) {
+                            connection.refresh()?;
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            #[cfg(not(feature = "android-ui"))]
+            let _ = asked;
         }
         if let Some(frame) = connection.read()? {
             connection.deliver(frame)?;
@@ -1143,6 +1163,7 @@ mod connection_tests {
             }),
             cancel: CancellationToken::new(),
             commands,
+            focus: Mutex::new(None),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
