@@ -181,7 +181,7 @@ impl Connection<'_> {
             .as_array()
             .and_then(|p| p.iter().find(|p| p["id"] == terminal));
         match action {
-            "tab.new" => {
+            "tab.new" | "agent.claude" | "agent.codex" => {
                 let unique = format!(
                     "mobile-{}-{}",
                     std::process::id(),
@@ -192,7 +192,22 @@ impl Connection<'_> {
                     .filter(|s| *s != "loose")
                     .unwrap_or(&unique);
                 let cwd = selected.and_then(|p| p["cwd"].as_str());
-                let result = self.call("terminal.run", json!({"name":"Mobile shell","cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":unique},"size":{"cols":cols,"rows":rows},"display":display()}))?;
+                let mut run = json!({"name":"Mobile shell","cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":unique},"size":{"cols":cols,"rows":rows},"display":display()});
+                if let Some((program, name)) = match action {
+                    "agent.claude" => Some(("claude", "Claude")),
+                    "agent.codex" => Some(("codex", "Codex")),
+                    _ => None,
+                } {
+                    // Through the machine's login shell, as a typed command would
+                    // be: its PATH has the Nix wrappers, which run interactive
+                    // sessions as `aswap run <agent> --auto` with that machine's
+                    // account, so a new agent never stops at a login screen.
+                    // keep: when the agent exits, the terminal stays as a shell.
+                    run["name"] = json!(name);
+                    run["line"] = json!(format!("exec \"${{SHELL:-/bin/sh}}\" -lic {program}"));
+                    run["labels"]["agent.kind"] = json!(program);
+                }
+                let result = self.call("terminal.run", run)?;
                 let terminal = result["address"]
                     .as_str()
                     .ok_or_else(|| Error::Protocol("missing terminal address".into()))?;

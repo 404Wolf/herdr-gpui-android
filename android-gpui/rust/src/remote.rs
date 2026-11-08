@@ -353,7 +353,10 @@ pub fn input(id: u64, terminal: &str, raw: &str) -> Result<String> {
 }
 /// Create a shell using herdr-app labels, or end the selected terminal.
 pub fn session_action(id: u64, action: &str) -> Result<String> {
-    if !matches!(action, "tab.new" | "pane.close") {
+    if !matches!(
+        action,
+        "tab.new" | "agent.claude" | "agent.codex" | "pane.close"
+    ) {
         return Err(Error::Config);
     }
     let owner = session(id)?;

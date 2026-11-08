@@ -2566,10 +2566,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // A raw shell has no Herdr panes or tabs to change.
         String[] labels = target.shell
                 ? new String[]{"Copy screen text", "Remote hosts…", "Save screenshot"}
-                : new String[]{"New terminal tab", "Close terminal", "Jump to live output", "Copy terminal text", "Remote hosts…", "Save screenshot"};
+                : new String[]{"New Claude", "New Codex", "New terminal tab", "Close terminal", "Jump to live output",
+                        "Copy terminal text", "Remote hosts…", "Save screenshot"};
         String[] actions = target.shell
                 ? new String[]{"copy.text", "hosts.list", "capture.screen"}
-                : new String[]{"tab.new", "pane.close", "scroll.live", "copy.text", "hosts.list", "capture.screen"};
+                : new String[]{"agent.claude", "agent.codex", "tab.new", "pane.close", "scroll.live", "copy.text",
+                        "hosts.list", "capture.screen"};
         if (!debuggable()) {
             // The screenshot is a debugging aid listed last; a release build drops it.
             labels = java.util.Arrays.copyOf(labels, labels.length - 1);
