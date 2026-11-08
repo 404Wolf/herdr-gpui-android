@@ -15,6 +15,7 @@ final class RemoteNative {
     }
 
     static native void initialize(Context context);
+    static native String discover(long handle);
     static native String inspect(String configJson);
     /**
      * {"endpoint_id", "endpoint_ticket", "relay_url"} for a pasted endpoint ID or ticket and an

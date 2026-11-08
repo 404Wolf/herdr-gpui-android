@@ -187,6 +187,7 @@ pub(crate) struct Session {
 }
 pub(crate) enum Operation {
     Focus(String),
+    Discover(mpsc::SyncSender<Result<String>>),
     Action(String, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
 }
@@ -400,4 +401,17 @@ fn run(
     let result = crate::core_session::run(owner, socket, cols, rows, active, commands);
     runtime.block_on(guard.shutdown());
     result
+}
+
+/// Discovery uses the already authenticated SSH/core connection, so Android
+/// needs neither root nor access to another app's private LocalAPI socket.
+pub fn discover(id: u64) -> Result<String> {
+    let owner = session(id)?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    owner
+        .commands
+        .try_send(Operation::Discover(tx))
+        .map_err(|_| Error::Capacity)?;
+    rx.recv_timeout(Duration::from_secs(120))
+        .map_err(|_| Error::Closed)?
 }

@@ -7,6 +7,7 @@ exclude = ["vendor/rio-vt"]
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22.1"
 async-channel = "2"
 thiserror = "2"
 gpui = { package = "gpui-pre", version = "=0.3.7", default-features = false }
@@ -49,6 +50,7 @@ remote = ["dep:herdr-remote-transport", "dep:gpui-rio", "dep:tokio", "dep:zeroiz
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 async-channel = { workspace = true, optional = true }
 thiserror = { workspace = true }
 gpui = { workspace = true, optional = true }

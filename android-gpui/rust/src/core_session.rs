@@ -207,6 +207,52 @@ impl Connection<'_> {
         }
         Ok(json!({"queued":true}).to_string())
     }
+    fn discover(&mut self) -> Result<String> {
+        use base64::Engine;
+        let result = self.call(
+            "machine.exec",
+            json!({"argv":["tailscale","status","--json"],"timeout":5}),
+        )?;
+        if result["code"] != 0 || result["truncated"] == true {
+            return Err(Error::Protocol(
+                "tailscale status failed on bootstrap host".into(),
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["stdout"].as_str().unwrap_or(""))
+            .map_err(|_| Error::Protocol("invalid command output".into()))?;
+        let status: Value = serde_json::from_slice(&bytes)?;
+        let mut peers = discovery_peers(&status)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for peer in &mut peers {
+            if peer["self"] == true {
+                peer["core"] = json!("available");
+                continue;
+            }
+            if peer["online"] != true {
+                peer["core"] = json!("offline");
+                continue;
+            }
+            if Instant::now() >= deadline
+                || !matches!(
+                    peer["os"].as_str(),
+                    Some("linux" | "macOS" | "windows" | "freebsd")
+                )
+            {
+                continue;
+            }
+            let host = peer["host"].as_str().unwrap_or("");
+            // Peer names enter argv, never a shell string. Reuse only the
+            // bootstrap machine's existing trust; never accept new host keys.
+            let probe = self.call("machine.exec", json!({"argv":["ssh","-oBatchMode=yes","-oStrictHostKeyChecking=yes","-oConnectTimeout=2","--",host,"command -v herdr-core >/dev/null && herdr-core server status >/dev/null"],"timeout":3}))?;
+            peer["core"] = json!(if probe["code"] == 0 {
+                "available"
+            } else {
+                "unverified"
+            });
+        }
+        Ok(json!({"peers":peers}).to_string())
+    }
     fn refresh(&mut self) -> Result<()> {
         // Subscribe precedes reading the app document; doc events/missed force
         // another read. Polling also handles older cores and unlabelled workers.
@@ -420,6 +466,9 @@ pub(crate) fn run(
     while !owner.cancel.is_cancelled() {
         for _ in 0..64 {
             match commands.try_recv() {
+                Ok(Operation::Discover(reply)) => {
+                    let _ = reply.send(connection.discover());
+                }
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
                 }
@@ -546,6 +595,49 @@ fn mark_focus(view: &mut Value) {
     }
 }
 
+/// Tailnet peers from `tailscale status --json`, the bootstrap host first.
+/// Only names safe as one SSH argv word survive.
+fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
+    let mut peers = Vec::new();
+    let entries = std::iter::once((&status["Self"], true)).chain(
+        status["Peer"]
+            .as_object()
+            .into_iter()
+            .flat_map(|p| p.values())
+            .map(|p| (p, false)),
+    );
+    for (peer, is_self) in entries {
+        let dns = peer["DNSName"].as_str().unwrap_or("").trim_end_matches('.');
+        let host = if dns.is_empty() {
+            peer["TailscaleIPs"][0].as_str().unwrap_or("")
+        } else {
+            dns
+        };
+        if host.is_empty()
+            || host.starts_with('-')
+            || host.len() > 253
+            || !host
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".:-".contains(&c))
+        {
+            continue;
+        }
+        peers.push(json!({"host":host,"name":peer["HostName"].as_str().unwrap_or(host),"online":peer["Online"].as_bool().unwrap_or(is_self),"os":peer["OS"].as_str().unwrap_or(""),"self":is_self,"core":"unverified"}));
+        if peers.len() > 256 {
+            return Err(Error::Capacity);
+        }
+    }
+    peers.sort_by_key(|p| {
+        let name = p["name"].as_str().unwrap_or("");
+        (
+            p["online"] != true,
+            !matches!(name, "server" | "laptop" | "desktop"),
+            name.to_lowercase(),
+        )
+    });
+    Ok(peers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +693,33 @@ mod tests {
         assert_eq!(view["tabs"][0]["label"], "Fix");
         assert_eq!(view["panes"][0]["status"], "blocked");
         assert_eq!(view["panes"][1]["workspace_id"], "loose");
+        Ok(())
+    }
+    #[test]
+    fn discovery_lists_self_first_then_online_peers_and_drops_unsafe_names() -> Result<()> {
+        let peers = discovery_peers(&json!({
+            "Self": {"HostName":"server","DNSName":"server.tail.ts.net.","OS":"linux"},
+            "Peer": {
+                "a": {"HostName":"zed","DNSName":"zed.tail.ts.net.","OS":"linux","Online":false},
+                "b": {"HostName":"laptop","DNSName":"laptop.tail.ts.net.","OS":"linux","Online":true},
+                "c": {"HostName":"evil","DNSName":"-oProxyCommand=x.","OS":"linux","Online":true},
+                "d": {"HostName":"ipad","DNSName":"","TailscaleIPs":["100.64.0.9"],"OS":"iOS","Online":true}
+            }
+        }))?;
+        let hosts: Vec<_> = peers
+            .iter()
+            .map(|p| p["host"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            hosts,
+            [
+                "laptop.tail.ts.net",
+                "server.tail.ts.net",
+                "100.64.0.9",
+                "zed.tail.ts.net"
+            ]
+        );
+        assert_eq!(peers[1]["self"], true);
         Ok(())
     }
 }

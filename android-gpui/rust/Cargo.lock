@@ -2515,6 +2515,7 @@ dependencies = [
  "android-activity",
  "android_logger",
  "async-channel",
+ "base64 0.22.1",
  "gpui-pre",
  "gpui-pre-mobile",
  "gpui-pre-wgpu",

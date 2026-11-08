@@ -1,6 +1,6 @@
 # Remote for Herdr privacy policy
 
-Effective 30 October 2026
+Effective 8 November 2026 (Wolf fork)
 
 Remote for Herdr is an unofficial client for Herdr, which is owned by an unrelated team. This policy explains what the app does with your information. In short: the app's developer collects nothing; when you connect, information goes to the computer and network services you choose to use.
 
@@ -23,6 +23,12 @@ If you choose **Export** under **Hosts file**, the app writes a file to a place 
 ## Network connections
 
 The app connects only to destinations you specify. SSH connects over TCP to a host you enter; your password or key goes only to that host, inside the encrypted SSH connection. Iroh connects to an endpoint ID or ticket you enter. By default, Iroh uses number0's public relays and address lookup at n0.computer; those services see your device's IP address, a random endpoint ID the app creates for each connection, and the endpoint IDs you connect to. If you set your own relay for a host, the app uses only that relay for it and makes no lookups at number0. Once a relay has introduced the two ends, Iroh may connect directly to the other endpoint's addresses. The optional companion feature connects over HTTPS to a host you enter, using a token you provide. The remote host and any relay or lookup service involved operate under their own terms. The app has no developer server.
+
+## Tailnet discovery
+
+When you tap **Discover tailnet machines**, the app runs `tailscale status --json` on the authenticated SSH bootstrap host through herdr-core. It lists that host's visible peers (name, DNS name, operating system and online status). No Tailscale API key or Android root access is needed.
+
+The bootstrap host probes online SSH-capable peers with its existing SSH keys and known-host trust. It never accepts unknown host keys, forwards your phone's SSH credentials, or installs software. Unreachable or untrusted peers are marked unverified. Adding a peer saves a profile; you verify its SSH fingerprint separately when connecting. Peer lists are not sent to the developer.
 
 ## Clipboard
 

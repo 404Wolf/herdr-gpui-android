@@ -547,7 +547,7 @@ public final class RemoteHostsActivity extends Activity {
         clearStatus();
         Runnable slow = () -> { if (current(token)) setStatus(Tone.PROGRESS, "Loading encrypted profiles…"); };
         main.postDelayed(slow, 300);
-        run(token, () -> new ProfilesSnapshot(store.read(), identityStore.exists()), snapshot -> {
+        run(token, () -> new ProfilesSnapshot(seedBootstrap(store.read()), identityStore.exists()), snapshot -> {
             main.removeCallbacks(slow);
             identityPresent = snapshot.identityPresent;
             renderProfiles(snapshot.hosts);
@@ -555,6 +555,28 @@ public final class RemoteHostsActivity extends Activity {
             main.removeCallbacks(slow);
             setStatus(Tone.ERROR, failure);
         });
+    }
+
+    /**
+     * The tailnet host discovery starts from, saved once on a fresh install so the
+     * first launch has something to connect to. Its SSH key is verified on first
+     * connect like any other host; deleting or editing it later sticks.
+     */
+    private static final String BOOTSTRAP_NAME = "Server";
+    private static final String BOOTSTRAP_HOST = "server.tailc6809.ts.net";
+    private static final String BOOTSTRAP_USER = "wolf";
+
+    /** Runs on the worker: the profile store is encrypted and read off the main thread. */
+    private List<SavedRemoteHost> seedBootstrap(List<SavedRemoteHost> hosts) throws Exception {
+        android.content.SharedPreferences prefs = getSharedPreferences(STARTUP, MODE_PRIVATE);
+        if (prefs.getBoolean("bootstrap_seeded", false)) return hosts;
+        if (hosts.isEmpty()) {
+            store.saveProfile(null, SavedRemoteHost.create(BOOTSTRAP_NAME, "tcp", BOOTSTRAP_HOST, 22,
+                    "", "", "", BOOTSTRAP_USER, "default"));
+            hosts = store.read();
+        }
+        prefs.edit().putBoolean("bootstrap_seeded", true).apply();
+        return hosts;
     }
 
     private void renderProfiles(List<SavedRemoteHost> hosts) {
@@ -1538,6 +1560,58 @@ public final class RemoteHostsActivity extends Activity {
                     new LinearLayout.LayoutParams(-1, -2));
         }
         content.addView(card, cardParams());
+        content.addView(tonalButton("Discover tailnet machines", () -> discoverTailnet(host, handle)), cardParams());
+    }
+
+    private void discoverTailnet(SavedRemoteHost bootstrap, long handle) {
+        int token = generation;
+        setStatus(Tone.PROGRESS, "Finding machines through " + bootstrap.name + "…");
+        run(token, () -> {
+            JSONObject found = result(RemoteNative.discover(handle));
+            // Hosts already in the list are shown but not added a second time.
+            JSONArray saved = new JSONArray();
+            for (SavedRemoteHost known : store.read()) if ("tcp".equals(known.transport)) saved.put(known.host);
+            found.put("saved", saved);
+            return found;
+        }, found -> {
+            content.removeAllViews();
+            showHeader("Tailnet machines", "Tap to add. SSH trust is checked separately when connecting.", "Return to terminals");
+            backAction = () -> { paneSnapshot = ""; pollConnection(token, handle, bootstrap, false); };
+            JSONArray peers = found.optJSONArray("peers");
+            JSONArray savedHosts = found.optJSONArray("saved");
+            java.util.Set<String> saved = new java.util.HashSet<>();
+            for (int i = 0; savedHosts != null && i < savedHosts.length(); i++) saved.add(savedHosts.optString(i));
+            if (peers == null || peers.length() == 0) {
+                setStatus(Tone.NOTE, "No machines found on " + bootstrap.name + "'s tailnet");
+                return;
+            }
+            for (int i = 0; i < peers.length(); i++) {
+                JSONObject peer = peers.optJSONObject(i);
+                if (peer == null) continue;
+                String address = peer.optString("host");
+                String name = peer.optString("name", address);
+                String core = peer.optString("core", "unverified");
+                String state = "available".equals(core) ? "herdr-core running" : "offline".equals(core) ? "offline" : "herdr-core unverified";
+                String label = name + " · " + peer.optString("os") + " · " + state;
+                if (saved.contains(address)) {
+                    Button known = tonalButton(label + " · Saved", () -> { });
+                    known.setEnabled(false);
+                    content.addView(known, cardParams());
+                    continue;
+                }
+                content.addView(tonalButton(label + " · Add", () -> {
+                    try {
+                        SavedRemoteHost draft = SavedRemoteHost.create(name, "tcp", address, 22, "", "", "", bootstrap.username, "default");
+                        run(token, () -> store.saveProfile(null, draft), profile -> {
+                            pendingStatus = "Added " + name + "; connect to verify its SSH key";
+                            pendingTone = Tone.NOTE;
+                            showProfiles();
+                        }, failure -> setStatus(Tone.ERROR, failure));
+                    } catch (Exception failure) { setStatus(Tone.ERROR, safeMessage(failure.getMessage())); }
+                }), cardParams());
+            }
+            clearStatus();
+        }, failure -> setStatus(Tone.ERROR, failure));
     }
 
     private Button paneRow(String title, String state, Runnable action) {
