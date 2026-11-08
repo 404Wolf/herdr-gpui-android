@@ -397,11 +397,6 @@ public final class HomeActivity extends Activity {
         getWindow().setBackgroundDrawable(new ColorDrawable(chrome.background));
         getWindow().setStatusBarColor(chrome.background);
         getWindow().setNavigationBarColor(chrome.background);
-        if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
-            int light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
-                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
-            getWindow().getInsetsController().setSystemBarsAppearance(chrome.light ? light : 0, light);
-        }
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(chrome.background);
@@ -424,6 +419,12 @@ public final class HomeActivity extends Activity {
             root.addView(treeScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         }
         setContentView(root);
+        // The insets controller belongs to the decor view, which exists only now.
+        if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
+            int light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+            getWindow().getInsetsController().setSystemBarsAppearance(chrome.light ? light : 0, light);
+        }
         render(true);
     }
 
