@@ -60,6 +60,17 @@ public class GpuiInputActivity extends Activity {
             InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
             imm.restartInput(input);
             imm.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT);
+            // A proxy added in this same frame has no window focus yet, and an
+            // implicit request is then dropped. Ask again once it is laid out,
+            // through the window's insets controller where there is one.
+            input.post(() -> {
+                if (!input.hasFocus()) input.requestFocus();
+                if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
+                    getWindow().getInsetsController().show(WindowInsets.Type.ime());
+                } else {
+                    imm.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT);
+                }
+            });
         });
     }
 
@@ -267,11 +278,12 @@ public class GpuiInputActivity extends Activity {
                     finally { endEdit(); }
                 }
                 @Override public boolean sendKeyEvent(KeyEvent event) {
-                    if (connectionSession != session || connectionEpoch != epoch || event == null
-                            || event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()
-                            || event.isSymPressed() || event.isFunctionPressed()) return false;
-                    if (event.isShiftPressed() && (event.getKeyCode() == KeyEvent.KEYCODE_DEL
-                            || event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) return false;
+                    if (connectionSession != session || connectionEpoch != epoch || event == null) return false;
+                    // Terminal keys from the keyboard (a sticky Ctrl, Shift+Enter, Esc,
+                    // Tab, arrows) mean what the same physical key means, so they go
+                    // to the host's key path, in order with committed text.
+                    if (terminalKey(event)) return gpuiImeKey(event);
+                    if (event.isMetaPressed() || event.isSymPressed() || event.isFunctionPressed()) return false;
                     if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
                         if (event.getAction() == KeyEvent.ACTION_DOWN) deleteSurroundingText(1, 0);
                         return true;
@@ -295,6 +307,30 @@ public class GpuiInputActivity extends Activity {
             };
         }
     }
+
+    /** A key event an IME sends that has no text meaning: modified, or a navigation key. */
+    static boolean terminalKey(KeyEvent event) {
+        if (event.isCtrlPressed() || event.isAltPressed()) return true;
+        int code = event.getKeyCode();
+        if (event.isShiftPressed() && (code == KeyEvent.KEYCODE_ENTER || code == KeyEvent.KEYCODE_DEL)) return true;
+        switch (code) {
+            case KeyEvent.KEYCODE_ESCAPE: case KeyEvent.KEYCODE_TAB:
+            case KeyEvent.KEYCODE_DPAD_UP: case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_DPAD_LEFT: case KeyEvent.KEYCODE_DPAD_RIGHT:
+            case KeyEvent.KEYCODE_MOVE_HOME: case KeyEvent.KEYCODE_MOVE_END:
+            case KeyEvent.KEYCODE_PAGE_UP: case KeyEvent.KEYCODE_PAGE_DOWN:
+            case KeyEvent.KEYCODE_FORWARD_DEL: case KeyEvent.KEYCODE_INSERT:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * A terminal key from the on-screen keyboard. Hosts route it like a physical
+     * key; without a host override it is refused, as before.
+     */
+    protected boolean gpuiImeKey(KeyEvent event) { return false; }
 
     /** Hosts can keep commits, hardware keys, and extra keys in one synchronous ordered queue. */
     protected void gpuiIme(long session, int kind, String text, int start, int end) {

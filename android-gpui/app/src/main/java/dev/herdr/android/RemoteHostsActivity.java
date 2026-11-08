@@ -49,6 +49,10 @@ import org.json.JSONObject;
 
 /** SSH login and pane selection. Credentials never enter a profile, Intent or saved state. */
 public final class RemoteHostsActivity extends Activity {
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(ProvisionedSettings.scaled(base));
+    }
+
     private final Handler main = new Handler();
     private final ThreadPoolExecutor worker = new ThreadPoolExecutor(1, 1, 0L,
             TimeUnit.MILLISECONDS, new ArrayBlockingQueue<Runnable>(8));
@@ -103,10 +107,7 @@ public final class RemoteHostsActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(null);
         // Matches the terminal: only a debuggable build that opts in may be captured.
-        boolean capturable = (getApplicationInfo().flags
-                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-                && "1".equals(android.provider.Settings.Global.getString(
-                        getContentResolver(), "herdr_probe"));
+        boolean capturable = ProvisionedSettings.capturable(this);
         if (!capturable) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         store = new RemoteHostStore(this);
         identityStore = new RemoteIdentityStore(this);

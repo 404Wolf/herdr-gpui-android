@@ -102,8 +102,76 @@ pub const PALETTES: [Palette; 4] = [
 
 static PALETTE_INDEX: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// A replacement for the Default palette, provisioned by whoever administers
+/// the device (the settings file's `palette`), e.g. a pure-black OLED scheme.
+static DEFAULT_OVERRIDE: std::sync::RwLock<Option<Palette>> = std::sync::RwLock::new(None);
+
+/// The built-in palette at `index`, with a provisioned Default in slot 0.
+pub fn palette_at(index: usize) -> Option<Palette> {
+    if index == 0
+        && let Some(custom) = *DEFAULT_OVERRIDE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return Some(custom);
+    }
+    PALETTES.get(index).copied()
+}
+
 pub fn palette() -> Palette {
-    PALETTES[PALETTE_INDEX.load(std::sync::atomic::Ordering::Relaxed) as usize % PALETTES.len()]
+    let index = PALETTE_INDEX.load(std::sync::atomic::Ordering::Relaxed) as usize % PALETTES.len();
+    palette_at(index).unwrap_or(PALETTES[0])
+}
+
+/// Replaces the Default palette from `{"background", "foreground", "chrome",
+/// "border", "muted", "accent": "rrggbb", "ansi": [16 × "rrggbb"]}`. A missing
+/// field keeps Default's own. Returns false, changing nothing, on bad input.
+pub fn set_default_palette_json(raw: &str) -> bool {
+    fn color(value: &serde_json::Value) -> Option<u32> {
+        let text = value.as_str()?.trim_start_matches('#');
+        (text.len() == 6)
+            .then(|| u32::from_str_radix(text, 16).ok())
+            .flatten()
+    }
+    if raw.len() > 4096 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let mut palette = PALETTES[0];
+    for (key, slot) in [
+        ("background", &mut palette.background),
+        ("foreground", &mut palette.foreground),
+        ("chrome", &mut palette.chrome),
+        ("border", &mut palette.border),
+        ("muted", &mut palette.muted),
+        ("accent", &mut palette.accent),
+    ] {
+        match value.get(key) {
+            None => {}
+            Some(found) => match color(found) {
+                Some(rgb) => *slot = rgb,
+                None => return false,
+            },
+        }
+    }
+    if let Some(ansi) = value.get("ansi") {
+        let Some(list) = ansi.as_array().filter(|list| list.len() == 16) else {
+            return false;
+        };
+        for (slot, found) in palette.ansi.iter_mut().zip(list) {
+            let Some(rgb) = color(found) else {
+                return false;
+            };
+            *slot = rgb;
+        }
+    }
+    palette.name = "Provisioned";
+    *DEFAULT_OVERRIDE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(palette);
+    true
 }
 
 /// Selects a built-in palette. Returns whether the choice changed.
@@ -1470,6 +1538,30 @@ mod tests {
     use super::*;
     fn text(value: &str) -> Command {
         Command::Text { text: value.into() }
+    }
+
+    #[test]
+    fn a_provisioned_palette_replaces_default_only_when_valid() {
+        let black = r##"{"background":"000000","chrome":"#000000","foreground":"EEFFFF",
+            "ansi":["000000","F07178","C3E88D","FFCB6B","82AAFF","C792EA","89DDFF","EEFFFF",
+                    "4A4A4A","F07178","C3E88D","FFCB6B","82AAFF","C792EA","89DDFF","FFFFFF"]}"##;
+        assert!(!set_default_palette_json(r#"{"background":"black"}"#));
+        assert!(!set_default_palette_json(r#"{"ansi":["000000"]}"#));
+        assert_eq!(palette_at(0), Some(PALETTES[0]));
+        assert!(set_default_palette_json(black));
+        let custom = palette_at(0).unwrap_or(PALETTES[0]);
+        assert_eq!(
+            (custom.background, custom.chrome, custom.ansi[1]),
+            (0, 0, 0xf07178)
+        );
+        assert_eq!(
+            custom.border, PALETTES[0].border,
+            "missing fields keep Default's"
+        );
+        assert_eq!(palette_at(3), Some(PALETTES[3]));
+        *DEFAULT_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     #[test]

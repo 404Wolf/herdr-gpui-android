@@ -25,6 +25,10 @@ import org.json.JSONObject;
  * screen is visible. Results are shown here and never stored or sent anywhere.
  */
 public final class DeviceDiagnosticsActivity extends Activity {
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(ProvisionedSettings.scaled(base));
+    }
+
     private static final int BG = Color.rgb(16, 18, 22);
     private static final int TEXT = Color.rgb(231, 234, 240);
     private static final int MUTED = Color.rgb(155, 167, 185);
@@ -51,10 +55,7 @@ public final class DeviceDiagnosticsActivity extends Activity {
         super.onCreate(null);
         // Device data is private: masked except in a debuggable build that opts
         // into capture, matching the terminal, its sheets and the companion.
-        boolean capturable = (getApplicationInfo().flags
-                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-                && "1".equals(android.provider.Settings.Global.getString(
-                        getContentResolver(), "herdr_probe"));
+        boolean capturable = ProvisionedSettings.capturable(this);
         if (!capturable) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         createScreen();
     }

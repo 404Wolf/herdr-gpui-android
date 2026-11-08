@@ -45,6 +45,7 @@ final class GpuiChrome {
      * The caller must already have loaded the native library.
      */
     static GpuiChrome load(int palette) {
+        ProvisionedSettings.applyPalette();
         int[] roles = nativeThemeColors(palette);
         return of(roles != null ? roles : nativeThemeColors(0));
     }
@@ -73,6 +74,13 @@ final class GpuiChrome {
     static int withAlpha(int color, int alpha) {
         return (color & 0x00ffffff) | (alpha << 24);
     }
+
+    /** Replaces the Default palette; see ProvisionedSettings. */
+    static void setDefaultPalette(String json) {
+        nativeSetDefaultPalette(json);
+    }
+
+    private static native boolean nativeSetDefaultPalette(String json);
 
     /** Roles for a palette in this class's order, or null for an unknown index. */
     private static native int[] nativeThemeColors(int index);

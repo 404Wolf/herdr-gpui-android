@@ -14,7 +14,7 @@ final class GpuiDisplayOptions {
 
     GpuiDisplayOptions(int mode, int fontSize, int altMode) {
         this.mode = mode >= AUTO && mode <= STANDARD ? mode : AUTO;
-        this.fontSize = fontSize == 0 || fontSize >= 11 && fontSize <= 18 ? fontSize : 0;
+        this.fontSize = fontSize == 0 || fontSize >= 9 && fontSize <= 24 ? fontSize : 0;
         this.altMode = altMode >= ALT_AUTO && altMode <= ALT_TERMINAL ? altMode : ALT_AUTO;
     }
 
@@ -27,7 +27,7 @@ final class GpuiDisplayOptions {
     float effectiveFont(boolean compact, float systemScale) {
         if (!Float.isFinite(systemScale) || systemScale <= 0) systemScale = 1;
         float base = fontSize == 0 ? compact ? 12 : 13 : fontSize;
-        return Math.max(11, Math.min(36, base * systemScale));
+        return Math.max(9, Math.min(36, base * systemScale));
     }
 
     boolean altUsesSymbols() {

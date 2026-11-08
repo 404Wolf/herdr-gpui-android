@@ -54,6 +54,10 @@ import org.json.JSONObject;
 
 /** GPUI paints and routes input; each connection owns either HTTPS or embedded SSH transport. */
 public final class GpuiTerminalActivity extends GpuiInputActivity implements SurfaceHolder.Callback {
+    @Override protected void attachBaseContext(android.content.Context base) {
+        super.attachBaseContext(ProvisionedSettings.scaled(base));
+    }
+
     private static final AtomicLong GENERATIONS = new AtomicLong();
     private static final java.util.regex.Pattern CHROME_CONTROLS =
             java.util.regex.Pattern.compile("[\\p{Cntrl}]");
@@ -139,6 +143,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private Button controlButton;
     /** Vertical swipe state: a short tap still reaches the terminal. */
     private float touchDownX, edgeStartX;
+    private boolean tapCandidate;
+    private long touchDownAt;
     private boolean edgeClaimed;
     private float touchDownY, lastTouchY, scrollFraction;
     private float scrollVelocity, flingRemainder;
@@ -199,10 +205,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Terminal content is private. Only a debuggable build that opts in through
         // the global switch may be captured, so a field report can be screenshotted
         // without weakening a release build.
-        boolean capturable = (getApplicationInfo().flags
-                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-                && "1".equals(android.provider.Settings.Global.getString(
-                        getContentResolver(), "herdr_probe"));
+        boolean capturable = ProvisionedSettings.capturable(this);
         if (!capturable) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         getWindow().getDecorView().setSaveFromParentEnabled(false);
         getWindow().getDecorView().setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
@@ -1080,12 +1083,62 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         compactDisplay = displayOptions.compact(width, height);
         // Zero hands type sizing to the renderer, which fits the pane's own
         // wrapping width; a first run on a fold should not be caption-sized.
-        float chosenFont = displayOptions.fontSize == 0
-                ? 0f
-                : displayOptions.effectiveFont(compactDisplay,
-                        getResources().getConfiguration().fontScale);
+        float systemScale = getResources().getConfiguration().fontScale;
+        if (!Float.isFinite(systemScale) || systemScale <= 0) systemScale = 1;
+        // A pinch for this posture wins, then a size chosen in the sheet, then
+        // the provisioned default; zero still means the renderer's own fit.
+        float pinched = pinchedFont();
+        float provisioned = ProvisionedSettings.get(this).fontSize;
+        float chosenFont = pinched > 0 ? pinched * systemScale
+                : displayOptions.fontSize != 0
+                        ? displayOptions.effectiveFont(compactDisplay, systemScale)
+                        : provisioned > 0 ? provisioned * systemScale : 0f;
+        appliedFont = chosenFont > 0 ? chosenFont / systemScale : compactDisplay ? 12 : 13;
         nativeSetDisplayPreferences(chosenFont, compactDisplay,
                 getResources().getConfiguration().fontScale);
+    }
+
+    /** Terminal text in points (before the system scale) last sent to the renderer. */
+    private float appliedFont = 13;
+
+    /** Folded and unfolded keep their own pinch, so each screen stays as set. */
+    private String pinchKey() { return compactDisplay ? "pinch_compact" : "pinch_standard"; }
+
+    private float pinchedFont() {
+        return getSharedPreferences("terminal-display", MODE_PRIVATE).getFloat(pinchKey(), 0f);
+    }
+
+    private android.view.ScaleGestureDetector pinch;
+    private float pinchFont;
+    private boolean pinching;
+
+    /** Two fingers resize the terminal text, 9 to 24 points, kept per posture. */
+    private android.view.ScaleGestureDetector pinchDetector() {
+        if (pinch != null) return pinch;
+        pinch = new android.view.ScaleGestureDetector(this,
+                new android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                    @Override public boolean onScaleBegin(android.view.ScaleGestureDetector detector) {
+                        pinching = true;
+                        pinchFont = appliedFont;
+                        return true;
+                    }
+                    @Override public boolean onScale(android.view.ScaleGestureDetector detector) {
+                        float next = Math.max(9f, Math.min(24f, pinchFont * detector.getScaleFactor()));
+                        // Whole half-points only: every step reflows the grid.
+                        next = Math.round(next * 2f) / 2f;
+                        if (next != pinchFont) {
+                            pinchFont = next;
+                            getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                                    .putFloat(pinchKey(), next).apply();
+                            applyDisplayOptions();
+                        }
+                        return true;
+                    }
+                    @Override public void onScaleEnd(android.view.ScaleGestureDetector detector) {
+                        pinching = false;
+                    }
+                });
+        return pinch;
     }
 
     private void hideInitialKeyboard() {
@@ -1211,10 +1264,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Same opt-in the activity used at create time. */
     private boolean capturableSession() {
-        return (getApplicationInfo().flags
-                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-                && "1".equals(android.provider.Settings.Global.getString(
-                        getContentResolver(), "herdr_probe"));
+        return ProvisionedSettings.capturable(this);
     }
 
     private void showLocalDialog(AlertDialog dialog) {
@@ -2332,7 +2382,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int count = event.getPointerCount();
         if (!hostStarted || count < 1 || count > 16) return false;
         int masked = event.getActionMasked();
+        pinchDetector().onTouchEvent(event);
+        if (pinching || count > 1 && masked != MotionEvent.ACTION_DOWN) {
+            // A pinch is ours: the program never sees half of a two-finger gesture.
+            scrolling = false;
+            tapCandidate = false;
+            return true;
+        }
         if (masked == MotionEvent.ACTION_DOWN) {
+            tapCandidate = true;
+            touchDownAt = SystemClock.uptimeMillis();
             stopFling();
             touchDownX = edgeStartX = event.getX();
             edgeClaimed = false;
@@ -2375,6 +2434,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 return true;
             }
         } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
+            // A plain tap on the terminal opens the keyboard: typing into an agent
+            // should not need the toolbar. The tap still reaches the program.
+            if (masked == MotionEvent.ACTION_UP && tapCandidate && !scrolling && !edgeClaimed
+                    && SystemClock.uptimeMillis() - touchDownAt < 350
+                    && Math.abs(event.getX() - touchDownX) < dp(10)
+                    && Math.abs(event.getY() - touchDownY) < dp(10)) {
+                Connection target;
+                synchronized (stateLock) { target = connection; }
+                if (target != null && target.ready) nativeShowKeyboard(target.generation);
+            }
+            tapCandidate = false;
             if (edgeClaimed) {
                 edgeClaimed = false;
                 return true;
@@ -2776,9 +2846,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Also skip the framework view-state traversal of the invisible IME proxy.
     }
 
+    /** True while a terminal key from the on-screen keyboard takes the physical path. */
+    private boolean imeKeyInFlight;
+
+    @Override protected boolean gpuiImeKey(KeyEvent event) {
+        imeKeyInFlight = true;
+        try {
+            dispatchKeyEvent(event);
+            return true;
+        } finally {
+            imeKeyInFlight = false;
+        }
+    }
+
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
-        boolean physical = event.isFromSource(InputDevice.SOURCE_KEYBOARD)
+        boolean physical = imeKeyInFlight || event.isFromSource(InputDevice.SOURCE_KEYBOARD)
                 && event.getDevice() != null && !event.getDevice().isVirtual()
                 && (event.getFlags() & KeyEvent.FLAG_SOFT_KEYBOARD) == 0;
         int code = event.getKeyCode();

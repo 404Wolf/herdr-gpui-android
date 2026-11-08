@@ -423,6 +423,21 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetThem
     }
 }
 
+/// Replaces the Default palette with a provisioned one (see
+/// `model::set_default_palette_json`). Call before any chrome or frame uses it.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiChrome_nativeSetDefaultPalette(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    json: JString<'_>,
+) -> jboolean {
+    let Ok(json) = env.get_string(&json) else {
+        return 0;
+    };
+    u8::from(model::set_default_palette_json(&String::from(json)))
+}
+
 /// Chrome colors for one built-in palette, in `GpuiChrome`'s order. The host
 /// list and the terminal's toolbar, rail and system bars use these so they
 /// follow the same theme as the painted header; an unknown index returns null.
@@ -433,13 +448,10 @@ pub extern "system" fn Java_dev_herdr_android_GpuiChrome_nativeThemeColors(
     _class: JClass<'_>,
     index: jint,
 ) -> jintArray {
-    let Some(palette) = usize::try_from(index)
-        .ok()
-        .and_then(|index| model::PALETTES.get(index))
-    else {
+    let Some(palette) = usize::try_from(index).ok().and_then(model::palette_at) else {
         return std::ptr::null_mut();
     };
-    let roles = model::ChromeRoles::of(palette).to_argb();
+    let roles = model::ChromeRoles::of(&palette).to_argb();
     let Ok(array) = env.new_int_array(roles.len() as i32) else {
         return std::ptr::null_mut();
     };
