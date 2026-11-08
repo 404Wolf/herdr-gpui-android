@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- ic_herdr's background, behind the adaptive launcher icon. -->
-    <color name="launcher_background">#14161A</color>
+    <!-- The ivory of Herdr's logo tile, behind the adaptive launcher icon. -->
+    <color name="launcher_background">#F4F1E9</color>
 </resources>

@@ -9,7 +9,8 @@
     <!-- Back reaches each screen through OnBackInvokedCallback (BackOwner) on
          Android 13 and later, as Android 16 requires for every app targeting it. -->
     <application android:label="Remote for Herdr" android:theme="@style/AppTheme"
-        android:icon="@mipmap/ic_launcher" android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
+        android:allowBackup="false"
         android:enableOnBackInvokedCallback="true" tools:targetApi="33"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
