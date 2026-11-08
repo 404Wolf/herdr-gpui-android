@@ -432,11 +432,16 @@ impl DisplayPreferences {
     }
 
     pub fn scaled(font_size: f32, compact: bool, scale: f32) -> Result<Self> {
-        // 0 is the auto sentinel; everything else is a deliberate user choice.
-        if !font_size.is_finite() || (font_size != 0. && !(11.0..=36.0).contains(&font_size)) {
+        // Android's font scale goes below 1 (Settings offers 0.85), and the
+        // caller sends the chosen size already multiplied by it, so the size
+        // range applies before the scale.
+        if !scale.is_finite() || !(0.5..=3.0).contains(&scale) {
             return Err(Error::InvalidDisplayPreferences);
         }
-        if !scale.is_finite() || !(1.0..=3.0).contains(&scale) {
+        // 0 is the auto sentinel; everything else is a deliberate user choice.
+        if !font_size.is_finite()
+            || (font_size != 0. && !(11.0..=36.0).contains(&(font_size / scale)))
+        {
             return Err(Error::InvalidDisplayPreferences);
         }
         Ok(Self {
@@ -1590,6 +1595,11 @@ mod tests {
         // Before the first layout there is no width; the floor holds.
         assert_eq!(shell_font_size(auto, 0.), 11.);
         // Android's font scale enlarges auto type; a chosen size is used as given.
+        // A compact system font scale below 1 is accepted, and the size is
+        // checked before that scale is applied.
+        assert!(DisplayPreferences::scaled(11. * 0.95, false, 0.95).is_ok());
+        assert!(DisplayPreferences::scaled(36. * 1.3, false, 1.3).is_ok());
+        assert!(DisplayPreferences::scaled(13., false, 0.4).is_err());
         let scaled = DisplayPreferences::scaled(0., false, 1.5).unwrap();
         assert_eq!(shell_font_size(scaled, 852.), DEFAULT_FONT * 1.5);
         let chosen = DisplayPreferences::new(16., false).unwrap();
