@@ -84,4 +84,81 @@ final class RailTree {
         while (tail.endsWith(".")) tail = tail.substring(0, tail.length() - 1);
         return !tail.isEmpty() && space.startsWith(tail) ? title.substring(0, bar).trim() : title;
     }
+
+    /** "~/.herdr/worktrees/macro/wolf-x/src" → "wolf-x". */
+    static String worktreeOfPath(String cwd) {
+        if (repoOfPath(cwd) == null) return null;
+        String rest = cwd.substring(cwd.indexOf(WORKTREES) + WORKTREES.length());
+        rest = rest.substring(rest.indexOf('/') + 1);
+        int slash = rest.indexOf('/');
+        return slash < 0 ? rest : rest.substring(0, slash);
+    }
+
+    /**
+     * What the rail calls each space: its worktree's name where herdr only
+     * knows it by the repo's (a space named "macro" in a macro worktree), and
+     * a repeated name told apart by its first window ("macro · Onboarding").
+     */
+    static Map<String, String> labels(JSONArray workspaces, JSONArray tabs, JSONArray panes) {
+        Map<String, String> worktrees = new HashMap<>();
+        Map<String, String> repos = repos(panes);
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane == null) continue;
+            String wt = worktreeOfPath(pane.optString("cwd", ""));
+            if (wt != null) worktrees.putIfAbsent(pane.optString("workspace_id", ""), wt);
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        Map<String, Integer> counts = new HashMap<>();
+        for (int i = 0; workspaces != null && i < workspaces.length(); i++) {
+            JSONObject space = workspaces.optJSONObject(i);
+            if (space == null) continue;
+            String id = space.optString("id", "");
+            String label = space.optString("label", "").trim();
+            String wt = worktrees.get(id);
+            if (wt != null && (label.isEmpty() || label.equals(repos.get(id)) || label.equals(id))) label = wt;
+            if (label.isEmpty()) label = id;
+            labels.put(id, label);
+            counts.merge(label, 1, Integer::sum);
+        }
+        for (Map.Entry<String, String> entry : labels.entrySet()) {
+            if (counts.get(entry.getValue()) < 2) continue;
+            String first = firstTab(entry.getKey(), tabs, panes);
+            if (!first.isEmpty() && !first.equals(entry.getValue())) {
+                entry.setValue(entry.getValue() + " · " + first);
+            }
+        }
+        return labels;
+    }
+
+    private static String firstTab(String space, JSONArray tabs, JSONArray panes) {
+        for (int i = 0; tabs != null && i < tabs.length(); i++) {
+            JSONObject tab = tabs.optJSONObject(i);
+            if (tab == null || !space.equals(tab.optString("workspace_id"))) continue;
+            String label = tab.optString("label", "").trim();
+            if (!label.isEmpty() && !isTerminalId(label)) return label;
+        }
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane == null || !space.equals(pane.optString("workspace_id"))) continue;
+            String title = pane.optString("title", "").trim();
+            if (!title.isEmpty() && !isTerminalId(title)) return title;
+        }
+        return "";
+    }
+
+    /** herdr-core's own names: "t5s", "server/t1z". Never a title worth showing. */
+    static boolean isTerminalId(String text) {
+        return text.matches("([A-Za-z0-9_.-]+/)?t[0-9a-z]{1,6}");
+    }
+
+    /** A title for a terminal with none: its agent or "shell", and its folder. */
+    static String fallbackTitle(String title, JSONObject pane) {
+        if (!title.isEmpty() && !isTerminalId(title)) return title;
+        String kind = pane.optString("kind", "");
+        String cwd = pane.optString("cwd", "").replaceAll("/+$", "");
+        String folder = cwd.isEmpty() ? "" : cwd.substring(cwd.lastIndexOf('/') + 1);
+        String who = kind.isEmpty() ? "shell" : kind;
+        return folder.isEmpty() ? who : who + " · " + folder;
+    }
 }

@@ -342,6 +342,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabStrip.setPadding(dp(6), 0, dp(6), 0);
         tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
         content.addView(tabScroll, new LinearLayout.LayoutParams(-1, dp(30)));
+        // Where this window is: machine › repo › worktree › window, and why
+        // it wants Wolf. Tapping it shows the window's row in the rail.
+        crumb = new TextView(this);
+        crumb.setTextSize(11);
+        crumb.setSingleLine(true);
+        crumb.setEllipsize(android.text.TextUtils.TruncateAt.START);
+        crumb.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        crumb.setPadding(dp(10), 0, dp(10), 0);
+        crumb.setVisibility(View.GONE);
+        crumb.setOnClickListener(v -> { showSidebar(); revealSelectedRow(true); });
+        content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
         content.addView(surface, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));
@@ -1737,6 +1748,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         applySidebarWidth();
         updateHostSampling();
         if (sidebarOpen) {
+            revealedPane = "";
             refreshSidebar(true);
         }
     }
@@ -1777,6 +1789,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Rebuilds the rail only when the daemon's chrome actually changed. */
     private android.widget.HorizontalScrollView tabScroll;
+    private TextView crumb;
+    private String crumbText = "";
+    /** The pane the rail last scrolled into view. */
+    private String revealedPane = "";
     private LinearLayout tabStrip;
     private String tabSignature = "";
     /** The tab the strip last scrolled to, so a refresh does not scroll it again. */
@@ -1799,6 +1815,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 paneTab = pane.optString("tab_id");
             }
         }
+        updateCrumb(current, space);
         // Rebuild only when what the strip shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
@@ -1811,15 +1828,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (tab == null || !space.equals(tab.optString("workspace_id"))) continue;
             String id = tab.optString("id");
             String status = "";
+            JSONObject tabPane = null;
             for (int j = 0; panes != null && j < panes.length(); j++) {
                 JSONObject pane = panes.optJSONObject(j);
                 if (pane != null && id.equals(pane.optString("tab_id"))
-                        && space.equals(pane.optString("workspace_id"))) status = pane.optString("status");
+                        && space.equals(pane.optString("workspace_id"))) {
+                    status = pane.optString("status");
+                    tabPane = pane;
+                }
             }
             // The pane being shown, which a tap moves at once, not the daemon's
             // confirmation a round trip later.
             boolean focused = id.equals(paneTab);
             String label = HomeActivity.cleanTitle(tab.optString("label", id), id);
+            if (tabPane != null && RailTree.isTerminalId(label)) {
+                label = RailTree.fallbackTitle(HomeActivity.cleanTitle(
+                        chromeTitle(tabPane.optString("title", ""), id), id), tabPane);
+            }
             shown.add(new String[] {id, label, status, focused ? "1" : ""});
             signature.append(id).append('\t').append(label).append('\t').append(status)
                     .append('\t').append(focused).append('\n');
@@ -1854,6 +1879,66 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             final View activePill = active;
             tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
         }
+    }
+
+    private void updateCrumb(Connection current, String space) {
+        if (crumb == null) return;
+        String title = "", status = "", cwd = "", spaceLabel = "";
+        JSONArray panes = current.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
+            title = RailTree.fallbackTitle(HomeActivity.cleanTitle(
+                    chromeTitle(pane.optString("title", ""), current.paneId), current.paneId), pane);
+            status = pane.optString("status", "");
+            cwd = pane.optString("cwd", "");
+        }
+        String named = RailTree.labels(current.workspaces, current.tabs, panes).get(space);
+        if (named != null) spaceLabel = chromeTitle(named, space);
+        String repo = RailTree.repoOfPath(cwd);
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        parts.add(current.hostName);
+        if (repo != null && !repo.equals(spaceLabel)) parts.add(repo);
+        if (!spaceLabel.isEmpty()) parts.add(spaceLabel);
+        if (!title.isEmpty()) parts.add(RailTree.withoutSpace(title, spaceLabel));
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(
+                android.text.TextUtils.join("  ›  ", parts));
+        String why = "blocked".equals(status) ? "needs you: waiting for your answer"
+                : "error".equals(status) ? "stopped with an error" : "";
+        if (!why.isEmpty()) {
+            text.append("   ");
+            int start = text.length();
+            text.append("● ").append(why);
+            text.setSpan(new android.text.style.ForegroundColorSpan(
+                    "error".equals(status) ? chrome.danger : chrome.warning), start, text.length(), 0);
+        }
+        crumb.setVisibility(View.VISIBLE);
+        crumb.setTextColor(chrome.onSurfaceVariant);
+        if (!text.toString().equals(crumbText)) {
+            crumbText = text.toString();
+            crumb.setText(text);
+            crumb.setContentDescription("Showing " + crumbText + ". Show it in the rail");
+        }
+    }
+
+    /** Scrolls the rail so the window on screen is in view (once per window, or when asked). */
+    private void revealSelectedRow(boolean always) {
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        if (current == null || sidebarScroll == null || !sidebarOpen) return;
+        String pane = current.paneId;
+        if (!always && pane.equals(revealedPane)) return;
+        RailPaneRow row = railPanes.get("pane:" + currentHostId + "/" + pane);
+        if (row == null || row.row.getParent() == null) return;
+        revealedPane = pane;
+        sidebarScroll.post(() -> {
+            int top = row.row.getTop();
+            int view = sidebarScroll.getHeight();
+            int scroll = sidebarScroll.getScrollY();
+            if (always || top < scroll || top + row.row.getHeight() > scroll + view) {
+                sidebarScroll.smoothScrollTo(0, Math.max(0, top - view / 3));
+            }
+        });
     }
 
     /** One tab: the active one raised with an outline, the rest quiet on black. */
@@ -2069,15 +2154,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     : sample == null ? null : sample.workspaces;
             JSONArray panes = live && current != null ? current.panes
                     : sample == null ? null : sample.panes;
-            addHostRows(host, live, sample, workspaces, panes, current, order, keep);
+            JSONArray tabs = live && current != null ? current.tabs
+                    : sample == null ? null : sample.tabs;
+            addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
         }
         pruneRailRows(keep);
         commitRailOrder(order);
+        // The window on screen (opened from Home, a notification or the rail)
+        // is always visible in the rail, selected.
+        revealSelectedRow(false);
     }
 
     private void addHostRows(SavedRemoteHost host, boolean live, HostSample sample, JSONArray workspaces,
-            JSONArray panes, Connection current, java.util.List<View> order, java.util.Set<String> keep) {
+            JSONArray tabs,            JSONArray panes, Connection current, java.util.List<View> order, java.util.Set<String> keep) {
         String hostKey = "host:" + host.id;
         keep.add(hostKey);
         RailHostRow header = railHostRows.get(hostKey);
@@ -2108,6 +2198,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Spaces read as repo → worktrees, like the desktop sidebar: a worktree
         // space (~/.herdr/worktrees/<repo>/<name>) follows its repo's own space.
         java.util.Map<String, String> repos = RailTree.repos(panes);
+        java.util.Map<String, String> labels = RailTree.labels(workspaces, tabs, panes);
         java.util.List<JSONObject> ordered = RailTree.order(workspaces, repos);
         java.util.Set<String> repoNames = new java.util.HashSet<>();
         for (JSONObject workspace : ordered) {
@@ -2117,7 +2208,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         for (JSONObject workspace : ordered) {
             String workspaceId = workspace.optString("id", "");
-            String workspaceLabel = chromeTitle(workspace.optString("label", ""), workspaceId);
+            String workspaceLabel = chromeTitle(labels.getOrDefault(workspaceId,
+                    workspace.optString("label", "")), workspaceId);
             String repo = repos.get(workspaceId);
             // Indented only under a repo the rail actually shows.
             boolean nested = repo != null && repoNames.contains(repo);
@@ -2152,8 +2244,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 JSONObject pane = panes.optJSONObject(p);
                 if (pane == null || !workspaceId.equals(pane.optString("workspace_id", ""))) continue;
                 String paneId = pane.optString("id", "");
-                String title = RailTree.withoutSpace(
-                        chromeTitle(pane.optString("title", ""), paneId), workspaceLabel);
+                String title = RailTree.withoutSpace(RailTree.fallbackTitle(
+                        chromeTitle(pane.optString("title", ""), paneId), pane), workspaceLabel);
                 boolean selected = live && current != null && paneId.equals(current.paneId);
                 String paneKey = "pane:" + host.id + "/" + paneId;
                 keep.add(paneKey);
@@ -2757,7 +2849,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             refreshSidebar(false);
         } catch (Exception | LinkageError failure) {
-            Toast.makeText(this, "Could not switch pane; reopen and check the session", Toast.LENGTH_LONG).show();
+            // The only failure left is a session that has ended (the switch
+            // itself is a slot that cannot overflow): reconnect, landing on
+            // the asked-for window, instead of telling Wolf to reopen.
+            android.util.Log.w("herdr-switch", "switch to " + paneId + " failed: " + failure);
+            rememberHostPane(paneId);
+            reconnectCurrentHost();
         }
     }
 
@@ -2800,7 +2897,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (current(target)) publish(target, "Switching " + kind + "…");
             }
         } catch (Exception | LinkageError failure) {
-            Toast.makeText(this, "Could not switch; reopen and check the session", Toast.LENGTH_LONG).show();
+            android.util.Log.w("herdr-switch", "switch to " + kind + " " + id + " failed: " + failure);
+            reconnectCurrentHost();
         }
     }
 
@@ -2972,6 +3070,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return nativeTouch(event.getActionMasked(), event.getActionIndex(), ids, xs, ys);
     }
 
+    /**
+     * Home opened over this terminal (a launcher or notification start) and
+     * an agent was picked there: show it here instead of refusing to open a
+     * second terminal.
+     */
+    @Override protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        String hostId = intent.getStringExtra(EXTRA_FOCUS_HOST);
+        String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
+        if (hostId == null || pane == null || destroyed) return;
+        Connection target;
+        synchronized (stateLock) { target = connection; }
+        if (hostId.equals(currentHostId) && target != null && target.remoteHandle > 0) {
+            focusRemotePane(target, pane);
+            return;
+        }
+        for (SavedRemoteHost host : savedHosts) {
+            if (host.id.equals(hostId)) { switchHost(host, pane); return; }
+        }
+    }
+
+    static final String EXTRA_FOCUS_HOST = "focus_host", EXTRA_FOCUS_PANE = "focus_pane";
+
     @Override protected void onResume() {
         super.onResume();
         if (isFinishing() || launch == null || shortcutJson == null || !hostStarted) return;
@@ -2991,6 +3112,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (launch.remoteHost != null) {
                 long remoteHandle = launch.takeRemoteHandle();
                 if (remoteHandle <= 0) {
+                    // Pausing (a tapped link opening the browser, the app
+                    // switcher) closed the session; this terminal used to give
+                    // up and close. Reconnect to the same host and pane instead.
+                    if (currentHostId != null) {
+                        main.post(this::reconnectCurrentHost);
+                        return;
+                    }
                     Toast.makeText(this, "Remote session was paused. Reconnect from Remote hosts", Toast.LENGTH_LONG).show();
                     finish();
                     return;
@@ -3014,6 +3142,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         clearControl();
         if (displayDialog != null) displayDialog.dismiss();
         capturedKeys.clear();
+        // Coming back reconnects to the pane on screen now, not an older one.
+        synchronized (stateLock) {
+            if (connection != null && connection.remoteHandle > 0 && currentHostId != null
+                    && !connection.paneId.isEmpty()) {
+                rememberHostPane(connection.paneId);
+            }
+        }
         stopConnection();
         if (hostStarted) nativePaused();
         super.onPause();

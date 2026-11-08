@@ -49,6 +49,28 @@ public final class RailTreeTest {
         assertEquals("plain", RailTree.withoutSpace("plain", "zulip"));
     }
 
+    @Test public void spacesAreNamedForTheirWorktreeAndRepeatsToldApart() throws Exception {
+        JSONArray spaces = new JSONArray()
+                .put(space("a", "macro")).put(space("b", "macro")).put(space("c", "macro"));
+        JSONArray panes = new JSONArray()
+                .put(pane("a", "/h/.herdr/worktrees/macro/wolf-connector-cards"))
+                .put(pane("b", "/h/macro")).put(pane("c", "/h/macro"));
+        JSONArray tabs = new JSONArray()
+                .put(new JSONObject().put("id", "x").put("workspace_id", "b").put("label", "Onboarding"))
+                .put(new JSONObject().put("id", "y").put("workspace_id", "c").put("label", "Research"));
+        Map<String, String> labels = RailTree.labels(spaces, tabs, panes);
+        assertEquals("wolf-connector-cards", labels.get("a"));
+        assertEquals("macro · Onboarding", labels.get("b"));
+        assertEquals("macro · Research", labels.get("c"));
+    }
+
+    @Test public void terminalIdsAreNeverTitles() throws Exception {
+        JSONObject pane = new JSONObject().put("kind", "claude").put("cwd", "/h/macro/");
+        assertEquals("claude · macro", RailTree.fallbackTitle("t5s", pane));
+        assertEquals("shell · macro", RailTree.fallbackTitle("server/t1z", new JSONObject().put("cwd", "/h/macro")));
+        assertEquals("Fix chart", RailTree.fallbackTitle("Fix chart", pane));
+    }
+
     private static JSONObject space(String id, String label) throws Exception {
         return new JSONObject().put("id", id).put("label", label);
     }

@@ -30,6 +30,14 @@ public final class GpuiLaunch {
         }
     }
 
+    /** Whether a terminal holds (or is about to take) the one GPUI session. */
+    static boolean terminalOpen() {
+        synchronized (GpuiLaunch.class) {
+            discardExpired(System.nanoTime());
+            return pending != null || active != null;
+        }
+    }
+
     static void launchRemote(Activity activity, SavedRemoteHost host, long handle, String paneId, String title) {
         if (activity == null || host == null || handle <= 0) throw new IllegalArgumentException("Remote session is required");
         RemoteNative.ensureLoaded(activity);

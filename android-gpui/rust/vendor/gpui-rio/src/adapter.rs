@@ -322,7 +322,8 @@ macro_rules! __bind_gpui {
                             if (text != " "
                                 || style
                                     .flags
-                                    .intersects(StyleFlags::ALL_UNDERLINES | StyleFlags::STRIKEOUT))
+                                    .intersects(StyleFlags::ALL_UNDERLINES | StyleFlags::STRIKEOUT)
+                                || square.has_hyperlink())
                                 && !style.flags.contains(StyleFlags::HIDDEN)
                             {
                                 let mut font = font.clone();
@@ -337,9 +338,9 @@ macro_rules! __bind_gpui {
                                     font,
                                     color: rgb_color(fg),
                                     background_color: None,
-                                    underline: style
-                                        .flags
-                                        .intersects(StyleFlags::ALL_UNDERLINES)
+                                    // OSC 8 links are underlined, so they read as tappable.
+                                    underline: (style.flags.intersects(StyleFlags::ALL_UNDERLINES)
+                                        || (self.link_handler.is_some() && square.has_hyperlink()))
                                         .then_some(UnderlineStyle {
                                             color: Some(rgb_color(fg)),
                                             thickness: px(1.),

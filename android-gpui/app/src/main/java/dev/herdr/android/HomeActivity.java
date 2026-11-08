@@ -838,6 +838,14 @@ public final class HomeActivity extends Activity {
     private void openAgent(Agent agent) {
         Machine machine = agent.machine;
         long handle = machine.handle;
+        if (GpuiLaunch.terminalOpen()) {
+            // A terminal is already open under this Home: it shows the agent.
+            startActivity(new Intent(this, GpuiTerminalActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_HOST, machine.host.id)
+                    .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_PANE, agent.id));
+            return;
+        }
         if (opening || handle <= 0 || !"ready".equals(machine.state)) {
             note = machine.host.name + " is not connected yet";
             render(true);
