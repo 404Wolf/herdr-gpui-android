@@ -2443,7 +2443,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row = new LinearLayout(this);
         holder.row.setOrientation(LinearLayout.HORIZONTAL);
         holder.row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        holder.row.setMinimumHeight(dp(30));
+        holder.row.setMinimumHeight(dp(28));
         holder.row.setSaveFromParentEnabled(false);
         holder.row.setFocusable(true);
         holder.row.setClickable(true);
@@ -2476,6 +2476,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row.setBackground(railBackground(false));
         holder.row.setOnLongClickListener(view -> { showSpaceActions(holder); return true; });
         holder.row.setOnClickListener(view -> {
+            // A repo with worktrees folds from anywhere on its row; Open is
+            // on its long-press menu. Worktrees and plain spaces open.
+            if (holder.foldKey != null) {
+                toggleRepo(holder.foldKey);
+                return;
+            }
             if (holder.firstPane.isEmpty()) return;
             if (holder.live) {
                 focusRemotePane(holder.connection, holder.firstPane);
@@ -2485,7 +2491,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             closeRailDrawer();
         });
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.topMargin = dp(4);
+        params.topMargin = dp(2);
         holder.row.setLayoutParams(params);
         return holder;
     }
@@ -2503,8 +2509,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (holder.nested != Boolean.valueOf(nested)) {
             holder.nested = nested;
             // Worktrees sit one step in, under their repo.
-            holder.row.setPadding(dp(nested ? 14 : 2), dp(4), dp(4), dp(4));
-            holder.label.setTextSize(nested ? 12 : 12.5f);
+            // Repo rows: bold, bright; worktrees: lighter and one step in.
+            holder.row.setPadding(dp(nested ? 16 : 2), dp(2), dp(4), dp(2));
+            holder.label.setTextSize(nested ? 12 : 13);
+            holder.label.setTypeface(android.graphics.Typeface.create(
+                    nested ? "sans-serif" : "sans-serif-medium",
+                    nested ? android.graphics.Typeface.NORMAL : android.graphics.Typeface.BOLD));
+            holder.label.setTextColor(Boolean.TRUE.equals(holder.selected) || !nested
+                    ? chrome.onSurface : chrome.primary);
         }
         StringBuilder meta = new StringBuilder();
         if (waiting > 0) meta.append(waiting).append("! ");
@@ -2515,7 +2527,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             holder.selected = holdsSelection;
             holder.row.setBackground(railBackground(holdsSelection));
             holder.row.setSelected(holdsSelection);
-            holder.label.setTextColor(holdsSelection ? chrome.onSurface : chrome.primary);
+            holder.label.setTextColor(holdsSelection || !Boolean.TRUE.equals(holder.nested)
+                    ? chrome.onSurface : chrome.primary);
             holder.mark.setTextColor(holdsSelection ? chrome.primary : chrome.onSurfaceVariant);
         }
         String described = "Open " + (nested ? "worktree " : "space ") + label + ", " + windows
@@ -2651,8 +2664,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row = new LinearLayout(this);
         holder.row.setOrientation(LinearLayout.HORIZONTAL);
         holder.row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        holder.row.setMinimumHeight(dp(34));
-        holder.row.setPadding(dp(12), dp(3), dp(6), dp(3));
+        holder.row.setMinimumHeight(dp(28));
+        holder.row.setPadding(dp(12), dp(1), dp(6), dp(1));
         holder.row.setSaveFromParentEnabled(false);
         holder.row.setBackground(railBackground(false));
         holder.dot = new View(this);
@@ -2693,7 +2706,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             boolean nested) {
         if (holder.nested != Boolean.valueOf(nested)) {
             holder.nested = nested;
-            holder.row.setPadding(dp(nested ? 22 : 12), dp(3), dp(6), dp(3));
+            holder.row.setPadding(dp(nested ? 30 : 14), dp(1), dp(6), dp(1));
         }
         holder.host = host;
         holder.live = live;
@@ -2737,8 +2750,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         rule = new View(this);
         rule.setBackgroundColor(chrome.outline);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(1));
-        params.topMargin = dp(12);
-        params.bottomMargin = dp(6);
+        params.topMargin = dp(6);
+        params.bottomMargin = dp(4);
         params.leftMargin = dp(6);
         params.rightMargin = dp(6);
         rule.setLayoutParams(params);
