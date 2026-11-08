@@ -374,15 +374,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             Toast.makeText(this, "New review · " + name, Toast.LENGTH_SHORT).show();
             postNotice("New review · " + name, "Open the agent’s Review tab to comment", pane);
         });
-        content.addView(reviews.tabs, new LinearLayout.LayoutParams(-1, dp(36)));
-        FrameLayout reviewStack = new FrameLayout(this);
-        terminalViewport = reviewStack;
-        reviewStack.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
+        terminalViewport = reviews.attachTo(content, surface);
+        terminalViewport.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
             if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
         });
-        reviewStack.addView(surface, new FrameLayout.LayoutParams(-1, -1));
-        reviewStack.addView(reviews.panel, new FrameLayout.LayoutParams(-1, -1));
-        content.addView(reviewStack, new LinearLayout.LayoutParams(-1, 0, 1));
         main.post(reviewTick);
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));

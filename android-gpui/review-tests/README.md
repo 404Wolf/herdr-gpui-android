@@ -30,6 +30,13 @@ Threads with reply/resolve, Chat with an acknowledged synthetic message, and
 Session / Review switching. Repeat at narrow and wide display sizes and after
 changing system font scale. Screenshots contain synthetic content only.
 
+The same run checks the single navigation bar, pinned gutter during horizontal
+scroll, and wrapping from the options menu. Use `--layout-only` to stop after
+those checks. Use `--long-diff` to check a 600-row diff and jump to its final row;
+the fixture asserts that no more than 64 row views are attached. The fixture and
+real activity share the terminal/review layout method. Switching to Session
+asserts that its viewport loses exactly the measured compact bar height.
+
 Real SSH channel reuse/cancellation and WebSocket endpoint/message ordering are
 covered by Rust fixtures in `android-remote/rust/src/tests.rs` and
 `android-gpui/rust/src/review.rs`. Real phone GPUI + SSH + diffd still needs a

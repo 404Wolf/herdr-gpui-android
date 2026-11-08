@@ -63,6 +63,31 @@ headers and rows, with no overlapping controls. Generated PNGs are under
 `android-gpui/build/review-screenshots/`; they contain only synthetic content.
 The emulator was stopped after validation.
 
+### Density follow-up
+
+The navigation now occupies one bar measuring 36 physical pixels at the tested
+default font scales (it grows when needed for larger text). There is no separate
+live-status row; status diagnostics are available from the dot or options menu.
+Code uses a 1.3× font pitch, a padded title, continuous virtualized aligned rows,
+shared horizontal scrolling with pinned gutters, and a menu wrap toggle.
+
+The complete widget interaction run passed again with the compact controls,
+including comments, replies, resolve, chat acknowledgement and Session switching.
+The shared production layout measured exactly one 36-pixel bar removed from the
+synthetic terminal viewport. A 600-row fixture reached its final row without
+paging; only 44 row views were attached at the tested narrow size.
+
+The layout-only run passed at 360 dp (720 px, density 320) and 800 dp (1200 px,
+density 240). It checks co-located tabs, fixed gutter bounds after horizontal
+gestures and increased code height after enabling wrapping. Files, unwrapped,
+horizontally scrolled and wrapped screenshots were captured and inspected under
+`android-gpui/build/review-screenshots-dense/`, with the wide set in `wide/` and
+the final continuous row in `long/`. These remain synthetic native-view checks;
+the actual activity uses the same layout method, but its GPUI terminal painting
+and attached SSH session still require the phone check below. The ARM64 APK was
+repackaged and its native freshness, contents and signatures verified. This
+follow-up changes Java UI and test/docs only; no Rust sources changed.
+
 ## Remaining platform checks
 
 The full ARM64 app was not installed on a physical phone. Native GPUI surface

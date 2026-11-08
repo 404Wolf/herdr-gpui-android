@@ -3,7 +3,7 @@ package dev.herdr.android;
 import android.app.Activity;
 import android.os.Handler;
 import android.view.View;
-import android.widget.Button;
+import android.widget.TextView;
 import android.widget.LinearLayout;
 import org.json.JSONArray;
 import java.util.HashMap;
@@ -16,7 +16,8 @@ final class DiffReviewController {
     interface Notice { void shared(String pane, String title); }
     final LinearLayout tabs;
     final DiffReviewPanel panel;
-    private final Button session, review;
+    private final TextView session, review, badge;
+    private GpuiChrome colors;
     private final Handler main = new Handler(android.os.Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "diffd-discovery"); t.setDaemon(true); return t; });
     private final Map<String, String> known = new HashMap<>();
@@ -30,32 +31,48 @@ final class DiffReviewController {
     private boolean showing, fetching, closed;
     DiffReviewController(Activity activity, GpuiChrome colors, java.util.function.Consumer<Boolean> visibility, Notice notice) {
         this.visibility = visibility; this.notice = notice;
+        this.colors = colors;
         panel = new DiffReviewPanel(activity, colors);
-        tabs = new LinearLayout(activity); tabs.setVisibility(View.GONE);
-        session = new Button(activity); review = new Button(activity);
-        for (Button button : new Button[]{session, review}) {
-            button.setTextSize(12); button.setAllCaps(false); button.setPadding(0, 0, 0, 0);
-            button.setTextColor(colors.primary); button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(colors.control));
-            tabs.addView(button, new LinearLayout.LayoutParams(0, -1, 1));
-        }
-        session.setText("Session"); review.setText("Review");
+        tabs = new LinearLayout(activity); tabs.setGravity(android.view.Gravity.CENTER_VERTICAL); tabs.setVisibility(View.GONE);
+        session = DiffReviewPanel.tab(activity, colors, "Session");
+        TextView divider = DiffReviewPanel.tab(activity, colors, "|"); divider.setClickable(false); divider.setFocusable(false); divider.setPadding(0, 0, 0, 0);
+        review = DiffReviewPanel.tab(activity, colors, "Review");
+        badge = DiffReviewPanel.tab(activity, colors, "•"); badge.setTextSize(9); badge.setPadding(0, 0, 0, 0);
+        badge.setClickable(false); badge.setFocusable(false); badge.setContentDescription("New review");
+        tabs.addView(session, new LinearLayout.LayoutParams(-2, -1));
+        tabs.addView(divider, new LinearLayout.LayoutParams(-2, -1));
+        tabs.addView(review, new LinearLayout.LayoutParams(-2, -1));
+        tabs.addView(badge, new LinearLayout.LayoutParams(Math.round(8 * activity.getResources().getDisplayMetrics().density), -1));
+        tabs.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
+        tabs.addView(panel.navigation, new LinearLayout.LayoutParams(-2, -1));
         session.setOnClickListener(v -> show(false)); review.setOnClickListener(v -> show(true));
+        style();
     }
-    void theme(GpuiChrome colors) {
-        panel.theme(colors);
-        for (Button b : new Button[]{session, review}) {
-            b.setTextColor(colors.primary);
-            b.setBackgroundTintList(android.content.res.ColorStateList.valueOf(colors.control));
-        }
+    /** The terminal keeps the entire weighted viewport; only this one bar consumes rows. */
+    android.widget.FrameLayout attachTo(LinearLayout parent, View terminal) {
+        int height = Math.max(36, (int) Math.ceil(session.getPaint().descent() - session.getPaint().ascent()) + 6);
+        parent.addView(tabs, new LinearLayout.LayoutParams(-1, height));
+        android.widget.FrameLayout viewport = new android.widget.FrameLayout(parent.getContext());
+        viewport.addView(terminal, new android.widget.FrameLayout.LayoutParams(-1, -1));
+        viewport.addView(panel, new android.widget.FrameLayout.LayoutParams(-1, -1));
+        parent.addView(viewport, new LinearLayout.LayoutParams(-1, 0, 1));
+        return viewport;
+    }
+    void theme(GpuiChrome colors) { this.colors = colors; panel.theme(colors); style(); }
+    private void style() {
+        tabs.setBackgroundColor(colors.surface);
+        session.setTextColor(showing ? colors.onSurfaceVariant : colors.primary);
+        review.setTextColor(showing ? colors.primary : colors.onSurfaceVariant);
+        badge.setTextColor(colors.info);
+        badge.setVisibility(unread.contains(host + ":" + pane) && !showing ? View.VISIBLE : View.INVISIBLE);
+        panel.navigation.setVisibility(showing ? View.VISIBLE : View.INVISIBLE);
     }
     boolean showing() { return showing; }
     void show(boolean show) {
         showing = show && DiffReviewModel.validId(id);
         if (showing) unread.remove(host + ":" + pane);
         panel.showReview(showing); visibility.accept(showing);
-        session.setSelected(!showing); review.setSelected(showing);
-        session.setText(showing ? "Session" : "● Session");
-        review.setText(showing ? "● Review" : unread.contains(host + ":" + pane) ? "Review ●" : "Review");
+        session.setSelected(!showing); review.setSelected(showing); style();
     }
     void update(long nextHandle, String nextHost, String nextPane, JSONArray nextPanes) {
         if (closed) return;
@@ -87,7 +104,7 @@ final class DiffReviewController {
         }
         if (showing && !id.isEmpty()) unread.remove(host + ":" + pane);
         tabs.setVisibility(id.isEmpty() ? View.GONE : View.VISIBLE);
-        review.setText(showing ? "● Review" : unread.contains(host + ":" + pane) ? "Review ●" : "Review");
+        style();
         // Labels need no HTTP poll. Older agents use the agreed unambiguous-cwd fallback.
         long now = android.os.SystemClock.elapsedRealtime();
         if (handle > 0 && selectedAgent && !labelled && !fetching && now - fetchedAt > 10000) {
