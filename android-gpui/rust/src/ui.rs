@@ -115,12 +115,14 @@ impl TerminalView {
             return;
         }
         self.shell_style = None;
-        self.shell = crate::shell::session(handle).map(|session| {
-            let style = self.shell_style(self.viewport.width);
-            let terminal = crate::rio::Terminal::attach(session, style, cx);
-            terminal.update(cx, |terminal, _| terminal.set_host_input(true));
-            (handle, terminal)
-        });
+        self.shell = crate::shell::session(handle)
+            .or_else(|| crate::remote::renderer(handle))
+            .map(|session| {
+                let style = self.shell_style(self.viewport.width);
+                let terminal = crate::rio::Terminal::attach(session, style, cx);
+                terminal.update(cx, |terminal, _| terminal.set_host_input(true));
+                (handle, terminal)
+            });
     }
 
     #[cfg(unix)]

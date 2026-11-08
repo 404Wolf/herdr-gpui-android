@@ -18,7 +18,6 @@ ndk = { version = "0.9", features = ["nativewindow"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 log = "0.4"
-herdr-client = { path = "../../crates/herdr-client" }
 herdr-remote-transport = { path = "../../android-remote/rust" }
 # Raw SSH shell mode renders with this vendored, PTY-free copy of gpui-rio.
 gpui-rio = { path = "vendor/gpui-rio" }
@@ -45,7 +44,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 # UI is host-checkable; only the actual activity/backend is Android-specific.
 android-ui = ["remote", "dep:async-channel", "dep:gpui", "dep:gpui-mobile", "dep:gpui-wgpu", "dep:jni", "dep:jni-mobile", "dep:ndk", "dep:android-activity", "dep:android_logger", "dep:log"]
-remote = ["dep:herdr-client", "dep:herdr-remote-transport", "dep:gpui-rio", "dep:tokio", "dep:zeroize", "dep:jni", "dep:ndk-context"]
+remote = ["dep:herdr-remote-transport", "dep:gpui-rio", "dep:tokio", "dep:zeroize", "dep:jni", "dep:ndk-context", "dep:rio-vt"]
 
 [dependencies]
 serde = { workspace = true }
@@ -58,9 +57,9 @@ gpui-wgpu = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-herdr-client = { workspace = true, optional = true }
 herdr-remote-transport = { workspace = true, optional = true }
 gpui-rio = { workspace = true, optional = true }
+rio-vt = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 

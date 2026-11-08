@@ -144,7 +144,7 @@ pub fn close(id: u64) -> bool {
     true
 }
 
-fn send(session: &Session, command: &Command) -> bool {
+pub(crate) fn send(session: &Session, command: &Command) -> bool {
     match command {
         Command::Text { text } => session.type_text(text),
         Command::Keys { keys } => keys.iter().all(|key| send_key(session, key)),

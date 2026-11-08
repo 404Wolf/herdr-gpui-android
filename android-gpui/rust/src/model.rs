@@ -45,15 +45,6 @@ pub struct Palette {
     pub accent: u32,
 }
 
-#[cfg(feature = "remote")]
-impl Palette {
-    /// Dark text on a light background: what a terminal reports as a light
-    /// color scheme.
-    pub(crate) fn is_light(&self) -> bool {
-        relative_luminance(self.background) > relative_luminance(self.foreground)
-    }
-}
-
 pub const PALETTES: [Palette; 4] = [
     Palette {
         name: "Default",
@@ -194,7 +185,7 @@ pub fn styled_colors(run: &StyledRun, palette: &Palette) -> (u32, u32) {
 pub(crate) const TEXT_CONTRAST: f32 = 4.5;
 
 /// WCAG 2 relative luminance of an opaque 0xRRGGBB color.
-#[cfg(any(feature = "remote", test))]
+#[cfg(any(feature = "android-ui", test))]
 fn relative_luminance(color: u32) -> f32 {
     let channel = |shift: u32| {
         let value = ((color >> shift) & 0xff) as f32 / 255.;

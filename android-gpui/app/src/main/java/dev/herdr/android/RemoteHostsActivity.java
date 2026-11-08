@@ -1532,7 +1532,7 @@ public final class RemoteHostsActivity extends Activity {
             JSONObject pane = panes.optJSONObject(i);
             if (pane == null) continue;
             String id = pane.optString("id", "");
-            if (!id.matches("[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*") || id.length() > 128) continue;
+            if (!id.matches("[A-Za-z0-9_./:-]+") || id.length() > 128) continue;
             String title = GpuiTerminalProtocol.title(pane.optString("title", id));
             card.addView(paneRow(title, pane.optString("status", "unknown"), () -> openPane(host, handle, id, title)),
                     new LinearLayout.LayoutParams(-1, -2));

@@ -69,7 +69,7 @@ public final class GpuiLaunch {
 
     private static void validatePane(String paneId) {
         if (paneId == null || paneId.length() > 128
-                || !paneId.matches("[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*")) {
+                || !paneId.matches("[A-Za-z0-9_./:-]+")) {
             throw new IllegalArgumentException("Invalid pane identifier");
         }
     }

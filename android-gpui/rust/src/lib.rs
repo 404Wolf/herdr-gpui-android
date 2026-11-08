@@ -7,6 +7,8 @@ pub use error::{Error, Result};
 pub mod model;
 
 #[cfg(all(feature = "remote", unix))]
+mod core_session;
+#[cfg(all(feature = "remote", unix))]
 pub mod remote;
 #[cfg(all(feature = "remote", target_os = "android"))]
 mod remote_jni;

@@ -2196,7 +2196,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void focusRemotePane(Connection target, String paneId) {
         if (paneId.isEmpty() || paneId.length() > 128
-                || !paneId.matches("[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*")) return;
+                || !paneId.matches("[A-Za-z0-9_./:-]+")) return;
         if (target.remoteHandle <= 0) {
             Toast.makeText(this, "Switch panes from Remote hosts for this connection", Toast.LENGTH_LONG).show();
             return;
@@ -2218,7 +2218,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Tabs and workspaces use the daemon's own switch requests. */
     private void focusChrome(Connection target, String kind, String id) {
         if (id.isEmpty() || id.length() > 128
-                || !id.matches("[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*")) return;
+                || !id.matches("[A-Za-z0-9_./:-]+")) return;
         if (target.remoteHandle <= 0) {
             Toast.makeText(this, "Switch workspaces from Remote hosts for this connection", Toast.LENGTH_LONG).show();
             return;
@@ -2498,12 +2498,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // A raw shell has no Herdr panes or tabs to change.
         String[] labels = target.shell
                 ? new String[]{"Copy screen text", "Remote hosts…", "Save screenshot"}
-                : new String[]{"New tab", "Split right", "Split down", "Toggle zoom", "Close pane", "Close tab",
-                        "Jump to live output", "Copy pane text", "Remote hosts…", "Save screenshot"};
+                : new String[]{"New terminal tab", "Close terminal", "Jump to live output", "Copy terminal text", "Remote hosts…", "Save screenshot"};
         String[] actions = target.shell
                 ? new String[]{"copy.text", "hosts.list", "capture.screen"}
-                : new String[]{"tab.new", "pane.split.right", "pane.split.down", "pane.zoom.on", "pane.close",
-                        "tab.close", "scroll.live", "copy.text", "hosts.list", "capture.screen"};
+                : new String[]{"tab.new", "pane.close", "scroll.live", "copy.text", "hosts.list", "capture.screen"};
         if (!debuggable()) {
             // The screenshot is a debugging aid listed last; a release build drops it.
             labels = java.util.Arrays.copyOf(labels, labels.length - 1);
