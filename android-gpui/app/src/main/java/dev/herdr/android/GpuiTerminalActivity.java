@@ -345,7 +345,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         sidebarScroll.setVerticalScrollBarEnabled(false);
         sidebarRows = new LinearLayout(this);
         sidebarRows.setOrientation(LinearLayout.VERTICAL);
-        sidebarRows.setPadding(dp(8), dp(10), dp(8), dp(20));
+        sidebarRows.setPadding(dp(6), dp(4), dp(6), dp(12));
         sidebarScroll.addView(sidebarRows, new android.widget.FrameLayout.LayoutParams(-1, -2));
         // Hosts and workspaces exceed one screen; the fade says the list keeps going.
         android.widget.FrameLayout railFrame = new android.widget.FrameLayout(this);
@@ -1853,8 +1853,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row = new LinearLayout(this);
         holder.row.setOrientation(LinearLayout.HORIZONTAL);
         holder.row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        holder.row.setMinimumHeight(dp(48));
-        holder.row.setPadding(dp(6), dp(8), dp(6), dp(8));
+        // Dense rail: Wolf scans many agents at once, so rows trade the 48 dp
+        // touch guideline for more of them on screen.
+        holder.row.setMinimumHeight(dp(36));
+        holder.row.setPadding(dp(6), dp(4), dp(6), dp(4));
         holder.row.setSaveFromParentEnabled(false);
         holder.dot = new View(this);
         holder.dot.setBackground(roundedDrawable(chrome.onSurfaceVariant, 4));
@@ -1928,8 +1930,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         TextView row = railText("", 12, chrome.onSurfaceVariant);
         row.setTypeface(android.graphics.Typeface.create("sans-serif-medium",
                 android.graphics.Typeface.NORMAL));
-        row.setMinimumHeight(dp(48));
-        row.setPadding(dp(10), dp(13), dp(6), dp(7));
+        row.setMinimumHeight(dp(26));
+        row.setPadding(dp(10), dp(7), dp(6), dp(2));
         row.setOnClickListener(view -> {
             if (!holder.live) return;
             focusChrome(holder.connection, "workspace", holder.workspaceId);
@@ -1958,8 +1960,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row = new LinearLayout(this);
         holder.row.setOrientation(LinearLayout.HORIZONTAL);
         holder.row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        holder.row.setMinimumHeight(dp(48));
-        holder.row.setPadding(dp(10), dp(6), dp(6), dp(6));
+        holder.row.setMinimumHeight(dp(34));
+        holder.row.setPadding(dp(10), dp(3), dp(6), dp(3));
         holder.row.setSaveFromParentEnabled(false);
         holder.dot = new View(this);
         holder.dot.setBackground(roundedDrawable(chrome.onSurfaceVariant, 4));
