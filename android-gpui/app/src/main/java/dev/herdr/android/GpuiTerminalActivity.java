@@ -1011,6 +1011,38 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Nothing pends: local scrolling never waits on a round trip. */
     private void flushScroll() { }
 
+    private TextView latestButton;
+    /** The pane last checked for a waiting agent; touched on the poll thread only. */
+    private volatile String autoKeyboardPane = "";
+
+    /**
+     * "↓ Latest" floats over the terminal while its history is scrolled back, so
+     * reading old output never loses the way back to the live end.
+     */
+    private void showLatest(boolean scrolledBack) {
+        if (destroyed || terminalContent == null) return;
+        if (latestButton == null) {
+            if (!scrolledBack) return;
+            latestButton = new TextView(this);
+            latestButton.setText("↓ Latest");
+            latestButton.setTextSize(12);
+            latestButton.setTextColor(chrome.onSurface);
+            latestButton.setPadding(dp(10), dp(5), dp(10), dp(5));
+            android.graphics.drawable.GradientDrawable pill = new android.graphics.drawable.GradientDrawable();
+            pill.setColor(chrome.control);
+            pill.setStroke(dp(1), chrome.outline);
+            pill.setCornerRadius(dp(14));
+            latestButton.setBackground(pill);
+            latestButton.setContentDescription("Jump to the latest output");
+            latestButton.setOnClickListener(v -> { jumpToLive(); showLatest(false); });
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2,
+                    android.view.Gravity.BOTTOM | android.view.Gravity.END);
+            params.setMargins(0, 0, dp(12), dp(60));
+            terminalRoot.addView(latestButton, params);
+        }
+        latestButton.setVisibility(scrolledBack ? View.VISIBLE : View.GONE);
+    }
+
     private void jumpToLive() {
         final Connection target;
         synchronized (stateLock) { target = connection; }
@@ -3096,6 +3128,21 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 current.remotePhase = phase;
                 current.remoteRevision = state.optLong("token", state.optLong("revision", 0));
                 current.ready = selected;
+                if (selected && !pane.equals(autoKeyboardPane)) {
+                    // Opening an agent that is waiting on Wolf (a question or a
+                    // permission) raises the keyboard once, ready for the answer.
+                    autoKeyboardPane = pane;
+                    JSONArray listed = state.optJSONArray("panes");
+                    for (int i = 0; listed != null && i < listed.length(); i++) {
+                        JSONObject item = listed.optJSONObject(i);
+                        if (item != null && pane.equals(item.optString("id"))
+                                && "blocked".equals(item.optString("status"))) {
+                            final long generation = current.generation;
+                            main.post(() -> nativeShowKeyboard(generation));
+                            break;
+                        }
+                    }
+                }
                 long chromeRevision = state.getLong("chrome_token");
                 chromeChanged = current.workspaces == null || current.chromeRevision != chromeRevision;
                 if (chromeChanged) {
@@ -3117,6 +3164,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                 }
                 current.chromePane = pane;
+                final boolean scrolledBack = state.optLong("local_offset", 0) > 0;
+                main.post(() -> showLatest(scrolledBack));
                 current.renderedScroll = state.optLong("rendered_scroll", current.renderedScroll);
                 JSONObject scroll = state.optJSONObject("scroll");
                 if (scroll != null) {

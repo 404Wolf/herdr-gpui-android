@@ -301,7 +301,15 @@ pub fn poll_terminal(
     let state = lock(&owner.state);
     model::mailbox().set_shell(generation, state.render_id);
     let _ = since;
-    Ok(state.view.to_string())
+    // How far the local history is scrolled back, for a "jump to latest" control.
+    let mut view = state.view.clone();
+    view["local_offset"] = json!(
+        state
+            .terminal
+            .as_ref()
+            .map_or(0, |terminal| terminal.grid().lock().display_offset())
+    );
+    Ok(view.to_string())
 }
 pub fn focus(id: u64, terminal: &str) -> Result<String> {
     let owner = session(id)?;
