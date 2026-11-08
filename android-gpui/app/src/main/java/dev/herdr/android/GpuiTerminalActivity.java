@@ -155,7 +155,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             long now = SystemClock.uptimeMillis();
             long dt = Math.max(1, Math.min(48, now - lastMoveAt));
             lastMoveAt = now;
-            float rowPx = rowHeightPx();
+            float rowPx = scrollRowPx();
             float lines = scrollVelocity * dt / rowPx + flingRemainder;
             int step = (int) lines;
             flingRemainder = lines - step;
@@ -323,6 +323,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         terminalContent = content;
+        // The current space's tabs across the top, as the desktop's tab bar
+        // shows them; the rail keeps only machines, spaces and agents.
+        tabScroll = new android.widget.HorizontalScrollView(this);
+        tabScroll.setHorizontalScrollBarEnabled(false);
+        tabScroll.setFillViewport(false);
+        tabStrip = new LinearLayout(this);
+        tabStrip.setOrientation(LinearLayout.HORIZONTAL);
+        tabStrip.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        tabStrip.setPadding(dp(6), 0, dp(6), 0);
+        tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
+        content.addView(tabScroll, new LinearLayout.LayoutParams(-1, dp(30)));
         content.addView(surface, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));
@@ -931,6 +942,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (clicked) view.performClick();
             return true;
         });
+    }
+
+    /**
+     * Pixels of finger travel per scrolled line: a row's height divided by the
+     * provisioned scroll speed (default 1.4, a little quicker than one row per
+     * row of travel). Drags and the fling that follows them use the same rate.
+     */
+    private float scrollRowPx() {
+        return Math.max(1f, rowHeightPx() / ProvisionedSettings.get(this).scrollSpeed);
     }
 
     private float rowHeightPx() {
@@ -1744,7 +1764,104 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** Rebuilds the rail only when the daemon's chrome actually changed. */
+    private android.widget.HorizontalScrollView tabScroll;
+    private LinearLayout tabStrip;
+    private String tabSignature = "";
+
+    /** Rebuilds the top tab strip when the space's tabs, their states or focus change. */
+    private void refreshTabStrip() {
+        if (tabStrip == null || destroyed) return;
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        boolean show = current != null && !shellMode() && current.tabs != null;
+        tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (!show) return;
+        String space = "";
+        JSONArray panes = current.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane != null && pane.optString("id").equals(current.paneId)) space = pane.optString("workspace_id");
+        }
+        String signature = space + current.paneId + current.tabs + panes;
+        if (signature.equals(tabSignature)) return;
+        tabSignature = signature;
+        tabStrip.removeAllViews();
+        JSONArray tabs = current.tabs;
+        View active = null;
+        for (int i = 0; i < tabs.length(); i++) {
+            JSONObject tab = tabs.optJSONObject(i);
+            if (tab == null || !space.equals(tab.optString("workspace_id"))) continue;
+            String id = tab.optString("id");
+            String status = "";
+            for (int j = 0; panes != null && j < panes.length(); j++) {
+                JSONObject pane = panes.optJSONObject(j);
+                if (pane != null && id.equals(pane.optString("tab_id"))) status = pane.optString("status");
+            }
+            boolean focused = tab.optBoolean("focused");
+            TextView pill = tabPill(HomeActivity.cleanTitle(tab.optString("label", id), id), focused, status);
+            final Connection target = current;
+            pill.setOnClickListener(v -> { if (!focused) focusChrome(target, "tab", id); });
+            pill.setContentDescription("Tab " + pill.getText() + (status.isEmpty() ? "" : ", " + status)
+                    + (focused ? ", current" : ""));
+            tabStrip.addView(pill);
+            if (focused) active = pill;
+        }
+        TextView add = tabPill("+", false, "");
+        add.setContentDescription("New Claude, Codex or terminal tab in this space");
+        add.setOnClickListener(this::showNewMenu);
+        tabStrip.addView(add);
+        if (active != null) {
+            final View shown = active;
+            tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, shown.getLeft() - dp(24)), 0));
+        }
+    }
+
+    /** One tab: the active one raised with an outline, the rest quiet on black. */
+    private TextView tabPill(String label, boolean active, String status) {
+        TextView pill = new TextView(this);
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
+        if ("working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status)) {
+            int color = "error".equals(status) ? chrome.danger : chrome.status(status);
+            text.append("● ", new android.text.style.ForegroundColorSpan(color), 0);
+        }
+        text.append(label.length() > 28 ? label.substring(0, 27) + "…" : label);
+        pill.setText(text);
+        pill.setTextSize(12);
+        pill.setSingleLine(true);
+        pill.setTextColor(active ? chrome.onSurface : chrome.onSurfaceVariant);
+        pill.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        pill.setPadding(dp(9), 0, dp(9), 0);
+        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
+        shape.setCornerRadius(dp(6));
+        shape.setColor(active ? chrome.control : chrome.background);
+        if (active) shape.setStroke(dp(1), chrome.outline);
+        pill.setBackground(shape);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
+        params.setMarginEnd(dp(3));
+        pill.setLayoutParams(params);
+        return pill;
+    }
+
+    /** "+": what a new tab in this space should run. */
+    private void showNewMenu(View anchor) {
+        Connection target;
+        synchronized (stateLock) { target = connection; }
+        if (target == null) return;
+        android.widget.PopupMenu menu = new android.widget.PopupMenu(
+                new android.view.ContextThemeWrapper(this, chrome.popupTheme()), anchor);
+        menu.getMenu().add(0, 1, 0, "Claude");
+        menu.getMenu().add(0, 2, 1, "Codex");
+        menu.getMenu().add(0, 3, 2, "Shell");
+        menu.setOnMenuItemClickListener(item -> {
+            String action = item.getItemId() == 1 ? "agent.claude" : item.getItemId() == 2 ? "agent.codex" : "tab.new";
+            runSessionAction(target, action, "New " + item.getTitle());
+            return true;
+        });
+        menu.show();
+    }
+
     private void refreshSidebar(boolean force) {
+        refreshTabStrip();
         if (!sidebarOpen || sidebarRows == null) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
@@ -2439,7 +2556,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 // Smoothed drag velocity in pixels per millisecond.
                 scrollVelocity = 0.6f * scrollVelocity + 0.4f * (dy / dt);
                 lastMoveAt = now;
-                float rowPx = rowHeightPx();
+                float rowPx = scrollRowPx();
                 scrollFraction += dy / rowPx;
                 lastTouchY = event.getY();
                 int lines = (int) scrollFraction;
@@ -2589,8 +2706,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // A raw shell has no Herdr panes or tabs to change.
         String[] labels = target.shell
                 ? new String[]{"Copy screen text", "Remote hosts…", "Save screenshot"}
-                : new String[]{"New Claude", "New Codex", "New terminal tab", "Close terminal", "Jump to live output",
-                        "Copy terminal text", "Remote hosts…", "Save screenshot"};
+                : new String[]{"New Claude", "New Codex", "New shell", "Close tab", "Scroll to bottom",
+                        "Copy screen", "Hosts…", "Save screenshot"};
         String[] actions = target.shell
                 ? new String[]{"copy.text", "hosts.list", "capture.screen"}
                 : new String[]{"agent.claude", "agent.codex", "tab.new", "pane.close", "scroll.live", "copy.text",

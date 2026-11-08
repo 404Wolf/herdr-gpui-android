@@ -20,6 +20,7 @@ import org.json.JSONObject;
  *  "fontSize": 12,        terminal text in points before the system text scale, 9..24
  *  "uiScale": 0.9,        every control and its text, 0.7..1.3
  *  "capturable": true,    allow screenshots and screen mirroring (no FLAG_SECURE)
+ *  "scrollSpeed": 1.4,    lines scrolled per row of finger travel, 0.5..3
  *  "palette": {...}}      replaces Default: see model::set_default_palette_json
  * </pre>
  *
@@ -30,6 +31,8 @@ final class ProvisionedSettings {
     static final String FILE_NAME = "remote-for-herdr-settings.json";
     static final String FORMAT = "remote-for-herdr-settings";
     private static final int MAX_BYTES = 64 * 1024;
+    /** Wolf found one line per row of travel slow; 1.4 is the app's own default. */
+    static final float DEFAULT_SCROLL_SPEED = 1.4f;
 
     private static ProvisionedSettings cached;
     private static boolean paletteApplied;
@@ -40,8 +43,11 @@ final class ProvisionedSettings {
     /** Null when unset: the build's own rule applies. */
     final Boolean capturable;
     final String paletteJson;
+    final float scrollSpeed;
 
-    private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson) {
+    private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson,
+            float scrollSpeed) {
+        this.scrollSpeed = scrollSpeed;
         this.fontSize = fontSize;
         this.uiScale = uiScale;
         this.capturable = capturable;
@@ -56,7 +62,7 @@ final class ProvisionedSettings {
     }
 
     private static ProvisionedSettings read(Context context) {
-        ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null);
+        ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED);
         File dir = context.getExternalFilesDir(null);
         File file = dir == null ? null : new File(dir, FILE_NAME);
         if (file == null || !file.isFile() || file.length() > MAX_BYTES) return none;
@@ -73,11 +79,13 @@ final class ProvisionedSettings {
             double font = root.optDouble("fontSize", 0);
             double scale = root.optDouble("uiScale", 1);
             JSONObject palette = root.optJSONObject("palette");
+            double speed = root.optDouble("scrollSpeed", DEFAULT_SCROLL_SPEED);
             return new ProvisionedSettings(
                     font >= 9 && font <= 24 ? (float) font : 0,
                     scale >= 0.7 && scale <= 1.3 ? (float) scale : 1,
                     root.has("capturable") ? root.optBoolean("capturable") : null,
-                    palette == null ? null : palette.toString());
+                    palette == null ? null : palette.toString(),
+                    speed >= 0.5 && speed <= 3 ? (float) speed : DEFAULT_SCROLL_SPEED);
         } catch (IOException | JSONException | RuntimeException unreadable) {
             return none;
         }
