@@ -106,7 +106,30 @@ public final class HomeActivity extends Activity {
         boolean dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                 == Configuration.UI_MODE_NIGHT_YES;
         chrome = GpuiChrome.load(GpuiDisplayOptions.palette(theme, dark));
+        // "Reopen the last session at launch" (Hosts): a fresh launch goes back to
+        // the remembered agent once its machine is connected, if it still exists.
+        if (state == null && RemoteHostsActivity.reopenEnabled(this)) {
+            android.content.SharedPreferences prefs = getSharedPreferences("remote-startup", MODE_PRIVATE);
+            reopenHost = prefs.getString("last_host", "");
+            reopenPane = prefs.getString("last_pane", "");
+        }
         build();
+    }
+
+    private String reopenHost = "", reopenPane = "";
+
+    private void tryReopen(Machine machine) {
+        if (reopenPane.isEmpty() || !machine.host.id.equals(reopenHost) || !"ready".equals(machine.state)) return;
+        Map<String, List<Agent>> spaces = spaces(machine);
+        // The first ready poll can precede the terminal list; wait for it.
+        if (spaces.isEmpty()) return;
+        String pane = reopenPane;
+        reopenPane = "";
+        for (List<Agent> agents : spaces.values()) {
+            for (Agent agent : agents) {
+                if (agent.id.equals(pane)) { openAgent(agent); return; }
+            }
+        }
     }
 
     @Override public void onConfigurationChanged(Configuration configuration) {
@@ -256,6 +279,7 @@ public final class HomeActivity extends Activity {
                     machine.state = state;
                 }
                 render(false);
+                tryReopen(machine);
             });
         });
     }
