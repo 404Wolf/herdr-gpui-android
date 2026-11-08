@@ -11,14 +11,14 @@ Nothing. The app has no developer accounts, advertising, analytics, crash report
 ## What stays on your device
 
 - Host profiles and SSH host fingerprints.
-- If you choose to save one, an SSH private key, and optional companion tokens.
+- If you choose to save or create one, an SSH private key, and optional companion tokens. A key created here is made on the device and its private half never leaves it; its public half is also written to the app's folder under Android/data, which a computer connected over USB or wireless debugging can read.
 - Display preferences and the last session.
 
 Host profiles, fingerprints, saved keys and companion tokens are encrypted using Android Keystore. Passwords and passphrases are used for a connection only and are never saved. App data is excluded from backup and device transfer. Uninstalling the app removes its local data.
 
 ## Host files
 
-If you choose **Export** under **Hosts file**, the app writes a file to a place you pick. It contains each saved host's name, address, user name, Herdr session, Iroh ticket and relay, extra keys, quick commands and trusted host fingerprint. It never contains passwords, passphrases, the device SSH key or companion tokens. The file is not encrypted, so keep it as you would an SSH configuration file. The app reads a hosts file only when you choose one to import, and shows you its hosts before adding them. It never sends a hosts file anywhere.
+If you choose **Export** under **Hosts file**, the app writes a file to a place you pick. It contains each saved host's name, address, user name, Herdr session, Iroh ticket and relay, extra keys, quick commands and trusted host fingerprint. It never contains passwords, passphrases, the device SSH key or companion tokens. The file is not encrypted, so keep it as you would an SSH configuration file. The app reads a hosts file when you choose one to import, and shows you its hosts before adding them. It also imports, once per version, a hosts file named remote-for-herdr-hosts.json placed in its own folder under Android/data; only a computer with USB or wireless debugging access, or the app itself, can put one there, so that file's host fingerprints are trusted without asking. It never sends a hosts file anywhere.
 
 ## Network connections
 

@@ -2541,6 +2541,7 @@ dependencies = [
  "base64 0.22.1",
  "iroh",
  "iroh-tickets",
+ "ring",
  "russh",
  "thiserror 2.0.21",
  "tokio",

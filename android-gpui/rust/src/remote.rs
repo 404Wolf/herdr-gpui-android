@@ -175,6 +175,18 @@ pub fn iroh_target(text: &str, relay: &str) -> Result<String> {
     }))?)
 }
 
+/// A new device key made here, never sent anywhere: `private` (OpenSSH, for
+/// the encrypted identity store) and `public` (the authorized_keys line).
+pub fn generate_identity(comment: &str) -> Result<String> {
+    if comment.is_empty() || comment.len() > 128 || comment.chars().any(char::is_control) {
+        return Err(Error::Config);
+    }
+    let (private, public) = herdr_remote_transport::generate_ed25519(comment)?;
+    Ok(serde_json::to_string(
+        &json!({"private": private.as_str(), "public": public}),
+    )?)
+}
+
 pub(crate) struct State {
     pub(crate) view: Value,
     pub(crate) terminal: Option<Arc<gpui_rio::Session>>,

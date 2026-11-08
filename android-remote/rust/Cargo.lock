@@ -1126,6 +1126,7 @@ dependencies = [
  "iroh",
  "iroh-tickets",
  "rand",
+ "ring",
  "russh",
  "thiserror 2.0.21",
  "tokio",

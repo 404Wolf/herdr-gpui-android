@@ -689,3 +689,13 @@ fn unavailable_public_key_method_is_reported_without_server_text() {
             .contains("publickey authentication at this stage")
     );
 }
+
+#[test]
+fn generated_identity_is_an_openssh_ed25519_key_matching_its_public_line() {
+    let (private, public) = generate_ed25519("phone").expect("generate");
+    let key = russh::keys::decode_secret_key(&private, None).expect("decode");
+    assert_eq!(key.public_key().to_openssh().expect("encode"), public);
+    assert!(public.starts_with("ssh-ed25519 AAAA") && public.ends_with(" phone"));
+    let (other, _) = generate_ed25519("phone").expect("generate");
+    assert_ne!(*private, *other, "every key gets a fresh seed");
+}

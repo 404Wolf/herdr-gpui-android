@@ -451,3 +451,17 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_discover(
 ) -> jstring {
     result_string(&mut env, remote::discover(handle as u64))
 }
+
+/// A new Ed25519 device key. Blocks only on the OS random number generator.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_generateIdentity(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    comment: JString<'_>,
+) -> jstring {
+    let Some(comment) = read(&mut env, &comment, 128) else {
+        return std::ptr::null_mut();
+    };
+    result_string(&mut env, remote::generate_identity(&comment))
+}

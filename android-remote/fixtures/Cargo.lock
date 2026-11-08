@@ -1208,11 +1208,12 @@ dependencies = [
 name = "herdr-gpui-android"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "gpui-rio",
- "herdr-client",
  "herdr-remote-transport",
  "jni 0.21.1",
  "ndk-context",
+ "rio-vt",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1238,6 +1239,7 @@ dependencies = [
  "base64 0.22.1",
  "iroh",
  "iroh-tickets",
+ "ring",
  "russh",
  "thiserror 2.0.21",
  "tokio",

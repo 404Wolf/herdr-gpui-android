@@ -16,6 +16,8 @@ final class RemoteNative {
 
     static native void initialize(Context context);
     static native String discover(long handle);
+    /** {"private", "public"} for a new Ed25519 key, or {"error"}. */
+    static native String generateIdentity(String comment);
     static native String inspect(String configJson);
     /**
      * {"endpoint_id", "endpoint_ticket", "relay_url"} for a pasted endpoint ID or ticket and an

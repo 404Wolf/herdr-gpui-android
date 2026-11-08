@@ -547,9 +547,16 @@ public final class RemoteHostsActivity extends Activity {
         clearStatus();
         Runnable slow = () -> { if (current(token)) setStatus(Tone.PROGRESS, "Loading encrypted profiles…"); };
         main.postDelayed(slow, 300);
-        run(token, () -> new ProfilesSnapshot(seedBootstrap(store.read()), identityStore.exists()), snapshot -> {
+        run(token, () -> {
+            String provisioned = importProvisioned();
+            return new ProfilesSnapshot(store.read(), identityStore.exists(), provisioned);
+        }, snapshot -> {
             main.removeCallbacks(slow);
             identityPresent = snapshot.identityPresent;
+            if (snapshot.provisioned != null && pendingStatus == null) {
+                pendingStatus = snapshot.provisioned;
+                pendingTone = Tone.NOTE;
+            }
             renderProfiles(snapshot.hosts);
         }, failure -> {
             main.removeCallbacks(slow);
@@ -558,25 +565,37 @@ public final class RemoteHostsActivity extends Activity {
     }
 
     /**
-     * The tailnet host discovery starts from, saved once on a fresh install so the
-     * first launch has something to connect to. Its SSH key is verified on first
-     * connect like any other host; deleting or editing it later sticks.
+     * Hosts provisioned by whoever administers the device: a hosts file (the same
+     * format as Export) pushed over adb, for example by nix-android, to this app's
+     * own external files directory, which other apps can neither read nor write.
+     * Each new version of the file is imported once, with its trusted host keys,
+     * since only adb or this app can write there. Hosts already saved, with their
+     * trust, win; hosts deleted here are added back only by a changed file.
+     * Runs on the worker; returns a status line, or null when nothing changed.
      */
-    private static final String BOOTSTRAP_NAME = "Server";
-    private static final String BOOTSTRAP_HOST = "server.tailc6809.ts.net";
-    private static final String BOOTSTRAP_USER = "wolf";
-
-    /** Runs on the worker: the profile store is encrypted and read off the main thread. */
-    private List<SavedRemoteHost> seedBootstrap(List<SavedRemoteHost> hosts) throws Exception {
-        android.content.SharedPreferences prefs = getSharedPreferences(STARTUP, MODE_PRIVATE);
-        if (prefs.getBoolean("bootstrap_seeded", false)) return hosts;
-        if (hosts.isEmpty()) {
-            store.saveProfile(null, SavedRemoteHost.create(BOOTSTRAP_NAME, "tcp", BOOTSTRAP_HOST, 22,
-                    "", "", "", BOOTSTRAP_USER, "default"));
-            hosts = store.read();
+    private String importProvisioned() {
+        java.io.File dir = getExternalFilesDir(null);
+        java.io.File file = dir == null ? null : new java.io.File(dir, HostFile.FILE_NAME);
+        if (file == null || !file.isFile()) return null;
+        try {
+            byte[] bytes;
+            try (InputStream in = new java.io.FileInputStream(file)) {
+                bytes = HostFile.readBounded(in);
+            }
+            StringBuilder digest = new StringBuilder();
+            for (byte b : java.security.MessageDigest.getInstance("SHA-256").digest(bytes)) {
+                digest.append(String.format(java.util.Locale.ROOT, "%02x", b));
+            }
+            android.content.SharedPreferences prefs = getSharedPreferences(STARTUP, MODE_PRIVATE);
+            if (digest.toString().equals(prefs.getString("provisioned_hosts", ""))) return null;
+            int added = store.importProfiles(HostFile.read(bytes));
+            prefs.edit().putString("provisioned_hosts", digest.toString()).apply();
+            if (added == 0) return null;
+            return added == 1 ? "Added 1 provisioned host" : "Added " + added + " provisioned hosts";
+        } catch (Exception failure) {
+            // A bad file must not hide the hosts already saved.
+            return "Provisioned hosts file not imported: " + safeMessage(failure.getMessage());
         }
-        prefs.edit().putBoolean("bootstrap_seeded", true).apply();
-        return hosts;
     }
 
     private void renderProfiles(List<SavedRemoteHost> hosts) {
@@ -751,11 +770,26 @@ public final class RemoteHostsActivity extends Activity {
         LinearLayout row = settingRow(R.drawable.ic_home_key, 2);
         LinearLayout about = column(this);
         about.addView(text(this, "Device SSH key", 16, chrome.onSurface));
+        String publicKey = identityPresent ? readPublicKey() : null;
         about.addView(text(this, identityPresent
-                ? "Saved here, encrypted with Android Keystore"
+                ? publicKey != null ? "Made here, encrypted with Android Keystore; add its public key to each host"
+                        : "Saved here, encrypted with Android Keystore"
                 : "None saved; connect with a password or a one-use key", 14, chrome.onSurfaceVariant));
         LinearLayout actions = row(this);
         actions.setGravity(Gravity.CENTER_VERTICAL);
+        if (!identityPresent) {
+            Button create = tonalButton("Create key", this::createIdentity);
+            create.setContentDescription("Create a new device SSH key");
+            LinearLayout.LayoutParams createParams = new LinearLayout.LayoutParams(-2, dp(48));
+            createParams.setMarginEnd(dp(8));
+            actions.addView(create, createParams);
+        } else if (publicKey != null) {
+            Button copy = tonalButton("Copy public key", () -> copyPublicKey(publicKey));
+            copy.setContentDescription("Copy the device SSH public key");
+            LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(-2, dp(48));
+            copyParams.setMarginEnd(dp(8));
+            actions.addView(copy, copyParams);
+        }
         Button primary = tonalButton(identityPresent ? "Replace" : "Save key", this::editIdentity);
         primary.setContentDescription(identityPresent ? "Replace the saved SSH key" : "Save a device SSH key");
         actions.addView(primary, new LinearLayout.LayoutParams(-2, dp(48)));
@@ -943,9 +977,11 @@ public final class RemoteHostsActivity extends Activity {
     private static final class ProfilesSnapshot {
         final List<SavedRemoteHost> hosts;
         final boolean identityPresent;
-        ProfilesSnapshot(List<SavedRemoteHost> hosts, boolean identityPresent) {
+        final String provisioned;
+        ProfilesSnapshot(List<SavedRemoteHost> hosts, boolean identityPresent, String provisioned) {
             this.hosts = hosts;
             this.identityPresent = identityPresent;
+            this.provisioned = provisioned;
         }
     }
 
@@ -993,6 +1029,11 @@ public final class RemoteHostsActivity extends Activity {
             run(token, () -> {
                 try {
                     identityStore.save(identity);
+                    // A pasted key replaces one made here; its public line no longer applies.
+                    java.io.File file = publicKeyFile();
+                    if (file != null && file.exists() && !file.delete()) {
+                        throw new IOException("The old public key file could not be removed");
+                    }
                     return true;
                 } finally {
                     Arrays.fill(identity, '\0');
@@ -1008,13 +1049,81 @@ public final class RemoteHostsActivity extends Activity {
         });
     }
 
+    /** The public half of a key made here, beside the provisioned hosts file. */
+    private static final String PUBLIC_KEY_FILE = "id_ed25519.pub";
+
+    private java.io.File publicKeyFile() {
+        java.io.File dir = getExternalFilesDir(null);
+        return dir == null ? null : new java.io.File(dir, PUBLIC_KEY_FILE);
+    }
+
+    /** The saved key's public line, when this device made it; small enough for the UI thread. */
+    private String readPublicKey() {
+        java.io.File file = publicKeyFile();
+        if (file == null || !file.isFile() || file.length() > 1024) return null;
+        try (InputStream in = new java.io.FileInputStream(file)) {
+            String line = new String(HostFile.readBounded(in), java.nio.charset.StandardCharsets.UTF_8).trim();
+            return line.startsWith("ssh-ed25519 ") ? line : null;
+        } catch (IOException | RuntimeException unreadable) {
+            return null;
+        }
+    }
+
+    private void copyPublicKey(String publicKey) {
+        ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+        if (clipboard == null) return;
+        clipboard.setPrimaryClip(ClipData.newPlainText("SSH public key", publicKey));
+        setStatus(Tone.NOTE, "Copied the public key; add it to authorized_keys on each host");
+    }
+
+    /**
+     * Makes an Ed25519 key here, so the private half never leaves this device. It
+     * is stored like a pasted key; the public line is also written to the app's
+     * external files directory, where adb can read it (Android/data/<package>/files).
+     */
+    private void createIdentity() {
+        generation++;
+        int token = generation;
+        setStatus(Tone.PROGRESS, "Creating an SSH key on this device…");
+        String device = Build.MODEL == null ? "android" : Build.MODEL.replaceAll("[^A-Za-z0-9._-]+", "-");
+        run(token, () -> {
+            JSONObject made = result(RemoteNative.generateIdentity("remote-for-herdr@" + device));
+            char[] identity = made.getString("private").toCharArray();
+            String publicKey = made.getString("public");
+            try {
+                identityStore.save(identity);
+            } finally {
+                Arrays.fill(identity, '\0');
+            }
+            java.io.File file = publicKeyFile();
+            if (file != null) {
+                try (OutputStream out = new java.io.FileOutputStream(file)) {
+                    out.write((publicKey + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            return publicKey;
+        }, publicKey -> {
+            identityPresent = true;
+            pendingStatus = "Created a device key; copy its public key to each host's authorized_keys";
+            pendingTone = Tone.NOTE;
+            showProfiles();
+        }, failure -> setStatus(Tone.ERROR, failure));
+    }
+
     private void removeIdentity() {
         generation++;
         showDialog(sheet().setTitle("Remove saved SSH key?")
                 .setMessage("Permanently remove the device-wide encrypted SSH key and its Android Keystore key. Saved SSH profiles and host fingerprints are unchanged.")
                 .setNegativeButton("Cancel", null).setPositiveButton("Remove key", (which, index) -> {
                     int token = generation;
-                    run(token, () -> { identityStore.delete(); return true; }, ignored -> {
+                    run(token, () -> {
+                        identityStore.delete();
+                        java.io.File file = publicKeyFile();
+                        if (file != null && file.exists() && !file.delete()) {
+                            throw new IOException("The old public key file could not be removed");
+                        }
+                        return true;
+                    }, ignored -> {
                         identityPresent = false;
                         showProfiles();
                     });

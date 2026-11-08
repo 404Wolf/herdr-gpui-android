@@ -76,6 +76,28 @@ pub enum Error {
     IrohStream(#[from] iroh::endpoint::ConnectionError),
 }
 
+/// A new Ed25519 identity made on this device: the unencrypted OpenSSH private
+/// key (for the caller's own encrypted store) and its `ssh-ed25519 AAAA… comment`
+/// line for authorized_keys. The seed comes from the OS RNG and is wiped.
+pub fn generate_ed25519(comment: &str) -> Result<(Zeroizing<String>, String)> {
+    use ring::rand::SecureRandom;
+    use russh::keys::ssh_key::{LineEnding, private::Ed25519Keypair};
+    let mut seed = Zeroizing::new([0u8; 32]);
+    ring::rand::SystemRandom::new()
+        .fill(seed.as_mut())
+        .map_err(|_| Error::Io(io::Error::other("system random number generator failed")))?;
+    let mut key = russh::keys::PrivateKey::from(Ed25519Keypair::from_seed(&seed));
+    key.set_comment(comment);
+    let private = key
+        .to_openssh(LineEnding::LF)
+        .map_err(russh::keys::Error::from)?;
+    let public = key
+        .public_key()
+        .to_openssh()
+        .map_err(russh::keys::Error::from)?;
+    Ok((private, public))
+}
+
 #[derive(Clone, Debug)]
 pub enum Transport {
     Tcp { host: String, port: u16 },
