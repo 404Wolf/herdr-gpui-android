@@ -192,10 +192,13 @@ impl Connection<'_> {
                     .filter(|s| *s != "loose")
                     .unwrap_or(&unique);
                 let cwd = selected.and_then(|p| p["cwd"].as_str());
-                let mut run = json!({"name":"Mobile shell","cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":unique},"size":{"cols":cols,"rows":rows},"display":display()});
-                if let Some((program, name)) = match action {
-                    "agent.claude" => Some(("claude", "Claude")),
-                    "agent.codex" => Some(("codex", "Codex")),
+                // No `name`: herdr-core names are unique ids (a-z 0-9 - _ .), and
+                // "Mobile shell" was refused, so these actions never ran. The
+                // app shows the program's title instead.
+                let mut run = json!({"cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":unique},"size":{"cols":cols,"rows":rows},"display":display()});
+                if let Some(program) = match action {
+                    "agent.claude" => Some("claude"),
+                    "agent.codex" => Some("codex"),
                     _ => None,
                 } {
                     // Through the machine's login shell, as a typed command would
@@ -203,7 +206,6 @@ impl Connection<'_> {
                     // sessions as `aswap run <agent> --auto` with that machine's
                     // account, so a new agent never stops at a login screen.
                     // keep: when the agent exits, the terminal stays as a shell.
-                    run["name"] = json!(name);
                     run["line"] = json!(format!("exec \"${{SHELL:-/bin/sh}}\" -lic {program}"));
                     run["labels"]["agent.kind"] = json!(program);
                 }

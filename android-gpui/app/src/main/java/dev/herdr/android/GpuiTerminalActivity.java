@@ -682,11 +682,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     "Workspaces, tabs and panes for this host", view -> showPanes()));
         }
         ImageButton keyboard = iconButton(R.drawable.ic_bar_keyboard, "Keyboard",
-                "Show the on-screen keyboard", view -> {
-                    Connection target;
-                    synchronized (stateLock) { target = connection; }
-                    if (target != null) nativeShowKeyboard(target.generation);
-                });
+                "Show or hide the on-screen keyboard", view -> toggleKeyboard());
         // Input controls resolve on touch-up, in order with the keys they sit by.
         synchronousTouch(keyboard);
         pinned.addView(keyboard);
@@ -1010,6 +1006,33 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Nothing pends: local scrolling never waits on a round trip. */
     private void flushScroll() { }
+
+    /**
+     * The toolbar's keyboard button toggles. It asks the window whether the IME
+     * is really showing (its insets), never a remembered flag, so a Back-gesture
+     * dismissal cannot leave the button out of step.
+     */
+    private void toggleKeyboard() {
+        boolean shown = false;
+        View root = getWindow().getDecorView();
+        if (Build.VERSION.SDK_INT >= 30 && root.getRootWindowInsets() != null) {
+            shown = root.getRootWindowInsets().isVisible(WindowInsets.Type.ime());
+        }
+        if (shown) {
+            allowNextKeyboardShow = false;
+            super.gpuiHideKeyboard(imeSession);
+            if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
+                getWindow().getInsetsController().hide(WindowInsets.Type.ime());
+            }
+            return;
+        }
+        Connection target;
+        synchronized (stateLock) { target = connection; }
+        if (target != null) {
+            if (terminalSurface != null) terminalSurface.requestFocus();
+            nativeShowKeyboard(target.generation);
+        }
+    }
 
     private TextView latestButton;
     /** The pane last checked for a waiting agent; touched on the poll thread only. */
