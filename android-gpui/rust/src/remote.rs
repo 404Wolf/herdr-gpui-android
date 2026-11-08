@@ -367,12 +367,15 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     let owner = session(id)?;
     let state = lock(&owner.state);
     if let Some(terminal) = &state.terminal {
-        terminal
-            .grid()
-            .lock()
-            .scroll_display(rio_vt::crosswords::grid::Scroll::Delta(
-                delta.clamp(-1000, 1000) as i32,
-            ));
+        let delta = delta.clamp(-1000, 1000) as i32;
+        // Full-screen agents (Claude Code, Codex) scroll themselves: they get
+        // wheel input. Plain output scrolls the attach's local history.
+        if !terminal.wheel(delta) {
+            terminal
+                .grid()
+                .lock()
+                .scroll_display(rio_vt::crosswords::grid::Scroll::Delta(delta));
+        }
     }
     let _ = (paint.generation, paint.title, paint.status, paint.shortcuts);
     Ok(json!({"queued":true}).to_string())

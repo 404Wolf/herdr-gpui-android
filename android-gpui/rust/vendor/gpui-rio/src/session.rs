@@ -282,6 +282,48 @@ impl Session {
     }
 
     /// Input returns the view to the live screen and drops any selection.
+    /// A touch scroll of `lines` (positive = back in history) as the program
+    /// wants it: wheel reports when it asked for mouse events (Claude Code,
+    /// Codex and other full-screen TUIs), arrow keys in the alternate screen
+    /// without mouse reporting, which is what xterm's alternate-scroll does.
+    /// Returns false when the program wants neither, so the caller scrolls
+    /// the local scrollback instead. Never follows the output to the bottom.
+    pub fn wheel(&self, lines: i32) -> bool {
+        if lines == 0 {
+            return true;
+        }
+        let (mode, columns, rows) = {
+            let grid = self.grid.lock();
+            (grid.mode(), grid.columns(), grid.screen_lines())
+        };
+        let count = lines.unsigned_abs().min(30) as usize;
+        let up = lines > 0;
+        let bytes = if mode.intersects(Mode::MOUSE_MODE) {
+            // Report at the middle of the screen: the pane under the finger is
+            // the whole terminal here.
+            let (column, row) = (columns / 2 + 1, rows / 2 + 1);
+            let button = if up { 64 } else { 65 };
+            let one = if mode.contains(Mode::SGR_MOUSE) {
+                format!("\x1b[<{button};{column};{row}M").into_bytes()
+            } else {
+                let encode = |value: usize| u8::try_from(32 + value.min(223)).unwrap_or(255);
+                vec![0x1b, b'[', b'M', 32 + button, encode(column), encode(row)]
+            };
+            one.repeat(count)
+        } else if mode.contains(Mode::ALT_SCREEN) {
+            let one: &[u8] = match (up, mode.contains(Mode::APP_CURSOR)) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            one.repeat(count)
+        } else {
+            return false;
+        };
+        self.write(bytes)
+    }
+
     fn follow_input(&self) -> Mode {
         let mut grid = self.grid.lock();
         grid.scroll_display(Scroll::Bottom);
