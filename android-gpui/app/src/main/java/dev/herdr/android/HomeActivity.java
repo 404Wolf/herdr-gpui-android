@@ -455,8 +455,14 @@ public final class HomeActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(chrome.background);
         root.setFitsSystemWindows(true);
-        root.addView(topBar(), new LinearLayout.LayoutParams(-1, dp(40)));
-        root.addView(divider(), new LinearLayout.LayoutParams(-1, 1));
+        // The top bar is hidden by default (Wolf: no wasted space). Its toggle,
+        // the picker and Hosts float at the top right while it is hidden.
+        boolean barShown = getSharedPreferences("home", MODE_PRIVATE).getBoolean("top_bar", false);
+        View bar = topBar(barShown);
+        if (barShown) {
+            root.addView(bar, new LinearLayout.LayoutParams(-1, dp(36)));
+            root.addView(divider(), new LinearLayout.LayoutParams(-1, 1));
+        }
         tree = column();
         tree.setPadding(dp(6), dp(2), dp(6), dp(16));
         ScrollView treeScroll = scroll(tree);
@@ -472,7 +478,18 @@ public final class HomeActivity extends Activity {
         } else {
             root.addView(treeScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         }
-        setContentView(root);
+        if (barShown) {
+            setContentView(root);
+        } else {
+            android.widget.FrameLayout frame = new android.widget.FrameLayout(this);
+            frame.setBackgroundColor(chrome.background);
+            frame.setFitsSystemWindows(true);
+            root.setFitsSystemWindows(false);
+            frame.addView(root, new android.widget.FrameLayout.LayoutParams(-1, -1));
+            frame.addView(floatingControls(), new android.widget.FrameLayout.LayoutParams(-2, -2,
+                    Gravity.TOP | Gravity.END));
+            setContentView(frame);
+        }
         // The insets controller belongs to the decor view, which exists only now.
         if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
             int light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
@@ -482,7 +499,34 @@ public final class HomeActivity extends Activity {
         render(true);
     }
 
-    private View topBar() {
+    /** ⌕, ⋯ and the bar toggle, small on black, while the top bar is hidden. */
+    private View floatingControls() {
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        controls.setBackgroundColor(chrome.background);
+        controls.addView(smallButton("⌕", "Search machines, spaces and agents (Ctrl+K)", v -> openPicker()));
+        controls.addView(smallButton("⋯", "Hosts, device key and settings", v -> openHosts()));
+        controls.addView(smallButton("▾", "Show the top bar", v -> setTopBar(true)));
+        return controls;
+    }
+
+    private TextView smallButton(String glyph, String description, View.OnClickListener action) {
+        TextView button = iconButton(glyph, description, action);
+        button.setTextSize(15);
+        button.setLayoutParams(new LinearLayout.LayoutParams(dp(32), dp(30)));
+        return button;
+    }
+
+    private void setTopBar(boolean shown) {
+        getSharedPreferences("home", MODE_PRIVATE).edit().putBoolean("top_bar", shown).apply();
+        build();
+    }
+
+    private void openHosts() {
+        startActivity(new Intent(this, RemoteHostsActivity.class).putExtra("skip_reopen", true));
+    }
+
+    private View topBar(boolean shown) {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
@@ -496,8 +540,8 @@ public final class HomeActivity extends Activity {
         summary.setPadding(dp(10), 0, dp(6), 0);
         bar.addView(summary, new LinearLayout.LayoutParams(0, -2, 1));
         bar.addView(iconButton("⌕", "Search machines, spaces and agents (Ctrl+K)", v -> openPicker()));
-        bar.addView(iconButton("⋯", "Hosts, device key and settings",
-                v -> startActivity(new Intent(this, RemoteHostsActivity.class).putExtra("skip_reopen", true))));
+        bar.addView(iconButton("⋯", "Hosts, device key and settings", v -> openHosts()));
+        bar.addView(iconButton("▴", "Hide the top bar", v -> setTopBar(false)));
         return bar;
     }
 
