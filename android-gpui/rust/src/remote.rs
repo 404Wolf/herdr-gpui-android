@@ -198,7 +198,8 @@ pub(crate) struct Session {
     pub(crate) commands: mpsc::SyncSender<Operation>,
 }
 pub(crate) enum Operation {
-    Focus(String),
+    /// The pane to attach, and when the phone asked for it.
+    Focus(String, std::time::Instant),
     Discover(mpsc::SyncSender<Result<String>>),
     Action(String, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
@@ -300,15 +301,30 @@ pub fn poll_terminal(
     let owner = session(id)?;
     let state = lock(&owner.state);
     model::mailbox().set_shell(generation, state.render_id);
-    let _ = since;
     // How far the local history is scrolled back, for a "jump to latest" control.
-    let mut view = state.view.clone();
-    view["local_offset"] = json!(
-        state
-            .terminal
-            .as_ref()
-            .map_or(0, |terminal| terminal.grid().lock().display_offset())
-    );
+    let local_offset = state
+        .terminal
+        .as_ref()
+        .map_or(0, |terminal| terminal.grid().lock().display_offset());
+    let view = &state.view;
+    if since != 0 && view["token"].as_u64() == Some(since) {
+        // The phone polls ten times a second; resending (and reparsing) the
+        // whole pane tree each time, under the activity's state lock, starved
+        // its UI thread while agents were busy. Only what moves without a
+        // revision goes back.
+        return Ok(json!({
+            "unchanged": true,
+            "state": view["state"],
+            "pane_id": view["pane_id"],
+            "boot_id": view["boot_id"],
+            "scroll": view["scroll"],
+            "fetch": view["fetch"],
+            "local_offset": local_offset,
+        })
+        .to_string());
+    }
+    let mut view = view.clone();
+    view["local_offset"] = json!(local_offset);
     Ok(view.to_string())
 }
 pub fn focus(id: u64, terminal: &str) -> Result<String> {
@@ -321,7 +337,7 @@ pub fn focus(id: u64, terminal: &str) -> Result<String> {
     }
     owner
         .commands
-        .try_send(Operation::Focus(terminal.into()))
+        .try_send(Operation::Focus(terminal.into(), std::time::Instant::now()))
         .map_err(|_| Error::Capacity)?;
     Ok(json!({"queued":true}).to_string())
 }
@@ -356,7 +372,8 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
     if !matches!(
         action,
         "tab.new" | "agent.claude" | "agent.codex" | "pane.close"
-    ) {
+    ) && crate::core_session::TabEdit::parse(action).is_none()
+    {
         return Err(Error::Config);
     }
     let owner = session(id)?;

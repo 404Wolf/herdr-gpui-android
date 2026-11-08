@@ -220,9 +220,172 @@ impl Connection<'_> {
                 self.call("terminal.kill", json!({"terminal":terminal}))?;
                 self.refresh()?;
             }
-            _ => return Err(Error::StaleTarget),
+            _ => match TabEdit::parse(action) {
+                Some(edit) => self.edit_tab(edit, cols, rows)?,
+                None => return Err(Error::StaleTarget),
+            },
         }
         Ok(json!({"queued":true}).to_string())
+    }
+    /// Changes herdr-app's layout document, which the desktop app reads too,
+    /// so a rename or reorder made here shows there. Retries on a version race.
+    fn edit_doc(&mut self, mut change: impl FnMut(&mut Value) -> Result<()>) -> Result<()> {
+        for _ in 0..3 {
+            let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+            let mut value = doc["value"].clone();
+            change(&mut value)?;
+            match self.call(
+                "doc.set",
+                json!({"name":"herdr-app","value":value,"version":doc["version"]}),
+            ) {
+                Ok(_) => return self.refresh(),
+                Err(Error::Protocol(message)) if message.contains("conflict") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Protocol("the layout kept changing; try again".into()))
+    }
+    /// The terminals the phone's view puts in this space's tab.
+    fn tab_terminals(&self, space: &str, tab: &str) -> Vec<String> {
+        lock(&self.owner.state).view["panes"]
+            .as_array()
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter(|p| p["workspace_id"] == space && p["tab_id"] == tab)
+                    .filter_map(|p| p["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn edit_tab(&mut self, edit: TabEdit, cols: u16, rows: u16) -> Result<()> {
+        match edit {
+            TabEdit::Rename { space, tab, name } => self.edit_doc(|doc| {
+                tab_mut(doc, &space, &tab)?["name"] = json!(name);
+                Ok(())
+            }),
+            TabEdit::Move { space, tab, index } => self.edit_doc(|doc| {
+                let tabs = tabs_mut(doc, &space)?;
+                let at = tabs
+                    .iter()
+                    .position(|t| t["id"] == tab.as_str())
+                    .ok_or(Error::StaleTarget)?;
+                let item = tabs.remove(at);
+                tabs.insert(index.min(tabs.len()), item);
+                Ok(())
+            }),
+            TabEdit::Close { space, tab } => {
+                for terminal in self.tab_terminals(&space, &tab) {
+                    self.call("terminal.kill", json!({"terminal":terminal}))?;
+                }
+                self.edit_doc(|doc| {
+                    let tabs = tabs_mut(doc, &space)?;
+                    tabs.retain(|t| t["id"] != tab.as_str());
+                    Ok(())
+                })
+            }
+            TabEdit::Split { space, tab } => {
+                let cwd = {
+                    let state = lock(&self.owner.state);
+                    let shown = state.view["pane_id"].clone();
+                    state.view["panes"]
+                        .as_array()
+                        .and_then(|p| p.iter().find(|p| p["id"] == shown))
+                        .map(|p| p["cwd"].clone())
+                        .unwrap_or(Value::Null)
+                };
+                let run = json!({"cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":tab},"size":{"cols":cols,"rows":rows},"display":display()});
+                let result = self.call("terminal.run", run)?;
+                let terminal = result["address"]
+                    .as_str()
+                    .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
+                    .to_owned();
+                let block = format!("p{:x}", NEXT_RENDER.fetch_add(1, Ordering::Relaxed));
+                self.edit_doc(|doc| {
+                    let item = tab_mut(doc, &space, &tab)?;
+                    let leaf = json!({"content":{"terminal":terminal},"id":block,"type":"block"});
+                    let root = &mut item["root"];
+                    if let Some(children) = root["children"].as_array_mut() {
+                        children.push(leaf);
+                    } else {
+                        let old = root.take();
+                        *root = json!({"children":[old, leaf],"id":tab,"type":"row"});
+                    }
+                    Ok(())
+                })?;
+                self.attach(&terminal, cols, rows)
+            }
+            TabEdit::SpaceRename { space, name } => self.edit_doc(|doc| {
+                doc["spaces"]
+                    .as_array_mut()
+                    .and_then(|spaces| spaces.iter_mut().find(|s| s["id"] == space.as_str()))
+                    .ok_or(Error::StaleTarget)?["name"] = json!(name);
+                Ok(())
+            }),
+            TabEdit::SpaceMove { space, index } => self.edit_doc(|doc| {
+                let spaces = doc["spaces"].as_array_mut().ok_or(Error::StaleTarget)?;
+                let at = spaces
+                    .iter()
+                    .position(|s| s["id"] == space.as_str())
+                    .ok_or(Error::StaleTarget)?;
+                let item = spaces.remove(at);
+                spaces.insert(index.min(spaces.len()), item);
+                Ok(())
+            }),
+            TabEdit::SpaceNew { space, kind } => {
+                let cwd = {
+                    let state = lock(&self.owner.state);
+                    state.view["panes"]
+                        .as_array()
+                        .and_then(|p| p.iter().find(|p| p["workspace_id"] == space.as_str()))
+                        .map(|p| p["cwd"].clone())
+                        .unwrap_or(Value::Null)
+                };
+                let tab = format!(
+                    "mobile-{}-{}",
+                    std::process::id(),
+                    NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
+                );
+                let mut run = json!({"cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":tab},"size":{"cols":cols,"rows":rows},"display":display()});
+                if kind != "shell" {
+                    run["line"] = json!(format!("exec \"${{SHELL:-/bin/sh}}\" -lic {kind}"));
+                    run["labels"]["agent.kind"] = json!(kind);
+                }
+                let result = self.call("terminal.run", run)?;
+                let terminal = result["address"]
+                    .as_str()
+                    .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
+                    .to_owned();
+                self.refresh()?;
+                self.attach(&terminal, cols, rows)
+            }
+            TabEdit::Interrupt { terminal } => {
+                self.call("terminal.interrupt", json!({"terminal":terminal}))?;
+                Ok(())
+            }
+            TabEdit::Kill { terminal } => {
+                self.call("terminal.kill", json!({"terminal":terminal}))?;
+                self.refresh()
+            }
+            TabEdit::ToSpace { space, tab, to } => {
+                for terminal in self.tab_terminals(&space, &tab) {
+                    self.call(
+                        "terminal.label",
+                        json!({"terminal":terminal,"labels":{"herdr.space":to}}),
+                    )?;
+                }
+                self.edit_doc(|doc| {
+                    let tabs = tabs_mut(doc, &space)?;
+                    let at = tabs
+                        .iter()
+                        .position(|t| t["id"] == tab.as_str())
+                        .ok_or(Error::StaleTarget)?;
+                    let item = tabs.remove(at);
+                    tabs_mut(doc, &to)?.push(item);
+                    Ok(())
+                })
+            }
+        }
     }
     fn discover(&mut self) -> Result<String> {
         use base64::Engine;
@@ -339,6 +502,78 @@ impl Connection<'_> {
         bump(&mut state.view);
         Ok(())
     }
+}
+/// A change asked for from the phone's tab strip or rail, as JSON:
+/// `{"op":"tab.rename","space":..,"tab":..,"name":..}`, `tab.move` with
+/// `index`, `tab.close`, `tab.split`, `tab.space` with `to`; `space.rename`
+/// with `name`, `space.move` with `index`, `space.new` with `kind`
+/// (shell, claude or codex); `pane.interrupt` and `pane.kill` with `terminal`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TabEdit {
+    Rename { space: String, tab: String, name: String },
+    Move { space: String, tab: String, index: usize },
+    Close { space: String, tab: String },
+    Split { space: String, tab: String },
+    ToSpace { space: String, tab: String, to: String },
+    SpaceRename { space: String, name: String },
+    SpaceMove { space: String, index: usize },
+    SpaceNew { space: String, kind: &'static str },
+    Interrupt { terminal: String },
+    Kill { terminal: String },
+}
+impl TabEdit {
+    pub(crate) fn parse(action: &str) -> Option<Self> {
+        if !action.starts_with('{') || action.len() > 1024 {
+            return None;
+        }
+        let value: Value = serde_json::from_str(action).ok()?;
+        let id = |key: &str| {
+            value[key]
+                .as_str()
+                .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        let name = || {
+            let name = value["name"].as_str()?.trim();
+            (!name.is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control))
+                .then(|| name.to_owned())
+        };
+        let index = || usize::try_from(value["index"].as_u64()?).ok().map(|i| i.min(512));
+        Some(match value["op"].as_str()? {
+            "tab.rename" => Self::Rename { space: id("space")?, tab: id("tab")?, name: name()? },
+            "tab.move" => Self::Move { space: id("space")?, tab: id("tab")?, index: index()? },
+            "tab.close" => Self::Close { space: id("space")?, tab: id("tab")? },
+            "tab.split" => Self::Split { space: id("space")?, tab: id("tab")? },
+            "tab.space" => Self::ToSpace { space: id("space")?, tab: id("tab")?, to: id("to")? },
+            "space.rename" => Self::SpaceRename { space: id("space")?, name: name()? },
+            "space.move" => Self::SpaceMove { space: id("space")?, index: index()? },
+            "space.new" => Self::SpaceNew {
+                space: id("space")?,
+                kind: match value["kind"].as_str()? {
+                    "shell" => "shell",
+                    "claude" => "claude",
+                    "codex" => "codex",
+                    _ => return None,
+                },
+            },
+            "pane.interrupt" => Self::Interrupt { terminal: id("terminal")? },
+            "pane.kill" => Self::Kill { terminal: id("terminal")? },
+            _ => return None,
+        })
+    }
+}
+fn tabs_mut<'a>(doc: &'a mut Value, space: &str) -> Result<&'a mut Vec<Value>> {
+    doc["spaces"]
+        .as_array_mut()
+        .and_then(|spaces| spaces.iter_mut().find(|s| s["id"] == space))
+        .and_then(|s| s["tabs"].as_array_mut())
+        .ok_or(Error::StaleTarget)
+}
+fn tab_mut<'a>(doc: &'a mut Value, space: &str, tab: &str) -> Result<&'a mut Value> {
+    tabs_mut(doc, space)?
+        .iter_mut()
+        .find(|t| t["id"] == tab)
+        .ok_or(Error::StaleTarget)
 }
 struct StreamRead {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -489,7 +724,17 @@ pub(crate) fn run(
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
                 }
-                Ok(Operation::Focus(terminal)) => connection.attach(&terminal, cols, rows)?,
+                Ok(Operation::Focus(terminal, asked)) => {
+                    let queued = asked.elapsed();
+                    connection.attach(&terminal, cols, rows)?;
+                    #[cfg(feature = "android-ui")]
+                    log::warn!(
+                        "switch {terminal}: queued {queued:?}, attached after {:?}",
+                        asked.elapsed()
+                    );
+                    #[cfg(not(feature = "android-ui"))]
+                    let _ = (queued, asked);
+                }
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
                     // current size, not the size it connected with.
@@ -509,9 +754,25 @@ pub(crate) fn run(
             connection.deliver(frame)?;
         }
         if refreshed.elapsed() >= Duration::from_secs(2)
-            || (connection.dirty && refreshed.elapsed() >= Duration::from_millis(250))
+            || (connection.dirty
+                && refreshed.elapsed()
+                    >= if connection.channel != 0 {
+                        // The session on screen: quick, but no busier than the
+                        // rail's eye needs while agents report constantly.
+                        Duration::from_millis(400)
+                    } else {
+                        // A host only sampled for the rail or Home.
+                        Duration::from_secs(1)
+                    })
         {
+            let started = Instant::now();
             connection.refresh()?;
+            #[cfg(feature = "android-ui")]
+            if started.elapsed() > Duration::from_secs(1) {
+                log::warn!("refresh took {:?}", started.elapsed());
+            }
+            #[cfg(not(feature = "android-ui"))]
+            let _ = started;
             refreshed = Instant::now();
         }
     }
@@ -614,11 +875,17 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
     if spaces.len() > 256 || tabs.len() > 512 {
         return Err(Error::Capacity);
     }
-    let old = json!([view["panes"], view["workspaces"], view["tabs"]]);
-    if old != json!([panes, spaces, tabs]) {
-        view["panes"] = json!(panes);
-        view["workspaces"] = json!(spaces);
-        view["tabs"] = json!(tabs);
+    // Compare with focus already marked: the fresh lists start unfocused, so
+    // comparing them bare changed the revision on every refresh and made the
+    // phone rebuild its chrome every couple of seconds for nothing.
+    let mut next = json!({"pane_id": view["pane_id"], "panes": panes, "workspaces": spaces, "tabs": tabs});
+    mark_focus(&mut next);
+    if [&view["panes"], &view["workspaces"], &view["tabs"]]
+        != [&next["panes"], &next["workspaces"], &next["tabs"]]
+    {
+        view["panes"] = next["panes"].take();
+        view["workspaces"] = next["workspaces"].take();
+        view["tabs"] = next["tabs"].take();
         bump(view);
     }
     mark_focus(view);
@@ -696,6 +963,34 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tab_edits_parse_only_bounded_known_operations() {
+        use super::TabEdit;
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"tab.rename","space":"s1","tab":"a","name":" Fix "}"#),
+            Some(TabEdit::Rename { space: "s1".into(), tab: "a".into(), name: "Fix".into() })
+        );
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"tab.move","space":"s1","tab":"a","index":2}"#),
+            Some(TabEdit::Move { space: "s1".into(), tab: "a".into(), index: 2 })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"tab.rename","space":"s1","tab":"a","name":"a\nb"}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"tab.rm","space":"s1","tab":"a"}"#), None);
+        assert_eq!(TabEdit::parse("tab.new"), None);
+    }
+
+    #[test]
+    fn tab_moves_and_renames_edit_the_layout_document() {
+        let mut doc = json!({"spaces":[{"id":"s1","tabs":[{"id":"a","name":"A"},{"id":"b","name":"B"},{"id":"c","name":"C"}]}]});
+        tab_mut(&mut doc, "s1", "b").unwrap()["name"] = json!("Bee");
+        let tabs = tabs_mut(&mut doc, "s1").unwrap();
+        let item = tabs.remove(2);
+        tabs.insert(0, item);
+        let names: Vec<_> = doc["spaces"][0]["tabs"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(names, ["C", "A", "Bee"]);
+        assert!(tabs_mut(&mut doc, "nope").is_err());
+    }
+
     use super::*;
     #[test]
     fn fragmented_and_coalesced_frames_survive_idle_reads() -> Result<()> {
