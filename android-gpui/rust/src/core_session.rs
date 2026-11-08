@@ -553,7 +553,31 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             .filter(|s| !s.is_empty())
             .or(terminal["name"].as_str())
             .unwrap_or(id);
-        panes.push(json!({"id":id,"title":title,"cwd":terminal["cwd"],"workspace_id":space,"tab_id":tab,"status":terminal["status"]["state"].as_str().unwrap_or("")}));
+        // The agent hierarchy (deacon, managers, workers) as the deacon skill
+        // labels it, with hc's own parent as the fallback.
+        let labels = &terminal["labels"];
+        let label = |key: &str| {
+            labels[key]
+                .as_str()
+                .filter(|v| !v.is_empty() && v.len() <= 128)
+        };
+        let kind = label("agent.kind").or_else(|| {
+            terminal["argv"][0]
+                .as_str()
+                .and_then(|program| program.rsplit('/').next())
+        });
+        panes.push(json!({
+            "id": id,
+            "title": title,
+            "cwd": terminal["cwd"],
+            "workspace_id": space,
+            "tab_id": tab,
+            "status": terminal["status"]["state"].as_str().unwrap_or(""),
+            "parent": label("parent").or(terminal["parent"].as_str()).unwrap_or(""),
+            "role": label("role").unwrap_or(""),
+            "project": label("project").unwrap_or(""),
+            "kind": kind.unwrap_or(""),
+        }));
     }
     if spaces.len() > 256 || tabs.len() > 512 {
         return Err(Error::Capacity);
@@ -686,13 +710,26 @@ mod tests {
         let mut view = json!({"revision":0});
         project(
             &mut view,
-            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{}}]),
+            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{},"parent":"t1","argv":["/usr/bin/claude"]}]),
             &json!({"spaces":[{"id":"s1","name":"Code","tabs":[{"id":"a","name":"Fix"}]}]}),
         )?;
         assert_eq!(view["workspaces"][0]["label"], "Code");
         assert_eq!(view["tabs"][0]["label"], "Fix");
         assert_eq!(view["panes"][0]["status"], "blocked");
+        assert_eq!(
+            [
+                &view["panes"][0]["role"],
+                &view["panes"][0]["project"],
+                &view["panes"][0]["kind"]
+            ],
+            ["pm", "billing", "codex"]
+        );
+        assert_eq!(
+            [&view["panes"][1]["parent"], &view["panes"][1]["kind"]],
+            ["t1", "claude"]
+        );
         assert_eq!(view["panes"][1]["workspace_id"], "loose");
+        assert_eq!(view["panes"][1]["role"], "");
         Ok(())
     }
     #[test]
