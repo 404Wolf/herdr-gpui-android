@@ -322,9 +322,14 @@ public final class HomeActivity extends Activity {
         for (int i = 0; panes != null && i < Math.min(panes.length(), 1024); i++) {
             JSONObject pane = panes.optJSONObject(i);
             if (pane == null) continue;
+            // A core also lists its federated machines' terminals ("server/t4m").
+            // The home connects to each machine itself, so it shows only each
+            // machine's own terminals, once, under that machine.
+            String id = pane.optString("id");
+            if (id.contains("/")) continue;
             Agent agent = new Agent();
             agent.machine = machine;
-            agent.id = pane.optString("id");
+            agent.id = id;
             agent.title = GpuiTerminalProtocol.title(pane.optString("title", agent.id));
             agent.status = pane.optString("status", "");
             agent.space = pane.optString("workspace_id", "loose");
@@ -333,31 +338,56 @@ public final class HomeActivity extends Activity {
             agent.role = pane.optString("role", "");
             agent.project = pane.optString("project", "");
             agent.kind = pane.optString("kind", "");
+            if ("none".equals(agent.kind)) agent.kind = "";
             agent.cwd = pane.optString("cwd", "");
             flat.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
         }
-        for (Map.Entry<String, List<Agent>> entry : flat.entrySet()) {
-            List<Agent> agents = entry.getValue();
-            Map<String, Agent> byId = new HashMap<>();
-            for (Agent agent : agents) byId.put(agent.id, agent);
-            Map<String, List<Agent>> children = new HashMap<>();
-            List<Agent> roots = new ArrayList<>();
-            for (Agent agent : agents) {
-                if (!agent.parent.isEmpty() && byId.containsKey(agent.parent) && !agent.parent.equals(agent.id)) {
-                    children.computeIfAbsent(agent.parent, key -> new ArrayList<>()).add(agent);
-                } else {
-                    roots.add(agent);
-                }
+        // The hierarchy spans spaces: a deacon's managers and their workers
+        // usually live in their projects' own spaces, yet nest under it here.
+        List<Agent> agents = new ArrayList<>();
+        for (List<Agent> list : flat.values()) agents.addAll(list);
+        Map<String, Agent> byId = new HashMap<>();
+        for (Agent agent : agents) byId.put(agent.id, agent);
+        Map<String, List<Agent>> children = new HashMap<>();
+        Map<String, List<Agent>> roots = new LinkedHashMap<>();
+        for (Agent agent : agents) {
+            if (!agent.parent.isEmpty() && byId.containsKey(agent.parent) && !agent.parent.equals(agent.id)) {
+                children.computeIfAbsent(agent.parent, key -> new ArrayList<>()).add(agent);
+            } else {
+                roots.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
             }
+        }
+        Set<String> seen = new HashSet<>();
+        for (Map.Entry<String, List<Agent>> entry : roots.entrySet()) {
             List<Agent> ordered = new ArrayList<>();
-            Set<String> seen = new HashSet<>();
-            sortAgents(roots);
-            for (Agent root : roots) walk(root, 0, children, ordered, seen);
-            // Parent cycles: anything unvisited still shows, at the top level.
-            for (Agent agent : agents) if (seen.add(agent.id)) { agent.depth = 0; ordered.add(agent); }
+            sortAgents(entry.getValue());
+            for (Agent root : entry.getValue()) walk(root, 0, children, ordered, seen);
             result.put(entry.getKey(), ordered);
         }
+        // Parent cycles: anything unvisited still shows, at the top of its space.
+        for (Agent agent : agents) {
+            if (seen.add(agent.id)) {
+                agent.depth = 0;
+                result.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
+            }
+        }
+        // Busiest spaces first: waiting on Wolf, then failing, then working.
+        List<Map.Entry<String, List<Agent>>> sorted = new ArrayList<>(result.entrySet());
+        Collections.sort(sorted, (a, b) -> Integer.compare(activity(a.getValue()), activity(b.getValue())));
+        Map<String, List<Agent>> ordered = new LinkedHashMap<>();
+        for (Map.Entry<String, List<Agent>> entry : sorted) ordered.put(entry.getKey(), entry.getValue());
+        result = ordered;
         return result;
+    }
+
+    /** Lower is busier: the most urgent status present, then fewer idle agents. */
+    private static int activity(List<Agent> agents) {
+        int best = 5, working = 0;
+        for (Agent agent : agents) {
+            best = Math.min(best, statusPriority(agent.status));
+            if ("working".equals(agent.status)) working++;
+        }
+        return best * 1000 - Math.min(working, 999);
     }
 
     private static void sortAgents(List<Agent> agents) {
@@ -490,7 +520,15 @@ public final class HomeActivity extends Activity {
         }
         // Folded, what needs Wolf sits on top of the tree; unfolded it is the Fleet pane.
         if (!wide()) attention(tree, all, false);
-        for (Machine machine : machines.values()) renderMachine(machine);
+        List<Machine> byActivity = new ArrayList<>(machines.values());
+        Map<Machine, Integer> busy = new HashMap<>();
+        for (Machine machine : byActivity) {
+            List<Agent> agents = new ArrayList<>();
+            for (List<Agent> list : spaces(machine).values()) agents.addAll(list);
+            busy.put(machine, "ready".equals(machine.state) ? activity(agents) : 9000);
+        }
+        Collections.sort(byActivity, (a, b) -> Integer.compare(busy.get(a), busy.get(b)));
+        for (Machine machine : byActivity) renderMachine(machine);
         if (fleet != null && wide()) {
             fleet.removeAllViews();
             fleetOverview(all, counts);
@@ -514,13 +552,22 @@ public final class HomeActivity extends Activity {
         for (List<Agent> list : spaces.values()) agents += list.size();
         boolean closed = collapsed.contains(machine.host.id);
         LinearLayout row = row();
-        row.setPadding(dp(4), dp(8), dp(4), dp(4));
+        row.setPadding(dp(4), dp(7), dp(4), dp(3));
         row.addView(dot(machineColor(machine)));
         TextView name = text(machine.host.name, 14, chrome.onSurface);
         name.setTypeface(Typeface.DEFAULT_BOLD);
         row.addView(name);
+        int waiting = 0, working = 0;
+        for (List<Agent> list : spaces.values()) {
+            for (Agent agent : list) {
+                if (statusPriority(agent.status) <= 1) waiting++;
+                if ("working".equals(agent.status)) working++;
+            }
+        }
         String detail = "ready".equals(machine.state)
                 ? agents + (agents == 1 ? " terminal" : " terminals")
+                        + (working > 0 ? " · " + working + " working" : "")
+                        + (waiting > 0 ? " · " + waiting + " waiting" : "")
                 : machine.status;
         TextView meta = text("  " + (closed ? "▸ " : "") + detail, 11, chrome.onSurfaceVariant);
         meta.setSingleLine(true);
@@ -540,7 +587,7 @@ public final class HomeActivity extends Activity {
             String spaceKey = machine.host.id + "/" + space.getKey();
             boolean spaceClosed = collapsed.contains(spaceKey);
             LinearLayout header = row();
-            header.setPadding(dp(14), dp(5), dp(4), dp(1));
+            header.setPadding(dp(14), dp(4), dp(4), dp(1));
             TextView label = text((spaceClosed ? "▸ " : "") + list.get(0).spaceLabel, 12, chrome.primary);
             label.setSingleLine(true);
             label.setEllipsize(TextUtils.TruncateAt.END);
@@ -571,16 +618,17 @@ public final class HomeActivity extends Activity {
 
     private View agentRow(Agent agent, boolean inTree) {
         LinearLayout row = row();
-        int indent = inTree ? 22 + 12 * agent.depth : 4;
-        row.setPadding(dp(indent), dp(3), dp(4), dp(3));
-        row.setMinimumHeight(dp(30));
+        int indent = inTree ? 20 + 12 * agent.depth : 4;
+        row.setPadding(dp(indent), dp(2), dp(4), dp(2));
+        row.setMinimumHeight(dp(26));
         row.addView(dot(statusColor(agent.status)));
         TextView title = text(inTree ? agent.title : agent.machine.host.name + " › " + agent.spaceLabel
-                + " › " + agent.title, 13, chrome.onSurface);
+                + " › " + agent.title, 12, chrome.onSurface);
         title.setSingleLine(true);
         title.setEllipsize(TextUtils.TruncateAt.END);
         row.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        String tag = !agent.role.isEmpty() ? agent.role : agent.kind;
+        String tag = "deacon".equals(agent.role) || "pm".equals(agent.role) || "worker".equals(agent.role)
+                ? agent.role : agent.kind;
         if (!tag.isEmpty()) {
             TextView meta = text(tag, 10, chrome.onSurfaceVariant);
             meta.setPadding(dp(6), 0, 0, 0);
@@ -632,8 +680,11 @@ public final class HomeActivity extends Activity {
             LinearLayout row = row();
             row.setPadding(dp(4), dp(3), dp(4), dp(3));
             row.addView(dot(machineColor(machine)));
-            TextView line = text(machine.host.name + " · " + (machine.status.isEmpty() ? machine.state : machine.status),
-                    12, chrome.onSurfaceVariant);
+            int count = 0;
+            for (List<Agent> list : spaces(machine).values()) count += list.size();
+            String detail = "ready".equals(machine.state) ? count + (count == 1 ? " terminal" : " terminals")
+                    : machine.status.isEmpty() ? machine.state : machine.status;
+            TextView line = text(machine.host.name + " · " + detail, 12, chrome.onSurfaceVariant);
             line.setSingleLine(true);
             line.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(line, new LinearLayout.LayoutParams(0, -2, 1));

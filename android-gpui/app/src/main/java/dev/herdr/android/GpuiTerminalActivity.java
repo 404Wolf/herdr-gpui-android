@@ -2429,7 +2429,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     && Math.abs(event.getY() - touchDownY) < dp(10)) {
                 Connection target;
                 synchronized (stateLock) { target = connection; }
-                if (target != null && target.ready) nativeShowKeyboard(target.generation);
+                // After the tap itself reaches the renderer: its focus handling
+                // would otherwise hide the keyboard this just asked for.
+                if (target != null && target.ready && terminalSurface != null) {
+                    final long generation = target.generation;
+                    terminalSurface.postDelayed(() -> {
+                        if (!destroyed) nativeShowKeyboard(generation);
+                    }, 150);
+                }
             }
             tapCandidate = false;
             if (edgeClaimed) {
