@@ -502,6 +502,20 @@ final class FleetTree {
         return now - lastAt >= (newFolder ? newMs : everyMs);
     }
 
+    enum StartHealth { WAITING, RUNNING, FAILED }
+
+    /**
+     * A just-launched agent: RUNNING once it reports a status or a non-shell
+     * program runs in it; FAILED when its terminal is gone, or still a plain
+     * shell after {@code limitMs} (claude missing, exit 127, kept as a shell).
+     */
+    static StartHealth startHealth(Member launched, long elapsedMs, long limitMs) {
+        if (launched == null) return StartHealth.FAILED;
+        if (!launched.status.isEmpty()) return StartHealth.RUNNING;
+        if (!launched.program.trim().isEmpty() && running(launched)) return StartHealth.RUNNING;
+        return elapsedMs >= limitMs ? StartHealth.FAILED : StartHealth.WAITING;
+    }
+
     /** A terminal already working in {@code folder} (fresh view, not the git cache), or null. */
     static Member memberAt(List<? extends Member> members, String folder) {
         String root = trimSlash(folder);

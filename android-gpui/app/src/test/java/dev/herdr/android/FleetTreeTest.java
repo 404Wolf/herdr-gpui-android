@@ -145,6 +145,29 @@ public final class FleetTreeTest {
         assertEquals(FleetTree.DeaconAction.OPEN, FleetTree.deaconAction(true, deacon, false));
     }
 
+    @Test public void aDeaconWithClaudeMissingFailsVisiblyAndARetryLaunchesNothing() {
+        FleetTree.Member launched = label(m("t9", "spX", "deacon", 0, 0, "/h/Config", ""), "deacon", "");
+        launched.kind = "claude"; // labelled at birth with the harness
+        // The login shell is still starting claude: wait.
+        launched.program = "zsh";
+        assertEquals(FleetTree.StartHealth.WAITING, FleetTree.startHealth(launched, 3_000, 45_000));
+        // claude: command not found (127); the kept terminal stays a plain shell: failed, not "started".
+        assertEquals(FleetTree.StartHealth.FAILED, FleetTree.startHealth(launched, 45_000, 45_000));
+        // The terminal is gone (exited): failed.
+        assertEquals(FleetTree.StartHealth.FAILED, FleetTree.startHealth(null, 6_000, 45_000));
+        // Retry: the kept shell is still the canonical Deacon, so Start is not offered and nothing launches.
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(launched), null);
+        assertSame(launched, fleet.deacon);
+        assertFalse(FleetTree.running(launched));
+        assertEquals(FleetTree.DeaconAction.OPEN, FleetTree.deaconAction(true, fleet.deacon, false));
+        // A healthy start: claude (through aswap) in the foreground, or a status report.
+        launched.program = "aswap";
+        assertEquals(FleetTree.StartHealth.RUNNING, FleetTree.startHealth(launched, 4_000, 45_000));
+        launched.program = "zsh";
+        launched.status = "idle";
+        assertEquals(FleetTree.StartHealth.RUNNING, FleetTree.startHealth(launched, 4_000, 45_000));
+    }
+
     // ── Projects and managers ───────────────────────────────────────────
 
     @Test public void anExplicitWorkerIsNeverPromotedAndUnlabelledProjectsInferTheirLead() {

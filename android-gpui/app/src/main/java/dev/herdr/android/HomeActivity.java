@@ -76,6 +76,9 @@ public final class HomeActivity extends Activity {
         Set<String> gitAsked = new HashSet<>();
         /** Start Deacon / New project / opening a worktree: in flight, and the last error. */
         boolean deaconBusy, projectBusy;
+        /** A Deacon just launched, not yet confirmed running: its terminal and when. */
+        String deaconPending = "";
+        long deaconPendingAt;
         String deaconError = "", projectError = "";
         final Set<String> opening = new HashSet<>();
         /** Bumped whenever any of the above changes, so the tree redraws. */
@@ -330,6 +333,7 @@ public final class HomeActivity extends Activity {
                     machine.state = state;
                 }
                 render(false);
+                checkDeaconStart(machine);
                 tryReopen(machine);
             });
         });
@@ -772,7 +776,11 @@ public final class HomeActivity extends Activity {
         FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
         boolean ready = "ready".equals(machine.state);
         boolean closed = collapsed.contains(machine.host.id);
-        if (fleet.deacon != null && deaconGuard(machine) > 0) clearDeaconGuard(machine);
+        if (fleet.deacon != null && deaconGuard(machine) > 0 && machine.deaconPending.isEmpty()) clearDeaconGuard(machine);
+        // Claude runs there again (Wolf started it): the failure no longer applies.
+        if (fleet.deacon != null && machine.deaconPending.isEmpty() && !fleet.deacon.status.isEmpty()) {
+            machine.deaconError = "";
+        }
         maybeLookGit(machine, all, ready, closed);
 
         LinearLayout row = row();
@@ -799,7 +807,10 @@ public final class HomeActivity extends Activity {
         row.addView(meta, new LinearLayout.LayoutParams(0, -2, 1));
         // The machine's one Deacon, a tap away; or the way to start it.
         switch (FleetTree.deaconAction(ready, fleet.deacon, machine.deaconBusy || deaconGuard(machine) > 0)) {
-            case OPEN: row.addView(chip("Deacon", true, () -> openAgent((Agent) fleet.deacon))); break;
+            case OPEN:
+                if (!machine.deaconPending.isEmpty()) row.addView(chip("Starting…", false, null));
+                else row.addView(chip("Deacon", true, () -> openAgent((Agent) fleet.deacon)));
+                break;
             case START: row.addView(chip("Start Deacon", true, () -> startDeacon(machine))); break;
             case STARTING: row.addView(chip("Starting…", false, null)); break;
             default: break;
@@ -886,11 +897,14 @@ public final class HomeActivity extends Activity {
         Row top;
         if (fleet.deacon != null) {
             Agent deacon = (Agent) fleet.deacon;
-            if (!FleetTree.running(deacon)) {
-                // Its claude ended: the kept terminal is a shell now. Say so; never start a second.
-                rows.add(new Row((guide, self) -> actionLine(guide, null, "!", "Claude isn't running in the Deacon's"
-                        + " terminal on " + machine.host.name + ". Open it and start claude there.", chrome.danger,
-                        () -> openAgent(deacon))));
+            if (deacon.id.equals(machine.deaconPending)) {
+                rows.add(new Row((guide, self) -> actionLine(guide, null, "◆", "Starting the Deacon on "
+                        + machine.host.name + "…", chrome.onSurfaceVariant, null)));
+            } else if (!machine.deaconError.isEmpty() || !FleetTree.running(deacon)) {
+                // Its claude ended or never started: the kept terminal is a shell. Say so; never start a second.
+                String said = machine.deaconError.isEmpty() ? notRunning(machine) : machine.deaconError;
+                rows.add(new Row((guide, self) -> actionLine(guide, null, "!", said + ". Tap to open it.",
+                        chrome.danger, () -> openAgent(deacon))));
             }
             top = new Row((guide, self) -> agentLine(guide, deacon, "deacon", null));
             for (FleetTree.Member helper : fleet.helpers) top.kids.add(agentTree(m, new FleetTree.AgentNode(helper), null));
@@ -1270,15 +1284,80 @@ public final class HomeActivity extends Activity {
             final boolean fresh = started;
             main.post(() -> {
                 if (destroyed) return;
+                if (address.isEmpty()) {
+                    machine.deaconBusy = false;
+                    clearDeaconGuard(machine);
+                    machine.deaconError = reason == null ? "it did not answer" : reason;
+                    machine.ui++;
+                    render(true);
+                    return;
+                }
+                if (reason != null) machine.deaconError = reason;
+                if (fresh) {
+                    // Launched: "Starting…" until claude is seen running there (checkDeaconStart).
+                    machine.deaconPending = address;
+                    machine.deaconPendingAt = System.currentTimeMillis();
+                    machine.ui++;
+                    render(true);
+                    return;
+                }
+                // An existing Deacon: open it; a kept shell gets a recovery message, not "found".
                 machine.deaconBusy = false;
-                if (reason != null && address.isEmpty()) clearDeaconGuard(machine);
-                machine.deaconError = reason == null ? "" : reason;
+                FleetTree.Member found = null;
+                for (Agent agent : members(machine)) if (agent.id.equals(address)) found = agent;
+                if (found != null && !FleetTree.running(found)) {
+                    machine.deaconError = notRunning(machine);
+                } else if (reason == null) {
+                    machine.deaconError = "";
+                }
                 machine.ui++;
-                note = reason == null ? (fresh ? "Started the Deacon on " : "Found the Deacon on ") + machine.host.name : null;
                 render(true);
-                if (!address.isEmpty() && machine.handle == handle) openTerminal(machine, address, "Deacon");
+                if (machine.handle == handle) openTerminal(machine, address, "Deacon");
             });
         });
+    }
+
+    /** How long a new Deacon has to show claude running before it counts as failed. */
+    private static final long DEACON_START_MS = 45_000;
+
+    private static String notRunning(Machine machine) {
+        return "The Deacon's terminal on " + machine.host.name + " is open, but claude isn't running in it."
+                + " Start claude there, or check that it is installed";
+    }
+
+    /**
+     * A launched Deacon is confirmed by what the core reports: a status or a
+     * non-shell program in it. Gone, or still a plain shell after
+     * DEACON_START_MS, it failed; its terminal keeps the role, so a retry
+     * finds it instead of launching a second.
+     */
+    private void checkDeaconStart(Machine machine) {
+        if (machine.deaconPending.isEmpty() || !"ready".equals(machine.state)) return;
+        FleetTree.Member launched = null;
+        for (Agent agent : members(machine)) if (agent.id.equals(machine.deaconPending)) launched = agent;
+        // Not in the list yet right after launch is not "gone": give the view a few polls.
+        long elapsed = System.currentTimeMillis() - machine.deaconPendingAt;
+        if (launched == null && elapsed < 5_000) return;
+        FleetTree.StartHealth health = FleetTree.startHealth(launched, elapsed, DEACON_START_MS);
+        if (health == FleetTree.StartHealth.WAITING) return;
+        String address = machine.deaconPending;
+        machine.deaconPending = "";
+        machine.deaconBusy = false;
+        if (health == FleetTree.StartHealth.RUNNING) {
+            machine.deaconError = "";
+            note = "Started the Deacon on " + machine.host.name;
+            clearDeaconGuard(machine);
+        } else {
+            machine.deaconError = launched == null
+                    ? "The Deacon on " + machine.host.name + " stopped right away. Check that claude is installed"
+                            + " and signed in there"
+                    : "The Deacon's terminal opened on " + machine.host.name + ", but claude didn't start in it."
+                            + " Check that claude is installed there";
+            clearDeaconGuard(machine);
+        }
+        machine.ui++;
+        render(true);
+        if (launched != null) openTerminal(machine, address, "Deacon");
     }
 
     /**
