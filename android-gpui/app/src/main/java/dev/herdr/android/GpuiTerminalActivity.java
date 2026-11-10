@@ -2264,121 +2264,410 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             order.add(note);
             return;
         }
-        // Spaces read as repo → worktrees, like the desktop sidebar: a worktree
-        // space (~/.herdr/worktrees/<repo>/<name>) follows its repo's own space.
-        java.util.Map<String, String> repos = RailTree.repos(panes);
-        java.util.Map<String, String> labels = RailTree.labels(workspaces, tabs, panes);
-        java.util.List<JSONObject> ordered = RailTree.order(workspaces, repos);
-        java.util.Set<String> repoNames = new java.util.HashSet<>();
-        for (JSONObject workspace : ordered) {
-            if (!repos.containsKey(workspace.optString("id", ""))) {
-                repoNames.add(workspace.optString("label", ""));
-            }
-        }
-        // Repos with worktrees under them fold; the path to the window on
-        // screen always stays open.
-        java.util.Map<String, Integer> worktreeCounts = new java.util.HashMap<>();
-        for (String repoName : repos.values()) {
-            if (repoNames.contains(repoName)) worktreeCounts.merge(repoName, 1, Integer::sum);
-        }
-        String activeGroup = null, activeSpace = null;
-        if (live && current != null) {
-            for (int q = 0; q < panes.length(); q++) {
-                JSONObject pane = panes.optJSONObject(q);
-                if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
-                String space = pane.optString("workspace_id", "");
-                activeSpace = space;
-                String r = repos.get(space);
-                if (r != null) activeGroup = r;
-                for (int w = 0; w < workspaces.length() && activeGroup == null; w++) {
-                    JSONObject item = workspaces.optJSONObject(w);
-                    if (item != null && space.equals(item.optString("id"))) activeGroup = item.optString("label", "");
+        // The same tree as Home (FleetTree via FleetPanes): this machine's
+        // Deacon, each project once under its PM, every terminal in the row of
+        // its own checkout, unopened worktrees once per repo, leftovers kept.
+        java.util.List<FleetTree.Member> members = FleetPanes.members(workspaces, tabs, panes, FleetTree.Member::new);
+        railSpaceOf.clear();
+        for (FleetTree.Member m : members) railSpaceOf.put(m.id, m.space);
+        if (live && current != null) maybeRailGitLook(host, current, members);
+        FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
+        String selectedPane = live && current != null ? current.paneId : "";
+        // Arriving at a window (a tap, Home, a notification) opens its folds once.
+        if (!selectedPane.isEmpty() && !selectedPane.equals(unfoldedFor)) {
+            unfoldedFor = selectedPane;
+            boolean changed = false;
+            for (FleetTree.Project project : fleet.projects) {
+                for (FleetTree.SpaceNode row : project.entries) {
+                    if (!containsMember(row.members, selectedPane) && (project.pm == null
+                            || !project.pm.id.equals(selectedPane))) continue;
+                    changed |= collapsedRepos().remove(railKey(host, "p/" + project.name));
+                    changed |= collapsedRepos().remove(railKey(host, "s/" + row.key));
                 }
             }
-        }
-        // Arriving at a window (a tap, Home's needs-you list, a notification)
-        // opens its folded repo once; folding it again afterwards sticks.
-        if (live && current != null && activeGroup != null && !current.paneId.equals(unfoldedFor)) {
-            unfoldedFor = current.paneId;
-            boolean spaceOpened = activeSpace != null && collapsedRepos().remove(RailTree.spaceFoldKey(host.id,
-                    labels.getOrDefault(activeSpace, activeSpace)));
-            if (collapsedRepos().remove(host.id + "/" + activeGroup) | spaceOpened) {
+            if (changed) {
                 getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
                         .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
             }
         }
-        for (JSONObject workspace : ordered) {
-            String workspaceId = workspace.optString("id", "");
-            String workspaceLabel = chromeTitle(labels.getOrDefault(workspaceId,
-                    workspace.optString("label", "")), workspaceId);
-            String repo = repos.get(workspaceId);
-            // Indented only under a repo the rail actually shows.
-            boolean nested = repo != null && repoNames.contains(repo);
-            String group = repo != null ? repo : workspace.optString("label", "");
-            String groupKey = host.id + "/" + group;
-            int worktreesUnder = repo == null ? worktreeCounts.getOrDefault(group, 0) : 0;
-            boolean folded = (nested || worktreesUnder > 0) && collapsedRepos().contains(groupKey);
-            if (nested && folded) continue;
-            // Every other header (a worktree, a plain space) folds its own
-            // windows; remembered by its name, which outlives a daemon restart.
-            String spaceKey = worktreesUnder > 0 ? null : RailTree.spaceFoldKey(host.id,
-                    labels.getOrDefault(workspaceId, workspaceId));
-            String workspaceKey = "ws:" + host.id + "/" + workspaceId;
-            keep.add(workspaceKey);
-            RailWorkspaceRow workspaceRow = railWorkspaces.get(workspaceKey);
-            if (workspaceRow == null) {
-                workspaceRow = createRailWorkspaceRow();
-                railWorkspaces.put(workspaceKey, workspaceRow);
+        updateRailFleetButtons(header, host, live, current, fleet);
+        FleetTree.Member deacon = fleet.deacon;
+        if (deacon != null) {
+            railAgent(host, live, current, deacon, "Deacon · ", 0, selectedPane, order, keep);
+            String pending = railDeaconPending.getOrDefault(host.id, "");
+            if (deacon.id.equals(pending)) {
+                railNote(host, "deacon-state", "Starting the Deacon…", chrome.onSurfaceVariant, 1, null, order, keep);
+            } else if (!FleetTree.running(deacon)) {
+                railNote(host, "deacon-state", "Claude isn't running in the Deacon's terminal. Tap to open it.",
+                        chrome.danger, 1, () -> openRailPane(host, live, current, deacon.id), order, keep);
             }
-            // Orientation on a long rail: mark the space that holds the
-            // focused pane, not just the pane itself.
-            boolean holdsSelection = false;
-            String firstPane = "";
-            java.util.Set<String> windows = new java.util.HashSet<>();
-            int waiting = 0, working = 0;
-            for (int q = 0; q < panes.length(); q++) {
-                JSONObject pane = panes.optJSONObject(q);
-                if (pane == null || !workspaceId.equals(pane.optString("workspace_id", ""))) continue;
-                String paneId = pane.optString("id", "");
-                if (firstPane.isEmpty()) firstPane = paneId;
-                windows.add(pane.optString("tab_id", paneId));
-                String status = pane.optString("status", "");
-                if ("blocked".equals(status) || "error".equals(status)) waiting++;
-                if ("working".equals(status)) working++;
-                if (live && current != null && current.paneId.equals(paneId)) holdsSelection = true;
-            }
-            boolean windowsFolded = spaceKey != null && !windows.isEmpty() && collapsedRepos().contains(spaceKey);
-            workspaceRow.foldKey = worktreesUnder > 0 ? groupKey : windows.isEmpty() ? null : spaceKey;
-            workspaceRow.folded = folded || windowsFolded;
-            updateRailWorkspaceRow(workspaceRow, host, workspaceLabel, live, current, workspaceId,
-                    firstPane, holdsSelection, nested, windows.size(), waiting, working);
-            String mark = folded || windowsFolded ? "▸" : workspaceRow.foldKey != null ? "▾" : "▪";
-            if (!mark.contentEquals(workspaceRow.mark.getText())) workspaceRow.mark.setText(mark);
-            String folds = folded ? "  +" + worktreesUnder + " wt" : "";
-            if (!folds.isEmpty() && !workspaceRow.meta.getText().toString().endsWith(folds)) {
-                workspaceRow.meta.append(folds);
-            }
-            order.add(workspaceRow.row);
-            if (folded || windowsFolded) continue;
-            for (int p = 0; p < panes.length(); p++) {
-                JSONObject pane = panes.optJSONObject(p);
-                if (pane == null || !workspaceId.equals(pane.optString("workspace_id", ""))) continue;
-                String paneId = pane.optString("id", "");
-                String title = RailTree.withoutSpace(RailTree.fallbackTitle(
-                        chromeTitle(pane.optString("title", ""), paneId), pane), workspaceLabel);
-                boolean selected = live && current != null && paneId.equals(current.paneId);
-                String paneKey = "pane:" + host.id + "/" + paneId;
-                keep.add(paneKey);
-                RailPaneRow row = railPanes.get(paneKey);
-                if (row == null) {
-                    row = createRailPaneRow();
-                    railPanes.put(paneKey, row);
+            railNote(host, "new-project", "+ New project (asks the Deacon)", chrome.primary, 1,
+                    () -> railNewProject(host, live, current, deacon), order, keep);
+        } else {
+            String why = !live ? "No Deacon. Switch to " + host.name + " to start one."
+                    : railDeaconBusy.contains(host.id) ? "Starting the Deacon…"
+                    : "◆ No Deacon on this computer. Tap to start one.";
+            railNote(host, "deacon-state", why, chrome.onSurfaceVariant, 0,
+                    live && !railDeaconBusy.contains(host.id) ? () -> railStartDeacon(host, current) : null,
+                    order, keep);
+        }
+        int base = deacon != null ? 1 : 0;
+        for (FleetTree.Project project : fleet.projects) {
+            String projectKey = railKey(host, "p/" + project.name);
+            boolean projectFolded = collapsedRepos().contains(projectKey);
+            String tally = (project.tally[0] > 0 ? project.tally[0] + "! " : "")
+                    + (project.tally[2] > 0 ? project.tally[2] + "▶ " : "") + project.agents();
+            String firstPane = project.pm != null ? project.pm.id : firstMember(project);
+            railHeader(host, live, current, "proj:" + project.name, project.name
+                    + (project.pm == null ? " · no project manager" : ""), tally, projectKey, projectFolded,
+                    base, firstPane, order, keep);
+            if (projectFolded) continue;
+            if (project.pm != null) railAgent(host, live, current, project.pm, "PM · ", base + 1, selectedPane, order, keep);
+            boolean flat = project.entries.size() == 1 && project.pm != null
+                    && project.entries.get(0).spaces.contains(project.pm.space);
+            for (FleetTree.SpaceNode row : project.entries) {
+                int depth = base + 1;
+                if (!flat) {
+                    String rowKey = railKey(host, "s/" + row.key);
+                    boolean rowFolded = collapsedRepos().contains(rowKey);
+                    String sub = row.branch.isEmpty() || row.branch.equals(row.name) ? "" : row.branch + " · ";
+                    railHeader(host, live, current, "row:" + row.key, (row.worktree ? "⑂ " : "") + row.name,
+                            sub + row.members.size(), row.members.isEmpty() ? null : rowKey, rowFolded, depth,
+                            row.members.isEmpty() ? "" : row.members.get(0).id, order, keep);
+                    if (rowFolded) continue;
+                    depth++;
                 }
-                updateRailPaneRow(row, host, live, current, paneId, title,
-                        pane.optString("status", "unknown"), selected, nested);
-                order.add(row.row);
+                for (FleetTree.AgentNode node : row.agents) railAgentTree(host, live, current, node, depth, selectedPane, order, keep);
+            }
+            for (FleetTree.GitWorktree wt : project.closed) {
+                String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
+                railNote(host, "closed:" + wt.path, "○ " + name, chrome.onSurfaceVariant, base + 1,
+                        live ? () -> railClosedWorktree(host, current, deacon, wt, name) : null, order, keep);
+            }
+            if (project.closedMore > 0) {
+                railNote(host, "closed-more:" + project.name, "○ +" + project.closedMore + " more worktrees",
+                        chrome.onSurfaceVariant, base + 1, null, order, keep);
             }
         }
+        if (!fleet.loose.isEmpty()) {
+            String key = railKey(host, "spaces");
+            boolean folded = !collapsedRepos().contains(key + ":open");
+            railHeader(host, live, current, "group:spaces", "Spaces", String.valueOf(fleet.loose.size()),
+                    key + ":open", folded, base, "", order, keep);
+            if (!folded) {
+                for (FleetTree.SpaceNode node : fleet.loose) {
+                    for (FleetTree.Member m : node.members) railAgent(host, live, current, m, "", base + 1, selectedPane, order, keep);
+                }
+            }
+        }
+        if (!fleet.others.isEmpty()) {
+            String key = railKey(host, "others");
+            boolean folded = collapsedRepos().contains(key);
+            railHeader(host, live, current, "group:others", "Other agents", String.valueOf(fleet.others.size()),
+                    key, folded, base, "", order, keep);
+            if (!folded) {
+                for (FleetTree.Member m : fleet.others) {
+                    railAgent(host, live, current, m, "deacon".equals(m.role) ? "Another deacon · " : "",
+                            base + 1, selectedPane, order, keep);
+                }
+            }
+        }
+    }
+
+    private static boolean containsMember(java.util.List<FleetTree.Member> list, String id) {
+        for (FleetTree.Member m : list) if (m.id.equals(id)) return true;
+        return false;
+    }
+
+    private static String firstMember(FleetTree.Project project) {
+        for (FleetTree.SpaceNode row : project.entries) if (!row.members.isEmpty()) return row.members.get(0).id;
+        return "";
+    }
+
+    /** Rail fold keys: per machine, apart from the old repo/space keys. */
+    private static String railKey(SavedRemoteHost host, String what) {
+        return host.id + "/fleet/" + what;
+    }
+
+    private void railAgentTree(SavedRemoteHost host, boolean live, Connection current, FleetTree.AgentNode node,
+            int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
+        railAgent(host, live, current, node.member, "", depth, selectedPane, order, keep);
+        for (FleetTree.AgentNode kid : node.children) railAgentTree(host, live, current, kid, depth + 1, selectedPane, order, keep);
+    }
+
+    /** One agent row: tapping focuses that exact terminal. */
+    private void railAgent(SavedRemoteHost host, boolean live, Connection current, FleetTree.Member m, String prefix,
+            int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
+        String paneKey = "pane:" + host.id + "/" + m.id;
+        if (!keep.add(paneKey)) return; // each terminal once
+        RailPaneRow row = railPanes.get(paneKey);
+        if (row == null) {
+            row = createRailPaneRow();
+            railPanes.put(paneKey, row);
+        }
+        String title = prefix + chromeTitle(FleetPanes.displayTitle(m), m.id);
+        updateRailPaneRow(row, host, live, current, m.id, title, m.status.isEmpty() ? "unknown" : m.status,
+                m.id.equals(selectedPane), depth > 0);
+        int pad = dp(10 + 12 * depth);
+        if (row.row.getPaddingLeft() != pad) row.row.setPadding(pad, dp(1), dp(6), dp(1));
+        if (!prefix.isEmpty() != (row.title.getTypeface() != null && row.title.getTypeface().isBold())) {
+            row.title.setTypeface(android.graphics.Typeface.create("sans-serif-medium",
+                    prefix.isEmpty() ? android.graphics.Typeface.NORMAL : android.graphics.Typeface.BOLD));
+        }
+        order.add(row.row);
+    }
+
+    /** A project, checkout or group header: folds when it has a key, else opens its first terminal. */
+    private void railHeader(SavedRemoteHost host, boolean live, Connection current, String id, String label,
+            String meta, String foldKey, boolean folded, int depth, String firstPane,
+            java.util.List<View> order, java.util.Set<String> keep) {
+        String key = "fleet:" + host.id + "/" + id;
+        keep.add(key);
+        RailWorkspaceRow row = railWorkspaces.get(key);
+        if (row == null) {
+            row = createRailWorkspaceRow();
+            railWorkspaces.put(key, row);
+        }
+        row.host = host;
+        row.live = live;
+        row.connection = current;
+        row.firstPane = firstPane;
+        row.workspaceId = railSpaceOf.getOrDefault(firstPane, "");
+        row.foldKey = foldKey;
+        row.folded = folded;
+        if (!label.contentEquals(row.label.getText())) row.label.setText(label);
+        if (!meta.contentEquals(row.meta.getText())) row.meta.setText(meta);
+        String mark = foldKey == null ? "▪" : folded ? "▸" : "▾";
+        if (!mark.contentEquals(row.mark.getText())) row.mark.setText(mark);
+        int pad = dp(2 + 12 * depth);
+        if (row.row.getPaddingLeft() != pad) {
+            row.row.setPadding(pad, dp(2), dp(4), dp(2));
+            boolean top = depth == 0 || id.startsWith("proj:");
+            row.label.setTextSize(top ? 13 : 12);
+            row.label.setTypeface(android.graphics.Typeface.create(top ? "sans-serif-medium" : "sans-serif",
+                    top ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL));
+            row.label.setTextColor(top ? chrome.onSurface : chrome.primary);
+        }
+        String described = (foldKey == null ? "Open " : folded ? "Unfold " : "Fold ") + label + ", " + meta;
+        if (!described.contentEquals(row.row.getContentDescription() == null ? "" : row.row.getContentDescription())) {
+            row.row.setContentDescription(described);
+        }
+        order.add(row.row);
+    }
+
+    /** A one-line rail action or state, reused by key. */
+    private void railNote(SavedRemoteHost host, String id, String text, int color, int depth, Runnable action,
+            java.util.List<View> order, java.util.Set<String> keep) {
+        String key = "fleetnote:" + host.id + "/" + id;
+        keep.add(key);
+        TextView note = railNotes.get(key);
+        if (note == null) {
+            note = railText("", 12, color);
+            note.setSingleLine(true);
+            note.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            note.setMinHeight(dp(28));
+            note.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            note.setBackground(railBackground(false));
+            railNotes.put(key, note);
+        }
+        if (!text.contentEquals(note.getText())) {
+            note.setText(text);
+            note.setContentDescription(text);
+        }
+        note.setTextColor(color);
+        note.setPadding(dp(10 + 12 * depth), dp(1), dp(6), dp(1));
+        note.setOnClickListener(action == null ? null : v -> action.run());
+        note.setClickable(action != null);
+        order.add(note);
+    }
+
+    // ── Rail Fleet actions (explicit taps only) ─────────────────────────
+
+    /** Each terminal's space, for the rail's header long-press menus. */
+    private final java.util.Map<String, String> railSpaceOf = new java.util.HashMap<>();
+    private final java.util.Map<String, String> railDeaconPending = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<String, Long> railDeaconPendingAt = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Set<String> railDeaconBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.Set<String> railGitBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.Map<String, java.util.Set<String>> railGitAsked = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void openRailPane(SavedRemoteHost host, boolean live, Connection current, String paneId) {
+        if (live && current != null) focusRemotePane(current, paneId);
+        else switchHost(host, paneId);
+        closeRailDrawer();
+    }
+
+    /** The machine header's ◆ (its Deacon) and + (New project, or Start Deacon first). */
+    private void updateRailFleetButtons(RailHostRow header, SavedRemoteHost host, boolean live, Connection current,
+            FleetTree.Fleet fleet) {
+        FleetTree.Member deacon = fleet.deacon;
+        boolean busy = railDeaconBusy.contains(host.id) || railDeaconPending.containsKey(host.id);
+        FleetTree.DeaconAction action = FleetTree.deaconAction(live, deacon, busy);
+        String deaconText = action == FleetTree.DeaconAction.OPEN ? "◆" : action == FleetTree.DeaconAction.START
+                ? "Start Deacon" : action == FleetTree.DeaconAction.STARTING ? "Starting…" : "";
+        if (!deaconText.contentEquals(header.deacon.getText())) header.deacon.setText(deaconText);
+        header.deacon.setVisibility(deaconText.isEmpty() ? View.GONE : View.VISIBLE);
+        header.deacon.setContentDescription(deacon != null ? "Open the Deacon on " + host.name : "Start the Deacon on " + host.name);
+        header.deacon.setOnClickListener(v -> {
+            if (deacon != null) openRailPane(host, live, current, deacon.id);
+            else if (live && !busy) railStartDeacon(host, current);
+        });
+        header.plus.setVisibility(live || deacon != null ? View.VISIBLE : View.GONE);
+        header.plus.setContentDescription(deacon != null ? "New project on " + host.name + ": ask its Deacon"
+                : "New project on " + host.name + ": start its Deacon first");
+        header.plus.setOnClickListener(v -> {
+            if (deacon != null) railNewProject(host, live, current, deacon);
+            else if (live && !busy) railStartDeacon(host, current);
+        });
+    }
+
+    /** Runs one session action off the main thread; ok gets the reply on the main thread. */
+    private void railAction(Connection target, String json, String label,
+            java.util.function.Consumer<JSONObject> ok, Runnable failed) {
+        actionWorker.execute(() -> {
+            JSONObject result = null;
+            String failure = null;
+            try {
+                result = new JSONObject(RemoteNative.sessionAction(target.remoteHandle, json));
+                if (!result.optBoolean("queued", false)) failure = result.optString("error", "it did not answer");
+            } catch (Exception | LinkageError error) {
+                failure = "the computer did not answer";
+            }
+            final JSONObject reply = result;
+            final String reason = failure;
+            main.post(() -> {
+                if (destroyed) return;
+                if (reason == null) { ok.accept(reply); return; }
+                if (failed != null) failed.run();
+                Toast.makeText(this, "Could not " + label + ": " + reason, Toast.LENGTH_LONG).show();
+            });
+        });
+    }
+
+    private void railStartDeacon(SavedRemoteHost host, Connection current) {
+        if (current == null || !railDeaconBusy.add(host.id)) return;
+        refreshSidebar(true);
+        String json;
+        try {
+            json = new JSONObject().put("op", "deacon.start").put("name", host.name).toString();
+        } catch (JSONException impossible) { return; }
+        railAction(current, json, "start the Deacon", reply -> {
+            railDeaconBusy.remove(host.id);
+            String terminal = reply.optString("terminal", "");
+            if (!reply.optString("layout_error", "").isEmpty()) {
+                Toast.makeText(this, "The Deacon started, but " + reply.optString("layout_error"), Toast.LENGTH_LONG).show();
+            }
+            if (reply.optBoolean("started", false) && !terminal.isEmpty()) {
+                // Starting… until claude is seen running there (checkRailDeacon).
+                railDeaconPending.put(host.id, terminal);
+                railDeaconPendingAt.put(host.id, System.currentTimeMillis());
+            } else if (!terminal.isEmpty()) {
+                focusRemotePane(current, terminal);
+            }
+            refreshSidebar(true);
+        }, () -> { railDeaconBusy.remove(host.id); refreshSidebar(true); });
+    }
+
+    /** Confirms a launched Deacon from the live view, as Home does; never relaunches. */
+    private void checkRailDeacon(SavedRemoteHost host, Connection current, java.util.List<FleetTree.Member> members) {
+        String pending = railDeaconPending.get(host.id);
+        if (pending == null) return;
+        FleetTree.Member launched = null;
+        for (FleetTree.Member m : members) if (m.id.equals(pending)) launched = m;
+        long elapsed = System.currentTimeMillis() - railDeaconPendingAt.getOrDefault(host.id, 0L);
+        if (launched == null && elapsed < 5_000) return;
+        FleetTree.StartHealth health = FleetTree.startHealth(launched, elapsed, 45_000);
+        if (health == FleetTree.StartHealth.WAITING) return;
+        railDeaconPending.remove(host.id);
+        if (health == FleetTree.StartHealth.FAILED) {
+            Toast.makeText(this, launched == null
+                    ? "The Deacon on " + host.name + " stopped right away. Check that claude is installed and signed in there."
+                    : "The Deacon's terminal opened on " + host.name + ", but claude didn't start in it.",
+                    Toast.LENGTH_LONG).show();
+        }
+        if (launched != null) main.post(() -> focusRemotePane(current, pending));
+    }
+
+    private void railNewProject(SavedRemoteHost host, boolean live, Connection current, FleetTree.Member deacon) {
+        if (!live || current == null) { switchHost(host, deacon.id); closeRailDrawer(); return; }
+        railSendToDeacon(current, deacon, FleetTree.newProjectPrompt(host.name));
+    }
+
+    private void railSendToDeacon(Connection current, FleetTree.Member deacon, String text) {
+        String json;
+        try {
+            json = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
+        } catch (JSONException impossible) { return; }
+        railAction(current, json, "reach the Deacon", reply -> {
+            focusRemotePane(current, deacon.id);
+            closeRailDrawer();
+        }, null);
+    }
+
+    /** An unopened worktree: work goes through the Deacon; a plain shell is the second choice. */
+    private void railClosedWorktree(SavedRemoteHost host, Connection current, FleetTree.Member deacon,
+            FleetTree.GitWorktree wt, String name) {
+        if (current == null) return;
+        java.util.List<FleetTree.Member> now = FleetPanes.members(current.workspaces, current.tabs, current.panes,
+                FleetTree.Member::new);
+        FleetTree.Member there = FleetTree.memberAt(now, wt.path);
+        if (there != null) { focusRemotePane(current, there.id); closeRailDrawer(); return; }
+        ActionSheet sheet = new ActionSheet(this, chrome, name);
+        if (deacon != null) {
+            sheet.add("Ask the Deacon to start work here", () -> railSendToDeacon(current, deacon,
+                    "I want to work in the " + name.replaceAll("\\p{Cntrl}", "") + " worktree ("
+                            + wt.path.replaceAll("\\p{Cntrl}", "") + ") on " + host.name
+                            + ". Help me set up a worker there."));
+        } else {
+            sheet.add("Start the Deacon first", () -> railStartDeacon(host, current));
+        }
+        sheet.add("Open a plain shell there", () -> {
+            String json;
+            try {
+                json = new JSONObject().put("op", "space.open").put("folder", wt.path).toString();
+            } catch (JSONException impossible) { return; }
+            railAction(current, json, "open " + name, reply -> {
+                String terminal = reply.optString("terminal", "");
+                if (!terminal.isEmpty()) { focusRemotePane(current, terminal); closeRailDrawer(); }
+            }, null);
+        });
+        sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", wt.path));
+        sheet.show();
+    }
+
+    /** The live machine's git look, shared with Home; same pacing rules. */
+    private void maybeRailGitLook(SavedRemoteHost host, Connection current, java.util.List<FleetTree.Member> members) {
+        checkRailDeacon(host, current, members);
+        java.util.Set<String> paths = FleetPanes.gitPaths(members);
+        if (paths.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        java.util.Set<String> asked = railGitAsked.getOrDefault(host.id, java.util.Collections.emptySet());
+        boolean fresh = !asked.containsAll(paths);
+        long at = FleetPanes.LOOKED_AT.getOrDefault(host.id, 0L);
+        if (!FleetTree.gitDue(true, false, railGitBusy.contains(host.id), fresh, now, at, 300_000, 15_000)) return;
+        if (!railGitBusy.add(host.id)) return;
+        FleetPanes.LOOKED_AT.put(host.id, now);
+        String json;
+        try {
+            json = new JSONObject().put("op", "git.look").put("paths", new JSONArray(paths)).toString();
+        } catch (JSONException impossible) { railGitBusy.remove(host.id); return; }
+        actionWorker.execute(() -> {
+            FleetTree.GitLook look = null;
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(current.remoteHandle, json));
+                if (result.optBoolean("queued", false)) look = FleetTree.parseGitLook(result.optString("text", ""), 200);
+            } catch (Exception | LinkageError ignored) {
+                look = null;
+            }
+            final FleetTree.GitLook answer = look;
+            main.post(() -> {
+                railGitBusy.remove(host.id);
+                if (destroyed || answer == null) return;
+                FleetPanes.LOOKS.put(host.id, answer);
+                railGitAsked.put(host.id, paths);
+                refreshSidebar(true);
+            });
+        });
     }
 
     /** Moves reused rows into their new positions without touching rows that already sit there. */
@@ -2444,6 +2733,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         LinearLayout.LayoutParams hostStateParams = new LinearLayout.LayoutParams(-2, -2);
         hostStateParams.leftMargin = dp(6);
         holder.row.addView(holder.state, hostStateParams);
+        holder.deacon = railText("", 11, chrome.primary);
+        holder.plus = railText("+", 15, chrome.primary);
+        for (TextView button : new TextView[] {holder.deacon, holder.plus}) {
+            button.setGravity(android.view.Gravity.CENTER);
+            button.setMinWidth(dp(28));
+            button.setMinHeight(dp(28));
+            button.setPadding(dp(6), 0, dp(6), 0);
+            button.setBackground(railBackground(false));
+            LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(-2, -2);
+            buttonParams.leftMargin = dp(4);
+            holder.row.addView(button, buttonParams);
+        }
         holder.host = host;
         holder.row.setContentDescription("Connect to " + host.name);
         holder.row.setOnClickListener(view -> {
@@ -2839,6 +3140,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         View dot;
         TextView name;
         TextView state;
+        /** The machine's Deacon (◆, or Start Deacon) and New project (+). */
+        TextView deacon, plus;
         String hostState = "";
         SavedRemoteHost host;
         String status;

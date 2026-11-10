@@ -368,62 +368,16 @@ public final class HomeActivity extends Activity {
         if (machine.view == null) return result;
         JSONArray panes = machine.view.optJSONArray("panes");
         JSONArray workspaces = machine.view.optJSONArray("workspaces");
-        Map<String, String> labels = new HashMap<>();
-        Map<String, Integer> spaceIndex = new HashMap<>();
-        for (int i = 0; workspaces != null && i < workspaces.length(); i++) {
-            JSONObject space = workspaces.optJSONObject(i);
-            if (space == null) continue;
-            labels.put(space.optString("id"), space.optString("label", ""));
-            spaceIndex.put(space.optString("id"), i);
-        }
-        // Tab order within each space: the PM fallback is the first tab's agent.
-        Map<String, Integer> tabIndex = new HashMap<>();
         JSONArray tabs = machine.view.optJSONArray("tabs");
-        Map<String, Integer> perSpace = new HashMap<>();
-        for (int i = 0; tabs != null && i < tabs.length(); i++) {
-            JSONObject tab = tabs.optJSONObject(i);
-            if (tab == null) continue;
-            String space = tab.optString("workspace_id");
-            int at = perSpace.merge(space, 1, Integer::sum) - 1;
-            tabIndex.put(space + "\n" + tab.optString("id"), at);
-        }
         Map<String, List<Agent>> flat = new LinkedHashMap<>();
-        for (int i = 0; panes != null && i < Math.min(panes.length(), 1024); i++) {
-            JSONObject pane = panes.optJSONObject(i);
-            if (pane == null) continue;
-            // A core also lists its federated machines' terminals ("server/t4m").
-            // The home connects to each machine itself, so it shows only each
-            // machine's own terminals, once, under that machine.
-            String id = pane.optString("id");
-            if (id.contains("/")) continue;
-            Agent agent = new Agent();
+        // The same adapter as the terminal's rail, so both draw one tree.
+        for (Agent agent : FleetPanes.members(workspaces, tabs, panes, Agent::new)) {
             agent.machine = machine;
-            agent.id = id;
-            agent.title = cleanTitle(GpuiTerminalProtocol.title(pane.optString("title", agent.id)), agent.id);
-            agent.status = pane.optString("status", "");
-            agent.space = pane.optString("workspace_id", "loose");
-            agent.spaceName = labels.containsKey(agent.space) ? labels.get(agent.space).trim() : "";
             agent.spaceLabel = agent.spaceName;
-            String cwd = pane.optString("cwd", "");
-            if (agent.spaceLabel.isEmpty() && !"loose".equals(agent.space) && !cwd.isEmpty()) {
-                agent.spaceLabel = FleetTree.lastSegment(cwd);
+            if (agent.spaceLabel.isEmpty() && !"loose".equals(agent.space) && !agent.cwd.isEmpty()) {
+                agent.spaceLabel = FleetTree.lastSegment(agent.cwd);
             }
             if (agent.spaceLabel.isEmpty()) agent.spaceLabel = "Other terminals";
-            agent.tab = pane.optString("tab_id", "");
-            agent.spaceIndex = spaceIndex.getOrDefault(agent.space, Integer.MAX_VALUE);
-            agent.tabIndex = tabIndex.getOrDefault(agent.space + "\n" + agent.tab, Integer.MAX_VALUE);
-            agent.createdMs = pane.optLong("created_ms", 0);
-            agent.parent = pane.optString("parent", "");
-            // Only the deacon skill's roles count; any other value is no role.
-            agent.role = FleetTree.role(pane.optString("role", ""));
-            agent.program = pane.optString("program", "");
-            agent.project = pane.optString("project", "");
-            agent.kind = pane.optString("kind", "");
-            if ("none".equals(agent.kind)) agent.kind = "";
-            agent.cwd = pane.optString("cwd", "");
-            agent.msg = pane.optString("msg", "").replace('\n', ' ').trim();
-            agent.waitKind = pane.optString("wait_kind", "");
-            agent.statusMs = pane.optLong("status_ms", 0);
             flat.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
         }
         // The hierarchy spans spaces: a deacon's managers and their workers
@@ -773,6 +727,11 @@ public final class HomeActivity extends Activity {
      */
     private void renderMachine(Machine machine) {
         List<Agent> all = members(machine);
+        FleetTree.GitLook shared = FleetPanes.LOOKS.get(machine.host.id);
+        if (shared != null && shared != machine.git) {
+            machine.git = shared;
+            machine.gitAt = Math.max(machine.gitAt, FleetPanes.LOOKED_AT.getOrDefault(machine.host.id, 0L));
+        }
         FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
         boolean ready = "ready".equals(machine.state);
         boolean closed = collapsed.contains(machine.host.id);
@@ -1497,19 +1456,7 @@ public final class HomeActivity extends Activity {
     private void maybeLookGit(Machine machine, List<Agent> all, boolean ready, boolean folded) {
         long handle = machine.handle;
         if (handle <= 0) return;
-        Map<String, List<Agent>> bySpace = new LinkedHashMap<>();
-        for (Agent agent : all) if (agent.hasSpace()) bySpace.computeIfAbsent(agent.space, k -> new ArrayList<>()).add(agent);
-        // Every terminal's own folder: workers are tabs of their PM's space,
-        // each in its own worktree. Spaces' first folders come first.
-        Set<String> paths = new java.util.LinkedHashSet<>();
-        for (List<Agent> list : bySpace.values()) {
-            String probe = FleetTree.probe(list);
-            if (probe.startsWith("/") && paths.size() < 96) paths.add(probe);
-        }
-        for (Agent agent : all) {
-            String cwd = FleetTree.trimSlash(agent.cwd);
-            if (agent.hasSpace() && cwd.startsWith("/") && paths.size() < 96) paths.add(cwd);
-        }
+        Set<String> paths = FleetPanes.gitPaths(all);
         if (paths.isEmpty()) return;
         long now = System.currentTimeMillis();
         boolean fresh = !machine.gitAsked.containsAll(paths);
@@ -1537,6 +1484,8 @@ public final class HomeActivity extends Activity {
                 if (destroyed || answer == null) return;
                 machine.git = answer;
                 machine.gitAsked = paths;
+                FleetPanes.LOOKS.put(machine.host.id, answer);
+                FleetPanes.LOOKED_AT.put(machine.host.id, System.currentTimeMillis());
                 render(true);
             });
         });
