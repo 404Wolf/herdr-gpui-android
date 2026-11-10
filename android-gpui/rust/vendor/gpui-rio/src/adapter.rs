@@ -37,6 +37,8 @@ macro_rules! __bind_gpui {
                 style: TerminalStyle,
                 visible: bool,
                 bounds: Bounds<Pixels>,
+                /// The grid cell (row, column) drawn at the pane's top-left.
+                view_origin: (i32, usize),
                 cell: Size<Pixels>,
                 selecting: bool,
                 scroll_delta: f32,
@@ -87,6 +89,7 @@ macro_rules! __bind_gpui {
                             style,
                             visible: true,
                             bounds: Bounds::default(),
+                            view_origin: (0, 0),
                             cell: size(px(8.), px(18.)),
                             selecting: false,
                             scroll_delta: 0.,
@@ -204,9 +207,11 @@ macro_rules! __bind_gpui {
                         (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor() as i32;
                     let col =
                         (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor() as usize;
+                    // Through the window drawn (it may follow the caret on a larger grid).
+                    let (row_off, col_off) = self.view_origin;
                     Pos::new(
-                        Line(row.clamp(0, grid.screen_lines() as i32 - 1) - grid.display_offset() as i32),
-                        Column(col.min(grid.columns() - 1)),
+                        Line((row + row_off).clamp(0, grid.screen_lines() as i32 - 1) - grid.display_offset() as i32),
+                        Column((col + col_off).min(grid.columns() - 1)),
                     )
                 }
 
@@ -247,9 +252,11 @@ macro_rules! __bind_gpui {
                         f32::from(bounds.size.width) as u16,
                         f32::from(bounds.size.height) as u16,
                     );
-                    // The grid may be the remote side's negotiated one: draw what
-                    // fits (a smaller grid is letterboxed, a larger one clipped).
+                    // The grid may be the remote side's negotiated one. Smaller than
+                    // the pane: drawn whole, the rest left empty (letterboxed).
+                    // Larger: a pane-sized window into it that follows the caret.
                     let (grid_cols, grid_rows) = self.session.grid_size();
+                    let pane = (cols, rows);
                     let (cols, rows) = (
                         usize::from(cols.min(grid_cols)),
                         usize::from(rows.min(grid_rows)),
@@ -262,11 +269,17 @@ macro_rules! __bind_gpui {
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
                     let offset = grid.display_offset() as i32;
+                    let (row_off, col_off) = if offset == 0 {
+                        $crate::viewport_origin((grid_cols, grid_rows), pane, (cursor.pos.row.0, cursor.pos.col.0))
+                    } else {
+                        (0, 0)
+                    };
+                    self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
                     for row in 0..rows {
                         for col in 0..cols {
-                            let pos = Pos::new(Line(row as i32 - offset), Column(col));
+                            let pos = Pos::new(Line(row as i32 + row_off - offset), Column(col + col_off));
                             let square = grid.grid[pos];
                             if square.wide() == Wide::Spacer {
                                 continue;
@@ -285,7 +298,7 @@ macro_rules! __bind_gpui {
                                 .is_some_and(|selection| selection.contains(pos));
                             let cursor_here = cursor_shown
                                 && cursor.content != CursorShape::Hidden
-                                && cursor.pos == Pos::new(Line(row as i32), Column(col))
+                                && cursor.pos == Pos::new(Line(row as i32 + row_off), Column(col + col_off))
                                 && offset == 0;
                             if selected || (cursor_here && cursor.content == CursorShape::Block) {
                                 std::mem::swap(&mut fg, &mut bg);
@@ -401,8 +414,8 @@ macro_rules! __bind_gpui {
                             .shape_line(text.into(), font_size, &[run], None);
                         let origin = bounds.origin
                             + point(
-                                self.cell.width * cursor.pos.col.0,
-                                self.cell.height * cursor.pos.row.0 as f32,
+                                self.cell.width * cursor.pos.col.0.saturating_sub(col_off),
+                                self.cell.height * (cursor.pos.row.0 - row_off) as f32,
                             );
                         let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
                     }
@@ -601,11 +614,13 @@ macro_rules! __bind_gpui {
                     _: &mut Context<Self>,
                 ) -> Option<Bounds<Pixels>> {
                     let cursor = self.session.grid().lock().cursor();
+                    // The IME sits at the caret as drawn (the window may follow it).
+                    let (row_off, col_off) = self.view_origin;
                     Some(Bounds::new(
                         self.bounds.origin
                             + point(
-                                self.cell.width * cursor.pos.col.0,
-                                self.cell.height * cursor.pos.row.0 as f32,
+                                self.cell.width * cursor.pos.col.0.saturating_sub(col_off),
+                                self.cell.height * (cursor.pos.row.0 - row_off) as f32,
                             ),
                         self.cell,
                     ))

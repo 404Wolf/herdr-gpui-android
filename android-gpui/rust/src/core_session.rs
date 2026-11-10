@@ -641,6 +641,12 @@ impl Connection<'_> {
             cols,
             rows,
         )?;
+        // The PTY's grid, set before a single replay byte can reach the parser
+        // (the output channel opens just below): the first frame is laid out
+        // at the program's width, never the phone's.
+        if let Some((cols, rows)) = initial_grid(&reply) {
+            terminal_session.set_grid(cols, rows);
+        }
         self.channel = channel;
         self.output = Some(tx);
         let mut state = lock(&self.owner.state);
@@ -792,6 +798,14 @@ done"#;
 /// for RESIZE frames so it can follow the PTY's authoritative grid.
 fn attach_params(terminal: &str, cols: u16, rows: u16) -> Value {
     json!({"terminal":terminal,"cols":cols,"rows":rows,"history":1000,"display":display(),"resize_notifications":true})
+}
+/// The PTY's grid from an attach reply, when the path negotiated RESIZE.
+fn initial_grid(reply: &Value) -> Option<(u16, u16)> {
+    if reply["resize_notifications"] != true {
+        return None;
+    }
+    let size = |key: &str| reply["terminal"][key].as_u64().and_then(|v| u16::try_from(v).ok()).filter(|v| *v > 0);
+    Some((size("cols")?, size("rows")?))
 }
 /// A RESIZE frame's payload: columns then rows, little-endian u16 each.
 fn resize_frame(bytes: &[u8]) -> Option<(u16, u16)> {
@@ -1325,7 +1339,18 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, existing_at, resize_frame, send_refusal};
+    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, existing_at, initial_grid, resize_frame, send_refusal};
+    #[test]
+    fn the_attach_replys_grid_is_used_only_when_negotiated() {
+        let reply = json!({"channel":3,"resize_notifications":true,"terminal":{"cols":174,"rows":69}});
+        assert_eq!(initial_grid(&reply), Some((174, 69)));
+        let old = json!({"channel":3,"terminal":{"cols":174,"rows":69}});
+        assert_eq!(initial_grid(&old), None);
+        let off = json!({"channel":3,"resize_notifications":false,"terminal":{"cols":174,"rows":69}});
+        assert_eq!(initial_grid(&off), None);
+        let empty = json!({"channel":3,"resize_notifications":true,"terminal":{"cols":0,"rows":69}});
+        assert_eq!(initial_grid(&empty), None);
+    }
     #[test]
     fn attach_asks_for_resize_frames_and_reads_them() {
         let params = attach_params("t3", 120, 40);

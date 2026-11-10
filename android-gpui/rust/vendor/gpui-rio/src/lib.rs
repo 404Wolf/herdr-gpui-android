@@ -16,7 +16,7 @@ mod session;
 pub use error::{Error, Result};
 pub use keys::{KeyPress, key_bytes};
 pub use options::{TerminalColor, TerminalStyle, TerminalTheme};
-pub use session::Session;
+pub use session::{Session, viewport_origin};
 
 #[doc(hidden)]
 pub mod __private {

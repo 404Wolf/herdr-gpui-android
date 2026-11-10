@@ -481,6 +481,27 @@ impl Reader {
 }
 
 #[doc(hidden)]
+/// Which part of a grid larger than the pane is drawn: the top-left cell
+/// (row, column) of the pane's window into the grid. Policy: the window starts
+/// at the top-left and moves only as far as needed to keep the caret on
+/// screen (it follows the caret); a grid that fits is drawn whole from (0, 0),
+/// with the rest of the pane left empty (letterboxed).
+pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize)) -> (i32, usize) {
+    let (grid_cols, grid_rows) = (usize::from(grid.0), i32::from(grid.1));
+    let (pane_cols, pane_rows) = (usize::from(pane.0.max(1)), i32::from(pane.1.max(1)));
+    let row = if grid_rows > pane_rows {
+        (cursor.0 - pane_rows + 1).clamp(0, grid_rows - pane_rows)
+    } else {
+        0
+    };
+    let col = if grid_cols > pane_cols {
+        (cursor.1 + 1).saturating_sub(pane_cols).min(grid_cols - pane_cols)
+    } else {
+        0
+    };
+    (row, col)
+}
+
 pub fn resolve_index(grid: &Crosswords<Listener>, theme: TerminalTheme, index: usize) -> ColorRgb {
     if index < 269
         && let Some(color) = grid.colors()[index]
@@ -621,6 +642,50 @@ mod tests {
             key: "a".into(),
             ..KeyPress::default()
         }));
+    }
+
+    #[test]
+    fn the_negotiated_grid_lays_out_the_first_replay() {
+        // Attach: the core's grid (80 wide) is set before any replay byte is
+        // parsed, so a 60-character line never wraps at the pane's 20 columns.
+        let (session, mut remote, _) = session();
+        assert!(session.set_grid(80, 24));
+        let line = "x".repeat(60);
+        remote.write_all(line.as_bytes()).unwrap();
+        until(|| text_at(&session, 0, 60) == line);
+        // Nothing spilled onto the next row.
+        assert!(text_at(&session, 1, 1).trim_matches(['\0', ' ']).is_empty());
+    }
+
+    #[test]
+    fn a_core_resize_never_echoes_back_and_pane_offers_are_deduplicated() {
+        let (session, _remote, resizes) = session();
+        // Core notifications, repeated and changing: nothing goes back.
+        for (cols, rows) in [(80, 24), (80, 24), (100, 30), (60, 20)] {
+            assert!(session.set_grid(cols, rows));
+        }
+        assert!(resizes.lock().unwrap().is_empty());
+        // The pane's own size goes out once per change, never twice for the same size.
+        session.resize(30, 8, 300, 160);
+        session.resize(30, 8, 300, 160);
+        assert!(session.set_grid(90, 25));
+        session.resize(30, 8, 310, 170);
+        assert_eq!(*resizes.lock().unwrap(), vec![(30, 8)]);
+        assert_eq!(session.grid_size(), (90, 25));
+    }
+
+    #[test]
+    fn a_grid_larger_than_the_pane_follows_the_caret() {
+        use super::viewport_origin;
+        // Fits: drawn whole from the top-left (the rest is letterboxed).
+        assert_eq!(viewport_origin((40, 10), (80, 24), (9, 39)), (0, 0));
+        // Larger, caret in view: no movement.
+        assert_eq!(viewport_origin((120, 40), (80, 24), (5, 10)), (0, 0));
+        // Caret below and right of the pane: just far enough to show it.
+        assert_eq!(viewport_origin((120, 40), (80, 24), (30, 100)), (7, 21));
+        // Never past the grid's end.
+        assert_eq!(viewport_origin((120, 40), (80, 24), (39, 119)), (16, 40));
+        assert_eq!(viewport_origin((120, 40), (80, 24), (60, 500)), (16, 40));
     }
 
     #[test]
