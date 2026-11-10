@@ -247,7 +247,13 @@ macro_rules! __bind_gpui {
                         f32::from(bounds.size.width) as u16,
                         f32::from(bounds.size.height) as u16,
                     );
-                    let (cols, rows) = (usize::from(cols), usize::from(rows));
+                    // The grid may be the remote side's negotiated one: draw what
+                    // fits (a smaller grid is letterboxed, a larger one clipped).
+                    let (grid_cols, grid_rows) = self.session.grid_size();
+                    let (cols, rows) = (
+                        usize::from(cols.min(grid_cols)),
+                        usize::from(rows.min(grid_rows)),
+                    );
                     let theme = self.style.theme;
                     let mut grid = self.session.grid().lock();
                     let selection = grid

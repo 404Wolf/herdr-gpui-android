@@ -70,6 +70,8 @@ struct Connection<'a> {
     events: u32,
     event_carry: Vec<u8>,
     dirty: bool,
+    /// The attached stream sends RESIZE (the PTY's grid) before repainting.
+    negotiated: bool,
 }
 impl Connection<'_> {
     fn read(&mut self) -> Result<Option<Frame>> {
@@ -157,6 +159,15 @@ impl Connection<'_> {
                         // 256 KiB starting credit bounds this queue. Credit is returned
                         // only as Rio consumes bytes, never when the network receives them.
                         output.try_send(frame.bytes).map_err(|_| Error::Capacity)?;
+                    }
+                }
+                // RESIZE from the core: the PTY's authoritative grid, sent before
+                // the paint at that size (only on a path that negotiated it).
+                3 if self.negotiated => {
+                    if let Some((cols, rows)) = resize_frame(&frame.bytes) {
+                        if let Some(terminal) = &lock(&self.owner.state).terminal {
+                            terminal.set_grid(cols, rows);
+                        }
                     }
                 }
                 2 => {
@@ -597,10 +608,10 @@ impl Connection<'_> {
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
         }
-        let reply = self.call(
-            "terminal.attach",
-            json!({"terminal":terminal,"cols":cols,"rows":rows,"history":1000,"display":display()}),
-        )?;
+        let reply = self.call("terminal.attach", attach_params(terminal, cols, rows))?;
+        // A core (and path) that will send RESIZE before repainting says so;
+        // an older one does not, and the phone's own size stays the grid.
+        self.negotiated = reply["resize_notifications"] == true;
         let channel = reply["channel"]
             .as_u64()
             .filter(|c| *c > 0 && *c <= u32::MAX as u64)
@@ -777,6 +788,21 @@ $c
   fi
   printf '\nE\n'
 done"#;
+/// terminal.attach's parameters: the pane's size is an offer; the phone asks
+/// for RESIZE frames so it can follow the PTY's authoritative grid.
+fn attach_params(terminal: &str, cols: u16, rows: u16) -> Value {
+    json!({"terminal":terminal,"cols":cols,"rows":rows,"history":1000,"display":display(),"resize_notifications":true})
+}
+/// A RESIZE frame's payload: columns then rows, little-endian u16 each.
+fn resize_frame(bytes: &[u8]) -> Option<(u16, u16)> {
+    match bytes {
+        [c0, c1, r0, r1] => {
+            let (cols, rows) = (u16::from_le_bytes([*c0, *c1]), u16::from_le_bytes([*r0, *r1]));
+            (cols > 0 && rows > 0).then_some((cols, rows))
+        }
+        _ => None,
+    }
+}
 /// The deacon's shell line: from ~/Config when it exists (Wolf's own config,
 /// never a user repo), else home; Claude with its brief as one argument. The
 /// machine name is reduced to plain characters, so it can sit in the quotes.
@@ -1000,6 +1026,7 @@ pub(crate) fn run(
         events: 0,
         event_carry: Vec::new(),
         dirty: false,
+        negotiated: false,
     };
     let subscribed = connection.call("events.subscribe", json!({}))?;
     connection.events = subscribed["channel"]
@@ -1298,7 +1325,18 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIT_LOOK, add_space, canonical_deacon, deacon_line, existing_at, send_refusal};
+    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, existing_at, resize_frame, send_refusal};
+    #[test]
+    fn attach_asks_for_resize_frames_and_reads_them() {
+        let params = attach_params("t3", 120, 40);
+        assert_eq!(params["resize_notifications"], true);
+        assert_eq!((params["cols"].as_u64(), params["rows"].as_u64()), (Some(120), Some(40)));
+        let mut bytes = Vec::from(80u16.to_le_bytes());
+        bytes.extend(24u16.to_le_bytes());
+        assert_eq!(resize_frame(&bytes), Some((80, 24)));
+        assert_eq!(resize_frame(&[0, 0, 24, 0]), None);
+        assert_eq!(resize_frame(&[80, 0, 24]), None);
+    }
     #[test]
     fn a_send_to_a_blocked_program_is_refused_never_forced() {
         // call() reports an RPC error as "<data.kind>: <message>".

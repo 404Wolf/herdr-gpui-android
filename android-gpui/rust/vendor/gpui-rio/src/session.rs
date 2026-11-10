@@ -68,6 +68,11 @@ struct Shared {
     theme: Mutex<TerminalTheme>,
     size: Mutex<WindowSize>,
     title: Mutex<Option<String>>,
+    /// The pane's last measured grid: an offer to the remote side.
+    offer: Mutex<(u16, u16)>,
+    /// The remote side's authoritative grid, once it negotiated one: the
+    /// program wraps at this width, so the grid follows it, not the pane.
+    negotiated: Mutex<Option<(u16, u16)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -129,6 +134,8 @@ impl Session {
                 height: 0,
             }),
             title: Mutex::new(None),
+            offer: Mutex::new((columns, lines)),
+            negotiated: Mutex::new(None),
         });
         let (input_queue, queued) = mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
         thread::Builder::new()
@@ -225,18 +232,71 @@ impl Session {
         *lock(&self.shared.theme) = theme;
     }
 
-    /// Resizes the grid and tells the remote side, only when the cell size changes.
+    /// The pane measured `columns` × `lines` cells: offers that size to the
+    /// remote side (only when it changes) and, unless the remote side
+    /// negotiated its own grid, resizes the grid to it.
     pub fn resize(&self, columns: u16, lines: u16, width: u16, height: u16) {
         let (columns, lines) = (columns.max(2), lines.max(1));
+        let offered = {
+            let mut offer = lock(&self.shared.offer);
+            let changed = *offer != (columns, lines);
+            *offer = (columns, lines);
+            changed
+        };
+        let target = lock(&self.shared.negotiated).unwrap_or((columns, lines));
+        let regrid = self.apply_grid(target, Some((width, height)));
+        if offered {
+            (self.resize)(columns, lines);
+        }
+        if offered || regrid {
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// The remote side's authoritative grid (it sends one before repainting at
+    /// that size). The grid follows it; nothing is offered back. False for an
+    /// empty size.
+    pub fn set_grid(&self, columns: u16, lines: u16) -> bool {
+        if columns == 0 || lines == 0 {
+            return false;
+        }
+        *lock(&self.shared.negotiated) = Some((columns, lines));
+        self.apply_grid((columns, lines), None);
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// Back to the pane's own geometry (a path that does not negotiate).
+    pub fn clear_grid(&self) {
+        *lock(&self.shared.negotiated) = None;
+        let offer = *lock(&self.shared.offer);
+        self.apply_grid(offer, None);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// The grid's size now: the negotiated one, else the pane's.
+    pub fn grid_size(&self) -> (u16, u16) {
+        let size = lock(&self.shared.size);
+        (size.cols, size.rows)
+    }
+
+    /// Whether the remote side negotiated the grid.
+    pub fn negotiated(&self) -> bool {
+        lock(&self.shared.negotiated).is_some()
+    }
+
+    /// Resizes the cell grid to `target` when it differs; true when it did.
+    fn apply_grid(&self, target: (u16, u16), pixels: Option<(u16, u16)>) -> bool {
+        let (columns, lines) = (target.0.max(2), target.1.max(1));
         let changed = {
             let mut size = lock(&self.shared.size);
             let changed = size.cols != columns || size.rows != lines;
-            *size = WindowSize {
-                rows: lines,
-                cols: columns,
-                width,
-                height,
-            };
+            size.cols = columns;
+            size.rows = lines;
+            if let Some((width, height)) = pixels {
+                size.width = width;
+                size.height = height;
+            }
             changed
         };
         if changed {
@@ -244,9 +304,8 @@ impl Session {
                 usize::from(columns),
                 usize::from(lines),
             ));
-            (self.resize)(columns, lines);
-            self.dirty.store(true, Ordering::Release);
         }
+        changed
     }
 
     /// Typed text, sent as is. Returns false when the input queue is full.
@@ -562,6 +621,27 @@ mod tests {
             key: "a".into(),
             ..KeyPress::default()
         }));
+    }
+
+    #[test]
+    fn a_negotiated_grid_is_followed_never_offered_back_and_falls_back() {
+        let (session, _remote, resizes) = session();
+        session.resize(40, 10, 400, 200);
+        // The remote side's grid: the grid follows it, nothing is offered back.
+        assert!(session.set_grid(80, 24));
+        assert_eq!(session.grid_size(), (80, 24));
+        assert_eq!(session.grid().lock().columns(), 80);
+        assert!(session.negotiated());
+        // The pane still offers its own size when it changes, but the grid stays.
+        session.resize(50, 12, 500, 240);
+        assert_eq!(session.grid_size(), (80, 24));
+        assert_eq!(*resizes.lock().unwrap(), vec![(40, 10), (50, 12)]);
+        assert!(!session.set_grid(0, 0));
+        // An old path: back to the pane's geometry.
+        session.clear_grid();
+        assert!(!session.negotiated());
+        assert_eq!(session.grid_size(), (50, 12));
+        assert_eq!(session.grid().lock().columns(), 50);
     }
 
     #[test]
