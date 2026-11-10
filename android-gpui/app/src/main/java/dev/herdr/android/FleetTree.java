@@ -308,10 +308,19 @@ final class FleetTree {
             }
             if (project.pm != null) count(project.tally, project.pm.status);
             project.entries.addAll(rows);
-            closedWorktrees(project, git);
             fleet.projects.add(project);
         }
         for (SpaceNode node : fleet.loose) nest(node, null);
+        // Each repo's unopened worktrees are listed once, under one owner
+        // project, minus every checkout open anywhere on this computer.
+        Set<String> open = new HashSet<>();
+        for (Project project : fleet.projects) for (SpaceNode row : project.entries) open.add(row.key);
+        for (SpaceNode node : fleet.loose) open.add(node.key);
+        Set<String> listed = new HashSet<>();
+        for (Project project : fleet.projects) {
+            if (project.repo.isEmpty() || !listed.add(project.repo)) continue;
+            closedWorktrees(repoOwner(fleet.projects, project.repo, git), git, open);
+        }
         return fleet;
     }
 
@@ -369,11 +378,30 @@ final class FleetTree {
         return false;
     }
 
-    private static void closedWorktrees(Project project, GitLook git) {
+    /**
+     * The one project that lists a repo's unopened worktrees: the one named
+     * after the repo, else the one whose PM works in the main checkout, else
+     * the first in order. Other projects labelled onto that repo keep their
+     * agents but never repeat the list.
+     */
+    static Project repoOwner(List<Project> projects, String repo, GitLook git) {
+        Project first = null, onMain = null;
+        String name = repoName(repo);
+        for (Project p : projects) {
+            if (!repo.equals(p.repo)) continue;
+            if (p.name.equals(name)) return p;
+            if (first == null) first = p;
+            if (onMain == null && p.pm != null) {
+                Place place = git.places.get(trimSlash(p.pm.cwd));
+                if (place != null && place.top.equals(mainTop(place, git))) onMain = p;
+            }
+        }
+        return onMain != null ? onMain : first;
+    }
+
+    private static void closedWorktrees(Project project, GitLook git, Set<String> open) {
         List<GitWorktree> list = git.repos.get(project.repo);
         if (list == null) return;
-        Set<String> open = new HashSet<>();
-        for (SpaceNode row : project.entries) open.add(row.key);
         int shown = 0;
         for (GitWorktree wt : list) {
             if (wt.bare || wt.prunable || open.contains(wt.path)) continue;

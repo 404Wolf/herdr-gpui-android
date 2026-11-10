@@ -375,6 +375,42 @@ public final class FleetTreeTest {
         assertEquals(FleetTree.DeaconAction.NONE, FleetTree.deaconAction(false, null, false));
     }
 
+    @Test public void oneRepoUnderSeveralProjectLabelsListsItsWorktreesOnce() {
+        // Wolf's desktop: home-manager, hypr2d and motion-cues all live in the home-manager repo.
+        FleetTree.Member hm = label(m("t1", "s1", "home-manager", 0, 0, "/c/home-manager", "idle"), "pm", "home-manager");
+        FleetTree.Member hypr = label(m("t2", "s2", "hypr2d", 1, 0, "/wt/hypr2d", "working"), "pm", "hypr2d");
+        FleetTree.Member cues = label(m("t3", "s3", "motion-cues", 2, 0, "/wt/cues", "idle"), "pm", "motion-cues");
+        FleetTree.GitLook git = FleetTree.parseGitLook(look(new String[][] {
+                {"/c/home-manager", "/c/home-manager/.git", "/c/home-manager", "main"},
+                {"/wt/hypr2d", "/c/home-manager/.git", "/wt/hypr2d", "hypr2d"},
+                {"/wt/cues", "/c/home-manager/.git", "/wt/cues", "cues"}},
+                "/c/home-manager/.git", "/c/home-manager=main", "/wt/hypr2d=hypr2d", "/wt/cues=cues",
+                "/wt/idle-a=a", "/wt/idle-b=b"), 200);
+        // Order must not matter: the owner is the project named after the repo.
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(cues, hypr, hm), git);
+        assertEquals(3, fleet.projects.size());
+        Set<String> seen = new HashSet<>();
+        int lists = 0;
+        for (FleetTree.Project p : fleet.projects) {
+            if (!p.closed.isEmpty()) lists++;
+            for (FleetTree.GitWorktree wt : p.closed) assertTrue("listed twice: " + wt.path, seen.add(wt.path));
+            for (FleetTree.SpaceNode row : p.entries) assertTrue("shown twice: " + row.key, seen.add(row.key));
+        }
+        assertEquals(1, lists);
+        assertEquals(Arrays.asList("/wt/idle-a", "/wt/idle-b"), closedPaths(project(fleet, "home-manager")));
+        // Without a project named after the repo, the PM on the main checkout owns the list.
+        hm.project = "dotfiles";
+        FleetTree.Fleet renamed = FleetTree.build(Arrays.asList(cues, hypr, hm), git);
+        assertEquals(Arrays.asList("/wt/idle-a", "/wt/idle-b"), closedPaths(project(renamed, "dotfiles")));
+        assertTrue(project(renamed, "hypr2d").closed.isEmpty() && project(renamed, "motion-cues").closed.isEmpty());
+    }
+
+    private static List<String> closedPaths(FleetTree.Project p) {
+        List<String> out = new ArrayList<>();
+        for (FleetTree.GitWorktree wt : p.closed) out.add(wt.path);
+        return out;
+    }
+
     // ── Leftovers are never dropped ─────────────────────────────────────
 
     @Test public void shellOnlySpacesAndSpacelessAgentsStayVisible() {
