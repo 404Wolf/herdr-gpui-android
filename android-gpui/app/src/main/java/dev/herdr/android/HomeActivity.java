@@ -929,8 +929,7 @@ public final class HomeActivity extends Activity {
         row.fold = key;
         // Quiet big projects start folded; anything waiting on Wolf stays open.
         row.foldedByDefault = project.agents() > 6 && project.tally[0] == 0;
-        boolean flat = project.entries.size() == 1 && project.pm != null
-                && project.entries.get(0).spaces.contains(project.pm.space);
+        boolean flat = FleetTree.flat(project);
         for (FleetTree.SpaceNode entry : project.entries) {
             if (flat) {
                 for (FleetTree.AgentNode node : entry.agents) row.kids.add(agentTree(machine.host.id, node, null));

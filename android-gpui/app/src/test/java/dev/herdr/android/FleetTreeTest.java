@@ -505,6 +505,36 @@ public final class FleetTreeTest {
         assertEquals(new HashSet<>(Arrays.asList("t9", "t10")), new HashSet<>(ids(fleet.others)));
     }
 
+    @Test public void aWorkerInANewLinkedWorktreeOfThePmSpaceKeepsItsWorktreeRow() {
+        // The herdr-flow-smoke fixture: PM t6w in the main checkout, worker t6x a tab in the same
+        // space, in a linked worktree created after the last git look (so git does not know it yet).
+        FleetTree.Member pm = label(m("t6w", "sp9", "herdr-flow-smoke", 0, 0, "/tmp/smoke", "idle"), "pm", "herdr-flow-smoke");
+        FleetTree.Member worker = label(m("t6x", "sp9", "herdr-flow-smoke", 0, 1,
+                "/h/.herdr/worktrees/smoke/smoke-marker", "working"), "worker", "herdr-flow-smoke");
+        worker.parent = "t6w";
+        FleetTree.GitLook stale = FleetTree.parseGitLook(look(new String[][] {
+                {"/tmp/smoke", "/tmp/smoke/.git", "/tmp/smoke", "main"}}, "/tmp/smoke/.git", "/tmp/smoke=main"), 200);
+        FleetTree.GitLook fresh = FleetTree.parseGitLook(look(new String[][] {
+                {"/tmp/smoke", "/tmp/smoke/.git", "/tmp/smoke", "main"},
+                {"/h/.herdr/worktrees/smoke/smoke-marker", "/tmp/smoke/.git", "/h/.herdr/worktrees/smoke/smoke-marker", "smoke-marker"}},
+                "/tmp/smoke/.git", "/tmp/smoke=main", "/h/.herdr/worktrees/smoke/smoke-marker=smoke-marker"), 200);
+        for (FleetTree.GitLook git : new FleetTree.GitLook[] {stale, fresh, null}) {
+            FleetTree.Project p = FleetTree.build(Arrays.asList(pm, worker), git).projects.get(0);
+            assertSame(pm, p.pm);
+            assertEquals(1, p.entries.size());
+            FleetTree.SpaceNode row = p.entries.get(0);
+            assertTrue(row.worktree);
+            assertEquals("smoke-marker", row.name);
+            assertEquals(Arrays.asList("t6x"), agentIds(row));
+            // Not flattened under the PM: the "⑂ smoke-marker" row is drawn.
+            assertFalse(FleetTree.flat(p));
+            assertTrue(p.closed.isEmpty() || !closedPaths(p).contains(row.key));
+        }
+        // A worker in the PM's own checkout is still drawn flat under the PM.
+        FleetTree.Member beside = label(m("t7", "sp9", "herdr-flow-smoke", 0, 2, "/tmp/smoke", "idle"), "worker", "herdr-flow-smoke");
+        assertTrue(FleetTree.flat(FleetTree.build(Arrays.asList(pm, beside), fresh).projects.get(0)));
+    }
+
     @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {
         // The shared laptop space: t67's and t5t's projects each see a slice of it.
         FleetTree.Member t67 = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "idle"), "pm", "home-manager");

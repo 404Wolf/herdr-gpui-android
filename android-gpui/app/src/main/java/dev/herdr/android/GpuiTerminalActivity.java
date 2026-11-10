@@ -2347,8 +2347,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     base, firstPane, order, keep);
             if (projectFolded) continue;
             if (project.pm != null) railAgent(host, live, current, project.pm, "PM · ", base + 1, selectedPane, order, keep);
-            boolean flat = project.entries.size() == 1 && project.pm != null
-                    && project.entries.get(0).spaces.contains(project.pm.space);
+            boolean flat = FleetTree.flat(project);
             for (FleetTree.SpaceNode row : project.entries) {
                 int depth = base + 1;
                 if (!flat) {

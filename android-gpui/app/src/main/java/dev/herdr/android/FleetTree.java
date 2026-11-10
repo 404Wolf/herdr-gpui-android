@@ -105,6 +105,8 @@ final class FleetTree {
         boolean closedIncomplete;
         /** The repo (git common dir) whose worktrees are listed, or "". */
         String repo = "";
+        /** The row key of the PM's own checkout (its row is not drawn: the PM is the project row). */
+        String pmKey = "";
         /** blocked, done, working, idle over the project's agents. */
         final int[] tally = new int[4];
         Project(String name) { this.name = name; }
@@ -298,6 +300,7 @@ final class FleetTree {
         Map<String, SpaceNode> looseBySpace = new LinkedHashMap<>();
         // Every checkout some terminal (a PM too) is in: never listed as unopened.
         Set<String> open = new HashSet<>();
+        Map<String, String> rowOf = new HashMap<>();
         Map<String, Integer> spaceOrder = new HashMap<>();
         for (String space : spaces.keySet()) spaceOrder.put(space, spaceOrder.size());
         for (Member m : placed) {
@@ -331,6 +334,7 @@ final class FleetTree {
             if (node == null) rows.put(key, node = new SpaceNode(key));
             fill(node, space, m, use, at, git);
             open.add(key);
+            rowOf.put(m.id, key);
         }
         fleet.loose.addAll(looseBySpace.values());
 
@@ -371,6 +375,7 @@ final class FleetTree {
                 project.entries.add(row);
             }
             if (project.pm != null) count(project.tally, project.pm.status);
+            if (project.pm != null) project.pmKey = rowOf.getOrDefault(project.pm.id, "");
             fleet.projects.add(project);
         }
         for (SpaceNode node : fleet.loose) nest(node, null);
@@ -654,6 +659,16 @@ final class FleetTree {
         String space = row.spaces.get(0);
         for (Member m : all) if (space.equals(m.space) && !row.members.contains(m)) return null;
         return space;
+    }
+
+    /**
+     * Whether a project's agents are drawn straight under its PM row: only
+     * when its one checkout row is the PM's own checkout. A worker in another
+     * checkout (a linked worktree, even in the PM's space) keeps its row.
+     */
+    static boolean flat(Project project) {
+        return project.pm != null && project.entries.size() == 1
+                && project.entries.get(0).key.equals(project.pmKey);
     }
 
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */
