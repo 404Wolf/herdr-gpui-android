@@ -3073,20 +3073,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             JSONArray panes, workspaces, tabs;
             Connection current;
             synchronized (stateLock) { current = connection; }
+            boolean connected;
             if (live) {
                 panes = current == null ? null : current.panes;
                 workspaces = current == null ? null : current.workspaces;
                 tabs = current == null ? null : current.tabs;
+                connected = current != null && current.ready;
             } else {
                 HostSample sample = hostSamples.get(host.id);
                 panes = sample == null ? null : sample.panes;
                 workspaces = sample == null ? null : sample.workspaces;
                 tabs = sample == null ? null : sample.tabs;
+                connected = sample != null && sample.connected;
             }
             // A pick focuses that computer's canonical live Deacon, in its exact
-            // terminal; with none, the rail shows Start Deacon. Nothing starts.
-            FleetTree.Member deacon = FleetTree.pickTarget(
-                    FleetPanes.members(workspaces, tabs, panes, FleetTree.Member::new));
+            // terminal; with none, the rail shows Start Deacon; offline (a cached
+            // list), nothing is focused or offered. Nothing ever starts.
+            java.util.List<FleetTree.Member> listed = FleetPanes.members(workspaces, tabs, panes, FleetTree.Member::new);
+            FleetTree.Pick pick = FleetTree.pick(connected, listed);
+            FleetTree.Member deacon = pick == FleetTree.Pick.FOCUS ? FleetTree.pickTarget(listed) : null;
             int waiting = 0;
             for (int i = 0; panes != null && i < panes.length(); i++) {
                 JSONObject pane = panes.optJSONObject(i);
@@ -3095,9 +3100,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             String label = (live ? "● " : "○ ") + host.name
                     + (waiting > 0 ? "   " + waiting + " need" + (waiting == 1 ? "s" : "") + " you" : "")
-                    + (live ? "   (here)" : "");
+                    + (live ? "   (here)" : "") + (pick == FleetTree.Pick.OFFLINE ? "   offline" : "");
             sheet.add(label, () -> {
-                if (deacon != null) {
+                if (pick == FleetTree.Pick.OFFLINE) {
+                    // Unavailable: no focus attempt, no Start Deacon; just show it.
+                    if (!live) switchHost(host);
+                } else if (deacon != null) {
                     if (live && current != null) focusRemotePane(current, deacon.id);
                     else switchHost(host, deacon.id);
                     closeRailDrawer();

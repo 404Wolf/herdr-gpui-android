@@ -763,11 +763,18 @@ public final class HomeActivity extends Activity {
             // The pick lasts this session.
         }
         render(true);
-        FleetTree.Member deacon = FleetTree.pickTarget(members(machine));
-        if (deacon != null && "ready".equals(machine.state)) openAgent((Agent) deacon);
-        else if (deacon == null && "ready".equals(machine.state)) {
-            note = "No Deacon on " + machine.host.name + ". Use Start Deacon to start one.";
-            render(true);
+        // Only a connected computer's list is live; a cached one is never focused.
+        boolean connected = "ready".equals(machine.state) && machine.handle > 0;
+        switch (FleetTree.pick(connected, members(machine))) {
+            case FOCUS: openAgent((Agent) FleetTree.pickTarget(members(machine))); break;
+            case START:
+                note = "No Deacon on " + machine.host.name + ". Use Start Deacon to start one.";
+                render(true);
+                break;
+            default:
+                note = machine.host.name + " is offline.";
+                render(true);
+                break;
         }
     }
 

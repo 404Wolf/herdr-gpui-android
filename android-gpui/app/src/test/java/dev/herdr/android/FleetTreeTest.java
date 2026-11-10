@@ -109,7 +109,8 @@ public final class FleetTreeTest {
         assertEquals(FleetTree.DeaconAction.STARTING, FleetTree.deaconAction(true, null, true));
         FleetTree.Member deacon = label(m("t1", "s", "deacon", 0, 0, "/h", "idle"), "deacon", "");
         assertEquals(FleetTree.DeaconAction.OPEN, FleetTree.deaconAction(true, deacon, true));
-        assertEquals(FleetTree.DeaconAction.OPEN, FleetTree.deaconAction(false, deacon, false));
+        // Offline: a cached Deacon is neither opened nor replaced.
+        assertEquals(FleetTree.DeaconAction.NONE, FleetTree.deaconAction(false, deacon, false));
     }
 
     @Test public void gitIsAskedOnlyForConnectedUnfoldedMachinesAndBounded() {
@@ -646,6 +647,19 @@ public final class FleetTreeTest {
         assertNull(FleetTree.pickTarget(none));
         assertEquals(FleetTree.DeaconAction.START,
                 FleetTree.deaconAction(true, FleetTree.pickTarget(none), false));
+    }
+
+    @Test public void anOfflineComputerOrAStaleDeaconIsNeverFocused() {
+        FleetTree.Member cached = label(m("t6k", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member pm = label(m("t67", "hm", "home-manager", 1, 0, "/c", "working"), "pm", "home-manager");
+        // Offline or disconnected: the cached list still holds a Deacon, but it is not focused or offered.
+        assertEquals(FleetTree.Pick.OFFLINE, FleetTree.pick(false, Arrays.asList(cached, pm)));
+        assertEquals(FleetTree.DeaconAction.NONE, FleetTree.deaconAction(false, cached, false));
+        // Online, but the cached Deacon is not among the live terminals now: Start Deacon, no focus.
+        assertEquals(FleetTree.Pick.START, FleetTree.pick(true, Arrays.asList(pm)));
+        // Online and live: focus exactly it.
+        assertEquals(FleetTree.Pick.FOCUS, FleetTree.pick(true, Arrays.asList(cached, pm)));
+        assertSame(cached, FleetTree.pickTarget(Arrays.asList(cached, pm)));
     }
 
     @Test public void thePaneHeaderBadgeNamesTheRole() {

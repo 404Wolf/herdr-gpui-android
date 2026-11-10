@@ -686,8 +686,9 @@ final class FleetTree {
      * nothing in flight (so taps never launch twice); offline offers nothing.
      */
     static DeaconAction deaconAction(boolean connected, Member deacon, boolean inFlight) {
-        if (deacon != null) return DeaconAction.OPEN;
+        // Offline: what is shown is a cached view; nothing to open, nothing to start.
         if (!connected) return DeaconAction.NONE;
+        if (deacon != null) return DeaconAction.OPEN;
         return inFlight ? DeaconAction.STARTING : DeaconAction.START;
     }
 
@@ -819,6 +820,20 @@ final class FleetTree {
      */
     static Member pickTarget(List<? extends Member> members) {
         return canonicalDeacon(members);
+    }
+
+    /** What a pick does: focus the Deacon, offer Start Deacon, or nothing (offline). */
+    enum Pick { FOCUS, START, OFFLINE }
+
+    /**
+     * A pick on a computer that is offline or disconnected is unavailable:
+     * its list is a cached view, so its Deacon is never focused and nothing
+     * is offered. Online, {@code members} are the core's live terminals right
+     * now; a cached Deacon missing from them gets Start Deacon, never a spawn.
+     */
+    static Pick pick(boolean connected, List<? extends Member> liveMembers) {
+        if (!connected) return Pick.OFFLINE;
+        return pickTarget(liveMembers) != null ? Pick.FOCUS : Pick.START;
     }
 
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */
