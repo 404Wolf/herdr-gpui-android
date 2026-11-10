@@ -358,7 +358,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setGravity(android.view.Gravity.CENTER_VERTICAL);
         crumb.setPadding(dp(10), 0, dp(10), 0);
         crumb.setVisibility(View.GONE);
-        crumb.setOnClickListener(v -> { showSidebar(); revealSelectedRow(true); });
+        crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
         content.addView(surface, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
@@ -447,9 +447,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return getResources().getConfiguration().screenWidthDp < 600;
     }
 
+    /**
+     * Opened by a gesture (edge swipe, edge Back, the breadcrumb) on a wide
+     * window, the rail floats over the terminal like the cover's drawer: the
+     * terminal keeps its width, so the agent's pty is never resized (a resize
+     * makes Claude Code's screen reflow into fragments, on every viewer of a
+     * shared terminal). The toolbar's toggle still pins it beside the terminal.
+     */
+    private boolean railOverlay;
+
+    private boolean railAsDrawer() {
+        return compactWindow() || railOverlay;
+    }
+
+    /** Opens the rail as a drawer over the terminal, never narrowing it. */
+    private void showRailOverlay() {
+        if (sidebarOpen) return;
+        railOverlay = !compactWindow();
+        setSidebarOpen(true);
+    }
+
     private void styleRail() {
         if (sidebar == null) return;
-        boolean drawer = compactWindow();
+        boolean drawer = railAsDrawer();
         if (drawer) {
             // A modal drawer: rounded on its open edge, raised over the scrim.
             float radius = dp(16);
@@ -476,7 +496,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Moves the rail between the drawer layer and the column beside the terminal. */
     private void placeRail() {
         if (sidebar == null || railColumns == null || terminalRoot == null) return;
-        boolean drawer = compactWindow();
+        boolean drawer = railAsDrawer();
         android.view.ViewGroup parent = (android.view.ViewGroup) sidebar.getParent();
         android.view.ViewGroup wanted = drawer ? terminalRoot : railColumns;
         if (parent != wanted) {
@@ -504,7 +524,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (Build.VERSION.SDK_INT < 34 || wanted == (edgeBack != null)) return;
         if (wanted) {
             edgeBack = EdgeBack.register(this, () -> {
-                if (shellMode()) leaveByBack(); else showSidebar();
+                if (shellMode()) leaveByBack(); else showRailOverlay();
             }, this::leaveByBack);
         } else {
             EdgeBack.unregister(this, edgeBack);
@@ -546,12 +566,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Choosing a destination in the drawer closes it, as Android's drawers do. */
     private void closeRailDrawer() {
-        if (compactWindow()) hideSidebar();
+        if (railAsDrawer()) hideSidebar();
     }
 
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
-        if (sidebarOpen && compactWindow()) {
+        if (sidebarOpen && railAsDrawer()) {
             hideSidebar();
             return;
         }
@@ -1803,9 +1823,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void setSidebarOpen(boolean open) {
         sidebarOpen = open;
-        // The stored choice is for a panel with room; a drawer opened on the
-        // cover is transient and must not reopen a rail after unfolding.
-        if (!compactWindow()) {
+        // The stored choice is for a pinned panel with room; a drawer (the
+        // cover's, or one opened by a gesture) is transient.
+        boolean transientDrawer = railAsDrawer();
+        if (!open) railOverlay = false;
+        if (!transientDrawer) {
             getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
                     .putBoolean("list", sidebarOpen).apply();
         }
@@ -1825,7 +1847,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int width;
         if (!sidebarOpen) {
             width = 0;
-        } else if (compactWindow()) {
+        } else if (railAsDrawer()) {
             // Modal drawer: wide enough to read titles, never the whole window.
             width = available > 0 ? Math.min(dp(320), Math.round(available * 0.86f)) : dp(300);
         } else {
@@ -3560,7 +3582,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 float needed = touchDownX < dp(40) ? dp(24) : dp(60);
                 if (dx > needed && dx > dy * 1.5f) {
                     edgeClaimed = true;
-                    showSidebar();
+                    showRailOverlay();
                     return true;
                 }
             }
