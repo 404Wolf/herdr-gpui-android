@@ -76,9 +76,6 @@ public final class HomeActivity extends Activity {
         Set<String> gitAsked = new HashSet<>();
         /** Start Deacon / New project / opening a worktree: in flight, and the last error. */
         boolean deaconBusy, projectBusy;
-        /** The Deacon message box: a send in flight, and why the last one did not go in. */
-        boolean sendBusy;
-        String sendError = "";
         /** A Deacon just launched, not yet confirmed running: its terminal and when. */
         String deaconPending = "";
         long deaconPendingAt;
@@ -547,16 +544,12 @@ public final class HomeActivity extends Activity {
         tree = column();
         tree.setPadding(dp(6), dp(2), dp(6), dp(16));
         // One computer at a time, as the desktop sidebar: its picker and Deacon
-        // card (with the message box, which is never rebuilt under a finger),
-        // then the repos, projects, worktrees and workers below.
-        if (draftBox != null && draftFor != null) drafts.put(draftFor, draftBox.getText().toString());
-        draftFor = null;
+        // card, then the repos, projects, worktrees and workers below.
         header = column();
         machineBar = column();
         deaconCard = column();
         header.addView(machineBar);
         header.addView(deaconCard);
-        header.addView(messageRow());
         body = column();
         tree.addView(header);
         tree.addView(body);
@@ -706,7 +699,6 @@ public final class HomeActivity extends Activity {
         }
         Machine shown = shownMachine();
         if (shown != null) renderMachine(shown);
-        else if (messageBox != null) messageBox.setVisibility(View.GONE);
         if (fleet != null && wide()) {
             fleet.removeAllViews();
             fleetOverview(all, counts);
@@ -816,7 +808,6 @@ public final class HomeActivity extends Activity {
             machine.deaconError = "";
         }
         maybeLookGit(machine, all, ready, false);
-        syncDraft(machine);
 
         // The computer picker: name, agents, how many need you, ▾ for the others.
         LinearLayout row = row();
@@ -874,7 +865,6 @@ public final class HomeActivity extends Activity {
         machineBar.addView(row);
 
         deaconRows(machine, fleet, ready);
-        updateMessageBox(machine, fleet, ready);
 
         LinearLayout rows = column();
         // Offline: what was last seen stays, dimmed; nothing can be started there.
@@ -882,6 +872,9 @@ public final class HomeActivity extends Activity {
         for (Row top : bodyRows(machine, fleet, ready)) emit(rows, top, "", true, 0);
         body.addView(rows);
     }
+
+    private LinearLayout header, body, machineBar, deaconCard;
+    private String selectedHost;
 
     /** The Deacon card: the Deacon (id, status), its state, Needs you, + Project. */
     private void deaconRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
@@ -925,128 +918,6 @@ public final class HomeActivity extends Activity {
                 : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
         deaconCard.addView(actionLine("   ", null, "+", said, machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
                 ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null));
-    }
-
-    // ── The Deacon message box (one per Home; its text is per computer) ──
-
-    private LinearLayout header, body, machineBar, deaconCard, messageBox;
-    private EditText draftBox;
-    private TextView sendButton, sendNote;
-    private String selectedHost, draftFor;
-    /** Unsent text per computer while another one is shown. */
-    private final Map<String, String> drafts = new HashMap<>();
-
-    private View messageRow() {
-        messageBox = column();
-        messageBox.setPadding(dp(14), dp(2), dp(4), dp(4));
-        LinearLayout line = new LinearLayout(this);
-        line.setOrientation(LinearLayout.HORIZONTAL);
-        line.setGravity(Gravity.CENTER_VERTICAL);
-        draftBox = new EditText(this);
-        draftBox.setHint("Tell the deacon…");
-        draftBox.setSingleLine(true);
-        draftBox.setTextSize(13);
-        draftBox.setTextColor(chrome.onSurface);
-        draftBox.setHintTextColor(chrome.onSurfaceVariant);
-        draftBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
-        draftBox.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
-        draftBox.setOnEditorActionListener((view, action, event) -> { sendDraft(); return true; });
-        line.addView(draftBox, new LinearLayout.LayoutParams(0, -2, 1));
-        sendButton = chip("Send", true, this::sendDraft);
-        line.addView(sendButton);
-        messageBox.addView(line);
-        sendNote = text("", 11, chrome.danger);
-        sendNote.setPadding(0, dp(1), 0, dp(2));
-        sendNote.setVisibility(View.GONE);
-        messageBox.addView(sendNote);
-        messageBox.setVisibility(View.GONE);
-        return messageBox;
-    }
-
-    /** The box holds the shown computer's text; switching keeps each computer's own. */
-    private void syncDraft(Machine machine) {
-        if (draftBox == null) return;
-        String now = machine.host.id;
-        if (now.equals(draftFor)) return;
-        if (draftFor != null) drafts.put(draftFor, draftBox.getText().toString());
-        String text = drafts.remove(now);
-        draftBox.setText(text == null ? "" : text);
-        draftFor = now;
-    }
-
-    private void updateMessageBox(Machine machine, FleetTree.Fleet fleet, boolean ready) {
-        if (messageBox == null) return;
-        messageBox.setVisibility(fleet.deacon == null ? View.GONE : View.VISIBLE);
-        boolean can = ready && !machine.sendBusy && fleet.deacon != null;
-        draftBox.setEnabled(ready);
-        sendButton.setEnabled(can);
-        sendButton.setText(machine.sendBusy ? "Sending…" : "Send");
-        sendButton.setAlpha(can ? 1f : 0.5f);
-        String note = machine.sendError;
-        if (!note.contentEquals(sendNote.getText())) sendNote.setText(note);
-        sendNote.setVisibility(note.isEmpty() ? View.GONE : View.VISIBLE);
-    }
-
-    /**
-     * One finished message into the shown computer's Deacon. A Deacon that is
-     * blocked on its own question refuses it (never forced); the draft stays.
-     */
-    private void sendDraft() {
-        Machine machine = shownMachine();
-        if (machine == null || draftBox == null) return;
-        FleetTree.Member deacon = FleetTree.canonicalDeacon(members(machine));
-        String text = draftBox.getText().toString().trim();
-        long handle = machine.handle;
-        if (text.isEmpty() || deacon == null || machine.sendBusy) return;
-        if (handle <= 0 || !"ready".equals(machine.state)) {
-            machine.sendError = machine.host.name + " is offline. Reconnect it, then send.";
-            machine.ui++;
-            render(true);
-            return;
-        }
-        if (text.length() > 1000) {
-            machine.sendError = "That message is too long for one send; shorten it.";
-            machine.ui++;
-            render(true);
-            return;
-        }
-        String action;
-        try {
-            action = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
-        } catch (org.json.JSONException impossible) {
-            return;
-        }
-        String id = machine.host.id;
-        machine.sendBusy = true;
-        machine.sendError = "";
-        machine.ui++;
-        render(true);
-        worker.execute(() -> {
-            boolean queued = false;
-            String refused = "";
-            int code = 0;
-            try {
-                JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
-                queued = result.optBoolean("queued", false);
-                refused = result.optString("refused", "");
-                code = result.optInt("code", 0);
-            } catch (Exception | LinkageError error) {
-                queued = false;
-            }
-            final String error = FleetTree.sendError(queued, refused, code, machine.host.name);
-            main.post(() -> {
-                if (destroyed) return;
-                machine.sendBusy = false;
-                machine.sendError = error == null ? "" : error;
-                // Only that computer's text, and only while it is still what was sent.
-                if (error == null) {
-                    if (id.equals(draftFor) && draftBox.getText().toString().trim().equals(text)) draftBox.setText("");
-                    else if (text.equals(drafts.getOrDefault(id, "").trim())) drafts.remove(id);
-                }
-                machine.ui++;
-                render(true);
-            });
-        });
     }
 
     /** One row of the tree and the rows it folds. */
@@ -1153,8 +1024,9 @@ public final class HomeActivity extends Activity {
                     + (tally.isEmpty() ? "" : "  " + tally), chrome.onSurfaceVariant, () -> askForManager(machine, project)));
         }
         row.fold = key;
-        // Quiet big projects start folded; anything waiting on Wolf stays open.
-        row.foldedByDefault = project.agents() > 6 && project.tally[0] == 0;
+        // Projects start folded, as on the desktop: a repo shows its PM rows,
+        // opening one shows its worktrees and workers. Home reveals nothing on its own.
+        row.foldedByDefault = true;
         boolean flat = FleetTree.flat(project);
         for (FleetTree.SpaceNode entry : project.entries) {
             if (flat) {

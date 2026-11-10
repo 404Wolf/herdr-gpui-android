@@ -197,16 +197,6 @@ final class FleetTree {
         return out;
     }
 
-    /**
-     * What to say when a message to the Deacon did not go in: the core's
-     * refusal of a blocked program (hc's exit 9) is never forced; the draft
-     * stays. Null when it went in.
-     */
-    static String sendError(boolean queued, String refused, int code, String computer) {
-        if (queued) return null;
-        if ("blocked".equals(refused) || code == 9) return "The deacon is waiting for an answer. Reply to it first.";
-        return "Couldn't reach the deacon on " + computer + ". Check that it's online and try again.";
-    }
 
     /** Unopened worktrees shown before "+N more"; a tap shows a page more. */
     static final int CLOSED_CAP = 30;
@@ -749,6 +739,41 @@ final class FleetTree {
     static boolean flat(Project project) {
         return project.pm != null && project.entries.size() == 1
                 && project.entries.get(0).key.equals(project.pmKey);
+    }
+
+    /**
+     * Project folds as the desktop sidebar keeps them: every project starts
+     * folded (a repo shows only its PM rows; opening one shows its worktrees
+     * and workers). {@code opened} holds the projects Wolf opened. Nothing is
+     * revealed at startup; a later focus change opens the focused agent's
+     * project once, and a fold made after that is kept.
+     */
+    static final class Folds {
+        final Set<String> opened;
+        private String focus;
+        Folds(Set<String> opened) { this.opened = opened; }
+
+        boolean folded(String projectKey) { return !opened.contains(projectKey); }
+
+        void toggle(String projectKey) { if (!opened.remove(projectKey)) opened.add(projectKey); }
+
+        /** The focused terminal, seen on a refresh: true when this reveals (opens) {@code keys}. */
+        boolean focusSeen(String now, java.util.Collection<String> keys) {
+            if (now == null || now.isEmpty()) return false;
+            if (focus == null) { focus = now; return false; } // startup: record, reveal nothing
+            if (now.equals(focus)) return false;
+            focus = now;
+            return opened.addAll(keys);
+        }
+    }
+
+    /** The project holding terminal {@code id} (as its PM or in one of its rows), or null. */
+    static Project projectOf(Fleet fleet, String id) {
+        for (Project p : fleet.projects) {
+            if (p.pm != null && p.pm.id.equals(id)) return p;
+            for (SpaceNode row : p.entries) for (Member m : row.members) if (m.id.equals(id)) return p;
+        }
+        return null;
     }
 
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */

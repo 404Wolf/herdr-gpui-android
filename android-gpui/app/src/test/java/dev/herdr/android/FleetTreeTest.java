@@ -574,14 +574,30 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("t3", "t2", "t1"), ids(FleetTree.needsYou(fleet)));
     }
 
-    @Test public void aRefusedSendToABlockedDeaconSaysSoAndIsNeverForced() {
-        assertNull(FleetTree.sendError(true, "", 0, "laptop"));
-        assertEquals("The deacon is waiting for an answer. Reply to it first.",
-                FleetTree.sendError(false, "blocked", 9, "laptop"));
-        assertEquals("The deacon is waiting for an answer. Reply to it first.",
-                FleetTree.sendError(false, "", 9, "laptop"));
-        assertEquals("Couldn't reach the deacon on server. Check that it's online and try again.",
-                FleetTree.sendError(false, "", 0, "server"));
+    @Test public void projectsStartFoldedNothingOpensAtStartupAndAManualFoldIsKept() {
+        FleetTree.Folds folds = new FleetTree.Folds(new HashSet<>());
+        assertTrue(folds.folded("hm"));
+        assertTrue(folds.folded("botd"));
+        // Startup: the active worker's project is not opened.
+        assertFalse(folds.focusSeen("t6m", Arrays.asList("hm")));
+        assertTrue(folds.folded("hm"));
+        // Wolf opens and folds by hand.
+        folds.toggle("botd");
+        assertFalse(folds.folded("botd"));
+        // Moving to another window later opens its project once...
+        assertTrue(folds.focusSeen("t5h", Arrays.asList("hm")));
+        assertFalse(folds.folded("hm"));
+        // ...and a fold made after that is kept while the focus stays.
+        folds.toggle("hm");
+        assertFalse(folds.focusSeen("t5h", Arrays.asList("hm")));
+        assertTrue(folds.folded("hm"));
+        // The focused agent's project is found by PM or worker.
+        FleetTree.Member pm = label(m("t1", "s", "app", 0, 0, "/w/app", "idle"), "pm", "app");
+        FleetTree.Member w = label(m("t2", "s", "app", 0, 1, "/w/app-wt", "working"), "worker", "app");
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(pm, w), null);
+        assertEquals("app", FleetTree.projectOf(fleet, "t2").name);
+        assertEquals("app", FleetTree.projectOf(fleet, "t1").name);
+        assertNull(FleetTree.projectOf(fleet, "t9"));
     }
 
     @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {

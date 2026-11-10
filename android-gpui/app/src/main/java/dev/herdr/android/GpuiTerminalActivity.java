@@ -1867,7 +1867,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (sidebarButton == null) return;
         sidebarButton.setSelected(sidebarOpen);
         sidebarButton.setBackground(controlBackground(sidebarOpen, 0x00000000, 12, dp(4)));
-        sidebarButton.setTooltipText(sidebarOpen ? "Hide hosts" : "Hosts");
         sidebarButton.setContentDescription(sidebarOpen
                 ? "Hide the host and workspace sidebar"
                 : "Show the host and workspace sidebar");
@@ -2295,22 +2294,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
         String selectedPane = live && current != null ? current.paneId : "";
-        // Arriving at a window (a tap, Home, a notification) opens its folds once.
-        if (!selectedPane.isEmpty() && !selectedPane.equals(unfoldedFor)) {
-            unfoldedFor = selectedPane;
-            boolean changed = false;
-            for (FleetTree.Project project : fleet.projects) {
-                for (FleetTree.SpaceNode row : project.entries) {
-                    if (!containsMember(row.members, selectedPane) && (project.pm == null
-                            || !project.pm.id.equals(selectedPane))) continue;
-                    changed |= collapsedRepos().remove(railKey(host, "p/" + project.name));
-                    changed |= collapsedRepos().remove(railKey(host, "s/" + project.name + "/" + row.key));
+        // Projects start folded. Nothing opens at startup; moving to another
+        // window later opens its project once, and a fold after that is kept.
+        FleetTree.Project focusedProject = FleetTree.projectOf(fleet, selectedPane);
+        java.util.List<String> reveal = new java.util.ArrayList<>();
+        if (focusedProject != null) reveal.add(railProjectKey(host, focusedProject));
+        if (railFolds().focusSeen(selectedPane, reveal)) {
+            for (FleetTree.SpaceNode row : focusedProject.entries) {
+                if (containsMember(row.members, selectedPane)) {
+                    collapsedRepos().remove(railKey(host, "s/" + focusedProject.name + "/" + row.key));
                 }
             }
-            if (changed) {
-                getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                        .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
-            }
+            getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                    .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
         }
         updateRailFleetButtons(header, host, live, current, fleet);
         FleetTree.Member deacon = fleet.deacon;
@@ -2335,7 +2331,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                             chrome.danger, 1, () -> openRailPane(host, live, current, waiting.id), order, keep);
                 }
             }
-            if (live) railMessageBox(host, current, deacon, order, keep);
             boolean asking = railProjectBusy.contains(host.id);
             railNote(host, "new-project", asking ? "Asking the Deacon…" : "+ Project (asks the Deacon)",
                     asking ? chrome.onSurfaceVariant : chrome.primary, 1,
@@ -2411,8 +2406,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             java.util.List<FleetTree.Member> members, String selectedPane, java.util.List<View> order,
             java.util.Set<String> keep) {
         int base = 1;
-        String projectKey = railKey(host, "p/" + project.name);
-        boolean projectFolded = collapsedRepos().contains(projectKey);
+        String projectKey = railProjectKey(host, project);
+        boolean projectFolded = railFolds().folded(projectKey);
         String tally = (project.tally[0] > 0 ? project.tally[0] + "! " : "")
                 + (project.tally[2] > 0 ? project.tally[2] + "▶ " : "") + project.agents();
         String firstPane = project.pm != null ? project.pm.id : firstMember(project);
@@ -2441,102 +2436,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    /** Per machine: the Deacon message box views (kept, so typing survives refreshes) and send state. */
-    private final java.util.Map<String, LinearLayout> railMessageBoxes = new java.util.HashMap<>();
-    private final java.util.Set<String> railSendBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private final java.util.Map<String, String> railSendError = new java.util.concurrent.ConcurrentHashMap<>();
+    private FleetTree.Folds railFoldState;
 
-    /** The Deacon message box for the live machine: one finished message, never forced. */
-    private void railMessageBox(SavedRemoteHost host, Connection current, FleetTree.Member deacon,
-            java.util.List<View> order, java.util.Set<String> keep) {
-        String key = "fleetmsg:" + host.id;
-        keep.add(key);
-        LinearLayout box = railMessageBoxes.get(key);
-        if (box == null) {
-            box = new LinearLayout(this);
-            box.setOrientation(LinearLayout.VERTICAL);
-            box.setPadding(dp(22), dp(1), dp(6), dp(2));
-            box.setSaveFromParentEnabled(false);
-            LinearLayout line = new LinearLayout(this);
-            line.setOrientation(LinearLayout.HORIZONTAL);
-            line.setGravity(android.view.Gravity.CENTER_VERTICAL);
-            EditText input = new EditText(this);
-            input.setHint("Tell the deacon…");
-            input.setSingleLine(true);
-            input.setTextSize(12);
-            input.setTextColor(chrome.onSurface);
-            input.setHintTextColor(chrome.onSurfaceVariant);
-            input.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEND
-                    | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
-            input.setSaveEnabled(false);
-            line.addView(input, new LinearLayout.LayoutParams(0, -2, 1));
-            TextView send = railText("Send", 12, chrome.primary);
-            send.setPadding(dp(8), dp(4), dp(8), dp(4));
-            send.setBackground(railBackground(false));
-            line.addView(send);
-            box.addView(line);
-            TextView note = railText("", 11, chrome.danger);
-            note.setVisibility(View.GONE);
-            box.addView(note);
-            railMessageBoxes.put(key, box);
-        }
-        LinearLayout line = (LinearLayout) box.getChildAt(0);
-        EditText input = (EditText) line.getChildAt(0);
-        TextView send = (TextView) line.getChildAt(1);
-        TextView note = (TextView) box.getChildAt(1);
-        boolean busy = railSendBusy.contains(host.id);
-        Runnable go = () -> railSendDraft(host, current, deacon, input);
-        send.setOnClickListener(busy ? null : v -> go.run());
-        send.setText(busy ? "Sending…" : "Send");
-        send.setAlpha(busy ? 0.5f : 1f);
-        input.setOnEditorActionListener((view, action, event) -> { if (!railSendBusy.contains(host.id)) go.run(); return true; });
-        String error = railSendError.getOrDefault(host.id, "");
-        if (!error.contentEquals(note.getText())) note.setText(error);
-        note.setVisibility(error.isEmpty() ? View.GONE : View.VISIBLE);
-        order.add(box);
+    /** Project folds (opened projects live in the rail's fold set as ":open" keys). */
+    private FleetTree.Folds railFolds() {
+        if (railFoldState == null) railFoldState = new FleetTree.Folds(collapsedRepos());
+        return railFoldState;
     }
 
-    private void railSendDraft(SavedRemoteHost host, Connection current, FleetTree.Member deacon, EditText input) {
-        String text = input.getText().toString().trim();
-        if (text.isEmpty() || current == null || !railSendBusy.add(host.id)) return;
-        if (text.length() > 1000) {
-            railSendBusy.remove(host.id);
-            railSendError.put(host.id, "That message is too long for one send; shorten it.");
-            refreshSidebar(true);
-            return;
-        }
-        String json;
-        try {
-            json = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
-        } catch (JSONException impossible) { railSendBusy.remove(host.id); return; }
-        railSendError.remove(host.id);
-        refreshSidebar(true);
-        actionWorker.execute(() -> {
-            boolean queued = false;
-            String refused = "";
-            int code = 0;
-            try {
-                JSONObject result = new JSONObject(RemoteNative.sessionAction(current.remoteHandle, json));
-                queued = result.optBoolean("queued", false);
-                refused = result.optString("refused", "");
-                code = result.optInt("code", 0);
-            } catch (Exception | LinkageError error) {
-                queued = false;
-            }
-            final String error = FleetTree.sendError(queued, refused, code, host.name);
-            main.post(() -> {
-                if (destroyed) return;
-                railSendBusy.remove(host.id);
-                if (error == null) {
-                    railSendError.remove(host.id);
-                    // Only while it is still what was sent; a refused draft stays.
-                    if (input.getText().toString().trim().equals(text)) input.setText("");
-                } else {
-                    railSendError.put(host.id, error);
-                }
-                refreshSidebar(true);
-            });
-        });
+    private static String railProjectKey(SavedRemoteHost host, FleetTree.Project project) {
+        return railKey(host, "p/" + project.name) + ":open";
     }
 
     private static boolean containsMember(java.util.List<FleetTree.Member> list, String id) {
@@ -2902,7 +2811,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         prune(railWorkspaces, keep, holder -> holder.row);
         prune(railPanes, keep, holder -> holder.row);
         prune(railNotes, keep, view -> view);
-        prune(railMessageBoxes, keep, view -> view);
         prune(railRules, keep, view -> view);
     }
 
@@ -3162,8 +3070,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private java.util.Set<String> railCollapsed;
-    /** The window whose repo was last unfolded on arrival. */
-    private String unfoldedFor = "";
 
     /** Collapsed repos, per machine and repo, kept across launches. */
     private java.util.Set<String> collapsedRepos() {
