@@ -633,6 +633,21 @@ public final class FleetTreeTest {
         }
     }
 
+    @Test public void pickingAComputerResolvesToItsExactDeaconOrToStart() {
+        // One computer: two deacon candidates; the canonical (oldest) one is focused.
+        FleetTree.Member older = label(m("t6k", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        older.createdMs = 10;
+        FleetTree.Member newer = label(m("t9", "d", "deacon", 0, 1, "/h", "working"), "deacon", "");
+        newer.createdMs = 20;
+        FleetTree.Member pm = label(m("t67", "hm", "home-manager", 1, 0, "/c", "working"), "pm", "home-manager");
+        assertSame(older, FleetTree.pickTarget(Arrays.asList(newer, pm, older)));
+        // Another computer with no Deacon: no target, the picker shows Start Deacon.
+        List<FleetTree.Member> none = Arrays.asList(pm);
+        assertNull(FleetTree.pickTarget(none));
+        assertEquals(FleetTree.DeaconAction.START,
+                FleetTree.deaconAction(true, FleetTree.pickTarget(none), false));
+    }
+
     @Test public void thePaneHeaderBadgeNamesTheRole() {
         assertEquals("PM·t19", FleetTree.roleBadge("pm", "t19", "ignored"));
         assertEquals("Deacon·t6k", FleetTree.roleBadge("deacon", "t6k", ""));

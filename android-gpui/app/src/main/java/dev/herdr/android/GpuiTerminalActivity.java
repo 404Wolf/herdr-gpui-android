@@ -3070,15 +3070,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         ActionSheet sheet = new ActionSheet(this, chrome, "Machine");
         for (SavedRemoteHost host : savedHosts) {
             boolean live = host.id.equals(currentHostId);
-            JSONArray panes;
+            JSONArray panes, workspaces, tabs;
+            Connection current;
+            synchronized (stateLock) { current = connection; }
             if (live) {
-                Connection current;
-                synchronized (stateLock) { current = connection; }
                 panes = current == null ? null : current.panes;
+                workspaces = current == null ? null : current.workspaces;
+                tabs = current == null ? null : current.tabs;
             } else {
                 HostSample sample = hostSamples.get(host.id);
                 panes = sample == null ? null : sample.panes;
+                workspaces = sample == null ? null : sample.workspaces;
+                tabs = sample == null ? null : sample.tabs;
             }
+            // A pick focuses that computer's canonical live Deacon, in its exact
+            // terminal; with none, the rail shows Start Deacon. Nothing starts.
+            FleetTree.Member deacon = FleetTree.pickTarget(
+                    FleetPanes.members(workspaces, tabs, panes, FleetTree.Member::new));
             int waiting = 0;
             for (int i = 0; panes != null && i < panes.length(); i++) {
                 JSONObject pane = panes.optJSONObject(i);
@@ -3088,7 +3096,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String label = (live ? "● " : "○ ") + host.name
                     + (waiting > 0 ? "   " + waiting + " need" + (waiting == 1 ? "s" : "") + " you" : "")
                     + (live ? "   (here)" : "");
-            sheet.add(label, () -> { if (!live) { switchHost(host); closeRailDrawer(); } });
+            sheet.add(label, () -> {
+                if (deacon != null) {
+                    if (live && current != null) focusRemotePane(current, deacon.id);
+                    else switchHost(host, deacon.id);
+                    closeRailDrawer();
+                } else if (!live) {
+                    // The rail then shows that computer with its Start Deacon row.
+                    switchHost(host);
+                }
+            });
         }
         sheet.show();
     }

@@ -812,6 +812,15 @@ final class FleetTree {
         }
     }
 
+    /**
+     * What picking a computer in the Fleet picker focuses: the exact
+     * terminal of its one canonical live Deacon, or null, when the picker
+     * shows Start Deacon instead (nothing is ever started by a pick).
+     */
+    static Member pickTarget(List<? extends Member> members) {
+        return canonicalDeacon(members);
+    }
+
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */
     static Member newProjectTarget(Fleet fleet) {
         return fleet.deacon;

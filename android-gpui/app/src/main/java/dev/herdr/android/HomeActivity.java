@@ -751,6 +751,10 @@ public final class HomeActivity extends Activity {
         return best;
     }
 
+    /**
+     * Picking a computer shows it and focuses its canonical live Deacon (the
+     * exact terminal). With none, its card offers Start Deacon; nothing starts.
+     */
     private void pickMachine(Machine machine) {
         selectedHost = machine.host.id;
         try {
@@ -759,6 +763,12 @@ public final class HomeActivity extends Activity {
             // The pick lasts this session.
         }
         render(true);
+        FleetTree.Member deacon = FleetTree.pickTarget(members(machine));
+        if (deacon != null && "ready".equals(machine.state)) openAgent((Agent) deacon);
+        else if (deacon == null && "ready".equals(machine.state)) {
+            note = "No Deacon on " + machine.host.name + ". Use Start Deacon to start one.";
+            render(true);
+        }
     }
 
     /** Every computer, with how many agents it runs and how many wait on Wolf. */
