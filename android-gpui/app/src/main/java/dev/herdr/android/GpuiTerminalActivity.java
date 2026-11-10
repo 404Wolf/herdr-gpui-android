@@ -1968,7 +1968,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void updateCrumb(Connection current, String space) {
         if (crumb == null) return;
-        String title = "", status = "", cwd = "", spaceLabel = "";
+        String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
@@ -1977,7 +1977,21 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     chromeTitle(pane.optString("title", ""), current.paneId), current.paneId), pane);
             status = pane.optString("status", "");
             cwd = pane.optString("cwd", "");
+            role = FleetTree.role(pane.optString("role", ""));
+            tabId = pane.optString("tab_id", "");
         }
+        // The pane's role badge, as the desktop's pane header: PM·t19, worker·<task>, Deacon·t6k.
+        String task = "";
+        JSONArray tabs = current.tabs;
+        for (int i = 0; tabs != null && i < tabs.length(); i++) {
+            JSONObject tab = tabs.optJSONObject(i);
+            if (tab != null && tabId.equals(tab.optString("id")) && space.equals(tab.optString("workspace_id"))) {
+                String label = tab.optString("label", "").trim();
+                if (!label.isEmpty() && !RailTree.isTerminalId(label)) task = label;
+            }
+        }
+        if (task.isEmpty()) task = title;
+        String badge = FleetTree.roleBadge(role, current.paneId, task);
         String named = RailTree.labels(current.workspaces, current.tabs, panes).get(space);
         if (named != null) spaceLabel = chromeTitle(named, space);
         String repo = RailTree.repoOfPath(cwd);
@@ -1986,8 +2000,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (repo != null && !repo.equals(spaceLabel)) parts.add(repo);
         if (!spaceLabel.isEmpty()) parts.add(spaceLabel);
         if (!title.isEmpty()) parts.add(RailTree.withoutSpace(title, spaceLabel));
-        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(
-                android.text.TextUtils.join("  ›  ", parts));
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
+        if (!badge.isEmpty()) {
+            text.append(badge, new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0);
+            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.primary), 0, text.length(), 0);
+            text.append("   ");
+        }
+        text.append(android.text.TextUtils.join("  ›  ", parts));
         String why = "blocked".equals(status) ? "needs you: waiting for your answer"
                 : "error".equals(status) ? "stopped with an error" : "";
         if (!why.isEmpty()) {
@@ -2414,6 +2433,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railHeader(host, live, current, "proj:" + project.name, project.name
                 + (project.pm == null ? " · no PM" : ""), tally, projectKey, projectFolded,
                 base, firstPane, order, keep);
+        RailWorkspaceRow projectRow = railWorkspaces.get("fleet:" + host.id + "/proj:" + project.name);
+        if (projectRow != null) projectRow.focusFirst = project.pm != null;
         if (projectFolded) return;
         if (project.pm != null) railAgent(host, live, current, project.pm, "PM · ", base + 1, selectedPane, order, keep);
         boolean flat = FleetTree.flat(project);
@@ -2508,6 +2529,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         row.firstPane = firstPane;
         // Virtual by default: the scoped menu (open its terminal, copy details).
         row.physicalSpace = null;
+        row.focusFirst = false;
         row.workspaceId = railSpaceOf.getOrDefault(firstPane, "");
         row.foldKey = foldKey;
         row.folded = folded;
@@ -2979,7 +3001,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // Every header folds from anywhere on its row (a repo its
             // worktrees, a worktree or space its windows); Open is on its
             // long-press menu, and a window row opens that window.
-            if (holder.foldKey != null) {
+            // A PM's project row focuses that PM (its chevron folds), as on the desktop.
+            if (holder.foldKey != null && !(holder.focusFirst && !holder.firstPane.isEmpty())) {
                 toggleRepo(holder.foldKey);
                 return;
             }
@@ -3285,6 +3308,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         /** What this header folds (a repo's worktrees, or its own windows), or null. */
         String foldKey;
         boolean folded;
+        /** A PM's project row: a tap focuses its PM; only the chevron folds. */
+        boolean focusFirst;
         /** The one physical space this row wholly is, or null for a Fleet header (scoped menu). */
         String physicalSpace = "";
     }

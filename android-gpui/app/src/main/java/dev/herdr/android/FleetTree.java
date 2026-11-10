@@ -139,6 +139,9 @@ final class FleetTree {
      * projects working in it, its loose spaces, and its unopened worktrees
      * once (from the one project fleet() listed them under).
      */
+    /** The repo key of a labelled PM's own heading outside git. */
+    static final String NO_GIT = "nogit:";
+
     static final class RepoGroup {
         final String repo, name;
         final List<Project> projects = new ArrayList<>();
@@ -155,6 +158,9 @@ final class FleetTree {
         }
 
         boolean outside() { return repo.isEmpty(); }
+
+        /** A labelled PM's own heading outside git: no repo, no unopened worktrees. */
+        boolean noGit() { return repo.startsWith(NO_GIT); }
     }
 
     /**
@@ -166,8 +172,11 @@ final class FleetTree {
         Map<String, RepoGroup> repos = new LinkedHashMap<>();
         RepoGroup outside = new RepoGroup("", "Outside git");
         for (Project p : fleet.projects) {
-            RepoGroup g = p.repo.isEmpty() ? outside
-                    : repos.computeIfAbsent(p.repo, r -> new RepoGroup(r, repoName(r)));
+            // An explicitly labelled PM outside git gets its own heading ("phone · no git").
+            boolean labelledPm = p.pm != null && "pm".equals(p.pm.role) && p.name.equals(p.pm.project);
+            RepoGroup g = !p.repo.isEmpty() ? repos.computeIfAbsent(p.repo, r -> new RepoGroup(r, repoName(r)))
+                    : labelledPm ? repos.computeIfAbsent(NO_GIT + p.name, r -> new RepoGroup(r, p.name + " · no git"))
+                    : outside;
             g.projects.add(p);
             for (int i = 0; i < 4; i++) g.tally[i] += p.tally[i];
             if (g.owner == null && !p.closed.isEmpty()) g.owner = p;
@@ -774,6 +783,16 @@ final class FleetTree {
             for (SpaceNode row : p.entries) for (Member m : row.members) if (m.id.equals(id)) return p;
         }
         return null;
+    }
+
+    /** The pane header's role badge: "PM·t19", "worker·<task>", "Deacon·t6k"; "" without a role. */
+    static String roleBadge(String role, String id, String task) {
+        switch (role == null ? "" : role) {
+            case "deacon": return "Deacon·" + id;
+            case "pm": return "PM·" + id;
+            case "worker": return "worker·" + (task == null || task.trim().isEmpty() ? id : task.trim());
+            default: return "";
+        }
     }
 
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */

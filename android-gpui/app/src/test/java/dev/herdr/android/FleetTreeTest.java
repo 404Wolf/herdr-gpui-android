@@ -549,16 +549,21 @@ public final class FleetTreeTest {
                 "/c/hm/.git", "/c/hm=main", "/wt/hypr=hypr", "/wt/idle=idle"), 200);
         FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(deacon, hm, hypr, botd, stray, kept), git);
         List<FleetTree.RepoGroup> groups = FleetTree.repoGroups(fleet);
-        assertEquals(2, groups.size());
+        assertEquals(3, groups.size());
         FleetTree.RepoGroup repo = groups.get(0);
         assertEquals("hm", repo.name);
         assertEquals(2, repo.pms());
         assertEquals(Arrays.asList("home-manager", "hypr2d"), Arrays.asList(repo.projects.get(0).name, repo.projects.get(1).name));
         // Unopened worktrees: ONE owner per repo.
         assertEquals(Arrays.asList("/wt/idle"), closedPaths(repo.owner));
-        FleetTree.RepoGroup outside = groups.get(1);
+        // botd's PM is explicitly labelled but outside git: its own heading, not Outside git.
+        FleetTree.RepoGroup noGit = groups.get(1);
+        assertTrue(noGit.noGit());
+        assertEquals("botd · no git", noGit.name);
+        assertEquals("botd", noGit.projects.get(0).name);
+        FleetTree.RepoGroup outside = groups.get(2);
         assertTrue(outside.outside());
-        assertEquals("botd", outside.projects.get(0).name);
+        assertTrue(outside.projects.isEmpty());
         assertEquals(1, outside.loose.size());
         assertEquals("t9", outside.loose.get(0).members.get(0).id);
         // Needs you: the blocked PM, by its own status.
@@ -598,6 +603,28 @@ public final class FleetTreeTest {
         assertEquals("app", FleetTree.projectOf(fleet, "t2").name);
         assertEquals("app", FleetTree.projectOf(fleet, "t1").name);
         assertNull(FleetTree.projectOf(fleet, "t9"));
+    }
+
+    @Test public void aLabelledPmOutsideGitHasItsOwnHeadingAnUnlabelledOneDoesNot() {
+        // project "phone", PM t2x in ~/Config (not a git repo).
+        FleetTree.Member phone = label(m("t2x", "hm", "home-manager", 0, 3, "/c", "working"), "pm", "phone");
+        FleetTree.Member loose = m("t9", "n", "notes", 1, 0, "/notes", "idle"); // unlabelled agent, no git
+        FleetTree.GitLook git = FleetTree.parseGitLook("P\t/c\nP\t/notes\n", 200);
+        List<FleetTree.RepoGroup> groups = FleetTree.repoGroups(FleetTree.build(Arrays.asList(phone, loose), git));
+        assertEquals(2, groups.size());
+        assertEquals("phone · no git", groups.get(0).name);
+        assertSame(phone, groups.get(0).projects.get(0).pm);
+        assertNull(groups.get(0).owner);
+        assertTrue(groups.get(1).outside());
+        assertEquals("notes", groups.get(1).projects.get(0).name);
+    }
+
+    @Test public void thePaneHeaderBadgeNamesTheRole() {
+        assertEquals("PM·t19", FleetTree.roleBadge("pm", "t19", "ignored"));
+        assertEquals("Deacon·t6k", FleetTree.roleBadge("deacon", "t6k", ""));
+        assertEquals("worker·smoke-marker", FleetTree.roleBadge("worker", "t6x", " smoke-marker "));
+        assertEquals("worker·t6x", FleetTree.roleBadge("worker", "t6x", ""));
+        assertEquals("", FleetTree.roleBadge("", "t1", "x"));
     }
 
     @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {
