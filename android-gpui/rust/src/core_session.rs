@@ -279,9 +279,21 @@ impl Connection<'_> {
             self.refresh()?;
             return Ok(json!({"queued":true,"terminal":terminal,"started":false}).to_string());
         }
+        // The Deacon's own folder on this computer ($HOME/.herdr/deacon, made
+        // if missing), never the folder of whatever happens to be focused.
+        let folder = self.deacon_folder()?;
+        // Resolving it took a round trip: check again, and launch only if no
+        // Deacon appeared meanwhile and this computer still answers (a failed
+        // call ends here with its error, nothing launched).
+        let again = self.call("terminal.list", json!({}))?;
+        let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+        if let Some(terminal) = canonical_deacon(&again["terminals"], &doc["value"]) {
+            self.refresh()?;
+            return Ok(json!({"queued":true,"terminal":terminal,"started":false}).to_string());
+        }
         let (terminal, layout_error) = self.launch_space(
             "deacon",
-            None,
+            Some(&folder),
             Some(deacon_line(machine)),
             json!({"role":"deacon","agent.kind":"claude"}),
             cols,
@@ -294,6 +306,20 @@ impl Connection<'_> {
             reply["layout_error"] = json!(error);
         }
         Ok(reply.to_string())
+    }
+    /// `$HOME/.herdr/deacon` on this computer, created if missing, as an
+    /// absolute path (one exec, as the desktop does; the same path as git.look).
+    fn deacon_folder(&mut self) -> Result<String> {
+        use base64::Engine;
+        let result = self.call("machine.exec", json!({"argv":["sh","-c",DEACON_DIR],"timeout":10}))?;
+        if result["code"] != 0 {
+            return Err(Error::Protocol("the Deacon's folder could not be made".into()));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["stdout"].as_str().unwrap_or(""))
+            .map_err(|_| Error::Protocol("invalid command output".into()))?;
+        deacon_dir(&String::from_utf8_lossy(&bytes))
+            .ok_or_else(|| Error::Protocol("the Deacon's folder could not be read".into()))
     }
     /// A new space in herdr-app's document with one tab running `line` (a
     /// shell when None) in `folder` (the core's default when None), labelled
@@ -830,10 +856,19 @@ fn deacon_line(machine: &str) -> String {
     let task = format!(
         "You are the Deacon for {here}; use the deacon skill. If you are not labelled yet, run hc label $HC_TERMINAL_ID role=deacon. Take inventory only until Wolf gives you a goal. Do not start duplicate project managers or workers, and do not restart or switch anything."
     );
-    format!(
-        "cd \"$HOME/Config\" 2>/dev/null || cd \"$HOME\"; exec \"${{SHELL:-/bin/sh}}\" -lic 'claude \"$0\"' {}",
-        sh_quote(&task)
-    )
+    // The terminal starts in the Deacon's folder (terminal.run's cwd).
+    format!("exec \"${{SHELL:-/bin/sh}}\" -lic 'claude \"$0\"' {}", sh_quote(&task))
+}
+/// Makes and prints the Deacon's folder on the computer that runs it. Fixed
+/// text: nothing from the phone is put into it.
+const DEACON_DIR: &str = r#"mkdir -p "$HOME/.herdr/deacon" && cd "$HOME/.herdr/deacon" && pwd"#;
+/// The folder DEACON_DIR printed: one absolute path ending in .herdr/deacon.
+fn deacon_dir(stdout: &str) -> Option<String> {
+    let path = stdout.strip_suffix('\n').unwrap_or(stdout);
+    (path.starts_with('/')
+        && path.trim_end_matches('/').ends_with("/.herdr/deacon")
+        && !path.chars().any(char::is_control))
+    .then(|| path.to_owned())
 }
 /// One POSIX shell word for any text: single quotes, each ' as '\''.
 fn sh_quote(text: &str) -> String {
@@ -1362,6 +1397,31 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{DEACON_DIR, deacon_dir};
+    #[test]
+    fn the_deacons_folder_is_home_herdr_deacon_made_and_read_back() {
+        // The script, run for real with HOME in a scratch folder (spaces and quotes included).
+        let home = std::env::temp_dir().join(format!("herdr deacon 'home' {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).ok();
+        let out = std::process::Command::new("sh")
+            .args(["-c", DEACON_DIR])
+            .env("HOME", &home)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let made = home.join(".herdr/deacon");
+        assert!(made.is_dir());
+        let canonical = std::fs::canonicalize(&made).ok().map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(deacon_dir(&out), canonical, "{out}");
+        let _ = std::fs::remove_dir_all(&home);
+        // Only an absolute .herdr/deacon path is accepted.
+        assert_eq!(deacon_dir("/home/wolf/.herdr/deacon\n").as_deref(), Some("/home/wolf/.herdr/deacon"));
+        assert_eq!(deacon_dir("/home/wolf/Config\n"), None);
+        assert_eq!(deacon_dir("relative/.herdr/deacon\n"), None);
+        assert_eq!(deacon_dir("/a/.herdr/deacon\n/b\n"), None);
+        assert_eq!(deacon_dir(""), None);
+    }
     use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, existing_at, initial_grid, resize_frame, send_refusal};
     #[test]
     fn the_attach_replys_grid_is_used_only_when_negotiated() {
@@ -1477,7 +1537,9 @@ mod tests {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         assert!(said.contains("(Wolf's \"box\" $(rm -rf ~) `x`; echo)"), "{said}");
-        assert!(line.starts_with("cd \"$HOME/Config\" 2>/dev/null || cd \"$HOME\"; exec "));
+        // No cd: the Deacon starts in its own folder, given as terminal.run's cwd.
+        assert!(line.starts_with("exec \"${SHELL:-/bin/sh}\" -lic "));
+        assert!(!line.contains("Config"));
         assert!(deacon_line("").contains("Deacon for this computer;"));
         assert!(deacon_line("a\nb").contains("(ab)"));
     }
@@ -1704,6 +1766,7 @@ mod connection_tests {
     use super::*;
     use crate::remote::State;
     use herdr_remote_transport::CancellationToken;
+    use std::collections::HashMap;
     use std::io::BufRead;
     use std::sync::Mutex;
 
@@ -1910,6 +1973,139 @@ mod connection_tests {
         assert!(runtime.join().unwrap().is_ok());
         peer.join().unwrap();
     }
+    /// Runs the phone's core session against a fixture core that answers each
+    /// request with `answer(method, params, nth call of that method)`, asks for
+    /// one Start Deacon, and returns the reply and every method the core saw.
+    fn start_deacon_against(
+        answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
+    ) -> (Result<String>, Vec<(String, Value)>) {
+        let (phone, mut core) = UnixStream::pair().unwrap();
+        core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let (commands, rx) = mpsc::sync_channel(256);
+        let owner = Arc::new(Session {
+            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0 }),
+            cancel: CancellationToken::new(),
+            commands: commands.clone(),
+            focus: Mutex::new(None),
+        });
+        let worker = owner.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let peer = std::thread::spawn(move || {
+            let mut hello = String::new();
+            io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
+            let mut decoder = Decoder::default();
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            loop {
+                let until = Instant::now() + Duration::from_secs(5);
+                let request = loop {
+                    if let Some(frame) = decoder.next().unwrap() {
+                        if frame.channel == 0 { break Some(frame); }
+                        continue;
+                    }
+                    if Instant::now() > until { break None; }
+                    let mut bytes = [0; 4096];
+                    match core.read(&mut bytes) {
+                        Ok(0) => break None,
+                        Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                        Err(_) => break None,
+                    }
+                };
+                let Some(frame) = request else { break };
+                let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                let method = request["method"].as_str().unwrap_or("").to_owned();
+                let nth = { let n = counts.entry(method.clone()).or_insert(0); *n += 1; *n };
+                lock(&log).push((method.clone(), request["params"].clone()));
+                let reply = match answer(&method, &request["params"], nth) {
+                    Ok(result) => json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                    Err(kind) => json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":kind,"data":{"kind":kind}}}),
+                };
+                write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
+            }
+        });
+        let (tx, reply) = mpsc::sync_channel(1);
+        commands.try_send(Operation::Action(r#"{"op":"deacon.start","name":"laptop"}"#.into(), tx)).unwrap();
+        let result = reply.recv_timeout(Duration::from_secs(10)).unwrap();
+        owner.cancel.cancel();
+        let _ = runtime.join();
+        let _ = peer.join();
+        let methods = lock(&seen).clone();
+        (result, methods)
+    }
+
+    fn base_answer(method: &str) -> Value {
+        match method {
+            "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+            "terminal.list" => json!({"terminals":[]}),
+            "doc.get" => json!({"value":{"spaces":[]},"version":1}),
+            _ => json!({}),
+        }
+    }
+
+    fn exec_ok(path: &str) -> Value {
+        use base64::Engine;
+        json!({"code":0,"stdout":base64::engine::general_purpose::STANDARD.encode(format!("{path}\n")),"truncated":false})
+    }
+
+    #[test]
+    fn start_deacon_runs_in_the_targets_own_deacon_folder() {
+        let (result, seen) = start_deacon_against(|method, _, _| Ok(match method {
+            "machine.exec" => exec_ok("/home/wolf/.herdr/deacon"),
+            "terminal.run" => json!({"address":"t9","cwd":"/home/wolf/.herdr/deacon"}),
+            "doc.set" => json!({"version":2}),
+            m => base_answer(m),
+        }));
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(reply["started"], true);
+        let exec = seen.iter().find(|(m, _)| m == "machine.exec").unwrap();
+        assert_eq!(exec.1["argv"], json!(["sh","-c",DEACON_DIR]));
+        let run = seen.iter().find(|(m, _)| m == "terminal.run").unwrap();
+        assert_eq!(run.1["cwd"], "/home/wolf/.herdr/deacon");
+        assert!(!run.1["line"].as_str().unwrap_or("").contains("Config"));
+        let set = seen.iter().find(|(m, _)| m == "doc.set").unwrap();
+        assert_eq!(set.1["value"]["spaces"][0]["folder"], "/home/wolf/.herdr/deacon");
+        // The folder was resolved before the second duplicate check, which came before the launch.
+        let order: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        let exec_at = order.iter().position(|m| *m == "machine.exec").unwrap();
+        let run_at = order.iter().position(|m| *m == "terminal.run").unwrap();
+        assert!(order[exec_at..run_at].contains(&"terminal.list"), "{order:?}");
+    }
+
+    #[test]
+    fn a_deacon_that_appeared_while_the_folder_resolved_is_returned_not_relaunched() {
+        let (result, seen) = start_deacon_against(|method, _, nth| Ok(match method {
+            "machine.exec" => exec_ok("/home/wolf/.herdr/deacon"),
+            // The 1st list is the session's own refresh, the 2nd the first check;
+            // by the 3rd (after the folder resolved) another client's Deacon is up.
+            "terminal.list" if nth >= 3 => json!({"terminals":[{"address":"t7","state":"live","labels":{"role":"deacon"},"created_ms":5}]}),
+            m => base_answer(m),
+        }));
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!((reply["terminal"].as_str(), reply["started"].as_bool()), (Some("t7"), Some(false)));
+        assert!(!seen.iter().any(|(m, _)| m == "terminal.run"), "launched a duplicate");
+    }
+
+    #[test]
+    fn a_computer_that_stops_answering_while_the_folder_resolves_gets_no_launch() {
+        // The folder could not be made, or the computer went away mid-start: nothing runs.
+        let (result, seen) = start_deacon_against(|method, _, _| match method {
+            "machine.exec" => Err("unavailable"),
+            m => Ok(base_answer(m)),
+        });
+        assert!(result.is_err());
+        assert!(!seen.iter().any(|(m, _)| m == "terminal.run"));
+        let (result, seen) = start_deacon_against(|method, _, nth| match method {
+            "machine.exec" => Ok(exec_ok("/home/wolf/.herdr/deacon")),
+            "terminal.list" if nth >= 3 => Err("unavailable"),
+            m => Ok(base_answer(m)),
+        });
+        assert!(result.is_err());
+        assert!(!seen.iter().any(|(m, _)| m == "terminal.run"));
+    }
+
     #[test]
     fn a_resize_inside_a_synchronized_update_flushes_it_at_the_old_grid_first() {
         // BSU, then a move to column 30 on a 20-column grid plus "A" (buffered
