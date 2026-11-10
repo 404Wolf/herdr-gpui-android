@@ -66,6 +66,9 @@ final class FleetTree {
     static final class GitLook {
         final Map<String, Place> places = new HashMap<>();
         final Map<String, List<GitWorktree>> repos = new HashMap<>();
+        /** Repos whose worktree list was cut short; all of them when the whole answer was. */
+        final Set<String> truncated = new HashSet<>();
+        boolean allTruncated;
     }
 
     /** An agent and the agents that name it as parent within the same project. */
@@ -96,9 +99,10 @@ final class FleetTree {
         /** True when no agent is labelled pm and the lead was inferred from space/tab order. */
         boolean pmInferred;
         final List<SpaceNode> entries = new ArrayList<>();
-        /** The repo's worktrees no space has open, at most CLOSED_CAP. */
+        /** Every one of the repo's worktrees no space has open (the full catalog). */
         final List<GitWorktree> closed = new ArrayList<>();
-        int closedMore;
+        /** True when git's answer was cut short, so the list may miss some. */
+        boolean closedIncomplete;
         /** The repo (git common dir) whose worktrees are listed, or "". */
         String repo = "";
         /** blocked, done, working, idle over the project's agents. */
@@ -124,7 +128,16 @@ final class FleetTree {
         final List<Member> others = new ArrayList<>();
     }
 
+    /** Unopened worktrees shown before "+N more"; a tap shows a page more. */
     static final int CLOSED_CAP = 30;
+    /** Worktrees read per repo; past it the list says it is incomplete. */
+    static final int PER_REPO = 5000;
+
+    /** How many of a project's unopened worktrees to draw after {@code pages} taps on "+N more". */
+    static int shownClosed(Project project, int pages) {
+        long n = (long) CLOSED_CAP * (Math.max(0, pages) + 1);
+        return (int) Math.min(project.closed.size(), n);
+    }
 
     private static long created(Member m) {
         return m.createdMs <= 0 ? Long.MAX_VALUE : m.createdMs;
@@ -402,12 +415,11 @@ final class FleetTree {
     private static void closedWorktrees(Project project, GitLook git, Set<String> open) {
         List<GitWorktree> list = git.repos.get(project.repo);
         if (list == null) return;
-        int shown = 0;
         for (GitWorktree wt : list) {
             if (wt.bare || wt.prunable || open.contains(wt.path)) continue;
-            if (shown < CLOSED_CAP) { project.closed.add(wt); shown++; }
-            else project.closedMore++;
+            project.closed.add(wt);
         }
+        project.closedIncomplete = git.allTruncated || git.truncated.contains(project.repo);
     }
 
     private static void count(int[] tally, String status) {
@@ -465,8 +477,15 @@ final class FleetTree {
         for (String line : (text == null ? "" : text).split("\n", -1)) {
             if (repo != null) {
                 if (line.equals("E")) {
-                    look.repos.put(repo, parsePorcelain(porcelain.toString(), perRepo));
+                    List<GitWorktree> list = parsePorcelain(porcelain.toString(), perRepo + 1);
+                    if (list.size() > perRepo) {
+                        list = new ArrayList<>(list.subList(0, perRepo));
+                        look.truncated.add(repo);
+                    }
+                    look.repos.put(repo, list);
                     repo = null;
+                } else if (line.equals("T")) {
+                    look.truncated.add(repo); // the core cut this repo's list short
                 } else porcelain.append(line).append('\n');
                 continue;
             }
@@ -477,6 +496,11 @@ final class FleetTree {
                 repo = trimSlash(f[1]);
                 porcelain.setLength(0);
             }
+        }
+        // An answer that ends inside a repo's list was cut short too.
+        if (repo != null) {
+            look.repos.put(repo, parsePorcelain(porcelain.toString(), perRepo));
+            look.truncated.add(repo);
         }
         return look;
     }

@@ -2301,8 +2301,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 railNote(host, "deacon-state", "Claude isn't running in the Deacon's terminal. Tap to open it.",
                         chrome.danger, 1, () -> openRailPane(host, live, current, deacon.id), order, keep);
             }
-            railNote(host, "new-project", "+ New project (asks the Deacon)", chrome.primary, 1,
-                    () -> railNewProject(host, live, current, deacon), order, keep);
+            boolean asking = railProjectBusy.contains(host.id);
+            railNote(host, "new-project", asking ? "Asking the Deacon…" : "+ New project (asks the Deacon)",
+                    asking ? chrome.onSurfaceVariant : chrome.primary, 1,
+                    asking ? null : () -> railNewProject(host, live, current, deacon), order, keep);
         } else {
             String why = !live ? "No Deacon. Switch to " + host.name + " to start one."
                     : railDeaconBusy.contains(host.id) ? "Starting the Deacon…"
@@ -2339,14 +2341,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 for (FleetTree.AgentNode node : row.agents) railAgentTree(host, live, current, node, depth, selectedPane, order, keep);
             }
-            for (FleetTree.GitWorktree wt : project.closed) {
+            // Every unopened worktree, a page at a time.
+            int pages = railClosedPages.getOrDefault(projectKey, 0);
+            int shown = FleetTree.shownClosed(project, pages);
+            for (int i = 0; i < shown; i++) {
+                FleetTree.GitWorktree wt = project.closed.get(i);
                 String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
                 railNote(host, "closed:" + wt.path, "○ " + name, chrome.onSurfaceVariant, base + 1,
                         live ? () -> railClosedWorktree(host, current, deacon, wt, name) : null, order, keep);
             }
-            if (project.closedMore > 0) {
-                railNote(host, "closed-more:" + project.name, "○ +" + project.closedMore + " more worktrees",
-                        chrome.onSurfaceVariant, base + 1, null, order, keep);
+            int more = project.closed.size() - shown;
+            if (more > 0) {
+                railNote(host, "closed-more:" + project.name, "○ +" + more + " more worktrees",
+                        chrome.primary, base + 1, () -> {
+                            railClosedPages.put(projectKey, pages + 1);
+                            refreshSidebar(true);
+                        }, order, keep);
+            }
+            if (project.closedIncomplete) {
+                railNote(host, "closed-cut:" + project.name, "! Git's list was cut short; some worktrees may be missing",
+                        chrome.warning, base + 1, null, order, keep);
             }
         }
         if (!fleet.loose.isEmpty()) {
@@ -2483,6 +2497,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     // ── Rail Fleet actions (explicit taps only) ─────────────────────────
 
+    private final java.util.Map<String, Integer> railClosedPages = new java.util.HashMap<>();
+    /** Machines with a New project (or other Deacon message) in flight: one send per tap. */
+    private final java.util.Set<String> railProjectBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** Each terminal's space, for the rail's header long-press menus. */
     private final java.util.Map<String, String> railSpaceOf = new java.util.HashMap<>();
     private final java.util.Map<String, String> railDeaconPending = new java.util.concurrent.ConcurrentHashMap<>();
@@ -2513,9 +2530,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             else if (live && !busy) railStartDeacon(host, current);
         });
         header.plus.setVisibility(live || deacon != null ? View.VISIBLE : View.GONE);
+        boolean asking = railProjectBusy.contains(host.id);
+        header.plus.setEnabled(!asking);
+        header.plus.setAlpha(asking ? 0.4f : 1f);
         header.plus.setContentDescription(deacon != null ? "New project on " + host.name + ": ask its Deacon"
                 : "New project on " + host.name + ": start its Deacon first");
         header.plus.setOnClickListener(v -> {
+            if (railProjectBusy.contains(host.id)) return;
             if (deacon != null) railNewProject(host, live, current, deacon);
             else if (live && !busy) railStartDeacon(host, current);
         });
@@ -2590,18 +2611,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void railNewProject(SavedRemoteHost host, boolean live, Connection current, FleetTree.Member deacon) {
         if (!live || current == null) { switchHost(host, deacon.id); closeRailDrawer(); return; }
-        railSendToDeacon(current, deacon, FleetTree.newProjectPrompt(host.name));
+        railSendToDeacon(host, current, deacon, FleetTree.newProjectPrompt(host.name));
     }
 
-    private void railSendToDeacon(Connection current, FleetTree.Member deacon, String text) {
+    private void railSendToDeacon(SavedRemoteHost host, Connection current, FleetTree.Member deacon, String text) {
         String json;
         try {
             json = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
         } catch (JSONException impossible) { return; }
+        // One send per tap: a second tap while this one is in flight does nothing.
+        if (!railProjectBusy.add(host.id)) return;
+        refreshSidebar(true);
         railAction(current, json, "reach the Deacon", reply -> {
+            railProjectBusy.remove(host.id);
+            refreshSidebar(true);
             focusRemotePane(current, deacon.id);
             closeRailDrawer();
-        }, null);
+        }, () -> { railProjectBusy.remove(host.id); refreshSidebar(true); });
     }
 
     /** An unopened worktree: work goes through the Deacon; a plain shell is the second choice. */
@@ -2614,7 +2640,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (there != null) { focusRemotePane(current, there.id); closeRailDrawer(); return; }
         ActionSheet sheet = new ActionSheet(this, chrome, name);
         if (deacon != null) {
-            sheet.add("Ask the Deacon to start work here", () -> railSendToDeacon(current, deacon,
+            sheet.add("Ask the Deacon to start work here", () -> railSendToDeacon(host, current, deacon,
                     "I want to work in the " + name.replaceAll("\\p{Cntrl}", "") + " worktree ("
                             + wt.path.replaceAll("\\p{Cntrl}", "") + ") on " + host.name
                             + ". Help me set up a worker there."));
@@ -2655,7 +2681,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             FleetTree.GitLook look = null;
             try {
                 JSONObject result = new JSONObject(RemoteNative.sessionAction(current.remoteHandle, json));
-                if (result.optBoolean("queued", false)) look = FleetTree.parseGitLook(result.optString("text", ""), 200);
+                if (result.optBoolean("queued", false)) {
+                    look = FleetTree.parseGitLook(result.optString("text", ""), FleetTree.PER_REPO);
+                    look.allTruncated = result.optBoolean("truncated", false);
+                }
             } catch (Exception | LinkageError ignored) {
                 look = null;
             }

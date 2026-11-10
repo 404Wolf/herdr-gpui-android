@@ -316,16 +316,40 @@ public final class FleetTreeTest {
         assertEquals(2, macro.entries.get(0).spaces.size());
     }
 
-    @Test public void closedWorktreesAreCappedAndSkipBareAndPrunable() {
+    @Test public void everyUnopenedWorktreeIsKeptAndPagedSoTheLastCanBeChosen() {
         StringBuilder porcelain = new StringBuilder("worktree /r\nbare\n\n");
-        for (int i = 0; i < 40; i++) porcelain.append("worktree /r/wt").append(i).append("\nbranch refs/heads/b").append(i).append("\n\n");
+        for (int i = 0; i < 75; i++) porcelain.append("worktree /r/wt").append(i).append("\nbranch refs/heads/b").append(i).append("\n\n");
         porcelain.append("worktree /r/stale\nbranch refs/heads/s\nprunable gitdir file points to non-existent location\n\n");
-        FleetTree.GitLook git = FleetTree.parseGitLook("P\t/r/wt0\t/r\t/r/wt0\tb0\nR\t/r\n" + porcelain + "E\n", 200);
-        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(m("t1", "s", "r", 0, 0, "/r/wt0", "idle")), git);
-        FleetTree.Project p = fleet.projects.get(0);
-        assertEquals(FleetTree.CLOSED_CAP, p.closed.size());
-        assertEquals(39 - FleetTree.CLOSED_CAP, p.closedMore);
+        FleetTree.GitLook git = FleetTree.parseGitLook("P\t/r/wt0\t/r\t/r/wt0\tb0\nR\t/r\n" + porcelain + "E\n",
+                FleetTree.PER_REPO);
+        FleetTree.Project p = FleetTree.build(Arrays.asList(m("t1", "s", "r", 0, 0, "/r/wt0", "idle")), git).projects.get(0);
+        // The full catalog: 74 unopened (wt0 is open; bare and prunable skipped), nothing cut.
+        assertEquals(74, p.closed.size());
+        assertFalse(p.closedIncomplete);
         for (FleetTree.GitWorktree wt : p.closed) assertFalse(wt.path.equals("/r/stale") || wt.path.equals("/r/wt0"));
+        // Home and the rail draw shownClosed() rows; each "+N more" tap adds a page.
+        assertEquals(30, FleetTree.shownClosed(p, 0));
+        assertEquals(60, FleetTree.shownClosed(p, 1));
+        assertEquals(74, FleetTree.shownClosed(p, 2));
+        assertEquals("/r/wt74", p.closed.get(FleetTree.shownClosed(p, 2) - 1).path);
+    }
+
+    @Test public void aCutShortGitAnswerIsNeverShownAsComplete() {
+        String body = "worktree /r\nbranch refs/heads/main\n\nworktree /r/a\nbranch refs/heads/a\n\n";
+        // The core marks a list it had to cut ("T").
+        FleetTree.GitLook marked = FleetTree.parseGitLook("P\t/r\t/r/.git\t/r\tmain\nR\t/r/.git\n" + body + "T\nE\n", 100);
+        assertTrue(FleetTree.build(Arrays.asList(m("t1", "s", "r", 0, 0, "/r", "idle")), marked).projects.get(0).closedIncomplete);
+        // An answer that stops inside a list.
+        FleetTree.GitLook cut = FleetTree.parseGitLook("P\t/r\t/r/.git\t/r\tmain\nR\t/r/.git\n" + body, 100);
+        assertTrue(cut.truncated.contains("/r/.git"));
+        // More entries than the phone reads per repo.
+        FleetTree.GitLook many = FleetTree.parseGitLook("P\t/r\t/r/.git\t/r\tmain\nR\t/r/.git\n" + body + "E\n", 1);
+        assertTrue(many.truncated.contains("/r/.git"));
+        // The whole exec output was truncated.
+        FleetTree.GitLook all = FleetTree.parseGitLook("P\t/r\t/r/.git\t/r\tmain\nR\t/r/.git\n" + body + "E\n", 100);
+        assertFalse(FleetTree.build(Arrays.asList(m("t1", "s", "r", 0, 0, "/r", "idle")), all).projects.get(0).closedIncomplete);
+        all.allTruncated = true;
+        assertTrue(FleetTree.build(Arrays.asList(m("t1", "s", "r", 0, 0, "/r", "idle")), all).projects.get(0).closedIncomplete);
     }
 
     @Test public void aChildInAnotherCheckoutStaysInItsOwnWorktree() {

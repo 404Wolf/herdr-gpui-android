@@ -100,6 +100,8 @@ public final class HomeActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newFixedThreadPool(4);
     private final Map<String, Machine> machines = new LinkedHashMap<>();
+    /** Pages of unopened worktrees shown per project ("+N more" taps). */
+    private final Map<String, Integer> closedPages = new HashMap<>();
     /** Folded rows (and "open:" rows that start folded), kept across launches. */
     private final Set<String> collapsed = new HashSet<>();
     /** Git looks: at most every GIT_MS per machine, sooner (GIT_NEW_MS) for a new folder. */
@@ -935,10 +937,18 @@ public final class HomeActivity extends Activity {
                 row.kids.add(spaceRow(machine, entry, project));
             }
         }
-        for (FleetTree.GitWorktree wt : project.closed) row.kids.add(closedRow(machine, wt));
-        if (project.closedMore > 0) {
-            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "○", "+" + project.closedMore + " more worktrees",
-                    chrome.onSurfaceVariant, null)));
+        // Every unopened worktree, a page at a time: "+N more" shows the next page.
+        int pages = closedPages.getOrDefault(key, 0);
+        int shown = FleetTree.shownClosed(project, pages);
+        for (int i = 0; i < shown; i++) row.kids.add(closedRow(machine, project.closed.get(i)));
+        int more = project.closed.size() - shown;
+        if (more > 0) {
+            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "○", "+" + more + " more worktrees",
+                    chrome.primary, () -> { closedPages.put(key, pages + 1); machine.ui++; render(true); })));
+        }
+        if (project.closedIncomplete) {
+            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "!", "Git's list was cut short;"
+                    + " some worktrees may be missing", chrome.warning, null)));
         }
         return row;
     }
@@ -1353,6 +1363,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void sendToDeacon(Machine machine, Agent deacon, String text) {
+        if (machine.projectBusy) return; // one send per tap
         long handle = machine.handle;
         String action;
         try {
@@ -1474,7 +1485,10 @@ public final class HomeActivity extends Activity {
             FleetTree.GitLook look = null;
             try {
                 JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
-                if (result.optBoolean("queued", false)) look = FleetTree.parseGitLook(result.optString("text", ""), 200);
+                if (result.optBoolean("queued", false)) {
+                    look = FleetTree.parseGitLook(result.optString("text", ""), FleetTree.PER_REPO);
+                    look.allTruncated = result.optBoolean("truncated", false);
+                }
             } catch (Exception | LinkageError error) {
                 look = null;
             }

@@ -755,7 +755,12 @@ $c
   seen="$seen$c
 "
   printf 'R\t%s\n' "$c"
-  git -C "$p" worktree list --porcelain 2>/dev/null | head -c 20000
+  w=$(git -C "$p" worktree list --porcelain 2>/dev/null)
+  if [ "${#w}" -gt 2000000 ]; then
+    printf '%s' "$w" | head -c 2000000; printf '\nT\n'
+  else
+    printf '%s\n' "$w"
+  fi
   printf '\nE\n'
 done"#;
 /// The deacon's shell line: from ~/Config when it exists (Wolf's own config,
