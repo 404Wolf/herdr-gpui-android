@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::net::UnixStream,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -66,7 +66,7 @@ struct Connection<'a> {
     owner: &'a Arc<Session>,
     serial: u64,
     channel: u32,
-    output: Option<mpsc::SyncSender<Vec<u8>>>,
+    output: Option<mpsc::SyncSender<Chunk>>,
     events: u32,
     event_carry: Vec<u8>,
     dirty: bool,
@@ -158,16 +158,16 @@ impl Connection<'_> {
                     if let Some(output) = &self.output {
                         // 256 KiB starting credit bounds this queue. Credit is returned
                         // only as Rio consumes bytes, never when the network receives them.
-                        output.try_send(frame.bytes).map_err(|_| Error::Capacity)?;
+                        output.try_send(Chunk::Data(frame.bytes)).map_err(|_| Error::Capacity)?;
                     }
                 }
                 // RESIZE from the core: the PTY's authoritative grid, sent before
-                // the paint at that size (only on a path that negotiated it).
+                // the paint at that size (only on a path that negotiated it). It
+                // joins the same ordered queue as DATA, so it applies only after
+                // every earlier byte was parsed (StreamRead::read).
                 3 if self.negotiated => {
-                    if let Some((cols, rows)) = resize_frame(&frame.bytes) {
-                        if let Some(terminal) = &lock(&self.owner.state).terminal {
-                            terminal.set_grid(cols, rows);
-                        }
+                    if let (Some(output), Some((cols, rows))) = (&self.output, resize_frame(&frame.bytes)) {
+                        output.try_send(Chunk::Grid(cols, rows)).map_err(|_| Error::Capacity)?;
                     }
                 }
                 2 => {
@@ -623,11 +623,13 @@ impl Connection<'_> {
             commands: commands.clone(),
             channel,
         };
+        let session_slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead {
             rx,
             chunks: VecDeque::new(),
             commands: commands.clone(),
             channel,
+            session: session_slot.clone(),
         };
         let terminal_session = gpui_rio::Session::start(
             output,
@@ -647,6 +649,7 @@ impl Connection<'_> {
         if let Some((cols, rows)) = initial_grid(&reply) {
             terminal_session.set_grid(cols, rows);
         }
+        *lock(&session_slot) = Arc::downgrade(&terminal_session);
         self.channel = channel;
         self.output = Some(tx);
         let mut state = lock(&self.owner.state);
@@ -921,20 +924,37 @@ fn tab_mut<'a>(doc: &'a mut Value, space: &str, tab: &str) -> Result<&'a mut Val
         .find(|t| t["id"] == tab)
         .ok_or(Error::StaleTarget)
 }
+/// One item of an attached stream, in the core's order.
+enum Chunk {
+    Data(Vec<u8>),
+    /// The PTY's authoritative grid (a RESIZE frame).
+    Grid(u16, u16),
+}
 struct StreamRead {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Chunk>,
     chunks: VecDeque<u8>,
     commands: mpsc::SyncSender<Operation>,
     channel: u32,
+    /// The session this stream feeds, for in-order grid changes.
+    session: Arc<Mutex<Weak<gpui_rio::Session>>>,
 }
 impl Read for StreamRead {
+    /// Rio's reader parses each read's bytes before it reads again, so a
+    /// Grid item reached here applies only after every earlier byte was
+    /// parsed: a RESIZE never overtakes older DATA, and later DATA always
+    /// meets the new grid.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        if self.chunks.is_empty() {
+        while self.chunks.is_empty() {
             match self.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(bytes) => self.chunks.extend(bytes),
+                Ok(Chunk::Data(bytes)) => self.chunks.extend(bytes),
+                Ok(Chunk::Grid(cols, rows)) => {
+                    if let Some(session) = lock(&self.session).upgrade() {
+                        session.set_grid(cols, rows);
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::ErrorKind::TimedOut.into()),
                 Err(_) => return Ok(0),
             }
@@ -1886,5 +1906,36 @@ mod connection_tests {
         owner.cancel.cancel();
         assert!(runtime.join().unwrap().is_ok());
         peer.join().unwrap();
+    }
+    #[test]
+    fn a_resize_never_overtakes_older_data_still_queued() {
+        // DATA at the old grid, RESIZE, DATA: all queued before Rio parses any.
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
+        assert!(session.set_grid(20, 4));
+        // As attach does: the slot is set before the stream's first item.
+        *lock(&slot) = Arc::downgrade(&session);
+        // One burst, as the network thread queues it, before Rio parses any:
+        // old DATA (go to row 1 column 30: on a 20-column grid, column 20),
+        // RESIZE to 40 columns, new DATA (the same move: column 30).
+        tx.send(Chunk::Data(b"\x1b[1;30HA".to_vec())).unwrap();
+        tx.send(Chunk::Grid(40, 4)).unwrap();
+        tx.send(Chunk::Data(b"\x1b[2;30HB".to_vec())).unwrap();
+        let cell = |row: usize, col: usize| {
+            session.screen_text().lines().nth(row).and_then(|line| line.chars().nth(col)).unwrap_or(' ')
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cell(1, 29) != 'B' {
+            assert!(Instant::now() < deadline, "later DATA never met the new grid:\n{}", session.screen_text());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(session.grid_size(), (40, 4));
+        // The old DATA was parsed at the old grid: A sits in column 20, not 30.
+        assert_eq!(cell(0, 19), 'A', "{}", session.screen_text());
+        assert_eq!(cell(0, 29), ' ', "{}", session.screen_text());
     }
 }
