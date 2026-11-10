@@ -317,9 +317,13 @@ impl Connection<'_> {
             .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
             .to_owned();
         // Labelled at birth above; set again so a core that drops run labels
-        // still has them (an agent labelling itself is the last backup).
+        // still has them (an agent labelling itself is the last backup). A
+        // failure here is reported, never a reason to launch again.
+        let mut label_error = None;
         if labels.as_object().is_some_and(|l| !l.is_empty()) {
-            self.call("terminal.label", json!({"terminal":terminal,"labels":labels}))?;
+            if let Err(error) = self.call("terminal.label", json!({"terminal":terminal,"labels":labels})) {
+                label_error = Some(format!("it could not be labelled ({error}); it will label itself"));
+            }
         }
         let folder = folder.map(|f| json!(f)).unwrap_or_else(|| result["cwd"].clone());
         let root = json!({"children":[{"content":{"terminal":terminal},"id":block,"type":"block"}],"id":tab,"type":"row"});
@@ -328,7 +332,8 @@ impl Connection<'_> {
         // conflict, so every other space and tab is kept.
         let entry = json!({"folder":folder,"id":space,"name":name,"tabs":[{"id":tab,"name":tab_name,"root":root}]});
         let placed = self.edit_doc(|doc| add_space(doc, &entry));
-        Ok((terminal, placed.err().map(|e| e.to_string())))
+        let layout_error = placed.err().map(|e| format!("its space could not be added ({e})"));
+        Ok((terminal, label_error.into_iter().chain(layout_error).reduce(|a, b| format!("{a}; {b}"))))
     }
     /// One exec on this computer answers, for each folder, its repo (git
     /// common dir), checkout top and branch, and lists each repo's worktrees
@@ -1144,6 +1149,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "status_ms": terminal["status_ms"].as_u64().unwrap_or(0),
             // Picks the canonical deacon when a computer has several candidates.
             "created_ms": terminal["created_ms"].as_u64().unwrap_or(0),
+            // What runs in it now: a deacon whose claude ended is a kept shell.
+            "program": terminal["foreground"]["name"].as_str().unwrap_or(""),
         }));
     }
     if spaces.len() > 256 || tabs.len() > 512 {

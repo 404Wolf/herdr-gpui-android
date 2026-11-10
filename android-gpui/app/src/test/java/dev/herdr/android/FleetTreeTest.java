@@ -129,6 +129,22 @@ public final class FleetTreeTest {
                 + " then set up its project manager and worktree.", FleetTree.newProjectPrompt("Macro (Google)\n"));
     }
 
+    @Test public void rawRoleValuesAreNoRoleAndAKeptShellIsNotARunningDeacon() {
+        assertEquals("", FleetTree.role("kache"));
+        assertEquals("pm", FleetTree.role(" pm "));
+        FleetTree.Member deacon = label(m("t1", "s", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        deacon.program = "aswap";
+        assertTrue(FleetTree.running(deacon));
+        deacon.program = "-zsh";
+        assertFalse(FleetTree.running(deacon));
+        deacon.program = "/run/current-system/sw/bin/bash";
+        assertFalse(FleetTree.running(deacon));
+        deacon.program = "";
+        assertTrue(FleetTree.running(deacon));
+        // A kept shell still holds the role: it is shown, and Start is not offered.
+        assertEquals(FleetTree.DeaconAction.OPEN, FleetTree.deaconAction(true, deacon, false));
+    }
+
     // ── Projects and managers ───────────────────────────────────────────
 
     @Test public void anExplicitWorkerIsNeverPromotedAndUnlabelledProjectsInferTheirLead() {

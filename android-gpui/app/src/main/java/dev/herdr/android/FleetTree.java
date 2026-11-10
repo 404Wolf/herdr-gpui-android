@@ -1,6 +1,7 @@
 package dev.herdr.android;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -24,6 +25,8 @@ final class FleetTree {
     static class Member {
         String id = "", title = "", status = "", space = "", spaceName = "", tab = "";
         String role = "", project = "", parent = "", kind = "", cwd = "", msg = "", waitKind = "";
+        /** The foreground program's name, when the core says ("" when unknown). */
+        String program = "";
         long statusMs, createdMs;
         int spaceIndex = Integer.MAX_VALUE, tabIndex = Integer.MAX_VALUE;
 
@@ -139,6 +142,22 @@ final class FleetTree {
         int c = Long.compare(created(a), created(b));
         return c != 0 ? c : PLACE.compare(a, b);
     };
+
+    /** deacon, pm or worker; any other label value is treated as no role. */
+    static String role(String value) {
+        String v = value == null ? "" : value.trim();
+        return v.equals("deacon") || v.equals("pm") || v.equals("worker") ? v : "";
+    }
+
+    private static final Set<String> SHELLS = new HashSet<>(Arrays.asList(
+            "sh", "bash", "zsh", "fish", "dash", "ksh", "nu", "tcsh", "csh", "login"));
+
+    /** False when a shell is in the foreground: the agent ended and its terminal was kept. */
+    static boolean running(Member m) {
+        String p = m.program.trim();
+        if (p.startsWith("-")) p = p.substring(1);
+        return p.isEmpty() || !SHELLS.contains(lastSegment(p));
+    }
 
     static boolean deaconSpace(Member m) {
         return "deacon".equals(m.spaceName.trim().toLowerCase(Locale.ROOT));

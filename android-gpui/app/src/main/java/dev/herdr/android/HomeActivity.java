@@ -410,7 +410,9 @@ public final class HomeActivity extends Activity {
             agent.tabIndex = tabIndex.getOrDefault(agent.space + "\n" + agent.tab, Integer.MAX_VALUE);
             agent.createdMs = pane.optLong("created_ms", 0);
             agent.parent = pane.optString("parent", "");
-            agent.role = pane.optString("role", "");
+            // Only the deacon skill's roles count; any other value is no role.
+            agent.role = FleetTree.role(pane.optString("role", ""));
+            agent.program = pane.optString("program", "");
             agent.project = pane.optString("project", "");
             agent.kind = pane.optString("kind", "");
             if ("none".equals(agent.kind)) agent.kind = "";
@@ -884,6 +886,12 @@ public final class HomeActivity extends Activity {
         Row top;
         if (fleet.deacon != null) {
             Agent deacon = (Agent) fleet.deacon;
+            if (!FleetTree.running(deacon)) {
+                // Its claude ended: the kept terminal is a shell now. Say so; never start a second.
+                rows.add(new Row((guide, self) -> actionLine(guide, null, "!", "Claude isn't running in the Deacon's"
+                        + " terminal on " + machine.host.name + ". Open it and start claude there.", chrome.danger,
+                        () -> openAgent(deacon))));
+            }
             top = new Row((guide, self) -> agentLine(guide, deacon, "deacon", null));
             for (FleetTree.Member helper : fleet.helpers) top.kids.add(agentTree(m, new FleetTree.AgentNode(helper), null));
             rows.add(top);
@@ -1253,8 +1261,7 @@ public final class HomeActivity extends Activity {
                 terminal = result.optString("terminal", "");
                 started = result.optBoolean("started", false);
                 if (!result.optString("layout_error", "").isEmpty()) {
-                    failure = "it started (" + terminal + ") but its space could not be added: "
-                            + result.optString("layout_error");
+                    failure = "the Deacon started, but " + result.optString("layout_error");
                 }
             } catch (Exception | LinkageError error) {
                 failure = "the computer did not answer";
