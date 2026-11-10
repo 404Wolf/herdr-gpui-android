@@ -535,6 +535,55 @@ public final class FleetTreeTest {
         assertTrue(FleetTree.flat(FleetTree.build(Arrays.asList(pm, beside), fresh).projects.get(0)));
     }
 
+    @Test public void reposGroupTheirProjectsAndOutsideGitComesLast() {
+        FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member hm = label(m("t67", "hm", "home-manager", 1, 0, "/c/hm", "working"), "pm", "home-manager");
+        FleetTree.Member hypr = label(m("t4m", "hy", "hypr2d", 2, 0, "/wt/hypr", "idle"), "pm", "hypr2d");
+        FleetTree.Member botd = label(m("t5t", "hm", "home-manager", 1, 4, "/c", "blocked"), "pm", "botd"); // outside git
+        FleetTree.Member stray = m("t9", "x", "scratch", 3, 0, "/tmp/x", ""); // a shell outside git
+        FleetTree.Member kept = m("t8", "k", "", 4, 0, "/c/hm/sub", ""); // a shell in the repo
+        FleetTree.GitLook git = FleetTree.parseGitLook(look(new String[][] {
+                {"/c/hm", "/c/hm/.git", "/c/hm", "main"},
+                {"/wt/hypr", "/c/hm/.git", "/wt/hypr", "hypr"},
+                {"/c/hm/sub", "/c/hm/.git", "/c/hm", "main"}, {"/c"}, {"/tmp/x"}},
+                "/c/hm/.git", "/c/hm=main", "/wt/hypr=hypr", "/wt/idle=idle"), 200);
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(deacon, hm, hypr, botd, stray, kept), git);
+        List<FleetTree.RepoGroup> groups = FleetTree.repoGroups(fleet);
+        assertEquals(2, groups.size());
+        FleetTree.RepoGroup repo = groups.get(0);
+        assertEquals("hm", repo.name);
+        assertEquals(2, repo.pms());
+        assertEquals(Arrays.asList("home-manager", "hypr2d"), Arrays.asList(repo.projects.get(0).name, repo.projects.get(1).name));
+        // Unopened worktrees: ONE owner per repo.
+        assertEquals(Arrays.asList("/wt/idle"), closedPaths(repo.owner));
+        FleetTree.RepoGroup outside = groups.get(1);
+        assertTrue(outside.outside());
+        assertEquals("botd", outside.projects.get(0).name);
+        assertEquals(1, outside.loose.size());
+        assertEquals("t9", outside.loose.get(0).members.get(0).id);
+        // Needs you: the blocked PM, by its own status.
+        assertEquals(Arrays.asList("t5t"), ids(FleetTree.needsYou(fleet)));
+    }
+
+    @Test public void needsYouListsTheDeaconFirstThenPmsThenTheRest() {
+        FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "blocked"), "deacon", "");
+        FleetTree.Member worker = label(m("t1", "a", "app", 1, 1, "/w/app", "blocked"), "worker", "app");
+        FleetTree.Member pm = label(m("t2", "a", "app", 1, 0, "/w/app", "blocked"), "pm", "app");
+        FleetTree.Member idle = label(m("t4", "a", "app", 1, 2, "/w/app", "idle"), "worker", "app");
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(worker, idle, pm, deacon), null);
+        assertEquals(Arrays.asList("t3", "t2", "t1"), ids(FleetTree.needsYou(fleet)));
+    }
+
+    @Test public void aRefusedSendToABlockedDeaconSaysSoAndIsNeverForced() {
+        assertNull(FleetTree.sendError(true, "", 0, "laptop"));
+        assertEquals("The deacon is waiting for an answer. Reply to it first.",
+                FleetTree.sendError(false, "blocked", 9, "laptop"));
+        assertEquals("The deacon is waiting for an answer. Reply to it first.",
+                FleetTree.sendError(false, "", 9, "laptop"));
+        assertEquals("Couldn't reach the deacon on server. Check that it's online and try again.",
+                FleetTree.sendError(false, "", 0, "server"));
+    }
+
     @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {
         // The shared laptop space: t67's and t5t's projects each see a slice of it.
         FleetTree.Member t67 = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "idle"), "pm", "home-manager");

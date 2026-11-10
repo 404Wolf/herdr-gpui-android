@@ -76,6 +76,9 @@ public final class HomeActivity extends Activity {
         Set<String> gitAsked = new HashSet<>();
         /** Start Deacon / New project / opening a worktree: in flight, and the last error. */
         boolean deaconBusy, projectBusy;
+        /** The Deacon message box: a send in flight, and why the last one did not go in. */
+        boolean sendBusy;
+        String sendError = "";
         /** A Deacon just launched, not yet confirmed running: its terminal and when. */
         String deaconPending = "";
         long deaconPendingAt;
@@ -543,6 +546,20 @@ public final class HomeActivity extends Activity {
         }
         tree = column();
         tree.setPadding(dp(6), dp(2), dp(6), dp(16));
+        // One computer at a time, as the desktop sidebar: its picker and Deacon
+        // card (with the message box, which is never rebuilt under a finger),
+        // then the repos, projects, worktrees and workers below.
+        if (draftBox != null && draftFor != null) drafts.put(draftFor, draftBox.getText().toString());
+        draftFor = null;
+        header = column();
+        machineBar = column();
+        deaconCard = column();
+        header.addView(machineBar);
+        header.addView(deaconCard);
+        header.addView(messageRow());
+        body = column();
+        tree.addView(header);
+        tree.addView(body);
         ScrollView treeScroll = scroll(tree);
         fleet = column();
         fleet.setPadding(dp(10), dp(4), dp(10), dp(16));
@@ -673,29 +690,23 @@ public final class HomeActivity extends Activity {
         int[] counts = new int[6];
         for (Agent agent : all) counts[statusPriority(agent.status)]++;
         summary.setText(summaryText(counts));
-        tree.removeAllViews();
+        body.removeAllViews();
+        machineBar.removeAllViews();
+        deaconCard.removeAllViews();
         if (note != null) {
             TextView line = text(note, 12, chrome.onSurfaceVariant);
             line.setPadding(dp(6), dp(4), dp(6), dp(4));
-            tree.addView(line);
+            machineBar.addView(line);
         }
         if (machines.isEmpty()) {
             TextView empty = text("No hosts yet. Add one under ⋯ Hosts, or let the device's "
                     + "provisioned hosts file add them.", 13, chrome.onSurfaceVariant);
             empty.setPadding(dp(8), dp(16), dp(8), dp(16));
-            tree.addView(empty);
+            body.addView(empty);
         }
-        // Folded, what needs Wolf sits on top of the tree; unfolded it is the Fleet pane.
-        if (!wide()) attention(tree, all, false);
-        List<Machine> byActivity = new ArrayList<>(machines.values());
-        Map<Machine, Integer> busy = new HashMap<>();
-        for (Machine machine : byActivity) {
-            List<Agent> agents = new ArrayList<>();
-            for (List<Agent> list : spaces(machine).values()) agents.addAll(list);
-            busy.put(machine, "ready".equals(machine.state) ? activity(agents) : 9000);
-        }
-        Collections.sort(byActivity, (a, b) -> Integer.compare(busy.get(a), busy.get(b)));
-        for (Machine machine : byActivity) renderMachine(machine);
+        Machine shown = shownMachine();
+        if (shown != null) renderMachine(shown);
+        else if (messageBox != null) messageBox.setVisibility(View.GONE);
         if (fleet != null && wide()) {
             fleet.removeAllViews();
             fleetOverview(all, counts);
@@ -727,6 +738,69 @@ public final class HomeActivity extends Activity {
      * and their agents nested by parent, then Spaces, Other agents and New
      * project. Built from this machine's own core only.
      */
+    /** The computer Home shows: the one Wolf picked, else the busiest. */
+    private Machine shownMachine() {
+        if (machines.isEmpty()) return null;
+        if (selectedHost == null) {
+            try {
+                selectedHost = getSharedPreferences("home", MODE_PRIVATE).getString("machine", null);
+            } catch (RuntimeException unreadable) {
+                selectedHost = null;
+            }
+        }
+        Machine picked = selectedHost == null ? null : machines.get(selectedHost);
+        if (picked != null) return picked;
+        Machine best = null;
+        int bestScore = Integer.MAX_VALUE;
+        for (Machine machine : machines.values()) {
+            int score = "ready".equals(machine.state) ? activity(members(machine)) : 9000;
+            if (best == null || score < bestScore) { best = machine; bestScore = score; }
+        }
+        return best;
+    }
+
+    private void pickMachine(Machine machine) {
+        selectedHost = machine.host.id;
+        try {
+            getSharedPreferences("home", MODE_PRIVATE).edit().putString("machine", selectedHost).apply();
+        } catch (RuntimeException ignored) {
+            // The pick lasts this session.
+        }
+        render(true);
+    }
+
+    /** Every computer, with how many agents it runs and how many wait on Wolf. */
+    private void showMachinePicker() {
+        ActionSheet sheet = new ActionSheet(this, chrome, "Computer");
+        for (Machine machine : machines.values()) {
+            int[] n = agentCounts(machine);
+            boolean here = machine == shownMachine();
+            String label = (here ? "● " : "○ ") + machine.host.name + "   " + n[0] + " agents"
+                    + (n[1] > 0 ? " · " + n[1] + " need you" : "")
+                    + ("ready".equals(machine.state) ? "" : " · offline");
+            sheet.add(label, () -> pickMachine(machine));
+        }
+        sheet.add("Hosts and keys…", this::openHosts);
+        sheet.show();
+    }
+
+    /** {agents, blocked} on one computer. */
+    private static int[] agentCounts(Machine machine) {
+        int[] n = new int[2];
+        for (Agent agent : members(machine)) {
+            if (!agent.isAgent()) continue;
+            n[0]++;
+            if ("blocked".equals(agent.status)) n[1]++;
+        }
+        return n;
+    }
+
+    /**
+     * One computer, as the desktop's single-machine sidebar: the computer
+     * picker, its Deacon card (status, Needs you, the message box, + Project),
+     * then its repos with their projects, worktrees and workers, unopened
+     * worktrees folded per repo, Outside git folded, Other agents.
+     */
     private void renderMachine(Machine machine) {
         List<Agent> all = members(machine);
         FleetTree.GitLook shared = FleetPanes.LOOKS.get(machine.host.id);
@@ -736,37 +810,28 @@ public final class HomeActivity extends Activity {
         }
         FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
         boolean ready = "ready".equals(machine.state);
-        boolean closed = collapsed.contains(machine.host.id);
         if (fleet.deacon != null && deaconGuard(machine) > 0 && machine.deaconPending.isEmpty()) clearDeaconGuard(machine);
         // Claude runs there again (Wolf started it): the failure no longer applies.
         if (fleet.deacon != null && machine.deaconPending.isEmpty() && !fleet.deacon.status.isEmpty()) {
             machine.deaconError = "";
         }
-        maybeLookGit(machine, all, ready, closed);
+        maybeLookGit(machine, all, ready, false);
+        syncDraft(machine);
 
+        // The computer picker: name, agents, how many need you, ▾ for the others.
         LinearLayout row = row();
         row.setPadding(dp(4), dp(7), dp(4), dp(3));
         row.addView(dot(machineColor(machine)));
-        TextView name = text(machine.host.name, 14, chrome.onSurface);
+        TextView name = text(machine.host.name + (machines.size() > 1 ? "  ▾" : ""), 14, chrome.onSurface);
         name.setTypeface(Typeface.DEFAULT_BOLD);
         row.addView(name);
-        int waiting = 0, working = 0, agents = 0;
-        for (Agent agent : all) {
-            if (!agent.isAgent()) continue;
-            agents++;
-            if (statusPriority(agent.status) <= 1) waiting++;
-            if ("working".equals(agent.status)) working++;
-        }
-        String detail = ready
-                ? agents + (agents == 1 ? " agent" : " agents")
-                        + (working > 0 ? " · " + working + " working" : "")
-                        + (waiting > 0 ? " · " + waiting + " waiting" : "")
+        int[] n = agentCounts(machine);
+        String detail = ready ? n[0] + (n[0] == 1 ? " agent" : " agents") + (n[1] > 0 ? " · " + n[1] + "!" : "")
                 : machine.status.isEmpty() ? "offline" : machine.status;
-        TextView meta = text("  " + (closed ? "▸ " : "") + detail, 11, chrome.onSurfaceVariant);
+        TextView meta = text("  " + detail, 11, n[1] > 0 ? chrome.danger : chrome.onSurfaceVariant);
         meta.setSingleLine(true);
         meta.setEllipsize(TextUtils.TruncateAt.END);
         row.addView(meta, new LinearLayout.LayoutParams(0, -2, 1));
-        // The machine's one Deacon, a tap away; or the way to start it.
         switch (FleetTree.deaconAction(ready, fleet.deacon, machine.deaconBusy || deaconGuard(machine) > 0)) {
             case OPEN:
                 if (!machine.deaconPending.isEmpty()) row.addView(chip("Starting…", false, null));
@@ -776,7 +841,6 @@ public final class HomeActivity extends Activity {
             case STARTING: row.addView(chip("Starting…", false, null)); break;
             default: break;
         }
-        // "+": a new project goes through this computer's Deacon (started first if missing).
         if (ready) {
             TextView plus = chip("+", !machine.projectBusy && !machine.deaconBusy, () -> {
                 if (fleet.deacon != null) newProject(machine, (Agent) fleet.deacon);
@@ -788,11 +852,11 @@ public final class HomeActivity extends Activity {
             row.addView(plus);
         }
         row.setOnClickListener(v -> {
-            toggleFold(machine.host.id, false);
+            if (machines.size() > 1) showMachinePicker();
             if ("closed".equals(machine.state) && machine.handle <= 0 && !machine.connecting) connect(machine);
         });
-        row.setContentDescription(machine.host.name + ", " + detail
-                + (fleet.deacon != null ? ", has a Deacon" : ready ? ", no Deacon" : ""));
+        row.setContentDescription("Computer " + machine.host.name + ", " + detail
+                + (machines.size() > 1 ? ", tap to pick another" : ""));
         row.setOnLongClickListener(v -> {
             ActionSheet sheet = new ActionSheet(this, chrome, machine.host.name);
             if (fleet.deacon != null) sheet.add("Open the Deacon", () -> openAgent((Agent) fleet.deacon));
@@ -807,14 +871,182 @@ public final class HomeActivity extends Activity {
                     .show();
             return true;
         });
-        tree.addView(row);
-        if (closed) return;
+        machineBar.addView(row);
 
-        LinearLayout body = column();
+        deaconRows(machine, fleet, ready);
+        updateMessageBox(machine, fleet, ready);
+
+        LinearLayout rows = column();
         // Offline: what was last seen stays, dimmed; nothing can be started there.
-        if (!ready) body.setAlpha(0.5f);
-        for (Row top : fleetRows(machine, fleet, ready)) emit(body, top, "", true, 0);
-        tree.addView(body);
+        if (!ready) rows.setAlpha(0.5f);
+        for (Row top : bodyRows(machine, fleet, ready)) emit(rows, top, "", true, 0);
+        body.addView(rows);
+    }
+
+    /** The Deacon card: the Deacon (id, status), its state, Needs you, + Project. */
+    private void deaconRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
+        if (fleet.deacon == null) {
+            boolean busy = machine.deaconBusy || deaconGuard(machine) > 0;
+            String said = !ready ? "No Deacon. Connect this computer to start one."
+                    : busy ? "Starting the Deacon…"
+                    : machine.deaconError.isEmpty() ? "No Deacon on this computer. Tap to start one."
+                    : "Could not start the Deacon: " + machine.deaconError + ". Tap to try again.";
+            deaconCard.addView(actionLine("", null, "◆", said, machine.deaconError.isEmpty()
+                    ? chrome.onSurfaceVariant : chrome.danger, ready && !busy ? () -> startDeacon(machine) : null));
+            return;
+        }
+        Agent deacon = (Agent) fleet.deacon;
+        deaconCard.addView(agentLine("", deacon, "Deacon " + deacon.id, null));
+        if (deacon.id.equals(machine.deaconPending)) {
+            deaconCard.addView(actionLine("   ", null, "◆", "Starting the Deacon on " + machine.host.name + "…",
+                    chrome.onSurfaceVariant, null));
+        } else if (!machine.deaconError.isEmpty() || !FleetTree.running(deacon)) {
+            String said = machine.deaconError.isEmpty() ? notRunning(machine) : machine.deaconError;
+            deaconCard.addView(actionLine("   ", null, "!", said + ". Tap to open it.", chrome.danger,
+                    () -> openAgent(deacon)));
+        }
+        for (FleetTree.Member helper : fleet.helpers) deaconCard.addView(agentLine("   ", (Agent) helper, roleTag((Agent) helper), null));
+        // Needs you: agents whose own status says they wait on Wolf; each opens its chat.
+        List<FleetTree.Member> needs = FleetTree.needsYou(fleet);
+        if (!needs.isEmpty()) {
+            TextView heading = text("Needs you", 11, chrome.danger);
+            heading.setPadding(dp(14), dp(4), dp(4), dp(1));
+            deaconCard.addView(heading);
+            for (FleetTree.Member waiting : needs) {
+                Agent agent = (Agent) waiting;
+                String who = "deacon".equals(agent.role) ? "Deacon · "
+                        : "pm".equals(agent.role) ? "PM " + (agent.project.isEmpty() ? "" : agent.project + " · ") : "";
+                deaconCard.addView(actionLine("   ", null, "!", who + FleetPanes.displayTitle(agent), chrome.danger,
+                        () -> openAgent(agent)));
+            }
+        }
+        String said = machine.projectBusy ? "Asking the Deacon…"
+                : machine.projectError.isEmpty() ? "+ Project (asks the Deacon)"
+                : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
+        deaconCard.addView(actionLine("   ", null, "+", said, machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
+                ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null));
+    }
+
+    // ── The Deacon message box (one per Home; its text is per computer) ──
+
+    private LinearLayout header, body, machineBar, deaconCard, messageBox;
+    private EditText draftBox;
+    private TextView sendButton, sendNote;
+    private String selectedHost, draftFor;
+    /** Unsent text per computer while another one is shown. */
+    private final Map<String, String> drafts = new HashMap<>();
+
+    private View messageRow() {
+        messageBox = column();
+        messageBox.setPadding(dp(14), dp(2), dp(4), dp(4));
+        LinearLayout line = new LinearLayout(this);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        draftBox = new EditText(this);
+        draftBox.setHint("Tell the deacon…");
+        draftBox.setSingleLine(true);
+        draftBox.setTextSize(13);
+        draftBox.setTextColor(chrome.onSurface);
+        draftBox.setHintTextColor(chrome.onSurfaceVariant);
+        draftBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        draftBox.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        draftBox.setOnEditorActionListener((view, action, event) -> { sendDraft(); return true; });
+        line.addView(draftBox, new LinearLayout.LayoutParams(0, -2, 1));
+        sendButton = chip("Send", true, this::sendDraft);
+        line.addView(sendButton);
+        messageBox.addView(line);
+        sendNote = text("", 11, chrome.danger);
+        sendNote.setPadding(0, dp(1), 0, dp(2));
+        sendNote.setVisibility(View.GONE);
+        messageBox.addView(sendNote);
+        messageBox.setVisibility(View.GONE);
+        return messageBox;
+    }
+
+    /** The box holds the shown computer's text; switching keeps each computer's own. */
+    private void syncDraft(Machine machine) {
+        if (draftBox == null) return;
+        String now = machine.host.id;
+        if (now.equals(draftFor)) return;
+        if (draftFor != null) drafts.put(draftFor, draftBox.getText().toString());
+        String text = drafts.remove(now);
+        draftBox.setText(text == null ? "" : text);
+        draftFor = now;
+    }
+
+    private void updateMessageBox(Machine machine, FleetTree.Fleet fleet, boolean ready) {
+        if (messageBox == null) return;
+        messageBox.setVisibility(fleet.deacon == null ? View.GONE : View.VISIBLE);
+        boolean can = ready && !machine.sendBusy && fleet.deacon != null;
+        draftBox.setEnabled(ready);
+        sendButton.setEnabled(can);
+        sendButton.setText(machine.sendBusy ? "Sending…" : "Send");
+        sendButton.setAlpha(can ? 1f : 0.5f);
+        String note = machine.sendError;
+        if (!note.contentEquals(sendNote.getText())) sendNote.setText(note);
+        sendNote.setVisibility(note.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    /**
+     * One finished message into the shown computer's Deacon. A Deacon that is
+     * blocked on its own question refuses it (never forced); the draft stays.
+     */
+    private void sendDraft() {
+        Machine machine = shownMachine();
+        if (machine == null || draftBox == null) return;
+        FleetTree.Member deacon = FleetTree.canonicalDeacon(members(machine));
+        String text = draftBox.getText().toString().trim();
+        long handle = machine.handle;
+        if (text.isEmpty() || deacon == null || machine.sendBusy) return;
+        if (handle <= 0 || !"ready".equals(machine.state)) {
+            machine.sendError = machine.host.name + " is offline. Reconnect it, then send.";
+            machine.ui++;
+            render(true);
+            return;
+        }
+        if (text.length() > 1000) {
+            machine.sendError = "That message is too long for one send; shorten it.";
+            machine.ui++;
+            render(true);
+            return;
+        }
+        String action;
+        try {
+            action = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
+        } catch (org.json.JSONException impossible) {
+            return;
+        }
+        String id = machine.host.id;
+        machine.sendBusy = true;
+        machine.sendError = "";
+        machine.ui++;
+        render(true);
+        worker.execute(() -> {
+            boolean queued = false;
+            String refused = "";
+            int code = 0;
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
+                queued = result.optBoolean("queued", false);
+                refused = result.optString("refused", "");
+                code = result.optInt("code", 0);
+            } catch (Exception | LinkageError error) {
+                queued = false;
+            }
+            final String error = FleetTree.sendError(queued, refused, code, machine.host.name);
+            main.post(() -> {
+                if (destroyed) return;
+                machine.sendBusy = false;
+                machine.sendError = error == null ? "" : error;
+                // Only that computer's text, and only while it is still what was sent.
+                if (error == null) {
+                    if (id.equals(draftFor) && draftBox.getText().toString().trim().equals(text)) draftBox.setText("");
+                    else if (text.equals(drafts.getOrDefault(id, "").trim())) drafts.remove(id);
+                }
+                machine.ui++;
+                render(true);
+            });
+        });
     }
 
     /** One row of the tree and the rows it folds. */
@@ -852,53 +1084,23 @@ public final class HomeActivity extends Activity {
         for (int i = 0; i < row.kids.size(); i++) emit(into, row.kids.get(i), next, i == row.kids.size() - 1, depth + 1);
     }
 
-    private List<Row> fleetRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
+    /** Repos (each with its projects, loose spaces and unopened worktrees), Outside git, Other agents. */
+    private List<Row> bodyRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
         String m = machine.host.id;
         List<Row> rows = new ArrayList<>();
-        Row top;
-        if (fleet.deacon != null) {
-            Agent deacon = (Agent) fleet.deacon;
-            if (deacon.id.equals(machine.deaconPending)) {
-                rows.add(new Row((guide, self) -> actionLine(guide, null, "◆", "Starting the Deacon on "
-                        + machine.host.name + "…", chrome.onSurfaceVariant, null)));
-            } else if (!machine.deaconError.isEmpty() || !FleetTree.running(deacon)) {
-                // Its claude ended or never started: the kept terminal is a shell. Say so; never start a second.
-                String said = machine.deaconError.isEmpty() ? notRunning(machine) : machine.deaconError;
-                rows.add(new Row((guide, self) -> actionLine(guide, null, "!", said + ". Tap to open it.",
-                        chrome.danger, () -> openAgent(deacon))));
-            }
-            top = new Row((guide, self) -> agentLine(guide, deacon, "deacon", null));
-            for (FleetTree.Member helper : fleet.helpers) top.kids.add(agentTree(m, new FleetTree.AgentNode(helper), null));
-            rows.add(top);
-        } else {
-            boolean busy = machine.deaconBusy || deaconGuard(machine) > 0;
-            String said = !ready ? "No Deacon. Connect this computer to start one."
-                    : busy ? "Starting the Deacon…"
-                    : machine.deaconError.isEmpty() ? "No Deacon on this computer. Tap to start one."
-                    : "Could not start the Deacon: " + machine.deaconError + ". Tap to try again.";
-            top = new Row((guide, self) -> actionLine(guide, null, "◆", said, !machine.deaconError.isEmpty() ? chrome.danger
-                    : chrome.onSurfaceVariant, ready && !busy ? () -> startDeacon(machine) : null));
-            rows.add(top);
-        }
-        // Projects live under the Deacon when there is one, at the top otherwise.
-        List<Row> under = fleet.deacon != null ? top.kids : rows;
-        // New project sits right under the Deacon, never after a long list.
-        if (FleetTree.newProjectTarget(fleet) != null) {
-            Agent deacon = (Agent) FleetTree.newProjectTarget(fleet);
-            String said = machine.projectBusy ? "Asking the Deacon…"
-                    : machine.projectError.isEmpty() ? "New project (asks the Deacon)"
-                    : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
-            under.add(new Row((guide, self) -> actionLine(guide, null, "+", said,
-                    machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
-                    ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null)));
-        }
-        for (FleetTree.Project project : fleet.projects) under.add(projectRow(machine, project));
-        if (!fleet.loose.isEmpty()) {
-            Row spaces = new Row((guide, self) -> groupLine(guide, self, "Spaces", fleet.loose.size() + ""));
-            spaces.fold = m + "/spaces";
-            spaces.foldedByDefault = true;
-            for (FleetTree.SpaceNode node : fleet.loose) spaces.kids.add(spaceRow(machine, node, null));
-            under.add(spaces);
+        for (FleetTree.RepoGroup group : FleetTree.repoGroups(fleet)) {
+            String key = m + (group.outside() ? "/outside" : "/r/" + group.repo);
+            int pms = group.pms();
+            String tally = tally(group.tally);
+            String count = group.outside() ? String.valueOf(group.projects.size() + group.loose.size())
+                    : pms + (pms == 1 ? " PM" : " PMs") + (tally.isEmpty() ? "" : "  " + tally);
+            Row repo = new Row((guide, self) -> groupLine(guide, self, group.name, count));
+            repo.fold = key;
+            repo.foldedByDefault = group.outside();
+            for (FleetTree.Project project : group.projects) repo.kids.add(projectRow(machine, project));
+            for (FleetTree.SpaceNode node : group.loose) repo.kids.add(spaceRow(machine, node, null));
+            if (group.owner != null) repo.kids.add(unopenedRow(machine, group));
+            rows.add(repo);
         }
         if (!fleet.others.isEmpty()) {
             Row others = new Row((guide, self) -> groupLine(guide, self, "Other agents", fleet.others.size() + ""));
@@ -908,9 +1110,33 @@ public final class HomeActivity extends Activity {
                 String tag = "deacon".equals(agent.role) ? "another deacon" : roleTag(agent);
                 others.kids.add(new Row((guide, self) -> agentLine(guide, agent, tag, null)));
             }
-            under.add(others);
+            rows.add(others);
         }
         return rows;
+    }
+
+    /** A repo's unopened worktrees: ONE folded row; open, a page at a time. */
+    private Row unopenedRow(Machine machine, FleetTree.RepoGroup group) {
+        FleetTree.Project owner = group.owner;
+        String key = machine.host.id + "/u/" + group.repo;
+        int total = owner.closed.size();
+        Row row = new Row((guide, self) -> groupLine(guide, self, total + (total == 1 ? " worktree" : " worktrees")
+                + " with no space" + (owner.closedIncomplete ? " (list cut short)" : ""), ""));
+        row.fold = key;
+        row.foldedByDefault = true;
+        int pages = closedPages.getOrDefault(key, 0);
+        int shown = FleetTree.shownClosed(owner, pages);
+        for (int i = 0; i < shown; i++) row.kids.add(closedRow(machine, owner.closed.get(i)));
+        int more = total - shown;
+        if (more > 0) {
+            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "○", "+" + more + " more worktrees",
+                    chrome.primary, () -> { closedPages.put(key, pages + 1); machine.ui++; render(true); })));
+        }
+        if (owner.closedIncomplete) {
+            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "!", "Git's list was cut short;"
+                    + " some worktrees may be missing", chrome.warning, null)));
+        }
+        return row;
     }
 
     private Row projectRow(Machine machine, FleetTree.Project project) {
@@ -923,7 +1149,7 @@ public final class HomeActivity extends Activity {
             String tag = "PM" + (tally.isEmpty() ? "" : "  " + tally);
             row = new Row((guide, self) -> agentLine(guide, pm, tag, self, project.name));
         } else {
-            row = new Row((guide, self) -> actionLine(guide, self, "●", project.name + " · no project manager"
+            row = new Row((guide, self) -> actionLine(guide, self, "●", project.name + " · no PM"
                     + (tally.isEmpty() ? "" : "  " + tally), chrome.onSurfaceVariant, () -> askForManager(machine, project)));
         }
         row.fold = key;
@@ -937,19 +1163,7 @@ public final class HomeActivity extends Activity {
                 row.kids.add(spaceRow(machine, entry, project));
             }
         }
-        // Every unopened worktree, a page at a time: "+N more" shows the next page.
-        int pages = closedPages.getOrDefault(key, 0);
-        int shown = FleetTree.shownClosed(project, pages);
-        for (int i = 0; i < shown; i++) row.kids.add(closedRow(machine, project.closed.get(i)));
-        int more = project.closed.size() - shown;
-        if (more > 0) {
-            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "○", "+" + more + " more worktrees",
-                    chrome.primary, () -> { closedPages.put(key, pages + 1); machine.ui++; render(true); })));
-        }
-        if (project.closedIncomplete) {
-            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "!", "Git's list was cut short;"
-                    + " some worktrees may be missing", chrome.warning, null)));
-        }
+        // Unopened worktrees are listed once per repo (unopenedRow), not under projects.
         return row;
     }
 

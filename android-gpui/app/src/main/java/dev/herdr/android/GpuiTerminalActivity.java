@@ -2314,8 +2314,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         updateRailFleetButtons(header, host, live, current, fleet);
         FleetTree.Member deacon = fleet.deacon;
+        // The Deacon card: the Deacon (id, status), its state, Needs you, the message box, + Project.
         if (deacon != null) {
-            railAgent(host, live, current, deacon, "Deacon · ", 0, selectedPane, order, keep);
+            railAgent(host, live, current, deacon, "Deacon " + deacon.id + " · ", 0, selectedPane, order, keep);
             String pending = railDeaconPending.getOrDefault(host.id, "");
             if (deacon.id.equals(pending)) {
                 railNote(host, "deacon-state", "Starting the Deacon…", chrome.onSurfaceVariant, 1, null, order, keep);
@@ -2323,8 +2324,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 railNote(host, "deacon-state", "Claude isn't running in the Deacon's terminal. Tap to open it.",
                         chrome.danger, 1, () -> openRailPane(host, live, current, deacon.id), order, keep);
             }
+            for (FleetTree.Member helper : fleet.helpers) railAgent(host, live, current, helper, "", 1, selectedPane, order, keep);
+            java.util.List<FleetTree.Member> needs = FleetTree.needsYou(fleet);
+            if (!needs.isEmpty()) {
+                railNote(host, "needs-head", "Needs you", chrome.danger, 1, null, order, keep);
+                for (FleetTree.Member waiting : needs) {
+                    String who = "deacon".equals(waiting.role) ? "Deacon · "
+                            : "pm".equals(waiting.role) ? "PM " + (waiting.project.isEmpty() ? "" : waiting.project + " · ") : "";
+                    railNote(host, "needs:" + waiting.id, "! " + who + chromeTitle(FleetPanes.displayTitle(waiting), waiting.id),
+                            chrome.danger, 1, () -> openRailPane(host, live, current, waiting.id), order, keep);
+                }
+            }
+            if (live) railMessageBox(host, current, deacon, order, keep);
             boolean asking = railProjectBusy.contains(host.id);
-            railNote(host, "new-project", asking ? "Asking the Deacon…" : "+ New project (asks the Deacon)",
+            railNote(host, "new-project", asking ? "Asking the Deacon…" : "+ Project (asks the Deacon)",
                     asking ? chrome.onSurfaceVariant : chrome.primary, 1,
                     asking ? null : () -> railNewProject(host, live, current, deacon), order, keep);
         } else {
@@ -2335,81 +2348,195 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     live && !railDeaconBusy.contains(host.id) ? () -> railStartDeacon(host, current) : null,
                     order, keep);
         }
-        int base = deacon != null ? 1 : 0;
-        for (FleetTree.Project project : fleet.projects) {
-            String projectKey = railKey(host, "p/" + project.name);
-            boolean projectFolded = collapsedRepos().contains(projectKey);
-            String tally = (project.tally[0] > 0 ? project.tally[0] + "! " : "")
-                    + (project.tally[2] > 0 ? project.tally[2] + "▶ " : "") + project.agents();
-            String firstPane = project.pm != null ? project.pm.id : firstMember(project);
-            railHeader(host, live, current, "proj:" + project.name, project.name
-                    + (project.pm == null ? " · no project manager" : ""), tally, projectKey, projectFolded,
-                    base, firstPane, order, keep);
-            if (projectFolded) continue;
-            if (project.pm != null) railAgent(host, live, current, project.pm, "PM · ", base + 1, selectedPane, order, keep);
-            boolean flat = FleetTree.flat(project);
-            for (FleetTree.SpaceNode row : project.entries) {
-                int depth = base + 1;
-                if (!flat) {
-                    String rowKey = railKey(host, "s/" + project.name + "/" + row.key);
-                    boolean rowFolded = collapsedRepos().contains(rowKey);
-                    String sub = row.branch.isEmpty() || row.branch.equals(row.name) ? "" : row.branch + " · ";
-                    railHeader(host, live, current, "row:" + project.name + "/" + row.key, (row.worktree ? "⑂ " : "") + row.name,
-                            sub + row.members.size(), row.members.isEmpty() ? null : rowKey, rowFolded, depth,
-                            row.members.isEmpty() ? "" : row.members.get(0).id, order, keep);
-                    RailWorkspaceRow drawn = railWorkspaces.get("fleet:" + host.id + "/row:" + project.name + "/" + row.key);
-                    String whole = FleetTree.wholeSpace(row, members);
-                    if (drawn != null && whole != null) { drawn.physicalSpace = whole; drawn.workspaceId = whole; }
-                    if (rowFolded) continue;
-                    depth++;
-                }
-                for (FleetTree.AgentNode node : row.agents) railAgentTree(host, live, current, node, depth, selectedPane, order, keep);
+        // Repos, each with its projects (PMs), loose spaces and ONE folded row of
+        // unopened worktrees; Outside git folded; Other agents.
+        for (FleetTree.RepoGroup group : FleetTree.repoGroups(fleet)) {
+            String repoKey = railKey(host, group.outside() ? "outside" : "r/" + group.repo);
+            // Outside git starts folded (its key means "open"); repos start open.
+            String foldKey = group.outside() ? repoKey + ":open" : repoKey;
+            boolean repoFolded = group.outside() ? !collapsedRepos().contains(foldKey) : collapsedRepos().contains(foldKey);
+            int pms = group.pms();
+            String meta = group.outside() ? String.valueOf(group.projects.size() + group.loose.size())
+                    : (group.tally[0] > 0 ? group.tally[0] + "! " : "") + pms + (pms == 1 ? " PM" : " PMs");
+            railHeader(host, live, current, "repo:" + group.repo, group.name, meta, foldKey, repoFolded, 0, "", order, keep);
+            if (repoFolded) continue;
+            for (FleetTree.Project project : group.projects) railProject(host, live, current, project, members, selectedPane, order, keep);
+            for (FleetTree.SpaceNode node : group.loose) {
+                for (FleetTree.Member m : node.members) railAgent(host, live, current, m, "", 1, selectedPane, order, keep);
             }
-            // Every unopened worktree, a page at a time.
-            int pages = railClosedPages.getOrDefault(projectKey, 0);
-            int shown = FleetTree.shownClosed(project, pages);
+            FleetTree.Project owner = group.owner;
+            if (owner == null) continue;
+            String uKey = railKey(host, "u/" + group.repo) + ":open";
+            boolean uFolded = !collapsedRepos().contains(uKey);
+            int total = owner.closed.size();
+            railHeader(host, live, current, "unopened:" + group.repo, total + (total == 1 ? " worktree" : " worktrees")
+                    + " with no space" + (owner.closedIncomplete ? " (list cut short)" : ""), "", uKey, uFolded, 1, "", order, keep);
+            if (uFolded) continue;
+            int pages = railClosedPages.getOrDefault(uKey, 0);
+            int shown = FleetTree.shownClosed(owner, pages);
             for (int i = 0; i < shown; i++) {
-                FleetTree.GitWorktree wt = project.closed.get(i);
+                FleetTree.GitWorktree wt = owner.closed.get(i);
                 String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
-                railNote(host, "closed:" + wt.path, "○ " + name, chrome.onSurfaceVariant, base + 1,
+                railNote(host, "closed:" + wt.path, "○ " + name, chrome.onSurfaceVariant, 2,
                         live ? () -> railClosedWorktree(host, current, deacon, wt, name) : null, order, keep);
             }
-            int more = project.closed.size() - shown;
+            int more = total - shown;
             if (more > 0) {
-                railNote(host, "closed-more:" + project.name, "○ +" + more + " more worktrees",
-                        chrome.primary, base + 1, () -> {
-                            railClosedPages.put(projectKey, pages + 1);
-                            refreshSidebar(true);
-                        }, order, keep);
+                railNote(host, "closed-more:" + group.repo, "○ +" + more + " more worktrees", chrome.primary, 2, () -> {
+                    railClosedPages.put(uKey, pages + 1);
+                    refreshSidebar(true);
+                }, order, keep);
             }
-            if (project.closedIncomplete) {
-                railNote(host, "closed-cut:" + project.name, "! Git's list was cut short; some worktrees may be missing",
-                        chrome.warning, base + 1, null, order, keep);
-            }
-        }
-        if (!fleet.loose.isEmpty()) {
-            String key = railKey(host, "spaces");
-            boolean folded = !collapsedRepos().contains(key + ":open");
-            railHeader(host, live, current, "group:spaces", "Spaces", String.valueOf(fleet.loose.size()),
-                    key + ":open", folded, base, "", order, keep);
-            if (!folded) {
-                for (FleetTree.SpaceNode node : fleet.loose) {
-                    for (FleetTree.Member m : node.members) railAgent(host, live, current, m, "", base + 1, selectedPane, order, keep);
-                }
+            if (owner.closedIncomplete) {
+                railNote(host, "closed-cut:" + group.repo, "! Git's list was cut short; some worktrees may be missing",
+                        chrome.warning, 2, null, order, keep);
             }
         }
         if (!fleet.others.isEmpty()) {
             String key = railKey(host, "others");
             boolean folded = collapsedRepos().contains(key);
             railHeader(host, live, current, "group:others", "Other agents", String.valueOf(fleet.others.size()),
-                    key, folded, base, "", order, keep);
+                    key, folded, 0, "", order, keep);
             if (!folded) {
                 for (FleetTree.Member m : fleet.others) {
                     railAgent(host, live, current, m, "deacon".equals(m.role) ? "Another deacon · " : "",
-                            base + 1, selectedPane, order, keep);
+                            1, selectedPane, order, keep);
                 }
             }
         }
+    }
+
+    /** One project under its repo: the PM, then its checkout rows and their agents. */
+    private void railProject(SavedRemoteHost host, boolean live, Connection current, FleetTree.Project project,
+            java.util.List<FleetTree.Member> members, String selectedPane, java.util.List<View> order,
+            java.util.Set<String> keep) {
+        int base = 1;
+        String projectKey = railKey(host, "p/" + project.name);
+        boolean projectFolded = collapsedRepos().contains(projectKey);
+        String tally = (project.tally[0] > 0 ? project.tally[0] + "! " : "")
+                + (project.tally[2] > 0 ? project.tally[2] + "▶ " : "") + project.agents();
+        String firstPane = project.pm != null ? project.pm.id : firstMember(project);
+        railHeader(host, live, current, "proj:" + project.name, project.name
+                + (project.pm == null ? " · no PM" : ""), tally, projectKey, projectFolded,
+                base, firstPane, order, keep);
+        if (projectFolded) return;
+        if (project.pm != null) railAgent(host, live, current, project.pm, "PM · ", base + 1, selectedPane, order, keep);
+        boolean flat = FleetTree.flat(project);
+        for (FleetTree.SpaceNode row : project.entries) {
+            int depth = base + 1;
+            if (!flat) {
+                String rowKey = railKey(host, "s/" + project.name + "/" + row.key);
+                boolean rowFolded = collapsedRepos().contains(rowKey);
+                String sub = row.branch.isEmpty() || row.branch.equals(row.name) ? "" : row.branch + " · ";
+                railHeader(host, live, current, "row:" + project.name + "/" + row.key, (row.worktree ? "⑂ " : "") + row.name,
+                        sub + row.members.size(), row.members.isEmpty() ? null : rowKey, rowFolded, depth,
+                        row.members.isEmpty() ? "" : row.members.get(0).id, order, keep);
+                RailWorkspaceRow drawn = railWorkspaces.get("fleet:" + host.id + "/row:" + project.name + "/" + row.key);
+                String whole = FleetTree.wholeSpace(row, members);
+                if (drawn != null && whole != null) { drawn.physicalSpace = whole; drawn.workspaceId = whole; }
+                if (rowFolded) continue;
+                depth++;
+            }
+            for (FleetTree.AgentNode node : row.agents) railAgentTree(host, live, current, node, depth, selectedPane, order, keep);
+        }
+    }
+
+    /** Per machine: the Deacon message box views (kept, so typing survives refreshes) and send state. */
+    private final java.util.Map<String, LinearLayout> railMessageBoxes = new java.util.HashMap<>();
+    private final java.util.Set<String> railSendBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.Map<String, String> railSendError = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The Deacon message box for the live machine: one finished message, never forced. */
+    private void railMessageBox(SavedRemoteHost host, Connection current, FleetTree.Member deacon,
+            java.util.List<View> order, java.util.Set<String> keep) {
+        String key = "fleetmsg:" + host.id;
+        keep.add(key);
+        LinearLayout box = railMessageBoxes.get(key);
+        if (box == null) {
+            box = new LinearLayout(this);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setPadding(dp(22), dp(1), dp(6), dp(2));
+            box.setSaveFromParentEnabled(false);
+            LinearLayout line = new LinearLayout(this);
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            line.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            EditText input = new EditText(this);
+            input.setHint("Tell the deacon…");
+            input.setSingleLine(true);
+            input.setTextSize(12);
+            input.setTextColor(chrome.onSurface);
+            input.setHintTextColor(chrome.onSurfaceVariant);
+            input.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+                    | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+            input.setSaveEnabled(false);
+            line.addView(input, new LinearLayout.LayoutParams(0, -2, 1));
+            TextView send = railText("Send", 12, chrome.primary);
+            send.setPadding(dp(8), dp(4), dp(8), dp(4));
+            send.setBackground(railBackground(false));
+            line.addView(send);
+            box.addView(line);
+            TextView note = railText("", 11, chrome.danger);
+            note.setVisibility(View.GONE);
+            box.addView(note);
+            railMessageBoxes.put(key, box);
+        }
+        LinearLayout line = (LinearLayout) box.getChildAt(0);
+        EditText input = (EditText) line.getChildAt(0);
+        TextView send = (TextView) line.getChildAt(1);
+        TextView note = (TextView) box.getChildAt(1);
+        boolean busy = railSendBusy.contains(host.id);
+        Runnable go = () -> railSendDraft(host, current, deacon, input);
+        send.setOnClickListener(busy ? null : v -> go.run());
+        send.setText(busy ? "Sending…" : "Send");
+        send.setAlpha(busy ? 0.5f : 1f);
+        input.setOnEditorActionListener((view, action, event) -> { if (!railSendBusy.contains(host.id)) go.run(); return true; });
+        String error = railSendError.getOrDefault(host.id, "");
+        if (!error.contentEquals(note.getText())) note.setText(error);
+        note.setVisibility(error.isEmpty() ? View.GONE : View.VISIBLE);
+        order.add(box);
+    }
+
+    private void railSendDraft(SavedRemoteHost host, Connection current, FleetTree.Member deacon, EditText input) {
+        String text = input.getText().toString().trim();
+        if (text.isEmpty() || current == null || !railSendBusy.add(host.id)) return;
+        if (text.length() > 1000) {
+            railSendBusy.remove(host.id);
+            railSendError.put(host.id, "That message is too long for one send; shorten it.");
+            refreshSidebar(true);
+            return;
+        }
+        String json;
+        try {
+            json = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
+        } catch (JSONException impossible) { railSendBusy.remove(host.id); return; }
+        railSendError.remove(host.id);
+        refreshSidebar(true);
+        actionWorker.execute(() -> {
+            boolean queued = false;
+            String refused = "";
+            int code = 0;
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(current.remoteHandle, json));
+                queued = result.optBoolean("queued", false);
+                refused = result.optString("refused", "");
+                code = result.optInt("code", 0);
+            } catch (Exception | LinkageError error) {
+                queued = false;
+            }
+            final String error = FleetTree.sendError(queued, refused, code, host.name);
+            main.post(() -> {
+                if (destroyed) return;
+                railSendBusy.remove(host.id);
+                if (error == null) {
+                    railSendError.remove(host.id);
+                    // Only while it is still what was sent; a refused draft stays.
+                    if (input.getText().toString().trim().equals(text)) input.setText("");
+                } else {
+                    railSendError.put(host.id, error);
+                }
+                refreshSidebar(true);
+            });
+        });
     }
 
     private static boolean containsMember(java.util.List<FleetTree.Member> list, String id) {
@@ -2543,6 +2670,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** The machine header's ◆ (its Deacon) and + (New project, or Start Deacon first). */
     private void updateRailFleetButtons(RailHostRow header, SavedRemoteHost host, boolean live, Connection current,
             FleetTree.Fleet fleet) {
+        int agents = 0, blocked = 0;
+        for (FleetTree.Member m : fleet.all) {
+            if (!m.isAgent()) continue;
+            agents++;
+            if ("blocked".equals(m.status)) blocked++;
+        }
+        String counts = agents + (blocked > 0 ? " · " + blocked + "!" : "");
+        String word = header.hostState == null || header.hostState.isEmpty() ? counts : header.hostState + " · " + counts;
+        if (!word.contentEquals(header.state.getText())) header.state.setText(word);
+        header.state.setTextColor(blocked > 0 ? chrome.danger : header.live ? chrome.onSurface : chrome.onSurfaceVariant);
         FleetTree.Member deacon = fleet.deacon;
         boolean busy = railDeaconBusy.contains(host.id) || railDeaconPending.containsKey(host.id);
         FleetTree.DeaconAction action = FleetTree.deaconAction(live, deacon, busy);
@@ -2765,6 +2902,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         prune(railWorkspaces, keep, holder -> holder.row);
         prune(railPanes, keep, holder -> holder.row);
         prune(railNotes, keep, view -> view);
+        prune(railMessageBoxes, keep, view -> view);
         prune(railRules, keep, view -> view);
     }
 

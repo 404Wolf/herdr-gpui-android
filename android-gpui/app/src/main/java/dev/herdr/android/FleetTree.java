@@ -90,6 +90,8 @@ final class FleetTree {
         final List<Member> members = new ArrayList<>();
         final List<AgentNode> agents = new ArrayList<>();
         int order = Integer.MAX_VALUE;
+        /** The git repo (common dir) this checkout belongs to, or "" outside git. */
+        String repo = "";
         SpaceNode(String key) { this.key = key; }
     }
 
@@ -128,6 +130,82 @@ final class FleetTree {
         final List<SpaceNode> loose = new ArrayList<>();
         /** Extra deacon candidates and agents with no space: "Other agents". */
         final List<Member> others = new ArrayList<>();
+        /** Every terminal of this computer, in space/tab order. */
+        final List<Member> all = new ArrayList<>();
+    }
+
+    /**
+     * A repo header (or "Outside git" when {@code repo} is empty): the
+     * projects working in it, its loose spaces, and its unopened worktrees
+     * once (from the one project fleet() listed them under).
+     */
+    static final class RepoGroup {
+        final String repo, name;
+        final List<Project> projects = new ArrayList<>();
+        final List<SpaceNode> loose = new ArrayList<>();
+        /** The project holding the repo's unopened worktrees, or null. */
+        Project owner;
+        final int[] tally = new int[4];
+        RepoGroup(String repo, String name) { this.repo = repo; this.name = name; }
+
+        int pms() {
+            int n = 0;
+            for (Project p : projects) if (p.pm != null) n++;
+            return n;
+        }
+
+        boolean outside() { return repo.isEmpty(); }
+    }
+
+    /**
+     * The desktop sidebar's middle: repos in project order, each with the
+     * projects (PMs) working in it, its loose spaces and its unopened
+     * worktrees; then "Outside git" (projects and spaces with no repo) last.
+     */
+    static List<RepoGroup> repoGroups(Fleet fleet) {
+        Map<String, RepoGroup> repos = new LinkedHashMap<>();
+        RepoGroup outside = new RepoGroup("", "Outside git");
+        for (Project p : fleet.projects) {
+            RepoGroup g = p.repo.isEmpty() ? outside
+                    : repos.computeIfAbsent(p.repo, r -> new RepoGroup(r, repoName(r)));
+            g.projects.add(p);
+            for (int i = 0; i < 4; i++) g.tally[i] += p.tally[i];
+            if (g.owner == null && !p.closed.isEmpty()) g.owner = p;
+        }
+        for (SpaceNode node : fleet.loose) {
+            RepoGroup g = node.repo.isEmpty() ? outside
+                    : repos.computeIfAbsent(node.repo, r -> new RepoGroup(r, repoName(r)));
+            g.loose.add(node);
+        }
+        List<RepoGroup> out = new ArrayList<>(repos.values());
+        if (!outside.projects.isEmpty() || !outside.loose.isEmpty()) out.add(outside);
+        return out;
+    }
+
+    /**
+     * Needs you: this computer's agents whose own status is blocked (no
+     * invented questions), the deacon first, then PMs in project order, then
+     * the rest in space/tab order.
+     */
+    static List<Member> needsYou(Fleet fleet) {
+        List<Member> order = new ArrayList<>();
+        if (fleet.deacon != null) order.add(fleet.deacon);
+        for (Project p : fleet.projects) if (p.pm != null && !order.contains(p.pm)) order.add(p.pm);
+        for (Member m : fleet.all) if (!order.contains(m)) order.add(m);
+        List<Member> out = new ArrayList<>();
+        for (Member m : order) if ("blocked".equals(m.status)) out.add(m);
+        return out;
+    }
+
+    /**
+     * What to say when a message to the Deacon did not go in: the core's
+     * refusal of a blocked program (hc's exit 9) is never forced; the draft
+     * stays. Null when it went in.
+     */
+    static String sendError(boolean queued, String refused, int code, String computer) {
+        if (queued) return null;
+        if ("blocked".equals(refused) || code == 9) return "The deacon is waiting for an answer. Reply to it first.";
+        return "Couldn't reach the deacon on " + computer + ". Check that it's online and try again.";
     }
 
     /** Unopened worktrees shown before "+N more"; a tap shows a page more. */
@@ -204,6 +282,7 @@ final class FleetTree {
         List<Member> sorted = new ArrayList<>(members);
         Collections.sort(sorted, PLACE);
         fleet.deacon = canonicalDeacon(sorted);
+        fleet.all.addAll(sorted);
 
         // A sub-agent without a place of its own takes its parent's (parent links are sparse).
         Map<String, Member> byId = new HashMap<>();
@@ -410,6 +489,7 @@ final class FleetTree {
         List<Member> one = Collections.singletonList(m);
         if (place != null && place.top.equals(node.key)) {
             if (node.branch.isEmpty()) node.branch = place.branch;
+            if (node.repo.isEmpty()) node.repo = place.common;
             node.worktree = !place.top.equals(mainTop(place, git));
         } else if (conventionTop(one) != null && conventionTop(one).equals(node.key)) {
             node.worktree = true;

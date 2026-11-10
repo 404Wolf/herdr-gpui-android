@@ -243,8 +243,13 @@ impl Connection<'_> {
                     return Ok(reply.to_string());
                 }
                 Some(TabEdit::Send { terminal, text }) => {
-                    self.call("terminal.send", json!({"terminal":terminal,"text":text}))?;
-                    return Ok(json!({"queued":true,"terminal":terminal}).to_string());
+                    // Never forced: a blocked program is refused (hc's exit 9),
+                    // and the phone says so instead of typing into its dialog.
+                    return Ok(match self.call("terminal.send", json!({"terminal":terminal,"text":text})) {
+                        Ok(_) => json!({"queued":true,"terminal":terminal}),
+                        Err(error) => send_refusal(&error.to_string()),
+                    }
+                    .to_string());
                 }
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
                 None => return Err(Error::StaleTarget),
@@ -740,6 +745,15 @@ fn add_space(doc: &mut Value, entry: &Value) -> Result<()> {
         spaces.push(entry.clone());
     }
     Ok(())
+}
+/// What the phone hears when terminal.send fails: `refused: "blocked"` (code
+/// 9, as hc exits) when the program waits on its own question, else the error.
+fn send_refusal(error: &str) -> Value {
+    if error.contains("\"blocked\"") || error.ends_with(": blocked") {
+        json!({"queued":false,"refused":"blocked","code":9})
+    } else {
+        json!({"queued":false,"error":error})
+    }
 }
 /// The phone's git look, one `sh -c` over the folders it shows (see git_look).
 const GIT_LOOK: &str = r#"seen='
@@ -1284,7 +1298,19 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIT_LOOK, add_space, canonical_deacon, deacon_line, existing_at};
+    use super::{GIT_LOOK, add_space, canonical_deacon, deacon_line, existing_at, send_refusal};
+    #[test]
+    fn a_send_to_a_blocked_program_is_refused_never_forced() {
+        // call() reports an RPC error as "<data.kind>: <message>".
+        let refused = send_refusal("protocol error: \"blocked\": \"blocked\"");
+        assert_eq!(refused["queued"], false);
+        assert_eq!(refused["refused"], "blocked");
+        assert_eq!(refused["code"], 9);
+        let other = send_refusal("protocol error: \"not_found\": \"not_found\"");
+        assert_eq!(other["queued"], false);
+        assert!(other["refused"].is_null());
+        assert!(other["error"].as_str().is_some_and(|e| e.contains("not_found")));
+    }
     #[test]
     fn reopening_a_worktree_finds_the_space_already_there() {
         let doc = json!({"spaces":[{"id":"sp1","folder":"/w/lane/","tabs":[]}]});
