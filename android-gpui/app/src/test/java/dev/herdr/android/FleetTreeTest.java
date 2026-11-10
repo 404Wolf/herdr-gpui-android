@@ -662,6 +662,46 @@ public final class FleetTreeTest {
         assertSame(cached, FleetTree.pickTarget(Arrays.asList(cached, pm)));
     }
 
+    @Test public void theTopStripFollowsTheRoleInFocus() {
+        FleetTree.Member deacon = label(m("t6k", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member hmPm = label(m("t67", "hm", "home-manager", 1, 0, "/c/hm", "working"), "pm", "home-manager");
+        FleetTree.Member w1 = label(m("t6m", "hm", "home-manager", 1, 3, "/wt/fleet", "working"), "worker", "home-manager");
+        w1.parent = "t67";
+        w1.title = "Desktop Fleet sidebar";
+        FleetTree.Member sub = label(m("t7a", "other", "scratch", 3, 0, "/wt/fleet", "idle"), "worker", "home-manager");
+        sub.parent = "t6m"; // another space: still in the project's strip, under its parent
+        FleetTree.Member w2 = label(m("t6n", "hm", "home-manager", 1, 4, "/wt/deploy", "done"), "worker", "home-manager");
+        w2.parent = "t67";
+        FleetTree.Member botdPm = label(m("t5t", "hm", "home-manager", 1, 5, "/c", "idle"), "pm", "botd");
+        FleetTree.Member inferred = m("t9", "z", "zulip", 2, 0, "/w/zulip", "idle"); // unlabelled lead
+        FleetTree.Member shell = m("t2", "x", "x", 4, 0, "/tmp", "");
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(deacon, hmPm, w1, sub, w2, botdPm, inferred, shell), null);
+        // A PM focused: the PM first, then its live workers depth first by parent, across spaces.
+        FleetTree.Strip pmStrip = FleetTree.stripFor(fleet, "t67");
+        assertEquals("pm", pmStrip.mode);
+        assertEquals("home-manager", pmStrip.name);
+        assertEquals(Arrays.asList("t67", "t6m", "t7a", "t6n"), stripIds(pmStrip));
+        assertEquals("Desktop Fleet sidebar", pmStrip.items.get(1).label);
+        // One of its workers focused: the same project strip.
+        assertEquals(stripIds(pmStrip), stripIds(FleetTree.stripFor(fleet, "t7a")));
+        // The Deacon focused: the Deacon, then the labelled PMs (not an inferred lead).
+        FleetTree.Strip deaconStrip = FleetTree.stripFor(fleet, "t6k");
+        assertEquals("deacon", deaconStrip.mode);
+        assertEquals(Arrays.asList("t6k", "t67", "t5t"), stripIds(deaconStrip));
+        // No role context: null, so the space's own tabs show.
+        assertNull(FleetTree.stripFor(fleet, "t9"));
+        assertNull(FleetTree.stripFor(fleet, "t2"));
+        assertNull(FleetTree.stripFor(fleet, ""));
+        // Every item is an exact terminal of this computer: a tap focuses that id.
+        for (FleetTree.StripItem item : pmStrip.items) assertTrue(ids(fleet.all).contains(item.id));
+    }
+
+    private static List<String> stripIds(FleetTree.Strip strip) {
+        List<String> out = new ArrayList<>();
+        for (FleetTree.StripItem item : strip.items) out.add(item.id);
+        return out;
+    }
+
     @Test public void thePaneHeaderBadgeNamesTheRole() {
         assertEquals("PM·t19", FleetTree.roleBadge("pm", "t19", "ignored"));
         assertEquals("Deacon·t6k", FleetTree.roleBadge("deacon", "t6k", ""));

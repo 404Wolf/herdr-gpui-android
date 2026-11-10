@@ -836,6 +836,74 @@ final class FleetTree {
         return pickTarget(liveMembers) != null ? Pick.FOCUS : Pick.START;
     }
 
+    /** One item of the role-aware top strip: an exact terminal to focus. */
+    static final class StripItem {
+        final String id, role, label, status;
+        StripItem(String id, String role, String label, String status) {
+            this.id = id; this.role = role; this.label = label; this.status = status;
+        }
+    }
+
+    /** The top strip for a role context: "deacon" or "pm" mode, its title and items. */
+    static final class Strip {
+        final String mode, name;
+        final List<StripItem> items = new ArrayList<>();
+        Strip(String mode, String name) { this.mode = mode; this.name = name; }
+    }
+
+    private static StripItem stripItem(Member m, String role) {
+        String label = "worker".equals(role) ? workerTask(m.title, "", m.id) : m.id;
+        return new StripItem(m.id, role, label, m.status);
+    }
+
+    /**
+     * The terminal's top strip for what is focused, as the desktop's stripFor:
+     * the canonical Deacon focused shows the Deacon, then this computer's
+     * labelled PMs; a labelled PM or one of its workers focused shows the PM,
+     * then the project's live workers depth first by parent, across spaces;
+     * anything else is null (the space's own tabs). Built from the live
+     * fleet each time, so it can never show a stale group.
+     */
+    static Strip stripFor(Fleet fleet, String focusId) {
+        if (focusId == null || focusId.isEmpty()) return null;
+        if (fleet.deacon != null && fleet.deacon.id.equals(focusId)) {
+            Strip strip = new Strip("deacon", "Deacon");
+            strip.items.add(stripItem(fleet.deacon, "deacon"));
+            for (Project p : fleet.projects) {
+                if (p.pm != null && "pm".equals(p.pm.role)) strip.items.add(stripItem(p.pm, "pm"));
+            }
+            return strip;
+        }
+        Project project = projectOf(fleet, focusId);
+        if (project == null || project.pm == null || !"pm".equals(project.pm.role)) return null;
+        List<Member> members = new ArrayList<>();
+        for (SpaceNode row : project.entries) for (Member m : row.members) if (m != project.pm) members.add(m);
+        Collections.sort(members, PLACE);
+        Set<String> inProject = new HashSet<>();
+        for (Member m : members) inProject.add(m.id);
+        Map<String, List<Member>> kids = new HashMap<>();
+        for (Member m : members) {
+            String up = !m.parent.isEmpty() && inProject.contains(m.parent) ? m.parent : project.pm.id;
+            kids.computeIfAbsent(up, k -> new ArrayList<>()).add(m);
+        }
+        Strip strip = new Strip("pm", project.name);
+        strip.items.add(stripItem(project.pm, "pm"));
+        Set<String> seen = new HashSet<>();
+        seen.add(project.pm.id);
+        walkStrip(project.pm.id, kids, seen, strip);
+        // A parent loop never hides anyone: whatever the walk missed comes last.
+        for (Member m : members) if (seen.add(m.id)) strip.items.add(stripItem(m, "worker"));
+        return strip;
+    }
+
+    private static void walkStrip(String id, Map<String, List<Member>> kids, Set<String> seen, Strip strip) {
+        for (Member m : kids.getOrDefault(id, Collections.emptyList())) {
+            if (!seen.add(m.id)) continue;
+            strip.items.add(stripItem(m, "worker"));
+            walkStrip(m.id, kids, seen, strip);
+        }
+    }
+
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */
     static Member newProjectTarget(Fleet fleet) {
         return fleet.deacon;

@@ -1901,6 +1901,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         updateCrumb(current, space);
+        if (showRoleStrip(current)) return;
         // Rebuild only when what the strip shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
@@ -1964,6 +1965,49 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             final View activePill = active;
             tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
         }
+    }
+
+    /**
+     * With a Deacon, a PM or a PM's worker focused, the strip shows that role
+     * context instead of the space's tabs (FleetTree.stripFor): each item is
+     * an exact terminal, possibly from another space, so a tap focuses that
+     * terminal and there is no close, move or rename. It is rebuilt from the
+     * live view on every refresh, so it never shows a stale group (what the
+     * desktop's projection handshake guards against). False: no role context.
+     */
+    private boolean showRoleStrip(Connection current) {
+        java.util.List<FleetTree.Member> members = FleetPanes.members(current.workspaces, current.tabs, current.panes,
+                FleetTree.Member::new);
+        FleetTree.Strip strip = FleetTree.stripFor(FleetTree.build(members, FleetPanes.LOOKS.get(currentHostId)),
+                current.paneId);
+        if (strip == null) return false;
+        StringBuilder signature = new StringBuilder("role:").append(strip.mode).append('\n');
+        for (FleetTree.StripItem item : strip.items) {
+            signature.append(item.id).append('\t').append(item.label).append('\t').append(item.status)
+                    .append('\t').append(item.id.equals(current.paneId)).append('\n');
+        }
+        if (signature.toString().equals(tabSignature)) return true;
+        boolean activeMoved = !current.paneId.equals(tabActive);
+        tabSignature = signature.toString();
+        tabActive = current.paneId;
+        tabStrip.removeAllViews();
+        View active = null;
+        for (FleetTree.StripItem item : strip.items) {
+            boolean focused = item.id.equals(current.paneId);
+            String label = ("worker".equals(item.role) ? "" : "pm".equals(item.role) ? "PM·" : "Deacon·") + item.label;
+            TextView pill = tabPill(label, focused, item.status);
+            final Connection target = current;
+            pill.setOnClickListener(v -> { if (!focused) focusRemotePane(target, item.id); });
+            pill.setContentDescription((strip.mode.equals("pm") ? strip.name + ": " : "") + label
+                    + (item.status.isEmpty() ? "" : ", " + item.status) + (focused ? ", current" : ""));
+            tabStrip.addView(pill);
+            if (focused) active = pill;
+        }
+        if (active != null && activeMoved) {
+            final View activePill = active;
+            tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
+        }
+        return true;
     }
 
     private void updateCrumb(Connection current, String space) {
