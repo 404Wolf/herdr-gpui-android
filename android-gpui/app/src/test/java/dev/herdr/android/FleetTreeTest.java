@@ -714,19 +714,47 @@ public final class FleetTreeTest {
         // Toggle to the space's own tabs and back: the focused terminal is untouched.
         Set<String> saved = new HashSet<>();
         FleetTree.StripChoice choice = new FleetTree.StripChoice(saved);
-        assertTrue(choice.showsGroup("hm", strip));
-        choice.toggle("hm");
-        assertFalse(choice.showsGroup("hm", strip));
-        assertTrue("another space keeps its own choice", choice.showsGroup("other", strip));
+        assertTrue(choice.showsGroup("laptop", "hm", strip));
+        choice.toggle("laptop", "hm");
+        assertFalse(choice.showsGroup("laptop", "hm", strip));
+        assertTrue("another space keeps its own choice", choice.showsGroup("laptop", "other", strip));
+        // The same space id on another machine keeps its own, independent choice.
+        assertTrue(choice.showsGroup("server", "hm", strip));
+        choice.toggle("server", "hm");
+        choice.toggle("server", "hm");
+        assertTrue(choice.showsGroup("server", "hm", strip));
+        assertFalse(choice.showsGroup("laptop", "hm", strip));
         // A refresh (a new strip, the persisted set read again) keeps the choice.
         FleetTree.StripChoice reread = new FleetTree.StripChoice(new HashSet<>(saved));
-        assertFalse(reread.showsGroup("hm", FleetTree.stripFor(fleet, focus, true)));
-        reread.toggle("hm");
-        assertTrue(reread.showsGroup("hm", FleetTree.stripFor(fleet, focus, true)));
+        assertFalse(reread.showsGroup("laptop", "hm", FleetTree.stripFor(fleet, focus, true)));
+        reread.toggle("laptop", "hm");
+        assertTrue(reread.showsGroup("laptop", "hm", FleetTree.stripFor(fleet, focus, true)));
         assertEquals("t6m", focus);
         assertEquals(Arrays.asList("t67", "t6m"), stripIds(FleetTree.stripFor(fleet, focus, true)));
         // No role context: the space's tabs, whatever the choice.
-        assertFalse(reread.showsGroup("hm", null));
+        assertFalse(reread.showsGroup("laptop", "hm", null));
+    }
+
+    @Test public void theStripNeverLetsARemoteTerminalInOrLead() {
+        FleetTree.GitLook none = null;
+        FleetTree.Member deacon = label(m("t6k", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member localPm = label(m("t67", "hm", "home-manager", 1, 1, "/c/hm", "working"), "pm", "home-manager");
+        FleetTree.Member remotePm = label(m("server/t5t", "b", "botd", 1, 0, "/c", "idle"), "pm", "botd");
+        // A local Deacon plus a remote PM: the remote PM is never listed.
+        assertEquals(Arrays.asList("t6k", "t67"),
+                stripIds(FleetTree.stripFor(Arrays.asList(deacon, localPm, remotePm), none, "t6k", true)));
+        // A local worker whose parent is a remote PM cannot take it as its lead.
+        FleetTree.Member worker = label(m("t5h", "b", "botd", 1, 2, "/w/botd", "working"), "worker", "botd");
+        worker.parent = "server/t5t";
+        assertNull(FleetTree.stripFor(Arrays.asList(deacon, remotePm, worker), none, "t5h", true));
+        // A same-named project on a remote machine stays apart: the local PM leads, alone with its own.
+        FleetTree.Member remoteSame = label(m("server/t70", "hm", "home-manager", 0, 0, "/c/hm", "idle"), "pm", "home-manager");
+        remoteSame.createdMs = 1;
+        FleetTree.Member remoteWorker = label(m("server/t71", "hm", "home-manager", 0, 1, "/c/hm", "working"), "worker", "home-manager");
+        FleetTree.Member localWorker = label(m("t6m", "hm", "home-manager", 1, 2, "/wt/f", "working"), "worker", "home-manager");
+        localWorker.parent = "t67";
+        assertEquals(Arrays.asList("t67", "t6m"), stripIds(FleetTree.stripFor(
+                Arrays.asList(remoteSame, remoteWorker, localPm, localWorker), none, "t6m", true)));
     }
 
     @Test public void anOfflineComputersCachedGroupIsUnavailable() {

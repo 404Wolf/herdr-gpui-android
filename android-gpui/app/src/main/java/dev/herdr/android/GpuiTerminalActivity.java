@@ -1903,9 +1903,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         updateCrumb(current, space);
         java.util.List<FleetTree.Member> fleetMembers = FleetPanes.members(current.workspaces, current.tabs,
                 current.panes, FleetTree.Member::new);
-        FleetTree.Strip roleStrip = FleetTree.stripFor(FleetTree.build(fleetMembers,
-                FleetPanes.LOOKS.get(currentHostId)), current.paneId, current.ready);
-        if (stripChoice().showsGroup(space, roleStrip)) {
+        FleetTree.Strip roleStrip = FleetTree.stripFor(fleetMembers, FleetPanes.LOOKS.get(currentHostId),
+                current.paneId, current.ready);
+        if (stripChoice().showsGroup(currentHostId, space, roleStrip)) {
             showRoleStrip(current, roleStrip, space);
             return;
         }
@@ -2039,7 +2039,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Switches this space's strip between the role group and its own tabs; focus is untouched. */
     private void toggleStrip(String space) {
-        stripChoice().toggle(space);
+        stripChoice().toggle(currentHostId, space);
         getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
                 .putStringSet("strip_tabs", new java.util.HashSet<>(stripChoice().physical)).apply();
         tabSignature = "";

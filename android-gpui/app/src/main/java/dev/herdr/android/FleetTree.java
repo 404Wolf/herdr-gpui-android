@@ -869,6 +869,19 @@ final class FleetTree {
     }
 
     /**
+     * The strip from this computer's terminals: anything another machine
+     * reports through federation ("machine/tN") is dropped BEFORE the Deacon
+     * or project is resolved, so a remote PM can never lead a local group or
+     * join the Deacon's list, and a same-named remote project stays apart.
+     * (The Fleet tree itself is unchanged.)
+     */
+    static Strip stripFor(List<? extends Member> members, GitLook git, String focusId, boolean connected) {
+        List<Member> local = new ArrayList<>();
+        for (Member m : members) if (!m.id.contains("/")) local.add(m);
+        return stripFor(build(local, git), focusId, connected);
+    }
+
+    /**
      * As {@link #stripFor(Fleet, String)}, for a computer that may be offline:
      * then its list is a cached view and no group is offered. Only this
      * computer's own terminals ever join a group (never "machine/tN").
@@ -879,12 +892,12 @@ final class FleetTree {
             Strip strip = new Strip("deacon", "Deacon");
             strip.items.add(stripItem(fleet.deacon, "deacon"));
             for (Project p : fleet.projects) {
-                if (p.pm != null && "pm".equals(p.pm.role)) strip.items.add(stripItem(p.pm, "pm"));
+                if (p.pm != null && "pm".equals(p.pm.role) && !p.pm.id.contains("/")) strip.items.add(stripItem(p.pm, "pm"));
             }
             return strip;
         }
         Project project = projectOf(fleet, focusId);
-        if (project == null || project.pm == null || !"pm".equals(project.pm.role)) return null;
+        if (project == null || project.pm == null || !"pm".equals(project.pm.role) || project.pm.id.contains("/")) return null;
         List<Member> members = new ArrayList<>();
         for (SpaceNode row : project.entries) {
             for (Member m : row.members) if (m != project.pm && !m.id.contains("/")) members.add(m);
@@ -917,12 +930,18 @@ final class FleetTree {
         final Set<String> physical;
         StripChoice(Set<String> physical) { this.physical = physical; }
 
-        boolean showsGroup(String space, Strip strip) {
-            return strip != null && !physical.contains(space);
+        /** Keyed by computer and space: two machines' spaces with one id never share a choice. */
+        static String key(String host, String space) {
+            return (host == null ? "" : host) + "\n" + space;
         }
 
-        void toggle(String space) {
-            if (!physical.remove(space)) physical.add(space);
+        boolean showsGroup(String host, String space, Strip strip) {
+            return strip != null && !physical.contains(key(host, space));
+        }
+
+        void toggle(String host, String space) {
+            String key = key(host, space);
+            if (!physical.remove(key)) physical.add(key);
         }
     }
 
