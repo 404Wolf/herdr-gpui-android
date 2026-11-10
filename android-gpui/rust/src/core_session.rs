@@ -1542,6 +1542,28 @@ mod tests {
 
     use super::*;
     #[test]
+    fn an_attach_reply_resize_and_data_in_one_read_come_out_in_order() -> Result<()> {
+        // A negotiated attach: the reply on channel 0, the initial RESIZE at
+        // byte 0 of channel 5, then its first paint, all in one read.
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, 0, 0, br#"{"id":4,"result":{"channel":5}}"#)?;
+        let mut size = Vec::from(100u16.to_le_bytes());
+        size.extend(30u16.to_le_bytes());
+        write_frame(&mut bytes, 5, 3, &size)?;
+        write_frame(&mut bytes, 5, 0, b"paint")?;
+        let mut decoder = Decoder::default();
+        decoder.bytes.extend_from_slice(&bytes);
+        let reply = decoder.next()?.map(|f| (f.channel, f.kind));
+        // What the call() that read the reply leaves behind stays buffered, in order.
+        assert_eq!(reply, Some((0, 0)));
+        let resize = decoder.next()?;
+        assert_eq!(resize.as_ref().map(|f| (f.channel, f.kind)), Some((5, 3)));
+        assert_eq!(resize.and_then(|f| resize_frame(&f.bytes)), Some((100, 30)));
+        assert_eq!(decoder.next()?.map(|f| (f.channel, f.kind, f.bytes)), Some((5, 0, b"paint".to_vec())));
+        assert_eq!(decoder.next()?, None);
+        Ok(())
+    }
+    #[test]
     fn fragmented_and_coalesced_frames_survive_idle_reads() -> Result<()> {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, 7, 0, b"hello")?;
@@ -1769,6 +1791,97 @@ mod connection_tests {
         events.recv_timeout(Duration::from_secs(5)).unwrap();
         let terminal = lock(&owner.state).terminal.clone().unwrap();
         assert!(terminal.type_text("x"));
+        events.recv_timeout(Duration::from_secs(5)).unwrap();
+        owner.cancel.cancel();
+        assert!(runtime.join().unwrap().is_ok());
+        peer.join().unwrap();
+    }
+    #[test]
+    fn a_coalesced_attach_reply_initial_resize_and_paint_are_all_applied_without_echo() {
+        let (phone, mut core) = UnixStream::pair().unwrap();
+        core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let (commands, rx) = mpsc::sync_channel(256);
+        let owner = Arc::new(Session {
+            state: Mutex::new(State {
+                view: json!({"revision":0,"panes":[]}),
+                terminal: None,
+                render_id: 0,
+            }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(None),
+        });
+        let worker = owner.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
+        let (observed, events) = mpsc::sync_channel(2);
+        let peer = std::thread::spawn(move || {
+            let mut hello = String::new();
+            io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
+            let mut decoder = Decoder::default();
+            for expected in ["events.subscribe", "terminal.list", "doc.get", "terminal.attach"] {
+                let request: Value = serde_json::from_slice(&frame(&mut core, &mut decoder).bytes).unwrap();
+                assert_eq!(request["method"], expected);
+                let result = match expected {
+                    "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                    "terminal.list" => json!({"terminals":[{"address":"t1","state":"live","labels":{},"cwd":"/tmp"}]}),
+                    "doc.get" => json!({"value":null,"version":0}),
+                    _ => {
+                        assert_eq!(request["params"]["resize_notifications"], true);
+                        json!({"channel":2,"resize_notifications":true,"terminal":{"cols":100,"rows":30}})
+                    }
+                };
+                let mut bytes = Vec::new();
+                write_frame(&mut bytes, 0, 0,
+                    &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap()).unwrap();
+                if expected == "terminal.attach" {
+                    // The initial RESIZE (always sent, even at the same size) and the
+                    // first paint, coalesced with the reply into ONE write.
+                    let mut size = Vec::from(100u16.to_le_bytes());
+                    size.extend(30u16.to_le_bytes());
+                    write_frame(&mut bytes, 2, 3, &size).unwrap();
+                    write_frame(&mut bytes, 2, 0, b"hello core\r\n").unwrap();
+                }
+                core.write_all(&bytes).unwrap();
+            }
+            // The paint arrived (it is credited), and the phone sent no RESIZE back.
+            let credit = frame(&mut core, &mut decoder);
+            assert_eq!((credit.channel, credit.kind), (2, 1));
+            assert_eq!(credit.bytes, 12u32.to_le_bytes());
+            observed.send(()).unwrap();
+            let until = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < until {
+                let mut bytes = [0; 4096];
+                match core.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                    Err(_) => {}
+                }
+                while let Some(frame) = decoder.next().unwrap() {
+                    assert_ne!(frame.kind, 3, "the phone echoed a resize");
+                }
+            }
+            observed.send(()).unwrap();
+            // Stay connected until the phone closes, as a core would.
+            let mut byte = [0];
+            loop {
+                match core.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        events.recv_timeout(Duration::from_secs(5)).unwrap();
+        let terminal = lock(&owner.state).terminal.clone().unwrap();
+        assert!(terminal.negotiated());
+        assert_eq!(terminal.grid_size(), (100, 30));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !terminal.screen_text().contains("hello core") {
+            assert!(Instant::now() < deadline, "the coalesced paint was lost");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         events.recv_timeout(Duration::from_secs(5)).unwrap();
         owner.cancel.cancel();
         assert!(runtime.join().unwrap().is_ok());
