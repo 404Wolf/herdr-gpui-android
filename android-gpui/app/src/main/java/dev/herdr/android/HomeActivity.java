@@ -69,16 +69,24 @@ public final class HomeActivity extends Activity {
         String state = "connecting";
         String status = "";
         JSONObject view;
+        /** The machine's git look (FleetTree.parseGitLook), when it was asked, and what. */
+        FleetTree.GitLook git;
+        long gitAt;
+        boolean gitBusy;
+        Set<String> gitAsked = new HashSet<>();
+        /** Start Deacon / New project / opening a worktree: in flight, and the last error. */
+        boolean deaconBusy, projectBusy;
+        String deaconError = "", projectError = "";
+        final Set<String> opening = new HashSet<>();
+        /** Bumped whenever any of the above changes, so the tree redraws. */
+        int ui;
     }
 
     /** One agent (terminal) as the tree and the picker show it. */
-    private static final class Agent {
+    static final class Agent extends FleetTree.Member {
         Machine machine;
-        String id, title, status, space, spaceLabel, parent, role, project, kind, cwd;
-        /** The program's own status message, and what it waits for when blocked. */
-        String msg, waitKind;
-        /** When the status last changed, on the core's clock (0: unknown). */
-        long statusMs;
+        /** The space's name as shown (spaceName is herdr's own, maybe empty). */
+        String spaceLabel = "";
         int depth;
         /** Tree guide in front of the row: "│  ├ ", "└ ", nothing at the top. */
         String guide = "";
@@ -89,10 +97,12 @@ public final class HomeActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newFixedThreadPool(4);
     private final Map<String, Machine> machines = new LinkedHashMap<>();
+    /** Folded rows (and "open:" rows that start folded), kept across launches. */
     private final Set<String> collapsed = new HashSet<>();
-    /** Spaces whose idle and finished agents Wolf asked to see on a busy machine. */
-    private final Set<String> expandedQuiet = new HashSet<>();
-    private static final int BUSY_MACHINE = 30;
+    /** Git looks: at most every GIT_MS per machine, sooner (GIT_NEW_MS) for a new folder. */
+    private static final long GIT_MS = 300_000, GIT_NEW_MS = 15_000;
+    /** A Start Deacon in flight blocks another for this long, across launches. */
+    private static final long DEACON_GUARD_MS = 90_000;
     private RemoteHostStore store;
     private RemoteIdentityStore identityStore;
     private GpuiChrome chrome;
@@ -125,6 +135,11 @@ public final class HomeActivity extends Activity {
         boolean dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                 == Configuration.UI_MODE_NIGHT_YES;
         chrome = GpuiChrome.load(GpuiDisplayOptions.palette(theme, dark));
+        try {
+            collapsed.addAll(getSharedPreferences("home", MODE_PRIVATE).getStringSet("folds", Collections.emptySet()));
+        } catch (RuntimeException unreadable) {
+            // Folds start open.
+        }
         // "Reopen the last session at launch" (Hosts): a fresh launch goes back to
         // the remembered agent once its machine is connected, if it still exists.
         if (state == null && RemoteHostsActivity.reopenEnabled(this)) {
@@ -350,9 +365,23 @@ public final class HomeActivity extends Activity {
         JSONArray panes = machine.view.optJSONArray("panes");
         JSONArray workspaces = machine.view.optJSONArray("workspaces");
         Map<String, String> labels = new HashMap<>();
+        Map<String, Integer> spaceIndex = new HashMap<>();
         for (int i = 0; workspaces != null && i < workspaces.length(); i++) {
             JSONObject space = workspaces.optJSONObject(i);
-            if (space != null) labels.put(space.optString("id"), space.optString("label", space.optString("id")));
+            if (space == null) continue;
+            labels.put(space.optString("id"), space.optString("label", ""));
+            spaceIndex.put(space.optString("id"), i);
+        }
+        // Tab order within each space: the PM fallback is the first tab's agent.
+        Map<String, Integer> tabIndex = new HashMap<>();
+        JSONArray tabs = machine.view.optJSONArray("tabs");
+        Map<String, Integer> perSpace = new HashMap<>();
+        for (int i = 0; tabs != null && i < tabs.length(); i++) {
+            JSONObject tab = tabs.optJSONObject(i);
+            if (tab == null) continue;
+            String space = tab.optString("workspace_id");
+            int at = perSpace.merge(space, 1, Integer::sum) - 1;
+            tabIndex.put(space + "\n" + tab.optString("id"), at);
         }
         Map<String, List<Agent>> flat = new LinkedHashMap<>();
         for (int i = 0; panes != null && i < Math.min(panes.length(), 1024); i++) {
@@ -369,8 +398,17 @@ public final class HomeActivity extends Activity {
             agent.title = cleanTitle(GpuiTerminalProtocol.title(pane.optString("title", agent.id)), agent.id);
             agent.status = pane.optString("status", "");
             agent.space = pane.optString("workspace_id", "loose");
-            agent.spaceLabel = labels.containsKey(agent.space) ? labels.get(agent.space) : agent.space;
-            if (agent.spaceLabel == null || agent.spaceLabel.trim().isEmpty()) agent.spaceLabel = "Other terminals";
+            agent.spaceName = labels.containsKey(agent.space) ? labels.get(agent.space).trim() : "";
+            agent.spaceLabel = agent.spaceName;
+            String cwd = pane.optString("cwd", "");
+            if (agent.spaceLabel.isEmpty() && !"loose".equals(agent.space) && !cwd.isEmpty()) {
+                agent.spaceLabel = FleetTree.lastSegment(cwd);
+            }
+            if (agent.spaceLabel.isEmpty()) agent.spaceLabel = "Other terminals";
+            agent.tab = pane.optString("tab_id", "");
+            agent.spaceIndex = spaceIndex.getOrDefault(agent.space, Integer.MAX_VALUE);
+            agent.tabIndex = tabIndex.getOrDefault(agent.space + "\n" + agent.tab, Integer.MAX_VALUE);
+            agent.createdMs = pane.optLong("created_ms", 0);
             agent.parent = pane.optString("parent", "");
             agent.role = pane.optString("role", "");
             agent.project = pane.optString("project", "");
@@ -640,7 +678,7 @@ public final class HomeActivity extends Activity {
     private void render(boolean force) {
         if (tree == null || destroyed) return;
         long now = System.currentTimeMillis();
-        StringBuilder key = new StringBuilder(String.valueOf(collapsed)).append(expandedQuiet).append(note);
+        StringBuilder key = new StringBuilder(String.valueOf(collapsed)).append(note);
         // Working agents rewrite their message as they go; like their spinner
         // titles, rebuilding for each would flicker and drop taps, so those
         // messages alone refresh the tree at most every CHATTER_MS.
@@ -649,13 +687,15 @@ public final class HomeActivity extends Activity {
         // themselves with spinner glyphs many times a second, and rebuilding
         // the whole tree for each made it flicker and dropped taps.
         for (Machine machine : machines.values()) {
-            key.append(machine.host.id).append(machine.state).append(machine.status).append('\n');
+            key.append(machine.host.id).append(machine.state).append(machine.status).append(machine.ui)
+                    .append(machine.git == null ? 0 : System.identityHashCode(machine.git)).append('\n');
             for (Map.Entry<String, List<Agent>> space : spaces(machine).entrySet()) {
                 key.append(space.getKey()).append('\n');
                 for (Agent agent : space.getValue()) {
                     key.append(agent.id).append('\t').append(agent.title).append('\t').append(agent.status)
                             .append('\t').append(agent.depth).append('\t').append(agent.role)
-                            .append('\t').append(agent.kind).append('\t').append(agent.guide)
+                            .append('\t').append(agent.kind).append('\t').append(agent.project)
+                            .append('\t').append(agent.parent).append('\t').append(agent.cwd)
                             .append('\t').append(agent.waitKind).append('\t').append(age(agent.statusMs, now))
                             .append('\t').append("working".equals(agent.status) ? "" : agent.msg).append('\n');
                     if ("working".equals(agent.status)) messages.append(agent.id).append(agent.msg).append('\n');
@@ -711,42 +751,68 @@ public final class HomeActivity extends Activity {
         return TextUtils.join(" · ", parts);
     }
 
+    /** Every terminal of a machine, flat, in space/tab order. */
+    private static List<Agent> members(Machine machine) {
+        List<Agent> all = new ArrayList<>();
+        for (List<Agent> list : spaces(machine).values()) all.addAll(list);
+        return all;
+    }
+
+    /**
+     * One machine: its header (fold, status, Deacon / Start Deacon), then the
+     * Fleet tree of the desktop's contract: the Deacon, each project once
+     * with its PM, main and worktree rows (open ones live, closed ones dim)
+     * and their agents nested by parent, then Spaces, Other agents and New
+     * project. Built from this machine's own core only.
+     */
     private void renderMachine(Machine machine) {
-        Map<String, List<Agent>> spaces = spaces(machine);
-        int agents = 0;
-        for (List<Agent> list : spaces.values()) agents += list.size();
+        List<Agent> all = members(machine);
+        FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
+        boolean ready = "ready".equals(machine.state);
         boolean closed = collapsed.contains(machine.host.id);
+        if (fleet.deacon != null && deaconGuard(machine) > 0) clearDeaconGuard(machine);
+        maybeLookGit(machine, all, ready, closed);
+
         LinearLayout row = row();
         row.setPadding(dp(4), dp(7), dp(4), dp(3));
         row.addView(dot(machineColor(machine)));
         TextView name = text(machine.host.name, 14, chrome.onSurface);
         name.setTypeface(Typeface.DEFAULT_BOLD);
         row.addView(name);
-        int waiting = 0, working = 0;
-        for (List<Agent> list : spaces.values()) {
-            for (Agent agent : list) {
-                if (statusPriority(agent.status) <= 1) waiting++;
-                if ("working".equals(agent.status)) working++;
-            }
+        int waiting = 0, working = 0, agents = 0;
+        for (Agent agent : all) {
+            if (!agent.isAgent()) continue;
+            agents++;
+            if (statusPriority(agent.status) <= 1) waiting++;
+            if ("working".equals(agent.status)) working++;
         }
-        String detail = "ready".equals(machine.state)
-                ? agents + (agents == 1 ? " terminal" : " terminals")
+        String detail = ready
+                ? agents + (agents == 1 ? " agent" : " agents")
                         + (working > 0 ? " · " + working + " working" : "")
                         + (waiting > 0 ? " · " + waiting + " waiting" : "")
-                : machine.status;
+                : machine.status.isEmpty() ? "offline" : machine.status;
         TextView meta = text("  " + (closed ? "▸ " : "") + detail, 11, chrome.onSurfaceVariant);
         meta.setSingleLine(true);
         meta.setEllipsize(TextUtils.TruncateAt.END);
         row.addView(meta, new LinearLayout.LayoutParams(0, -2, 1));
+        // The machine's one Deacon, a tap away; or the way to start it.
+        switch (FleetTree.deaconAction(ready, fleet.deacon, machine.deaconBusy || deaconGuard(machine) > 0)) {
+            case OPEN: row.addView(chip("Deacon", true, () -> openAgent((Agent) fleet.deacon))); break;
+            case START: row.addView(chip("Start Deacon", true, () -> startDeacon(machine))); break;
+            case STARTING: row.addView(chip("Starting…", false, null)); break;
+            default: break;
+        }
         row.setOnClickListener(v -> {
-            if (!collapsed.remove(machine.host.id)) collapsed.add(machine.host.id);
+            toggleFold(machine.host.id, false);
             if ("closed".equals(machine.state) && machine.handle <= 0 && !machine.connecting) connect(machine);
-            render(true);
         });
-        row.setContentDescription(machine.host.name + ", " + detail);
+        row.setContentDescription(machine.host.name + ", " + detail
+                + (fleet.deacon != null ? ", has a Deacon" : ready ? ", no Deacon" : ""));
         row.setOnLongClickListener(v -> {
-            new ActionSheet(this, chrome, machine.host.name)
-                    .add("Reconnect", () -> {
+            ActionSheet sheet = new ActionSheet(this, chrome, machine.host.name);
+            if (fleet.deacon != null) sheet.add("Open the Deacon", () -> openAgent((Agent) fleet.deacon));
+            else if (ready) sheet.add("Start Deacon", () -> startDeacon(machine));
+            sheet.add("Reconnect", () -> {
                         if (machine.handle > 0) RemoteNative.close(machine.handle);
                         machine.handle = 0;
                         if (!machine.connecting) connect(machine);
@@ -758,64 +824,280 @@ public final class HomeActivity extends Activity {
         });
         tree.addView(row);
         if (closed) return;
-        for (Map.Entry<String, List<Agent>> space : spaces.entrySet()) {
-            List<Agent> list = space.getValue();
-            if (list.isEmpty()) continue;
-            String spaceKey = machine.host.id + "/" + space.getKey();
-            boolean spaceClosed = collapsed.contains(spaceKey);
-            LinearLayout header = row();
-            header.setPadding(dp(14), dp(4), dp(4), dp(1));
-            TextView label = text((spaceClosed ? "▸ " : "") + list.get(0).spaceLabel, 12, chrome.primary);
-            label.setSingleLine(true);
-            label.setEllipsize(TextUtils.TruncateAt.END);
-            header.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
-            header.addView(text(statusCounts(list), 10, chrome.onSurfaceVariant));
-            header.setOnClickListener(v -> {
-                if (!collapsed.remove(spaceKey)) collapsed.add(spaceKey);
-                render(true);
-            });
-            tree.addView(header);
-            if (spaceClosed) continue;
-            // On a busy machine the quiet agents fold into one row per space, so
-            // what is waiting or working stands out; the hierarchy's managers stay.
-            boolean fold = agents > BUSY_MACHINE && !expandedQuiet.contains(spaceKey);
-            int quiet = 0;
-            // A folded deacon or manager hides its reports; its row keeps their counts.
-            int foldedAt = -1;
-            for (Agent agent : list) {
-                if (foldedAt >= 0 && agent.depth > foldedAt) continue;
-                foldedAt = collapsed.contains(subtreeKey(agent)) && agent.below > 0 ? agent.depth : -1;
-                boolean anchor = "deacon".equals(agent.role) || "pm".equals(agent.role) || agent.below > 0;
-                if (fold && statusPriority(agent.status) > 2 && !anchor) { quiet++; continue; }
-                tree.addView(agentRow(agent, true));
-            }
-            if (quiet > 0) {
-                LinearLayout more = row();
-                more.setPadding(dp(20), dp(2), dp(4), dp(2));
-                more.setMinimumHeight(dp(24));
-                more.addView(text("+" + quiet + " idle", 11, chrome.onSurfaceVariant));
-                more.setContentDescription("Show " + quiet + " idle or finished agents in " + list.get(0).spaceLabel);
-                more.setOnClickListener(v -> { expandedQuiet.add(spaceKey); render(true); });
-                tree.addView(more);
-            }
-        }
+
+        LinearLayout body = column();
+        // Offline: what was last seen stays, dimmed; nothing can be started there.
+        if (!ready) body.setAlpha(0.5f);
+        for (Row top : fleetRows(machine, fleet, ready)) emit(body, top, "", true, 0);
+        tree.addView(body);
     }
 
-    private String statusCounts(List<Agent> agents) {
-        int working = 0, waiting = 0;
-        for (Agent agent : agents) {
-            if ("working".equals(agent.status)) working++;
-            if ("blocked".equals(agent.status) || "error".equals(agent.status)) waiting++;
+    /** One row of the tree and the rows it folds. */
+    private static final class Row {
+        java.util.function.BiFunction<String, Row, View> view;
+        final List<Row> kids = new ArrayList<>();
+        /** Fold key, or null when it cannot fold; folded by default flips the key's meaning. */
+        String fold;
+        boolean foldedByDefault;
+        Row(java.util.function.BiFunction<String, Row, View> view) { this.view = view; }
+    }
+
+    private boolean folded(Row row) {
+        if (row.fold == null || row.kids.isEmpty()) return false;
+        return row.foldedByDefault ? !collapsed.contains("open:" + row.fold) : collapsed.contains(row.fold);
+    }
+
+    private void toggleFold(String key, boolean foldedByDefault) {
+        String stored = foldedByDefault ? "open:" + key : key;
+        if (!collapsed.remove(stored)) collapsed.add(stored);
+        try {
+            getSharedPreferences("home", MODE_PRIVATE).edit().putStringSet("folds", new HashSet<>(collapsed)).apply();
+        } catch (RuntimeException ignored) {
+            // Folds are a convenience; the tree still works without storage.
         }
+        render(true);
+    }
+
+    /** Draws a row with its tree guide, then its children unless folded. */
+    private void emit(LinearLayout into, Row row, String prefix, boolean last, int depth) {
+        String guide = depth == 0 ? "" : prefix + (last ? "└ " : "├ ");
+        into.addView(row.view.apply(guide, row));
+        if (folded(row)) return;
+        String next = depth == 0 ? "" : prefix + (last ? "   " : "│  ");
+        for (int i = 0; i < row.kids.size(); i++) emit(into, row.kids.get(i), next, i == row.kids.size() - 1, depth + 1);
+    }
+
+    private List<Row> fleetRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
+        String m = machine.host.id;
+        List<Row> rows = new ArrayList<>();
+        Row top;
+        if (fleet.deacon != null) {
+            Agent deacon = (Agent) fleet.deacon;
+            top = new Row((guide, self) -> agentLine(guide, deacon, "deacon", null));
+            for (FleetTree.Member helper : fleet.helpers) top.kids.add(agentTree(m, new FleetTree.AgentNode(helper), null));
+            rows.add(top);
+        } else {
+            boolean busy = machine.deaconBusy || deaconGuard(machine) > 0;
+            String said = !ready ? "No Deacon. Connect this computer to start one."
+                    : busy ? "Starting the Deacon…"
+                    : machine.deaconError.isEmpty() ? "No Deacon on this computer. Tap to start one."
+                    : "Could not start the Deacon: " + machine.deaconError + ". Tap to try again.";
+            top = new Row((guide, self) -> actionLine(guide, null, "◆", said, !machine.deaconError.isEmpty() ? chrome.danger
+                    : chrome.onSurfaceVariant, ready && !busy ? () -> startDeacon(machine) : null));
+            rows.add(top);
+        }
+        // Projects live under the Deacon when there is one, at the top otherwise.
+        List<Row> under = fleet.deacon != null ? top.kids : rows;
+        for (FleetTree.Project project : fleet.projects) under.add(projectRow(machine, project));
+        if (!fleet.loose.isEmpty()) {
+            Row spaces = new Row((guide, self) -> groupLine(guide, self, "Spaces", fleet.loose.size() + ""));
+            spaces.fold = m + "/spaces";
+            spaces.foldedByDefault = true;
+            for (FleetTree.SpaceNode node : fleet.loose) spaces.kids.add(spaceRow(machine, node, null));
+            under.add(spaces);
+        }
+        if (!fleet.others.isEmpty()) {
+            Row others = new Row((guide, self) -> groupLine(guide, self, "Other agents", fleet.others.size() + ""));
+            others.fold = m + "/others";
+            for (FleetTree.Member other : fleet.others) {
+                Agent agent = (Agent) other;
+                String tag = "deacon".equals(agent.role) ? "another deacon" : roleTag(agent);
+                others.kids.add(new Row((guide, self) -> agentLine(guide, agent, tag, null)));
+            }
+            under.add(others);
+        }
+        if (FleetTree.newProjectTarget(fleet) != null) {
+            Agent deacon = (Agent) FleetTree.newProjectTarget(fleet);
+            String said = machine.projectBusy ? "Asking the Deacon…"
+                    : machine.projectError.isEmpty() ? "New project"
+                    : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
+            under.add(new Row((guide, self) -> actionLine(guide, null, "+", said,
+                    machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
+                    ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null)));
+        }
+        return rows;
+    }
+
+    private Row projectRow(Machine machine, FleetTree.Project project) {
+        String key = machine.host.id + "/p/" + project.name;
+        String tally = tally(project.tally);
+        Row row;
+        if (project.pm != null) {
+            Agent pm = (Agent) project.pm;
+            String tag = "pm · " + project.name + (tally.isEmpty() ? "" : "  " + tally);
+            row = new Row((guide, self) -> agentLine(guide, pm, tag, self));
+        } else {
+            row = new Row((guide, self) -> actionLine(guide, self, "●", project.name + " · no project manager"
+                    + (tally.isEmpty() ? "" : "  " + tally), chrome.onSurfaceVariant, () -> askForManager(machine, project)));
+        }
+        row.fold = key;
+        // Quiet big projects start folded; anything waiting on Wolf stays open.
+        row.foldedByDefault = project.agents() > 6 && project.tally[0] == 0;
+        boolean flat = project.entries.size() == 1 && project.pm != null
+                && project.entries.get(0).spaces.contains(project.pm.space);
+        for (FleetTree.SpaceNode entry : project.entries) {
+            if (flat) {
+                for (FleetTree.AgentNode node : entry.agents) row.kids.add(agentTree(machine.host.id, node, null));
+            } else {
+                row.kids.add(spaceRow(machine, entry, project));
+            }
+        }
+        for (FleetTree.GitWorktree wt : project.closed) row.kids.add(closedRow(machine, wt));
+        if (project.closedMore > 0) {
+            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "○", "+" + project.closedMore + " more worktrees",
+                    chrome.onSurfaceVariant, null)));
+        }
+        return row;
+    }
+
+    /** A main checkout or worktree with its agents; every space at that checkout is one row. */
+    private Row spaceRow(Machine machine, FleetTree.SpaceNode node, FleetTree.Project project) {
+        String key = machine.host.id + "/s/" + node.key;
+        Agent first = null;
+        int[] tally = new int[4];
+        int worst = 5;
+        for (FleetTree.Member member : node.members) {
+            if (first == null) first = (Agent) member;
+            worst = Math.min(worst, statusPriority(member.status));
+            switch (member.status) {
+                case "blocked": case "error": tally[0]++; break;
+                case "done": tally[1]++; break;
+                case "working": tally[2]++; break;
+                case "idle": tally[3]++; break;
+                default: break;
+            }
+        }
+        final Agent open = first;
+        final String worstStatus = worst == 0 ? "blocked" : worst == 1 ? "error" : worst == 2 ? "working"
+                : worst == 3 ? "idle" : worst == 4 ? "done" : "";
+        String sub = (!node.branch.isEmpty() && !node.branch.equals(node.name) ? node.branch : "")
+                + (node.spaces.size() > 1 ? (node.branch.isEmpty() || node.branch.equals(node.name) ? "" : " · ")
+                        + node.spaces.size() + " spaces" : "");
+        String mark = node.worktree ? "⑂ " : "";
+        Row row = new Row((guide, self) -> {
+            LinearLayout line = treeLine(guide, self);
+            line.addView(dot(statusColor(worstStatus)));
+            LinearLayout lines = column();
+            lines.addView(single(text(mark + node.name, 12, chrome.primary)));
+            if (!sub.isEmpty()) lines.addView(single(text(sub, 10, chrome.onSurfaceVariant)));
+            line.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
+            String counts = tally(tally);
+            if (!counts.isEmpty()) line.addView(tag(counts, chrome.onSurfaceVariant));
+            line.setContentDescription((node.worktree ? "Worktree " : "Checkout ") + node.name
+                    + (sub.isEmpty() ? "" : ", " + sub) + ", " + node.members.size() + " terminals");
+            if (open != null) line.setOnClickListener(v -> openAgent(open));
+            return line;
+        });
+        row.fold = key;
+        row.foldedByDefault = node.members.size() > 6 && tally[0] == 0;
+        for (FleetTree.AgentNode agent : node.agents) row.kids.add(agentTree(machine.host.id, agent, null));
+        return row;
+    }
+
+    /** A worktree no space has open: dim; a tap opens a shell space there. */
+    private Row closedRow(Machine machine, FleetTree.GitWorktree wt) {
+        String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
+        boolean busy = machine.opening.contains(wt.path);
+        return new Row((guide, self) -> {
+            View line = actionLine(guide, null, "○", busy ? name + " · opening…" : name, chrome.onSurfaceVariant,
+                    busy || !"ready".equals(machine.state) ? null : () -> openWorktree(machine, wt.path));
+            line.setContentDescription("Worktree " + name + ", not open. Open a space there.");
+            return line;
+        });
+    }
+
+    private Row agentTree(String machineId, FleetTree.AgentNode node, String tagOverride) {
+        Agent agent = (Agent) node.member;
+        String key = machineId + "/a/" + agent.id;
+        Row row = new Row((guide, self) -> agentLine(guide, agent, tagOverride != null ? tagOverride : roleTag(agent), self));
+        row.fold = key;
+        for (FleetTree.AgentNode kid : node.children) row.kids.add(agentTree(machineId, kid, null));
+        return row;
+    }
+
+    /** "1! 2✓ 3▶" over blocked, done, working; idle is the rest. */
+    private static String tally(int[] n) {
         List<String> parts = new ArrayList<>();
-        if (waiting > 0) parts.add(waiting + "!");
-        if (working > 0) parts.add(working + "▶");
-        parts.add(String.valueOf(agents.size()));
+        if (n[0] > 0) parts.add(n[0] + "!");
+        if (n[1] > 0) parts.add(n[1] + "✓");
+        if (n[2] > 0) parts.add(n[2] + "▶");
         return TextUtils.join(" ", parts);
     }
 
-    private static String subtreeKey(Agent agent) {
-        return "agent:" + agent.machine.host.id + "/" + agent.id;
+    /** A tree row: guide lines, then ▾/▸ when it folds something (its own tap target). */
+    private LinearLayout treeLine(String guide, Row fold) {
+        LinearLayout row = row();
+        row.setPadding(dp(14), dp(2), dp(4), dp(2));
+        row.setMinimumHeight(dp(26));
+        if (!guide.isEmpty()) {
+            TextView lines = text(guide, 12, GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x80));
+            lines.setTypeface(Typeface.MONOSPACE);
+            lines.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            row.addView(lines);
+        }
+        if (fold != null && fold.fold != null && !fold.kids.isEmpty()) {
+            boolean folded = folded(fold);
+            TextView toggle = text(folded ? "▸" : "▾", 12, chrome.onSurfaceVariant);
+            toggle.setGravity(Gravity.CENTER);
+            toggle.setMinWidth(dp(18));
+            toggle.setMinHeight(dp(24));
+            toggle.setContentDescription((folded ? "Show " : "Hide ") + fold.kids.size() + " rows under it");
+            toggle.setOnClickListener(v -> toggleFold(fold.fold, fold.foldedByDefault));
+            row.addView(toggle);
+        }
+        return row;
+    }
+
+    private TextView single(TextView view) {
+        view.setSingleLine(true);
+        view.setEllipsize(TextUtils.TruncateAt.END);
+        return view;
+    }
+
+    private TextView tag(String value, int color) {
+        TextView meta = text(value, 10, color);
+        meta.setPadding(dp(6), 0, 0, 0);
+        return meta;
+    }
+
+    /** A plain row: glyph and words; tappable when there is an action. */
+    private View actionLine(String guide, Row fold, String glyph, String words, int color, Runnable action) {
+        LinearLayout line = treeLine(guide, fold);
+        TextView mark = text(glyph, 11, color);
+        mark.setPadding(0, 0, dp(6), 0);
+        mark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        line.addView(mark);
+        line.addView(single(text(words, 12, color)), new LinearLayout.LayoutParams(0, -2, 1));
+        line.setContentDescription(words);
+        if (action != null) line.setOnClickListener(v -> action.run());
+        else line.setClickable(false);
+        return line;
+    }
+
+    /** "Spaces", "Other agents": the whole row folds. */
+    private View groupLine(String guide, Row fold, String words, String count) {
+        LinearLayout line = treeLine(guide, fold);
+        line.addView(single(text(words, 11, chrome.primary)), new LinearLayout.LayoutParams(0, -2, 1));
+        line.addView(tag(count, chrome.onSurfaceVariant));
+        line.setContentDescription(words + ", " + count + (folded(fold) ? ", folded" : ""));
+        line.setOnClickListener(v -> toggleFold(fold.fold, fold.foldedByDefault));
+        return line;
+    }
+
+    /** A small bordered button on the machine row. */
+    private TextView chip(String words, boolean enabled, Runnable action) {
+        TextView chip = text(words, 11, enabled ? chrome.primary : chrome.onSurfaceVariant);
+        chip.setPadding(dp(8), dp(4), dp(8), dp(4));
+        GradientDrawable border = new GradientDrawable();
+        border.setCornerRadius(dp(10));
+        border.setStroke(Math.max(1, dp(1)), enabled ? chrome.primary : chrome.outline);
+        chip.setBackground(border);
+        chip.setEnabled(enabled);
+        if (enabled) chip.setOnClickListener(v -> action.run());
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+        params.setMarginStart(dp(6));
+        chip.setLayoutParams(params);
+        return chip;
     }
 
     private static boolean hasRole(Agent agent) {
@@ -823,85 +1105,62 @@ public final class HomeActivity extends Activity {
     }
 
     /**
-     * One agent: tree guide, fold toggle for whoever has reports, status dot,
-     * title, role; and, for the deacon skill's agents or any agent that said
-     * something, a second line with its status in words, for how long, and
-     * its latest message.
+     * One agent in the tree: guide, fold toggle when it has children, status
+     * dot, title and, for the skill's agents or any agent that said something,
+     * its status in words, for how long, and its latest message.
      */
-    private View agentRow(Agent agent, boolean inTree) {
-        LinearLayout row = row();
-        int indent = inTree ? 14 : 4;
-        row.setPadding(dp(indent), dp(2), dp(4), dp(2));
-        row.setMinimumHeight(dp(26));
-        if (inTree && !agent.guide.isEmpty()) {
-            TextView guide = text(agent.guide, 12, GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x80));
-            guide.setTypeface(Typeface.MONOSPACE);
-            guide.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-            row.addView(guide);
-        }
-        boolean folded = collapsed.contains(subtreeKey(agent));
-        if (inTree && agent.below > 0) {
-            TextView toggle = text(folded ? "▸" : "▾", 12, chrome.onSurfaceVariant);
-            toggle.setGravity(Gravity.CENTER);
-            toggle.setMinWidth(dp(18));
-            toggle.setMinHeight(dp(24));
-            toggle.setContentDescription((folded ? "Show " : "Hide ") + agent.below + " under " + agent.title);
-            toggle.setOnClickListener(v -> {
-                String key = subtreeKey(agent);
-                if (!collapsed.remove(key)) collapsed.add(key);
-                render(true);
-            });
-            row.addView(toggle);
-        }
+    private View agentLine(String guide, Agent agent, String tag, Row fold) {
+        LinearLayout row = treeLine(guide, fold);
         row.addView(dot(statusColor(agent.status)));
         LinearLayout lines = column();
-        boolean lead = "deacon".equals(agent.role) || "pm".equals(agent.role);
-        TextView title = text(inTree ? agent.title : breadcrumb(agent), lead ? 13 : 12, chrome.onSurface);
+        boolean lead = "deacon".equals(agent.role) || "pm".equals(agent.role) || tag.startsWith("deacon")
+                || tag.startsWith("pm");
+        TextView title = single(text(agent.title, lead ? 13 : 12, chrome.onSurface));
         if (lead) title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setSingleLine(true);
-        title.setEllipsize(TextUtils.TruncateAt.END);
         lines.addView(title);
         String said = detail(agent);
         if (!said.isEmpty()) {
-            TextView sub = text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
-                    : chrome.onSurfaceVariant);
-            sub.setSingleLine(true);
-            sub.setEllipsize(TextUtils.TruncateAt.END);
+            TextView sub = single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
+                    : chrome.onSurfaceVariant));
             sub.setPadding(0, dp(1), 0, 0);
             lines.addView(sub);
         }
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
-        String tag = roleTag(agent);
-        if (agent.below > 0) {
-            List<String> counts = new ArrayList<>();
-            if (agent.belowWaiting > 0) counts.add(agent.belowWaiting + "!");
-            if (agent.belowWorking > 0) counts.add(agent.belowWorking + "▶");
-            counts.add(agent.below + ("deacon".equals(agent.role) ? " below" : " under"));
-            tag = (tag.isEmpty() ? "" : tag + "  ") + TextUtils.join(" ", counts);
-        }
-        if (!tag.isEmpty()) {
-            TextView meta = text(tag, 10, "deacon".equals(agent.role) ? chrome.primary : chrome.onSurfaceVariant);
-            meta.setPadding(dp(6), 0, 0, 0);
-            row.addView(meta);
-        }
+        if (!tag.isEmpty()) row.addView(tag(tag, "deacon".equals(tag) ? chrome.primary : chrome.onSurfaceVariant));
         row.setContentDescription(agent.title + ", " + statusWord(agent.status, agent.waitKind)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
-        row.setOnLongClickListener(v -> {
-            ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent))
-                    .add("Open", () -> openAgent(agent));
-            if (inTree && agent.below > 0) {
-                sheet.add(folded ? "Show its " + agent.below : "Hide its " + agent.below, () -> {
-                    String key = subtreeKey(agent);
-                    if (!collapsed.remove(key)) collapsed.add(key);
-                    render(true);
-                });
-            }
-            if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
-            if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
-            sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
-            return true;
-        });
+        row.setOnLongClickListener(v -> { agentActions(agent); return true; });
+        return row;
+    }
+
+    private void agentActions(Agent agent) {
+        ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent)).add("Open", () -> openAgent(agent));
+        if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
+        if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
+        sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
+    }
+
+    /** An agent in a flat list (Needs you, Working, the picker): breadcrumb title, no tree. */
+    private View agentRow(Agent agent, boolean unused) {
+        LinearLayout row = row();
+        row.setPadding(dp(4), dp(2), dp(4), dp(2));
+        row.setMinimumHeight(dp(26));
+        row.addView(dot(statusColor(agent.status)));
+        LinearLayout lines = column();
+        lines.addView(single(text(breadcrumb(agent), 12, chrome.onSurface)));
+        String said = detail(agent);
+        if (!said.isEmpty()) {
+            lines.addView(single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
+                    : chrome.onSurfaceVariant)));
+        }
+        row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
+        String tag = roleTag(agent);
+        if (!tag.isEmpty()) row.addView(tag(tag, chrome.onSurfaceVariant));
+        row.setContentDescription(agent.title + ", " + statusWord(agent.status, agent.waitKind)
+                + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
+        row.setOnClickListener(v -> openAgent(agent));
+        row.setOnLongClickListener(v -> { agentActions(agent); return true; });
         return row;
     }
 
@@ -920,6 +1179,240 @@ public final class HomeActivity extends Activity {
         if (!since.isEmpty()) parts.add(since);
         if (!agent.msg.isEmpty()) parts.add(agent.msg);
         return TextUtils.join(" · ", parts);
+    }
+
+    // ── Fleet actions (explicit taps only; rendering never starts anything) ──
+
+    /** Milliseconds left on this machine's Start Deacon guard, or 0. */
+    private long deaconGuard(Machine machine) {
+        try {
+            long at = getSharedPreferences("home", MODE_PRIVATE).getLong("deacon_start:" + machine.host.id, 0);
+            long left = at + DEACON_GUARD_MS - System.currentTimeMillis();
+            return left > 0 && left <= DEACON_GUARD_MS ? left : 0;
+        } catch (RuntimeException unreadable) {
+            return 0;
+        }
+    }
+
+    private void clearDeaconGuard(Machine machine) {
+        try {
+            getSharedPreferences("home", MODE_PRIVATE).edit().remove("deacon_start:" + machine.host.id).apply();
+        } catch (RuntimeException ignored) {
+            // The guard expires on its own.
+        }
+    }
+
+    /**
+     * Starts this machine's Deacon on its own core, never another's and never
+     * locally. The core rechecks for one first and returns it instead of
+     * launching a second; a guard blocks repeat taps for 90 s.
+     */
+    private void startDeacon(Machine machine) {
+        long handle = machine.handle;
+        if (machine.deaconBusy || deaconGuard(machine) > 0) return;
+        if (handle <= 0 || !"ready".equals(machine.state)) {
+            machine.deaconError = machine.host.name + " is offline";
+            machine.ui++;
+            render(true);
+            return;
+        }
+        machine.deaconBusy = true;
+        machine.deaconError = "";
+        machine.ui++;
+        try {
+            getSharedPreferences("home", MODE_PRIVATE).edit()
+                    .putLong("deacon_start:" + machine.host.id, System.currentTimeMillis()).apply();
+        } catch (RuntimeException ignored) {
+            // The in-memory flag still guards this session.
+        }
+        render(true);
+        String action;
+        try {
+            action = new JSONObject().put("op", "deacon.start").put("name", machine.host.name).toString();
+        } catch (org.json.JSONException impossible) {
+            return;
+        }
+        worker.execute(() -> {
+            String failure = null, terminal = "";
+            boolean started = false;
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
+                if (!result.optBoolean("queued", false)) failure = result.optString("error", "it did not answer");
+                terminal = result.optString("terminal", "");
+                started = result.optBoolean("started", false);
+                if (!result.optString("layout_error", "").isEmpty()) {
+                    failure = "it started (" + terminal + ") but its space could not be added: "
+                            + result.optString("layout_error");
+                }
+            } catch (Exception | LinkageError error) {
+                failure = "the computer did not answer";
+            }
+            final String reason = failure, address = terminal;
+            final boolean fresh = started;
+            main.post(() -> {
+                if (destroyed) return;
+                machine.deaconBusy = false;
+                if (reason != null && address.isEmpty()) clearDeaconGuard(machine);
+                machine.deaconError = reason == null ? "" : reason;
+                machine.ui++;
+                note = reason == null ? (fresh ? "Started the Deacon on " : "Found the Deacon on ") + machine.host.name : null;
+                render(true);
+                if (!address.isEmpty() && machine.handle == handle) openTerminal(machine, address, "Deacon");
+            });
+        });
+    }
+
+    /**
+     * New project: one complete message into this machine's Deacon chat, then
+     * the chat itself. The Deacon asks for the goal and folder and sets up
+     * the project manager; nothing here starts one.
+     */
+    private void newProject(Machine machine, Agent deacon) {
+        long handle = machine.handle;
+        if (machine.projectBusy) return;
+        if (handle <= 0 || !"ready".equals(machine.state)) {
+            machine.projectError = machine.host.name + " is offline";
+            machine.ui++;
+            render(true);
+            return;
+        }
+        sendToDeacon(machine, deacon, FleetTree.newProjectPrompt(machine.host.name));
+    }
+
+    /** A project with no manager: ask that machine's Deacon to set one up. */
+    private void askForManager(Machine machine, FleetTree.Project project) {
+        FleetTree.Member found = FleetTree.canonicalDeacon(members(machine));
+        if (found == null) {
+            note = "Start the Deacon on " + machine.host.name + " first; it sets up project managers.";
+            render(true);
+            return;
+        }
+        Agent target = (Agent) found;
+        new ActionSheet(this, chrome, project.name + " has no project manager")
+                .add("Ask the Deacon to set one up", () -> sendToDeacon(machine, target,
+                        "The " + project.name.replaceAll("\\p{Cntrl}", "") + " project on "
+                                + machine.host.name + " has no project manager. Please set one up for it."))
+                .show();
+    }
+
+    private void sendToDeacon(Machine machine, Agent deacon, String text) {
+        long handle = machine.handle;
+        String action;
+        try {
+            action = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
+        } catch (org.json.JSONException impossible) {
+            return;
+        }
+        machine.projectBusy = true;
+        machine.projectError = "";
+        machine.ui++;
+        render(true);
+        worker.execute(() -> {
+            String failure = null;
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
+                if (!result.optBoolean("queued", false)) failure = result.optString("error", "it did not answer");
+            } catch (Exception | LinkageError error) {
+                failure = "the computer did not answer";
+            }
+            final String reason = failure;
+            main.post(() -> {
+                if (destroyed) return;
+                machine.projectBusy = false;
+                machine.projectError = reason == null ? "" : reason;
+                machine.ui++;
+                render(true);
+                if (reason == null) openAgent(deacon);
+            });
+        });
+    }
+
+    /** A closed worktree: a shell space there (no agent), then that shell. */
+    private void openWorktree(Machine machine, String path) {
+        long handle = machine.handle;
+        if (handle <= 0 || !"ready".equals(machine.state) || !machine.opening.add(path)) return;
+        machine.ui++;
+        render(true);
+        String action;
+        try {
+            action = new JSONObject().put("op", "space.open").put("folder", path).toString();
+        } catch (org.json.JSONException impossible) {
+            return;
+        }
+        worker.execute(() -> {
+            String failure = null, terminal = "";
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
+                if (!result.optBoolean("queued", false)) failure = result.optString("error", "it did not answer");
+                terminal = result.optString("terminal", "");
+            } catch (Exception | LinkageError error) {
+                failure = "the computer did not answer";
+            }
+            final String reason = failure, address = terminal;
+            main.post(() -> {
+                if (destroyed) return;
+                machine.opening.remove(path);
+                machine.ui++;
+                note = reason == null ? null : "Could not open " + FleetTree.lastSegment(path) + ": " + reason;
+                render(true);
+                if (!address.isEmpty() && machine.handle == handle) openTerminal(machine, address, FleetTree.lastSegment(path));
+            });
+        });
+    }
+
+    /** Opens a terminal the core just made or found, by address on this machine. */
+    private void openTerminal(Machine machine, String address, String title) {
+        Agent agent = new Agent();
+        agent.machine = machine;
+        agent.id = address;
+        agent.title = title;
+        openAgent(agent);
+    }
+
+    /**
+     * Asks the machine's git about the folders its spaces show (never other
+     * repos): at most every GIT_MS, or GIT_NEW_MS after a new folder appears.
+     */
+    private void maybeLookGit(Machine machine, List<Agent> all, boolean ready, boolean folded) {
+        long handle = machine.handle;
+        if (handle <= 0) return;
+        Map<String, List<Agent>> bySpace = new LinkedHashMap<>();
+        for (Agent agent : all) if (agent.hasSpace()) bySpace.computeIfAbsent(agent.space, k -> new ArrayList<>()).add(agent);
+        Set<String> paths = new java.util.TreeSet<>();
+        for (List<Agent> list : bySpace.values()) {
+            String probe = FleetTree.probe(list);
+            if (probe.startsWith("/") && paths.size() < 48) paths.add(probe);
+        }
+        if (paths.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        boolean fresh = !machine.gitAsked.containsAll(paths);
+        if (!FleetTree.gitDue(ready, folded, machine.gitBusy, fresh, now, machine.gitAt, GIT_MS, GIT_NEW_MS)) return;
+        machine.gitBusy = true;
+        machine.gitAt = now;
+        String action;
+        try {
+            action = new JSONObject().put("op", "git.look").put("paths", new JSONArray(paths)).toString();
+        } catch (org.json.JSONException impossible) {
+            machine.gitBusy = false;
+            return;
+        }
+        worker.execute(() -> {
+            FleetTree.GitLook look = null;
+            try {
+                JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
+                if (result.optBoolean("queued", false)) look = FleetTree.parseGitLook(result.optString("text", ""), 200);
+            } catch (Exception | LinkageError error) {
+                look = null;
+            }
+            final FleetTree.GitLook answer = look;
+            main.post(() -> {
+                machine.gitBusy = false;
+                if (destroyed || answer == null) return;
+                machine.git = answer;
+                machine.gitAsked = paths;
+                render(true);
+            });
+        });
     }
 
     /** machine › space › agent, without empty segments. */

@@ -305,7 +305,9 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_sessionAction(
     handle: jlong,
     action: JString<'_>,
 ) -> jstring {
-    let Some(action) = read(&mut env, &action, 64) else {
+    // JSON edits (space ids, folders, a git look over many folders) are far
+    // longer than the plain action names; TabEdit::parse bounds each field.
+    let Some(action) = read(&mut env, &action, 32 * 1024) else {
         return std::ptr::null_mut();
     };
     result_string(&mut env, remote::session_action(handle as u64, &action))

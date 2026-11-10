@@ -221,11 +221,130 @@ impl Connection<'_> {
                 self.refresh()?;
             }
             _ => match TabEdit::parse(action) {
+                Some(TabEdit::DeaconStart { machine }) => {
+                    return self.start_deacon(&machine, cols, rows);
+                }
+                Some(TabEdit::GitLook { paths }) => return self.git_look(&paths),
+                Some(TabEdit::SpaceOpen { folder }) => {
+                    let (terminal, layout_error) =
+                        self.launch_space("", Some(&folder), None, json!({}), cols, rows)?;
+                    let mut reply = json!({"queued":true,"terminal":terminal});
+                    if let Some(error) = layout_error {
+                        reply["layout_error"] = json!(error);
+                    }
+                    return Ok(reply.to_string());
+                }
+                Some(TabEdit::Send { terminal, text }) => {
+                    self.call("terminal.send", json!({"terminal":terminal,"text":text}))?;
+                    return Ok(json!({"queued":true,"terminal":terminal}).to_string());
+                }
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
                 None => return Err(Error::StaleTarget),
             },
         }
         Ok(json!({"queued":true}).to_string())
+    }
+    /// This computer's deacon, as the desktop's Fleet starts one: a `deacon`
+    /// space with a `deacon` tab running Claude, labelled `role=deacon` from
+    /// birth. Rechecks first: an existing local deacon is returned, never a
+    /// second launch. `{"queued":true,"terminal":..,"started":bool}`.
+    fn start_deacon(&mut self, machine: &str, cols: u16, rows: u16) -> Result<String> {
+        let existing = self.call("terminal.list", json!({}))?;
+        let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+        if let Some(terminal) = canonical_deacon(&existing["terminals"], &doc["value"]) {
+            self.refresh()?;
+            return Ok(json!({"queued":true,"terminal":terminal,"started":false}).to_string());
+        }
+        let (terminal, layout_error) = self.launch_space(
+            "deacon",
+            None,
+            Some(deacon_line(machine)),
+            json!({"role":"deacon","agent.kind":"claude"}),
+            cols,
+            rows,
+        )?;
+        // The deacon runs and is labelled either way: report it for recovery,
+        // and a retry finds it instead of launching another.
+        let mut reply = json!({"queued":true,"terminal":terminal,"started":true});
+        if let Some(error) = layout_error {
+            reply["layout_error"] = json!(error);
+        }
+        Ok(reply.to_string())
+    }
+    /// A new space in herdr-app's document with one tab running `line` (a
+    /// shell when None) in `folder` (the core's default when None), labelled
+    /// at birth. The terminal is returned even when the document update
+    /// fails, with that error, so a caller can recover instead of relaunching.
+    fn launch_space(
+        &mut self,
+        name: &str,
+        folder: Option<&str>,
+        line: Option<String>,
+        labels: Value,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(String, Option<String>)> {
+        let unique = format!(
+            "{:x}{:016x}",
+            std::process::id(),
+            NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+        );
+        let (space, tab, block) = (format!("sp{unique}"), format!("tb{unique}"), format!("pb{unique}"));
+        let mut run = json!({
+            "keep": true,
+            "labels": {"herdr.space": space, "herdr.tab": tab},
+            "size": {"cols": cols, "rows": rows},
+            "display": display(),
+        });
+        if let Some(folder) = folder {
+            run["cwd"] = json!(folder);
+        }
+        if let Some(line) = line {
+            run["line"] = json!(line);
+        }
+        if let Some(extra) = labels.as_object() {
+            for (key, value) in extra {
+                run["labels"][key] = value.clone();
+            }
+        }
+        let result = self.call("terminal.run", run)?;
+        let terminal = result["address"]
+            .as_str()
+            .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
+            .to_owned();
+        // Labelled at birth above; set again so a core that drops run labels
+        // still has them (an agent labelling itself is the last backup).
+        if labels.as_object().is_some_and(|l| !l.is_empty()) {
+            self.call("terminal.label", json!({"terminal":terminal,"labels":labels}))?;
+        }
+        let folder = folder.map(|f| json!(f)).unwrap_or_else(|| result["cwd"].clone());
+        let root = json!({"children":[{"content":{"terminal":terminal},"id":block,"type":"block"}],"id":tab,"type":"row"});
+        let tab_name = if name.is_empty() { "shell" } else { name };
+        // edit_doc re-reads the document each try and retries on a version
+        // conflict, so every other space and tab is kept.
+        let entry = json!({"folder":folder,"id":space,"name":name,"tabs":[{"id":tab,"name":tab_name,"root":root}]});
+        let placed = self.edit_doc(|doc| add_space(doc, &entry));
+        Ok((terminal, placed.err().map(|e| e.to_string())))
+    }
+    /// One exec on this computer answers, for each folder, its repo (git
+    /// common dir), checkout top and branch, and lists each repo's worktrees
+    /// once (FleetTree.parseGitLook reads it). Only folders the phone already
+    /// shows are asked about; output is bounded.
+    fn git_look(&mut self, paths: &[String]) -> Result<String> {
+        use base64::Engine;
+
+        let mut argv = vec![json!("sh"), json!("-c"), json!(GIT_LOOK), json!("sh")];
+        argv.extend(paths.iter().map(|p| json!(p)));
+        let result = self.call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["stdout"].as_str().unwrap_or(""))
+            .map_err(|_| Error::Protocol("invalid command output".into()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(json!({"queued":true,"text":text,"truncated":result["truncated"]}).to_string())
     }
     /// Changes herdr-app's layout document, which the desktop app reads too,
     /// so a rename or reorder made here shows there. Retries on a version race.
@@ -366,6 +485,10 @@ impl Connection<'_> {
             TabEdit::Kill { terminal } => {
                 self.call("terminal.kill", json!({"terminal":terminal}))?;
                 self.refresh()
+            }
+            TabEdit::DeaconStart { machine } => self.start_deacon(&machine, cols, rows).map(drop),
+            TabEdit::GitLook { .. } | TabEdit::SpaceOpen { .. } | TabEdit::Send { .. } => {
+                Err(Error::StaleTarget)
             }
             TabEdit::ToSpace { space, tab, to } => {
                 for terminal in self.tab_terminals(&space, &tab) {
@@ -520,10 +643,14 @@ pub(crate) enum TabEdit {
     SpaceNew { space: String, kind: &'static str },
     Interrupt { terminal: String },
     Kill { terminal: String },
+    DeaconStart { machine: String },
+    GitLook { paths: Vec<String> },
+    SpaceOpen { folder: String },
+    Send { terminal: String, text: String },
 }
 impl TabEdit {
     pub(crate) fn parse(action: &str) -> Option<Self> {
-        if !action.starts_with('{') || action.len() > 1024 {
+        if !action.starts_with('{') || action.len() > 32 * 1024 {
             return None;
         }
         let value: Value = serde_json::from_str(action).ok()?;
@@ -539,6 +666,12 @@ impl TabEdit {
                 .then(|| name.to_owned())
         };
         let index = || usize::try_from(value["index"].as_u64()?).ok().map(|i| i.min(512));
+        // An absolute folder on that computer: bounded, no control characters.
+        let folder = |v: &Value| {
+            v.as_str()
+                .filter(|p| p.starts_with('/') && p.len() <= 1024 && !p.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
         Some(match value["op"].as_str()? {
             "tab.rename" => Self::Rename { space: id("space")?, tab: id("tab")?, name: name()? },
             "tab.move" => Self::Move { space: id("space")?, tab: id("tab")?, index: index()? },
@@ -558,9 +691,123 @@ impl TabEdit {
             },
             "pane.interrupt" => Self::Interrupt { terminal: id("terminal")? },
             "pane.kill" => Self::Kill { terminal: id("terminal")? },
+            "deacon.start" => Self::DeaconStart { machine: name().unwrap_or_default() },
+            "git.look" => Self::GitLook {
+                paths: {
+                    let list = value["paths"].as_array()?;
+                    if list.is_empty() || list.len() > 48 {
+                        return None;
+                    }
+                    list.iter().map(|p| folder(p)).collect::<Option<Vec<_>>>()?
+                },
+            },
+            "space.open" => Self::SpaceOpen { folder: folder(&value["folder"])? },
+            "pane.send" => Self::Send {
+                terminal: id("terminal")?,
+                text: value["text"]
+                    .as_str()
+                    .filter(|t| !t.trim().is_empty() && t.chars().count() <= 1000 && !t.chars().any(char::is_control))
+                    .map(str::to_owned)?,
+            },
             _ => return None,
         })
     }
+}
+/// Appends one space to herdr-app's document, keeping every space and tab
+/// already there (edit_doc hands it the freshest version on each try).
+fn add_space(doc: &mut Value, entry: &Value) -> Result<()> {
+    if doc.is_null() {
+        *doc = json!({});
+    }
+    if !doc["spaces"].is_array() {
+        doc["spaces"] = json!([]);
+    }
+    let spaces = doc["spaces"].as_array_mut().ok_or(Error::StaleTarget)?;
+    if !spaces.iter().any(|s| s["id"] == entry["id"]) {
+        spaces.push(entry.clone());
+    }
+    Ok(())
+}
+/// The phone's git look, one `sh -c` over the folders it shows (see git_look).
+const GIT_LOOK: &str = r#"seen='
+'
+for p in "$@"; do
+  c=$(git -C "$p" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { printf 'P\t%s\n' "$p"; continue; }
+  t=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)
+  b=$(git -C "$p" symbolic-ref --short -q HEAD 2>/dev/null)
+  printf 'P\t%s\t%s\t%s\t%s\n' "$p" "$c" "$t" "$b"
+  case "$seen" in *"
+$c
+"*) continue;; esac
+  seen="$seen$c
+"
+  printf 'R\t%s\n' "$c"
+  git -C "$p" worktree list --porcelain 2>/dev/null | head -c 20000
+  printf '\nE\n'
+done"#;
+/// The deacon's shell line: from ~/Config when it exists (Wolf's own config,
+/// never a user repo), else home; Claude with its brief as one argument. The
+/// machine name is reduced to plain characters, so it can sit in the quotes.
+fn deacon_line(machine: &str) -> String {
+    let name: String = machine.chars().filter(|c| !c.is_control()).take(64).collect();
+    let name = name.trim();
+    let here = if name.is_empty() { "this computer".to_owned() } else { format!("this computer ({name})") };
+    let task = format!(
+        "You are the Deacon for {here}; use the deacon skill. If you are not labelled yet, run hc label $HC_TERMINAL_ID role=deacon. Take inventory only until Wolf gives you a goal. Do not start duplicate project managers or workers, and do not restart or switch anything."
+    );
+    format!(
+        "cd \"$HOME/Config\" 2>/dev/null || cd \"$HOME\"; exec \"${{SHELL:-/bin/sh}}\" -lic 'claude \"$0\"' {}",
+        sh_quote(&task)
+    )
+}
+/// One POSIX shell word for any text: single quotes, each ' as '\''.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+/// This core's one deacon, as the Fleet picks it: a live local terminal
+/// labelled role=deacon (oldest first, then address), else the first
+/// unlabelled agent in a space named "deacon" (space, then tab order).
+/// Federated `machine/tN` entries belong to other computers and never count.
+fn canonical_deacon(terminals: &Value, doc: &Value) -> Option<String> {
+    let live: Vec<&Value> = terminals
+        .as_array()?
+        .iter()
+        .filter(|t| t["state"] == "live")
+        .filter(|t| address(t).is_some_and(|a| !a.contains('/')))
+        .collect();
+    fn role(t: &Value) -> Option<&str> {
+        t["labels"]["role"].as_str().filter(|r| !r.is_empty() && *r != "none")
+    }
+    let labelled = live
+        .iter()
+        .filter(|t| role(t) == Some("deacon"))
+        .min_by_key(|t| (t["created_ms"].as_u64().unwrap_or(u64::MAX), address(t).unwrap_or("").to_owned()));
+    if let Some(t) = labelled {
+        return address(t).map(str::to_owned);
+    }
+    let spaces = doc["spaces"].as_array()?;
+    let place = |t: &Value| -> Option<(usize, usize)> {
+        let space = t["labels"]["herdr.space"].as_str()?;
+        let tab = t["labels"]["herdr.tab"].as_str().unwrap_or("");
+        let at = spaces.iter().position(|s| {
+            s["id"] == space && s["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case("deacon"))
+        })?;
+        let tabs = spaces[at]["tabs"].as_array();
+        let tab_at = tabs.and_then(|ts| ts.iter().position(|x| x["id"] == tab)).unwrap_or(usize::MAX);
+        Some((at, tab_at))
+    };
+    let agent = |t: &Value| {
+        t["status"]["state"].as_str().is_some_and(|s| !s.is_empty())
+            || t["labels"]["agent.kind"].as_str().is_some_and(|k| !k.is_empty() && k != "none")
+    };
+    live.iter()
+        .filter(|t| role(t).is_none() && agent(t))
+        .filter_map(|t| place(t).map(|p| (p, t["created_ms"].as_u64().unwrap_or(u64::MAX), *t)))
+        .min_by_key(|(p, created, t)| (*p, *created, address(t).unwrap_or("").to_owned()))
+        .and_then(|(_, _, t)| address(t).map(str::to_owned))
+}
+fn address(terminal: &Value) -> Option<&str> {
+    terminal["address"].as_str().or(terminal["id"].as_str())
 }
 fn tabs_mut<'a>(doc: &'a mut Value, space: &str) -> Result<&'a mut Vec<Value>> {
     doc["spaces"]
@@ -895,6 +1142,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),
             "wait_kind": terminal["status"]["kind"].as_str().unwrap_or(""),
             "status_ms": terminal["status_ms"].as_u64().unwrap_or(0),
+            // Picks the canonical deacon when a computer has several candidates.
+            "created_ms": terminal["created_ms"].as_u64().unwrap_or(0),
         }));
     }
     if spaces.len() > 256 || tabs.len() > 512 {
@@ -988,6 +1237,102 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{GIT_LOOK, add_space, canonical_deacon, deacon_line};
+    #[test]
+    fn adding_a_space_keeps_every_existing_space_and_tab() {
+        let mut doc = json!({"spaces":[{"id":"s1","name":"botd","tabs":[{"id":"a","name":"pm"},{"id":"b"}]}],"other":1});
+        let entry = json!({"id":"spX","name":"deacon","tabs":[{"id":"tbX","name":"deacon"}]});
+        assert!(add_space(&mut doc, &entry).is_ok());
+        assert!(add_space(&mut doc, &entry).is_ok());
+        assert_eq!(doc["spaces"].as_array().map(Vec::len), Some(2));
+        assert_eq!(doc["spaces"][0]["tabs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(doc["other"], 1);
+        assert_eq!(doc["spaces"][1]["name"], "deacon");
+        let mut empty = Value::Null;
+        assert!(add_space(&mut empty, &entry).is_ok());
+        assert_eq!(empty["spaces"][0]["id"], "spX");
+    }
+    #[test]
+    fn git_look_names_each_repo_once_with_its_worktrees() {
+        let dir = std::env::temp_dir().join(format!("herdr-git-look-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("kache");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(args).output().map(|o| o.status.success()).unwrap_or(false)
+        };
+        std::fs::create_dir_all(&main).ok();
+        let m = main.to_string_lossy().into_owned();
+        if !run(&["-C", &m, "init", "-q", "-b", "main"]) {
+            return; // no git on this host
+        }
+        assert!(run(&["-C", &m, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]));
+        let lane = dir.join("custom place/lane 1");
+        let l = lane.to_string_lossy().into_owned();
+        assert!(run(&["-C", &m, "worktree", "add", "-q", "-b", "lane-1", &l]));
+        let out = std::process::Command::new("sh")
+            .args(["-c", GIT_LOOK, "sh", &m, &l, &format!("{l}/"), "/nonexistent"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let common = format!("{m}/.git");
+        assert!(out.contains(&format!("P\t{m}\t{common}\t{m}\tmain\n")), "{out}");
+        assert!(out.contains(&format!("P\t{l}\t{common}\t{l}\tlane-1\n")), "{out}");
+        assert!(out.contains("P\t/nonexistent\n"), "{out}");
+        assert_eq!(out.matches("\nR\t").count() + usize::from(out.starts_with("R\t")), 1, "{out}");
+        assert!(out.contains(&format!("worktree {l}\n")) && out.contains("branch refs/heads/lane-1\n"), "{out}");
+        assert!(out.contains("\nE\nP\t"), "{out}");
+    }
+    use serde_json::{Value, json};
+    #[test]
+    fn deacon_line_quotes_any_machine_name_as_one_word() {
+        let line = deacon_line("Wolf's \"box\" $(rm -rf ~) `x`; echo");
+        // The brief is one single-quoted word; the only way out of it is '\''.
+        let brief = line.rsplit_once(" -lic 'claude \"$0\"' ").map(|(_, b)| b).unwrap_or("");
+        assert!(brief.starts_with('\'') && brief.ends_with('\''));
+        assert!(brief.contains(r"Wolf'\''s"));
+        // A real shell reads it back as the exact brief, nothing run.
+        let said = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {brief}"))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        assert!(said.contains("(Wolf's \"box\" $(rm -rf ~) `x`; echo)"), "{said}");
+        assert!(line.starts_with("cd \"$HOME/Config\" 2>/dev/null || cd \"$HOME\"; exec "));
+        assert!(deacon_line("").contains("Deacon for this computer;"));
+        assert!(deacon_line("a\nb").contains("(ab)"));
+    }
+    #[test]
+    fn canonical_deacon_prefers_the_oldest_labelled_then_the_deacon_space() {
+        let doc = json!({"spaces":[
+            {"id":"s1","name":"botd","tabs":[{"id":"a"}]},
+            {"id":"s2","name":"Deacon","tabs":[{"id":"x"},{"id":"y"}]}
+        ]});
+        let t = |id: &str, labels: Value, created: u64, status: &str| json!({
+            "address":id,"state":"live","labels":labels,"created_ms":created,"status":{"state":status}
+        });
+        // Duplicate labels: the oldest wins, a federated one never counts.
+        let both = json!([
+            t("t9", json!({"role":"deacon"}), 50, "idle"),
+            t("t3", json!({"role":"deacon"}), 10, "working"),
+            t("server/t1", json!({"role":"deacon"}), 1, "idle"),
+        ]);
+        assert_eq!(canonical_deacon(&both, &doc).as_deref(), Some("t3"));
+        // No label: the first unlabelled agent of the deacon space, by tab.
+        let fallback = json!([
+            t("t5", json!({"herdr.space":"s2","herdr.tab":"y"}), 1, "idle"),
+            t("t6", json!({"herdr.space":"s2","herdr.tab":"x"}), 9, "working"),
+            t("t7", json!({"herdr.space":"s2","herdr.tab":"x","role":"pm"}), 0, "idle"),
+            t("t8", json!({"herdr.space":"s1","herdr.tab":"a"}), 0, "idle"),
+            t("t4", json!({"herdr.space":"s2","herdr.tab":"x"}), 0, ""),
+        ]);
+        assert_eq!(canonical_deacon(&fallback, &doc).as_deref(), Some("t6"));
+        // None at all: a start may launch.
+        let none = json!([t("t8", json!({"herdr.space":"s1"}), 0, "idle"),
+            json!({"address":"t2","state":"finished","labels":{"role":"deacon"}})]);
+        assert_eq!(canonical_deacon(&none, &doc), None);
+    }
     #[test]
     fn tab_edits_parse_only_bounded_known_operations() {
         use super::TabEdit;
@@ -1001,6 +1346,30 @@ mod tests {
         );
         assert_eq!(TabEdit::parse(r#"{"op":"tab.rename","space":"s1","tab":"a","name":"a\nb"}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"tab.rm","space":"s1","tab":"a"}"#), None);
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"deacon.start","name":"Macro (Google)"}"#),
+            Some(TabEdit::DeaconStart { machine: "Macro (Google)".into() })
+        );
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"deacon.start"}"#),
+            Some(TabEdit::DeaconStart { machine: String::new() })
+        );
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"git.look","paths":["/w/kache","/w/x y"]}"#),
+            Some(TabEdit::GitLook { paths: vec!["/w/kache".into(), "/w/x y".into()] })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"git.look","paths":["relative"]}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"git.look","paths":[]}"#), None);
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"space.open","folder":"/w/kache-wt"}"#),
+            Some(TabEdit::SpaceOpen { folder: "/w/kache-wt".into() })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"space.open","folder":"/w/a\nb"}"#), None);
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"pane.send","terminal":"t3","text":"I want to start a new project on server."}"#),
+            Some(TabEdit::Send { terminal: "t3".into(), text: "I want to start a new project on server.".into() })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"pane.send","terminal":"t3","text":"a\nb"}"#), None);
         assert_eq!(TabEdit::parse("tab.new"), None);
     }
 
