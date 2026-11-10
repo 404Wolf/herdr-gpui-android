@@ -785,6 +785,23 @@ final class FleetTree {
         return null;
     }
 
+    private static final Set<String> GENERIC_NAMES = new HashSet<>(Arrays.asList(
+            "general", "pm", "deacon", "worker", "main", "shell", "zsh", "bash", "claude", "claude code", "codex"));
+
+    /** A tab or title that names no task: a role, a shell, a harness, a number, a terminal id. */
+    static boolean genericName(String name) {
+        String n = name == null ? "" : name.trim();
+        return n.isEmpty() || GENERIC_NAMES.contains(n.toLowerCase(Locale.ROOT)) || n.matches("\\d+")
+                || RailTree.isTerminalId(n);
+    }
+
+    /** A worker's task for its badge: its own title, else a tab name that says something, else its id. */
+    static String workerTask(String title, String tabName, String id) {
+        if (!genericName(title)) return title.trim();
+        if (!genericName(tabName)) return tabName.trim();
+        return id;
+    }
+
     /** The pane header's role badge: "PM·t19", "worker·<task>", "Deacon·t6k"; "" without a role. */
     static String roleBadge(String role, String id, String task) {
         switch (role == null ? "" : role) {

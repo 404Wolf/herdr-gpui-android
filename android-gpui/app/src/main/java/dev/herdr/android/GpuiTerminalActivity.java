@@ -1968,7 +1968,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void updateCrumb(Connection current, String space) {
         if (crumb == null) return;
-        String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "";
+        String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "", ownTitle = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
@@ -1979,19 +1979,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             cwd = pane.optString("cwd", "");
             role = FleetTree.role(pane.optString("role", ""));
             tabId = pane.optString("tab_id", "");
+            ownTitle = HomeActivity.cleanTitle(chromeTitle(pane.optString("title", ""), current.paneId), current.paneId);
         }
         // The pane's role badge, as the desktop's pane header: PM·t19, worker·<task>, Deacon·t6k.
-        String task = "";
+        // A worker's task is its own title, else a tab name that is not generic
+        // (several workers can share a tab like "general"), else its id.
+        String tabName = "";
         JSONArray tabs = current.tabs;
         for (int i = 0; tabs != null && i < tabs.length(); i++) {
             JSONObject tab = tabs.optJSONObject(i);
             if (tab != null && tabId.equals(tab.optString("id")) && space.equals(tab.optString("workspace_id"))) {
-                String label = tab.optString("label", "").trim();
-                if (!label.isEmpty() && !RailTree.isTerminalId(label)) task = label;
+                tabName = tab.optString("label", "");
             }
         }
-        if (task.isEmpty()) task = title;
-        String badge = FleetTree.roleBadge(role, current.paneId, task);
+        String badge = FleetTree.roleBadge(role, current.paneId, FleetTree.workerTask(ownTitle, tabName, current.paneId));
         String named = RailTree.labels(current.workspaces, current.tabs, panes).get(space);
         if (named != null) spaceLabel = chromeTitle(named, space);
         String repo = RailTree.repoOfPath(cwd);

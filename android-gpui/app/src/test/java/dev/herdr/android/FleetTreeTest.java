@@ -619,6 +619,20 @@ public final class FleetTreeTest {
         assertEquals("notes", groups.get(1).projects.get(0).name);
     }
 
+    @Test public void aWorkerBadgeShowsItsTaskNotAGenericTabName() {
+        // t6z in the shared "general" tab: its task title, not "general".
+        assertEquals("worker·Desktop Fleet sidebar", FleetTree.roleBadge("worker", "t6z",
+                FleetTree.workerTask("Desktop Fleet sidebar", "general", "t6z")));
+        // No title of its own: a specific tab name still says something.
+        assertEquals("smoke-marker", FleetTree.workerTask("", "smoke-marker", "t6x"));
+        // No title, a generic tab: its terminal id.
+        assertEquals("worker·t6z", FleetTree.roleBadge("worker", "t6z", FleetTree.workerTask("", "general", "t6z")));
+        for (String generic : new String[] {"General", "pm", "Deacon", "worker", "MAIN", "shell", "zsh", "bash",
+                "claude", "Claude Code", "codex", "12", "t6z"}) {
+            assertEquals(generic, "t6z", FleetTree.workerTask(generic, generic, "t6z"));
+        }
+    }
+
     @Test public void thePaneHeaderBadgeNamesTheRole() {
         assertEquals("PM·t19", FleetTree.roleBadge("pm", "t19", "ignored"));
         assertEquals("Deacon·t6k", FleetTree.roleBadge("deacon", "t6k", ""));
