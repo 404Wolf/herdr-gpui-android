@@ -919,8 +919,9 @@ public final class HomeActivity extends Activity {
         Row row;
         if (project.pm != null) {
             Agent pm = (Agent) project.pm;
-            String tag = "pm · " + project.name + (tally.isEmpty() ? "" : "  " + tally);
-            row = new Row((guide, self) -> agentLine(guide, pm, tag, self));
+            // The project's name leads its row; the manager's own title is the second line.
+            String tag = "PM" + (tally.isEmpty() ? "" : "  " + tally);
+            row = new Row((guide, self) -> agentLine(guide, pm, tag, self, project.name));
         } else {
             row = new Row((guide, self) -> actionLine(guide, self, "●", project.name + " · no project manager"
                     + (tally.isEmpty() ? "" : "  " + tally), chrome.onSurfaceVariant, () -> askForManager(machine, project)));
@@ -1113,15 +1114,31 @@ public final class HomeActivity extends Activity {
      * its status in words, for how long, and its latest message.
      */
     private View agentLine(String guide, Agent agent, String tag, Row fold) {
+        return agentLine(guide, agent, tag, fold, null);
+    }
+
+    /**
+     * {@code heading}, when given (a project's name), leads the row and the
+     * agent's own title moves to the second line. An untitled terminal reads
+     * as its harness and folder; its id only ever sits on the second line.
+     */
+    private View agentLine(String guide, Agent agent, String tag, Row fold, String heading) {
         LinearLayout row = treeLine(guide, fold);
         row.addView(dot(statusColor(agent.status)));
         LinearLayout lines = column();
-        boolean lead = "deacon".equals(agent.role) || "pm".equals(agent.role) || tag.startsWith("deacon")
-                || tag.startsWith("pm");
-        TextView title = single(text(agent.title, lead ? 13 : 12, chrome.onSurface));
+        boolean lead = heading != null || "deacon".equals(agent.role) || "pm".equals(agent.role)
+                || tag.startsWith("deacon") || tag.startsWith("pm");
+        boolean untitled = agent.title.isEmpty() || RailTree.isTerminalId(agent.title);
+        String shown = heading != null ? heading : FleetPanes.displayTitle(agent);
+        TextView title = single(text(shown, lead ? 13 : 12, chrome.onSurface));
         if (lead) title.setTypeface(Typeface.DEFAULT_BOLD);
         lines.addView(title);
-        String said = detail(agent);
+        List<String> second = new ArrayList<>();
+        if (heading != null && !untitled) second.add(agent.title);
+        String state = detail(agent);
+        if (!state.isEmpty()) second.add(state);
+        if (untitled) second.add(agent.id);
+        String said = TextUtils.join(" · ", second);
         if (!said.isEmpty()) {
             TextView sub = single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
                     : chrome.onSurfaceVariant));
@@ -1130,7 +1147,8 @@ public final class HomeActivity extends Activity {
         }
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
         if (!tag.isEmpty()) row.addView(tag(tag, "deacon".equals(tag) ? chrome.primary : chrome.onSurfaceVariant));
-        row.setContentDescription(agent.title + ", " + statusWord(agent.status, agent.waitKind)
+        row.setContentDescription(shown + (heading != null && !untitled ? ", " + agent.title : "") + ", "
+                + statusWord(agent.status, agent.waitKind)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
         row.setOnLongClickListener(v -> { agentActions(agent); return true; });
@@ -1160,7 +1178,7 @@ public final class HomeActivity extends Activity {
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
         String tag = roleTag(agent);
         if (!tag.isEmpty()) row.addView(tag(tag, chrome.onSurfaceVariant));
-        row.setContentDescription(agent.title + ", " + statusWord(agent.status, agent.waitKind)
+        row.setContentDescription(FleetPanes.displayTitle(agent) + ", " + statusWord(agent.status, agent.waitKind)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
         row.setOnLongClickListener(v -> { agentActions(agent); return true; });
@@ -1508,7 +1526,7 @@ public final class HomeActivity extends Activity {
     /** machine › space › agent, without empty segments. */
     private static String breadcrumb(Agent agent) {
         List<String> parts = new ArrayList<>();
-        for (String part : new String[] {agent.machine.host.name, agent.spaceLabel, agent.title}) {
+        for (String part : new String[] {agent.machine.host.name, agent.spaceLabel, FleetPanes.displayTitle(agent)}) {
             if (part != null && !part.trim().isEmpty()) parts.add(part.trim());
         }
         return TextUtils.join(" › ", parts);
@@ -1605,7 +1623,7 @@ public final class HomeActivity extends Activity {
                 }
                 try {
                     RemoteHostsActivity.rememberLastSession(this, machine.host, agent.id);
-                    GpuiLaunch.launchRemote(this, machine.host, handle, agent.id, agent.title);
+                    GpuiLaunch.launchRemote(this, machine.host, handle, agent.id, FleetPanes.displayTitle(agent));
                     // The terminal owns the session now; coming back reconnects in the background.
                     machine.handle = 0;
                     machine.state = "connecting";
