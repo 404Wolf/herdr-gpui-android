@@ -209,7 +209,10 @@ final class FleetTree {
         Map<String, String> adopted = new HashMap<>();
         for (Member m : sorted) {
             Member up = m;
-            for (int hops = 0; hops < 8 && !up.hasSpace() && !up.parent.isEmpty(); hops++) up = byId.get(up.parent);
+            // A parent that is not listed ends the walk (null): the agent stays under Other agents.
+            for (int hops = 0; hops < 8 && up != null && !up.hasSpace() && !up.parent.isEmpty(); hops++) {
+                up = byId.get(up.parent);
+            }
             if (!m.hasSpace() && up != null && up.hasSpace()) adopted.put(m.id, up.space);
         }
         // Spaces in order, with their members; agents without a space go to Other agents.

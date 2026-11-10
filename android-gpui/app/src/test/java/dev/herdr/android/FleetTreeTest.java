@@ -496,6 +496,15 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("/wt/x"), closedPaths(project(fleet, "home-manager")));
     }
 
+    @Test public void anOrphanWithNoSpaceAndAMissingParentIsKeptUnderOtherAgents() {
+        FleetTree.Member orphan = m("t9", "loose", "", Integer.MAX_VALUE, Integer.MAX_VALUE, "/h", "working");
+        orphan.parent = "t404"; // not listed on this computer
+        FleetTree.Member grandchild = m("t10", "", "", Integer.MAX_VALUE, Integer.MAX_VALUE, "/h", "idle");
+        grandchild.parent = "t9";
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(orphan, grandchild), null);
+        assertEquals(new HashSet<>(Arrays.asList("t9", "t10")), new HashSet<>(ids(fleet.others)));
+    }
+
     @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {
         // The shared laptop space: t67's and t5t's projects each see a slice of it.
         FleetTree.Member t67 = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "idle"), "pm", "home-manager");
