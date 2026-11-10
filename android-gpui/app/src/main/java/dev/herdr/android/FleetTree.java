@@ -231,67 +231,105 @@ final class FleetTree {
             spaces.computeIfAbsent(space, k -> new ArrayList<>()).add(m);
         }
 
-        // Each space's project: its PM's label, else its agents' label;
-        // else its repo's (a linked worktree joins its main checkout); else its own name.
-        Map<String, String> labelOf = new HashMap<>();
-        Map<String, Place> placeOf = new HashMap<>();
-        Map<String, String> repoProject = new HashMap<>();
+        // Each AGENT's project, not each space's: a PM's workers are tabs in
+        // its space, but two managers can share one space too (t67 for
+        // home-manager and t5t for botd). In order: its own project label;
+        // its parent's project (same computer); its space's label when that
+        // space carries exactly one; its own repo (a linked worktree joins
+        // its main checkout's project); the folder convention; its space's name.
+        Map<String, String> spaceOfMember = new HashMap<>();
+        Map<String, Set<String>> spaceLabels = new HashMap<>();
+        List<Member> placed = new ArrayList<>();
         for (Map.Entry<String, List<Member>> entry : spaces.entrySet()) {
-            String label = "";
-            for (Member m : entry.getValue()) if ("pm".equals(m.role) && !m.project.isEmpty()) { label = m.project; break; }
-            if (label.isEmpty()) for (Member m : entry.getValue()) if (!m.project.isEmpty()) { label = m.project; break; }
-            labelOf.put(entry.getKey(), label);
-            Place place = git.places.get(probe(entry.getValue()));
-            if (place != null) placeOf.put(entry.getKey(), place);
+            Set<String> labels = new java.util.TreeSet<>();
+            for (Member m : entry.getValue()) {
+                spaceOfMember.put(m.id, entry.getKey());
+                placed.add(m);
+                if (!m.project.isEmpty()) labels.add(m.project);
+            }
+            spaceLabels.put(entry.getKey(), labels);
         }
-        // A linked worktree joins the project of its main checkout's space
-        // (that space's label, else its name); with no such space, the repo's name.
-        for (Map.Entry<String, List<Member>> entry : spaces.entrySet()) {
-            Place place = placeOf.get(entry.getKey());
-            if (place == null || place.common.isEmpty() || repoProject.containsKey(place.common)) continue;
-            if (!place.top.equals(mainTop(place, git))) continue;
-            String label = labelOf.get(entry.getKey());
-            repoProject.put(place.common, label.isEmpty() ? spaceTitle(entry.getValue()) : label);
+        Collections.sort(placed, PLACE);
+        Map<String, String> projectOf = new HashMap<>();
+        for (Member m : placed) if (m.isAgent()) {
+            String p = labelledProject(m, byId, spaceOfMember, spaceLabels, new HashSet<>());
+            if (!p.isEmpty()) projectOf.put(m.id, p);
+        }
+        // Repos: the project of the agents on each repo's main checkout.
+        Map<String, String> repoProject = new HashMap<>();
+        for (Member m : placed) {
+            if (!m.isAgent()) continue;
+            Place own = git.places.get(trimSlash(m.cwd));
+            if (own == null || own.common.isEmpty() || !own.top.equals(mainTop(own, git))) continue;
+            if (!projectOf.containsKey(m.id)) projectOf.put(m.id, spaceTitle(spaces.get(spaceOfMember.get(m.id))));
+            repoProject.putIfAbsent(own.common, projectOf.get(m.id));
+        }
+        for (Member m : placed) {
+            if (!m.isAgent() || projectOf.containsKey(m.id)) continue;
+            Place own = git.places.get(trimSlash(m.cwd));
+            String name = "";
+            if (own != null && !own.common.isEmpty()) {
+                name = repoProject.containsKey(own.common) ? repoProject.get(own.common) : repoName(own.common);
+            }
+            if (name.isEmpty()) name = conventionRepo(Collections.singletonList(m));
+            if (name.isEmpty()) name = spaceTitle(spaces.get(spaceOfMember.get(m.id)));
+            if (!name.isEmpty()) projectOf.put(m.id, name);
+        }
+        // Shells follow their space when all its agents are in one project; else they stay loose.
+        Map<String, Set<String>> spaceProjects = new HashMap<>();
+        for (Member m : placed) {
+            if (projectOf.containsKey(m.id)) {
+                spaceProjects.computeIfAbsent(spaceOfMember.get(m.id), k -> new HashSet<>()).add(projectOf.get(m.id));
+            }
+        }
+        for (Member m : placed) {
+            if (projectOf.containsKey(m.id)) continue;
+            Set<String> ps = spaceProjects.get(spaceOfMember.get(m.id));
+            if (ps != null && ps.size() == 1) projectOf.put(m.id, ps.iterator().next());
         }
 
+        // Groups: each project holds its own members only, so one physical
+        // space can take part in several projects; every terminal is placed once.
         Map<String, Project> projects = new LinkedHashMap<>();
         Map<String, Map<String, SpaceNode>> entries = new HashMap<>();
-        int order = 0;
-        for (Map.Entry<String, List<Member>> entry : spaces.entrySet()) {
-            List<Member> list = entry.getValue();
-            Place place = placeOf.get(entry.getKey());
-            String name = labelOf.get(entry.getKey());
-            if (name.isEmpty() && place != null && repoProject.containsKey(place.common)) name = repoProject.get(place.common);
-            if (name.isEmpty() && place != null && !place.common.isEmpty()) name = repoName(place.common);
-            if (name.isEmpty()) name = conventionRepo(list);
-            boolean agents = false;
-            for (Member m : list) agents |= m.isAgent();
-            if (name.isEmpty() && agents) name = spaceTitle(list);
-            int at = order++;
-            if (name.isEmpty() || !agents) {
-                // A loose space stays one row, at its own place.
-                String key = place != null && !place.top.isEmpty() ? place.top : "space:" + entry.getKey();
-                SpaceNode node = new SpaceNode(key);
-                for (Member m : list) fill(node, entry.getKey(), m, place, at, git);
-                fleet.loose.add(node);
+        Map<String, SpaceNode> looseBySpace = new LinkedHashMap<>();
+        // Every checkout some terminal (a PM too) is in: never listed as unopened.
+        Set<String> open = new HashSet<>();
+        Map<String, Integer> spaceOrder = new HashMap<>();
+        for (String space : spaces.keySet()) spaceOrder.put(space, spaceOrder.size());
+        for (Member m : placed) {
+            String space = spaceOfMember.get(m.id);
+            int at = spaceOrder.get(space);
+            Place spacePlace = git.places.get(probe(spaces.get(space)));
+            String name = projectOf.get(m.id);
+            if (name == null) {
+                SpaceNode node = looseBySpace.get(space);
+                if (node == null) {
+                    String key = spacePlace != null && !spacePlace.top.isEmpty() ? spacePlace.top : "space:" + space;
+                    looseBySpace.put(space, node = new SpaceNode(key));
+                }
+                open.add(node.key);
+                fill(node, space, m, spacePlace, at, git);
                 continue;
             }
             Project project = projects.get(name);
             if (project == null) projects.put(name, project = new Project(name));
             Map<String, SpaceNode> rows = entries.computeIfAbsent(name, k -> new LinkedHashMap<>());
-            // Workers are tabs of their PM's space, each in its own worktree:
-            // every terminal goes to the row of its OWN checkout, not its space's.
-            for (Member m : list) {
-                Place own = git.places.get(trimSlash(m.cwd));
-                String key = own != null && !own.top.isEmpty() ? own.top
-                        : conventionTop(Collections.singletonList(m)) != null ? conventionTop(Collections.singletonList(m))
-                        : place != null && !place.top.isEmpty() ? place.top : "space:" + entry.getKey();
-                SpaceNode node = rows.get(key);
-                if (node == null) rows.put(key, node = new SpaceNode(key));
-                fill(node, entry.getKey(), m, own != null ? own : place, at, git);
-            }
-            if (project.repo.isEmpty() && place != null) project.repo = place.common;
+            // Its OWN checkout first; the space's only when that space is this project's alone.
+            Place own = git.places.get(trimSlash(m.cwd));
+            Set<String> inSpace = spaceProjects.getOrDefault(space, Collections.emptySet());
+            boolean spaceIsOurs = inSpace.size() <= 1;
+            Place use = own != null ? own : spaceIsOurs ? spacePlace : null;
+            String convention = conventionTop(Collections.singletonList(m));
+            String key = own != null && !own.top.isEmpty() ? own.top
+                    : convention != null ? convention
+                    : use != null && !use.top.isEmpty() ? use.top : "space:" + space;
+            SpaceNode node = rows.get(key);
+            if (node == null) rows.put(key, node = new SpaceNode(key));
+            fill(node, space, m, use, at, git);
+            open.add(key);
         }
+        fleet.loose.addAll(looseBySpace.values());
 
         for (Project project : projects.values()) {
             List<SpaceNode> rows = new ArrayList<>(entries.get(project.name).values());
@@ -308,33 +346,53 @@ final class FleetTree {
             if (project.pm == null && !explicitWorker) {
                 for (Member m : all) if (m.role.isEmpty() && m.isAgent()) { project.pm = m; project.pmInferred = true; break; }
             }
-            // The repo listed is the PM's checkout's, else the first open one's.
+            // The repo listed: the PM's own; a PM outside git uses its own
+            // members' repo, never another project's checkout.
             Place pmPlace = project.pm == null ? null : git.places.get(trimSlash(project.pm.cwd));
             if (pmPlace != null && !pmPlace.common.isEmpty()) project.repo = pmPlace.common;
+            else {
+                for (Member m : all) {
+                    Place own = git.places.get(trimSlash(m.cwd));
+                    if (own != null && !own.common.isEmpty()) { project.repo = own.common; break; }
+                }
+            }
             // Main checkout first, then worktrees, in space order.
             Collections.sort(rows, (a, b) -> a.worktree != b.worktree ? (a.worktree ? 1 : 0) - (b.worktree ? 1 : 0)
                     : Integer.compare(a.order, b.order));
             for (SpaceNode row : rows) {
                 row.members.remove(project.pm);
+                // A row that only held the PM is the PM row itself: no ghost checkout row.
+                if (row.members.isEmpty()) continue;
                 nest(row, project.pm);
                 for (Member m : row.members) count(project.tally, m.status);
+                project.entries.add(row);
             }
             if (project.pm != null) count(project.tally, project.pm.status);
-            project.entries.addAll(rows);
             fleet.projects.add(project);
         }
         for (SpaceNode node : fleet.loose) nest(node, null);
         // Each repo's unopened worktrees are listed once, under one owner
         // project, minus every checkout open anywhere on this computer.
-        Set<String> open = new HashSet<>();
-        for (Project project : fleet.projects) for (SpaceNode row : project.entries) open.add(row.key);
-        for (SpaceNode node : fleet.loose) open.add(node.key);
         Set<String> listed = new HashSet<>();
         for (Project project : fleet.projects) {
             if (project.repo.isEmpty() || !listed.add(project.repo)) continue;
             closedWorktrees(repoOwner(fleet.projects, project.repo, git), git, open);
         }
         return fleet;
+    }
+
+    /** An agent's project from labels: its own, its parent's, its space's when unambiguous. */
+    private static String labelledProject(Member m, Map<String, Member> byId, Map<String, String> spaceOf,
+            Map<String, Set<String>> spaceLabels, Set<String> seen) {
+        if (!m.project.isEmpty()) return m.project;
+        if (!seen.add(m.id)) return "";
+        Member parent = m.parent.isEmpty() ? null : byId.get(m.parent);
+        if (parent != null && parent != m && !"deacon".equals(parent.role)) {
+            String up = labelledProject(parent, byId, spaceOf, spaceLabels, seen);
+            if (!up.isEmpty()) return up;
+        }
+        Set<String> labels = spaceLabels.get(spaceOf.get(m.id));
+        return labels != null && labels.size() == 1 ? labels.iterator().next() : "";
     }
 
     private static void fill(SpaceNode node, String space, Member m, Place place, int order, GitLook git) {
@@ -351,6 +409,9 @@ final class FleetTree {
         // A worktree row is named after its checkout; a main or plain row after its space.
         if (node.worktree) {
             node.name = lastSegment(node.key);
+        } else if (node.name.isEmpty() && node.key.startsWith("space:") && !m.cwd.isEmpty()) {
+            // Outside git in a space shared by projects: named by its folder, not the space.
+            node.name = lastSegment(m.cwd);
         } else if (node.name.isEmpty()) {
             String title = spaceTitle(one);
             node.name = title.isEmpty() ? lastSegment(node.key) : title;

@@ -2282,7 +2282,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     if (!containsMember(row.members, selectedPane) && (project.pm == null
                             || !project.pm.id.equals(selectedPane))) continue;
                     changed |= collapsedRepos().remove(railKey(host, "p/" + project.name));
-                    changed |= collapsedRepos().remove(railKey(host, "s/" + row.key));
+                    changed |= collapsedRepos().remove(railKey(host, "s/" + project.name + "/" + row.key));
                 }
             }
             if (changed) {
@@ -2330,10 +2330,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             for (FleetTree.SpaceNode row : project.entries) {
                 int depth = base + 1;
                 if (!flat) {
-                    String rowKey = railKey(host, "s/" + row.key);
+                    String rowKey = railKey(host, "s/" + project.name + "/" + row.key);
                     boolean rowFolded = collapsedRepos().contains(rowKey);
                     String sub = row.branch.isEmpty() || row.branch.equals(row.name) ? "" : row.branch + " · ";
-                    railHeader(host, live, current, "row:" + row.key, (row.worktree ? "⑂ " : "") + row.name,
+                    railHeader(host, live, current, "row:" + project.name + "/" + row.key, (row.worktree ? "⑂ " : "") + row.name,
                             sub + row.members.size(), row.members.isEmpty() ? null : rowKey, rowFolded, depth,
                             row.members.isEmpty() ? "" : row.members.get(0).id, order, keep);
                     if (rowFolded) continue;

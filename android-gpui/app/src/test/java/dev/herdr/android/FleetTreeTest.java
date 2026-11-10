@@ -8,6 +8,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -228,7 +229,8 @@ public final class FleetTreeTest {
         FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(pm, wt, stray), git);
         assertEquals(Arrays.asList("new-world"), names(fleet));
         FleetTree.Project p = project(fleet, "new-world");
-        assertEquals(3, p.entries.size());
+        // The PM is the project row; its main checkout holds no one else, so no extra row.
+        assertEquals(2, p.entries.size());
         assertEquals("/srv/monopoly/.git", p.repo);
         // Only the PM's repo lists closed worktrees; the stray space's repo never does.
         assertEquals(1, p.closed.size());
@@ -290,9 +292,9 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("kache", "zulip", "notes"), names(fleet));
         FleetTree.Project kache = project(fleet, "kache");
         assertEquals("t1", kache.pm.id);
-        // Main checkout first, then ONE row for the five lanes, with every agent.
-        assertEquals(2, kache.entries.size());
-        FleetTree.SpaceNode lanes = kache.entries.get(1);
+        // ONE row for the five lanes, with every agent (the main checkout holds only the lead).
+        assertEquals(1, kache.entries.size());
+        FleetTree.SpaceNode lanes = kache.entries.get(0);
         assertTrue(lanes.worktree);
         assertEquals("/srv/lanes/kache-a", lanes.key);
         assertEquals("lane-a", lanes.branch);
@@ -433,6 +435,65 @@ public final class FleetTreeTest {
         List<String> out = new ArrayList<>();
         for (FleetTree.GitWorktree wt : p.closed) out.add(wt.path);
         return out;
+    }
+
+    @Test public void twoManagersInOneSpaceEachLeadTheirOwnProject() {
+        // The laptop: t67 (PM home-manager) and t5t (PM botd) are tabs of one space;
+        // t5t works from ~/Config (no git); botd's worker is in another space and repo.
+        FleetTree.Member t67 = label(m("t67", "hm", "home-manager", 0, 0, "/c/home-manager", "working"), "pm", "home-manager");
+        FleetTree.Member t5t = label(m("t5t", "hm", "home-manager", 0, 5, "/c", "done"), "pm", "botd");
+        FleetTree.Member hmWorker = label(m("t6m", "hm", "home-manager", 0, 3, "/wt/fleet", "working"), "worker", "home-manager");
+        hmWorker.parent = "t67";
+        FleetTree.Member botdWorker = label(m("t5h", "b", "botd", 1, 0, "/wt/botd-w5", "working"), "worker", "");
+        botdWorker.parent = "t5t"; // no project label: inherits its parent's
+        FleetTree.Member shell = m("t4h", "hm", "home-manager", 0, 6, "/c/home-manager", ""); // a shell in the shared space
+        FleetTree.GitLook git = FleetTree.parseGitLook(look(new String[][] {
+                {"/c/home-manager", "/c/home-manager/.git", "/c/home-manager", "main"},
+                {"/wt/fleet", "/c/home-manager/.git", "/wt/fleet", "fleet"},
+                {"/wt/botd-w5", "/p/botd/.git", "/wt/botd-w5", "w5"},
+                {"/c"}}, "/c/home-manager/.git", "/c/home-manager=main", "/wt/fleet=fleet", "/wt/hm-idle=idle")
+                + "R\t/p/botd/.git\nworktree /p/botd\nbranch refs/heads/main\n\nworktree /wt/botd-w5\nbranch refs/heads/w5\n\n"
+                + "worktree /wt/botd-idle\nbranch refs/heads/bi\n\nE\n", 200);
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(t5t, shell, hmWorker, botdWorker, t67), git);
+        FleetTree.Project hm = project(fleet, "home-manager");
+        FleetTree.Project botd = project(fleet, "botd");
+        assertSame(t67, hm.pm);
+        assertSame(t5t, botd.pm);
+        // botd: its worker's row only, its own repo's worktrees; no ghost home-manager row.
+        assertEquals("/p/botd/.git", botd.repo);
+        assertEquals(1, botd.entries.size());
+        assertEquals("/wt/botd-w5", botd.entries.get(0).key);
+        // Its main checkout is not open anywhere, so it is listed too.
+        assertEquals(Arrays.asList("/p/botd", "/wt/botd-idle"), closedPaths(botd));
+        for (FleetTree.SpaceNode row : botd.entries) assertFalse(row.key.startsWith("/c/home-manager"));
+        // home-manager keeps its worker and its own worktree list.
+        assertEquals("/c/home-manager/.git", hm.repo);
+        assertEquals(Arrays.asList("/wt/hm-idle"), closedPaths(hm));
+        // Every terminal exactly once; the shell of the shared space stays loose.
+        List<String> all = new ArrayList<>();
+        for (FleetTree.Project p : fleet.projects) {
+            if (p.pm != null) all.add(p.pm.id);
+            for (FleetTree.SpaceNode n : p.entries) all.addAll(ids(n.members));
+        }
+        for (FleetTree.SpaceNode n : fleet.loose) all.addAll(ids(n.members));
+        all.addAll(ids(fleet.others));
+        Collections.sort(all);
+        assertEquals(Arrays.asList("t4h", "t5h", "t5t", "t67", "t6m"), all);
+    }
+
+    @Test public void aPmOutsideGitWithNoWorkersHasNoBorrowedCheckout() {
+        FleetTree.Member a = label(m("t1", "s", "home-manager", 0, 0, "/c/home-manager", "idle"), "pm", "home-manager");
+        FleetTree.Member b = label(m("t2", "s", "home-manager", 0, 1, "/c", "idle"), "pm", "botd");
+        FleetTree.GitLook git = FleetTree.parseGitLook(look(new String[][] {
+                {"/c/home-manager", "/c/home-manager/.git", "/c/home-manager", "main"}, {"/c"}},
+                "/c/home-manager/.git", "/c/home-manager=main", "/wt/x=x"), 200);
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(a, b), git);
+        FleetTree.Project botd = project(fleet, "botd");
+        assertSame(b, botd.pm);
+        assertTrue(botd.entries.isEmpty());
+        assertEquals("", botd.repo);
+        assertTrue(botd.closed.isEmpty());
+        assertEquals(Arrays.asList("/wt/x"), closedPaths(project(fleet, "home-manager")));
     }
 
     // ── Leftovers are never dropped ─────────────────────────────────────

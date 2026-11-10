@@ -956,7 +956,8 @@ public final class HomeActivity extends Activity {
 
     /** A main checkout or worktree with its agents; every space at that checkout is one row. */
     private Row spaceRow(Machine machine, FleetTree.SpaceNode node, FleetTree.Project project) {
-        String key = machine.host.id + "/s/" + node.key;
+        // Namespaced by project: one checkout can show in two projects' groups.
+        String key = machine.host.id + "/s/" + (project == null ? "" : project.name) + "/" + node.key;
         Agent first = null;
         int[] tally = new int[4];
         int worst = 5;
