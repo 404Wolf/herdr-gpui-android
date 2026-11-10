@@ -496,6 +496,20 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("/wt/x"), closedPaths(project(fleet, "home-manager")));
     }
 
+    @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {
+        // The shared laptop space: t67's and t5t's projects each see a slice of it.
+        FleetTree.Member t67 = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "idle"), "pm", "home-manager");
+        FleetTree.Member w = label(m("t2", "hm", "home-manager", 0, 1, "/c/hm", "working"), "worker", "home-manager");
+        FleetTree.Member t5t = label(m("t5t", "hm", "home-manager", 0, 2, "/c", "idle"), "pm", "botd");
+        FleetTree.Member bw = label(m("t5h", "b", "botd", 1, 0, "/w/botd", "working"), "worker", "botd");
+        List<FleetTree.Member> all = Arrays.asList(t67, w, t5t, bw);
+        FleetTree.Fleet fleet = FleetTree.build(all, null);
+        // home-manager's row is a slice of the shared space (t67 and t5t are elsewhere): scoped.
+        for (FleetTree.SpaceNode row : project(fleet, "home-manager").entries) assertNull(FleetTree.wholeSpace(row, all));
+        // botd's worker row is its whole space: the space's own menu is fine there.
+        assertEquals("b", FleetTree.wholeSpace(project(fleet, "botd").entries.get(0), all));
+    }
+
     // ── Leftovers are never dropped ─────────────────────────────────────
 
     @Test public void shellOnlySpacesAndSpacelessAgentsStayVisible() {

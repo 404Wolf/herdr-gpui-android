@@ -640,6 +640,19 @@ final class FleetTree {
         return !root.isEmpty() && (path.equals(root) || path.startsWith(root.endsWith("/") ? root : root + "/"));
     }
 
+    /**
+     * The physical space a checkout row may offer the space's own menu for
+     * (Rename, Move, New agent): only when the row is that one space, wholly,
+     * every terminal of it in this row. Otherwise null: the row is a virtual
+     * slice of a shared space, and its menu stays scoped to its terminals.
+     */
+    static String wholeSpace(SpaceNode row, List<? extends Member> all) {
+        if (row.spaces.size() != 1) return null;
+        String space = row.spaces.get(0);
+        for (Member m : all) if (space.equals(m.space) && !row.members.contains(m)) return null;
+        return space;
+    }
+
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */
     static Member newProjectTarget(Fleet fleet) {
         return fleet.deacon;

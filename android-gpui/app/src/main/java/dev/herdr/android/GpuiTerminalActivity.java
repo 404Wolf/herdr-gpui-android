@@ -2336,6 +2336,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     railHeader(host, live, current, "row:" + project.name + "/" + row.key, (row.worktree ? "⑂ " : "") + row.name,
                             sub + row.members.size(), row.members.isEmpty() ? null : rowKey, rowFolded, depth,
                             row.members.isEmpty() ? "" : row.members.get(0).id, order, keep);
+                    RailWorkspaceRow drawn = railWorkspaces.get("fleet:" + host.id + "/row:" + project.name + "/" + row.key);
+                    String whole = FleetTree.wholeSpace(row, members);
+                    if (drawn != null && whole != null) { drawn.physicalSpace = whole; drawn.workspaceId = whole; }
                     if (rowFolded) continue;
                     depth++;
                 }
@@ -2446,6 +2449,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         row.live = live;
         row.connection = current;
         row.firstPane = firstPane;
+        // Virtual by default: the scoped menu (open its terminal, copy details).
+        row.physicalSpace = null;
         row.workspaceId = railSpaceOf.getOrDefault(firstPane, "");
         row.foldKey = foldKey;
         row.folded = folded;
@@ -2540,6 +2545,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (deacon != null) railNewProject(host, live, current, deacon);
             else if (live && !busy) railStartDeacon(host, current);
         });
+    }
+
+    /** A Fleet header's menu: only its own terminal and details, never the shared space's edits. */
+    private void showFleetHeaderActions(RailWorkspaceRow holder) {
+        String label = holder.label.getText().toString();
+        ActionSheet sheet = new ActionSheet(this, chrome, label);
+        String pane = holder.firstPane;
+        if (pane != null && !pane.isEmpty()) {
+            sheet.add("Open", () -> {
+                if (holder.live && holder.connection != null) focusRemotePane(holder.connection, pane);
+                else switchHost(holder.host, pane);
+                closeRailDrawer();
+            });
+            String cwd = holder.live ? paneCwd(holder.connection, pane) : "";
+            if (!cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", cwd));
+            sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", pane));
+        }
+        sheet.add("Copy name", () -> ActionSheet.copy(this, "Name", label));
+        sheet.show();
     }
 
     /** Runs one session action off the main thread; ok gets the reply on the main thread. */
@@ -2877,7 +2901,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         chevronParams.leftMargin = dp(4);
         holder.row.addView(chevron, chevronParams);
         holder.row.setBackground(railBackground(false));
-        holder.row.setOnLongClickListener(view -> { showSpaceActions(holder); return true; });
+        holder.row.setOnLongClickListener(view -> {
+            // A Fleet header (project, checkout slice, group) is not a physical
+            // space: its menu never renames, moves or adds to the shared space.
+            if (holder.physicalSpace == null) showFleetHeaderActions(holder);
+            else showSpaceActions(holder);
+            return true;
+        });
         holder.row.setOnClickListener(view -> {
             // Every header folds from anywhere on its row (a repo its
             // worktrees, a worktree or space its windows); Open is on its
@@ -3190,6 +3220,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         /** What this header folds (a repo's worktrees, or its own windows), or null. */
         String foldKey;
         boolean folded;
+        /** The one physical space this row wholly is, or null for a Fleet header (scoped menu). */
+        String physicalSpace = "";
     }
 
     private static final class RailPaneRow {
