@@ -73,6 +73,9 @@ struct Shared {
     /// The remote side's authoritative grid, once it negotiated one: the
     /// program wraps at this width, so the grid follows it, not the pane.
     negotiated: Mutex<Option<(u16, u16)>>,
+    /// Grid changes queued in stream order, for the reader to apply at its
+    /// parser boundary (after flushing a pending synchronized update).
+    grid_controls: Mutex<std::collections::VecDeque<(u16, u16)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -136,6 +139,7 @@ impl Session {
             title: Mutex::new(None),
             offer: Mutex::new((columns, lines)),
             negotiated: Mutex::new(None),
+            grid_controls: Mutex::new(std::collections::VecDeque::new()),
         });
         let (input_queue, queued) = mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
         thread::Builder::new()
@@ -266,6 +270,19 @@ impl Session {
         true
     }
 
+    /// The remote side's grid, in stream order: the transport calls this
+    /// where the grid change sits between stream bytes, then returns from
+    /// `read` without more bytes. The reader then ends any synchronized
+    /// update pending under the old grid (its buffered bytes are parsed at
+    /// that size) and only then applies the new grid, before reading on.
+    pub fn queue_grid(&self, columns: u16, lines: u16) -> bool {
+        if columns == 0 || lines == 0 {
+            return false;
+        }
+        lock(&self.shared.grid_controls).push_back((columns, lines));
+        true
+    }
+
     /// Back to the pane's own geometry (a path that does not negotiate).
     pub fn clear_grid(&self) {
         *lock(&self.shared.negotiated) = None;
@@ -287,9 +304,21 @@ impl Session {
 
     /// Resizes the cell grid to `target` when it differs; true when it did.
     fn apply_grid(&self, target: (u16, u16), pixels: Option<(u16, u16)>) -> bool {
+        apply_grid(&self.grid, &self.shared, target, pixels)
+    }
+}
+
+/// Resizes `grid` to `target` (and records it as the window size); true when it changed.
+fn apply_grid(
+    grid: &FairMutex<Crosswords<Listener>>,
+    shared: &Shared,
+    target: (u16, u16),
+    pixels: Option<(u16, u16)>,
+) -> bool {
+    {
         let (columns, lines) = (target.0.max(2), target.1.max(1));
         let changed = {
-            let mut size = lock(&self.shared.size);
+            let mut size = lock(&shared.size);
             let changed = size.cols != columns || size.rows != lines;
             size.cols = columns;
             size.rows = lines;
@@ -300,13 +329,16 @@ impl Session {
             changed
         };
         if changed {
-            self.grid.lock().resize(CrosswordsSize::new(
+            grid.lock().resize(CrosswordsSize::new(
                 usize::from(columns),
                 usize::from(lines),
             ));
         }
         changed
     }
+}
+
+impl Session {
 
     /// Typed text, sent as is. Returns false when the input queue is full.
     pub fn type_text(&self, text: &str) -> bool {
@@ -443,6 +475,22 @@ impl Reader {
                 }
                 Err(_) => break,
             };
+            // Grid changes the transport queued at this point in the stream:
+            // end a synchronized update still pending under the old grid (its
+            // bytes are parsed at that size), then switch grids, before any
+            // later byte is read.
+            let controls: Vec<(u16, u16)> = lock(&self.shared.grid_controls).drain(..).collect();
+            for (columns, lines) in controls {
+                let mut grid = self.grid.lock();
+                if processor.sync_timeout().sync_timeout().is_some() {
+                    processor.stop_sync(&mut *grid);
+                    self.answer(&grid);
+                }
+                drop(grid);
+                *lock(&self.shared.negotiated) = Some((columns, lines));
+                apply_grid(&self.grid, &self.shared, (columns, lines), None);
+                self.dirty.store(true, Ordering::Release);
+            }
             let flush = processor
                 .sync_timeout()
                 .sync_timeout()

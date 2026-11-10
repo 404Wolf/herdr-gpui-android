@@ -939,10 +939,12 @@ struct StreamRead {
     session: Arc<Mutex<Weak<gpui_rio::Session>>>,
 }
 impl Read for StreamRead {
-    /// Rio's reader parses each read's bytes before it reads again, so a
-    /// Grid item reached here applies only after every earlier byte was
-    /// parsed: a RESIZE never overtakes older DATA, and later DATA always
-    /// meets the new grid.
+    /// A Grid item is reached only once every earlier byte was handed out
+    /// (and so parsed: Rio parses each read before reading again). It is
+    /// queued with the session and this read returns no bytes, so Rio's
+    /// reader applies it next, at its parser boundary: it first ends a
+    /// synchronized update pending under the old grid, then switches grids,
+    /// and only then reads the DATA after it.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
@@ -952,8 +954,9 @@ impl Read for StreamRead {
                 Ok(Chunk::Data(bytes)) => self.chunks.extend(bytes),
                 Ok(Chunk::Grid(cols, rows)) => {
                     if let Some(session) = lock(&self.session).upgrade() {
-                        session.set_grid(cols, rows);
+                        session.queue_grid(cols, rows);
                     }
+                    return Err(io::ErrorKind::TimedOut.into());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::ErrorKind::TimedOut.into()),
                 Err(_) => return Ok(0),
@@ -1907,6 +1910,36 @@ mod connection_tests {
         assert!(runtime.join().unwrap().is_ok());
         peer.join().unwrap();
     }
+    #[test]
+    fn a_resize_inside_a_synchronized_update_flushes_it_at_the_old_grid_first() {
+        // BSU, then a move to column 30 on a 20-column grid plus "A" (buffered
+        // by the pending update), then RESIZE to 40, then ESU and a second move.
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
+        assert!(session.set_grid(20, 4));
+        *lock(&slot) = Arc::downgrade(&session);
+        tx.send(Chunk::Data(b"\x1b[?2026h".to_vec())).unwrap();
+        tx.send(Chunk::Data(b"\x1b[1;30HA".to_vec())).unwrap();
+        tx.send(Chunk::Grid(40, 4)).unwrap();
+        tx.send(Chunk::Data(b"\x1b[?2026l\x1b[2;30HB".to_vec())).unwrap();
+        let cell = |row: usize, col: usize| {
+            session.screen_text().lines().nth(row).and_then(|line| line.chars().nth(col)).unwrap_or(' ')
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cell(1, 29) != 'B' {
+            assert!(Instant::now() < deadline, "the content after ESU never rendered at the new grid:\n{}", session.screen_text());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(session.grid_size(), (40, 4));
+        // The buffered move was parsed under the old 20-column grid: column 20.
+        assert_eq!(cell(0, 19), 'A', "{}", session.screen_text());
+        assert_eq!(cell(0, 29), ' ', "{}", session.screen_text());
+    }
+
     #[test]
     fn a_resize_never_overtakes_older_data_still_queued() {
         // DATA at the old grid, RESIZE, DATA: all queued before Rio parses any.
