@@ -226,6 +226,14 @@ impl Connection<'_> {
                 }
                 Some(TabEdit::GitLook { paths }) => return self.git_look(&paths),
                 Some(TabEdit::SpaceOpen { folder }) => {
+                    // Fresh, not cached: a retry after a slow answer must find
+                    // the space it already made instead of making a second.
+                    let list = self.call("terminal.list", json!({}))?;
+                    let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+                    if let Some(terminal) = existing_at(&list["terminals"], &doc["value"], &folder) {
+                        self.refresh()?;
+                        return Ok(json!({"queued":true,"terminal":terminal,"existing":true}).to_string());
+                    }
                     let (terminal, layout_error) =
                         self.launch_space("", Some(&folder), None, json!({}), cols, rows)?;
                     let mut reply = json!({"queued":true,"terminal":terminal});
@@ -811,6 +819,33 @@ fn canonical_deacon(terminals: &Value, doc: &Value) -> Option<String> {
         .min_by_key(|(p, created, t)| (*p, *created, address(t).unwrap_or("").to_owned()))
         .and_then(|(_, _, t)| address(t).map(str::to_owned))
 }
+/// A live local terminal already at `folder`: one in a space whose folder it
+/// is, else one whose working directory is in it.
+fn existing_at(terminals: &Value, doc: &Value, folder: &str) -> Option<String> {
+    let folder = folder.trim_end_matches('/');
+    let within = |path: &str| {
+        let path = path.trim_end_matches('/');
+        path == folder || path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
+    };
+    let live: Vec<&Value> = terminals
+        .as_array()?
+        .iter()
+        .filter(|t| t["state"] == "live" && address(t).is_some_and(|a| !a.contains('/')))
+        .collect();
+    let spaces: Vec<&str> = doc["spaces"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|s| s["folder"].as_str().is_some_and(|f| f.trim_end_matches('/') == folder))
+                .filter_map(|s| s["id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    live.iter()
+        .find(|t| t["labels"]["herdr.space"].as_str().is_some_and(|s| spaces.contains(&s)))
+        .or_else(|| live.iter().find(|t| t["cwd"].as_str().is_some_and(within)))
+        .and_then(|t| address(t).map(str::to_owned))
+}
 fn address(terminal: &Value) -> Option<&str> {
     terminal["address"].as_str().or(terminal["id"].as_str())
 }
@@ -1244,7 +1279,26 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIT_LOOK, add_space, canonical_deacon, deacon_line};
+    use super::{GIT_LOOK, add_space, canonical_deacon, deacon_line, existing_at};
+    #[test]
+    fn reopening_a_worktree_finds_the_space_already_there() {
+        let doc = json!({"spaces":[{"id":"sp1","folder":"/w/lane/","tabs":[]}]});
+        let t = |id: &str, space: &str, cwd: &str| json!({"address":id,"state":"live","cwd":cwd,"labels":{"herdr.space":space}});
+        // The space made by a first try whose answer timed out: found by its folder.
+        let first = json!([t("t1", "other", "/w"), t("t7", "sp1", "/home")]);
+        assert_eq!(existing_at(&first, &doc, "/w/lane").as_deref(), Some("t7"));
+        // Or a terminal already working inside it.
+        let inside = json!([t("t2", "x", "/w/lane-2"), t("t3", "x", "/w/lane/src")]);
+        assert_eq!(existing_at(&inside, &json!({}), "/w/lane").as_deref(), Some("t3"));
+        // Nothing there: open it.
+        assert_eq!(existing_at(&json!([t("t2", "x", "/w/lane-2"), t("server/t3", "x", "/w/lane")]), &json!({}), "/w/lane"), None);
+    }
+    #[test]
+    fn a_deacon_whose_claude_was_missing_is_found_again_not_relaunched() {
+        // The first start's terminal: labelled at birth, claude missing, kept as a shell.
+        let kept = json!([{"address":"t9","state":"live","labels":{"role":"deacon","herdr.space":"spX"},"status":{},"created_ms":5}]);
+        assert_eq!(canonical_deacon(&kept, &json!({})).as_deref(), Some("t9"));
+    }
     #[test]
     fn adding_a_space_keeps_every_existing_space_and_tab() {
         let mut doc = json!({"spaces":[{"id":"s1","name":"botd","tabs":[{"id":"a","name":"pm"},{"id":"b"}]}],"other":1});

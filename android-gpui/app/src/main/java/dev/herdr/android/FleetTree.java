@@ -502,6 +502,17 @@ final class FleetTree {
         return now - lastAt >= (newFolder ? newMs : everyMs);
     }
 
+    /** A terminal already working in {@code folder} (fresh view, not the git cache), or null. */
+    static Member memberAt(List<? extends Member> members, String folder) {
+        String root = trimSlash(folder);
+        for (Member m : members) if (within(trimSlash(m.cwd), root)) return m;
+        return null;
+    }
+
+    static boolean within(String path, String root) {
+        return !root.isEmpty() && (path.equals(root) || path.startsWith(root.endsWith("/") ? root : root + "/"));
+    }
+
     /** Who "New project" talks to: the computer's Deacon, never an automatic PM. */
     static Member newProjectTarget(Fleet fleet) {
         return fleet.deacon;

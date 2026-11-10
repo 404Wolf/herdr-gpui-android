@@ -305,6 +305,53 @@ public final class FleetTreeTest {
         for (FleetTree.GitWorktree wt : p.closed) assertFalse(wt.path.equals("/r/stale") || wt.path.equals("/r/wt0"));
     }
 
+    @Test public void aChildInAnotherCheckoutStaysInItsOwnWorktree() {
+        FleetTree.Member pm = label(m("t1", "s", "app", 0, 0, "/r/app", "idle"), "pm", "app");
+        FleetTree.Member worker = label(m("t2", "s", "app", 0, 1, "/r/wt-a", "working"), "worker", "app");
+        worker.parent = "t1";
+        FleetTree.Member sub = label(m("t3", "s", "app", 0, 2, "/r/wt-b/src", "working"), "worker", "app");
+        sub.parent = "t2"; // its parent works in another checkout
+        FleetTree.GitLook git = FleetTree.parseGitLook(look(new String[][] {
+                {"/r/app", "/r/app/.git", "/r/app", "main"},
+                {"/r/wt-a", "/r/app/.git", "/r/wt-a", "a"},
+                {"/r/wt-b/src", "/r/app/.git", "/r/wt-b", "b"}},
+                "/r/app/.git", "/r/app=main", "/r/wt-a=a", "/r/wt-b=b"), 200);
+        FleetTree.Project p = FleetTree.build(Arrays.asList(pm, worker, sub), git).projects.get(0);
+        FleetTree.SpaceNode a = null, b = null;
+        for (FleetTree.SpaceNode n : p.entries) {
+            if (n.key.equals("/r/wt-a")) a = n;
+            if (n.key.equals("/r/wt-b")) b = n;
+        }
+        assertEquals(Arrays.asList("t2"), agentIds(a));
+        assertTrue(a.agents.get(0).children.isEmpty());
+        assertEquals(Arrays.asList("t3"), agentIds(b));
+        assertSame(sub, b.members.get(0));
+        assertTrue(p.closed.isEmpty());
+    }
+
+    @Test public void reopeningAWorktreeFindsTheTerminalAlreadyThere() {
+        FleetTree.Member there = m("t5", "s9", "", 3, 0, "/r/wt-c/src", "");
+        List<FleetTree.Member> all = Arrays.asList(m("t1", "s", "app", 0, 0, "/r/wt-cc", "idle"), there);
+        assertSame(there, FleetTree.memberAt(all, "/r/wt-c/"));
+        assertNull(FleetTree.memberAt(all, "/r/wt-d"));
+    }
+
+    @Test public void newProjectGoesToEachComputersOwnDeacon() {
+        String[] computers = {"laptop", "server", "Macro (Google)"};
+        Set<String> targets = new HashSet<>();
+        for (String computer : computers) {
+            FleetTree.Member d = label(m("t1", "s", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+            d.title = computer;
+            FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(d, m("t2", "x", "app", 1, 0, "/w/app", "idle")), null);
+            assertSame(d, FleetTree.newProjectTarget(fleet));
+            targets.add(FleetTree.newProjectTarget(fleet).title);
+            assertTrue(FleetTree.newProjectPrompt(computer).startsWith("I want to start a new project on " + computer + ". "));
+        }
+        assertEquals(3, targets.size());
+        // An offline computer offers neither Start nor launches.
+        assertEquals(FleetTree.DeaconAction.NONE, FleetTree.deaconAction(false, null, false));
+    }
+
     // ── Leftovers are never dropped ─────────────────────────────────────
 
     @Test public void shellOnlySpacesAndSpacelessAgentsStayVisible() {

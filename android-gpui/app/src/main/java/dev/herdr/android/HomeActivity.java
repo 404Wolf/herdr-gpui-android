@@ -1351,6 +1351,9 @@ public final class HomeActivity extends Activity {
      * labelled worker); a bare shell is only the secondary choice.
      */
     private void closedWorktreeActions(Machine machine, FleetTree.GitWorktree wt, String name) {
+        // The git cache can lag: a terminal already there (a slow first open) is opened instead.
+        FleetTree.Member there = FleetTree.memberAt(members(machine), wt.path);
+        if (there != null) { openAgent((Agent) there); return; }
         FleetTree.Member deacon = FleetTree.canonicalDeacon(members(machine));
         ActionSheet sheet = new ActionSheet(this, chrome, name);
         if (deacon != null) {
