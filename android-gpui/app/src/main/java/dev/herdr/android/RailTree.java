@@ -29,6 +29,15 @@ final class RailTree {
         return repos;
     }
 
+    /**
+     * The remembered fold of one worktree's or space's windows: per machine and
+     * the space's rail name, which outlives a daemon restart. Kept apart from a
+     * repo's fold ("host/repo") so a repo and its own space fold separately.
+     */
+    static String spaceFoldKey(String hostId, String spaceLabel) {
+        return hostId + "/space:" + spaceLabel;
+    }
+
     /** "~/.herdr/worktrees/monopoly/wolf-x/src" → "monopoly". */
     static String repoOfPath(String cwd) {
         int at = cwd == null ? -1 : cwd.indexOf(WORKTREES);

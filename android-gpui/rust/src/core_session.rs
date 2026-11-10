@@ -890,6 +890,11 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "role": label("role").unwrap_or(""),
             "project": label("project").unwrap_or(""),
             "kind": kind.unwrap_or(""),
+            // What the deacon view shows under each agent: the program's own
+            // status message, why it is blocked, and since when (core clock, ms).
+            "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),
+            "wait_kind": terminal["status"]["kind"].as_str().unwrap_or(""),
+            "status_ms": terminal["status_ms"].as_u64().unwrap_or(0),
         }));
     }
     if spaces.len() > 256 || tabs.len() > 512 {
@@ -1057,12 +1062,16 @@ mod tests {
         let mut view = json!({"revision":0});
         project(
             &mut view,
-            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex"},"status":{"state":"blocked"}},{"id":"t2","state":"live","labels":{"role":"none"},"parent":"t1","argv":["/usr/bin/claude"]},{"id":"t3","state":"live","cwd":"/home/w/botd","labels":{"herdr.space":"sp9","where":"botd / w1-backend"}},{"id":"t4","state":"live","cwd":"/home/w/zulip/","labels":{"herdr.space":"sp8"}}]),
+            &json!([{"id":"t1","state":"live","title":"Agent","labels":{"herdr.space":"s1","herdr.tab":"a","role":"pm","project":"billing","agent.kind":"codex"},"status":{"state":"blocked","msg":"Run the migration?","kind":"question"},"status_ms":42},{"id":"t2","state":"live","labels":{"role":"none"},"parent":"t1","argv":["/usr/bin/claude"]},{"id":"t3","state":"live","cwd":"/home/w/botd","labels":{"herdr.space":"sp9","where":"botd / w1-backend"}},{"id":"t4","state":"live","cwd":"/home/w/zulip/","labels":{"herdr.space":"sp8"}}]),
             &json!({"spaces":[{"id":"s1","name":"Code","tabs":[{"id":"a","name":"Fix"}]}]}),
         )?;
         assert_eq!(view["workspaces"][0]["label"], "Code");
         assert_eq!(view["tabs"][0]["label"], "Fix");
         assert_eq!(view["panes"][0]["status"], "blocked");
+        assert_eq!(view["panes"][0]["msg"], "Run the migration?");
+        assert_eq!(view["panes"][0]["wait_kind"], "question");
+        assert_eq!(view["panes"][0]["status_ms"], 42);
+        assert_eq!(view["panes"][1]["msg"], "");
         assert_eq!(
             [
                 &view["panes"][0]["role"],

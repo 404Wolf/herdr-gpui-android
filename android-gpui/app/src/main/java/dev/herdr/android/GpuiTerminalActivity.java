@@ -2217,12 +2217,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         for (String repoName : repos.values()) {
             if (repoNames.contains(repoName)) worktreeCounts.merge(repoName, 1, Integer::sum);
         }
-        String activeGroup = null;
+        String activeGroup = null, activeSpace = null;
         if (live && current != null) {
             for (int q = 0; q < panes.length(); q++) {
                 JSONObject pane = panes.optJSONObject(q);
                 if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
                 String space = pane.optString("workspace_id", "");
+                activeSpace = space;
                 String r = repos.get(space);
                 if (r != null) activeGroup = r;
                 for (int w = 0; w < workspaces.length() && activeGroup == null; w++) {
@@ -2235,7 +2236,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // opens its folded repo once; folding it again afterwards sticks.
         if (live && current != null && activeGroup != null && !current.paneId.equals(unfoldedFor)) {
             unfoldedFor = current.paneId;
-            if (collapsedRepos().remove(host.id + "/" + activeGroup)) {
+            boolean spaceOpened = activeSpace != null && collapsedRepos().remove(RailTree.spaceFoldKey(host.id,
+                    labels.getOrDefault(activeSpace, activeSpace)));
+            if (collapsedRepos().remove(host.id + "/" + activeGroup) | spaceOpened) {
                 getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
                         .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
             }
@@ -2252,6 +2255,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             int worktreesUnder = repo == null ? worktreeCounts.getOrDefault(group, 0) : 0;
             boolean folded = (nested || worktreesUnder > 0) && collapsedRepos().contains(groupKey);
             if (nested && folded) continue;
+            // Every other header (a worktree, a plain space) folds its own
+            // windows; remembered by its name, which outlives a daemon restart.
+            String spaceKey = worktreesUnder > 0 ? null : RailTree.spaceFoldKey(host.id,
+                    labels.getOrDefault(workspaceId, workspaceId));
             String workspaceKey = "ws:" + host.id + "/" + workspaceId;
             keep.add(workspaceKey);
             RailWorkspaceRow workspaceRow = railWorkspaces.get(workspaceKey);
@@ -2276,17 +2283,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if ("working".equals(status)) working++;
                 if (live && current != null && current.paneId.equals(paneId)) holdsSelection = true;
             }
+            boolean windowsFolded = spaceKey != null && !windows.isEmpty() && collapsedRepos().contains(spaceKey);
+            workspaceRow.foldKey = worktreesUnder > 0 ? groupKey : windows.isEmpty() ? null : spaceKey;
+            workspaceRow.folded = folded || windowsFolded;
             updateRailWorkspaceRow(workspaceRow, host, workspaceLabel, live, current, workspaceId,
                     firstPane, holdsSelection, nested, windows.size(), waiting, working);
-            workspaceRow.foldKey = worktreesUnder > 0 ? groupKey : null;
-            String mark = nested ? "⑂" : worktreesUnder > 0 ? (folded ? "▸" : "▾") : "▪";
+            String mark = folded || windowsFolded ? "▸" : workspaceRow.foldKey != null ? "▾" : "▪";
             if (!mark.contentEquals(workspaceRow.mark.getText())) workspaceRow.mark.setText(mark);
             String folds = folded ? "  +" + worktreesUnder + " wt" : "";
             if (!folds.isEmpty() && !workspaceRow.meta.getText().toString().endsWith(folds)) {
                 workspaceRow.meta.append(folds);
             }
             order.add(workspaceRow.row);
-            if (folded) continue;
+            if (folded || windowsFolded) continue;
             for (int p = 0; p < panes.length(); p++) {
                 JSONObject pane = panes.optJSONObject(p);
                 if (pane == null || !workspaceId.equals(pane.optString("workspace_id", ""))) continue;
@@ -2448,7 +2457,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row.setFocusable(true);
         holder.row.setClickable(true);
         holder.mark = railText("", 12, chrome.onSurfaceVariant);
-        // The chevron is its own target (fold the repo); the rest of the row opens it.
+        // The chevron folds, like the rest of the row; Open is on the long press.
         holder.mark.setGravity(android.view.Gravity.CENTER);
         holder.mark.setMinWidth(dp(22));
         holder.mark.setMinHeight(dp(28));
@@ -2476,8 +2485,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row.setBackground(railBackground(false));
         holder.row.setOnLongClickListener(view -> { showSpaceActions(holder); return true; });
         holder.row.setOnClickListener(view -> {
-            // A repo with worktrees folds from anywhere on its row; Open is
-            // on its long-press menu. Worktrees and plain spaces open.
+            // Every header folds from anywhere on its row (a repo its
+            // worktrees, a worktree or space its windows); Open is on its
+            // long-press menu, and a window row opens that window.
             if (holder.foldKey != null) {
                 toggleRepo(holder.foldKey);
                 return;
@@ -2531,7 +2541,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     ? chrome.onSurface : chrome.primary);
             holder.mark.setTextColor(holdsSelection ? chrome.primary : chrome.onSurfaceVariant);
         }
-        String described = "Open " + (nested ? "worktree " : "space ") + label + ", " + windows
+        String verb = holder.foldKey == null ? "Open " : holder.folded ? "Unfold " : "Fold ";
+        String described = verb + (nested ? "worktree " : "space ") + label + ", " + windows
                 + (windows == 1 ? " window" : " windows") + (holdsSelection ? ", current" : "");
         if (!described.contentEquals(holder.row.getContentDescription() == null
                 ? "" : holder.row.getContentDescription())) {
@@ -2780,8 +2791,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String firstPane = "";
         boolean live;
         Boolean nested, selected;
-        /** Machine/repo this header folds, or null when it has no worktrees. */
+        /** What this header folds (a repo's worktrees, or its own windows), or null. */
         String foldKey;
+        boolean folded;
     }
 
     private static final class RailPaneRow {

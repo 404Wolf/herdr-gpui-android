@@ -20,6 +20,13 @@ public final class RailTreeTest {
         assertNull(RailTree.repoOfPath(""));
     }
 
+    @Test public void aSpaceFoldIsPerMachineAndApartFromItsRepoFold() {
+        assertEquals("mac/space:wolf-x", RailTree.spaceFoldKey("mac", "wolf-x"));
+        // A repo's own space folds its windows without folding its worktrees.
+        org.junit.Assert.assertNotEquals("mac/monopoly", RailTree.spaceFoldKey("mac", "monopoly"));
+        org.junit.Assert.assertNotEquals(RailTree.spaceFoldKey("mac", "wolf-x"), RailTree.spaceFoldKey("srv", "wolf-x"));
+    }
+
     @Test public void worktreesFollowTheirRepoAndOthersKeepTheirPlace() throws Exception {
         JSONArray spaces = new JSONArray()
                 .put(space("a", "wolf-x"))

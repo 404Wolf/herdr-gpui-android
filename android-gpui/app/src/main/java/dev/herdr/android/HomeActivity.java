@@ -45,7 +45,10 @@ import org.json.JSONObject;
  * The app's home: every machine the device trusts, connected in the background,
  * as one tree of Machine › Space › agents arranged by role (deacon, project
  * managers, workers, from the deacon skill's labels and hc's parent), with live
- * status. Folded it is one dense list; unfolded the tree is a persistent left
+ * status. Tree guides draw who reports to whom; a deacon or manager folds its
+ * reports and counts how many of them wait or work; each of the skill's agents
+ * says its status in words, for how long, and its latest message (hc's status
+ * msg). Folded it is one dense list; unfolded the tree is a persistent left
  * pane beside a Fleet overview of what is working, waiting or failing. A small
  * search button (or Ctrl+K) opens a picker across all of it. Hosts, keys and
  * settings stay on the host list ("Hosts").
@@ -72,7 +75,15 @@ public final class HomeActivity extends Activity {
     private static final class Agent {
         Machine machine;
         String id, title, status, space, spaceLabel, parent, role, project, kind, cwd;
+        /** The program's own status message, and what it waits for when blocked. */
+        String msg, waitKind;
+        /** When the status last changed, on the core's clock (0: unknown). */
+        long statusMs;
         int depth;
+        /** Tree guide in front of the row: "│  ├ ", "└ ", nothing at the top. */
+        String guide = "";
+        /** Everything under it in the hierarchy, and how much of that waits or works. */
+        int below, belowWaiting, belowWorking;
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -87,7 +98,10 @@ public final class HomeActivity extends Activity {
     private GpuiChrome chrome;
     private LinearLayout tree, fleet;
     private TextView summary;
-    private String signature = "";
+    private String signature = "", chatter = "";
+    /** When a working agent's message last rebuilt the tree on its own. */
+    private long chatterAt;
+    private static final long CHATTER_MS = 10_000;
     private boolean resumed, destroyed, opening;
     /** Hidden (onStop): no background sessions until the next onResume. */
     private boolean stopped;
@@ -363,6 +377,9 @@ public final class HomeActivity extends Activity {
             agent.kind = pane.optString("kind", "");
             if ("none".equals(agent.kind)) agent.kind = "";
             agent.cwd = pane.optString("cwd", "");
+            agent.msg = pane.optString("msg", "").replace('\n', ' ').trim();
+            agent.waitKind = pane.optString("wait_kind", "");
+            agent.statusMs = pane.optLong("status_ms", 0);
             flat.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
         }
         // The hierarchy spans spaces: a deacon's managers and their workers
@@ -385,7 +402,8 @@ public final class HomeActivity extends Activity {
         for (Map.Entry<String, List<Agent>> entry : roots.entrySet()) {
             List<Agent> ordered = new ArrayList<>();
             sortAgents(entry.getValue());
-            for (Agent root : entry.getValue()) walk(root, 0, children, ordered, seen);
+            for (Agent root : entry.getValue()) walk(root, 0, "", true, children, ordered, seen);
+            rollUp(ordered);
             result.put(entry.getKey(), ordered);
         }
         // Parent cycles: anything unvisited still shows, at the top of its space.
@@ -441,15 +459,56 @@ public final class HomeActivity extends Activity {
         });
     }
 
-    private static void walk(Agent agent, int depth, Map<String, List<Agent>> children,
-            List<Agent> out, Set<String> seen) {
+    private static void walk(Agent agent, int depth, String prefix, boolean last,
+            Map<String, List<Agent>> children, List<Agent> out, Set<String> seen) {
         if (!seen.add(agent.id) || depth > 8) return;
         agent.depth = depth;
+        agent.guide = depth == 0 ? "" : prefix + (last ? "└ " : "├ ");
+        agent.below = agent.belowWaiting = agent.belowWorking = 0;
         out.add(agent);
         List<Agent> kids = children.get(agent.id);
         if (kids == null) return;
         sortAgents(kids);
-        for (Agent kid : kids) walk(kid, depth + 1, children, out, seen);
+        String next = depth == 0 ? "" : prefix + (last ? "   " : "│  ");
+        for (int i = 0; i < kids.size(); i++) {
+            walk(kids.get(i), depth + 1, next, i == kids.size() - 1, children, out, seen);
+        }
+    }
+
+    /** Counts each agent's reports, all the way down, from the tree order. */
+    static void rollUp(List<Agent> ordered) {
+        List<Agent> path = new ArrayList<>();
+        for (Agent agent : ordered) {
+            while (!path.isEmpty() && path.get(path.size() - 1).depth >= agent.depth) path.remove(path.size() - 1);
+            for (Agent above : path) {
+                above.below++;
+                if (statusPriority(agent.status) <= 1) above.belowWaiting++;
+                if ("working".equals(agent.status)) above.belowWorking++;
+            }
+            path.add(agent);
+        }
+    }
+
+    /** What the deacon view says of a status, in Wolf's words. */
+    static String statusWord(String status, String waitKind) {
+        switch (status) {
+            case "blocked": return waitKind == null || waitKind.isEmpty() ? "needs you" : "needs you: " + waitKind;
+            case "error": return "error";
+            case "working": return "working";
+            case "idle": return "idle";
+            case "done": return "done";
+            default: return status.isEmpty() ? "no status" : status;
+        }
+    }
+
+    /** "now", "4m", "2h", "3d": how long a status has held. Empty when unknown. */
+    static String age(long sinceMs, long nowMs) {
+        if (sinceMs <= 0) return "";
+        long minutes = Math.max(0, nowMs - sinceMs) / 60_000;
+        if (minutes < 1) return "now";
+        if (minutes < 60) return minutes + "m";
+        if (minutes < 48 * 60) return (minutes / 60) + "h";
+        return (minutes / (24 * 60)) + "d";
     }
 
     private List<Agent> allAgents() {
@@ -580,7 +639,12 @@ public final class HomeActivity extends Activity {
     /** Rebuilds the tree and the Fleet only when what they show changed. */
     private void render(boolean force) {
         if (tree == null || destroyed) return;
+        long now = System.currentTimeMillis();
         StringBuilder key = new StringBuilder(String.valueOf(collapsed)).append(expandedQuiet).append(note);
+        // Working agents rewrite their message as they go; like their spinner
+        // titles, rebuilding for each would flicker and drop taps, so those
+        // messages alone refresh the tree at most every CHATTER_MS.
+        StringBuilder messages = new StringBuilder();
         // Keyed on what the tree shows, not the raw pane list: agents retitle
         // themselves with spinner glyphs many times a second, and rebuilding
         // the whole tree for each made it flicker and dropped taps.
@@ -591,13 +655,18 @@ public final class HomeActivity extends Activity {
                 for (Agent agent : space.getValue()) {
                     key.append(agent.id).append('\t').append(agent.title).append('\t').append(agent.status)
                             .append('\t').append(agent.depth).append('\t').append(agent.role)
-                            .append('\t').append(agent.kind).append('\n');
+                            .append('\t').append(agent.kind).append('\t').append(agent.guide)
+                            .append('\t').append(agent.waitKind).append('\t').append(age(agent.statusMs, now))
+                            .append('\t').append("working".equals(agent.status) ? "" : agent.msg).append('\n');
+                    if ("working".equals(agent.status)) messages.append(agent.id).append(agent.msg).append('\n');
                 }
             }
         }
-        String next = key.toString();
-        if (!force && next.equals(signature)) return;
+        String next = key.toString(), said = messages.toString();
+        boolean chatty = !said.equals(chatter) && now - chatterAt >= CHATTER_MS;
+        if (!force && next.equals(signature) && !chatty) return;
         signature = next;
+        if (!said.equals(chatter)) { chatter = said; chatterAt = now; }
         List<Agent> all = allAgents();
         int[] counts = new int[6];
         for (Agent agent : all) counts[statusPriority(agent.status)]++;
@@ -711,8 +780,12 @@ public final class HomeActivity extends Activity {
             // what is waiting or working stands out; the hierarchy's managers stay.
             boolean fold = agents > BUSY_MACHINE && !expandedQuiet.contains(spaceKey);
             int quiet = 0;
+            // A folded deacon or manager hides its reports; its row keeps their counts.
+            int foldedAt = -1;
             for (Agent agent : list) {
-                boolean anchor = "deacon".equals(agent.role) || "pm".equals(agent.role);
+                if (foldedAt >= 0 && agent.depth > foldedAt) continue;
+                foldedAt = collapsed.contains(subtreeKey(agent)) && agent.below > 0 ? agent.depth : -1;
+                boolean anchor = "deacon".equals(agent.role) || "pm".equals(agent.role) || agent.below > 0;
                 if (fold && statusPriority(agent.status) > 2 && !anchor) { quiet++; continue; }
                 tree.addView(agentRow(agent, true));
             }
@@ -741,34 +814,112 @@ public final class HomeActivity extends Activity {
         return TextUtils.join(" ", parts);
     }
 
+    private static String subtreeKey(Agent agent) {
+        return "agent:" + agent.machine.host.id + "/" + agent.id;
+    }
+
+    private static boolean hasRole(Agent agent) {
+        return "deacon".equals(agent.role) || "pm".equals(agent.role) || "worker".equals(agent.role);
+    }
+
+    /**
+     * One agent: tree guide, fold toggle for whoever has reports, status dot,
+     * title, role; and, for the deacon skill's agents or any agent that said
+     * something, a second line with its status in words, for how long, and
+     * its latest message.
+     */
     private View agentRow(Agent agent, boolean inTree) {
         LinearLayout row = row();
-        int indent = inTree ? 20 + 12 * agent.depth : 4;
+        int indent = inTree ? 14 : 4;
         row.setPadding(dp(indent), dp(2), dp(4), dp(2));
         row.setMinimumHeight(dp(26));
+        if (inTree && !agent.guide.isEmpty()) {
+            TextView guide = text(agent.guide, 12, GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x80));
+            guide.setTypeface(Typeface.MONOSPACE);
+            guide.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            row.addView(guide);
+        }
+        boolean folded = collapsed.contains(subtreeKey(agent));
+        if (inTree && agent.below > 0) {
+            TextView toggle = text(folded ? "▸" : "▾", 12, chrome.onSurfaceVariant);
+            toggle.setGravity(Gravity.CENTER);
+            toggle.setMinWidth(dp(18));
+            toggle.setMinHeight(dp(24));
+            toggle.setContentDescription((folded ? "Show " : "Hide ") + agent.below + " under " + agent.title);
+            toggle.setOnClickListener(v -> {
+                String key = subtreeKey(agent);
+                if (!collapsed.remove(key)) collapsed.add(key);
+                render(true);
+            });
+            row.addView(toggle);
+        }
         row.addView(dot(statusColor(agent.status)));
-        TextView title = text(inTree ? agent.title : breadcrumb(agent), 12, chrome.onSurface);
+        LinearLayout lines = column();
+        boolean lead = "deacon".equals(agent.role) || "pm".equals(agent.role);
+        TextView title = text(inTree ? agent.title : breadcrumb(agent), lead ? 13 : 12, chrome.onSurface);
+        if (lead) title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setSingleLine(true);
         title.setEllipsize(TextUtils.TruncateAt.END);
-        row.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        String tag = "deacon".equals(agent.role) || "pm".equals(agent.role) || "worker".equals(agent.role)
-                ? agent.role : agent.kind;
+        lines.addView(title);
+        String said = detail(agent);
+        if (!said.isEmpty()) {
+            TextView sub = text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
+                    : chrome.onSurfaceVariant);
+            sub.setSingleLine(true);
+            sub.setEllipsize(TextUtils.TruncateAt.END);
+            sub.setPadding(0, dp(1), 0, 0);
+            lines.addView(sub);
+        }
+        row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
+        String tag = roleTag(agent);
+        if (agent.below > 0) {
+            List<String> counts = new ArrayList<>();
+            if (agent.belowWaiting > 0) counts.add(agent.belowWaiting + "!");
+            if (agent.belowWorking > 0) counts.add(agent.belowWorking + "▶");
+            counts.add(agent.below + ("deacon".equals(agent.role) ? " below" : " under"));
+            tag = (tag.isEmpty() ? "" : tag + "  ") + TextUtils.join(" ", counts);
+        }
         if (!tag.isEmpty()) {
-            TextView meta = text(tag, 10, chrome.onSurfaceVariant);
+            TextView meta = text(tag, 10, "deacon".equals(agent.role) ? chrome.primary : chrome.onSurfaceVariant);
             meta.setPadding(dp(6), 0, 0, 0);
             row.addView(meta);
         }
-        row.setContentDescription(agent.title + ", " + (agent.status.isEmpty() ? "no status" : agent.status)
-                + (tag.isEmpty() ? "" : ", " + tag));
+        row.setContentDescription(agent.title + ", " + statusWord(agent.status, agent.waitKind)
+                + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
         row.setOnLongClickListener(v -> {
             ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent))
                     .add("Open", () -> openAgent(agent));
+            if (inTree && agent.below > 0) {
+                sheet.add(folded ? "Show its " + agent.below : "Hide its " + agent.below, () -> {
+                    String key = subtreeKey(agent);
+                    if (!collapsed.remove(key)) collapsed.add(key);
+                    render(true);
+                });
+            }
+            if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
             if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
             sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
             return true;
         });
         return row;
+    }
+
+    /** "deacon", "pm · billing", "worker", else the agent's harness. */
+    private static String roleTag(Agent agent) {
+        if ("pm".equals(agent.role)) return agent.project.isEmpty() ? "pm" : "pm · " + agent.project;
+        return hasRole(agent) ? agent.role : agent.kind;
+    }
+
+    /** The second line: "needs you: question · 12m · Run the migration?". */
+    private static String detail(Agent agent) {
+        if (!hasRole(agent) && agent.msg.isEmpty() && statusPriority(agent.status) > 1) return "";
+        List<String> parts = new ArrayList<>();
+        parts.add(statusWord(agent.status, agent.waitKind));
+        String since = age(agent.statusMs, System.currentTimeMillis());
+        if (!since.isEmpty()) parts.add(since);
+        if (!agent.msg.isEmpty()) parts.add(agent.msg);
+        return TextUtils.join(" · ", parts);
     }
 
     /** machine › space › agent, without empty segments. */
@@ -946,7 +1097,7 @@ public final class HomeActivity extends Activity {
         for (Agent agent : agents) {
             String hay = (agent.machine.host.name + " " + agent.spaceLabel + " " + agent.title + " "
                     + agent.kind + " " + agent.role + " " + agent.project + " " + agent.status + " "
-                    + agent.cwd).toLowerCase(Locale.ROOT);
+                    + agent.cwd + " " + agent.msg).toLowerCase(Locale.ROOT);
             int score = q.isEmpty() ? 0 : fuzzy(hay, q);
             if (score < 0) continue;
             scored.add(new Object[] {agent, score, hay.length()});
