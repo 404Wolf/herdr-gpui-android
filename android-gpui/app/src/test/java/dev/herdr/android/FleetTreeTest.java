@@ -198,6 +198,37 @@ public final class FleetTreeTest {
 
     // ── Worktrees ────────────────────────────────────────────────────────
 
+    @Test public void aWorkerTabInItsOwnWorktreeIsItsOwnOpenRowInsideThePmSpace() {
+        // One PM space: the PM's tab in the main checkout, a worker's tab in a custom worktree.
+        FleetTree.Member pm = label(m("t67", "hm", "home-manager", 0, 0, "/c/home-manager", "working"), "pm", "home-manager");
+        FleetTree.Member worker = label(m("t6m", "hm", "home-manager", 0, 3, "/wt/fleet tree/sub", "working"),
+                "worker", "home-manager");
+        worker.parent = "t67";
+        FleetTree.Member mainWorker = label(m("t6n", "hm", "home-manager", 0, 4, "/c/home-manager", "idle"),
+                "worker", "home-manager");
+        FleetTree.GitLook git = FleetTree.parseGitLook(look(new String[][] {
+                {"/c/home-manager", "/c/home-manager/.git", "/c/home-manager", "main"},
+                {"/wt/fleet tree/sub", "/c/home-manager/.git", "/wt/fleet tree", "wolf/fleet-workflow-tree"}},
+                "/c/home-manager/.git", "/c/home-manager=main", "/wt/fleet tree=wolf/fleet-workflow-tree",
+                "/wt/elsewhere=other"), 200);
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(mainWorker, worker, pm), git);
+        FleetTree.Project p = project(fleet, "home-manager");
+        assertSame(pm, p.pm);
+        assertEquals(2, p.entries.size());
+        FleetTree.SpaceNode main = p.entries.get(0), wt = p.entries.get(1);
+        assertFalse(main.worktree);
+        assertEquals(Arrays.asList("t6n"), agentIds(main));
+        assertTrue(wt.worktree);
+        assertEquals("/wt/fleet tree", wt.key);
+        assertEquals("fleet tree", wt.name);
+        assertEquals("wolf/fleet-workflow-tree", wt.branch);
+        // Tapping the worktree focuses the worker's own tab.
+        assertSame(worker, wt.members.get(0));
+        // Open in a tab means not "unopened".
+        assertEquals(1, p.closed.size());
+        assertEquals("/wt/elsewhere", p.closed.get(0).path);
+    }
+
     @Test public void spacesAtOneWorktreeMergeIntoOneRowAndUnrelatedReposStaySeparate() {
         // The server: many unlabelled "Kache lane" spaces at the same worktree.
         List<FleetTree.Member> all = new ArrayList<>();

@@ -235,20 +235,29 @@ final class FleetTree {
             boolean agents = false;
             for (Member m : list) agents |= m.isAgent();
             if (name.isEmpty() && agents) name = spaceTitle(list);
-            String rowKey = place != null && !place.top.isEmpty() ? place.top
-                    : conventionTop(list) != null ? conventionTop(list) : "space:" + entry.getKey();
+            int at = order++;
             if (name.isEmpty() || !agents) {
-                SpaceNode node = new SpaceNode(rowKey);
-                fill(node, entry.getKey(), list, place, order++, git);
+                // A loose space stays one row, at its own place.
+                String key = place != null && !place.top.isEmpty() ? place.top : "space:" + entry.getKey();
+                SpaceNode node = new SpaceNode(key);
+                for (Member m : list) fill(node, entry.getKey(), m, place, at, git);
                 fleet.loose.add(node);
                 continue;
             }
             Project project = projects.get(name);
             if (project == null) projects.put(name, project = new Project(name));
             Map<String, SpaceNode> rows = entries.computeIfAbsent(name, k -> new LinkedHashMap<>());
-            SpaceNode node = rows.get(rowKey);
-            if (node == null) rows.put(rowKey, node = new SpaceNode(rowKey));
-            fill(node, entry.getKey(), list, place, order++, git);
+            // Workers are tabs of their PM's space, each in its own worktree:
+            // every terminal goes to the row of its OWN checkout, not its space's.
+            for (Member m : list) {
+                Place own = git.places.get(trimSlash(m.cwd));
+                String key = own != null && !own.top.isEmpty() ? own.top
+                        : conventionTop(Collections.singletonList(m)) != null ? conventionTop(Collections.singletonList(m))
+                        : place != null && !place.top.isEmpty() ? place.top : "space:" + entry.getKey();
+                SpaceNode node = rows.get(key);
+                if (node == null) rows.put(key, node = new SpaceNode(key));
+                fill(node, entry.getKey(), m, own != null ? own : place, at, git);
+            }
             if (project.repo.isEmpty() && place != null) project.repo = place.common;
         }
 
@@ -268,10 +277,8 @@ final class FleetTree {
                 for (Member m : all) if (m.role.isEmpty() && m.isAgent()) { project.pm = m; project.pmInferred = true; break; }
             }
             // The repo listed is the PM's checkout's, else the first open one's.
-            for (SpaceNode row : rows) if (project.pm != null && row.members.contains(project.pm)) {
-                Place place = git.places.get(probe(row.members));
-                if (place != null && !place.common.isEmpty()) project.repo = place.common;
-            }
+            Place pmPlace = project.pm == null ? null : git.places.get(trimSlash(project.pm.cwd));
+            if (pmPlace != null && !pmPlace.common.isEmpty()) project.repo = pmPlace.common;
             // Main checkout first, then worktrees, in space order.
             Collections.sort(rows, (a, b) -> a.worktree != b.worktree ? (a.worktree ? 1 : 0) - (b.worktree ? 1 : 0)
                     : Integer.compare(a.order, b.order));
@@ -289,16 +296,23 @@ final class FleetTree {
         return fleet;
     }
 
-    private static void fill(SpaceNode node, String space, List<Member> list, Place place, int order, GitLook git) {
-        node.spaces.add(space);
-        node.members.addAll(list);
+    private static void fill(SpaceNode node, String space, Member m, Place place, int order, GitLook git) {
+        if (!node.spaces.contains(space)) node.spaces.add(space);
+        node.members.add(m);
         node.order = Math.min(node.order, order);
-        if (node.name.isEmpty()) node.name = spaceTitle(list);
-        if (place != null) {
+        List<Member> one = Collections.singletonList(m);
+        if (place != null && place.top.equals(node.key)) {
             if (node.branch.isEmpty()) node.branch = place.branch;
-            node.worktree = !place.top.isEmpty() && !place.top.equals(mainTop(place, git));
-        } else if (conventionTop(list) != null) {
+            node.worktree = !place.top.equals(mainTop(place, git));
+        } else if (conventionTop(one) != null && conventionTop(one).equals(node.key)) {
             node.worktree = true;
+        }
+        // A worktree row is named after its checkout; a main or plain row after its space.
+        if (node.worktree) {
+            node.name = lastSegment(node.key);
+        } else if (node.name.isEmpty()) {
+            String title = spaceTitle(one);
+            node.name = title.isEmpty() ? lastSegment(node.key) : title;
         }
     }
 

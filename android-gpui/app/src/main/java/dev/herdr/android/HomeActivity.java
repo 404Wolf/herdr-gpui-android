@@ -1378,10 +1378,16 @@ public final class HomeActivity extends Activity {
         if (handle <= 0) return;
         Map<String, List<Agent>> bySpace = new LinkedHashMap<>();
         for (Agent agent : all) if (agent.hasSpace()) bySpace.computeIfAbsent(agent.space, k -> new ArrayList<>()).add(agent);
-        Set<String> paths = new java.util.TreeSet<>();
+        // Every terminal's own folder: workers are tabs of their PM's space,
+        // each in its own worktree. Spaces' first folders come first.
+        Set<String> paths = new java.util.LinkedHashSet<>();
         for (List<Agent> list : bySpace.values()) {
             String probe = FleetTree.probe(list);
-            if (probe.startsWith("/") && paths.size() < 48) paths.add(probe);
+            if (probe.startsWith("/") && paths.size() < 96) paths.add(probe);
+        }
+        for (Agent agent : all) {
+            String cwd = FleetTree.trimSlash(agent.cwd);
+            if (agent.hasSpace() && cwd.startsWith("/") && paths.size() < 96) paths.add(cwd);
         }
         if (paths.isEmpty()) return;
         long now = System.currentTimeMillis();

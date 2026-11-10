@@ -695,7 +695,7 @@ impl TabEdit {
             "git.look" => Self::GitLook {
                 paths: {
                     let list = value["paths"].as_array()?;
-                    if list.is_empty() || list.len() > 48 {
+                    if list.is_empty() || list.len() > 96 {
                         return None;
                     }
                     list.iter().map(|p| folder(p)).collect::<Option<Vec<_>>>()?
