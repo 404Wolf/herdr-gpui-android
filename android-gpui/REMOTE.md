@@ -252,9 +252,11 @@ raised over a scrim, and closed by Back, a tap on the scrim or any choice in it.
 never changes the remembered wide-panel preference, so unfolding restores the
 rail the way it was. The rail also answers to gestures: swipe right anywhere in
 the left half of the terminal to open it, and swipe left on the rail itself to
-close it. Android's Back gesture owns the screen edges and ignores exclusion
-requests on this version, so the open swipe starts inside the content rather
-than at x=0. It lists every saved host above the session tree. Choosing one
+close it, or swipe across (or tap) the scrim beside it. Android's Back gesture
+owns the screen edges and ignores exclusion requests, so on Android 14 and
+newer the drawer rides on Back itself: while the rail is closed, a Back swipe
+from the left edge opens it, and the right edge and the navigation buttons
+still go back. Below Android 14 the open swipe starts inside the content. It lists every saved host above the session tree. Choosing one
 opens a new SSH connection with the saved device key, focuses the pane this phone
 last used there - or an agent pane that is not idle - and bumps the connection
 generation, so the old handle is closed before

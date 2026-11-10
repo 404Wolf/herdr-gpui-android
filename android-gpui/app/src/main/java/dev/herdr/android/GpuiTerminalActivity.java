@@ -129,6 +129,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** When the last window switch was asked for, to log how long it took. */
     private volatile long switchAskedAt;
     private final BackOwner backOwner = new BackOwner(this, this::hideSidebar);
+    /**
+     * Android 14+: while the rail is closed, a Back swipe from the left edge
+     * opens it, like a navigation drawer; the right edge and the buttons still
+     * go back. Null below Android 14 or while the rail is open.
+     */
+    private Object edgeBack;
     private String sidebarSignature = "";
     private volatile java.util.List<SavedRemoteHost> savedHosts = java.util.Collections.emptyList();
     private volatile String currentHostId;
@@ -326,8 +332,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         surface.setSaveEnabled(false);
         surface.getHolder().addCallback(this);
         surface.setOnTouchListener((view, event) -> forwardTouch(event));
-        // Android's Back gesture owns the screen edges. Excluding a narrow left
-        // strip lets an edge swipe reach the terminal, where it opens the rail.
+        // Android's Back gesture owns the screen edges and ignores exclusion
+        // requests, so a left-edge Back swipe opens the rail (setEdgeBack) and
+        // a right swipe inside the left half does too (forwardTouch).
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         terminalContent = content;
@@ -399,6 +406,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railScrim.setVisibility(View.GONE);
         railScrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         railScrim.setOnClickListener(view -> hideSidebar());
+        // A swipe across the scrim closes the drawer as a tap does; any lift
+        // outside the drawer is "away from the rail".
+        railScrim.setOnTouchListener((view, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP) view.performClick();
+            return true;
+        });
         root.addView(railScrim, new FrameLayout.LayoutParams(-1, -1));
         styleRail();
         applySystemBars();
@@ -478,6 +491,57 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railScrim.setVisibility(drawer && sidebarOpen ? View.VISIBLE : View.GONE);
         // An open drawer is the only thing Back closes here; otherwise Back leaves the terminal.
         backOwner.setOwned(drawer && sidebarOpen);
+        setEdgeBack(!sidebarOpen);
+    }
+
+    /**
+     * The system takes every left-edge swipe for Back and ignores exclusion
+     * requests (d62d747), so the drawer gesture rides on Back itself: Android
+     * 14's BackEvent says which edge the swipe came from. Left edge opens the
+     * rail; anything else leaves the terminal as Back always did.
+     */
+    private void setEdgeBack(boolean wanted) {
+        if (Build.VERSION.SDK_INT < 34 || wanted == (edgeBack != null)) return;
+        if (wanted) {
+            edgeBack = EdgeBack.register(this, () -> {
+                if (shellMode()) leaveByBack(); else showSidebar();
+            }, this::leaveByBack);
+        } else {
+            EdgeBack.unregister(this, edgeBack);
+            edgeBack = null;
+        }
+    }
+
+    /** What Back did before the edge callback: finish, or send a root task back. */
+    @SuppressWarnings("deprecation")
+    private void leaveByBack() {
+        super.onBackPressed();
+    }
+
+    @android.annotation.TargetApi(34)
+    private static final class EdgeBack {
+        static Object register(android.app.Activity activity, Runnable leftEdge, Runnable otherwise) {
+            android.window.OnBackAnimationCallback callback = new android.window.OnBackAnimationCallback() {
+                private boolean fromLeft;
+                @Override public void onBackStarted(android.window.BackEvent event) {
+                    fromLeft = event.getSwipeEdge() == android.window.BackEvent.EDGE_LEFT;
+                }
+                @Override public void onBackCancelled() { fromLeft = false; }
+                @Override public void onBackInvoked() {
+                    boolean left = fromLeft;
+                    fromLeft = false;
+                    (left ? leftEdge : otherwise).run();
+                }
+            };
+            activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+            return callback;
+        }
+
+        static void unregister(android.app.Activity activity, Object callback) {
+            activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
+                    (android.window.OnBackInvokedCallback) callback);
+        }
     }
 
     /** Choosing a destination in the drawer closes it, as Android's drawers do. */
@@ -3127,7 +3191,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (!edgeClaimed && !sidebarOpen && width > 0 && touchDownX < width / 2f) {
                 float dx = event.getX() - edgeStartX;
                 float dy = Math.abs(event.getY() - touchDownY);
-                if (dx > dp(60) && dx > dy * 1.5f) {
+                // From the edge strip (where Back does not take it: buttons
+                // navigation, a swipe just inside the edge) a short pull opens it.
+                float needed = touchDownX < dp(40) ? dp(24) : dp(60);
+                if (dx > needed && dx > dy * 1.5f) {
                     edgeClaimed = true;
                     showSidebar();
                     return true;
