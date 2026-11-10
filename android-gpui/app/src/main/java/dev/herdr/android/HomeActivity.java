@@ -802,6 +802,17 @@ public final class HomeActivity extends Activity {
             case STARTING: row.addView(chip("Starting…", false, null)); break;
             default: break;
         }
+        // "+": a new project goes through this computer's Deacon (started first if missing).
+        if (ready) {
+            TextView plus = chip("+", !machine.projectBusy && !machine.deaconBusy, () -> {
+                if (fleet.deacon != null) newProject(machine, (Agent) fleet.deacon);
+                else startDeacon(machine);
+            });
+            plus.setContentDescription(fleet.deacon != null
+                    ? "New project on " + machine.host.name + ": ask its Deacon"
+                    : "New project on " + machine.host.name + ": start its Deacon first");
+            row.addView(plus);
+        }
         row.setOnClickListener(v -> {
             toggleFold(machine.host.id, false);
             if ("closed".equals(machine.state) && machine.handle <= 0 && !machine.connecting) connect(machine);
@@ -888,6 +899,16 @@ public final class HomeActivity extends Activity {
         }
         // Projects live under the Deacon when there is one, at the top otherwise.
         List<Row> under = fleet.deacon != null ? top.kids : rows;
+        // New project sits right under the Deacon, never after a long list.
+        if (FleetTree.newProjectTarget(fleet) != null) {
+            Agent deacon = (Agent) FleetTree.newProjectTarget(fleet);
+            String said = machine.projectBusy ? "Asking the Deacon…"
+                    : machine.projectError.isEmpty() ? "New project (asks the Deacon)"
+                    : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
+            under.add(new Row((guide, self) -> actionLine(guide, null, "+", said,
+                    machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
+                    ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null)));
+        }
         for (FleetTree.Project project : fleet.projects) under.add(projectRow(machine, project));
         if (!fleet.loose.isEmpty()) {
             Row spaces = new Row((guide, self) -> groupLine(guide, self, "Spaces", fleet.loose.size() + ""));
@@ -905,15 +926,6 @@ public final class HomeActivity extends Activity {
                 others.kids.add(new Row((guide, self) -> agentLine(guide, agent, tag, null)));
             }
             under.add(others);
-        }
-        if (FleetTree.newProjectTarget(fleet) != null) {
-            Agent deacon = (Agent) FleetTree.newProjectTarget(fleet);
-            String said = machine.projectBusy ? "Asking the Deacon…"
-                    : machine.projectError.isEmpty() ? "New project"
-                    : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
-            under.add(new Row((guide, self) -> actionLine(guide, null, "+", said,
-                    machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
-                    ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null)));
         }
         return rows;
     }
@@ -1000,8 +1012,8 @@ public final class HomeActivity extends Activity {
         boolean busy = machine.opening.contains(wt.path);
         return new Row((guide, self) -> {
             View line = actionLine(guide, null, "○", busy ? name + " · opening…" : name, chrome.onSurfaceVariant,
-                    busy || !"ready".equals(machine.state) ? null : () -> openWorktree(machine, wt.path));
-            line.setContentDescription("Worktree " + name + ", not open. Open a space there.");
+                    busy || !"ready".equals(machine.state) ? null : () -> closedWorktreeActions(machine, wt, name));
+            line.setContentDescription("Worktree " + name + ", not open. Choose who works there.");
             return line;
         });
     }
@@ -1325,6 +1337,26 @@ public final class HomeActivity extends Activity {
                 if (reason == null) openAgent(deacon);
             });
         });
+    }
+
+    /**
+     * An unopened worktree: work there goes through the Deacon (it starts a
+     * labelled worker); a bare shell is only the secondary choice.
+     */
+    private void closedWorktreeActions(Machine machine, FleetTree.GitWorktree wt, String name) {
+        FleetTree.Member deacon = FleetTree.canonicalDeacon(members(machine));
+        ActionSheet sheet = new ActionSheet(this, chrome, name);
+        if (deacon != null) {
+            sheet.add("Ask the Deacon to start work here", () -> sendToDeacon(machine, (Agent) deacon,
+                    "I want to work in the " + name.replaceAll("\\p{Cntrl}", "") + " worktree ("
+                            + wt.path.replaceAll("\\p{Cntrl}", "") + ") on " + machine.host.name
+                            + ". Help me set up a worker there."));
+        } else {
+            sheet.add("Start the Deacon first", () -> startDeacon(machine));
+        }
+        sheet.add("Open a plain shell there", () -> openWorktree(machine, wt.path));
+        sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", wt.path));
+        sheet.show();
     }
 
     /** A closed worktree: a shell space there (no agent), then that shell. */
