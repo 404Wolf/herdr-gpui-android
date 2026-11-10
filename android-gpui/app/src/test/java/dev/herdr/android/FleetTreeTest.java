@@ -2,6 +2,7 @@ package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -694,6 +695,47 @@ public final class FleetTreeTest {
         assertNull(FleetTree.stripFor(fleet, ""));
         // Every item is an exact terminal of this computer: a tap focuses that id.
         for (FleetTree.StripItem item : pmStrip.items) assertTrue(ids(fleet.all).contains(item.id));
+    }
+
+    @Test public void theStripTogglesToPhysicalTabsPerSpaceAndBackWithoutMovingFocus() {
+        FleetTree.Member pm = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "working"), "pm", "home-manager");
+        FleetTree.Member w = label(m("t6m", "hm", "home-manager", 0, 1, "/wt/f", "working"), "worker", "home-manager");
+        w.parent = "t67";
+        FleetTree.Member other = label(m("t5t", "hm", "home-manager", 0, 2, "/c", "idle"), "pm", "botd");
+        FleetTree.Member otherWorker = label(m("t5h", "hm", "home-manager", 0, 3, "/w/botd", "working"), "worker", "botd");
+        otherWorker.parent = "t5t";
+        FleetTree.Member remote = label(m("server/t4", "hm", "home-manager", 0, 4, "/c/hm", "working"), "worker", "home-manager");
+        remote.parent = "t67";
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(pm, w, other, otherWorker, remote), null);
+        String focus = "t6m";
+        FleetTree.Strip strip = FleetTree.stripFor(fleet, focus, true);
+        // A group never holds another project's or another machine's terminals.
+        assertEquals(Arrays.asList("t67", "t6m"), stripIds(strip));
+        // Toggle to the space's own tabs and back: the focused terminal is untouched.
+        Set<String> saved = new HashSet<>();
+        FleetTree.StripChoice choice = new FleetTree.StripChoice(saved);
+        assertTrue(choice.showsGroup("hm", strip));
+        choice.toggle("hm");
+        assertFalse(choice.showsGroup("hm", strip));
+        assertTrue("another space keeps its own choice", choice.showsGroup("other", strip));
+        // A refresh (a new strip, the persisted set read again) keeps the choice.
+        FleetTree.StripChoice reread = new FleetTree.StripChoice(new HashSet<>(saved));
+        assertFalse(reread.showsGroup("hm", FleetTree.stripFor(fleet, focus, true)));
+        reread.toggle("hm");
+        assertTrue(reread.showsGroup("hm", FleetTree.stripFor(fleet, focus, true)));
+        assertEquals("t6m", focus);
+        assertEquals(Arrays.asList("t67", "t6m"), stripIds(FleetTree.stripFor(fleet, focus, true)));
+        // No role context: the space's tabs, whatever the choice.
+        assertFalse(reread.showsGroup("hm", null));
+    }
+
+    @Test public void anOfflineComputersCachedGroupIsUnavailable() {
+        FleetTree.Member pm = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "working"), "pm", "home-manager");
+        FleetTree.Member deacon = label(m("t6k", "d", "deacon", 1, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(pm, deacon), null);
+        assertNull(FleetTree.stripFor(fleet, "t67", false));
+        assertNull(FleetTree.stripFor(fleet, "t6k", false));
+        assertNotNull(FleetTree.stripFor(fleet, "t67", true));
     }
 
     private static List<String> stripIds(FleetTree.Strip strip) {

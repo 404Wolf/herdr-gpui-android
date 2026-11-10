@@ -865,7 +865,16 @@ final class FleetTree {
      * fleet each time, so it can never show a stale group.
      */
     static Strip stripFor(Fleet fleet, String focusId) {
-        if (focusId == null || focusId.isEmpty()) return null;
+        return stripFor(fleet, focusId, true);
+    }
+
+    /**
+     * As {@link #stripFor(Fleet, String)}, for a computer that may be offline:
+     * then its list is a cached view and no group is offered. Only this
+     * computer's own terminals ever join a group (never "machine/tN").
+     */
+    static Strip stripFor(Fleet fleet, String focusId, boolean connected) {
+        if (!connected || focusId == null || focusId.isEmpty() || focusId.contains("/")) return null;
         if (fleet.deacon != null && fleet.deacon.id.equals(focusId)) {
             Strip strip = new Strip("deacon", "Deacon");
             strip.items.add(stripItem(fleet.deacon, "deacon"));
@@ -877,7 +886,9 @@ final class FleetTree {
         Project project = projectOf(fleet, focusId);
         if (project == null || project.pm == null || !"pm".equals(project.pm.role)) return null;
         List<Member> members = new ArrayList<>();
-        for (SpaceNode row : project.entries) for (Member m : row.members) if (m != project.pm) members.add(m);
+        for (SpaceNode row : project.entries) {
+            for (Member m : row.members) if (m != project.pm && !m.id.contains("/")) members.add(m);
+        }
         Collections.sort(members, PLACE);
         Set<String> inProject = new HashSet<>();
         for (Member m : members) inProject.add(m.id);
@@ -894,6 +905,25 @@ final class FleetTree {
         // A parent loop never hides anyone: whatever the walk missed comes last.
         for (Member m : members) if (seen.add(m.id)) strip.items.add(stripItem(m, "worker"));
         return strip;
+    }
+
+    /**
+     * Per physical space, whether Wolf switched the top strip from the role
+     * group to the space's own tabs (where +, close, move and rename live).
+     * Backed by a persisted set, so the choice survives refreshes and
+     * relaunches; it never changes which terminal is focused.
+     */
+    static final class StripChoice {
+        final Set<String> physical;
+        StripChoice(Set<String> physical) { this.physical = physical; }
+
+        boolean showsGroup(String space, Strip strip) {
+            return strip != null && !physical.contains(space);
+        }
+
+        void toggle(String space) {
+            if (!physical.remove(space)) physical.add(space);
+        }
     }
 
     private static void walkStrip(String id, Map<String, List<Member>> kids, Set<String> seen, Strip strip) {

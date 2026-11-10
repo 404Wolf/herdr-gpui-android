@@ -1901,13 +1901,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         updateCrumb(current, space);
-        if (showRoleStrip(current)) return;
+        java.util.List<FleetTree.Member> fleetMembers = FleetPanes.members(current.workspaces, current.tabs,
+                current.panes, FleetTree.Member::new);
+        FleetTree.Strip roleStrip = FleetTree.stripFor(FleetTree.build(fleetMembers,
+                FleetPanes.LOOKS.get(currentHostId)), current.paneId, current.ready);
+        if (stripChoice().showsGroup(space, roleStrip)) {
+            showRoleStrip(current, roleStrip, space);
+            return;
+        }
         // Rebuild only when what the strip shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
         JSONArray tabs = current.tabs;
         java.util.List<String[]> shown = new java.util.ArrayList<>();
-        StringBuilder signature = new StringBuilder(space).append('\n');
+        StringBuilder signature = new StringBuilder(space).append(roleStrip != null ? "\tgroup" : "").append('\n');
         String activeId = "";
         for (int i = 0; i < tabs.length(); i++) {
             JSONObject tab = tabs.optJSONObject(i);
@@ -1961,6 +1968,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         add.setContentDescription("New Claude, Codex or terminal tab in this space");
         add.setOnClickListener(this::showNewMenu);
         tabStrip.addView(add);
+        // Back to the role group (as the desktop's chip), when there is one.
+        if (roleStrip != null) {
+            final String chipSpace = space;
+            TextView group = tabPill(roleStrip.mode.equals("pm") ? "▤ " + roleStrip.name : "▤ Deacon", false, "");
+            group.setContentDescription("Show the " + (roleStrip.mode.equals("pm") ? roleStrip.name + " project" : "Deacon")
+                    + " group instead of this space's tabs");
+            group.setOnClickListener(v -> toggleStrip(chipSpace));
+            tabStrip.addView(group);
+        }
         if (active != null && activeMoved) {
             final View activePill = active;
             tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
@@ -1975,18 +1991,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * live view on every refresh, so it never shows a stale group (what the
      * desktop's projection handshake guards against). False: no role context.
      */
-    private boolean showRoleStrip(Connection current) {
-        java.util.List<FleetTree.Member> members = FleetPanes.members(current.workspaces, current.tabs, current.panes,
-                FleetTree.Member::new);
-        FleetTree.Strip strip = FleetTree.stripFor(FleetTree.build(members, FleetPanes.LOOKS.get(currentHostId)),
-                current.paneId);
-        if (strip == null) return false;
-        StringBuilder signature = new StringBuilder("role:").append(strip.mode).append('\n');
+    private void showRoleStrip(Connection current, FleetTree.Strip strip, String space) {
+        StringBuilder signature = new StringBuilder("role:").append(strip.mode).append('\t').append(space).append('\n');
         for (FleetTree.StripItem item : strip.items) {
             signature.append(item.id).append('\t').append(item.label).append('\t').append(item.status)
                     .append('\t').append(item.id.equals(current.paneId)).append('\n');
         }
-        if (signature.toString().equals(tabSignature)) return true;
+        if (signature.toString().equals(tabSignature)) return;
         boolean activeMoved = !current.paneId.equals(tabActive);
         tabSignature = signature.toString();
         tabActive = current.paneId;
@@ -2003,11 +2014,36 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             tabStrip.addView(pill);
             if (focused) active = pill;
         }
+        // To this space's own tabs (where +, close, move and rename are).
+        TextView tabsChip = tabPill("⊞ Tabs", false, "");
+        tabsChip.setContentDescription("Show this space's own tabs");
+        tabsChip.setOnClickListener(v -> toggleStrip(space));
+        tabStrip.addView(tabsChip);
         if (active != null && activeMoved) {
             final View activePill = active;
             tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
         }
-        return true;
+    }
+
+    private FleetTree.StripChoice stripChoiceState;
+
+    /** The group/tabs choice per physical space, kept across refreshes and launches. */
+    private FleetTree.StripChoice stripChoice() {
+        if (stripChoiceState == null) {
+            java.util.Set<String> saved = new java.util.HashSet<>(getSharedPreferences("terminal-display", MODE_PRIVATE)
+                    .getStringSet("strip_tabs", java.util.Collections.emptySet()));
+            stripChoiceState = new FleetTree.StripChoice(saved);
+        }
+        return stripChoiceState;
+    }
+
+    /** Switches this space's strip between the role group and its own tabs; focus is untouched. */
+    private void toggleStrip(String space) {
+        stripChoice().toggle(space);
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                .putStringSet("strip_tabs", new java.util.HashSet<>(stripChoice().physical)).apply();
+        tabSignature = "";
+        refreshTabStrip();
     }
 
     private void updateCrumb(Connection current, String space) {
