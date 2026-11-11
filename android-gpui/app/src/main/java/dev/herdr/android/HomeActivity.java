@@ -403,7 +403,7 @@ public final class HomeActivity extends Activity {
                 } else {
                     String credential = new JSONObject().put("private_key", new String(secret)).toString();
                     // A background session lists terminals without attaching to one.
-                    handle = RemoteNative.connectGrid(host.connectionJson(), credential, "80,24,8,16", false);
+                    handle = RemoteNative.connectGrid(host.connectionJson(), credential, TerminalGrid.estimate(this), false);
                     if (handle <= 0) failure = "Could not start the connection";
                 }
             } catch (Exception | LinkageError error) {

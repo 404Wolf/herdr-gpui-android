@@ -443,7 +443,8 @@ public final class RemoteHostsActivity extends Activity {
             } finally {
                 Arrays.fill(secret, '\0');
             }
-            handle = RemoteNative.connect(host.connectionJson(), credential);
+            // No pane is attached until reopenPane picks one, at the phone's grid.
+            handle = RemoteNative.connectGrid(host.connectionJson(), credential, TerminalGrid.estimate(this), false);
             if (handle <= 0) throw new IllegalStateException("connect refused");
             String focused = reopenPane(handle, wantedPane);
             final long readyHandle = handle;
@@ -1539,7 +1540,9 @@ public final class RemoteHostsActivity extends Activity {
                     Arrays.fill(phrase, '\0');
                     pendingSecret = null; pendingPassphrase = null;
                 }
-                handle = RemoteNative.connect(currentHost.connectionJson(), credential);
+                // Choosing a terminal lists panes; none is attached until one is picked.
+                handle = RemoteNative.connectGrid(currentHost.connectionJson(), credential,
+                        TerminalGrid.estimate(this), false);
                 if (handle <= 0) throw new IllegalStateException("Remote connection could not be started");
                 final long readyHandle = handle;
                 main.post(() -> {

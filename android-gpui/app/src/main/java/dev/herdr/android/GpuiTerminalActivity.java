@@ -601,15 +601,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * uses, so Herdr sizes the pane to this display instead of 80x24.
      */
     private String terminalGrid() {
-        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-        int stored = getSharedPreferences("terminal-display", MODE_PRIVATE).getInt("font", 13);
-        float fontPx = Math.max(8f, (stored > 0 ? stored : 13) * getResources()
-                .getConfiguration().fontScale * dm.density / dm.scaledDensity * dm.density);
-        int cellW = Math.max(1, Math.round(fontPx * 0.6f));
-        int cellH = Math.max(1, Math.round(fontPx * 1.25f));
-        int cols = Math.min(400, Math.max(20, dm.widthPixels / cellW));
-        int rows = Math.min(200, Math.max(5, (dm.heightPixels - dp(48) * 3) / cellH));
-        return cols + "," + rows + "," + cellW + "," + cellH;
+        return TerminalGrid.estimate(this);
     }
 
 
@@ -725,9 +717,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 } finally {
                     java.util.Arrays.fill(key, '\0');
                 }
-                handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), true);
+                handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), false);
                 if (handle <= 0) throw new IllegalStateException("connection refused");
+                reconnectHandle = handle;
+                // Paused before the handle was published: attach nothing.
+                if (!hostResumed) throw new IllegalStateException("left the screen");
                 String chosen = awaitHostPane(handle, host.id, null);
+                reconnectHandle = 0;
                 final long readyHandle = handle;
                 final String readyPane = chosen;
                 final SavedRemoteHost readyHost = host;
@@ -743,11 +739,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
+                reconnectHandle = 0;
                 if (handle != 0) RemoteNative.close(handle);
                 android.util.Log.i("herdr-reconnect", "attempt failed: " + failure);
                 runOnUiThread(() -> {
                     reconnectRunning = false;
-                    if (monitor != null && hostResumed) {
+                    // Left the screen meanwhile: onResume reconnects; say nothing.
+                    if (!hostResumed) return;
+                    if (monitor != null) {
                         // Keep trying, quickly, while the terminal is on screen.
                         monitor.failed();
                         showLinkDown();
@@ -1668,7 +1667,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 } finally {
                     java.util.Arrays.fill(key, '\0');
                 }
-                handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), true);
+                handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), false);
                 if (handle <= 0) throw new IllegalStateException("connection refused");
                 String chosen = awaitHostPane(handle, host.id, forcedPane);
                 final long readyHandle = handle;
@@ -1931,6 +1930,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private final PendingInput pendingInput = new PendingInput();
     /** One reconnect at a time. Main thread. */
     private boolean reconnectRunning;
+    /** The session a reconnect is opening; closed if the terminal leaves the screen first. */
+    private volatile long reconnectHandle;
     /** The pane the rail last scrolled into view. */
     private String revealedPane = "";
     private LinearLayout tabStrip;
@@ -4047,8 +4048,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             monitor.stop();
             monitor.succeeded();
         }
-        // An attempt still in flight finishes on its own: it adopts if the
-        // terminal is back on screen by then and closes its session if not.
+        // A reconnect still opening must not attach (and size) a pane while
+        // the terminal is off screen: closing it releases any claim, and the
+        // attempt then fails quietly; onResume reconnects.
+        long opening = reconnectHandle;
+        reconnectHandle = 0;
+        if (opening > 0) RemoteNative.close(opening);
         // Mirrors are only useful on screen; three SSH sessions polling in the
         // background would spend battery for a rail nobody can see.
         stopHostSampling();

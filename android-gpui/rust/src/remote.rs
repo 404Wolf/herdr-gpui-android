@@ -202,6 +202,9 @@ pub(crate) struct Session {
     pub(crate) focus: Mutex<Option<(String, std::time::Instant)>>,
     /// When herdr-core last sent any byte, for the phone's liveness check.
     pub(crate) heard: Heard,
+    /// Whether the phone shows this session: only a visible viewer may size
+    /// the pane's grid (core_session's `Claim`).
+    pub(crate) visible: std::sync::atomic::AtomicBool,
 }
 
 /// The last time bytes arrived, lock-free: the socket loop marks it on every
@@ -259,7 +262,8 @@ pub fn renderer(id: u64) -> Option<Arc<gpui_rio::Session>> {
     None
 }
 pub fn connect_credentials(raw: &str, credentials: &str) -> Result<u64> {
-    connect_credentials_grid(raw, credentials, "80,24,8,16", true)
+    // No pane is attached (no grid claimed) until one is focused.
+    connect_credentials_grid(raw, credentials, "80,24,8,16", false)
 }
 pub fn connect_credentials_grid(
     raw: &str,
@@ -293,6 +297,7 @@ pub fn connect_credentials_grid(
         commands: tx,
         focus: Mutex::new(None),
         heard: Heard::default(),
+        visible: std::sync::atomic::AtomicBool::new(true),
     });
     let worker = owner.clone();
     std::thread::Builder::new()
@@ -313,6 +318,15 @@ pub(crate) fn bump(view: &mut Value) {
     view["revision"] = json!(revision);
     view["token"] = json!(revision);
     view["chrome_token"] = json!(revision);
+}
+/// The phone shows (true) or hides (false) this session. Hidden, it sends no
+/// RESIZE and gives up its claim on the pane's grid; shown, it offers a fresh
+/// measured size first.
+pub fn set_visible(id: u64, visible: bool) -> Result<()> {
+    session(id)?
+        .visible
+        .store(visible, Ordering::Relaxed);
+    Ok(())
 }
 pub fn close(id: u64) {
     if let Some(owner) = lock(sessions()).remove(&id) {

@@ -126,7 +126,16 @@ saved host and key and lands on the same pane; input not yet sent is held for
 that pane and sent once, input in flight is never resent, and held input is
 discarded if the reconnect lands elsewhere or Herdr restarted. Leaving the remote
 terminal closes its connection; coming back reconnects to the pane that was
-showing. A daemon restart,
+showing.
+
+The phone sizes a pane only while it is on screen. Connecting attaches no pane
+until one is picked, at the phone's own grid rather than 80x24. With a core
+that advertises `viewer_visibility` (and a relay path that confirms it), each
+attach starts hidden, offers its measured size, then shows itself with a
+VISIBILITY frame, and hides with one; an older core is detached instead. Leaving
+the terminal (backgrounding, screen off) closes the session after an explicit
+hide and DETACH, so a desktop viewer's grid is restored without waiting for the
+transport to time out. A daemon restart,
 deleted pane or stale launch cannot silently retarget a command.
 
 The remote renderer paints the validated binary surface frame: named, indexed and

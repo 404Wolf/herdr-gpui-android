@@ -72,8 +72,123 @@ struct Connection<'a> {
     dirty: bool,
     /// The attached stream sends RESIZE (the PTY's grid) before repainting.
     negotiated: bool,
+    /// How this viewer claims the attached pane's grid.
+    claim: Claim,
+}
+
+/// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
+const DETACH: u8 = 2;
+const RESIZE: u8 = 3;
+/// herdr-core's viewer VISIBILITY frame: one byte, 0 hidden or 1 visible.
+const VISIBILITY: u8 = 7;
+/// How long a fresh attach waits for the terminal's own measured RESIZE
+/// before offering the size it attached with and showing itself.
+const MEASURE_WAIT: Duration = Duration::from_secs(1);
+
+/// herdr-core sizes a pane from its eligible viewers. A phone in a pocket must
+/// not hold a desktop's terminals at its own small grid, so this viewer is
+/// eligible only while the activity is on screen (`Session::visible`).
+///
+/// A core and relay path that negotiated `viewer_visibility` get VISIBILITY
+/// frames: the attach starts hidden, shows itself only after a measured
+/// RESIZE, and hides without detaching. Anything older is detached while
+/// hidden (no RESIZE alone releases the claim) and reattached, with a fresh
+/// RESIZE, when shown again.
+#[derive(Default)]
+struct Claim {
+    /// The core's hello advertised `viewer_visibility`.
+    offered: bool,
+    /// The current attach confirmed VISIBILITY frames on every hop.
+    frames: bool,
+    /// The core was last told this viewer is visible.
+    shown: bool,
+    /// A RESIZE was sent since the attach (or since the last hide).
+    measured: bool,
+    attached_at: Option<Instant>,
+    /// Without frames: the pane detached while hidden, attached again when shown.
+    parked: Option<String>,
 }
 impl Connection<'_> {
+    fn wants_visible(&self) -> bool {
+        self.owner.visible.load(Ordering::Relaxed)
+    }
+    /// Whether an attach now would not claim the grid while hidden: it is
+    /// shown, or the core can be told it is hidden (frames, as far as known).
+    fn may_attach(&self) -> bool {
+        self.wants_visible()
+            || self.claim.offered && (self.claim.frames || self.claim.attached_at.is_none())
+    }
+    /// The viewer's size for the attached pane; marks it measured.
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        let mut bytes = Vec::from(cols.to_le_bytes());
+        bytes.extend(rows.to_le_bytes());
+        write_frame(&mut self.socket, self.channel, RESIZE, &bytes)?;
+        self.claim.measured = true;
+        Ok(())
+    }
+    fn detach(&mut self) -> Result<()> {
+        if self.channel != 0 {
+            write_frame(&mut self.socket, self.channel, DETACH, &[])?;
+        }
+        self.channel = 0;
+        self.output = None;
+        self.claim.shown = false;
+        Ok(())
+    }
+    /// Brings the core's view of this viewer in line with `Session::visible`.
+    fn sync_claim(&mut self, cols: u16, rows: u16) -> Result<()> {
+        let want = self.wants_visible();
+        if self.claim.frames && self.channel != 0 {
+            if want && !self.claim.shown {
+                let waited = self
+                    .claim
+                    .attached_at
+                    .is_none_or(|at| at.elapsed() >= MEASURE_WAIT);
+                if !self.claim.measured && !waited {
+                    return Ok(());
+                }
+                if !self.claim.measured {
+                    self.resize(cols, rows)?;
+                }
+                write_frame(&mut self.socket, self.channel, VISIBILITY, &[1])?;
+                self.claim.shown = true;
+            } else if !want && self.claim.shown {
+                write_frame(&mut self.socket, self.channel, VISIBILITY, &[0])?;
+                self.claim.shown = false;
+                // Showing again offers a fresh size first.
+                self.claim.measured = false;
+            }
+            return Ok(());
+        }
+        if !want && self.channel != 0 {
+            let pane = lock(&self.owner.state).view["pane_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            self.claim.parked = (!pane.is_empty()).then_some(pane);
+            self.detach()?;
+        } else if want
+            && self.channel == 0
+            && let Some(pane) = self.claim.parked.take()
+        {
+            self.attach(&pane, cols, rows)?;
+            if !self.claim.frames {
+                self.resize(cols, rows)?;
+            }
+        }
+        Ok(())
+    }
+    /// Best effort as the session ends: the core forgets this viewer now
+    /// rather than when the transport finally times out.
+    fn release(&mut self) {
+        if self.channel == 0 {
+            return;
+        }
+        if self.claim.frames && self.claim.shown {
+            let _ = write_frame(&mut self.socket, self.channel, VISIBILITY, &[0]);
+        }
+        let _ = self.detach();
+    }
     fn read(&mut self) -> Result<Option<Frame>> {
         if self.owner.cancel.is_cancelled() {
             return Err(Error::Closed);
@@ -677,11 +792,7 @@ impl Connection<'_> {
         Ok(())
     }
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
-        if self.channel != 0 {
-            write_frame(&mut self.socket, self.channel, 2, &[])?;
-        }
-        self.channel = 0;
-        self.output = None;
+        self.detach()?;
         {
             let mut state = lock(&self.owner.state);
             state.terminal = None;
@@ -689,10 +800,18 @@ impl Connection<'_> {
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
         }
-        let reply = self.call("terminal.attach", attach_params(terminal, cols, rows))?;
+        let reply = self.call(
+            "terminal.attach",
+            attach_params(terminal, cols, rows, self.claim.offered),
+        )?;
         // A core (and path) that will send RESIZE before repainting says so;
         // an older one does not, and the phone's own size stays the grid.
         self.negotiated = reply["resize_notifications"] == true;
+        self.claim.frames = self.claim.offered && reply["visibility_updates"] == true;
+        self.claim.shown = false;
+        self.claim.measured = false;
+        self.claim.attached_at = Some(Instant::now());
+        self.claim.parked = None;
         let channel = reply["channel"]
             .as_u64()
             .filter(|c| *c > 0 && *c <= u32::MAX as u64)
@@ -888,8 +1007,15 @@ $c
 done"#;
 /// terminal.attach's parameters: the pane's size is an offer; the phone asks
 /// for RESIZE frames so it can follow the PTY's authoritative grid.
-fn attach_params(terminal: &str, cols: u16, rows: u16) -> Value {
-    json!({"terminal":terminal,"cols":cols,"rows":rows,"history":1000,"display":display(),"resize_notifications":true})
+fn attach_params(terminal: &str, cols: u16, rows: u16, visibility: bool) -> Value {
+    let mut params = json!({"terminal":terminal,"cols":cols,"rows":rows,"history":1000,"display":display(),"resize_notifications":true});
+    if visibility {
+        // Hidden until a measured RESIZE: the attach-time size is only the
+        // phone's estimate and must not lead the grid.
+        params["visibility_updates"] = json!(true);
+        params["visible"] = json!(false);
+    }
+    params
 }
 /// The PTY's grid from an attach reply, when the path negotiated RESIZE.
 fn initial_grid(reply: &Value) -> Option<(u16, u16)> {
@@ -1132,8 +1258,8 @@ fn display() -> Value {
 pub(crate) fn run(
     owner: &Arc<Session>,
     mut socket: UnixStream,
-    mut cols: u16,
-    mut rows: u16,
+    cols: u16,
+    rows: u16,
     active: bool,
     commands: mpsc::Receiver<Operation>,
 ) -> Result<()> {
@@ -1187,7 +1313,26 @@ pub(crate) fn run(
         event_carry: Vec::new(),
         dirty: false,
         negotiated: false,
+        claim: Claim {
+            offered: hello["result"]["features"]
+                .as_array()
+                .is_some_and(|features| features.iter().any(|f| f == "viewer_visibility")),
+            ..Claim::default()
+        },
     };
+    let result = serve(&mut connection, cols, rows, active, &commands);
+    connection.release();
+    result
+}
+
+fn serve(
+    connection: &mut Connection<'_>,
+    mut cols: u16,
+    mut rows: u16,
+    active: bool,
+    commands: &mpsc::Receiver<Operation>,
+) -> Result<()> {
+    let owner = connection.owner;
     let subscribed = connection.call("events.subscribe", json!({}))?;
     connection.events = subscribed["channel"]
         .as_u64()
@@ -1199,12 +1344,20 @@ pub(crate) fn run(
         .and_then(|panes| panes.first())
         .and_then(|p| p["id"].as_str())
         .map(str::to_owned);
-    if let Some(first) = first.filter(|_| active) {
-        connection.attach(&first, cols, rows)?;
+    if let Some(first) = first.as_ref().filter(|_| active) {
+        if connection.may_attach() {
+            connection.attach(first, cols, rows)?;
+        } else {
+            connection.claim.parked = Some(first.clone());
+        }
     } else {
         let mut state = lock(&owner.state);
         state.view["state"] = json!("ready");
-        state.view["status"] = json!("No live terminals on this host");
+        state.view["status"] = json!(if first.is_some() {
+            "Connected to herdr-core"
+        } else {
+            "No live terminals on this host"
+        });
         bump(&mut state.view);
     }
     let mut refreshed = Instant::now();
@@ -1220,11 +1373,17 @@ pub(crate) fn run(
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
                     // current size, not the size it connected with.
-                    if let (3, [c0, c1, r0, r1]) = (kind, bytes.as_slice()) {
+                    if let (RESIZE, [c0, c1, r0, r1]) = (kind, bytes.as_slice()) {
                         (cols, rows) = (
                             u16::from_le_bytes([*c0, *c1]),
                             u16::from_le_bytes([*r0, *r1]),
                         );
+                        // Hidden, the size is only remembered: it is offered
+                        // again, fresh, when the viewer is shown.
+                        if !connection.wants_visible() {
+                            continue;
+                        }
+                        connection.claim.measured = true;
                     }
                     write_frame(&mut connection.socket, channel, kind, &bytes)?
                 }
@@ -1232,7 +1391,14 @@ pub(crate) fn run(
                 Err(_) => break,
             }
         }
-        let switch = lock(&owner.focus).take();
+        connection.sync_claim(cols, rows)?;
+        let mut switch = lock(&owner.focus).take();
+        if !connection.may_attach() {
+            // Hidden without VISIBILITY frames: remember the pick, claim nothing.
+            if let Some((terminal, _)) = switch.take() {
+                connection.claim.parked = Some(terminal);
+            }
+        }
         if let Some((terminal, asked)) = switch {
             let previous = lock(&owner.state).view["pane_id"]
                 .as_str()
@@ -1534,7 +1700,7 @@ mod tests {
     }
     #[test]
     fn attach_asks_for_resize_frames_and_reads_them() {
-        let params = attach_params("t3", 120, 40);
+        let params = attach_params("t3", 120, 40, false);
         assert_eq!(params["resize_notifications"], true);
         assert_eq!((params["cols"].as_u64(), params["rows"].as_u64()), (Some(120), Some(40)));
         let mut bytes = Vec::from(80u16.to_le_bytes());
@@ -1931,6 +2097,7 @@ mod connection_tests {
             commands,
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -1985,12 +2152,14 @@ mod connection_tests {
             assert_eq!((input.channel, input.kind), (2, 0));
             assert_eq!(input.bytes, b"x");
             observed.send(()).unwrap();
-            // Closing the viewer transport never requests terminal.kill or server.stop.
-            let mut byte = [0];
+            // Closing the viewer releases its claim with a DETACH and never
+            // requests terminal.kill or server.stop.
+            let mut trailing = Vec::new();
+            let mut bytes = [0; 4096];
             loop {
-                match core.read(&mut byte) {
+                match core.read(&mut bytes) {
                     Ok(0) => break,
-                    Ok(_) => panic!("unexpected trailing command"),
+                    Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
                     Err(e)
                         if matches!(
                             e.kind(),
@@ -1998,7 +2167,11 @@ mod connection_tests {
                         ) => {}
                     Err(_) => break,
                 }
+                while let Some(frame) = decoder.next().unwrap() {
+                    trailing.push((frame.channel, frame.kind, frame.bytes));
+                }
             }
+            assert_eq!(trailing, vec![(2, DETACH, Vec::new())]);
         });
         events.recv_timeout(Duration::from_secs(5)).unwrap();
         let terminal = lock(&owner.state).terminal.clone().unwrap();
@@ -2023,6 +2196,7 @@ mod connection_tests {
             commands,
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -2124,6 +2298,7 @@ mod connection_tests {
             commands: commands.clone(),
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -2335,5 +2510,227 @@ mod connection_tests {
         // The old DATA was parsed at the old grid: A sits in column 20, not 30.
         assert_eq!(cell(0, 19), 'A', "{}", session.screen_text());
         assert_eq!(cell(0, 29), ' ', "{}", session.screen_text());
+    }
+}
+
+/// A scripted herdr-core on the far end of the socket: it answers every RPC
+/// and records, in order, each attach and each DETACH, RESIZE and VISIBILITY
+/// frame the phone sends, so the tests can say what claimed the grid when.
+#[cfg(test)]
+mod claim_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::remote::State;
+    use herdr_remote_transport::CancellationToken;
+    use std::io::BufRead;
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Attach(Value),
+        Frame(u32, u8, Vec<u8>),
+    }
+
+    struct Mock {
+        owner: Arc<Session>,
+        seen: mpsc::Receiver<Seen>,
+        session: Option<std::thread::JoinHandle<Result<()>>>,
+        peer: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Mock {
+        /// `features` is what hello advertises; `confirm` is whether the
+        /// attach reply confirms VISIBILITY frames when asked for them.
+        fn start(features: Value, confirm: bool, visible: bool, active: bool) -> Self {
+            let (phone, mut core) = UnixStream::pair().unwrap();
+            core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let (commands, rx) = mpsc::sync_channel(256);
+            let owner = Arc::new(Session {
+                state: Mutex::new(State {
+                    view: json!({"revision":0,"panes":[]}),
+                    terminal: None,
+                    render_id: 0,
+                }),
+                cancel: CancellationToken::new(),
+                commands,
+                focus: Mutex::new(None),
+                heard: crate::remote::Heard::default(),
+                visible: AtomicBool::new(visible),
+            });
+            let worker = owner.clone();
+            let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
+            let (tx, seen) = mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let mut hello = String::new();
+                io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+                let reply = json!({"jsonrpc":"2.0","id":0,"result":{"generation":1,"core":{"id":"fixture"},"framed":true,"features":features}});
+                core.write_all(format!("{reply}\n").as_bytes()).unwrap();
+                let mut decoder = Decoder::default();
+                let mut next_channel = 2;
+                let mut bytes = [0; 4096];
+                loop {
+                    match core.read(&mut bytes) {
+                        Ok(0) => return,
+                        Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                        Err(_) => return,
+                    }
+                    while let Some(frame) = decoder.next().unwrap() {
+                        if frame.channel != 0 {
+                            if matches!(frame.kind, DETACH | RESIZE | VISIBILITY) {
+                                let _ = tx.send(Seen::Frame(frame.channel, frame.kind, frame.bytes));
+                            }
+                            continue;
+                        }
+                        let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                        let result = match request["method"].as_str().unwrap() {
+                            "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                            "terminal.list" => json!({"terminals":[
+                                {"address":"t1","state":"live","labels":{},"cwd":"/tmp"},
+                                {"address":"t2","state":"live","labels":{},"cwd":"/tmp"}]}),
+                            "doc.get" => json!({"value":null,"version":0}),
+                            "terminal.attach" => {
+                                let asked = request["params"]["visibility_updates"] == true;
+                                let _ = tx.send(Seen::Attach(request["params"].clone()));
+                                next_channel += 1;
+                                json!({"channel":next_channel - 1,"resize_notifications":false,
+                                       "visibility_updates": asked && confirm})
+                            }
+                            other => panic!("unexpected {other}"),
+                        };
+                        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
+                    }
+                }
+            });
+            Self { owner, seen, session: Some(session), peer: Some(peer) }
+        }
+
+        fn next(&self) -> Seen {
+            self.seen.recv_timeout(Duration::from_secs(5)).expect("the core saw nothing more")
+        }
+
+        /// Nothing more reaches the core within this window.
+        fn quiet(&self, window: Duration) {
+            if let Ok(seen) = self.seen.recv_timeout(window) {
+                panic!("unexpected {seen:?}");
+            }
+        }
+
+        fn set_visible(&self, visible: bool) {
+            self.owner.visible.store(visible, Ordering::Relaxed);
+        }
+
+        /// What the phone's terminal does when its view is laid out.
+        fn measured(&self, channel: u32, cols: u16, rows: u16) {
+            let mut bytes = Vec::from(cols.to_le_bytes());
+            bytes.extend(rows.to_le_bytes());
+            self.owner.commands.try_send(Operation::Frame(channel, RESIZE, bytes)).unwrap();
+        }
+
+        /// Ends the session as the activity does; returns what it sent last.
+        fn close(mut self) -> Vec<Seen> {
+            self.owner.cancel.cancel();
+            let _ = self.session.take().unwrap().join().unwrap();
+            self.peer.take().unwrap().join().unwrap();
+            self.seen.try_iter().collect()
+        }
+    }
+
+    fn size(cols: u16, rows: u16) -> Vec<u8> {
+        let mut bytes = Vec::from(cols.to_le_bytes());
+        bytes.extend(rows.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_visibility_core_sees_hidden_attach_then_measured_resize_then_shown() {
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["terminal"], "t1");
+        assert_eq!(params["visibility_updates"], true);
+        assert_eq!(params["visible"], false, "the attach-time estimate never leads");
+        core.measured(2, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 30)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+
+        // Backgrounded: hidden, and no RESIZE while hidden.
+        core.set_visible(false);
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![0]));
+        core.measured(2, 60, 20);
+        core.quiet(Duration::from_millis(300));
+
+        // Foregrounded: a fresh measured RESIZE comes before showing.
+        core.set_visible(true);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(60, 20)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+
+        assert_eq!(
+            core.close(),
+            vec![Seen::Frame(2, VISIBILITY, vec![0]), Seen::Frame(2, DETACH, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn without_a_measured_resize_the_attach_size_is_offered_before_showing() {
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        core.close();
+    }
+
+    #[test]
+    fn an_older_core_is_detached_while_hidden_and_reattached_with_a_fresh_resize() {
+        let core = Mock::start(json!([]), true, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["terminal"], "t1");
+        assert!(params.get("visibility_updates").is_none(), "never asked of an older core");
+        core.measured(2, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 30)));
+
+        core.set_visible(false);
+        assert_eq!(core.next(), Seen::Frame(2, DETACH, Vec::new()));
+        core.measured(2, 60, 20);
+        core.quiet(Duration::from_millis(300));
+
+        core.set_visible(true);
+        let Seen::Attach(params) = core.next() else { panic!("reattach") };
+        assert_eq!(params["terminal"], "t1", "the same pane comes back");
+        assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(100, 30)));
+        assert_eq!(core.close(), vec![Seen::Frame(3, DETACH, Vec::new())]);
+    }
+
+    #[test]
+    fn a_relay_that_drops_visibility_falls_back_to_detaching() {
+        let core = Mock::start(json!(["viewer_visibility"]), false, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["visibility_updates"], true);
+        core.quiet(Duration::from_millis(1300));
+        core.set_visible(false);
+        assert_eq!(core.next(), Seen::Frame(2, DETACH, Vec::new()));
+        core.quiet(Duration::from_millis(300));
+        assert!(core.close().is_empty(), "nothing left to release");
+    }
+
+    #[test]
+    fn a_session_hidden_from_the_start_claims_no_grid_on_an_older_core() {
+        let core = Mock::start(json!([]), true, false, true);
+        core.quiet(Duration::from_millis(500));
+        core.set_visible(true);
+        let Seen::Attach(params) = core.next() else { panic!("attach when shown") };
+        assert_eq!(params["terminal"], "t1");
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        core.close();
+    }
+
+    #[test]
+    fn an_inactive_session_attaches_nothing_until_a_pane_is_picked() {
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, false);
+        core.quiet(Duration::from_millis(500));
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        let Seen::Attach(params) = core.next() else { panic!("attach the pick") };
+        assert_eq!(params["terminal"], "t2");
+        assert!(core.close().iter().any(|seen| *seen == Seen::Frame(2, DETACH, Vec::new())));
     }
 }
