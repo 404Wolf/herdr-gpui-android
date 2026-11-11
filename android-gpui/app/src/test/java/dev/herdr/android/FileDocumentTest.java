@@ -10,14 +10,14 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public class FileDocumentTest {
-    @Test public void splitsLinesKeepingNoExtraLineAndExpandingTabs() {
+    @Test public void splitsLinesKeepingNoExtraLineAndExpandingTabs() throws Exception {
         assertEquals(Arrays.asList("a", "", "b"), FileDocument.split("a\n\nb\n"));
         assertEquals(Arrays.asList("a", "b"), FileDocument.split("a\r\nb"));
         assertEquals(Arrays.asList("    x"), FileDocument.split("\tx\n"));
         assertEquals(Arrays.asList(), FileDocument.split(""));
     }
 
-    @Test public void aReadIsHighlightedAndKnowsWhenItWasCut() {
+    @Test public void aReadIsHighlightedAndKnowsWhenItWasCut() throws Exception {
         FileDocument doc = FileDocument.parse("src/a.rs", 2,
                 "{\"queued\":true,\"path\":\"/w/src/a.rs\",\"text\":\"fn a() {}\\nlet b = 1;\\n\",\"lines\":40000,\"last\":2}");
         assertNull(doc.error);
@@ -29,14 +29,14 @@ public class FileDocumentTest {
         assertEquals(0, doc.scrollRow());
     }
 
-    @Test public void failuresBecomeReadableReasons() {
+    @Test public void failuresBecomeReadableReasons() throws Exception {
         FileDocument doc = FileDocument.parse("/bin/sh", 0, "{\"queued\":false,\"error\":\"\\\"not_text\\\": binary\"}");
         assertEquals("Not a text file", doc.error);
         assertEquals("No such file", FileDocument.parse("x", 0, "{\"queued\":false,\"error\":\"\\\"not_found\\\": x\"}").error);
         assertEquals("unreadable reply", FileDocument.parse("x", 0, "not json").error);
     }
 
-    @Test public void theMarkedLineScrollsWithContextAbove() {
+    @Test public void theMarkedLineScrollsWithContextAbove() throws Exception {
         StringBuilder text = new StringBuilder();
         for (int i = 0; i < 100; i++) text.append("l").append(i).append('\n');
         String raw = new JSONObject().put("queued", true).put("text", text.toString()).toString();
@@ -45,7 +45,7 @@ public class FileDocumentTest {
         assertEquals(96, FileDocument.parse("/a", 900, raw).scrollRow());
     }
 
-    @Test public void onlyANewerEventForTheShownTerminalOpens() {
+    @Test public void onlyANewerEventForTheShownTerminalOpens() throws Exception {
         JSONObject event = new JSONObject().put("terminal", "t7").put("path", "/w/a.rs").put("line", 3).put("seq", 12);
         assertTrue(FileDocument.shouldOpen(event, "t7", 11));
         assertFalse(FileDocument.shouldOpen(event, "t7", 12));
