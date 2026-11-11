@@ -47,13 +47,18 @@ public final class ComposerDraftsTest {
     }
 
     @Test
-    public void abandonedDictationRestoresTheDraft() {
+    public void anEndedUtteranceKeepsItsLastPartial() {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.switchTo("a");
-        drafts.edit("keep ");
+        drafts.edit("keep");
         drafts.dictationStarted();
-        drafts.dictationPartial("garbage");
-        assertEquals("keep ", drafts.dictationAbandoned());
+        drafts.dictationPartial("these");
+        drafts.dictationPartial("these words");
+        assertEquals("keep these words", drafts.dictationEnded());
+        assertFalse(drafts.dictating());
+        // The next utterance appends after the kept words, not over them.
+        drafts.dictationStarted();
+        assertEquals("keep these words too", drafts.dictationPartial("too"));
     }
 
     @Test

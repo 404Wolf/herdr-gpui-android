@@ -63,9 +63,12 @@ final class ComposerDrafts {
         return result;
     }
 
-    /** The utterance failed or was cancelled: back to the text before it. */
-    String dictationAbandoned() {
-        if (dictationBase != null) edit(dictationBase);
+    /**
+     * The utterance ended without a final (an error, or cancelled by a mode or
+     * pane change). The last partial stays in the draft: spoken words are never
+     * thrown away, and the next utterance builds on them.
+     */
+    String dictationEnded() {
         dictationBase = null;
         return text();
     }

@@ -47,6 +47,11 @@ final class ComposerBar {
         void hideKeyboard();
         /** A short status for the user; the connection stays as it is. */
         void notice(String message);
+        /**
+         * Runs {@code granted} once the microphone may be used: at once when
+         * RECORD_AUDIO is already granted, or after the user allows it.
+         */
+        void withMicrophone(Runnable granted);
     }
 
     private static final String PREFS = "terminal-display";
@@ -161,6 +166,7 @@ final class ComposerBar {
             dictation.cancel();
             dictationState = DictationEngine.State.IDLE;
             sendWhenFinal = false;
+            drafts.dictationEnded();
         }
         String text = drafts.switchTo(paneId);
         if (switched) showText(text);
@@ -186,7 +192,7 @@ final class ComposerBar {
         else if (dictationState != DictationEngine.State.IDLE) {
             dictation.cancel();
             dictationState = DictationEngine.State.IDLE;
-            showText(drafts.dictationAbandoned());
+            showText(drafts.dictationEnded());
         }
         apply();
     }
@@ -362,6 +368,12 @@ final class ComposerBar {
             host.notice("Dictation is not set up on this phone");
             return;
         }
+        // The engines refuse to start without RECORD_AUDIO; ask first, start on yes.
+        host.withMicrophone(this::startDictation);
+    }
+
+    private void startDictation() {
+        if (!micOnly || dictationState != DictationEngine.State.IDLE) return;
         drafts.dictationStarted();
         final String pane = drafts.pane();
         dictation.start(new DictationEngine.Listener() {
@@ -386,7 +398,7 @@ final class ComposerBar {
             @Override public void onError(DictationException error) {
                 dictationState = DictationEngine.State.IDLE;
                 sendWhenFinal = false;
-                if (pane.equals(drafts.pane())) showText(drafts.dictationAbandoned());
+                if (pane.equals(drafts.pane())) showText(drafts.dictationEnded());
                 host.notice(error.getMessage() == null ? "Dictation stopped" : error.getMessage());
             }
         });

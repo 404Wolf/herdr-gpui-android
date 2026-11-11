@@ -378,8 +378,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         content.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
             if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
         });
-        composer = new ComposerBar(this, chrome, new dev.herdr.android.dictation.NoopDictationEngine(),
-                composerHost());
+        composer = new ComposerBar(this, chrome, Dictation.create(this), composerHost());
         content.addView(composer.keysRow(), new LinearLayout.LayoutParams(-1, dp(48)));
         shortcutBar = createShortcutBar();
         content.addView(shortcutBar, new LinearLayout.LayoutParams(-1, dp(48)));
@@ -3822,7 +3821,34 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             @Override public void notice(String message) {
                 Toast.makeText(GpuiTerminalActivity.this, message, Toast.LENGTH_SHORT).show();
             }
+
+            @Override public void withMicrophone(Runnable granted) {
+                if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    granted.run();
+                    return;
+                }
+                microphoneGranted = granted;
+                requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, MICROPHONE_REQUEST);
+            }
         };
+    }
+
+    private static final int MICROPHONE_REQUEST = 41;
+    /** What the composer asked to do once the microphone is allowed; one request at a time. */
+    private Runnable microphoneGranted;
+
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request != MICROPHONE_REQUEST) return;
+        Runnable granted = microphoneGranted;
+        microphoneGranted = null;
+        if (destroyed || granted == null) return;
+        if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            granted.run();
+        } else {
+            Toast.makeText(this, "Dictation needs the microphone", Toast.LENGTH_SHORT).show();
+        }
     }
 
     /** False leaves the composer's draft in place: unlike a key, it is never lost. */
