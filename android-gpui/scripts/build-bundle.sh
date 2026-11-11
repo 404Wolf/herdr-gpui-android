@@ -69,7 +69,7 @@ with zipfile.ZipFile(work / 'linked.apk') as linked, \
     for path in sorted((work / 'dex').glob('*.dex')):
         module.write(path, f'dex/{path.name}')
     for abi in abis:
-        paths = sorted((libraries / abi).glob('*.so'))
+        paths = sorted((libraries / abi).glob('*.so')) + sorted((work / 'aar-jni' / abi).glob('*.so'))
         if not paths:
             raise SystemExit(f'No shared libraries found for {abi}')
         for path in paths:

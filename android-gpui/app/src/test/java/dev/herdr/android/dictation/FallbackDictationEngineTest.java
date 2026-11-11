@@ -163,9 +163,14 @@ public final class FallbackDictationEngineTest {
         assertFalse(engine.isAvailable());
     }
 
-    @Test public void systemJoinSpacesUtterances() {
-        assertEquals("one two", SystemDictationEngine.join("one ", " two"));
-        assertEquals("two", SystemDictationEngine.join("", "two"));
-        assertEquals("one", SystemDictationEngine.join("one", null));
+    @Test public void voskJoinsUtterancesAndReadsItsJson() {
+        assertEquals("one two", VoskDictationEngine.join("one", "two"));
+        assertEquals("two", VoskDictationEngine.join("", "two"));
+        assertEquals("one", VoskDictationEngine.join("one", ""));
+        assertEquals("hello there", VoskDictationEngine.words("{\"text\" : \"hello there\"}", "text"));
+        assertEquals("hel", VoskDictationEngine.words("{\"partial\" : \"hel \"}", "partial"));
+        assertEquals("", VoskDictationEngine.words("{\"text\" : \"\"}", "text"));
+        assertEquals("", VoskDictationEngine.words("not json", "text"));
+        assertEquals("", VoskDictationEngine.words(null, "text"));
     }
 }

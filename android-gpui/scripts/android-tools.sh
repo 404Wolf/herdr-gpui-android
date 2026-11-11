@@ -28,6 +28,36 @@ fetch() {
     echo "$sha  $CACHE/$name" | sha256sum --check --quiet
 }
 
+# The only app dependencies, as app/build.gradle declares them; the manual build
+# provides them itself: coordinate, file, sha256, URL. On-device dictation
+# (Vosk, Apache-2.0) and its JNA binding (Apache-2.0). HERDR_AAR_DIR, if set,
+# holds these files (Nix builds have no network); otherwise they are fetched.
+AARS=(
+    "com.alphacephei:vosk-android:0.3.75 vosk-android-0.3.75.aar ab2f8b91ac8051561aa325546b35fed9a68b36b8121bac5c6fb927525c4adfad https://repo1.maven.org/maven2/com/alphacephei/vosk-android/0.3.75/vosk-android-0.3.75.aar"
+    "net.java.dev.jna:jna:5.18.1@aar jna-5.18.1.aar 7f053e3ec99e14dd71259c82c1c8a02738d64a13c31226b2acc170f3060951e0 https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.18.1/jna-5.18.1.aar"
+)
+
+# Unpacks each AAR's classes into $work/deps and its native libraries into
+# $work/aar-jni/<abi>.
+prepare_aars() {
+    local work="$1" entry coordinate file sha url path
+    mkdir -p "$work/deps" "$work/aar-jni"
+    for entry in "${AARS[@]}"; do
+        read -r coordinate file sha url <<< "$entry"
+        if [[ -n "${HERDR_AAR_DIR:-}" ]]; then
+            path="$HERDR_AAR_DIR/$file"
+            echo "$sha  $path" | sha256sum --check --quiet || { echo "Checksum mismatch: $path" >&2; exit 1; }
+        else
+            fetch "$file" "$sha" "$url" || { echo "Cannot fetch $coordinate" >&2; exit 1; }
+            path="$CACHE/$file"
+        fi
+        unzip -p "$path" classes.jar > "$work/deps/${file%.aar}.jar"
+        unzip -q -o "$path" 'jni/*' -d "$work/aar-unpacked"
+    done
+    cp -r "$work/aar-unpacked/jni/." "$work/aar-jni/"
+    rm -rf "$work/aar-unpacked"
+}
+
 fetch_bundletool() {
     fetch bundletool-all-1.18.3.jar a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 \
         https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar
@@ -65,11 +95,15 @@ configure_tools() {
 }
 
 read_app_settings() {
-    local work="$1"
-    python3 - "$ROOT" "$work" <<'PY'
+    local work="$1" entry provided=()
+    for entry in "${AARS[@]}"; do provided+=("${entry%% *}"); done
+    HERDR_PROVIDED_DEPS="${provided[*]}" python3 - "$ROOT" "$work" <<'PY'
 import os, pathlib, re, sys, xml.etree.ElementTree as ET
 root, work = map(pathlib.Path, sys.argv[1:])
 gradle = (root / 'app/build.gradle').read_text(encoding='utf-8')
+# Dependencies prepare_aars provides are fine; any other needs Gradle.
+for coordinate in os.environ.get('HERDR_PROVIDED_DEPS', '').split():
+    gradle = re.sub(r"^\s*implementation\s+'" + re.escape(coordinate) + r"'\s*$", '', gradle, flags=re.MULTILINE)
 if re.search(r'^\s*(?:implementation|api|compileOnly|runtimeOnly|kapt|annotationProcessor)\b', gradle, re.MULTILINE):
     raise SystemExit('Manual build does not resolve app dependencies; use Gradle.')
 def value(key, pattern):
@@ -109,6 +143,15 @@ for source in (root.parent / 'android/app/src/main/assets', root / 'app/src/main
     if source.is_dir():
         shutil.copytree(source, assets, dirs_exist_ok=True)
 PY
+    # The Vosk speech model, optional: HERDR_VOSK_ASSETS is a directory holding
+    # vosk-model/ (as Gradle's -PvoskAssetsDir). Without it dictation falls back
+    # to nothing when the dictation server is unreachable.
+    if [[ -n "${HERDR_VOSK_ASSETS:-}" ]]; then
+        [[ -d "$HERDR_VOSK_ASSETS/vosk-model" ]] || { echo "No vosk-model/ in $HERDR_VOSK_ASSETS" >&2; exit 1; }
+        cp -r "$HERDR_VOSK_ASSETS/vosk-model" "$work/assets/vosk-model"
+        chmod -R u+w "$work/assets/vosk-model"
+    fi
+    prepare_aars "$work"
     local privacy="${HERDR_PRIVACY_SOURCE:-$ROOT/PRIVACY.md}"
     python3 "$ROOT/scripts/about-pages.py" --out "$work/assets/about" --privacy "$privacy"
     "$AAPT2" compile --dir "$ROOT/../android/app/src/main/res" -o "$work/resources.zip"
@@ -128,10 +171,14 @@ link_resources() {
 compile_dex() {
     local work="$1" mode="$2"; local -a sources d8_mode javac_api
     mapfile -d '' sources < <(find "$ROOT/../android/app/src/main/java" "$ROOT/app/src/main/java" "$work/generated" -name '*.java' -print0)
+    local -a deps
+    mapfile -t deps < <(find "$work/deps" -name '*.jar' | sort)
+    local dep_path
+    dep_path="$(IFS=:; echo "${deps[*]}")"
     if [[ -n "$SDK" ]]; then
-        javac_api=(-bootclasspath "$BOOT_CLASSES")
+        javac_api=(-bootclasspath "$BOOT_CLASSES" -classpath "$dep_path")
     else
-        javac_api=(-classpath "$FRAMEWORK")
+        javac_api=(-classpath "$FRAMEWORK:$dep_path")
     fi
     java com.sun.tools.javac.Main -source 8 -target 8 -encoding UTF-8 -Xlint:-options \
         "${javac_api[@]}" -d "$work/classes" "${sources[@]}"
@@ -150,5 +197,5 @@ PY
     local jdk
     jdk="$(dirname -- "$(dirname -- "$(readlink -f -- "$(command -v java)")")")"
     java -cp "$R8_JAR" com.android.tools.r8.D8 "${d8_mode[@]}" --min-api "${SETTINGS[1]}" \
-        --lib "$FRAMEWORK" --lib "$jdk" --output "$work/dex" "$work/classes.jar"
+        --lib "$FRAMEWORK" --lib "$jdk" --output "$work/dex" "$work/classes.jar" "${deps[@]}"
 }

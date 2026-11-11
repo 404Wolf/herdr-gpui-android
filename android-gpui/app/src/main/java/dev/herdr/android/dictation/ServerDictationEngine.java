@@ -3,9 +3,6 @@ package dev.herdr.android.dictation;
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.media.AudioFormat;
-import android.media.AudioRecord;
-import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.Looper;
 import java.io.IOException;
@@ -24,8 +21,8 @@ import org.json.JSONObject;
  * so the first words are not lost.
  */
 public final class ServerDictationEngine implements DictationEngine {
-    static final int RATE = 16000;
-    static final int CHUNK_BYTES = RATE * 2 / 10;
+    static final int RATE = Microphone.RATE;
+    static final int CHUNK_BYTES = Microphone.CHUNK_BYTES;
     /** Audio kept while connecting: 10 s. */
     static final int MAX_PENDING_CHUNKS = 100;
     static final int CONNECT_TIMEOUT_MS = 2500;
@@ -157,52 +154,33 @@ public final class ServerDictationEngine implements DictationEngine {
 
         /** Mic thread: records until stop, sending once the server is ready, then sends "stop". */
         private void record() {
-            AudioRecord rec;
-            try {
-                int min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT);
-                rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE,
-                        AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                        Math.max(min, CHUNK_BYTES * 4));
-            } catch (IllegalArgumentException | SecurityException e) {
-                postFailure(DictationException.Reason.AUDIO, "The microphone could not be opened", e);
-                return;
-            }
             ArrayDeque<byte[]> pending = new ArrayDeque<>();
-            try {
-                if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                    throw new AudioException("AudioRecord did not initialize");
-                }
-                rec.startRecording();
+            try (Microphone mic = Microphone.open()) {
                 while (!stopping) {
                     byte[] chunk = new byte[CHUNK_BYTES];
-                    int n = 0;
-                    while (n < chunk.length && !stopping) {
-                        int r = rec.read(chunk, n, chunk.length - n);
-                        if (r < 0) throw new AudioException("AudioRecord.read returned " + r);
-                        n += r;
-                    }
-                    if (n > 0) {
-                        enqueue(pending, n == chunk.length ? chunk : Arrays.copyOf(chunk, n));
-                    }
+                    int n = mic.read(chunk, () -> stopping);
+                    if (n > 0) enqueue(pending, n == chunk.length ? chunk : Arrays.copyOf(chunk, n));
                     DictationSocket s = ready;
                     if (s != null) drain(pending, s);
                 }
-                rec.stop();
-                if (cancelled) return;
+            } catch (Microphone.Failure e) {
+                postFailure(DictationException.Reason.AUDIO, e.getMessage(), e);
+                return;
+            } catch (IOException e) {
+                postFailure(DictationException.Reason.UNREACHABLE, "Lost the dictation server", e);
+                return;
+            }
+            if (cancelled) return;
+            try {
                 readyLatch.await(CONNECT_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS);
                 DictationSocket s = ready;
                 if (s == null || cancelled) return;
                 drain(pending, s);
                 s.sendText("{\"type\":\"stop\"}");
-            } catch (AudioException e) {
-                postFailure(DictationException.Reason.AUDIO, "The microphone stopped", e);
             } catch (IOException e) {
                 postFailure(DictationException.Reason.UNREACHABLE, "Lost the dictation server", e);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-            } finally {
-                rec.release();
             }
         }
 
@@ -265,15 +243,6 @@ public final class ServerDictationEngine implements DictationEngine {
         while (!pending.isEmpty()) {
             byte[] p = pending.removeFirst();
             s.sendBinary(p, 0, p.length);
-        }
-    }
-
-    /** The microphone failed after opening; kept apart from socket I/O failures. */
-    private static final class AudioException extends Exception {
-        private static final long serialVersionUID = 1L;
-
-        AudioException(String message) {
-            super(message);
         }
     }
 }

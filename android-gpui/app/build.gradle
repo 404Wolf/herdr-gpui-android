@@ -22,6 +22,9 @@ android {
             java.srcDirs = ['../../android/app/src/main/java', 'src/main/java']
             res.srcDirs = ['../../android/app/src/main/res']
             assets.srcDirs = ['../../android/app/src/main/assets', 'src/main/assets']
+            // The offline dictation model, a directory holding vosk-model/ (Nix passes
+            // vosk-model-small-en-us-0.15). Without it dictation has no offline fallback.
+            if (project.hasProperty('voskAssetsDir')) assets.srcDirs += [project.property('voskAssetsDir')]
         }
     }
     compileOptions {
@@ -46,6 +49,10 @@ android {
 }
 
 dependencies {
+    // Offline dictation (Apache-2.0). scripts/android-tools.sh provides the same two
+    // AARs to the manual build; keep the versions and its AARS list in step.
+    implementation 'com.alphacephei:vosk-android:0.3.75'
+    implementation 'net.java.dev.jna:jna:5.18.1@aar'
     testImplementation 'junit:junit:4.13.2'
     // android.jar's org.json is a stub that throws on the JVM; hosts-file tests need a real one.
     testImplementation 'org.json:json:20260814'

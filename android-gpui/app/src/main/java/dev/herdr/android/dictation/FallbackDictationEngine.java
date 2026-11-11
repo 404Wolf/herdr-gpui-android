@@ -5,7 +5,7 @@ import java.util.function.LongSupplier;
 
 /**
  * Tries {@code primary} (the tailnet server) and, if it cannot be reached before it starts
- * listening, switches the same session to {@code fallback} (the phone's recognizer); the composer
+ * listening, switches the same session to {@code fallback} (offline Vosk); the composer
  * sees only a longer CONNECTING. After such a miss it goes straight to the fallback for
  * {@link #RETRY_PRIMARY_AFTER_MS}, so every tap is not a connect timeout. Failures after
  * listening began are reported as they are: the server's partial text is already shown.
