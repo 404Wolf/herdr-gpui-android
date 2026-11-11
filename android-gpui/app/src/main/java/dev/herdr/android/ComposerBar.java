@@ -52,6 +52,8 @@ final class ComposerBar {
         void hideKeyboard();
         /** A short status for the user; the connection stays as it is. */
         void notice(String message);
+        /** A queued message was tapped: offer what can be done with it. */
+        void queuedTapped(Outbox.Message message);
         /**
          * Runs {@code granted} once the microphone may be used: at once when
          * RECORD_AUDIO is already granted, or after the user allows it.
@@ -78,6 +80,10 @@ final class ComposerBar {
     private final FrameLayout keysRow;
     /** Floats over the terminal; the parent frame positions it over {@link #slot}. */
     private final EditText field;
+    /** The outbox's messages for this pane, directly above the field. */
+    private final QueuedStrip queued;
+    /** The queued strip over the field: what the activity floats over the terminal. */
+    private final LinearLayout stack;
     private GpuiChrome chrome;
 
     private LinearLayout bar;
@@ -111,13 +117,39 @@ final class ComposerBar {
         micOnly = preferences.getBoolean(MIC_ONLY, false);
         keysRow = new FrameLayout(context);
         field = createField();
+        queued = new QueuedStrip(context, chrome, host::queuedTapped);
+        stack = new LinearLayout(context);
+        stack.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams above = new LinearLayout.LayoutParams(-1, -2);
+        above.bottomMargin = dp(2);
+        stack.addView(queued.view(), above);
+        stack.addView(field, new LinearLayout.LayoutParams(-1, -2));
+        stack.setVisibility(View.GONE);
     }
 
     /** The collapsible keys row; the activity places it directly above the bar. */
     View keysRow() { return keysRow; }
 
-    /** The floating composer field; the activity adds it to a frame over the terminal column. */
-    View field() { return field; }
+    /**
+     * The floating composer field with the queued strip above it; the activity
+     * adds it to a frame over the terminal column.
+     */
+    View field() { return stack; }
+
+    /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
+    void showQueued(java.util.List<Outbox.Message> messages) {
+        queued.show(messages, drafts.pane());
+        updateStack();
+    }
+
+    /** A queued message taken back: its text joins the draft, on a line of its own. */
+    void takeBack(String text) {
+        if (text == null || text.isEmpty()) return;
+        String draft = drafts.text();
+        String joined = draft.trim().isEmpty() ? text : draft.replaceAll("\\s+$", "") + "\n" + text;
+        drafts.edit(joined);
+        showText(joined);
+    }
 
     /**
      * Builds the 48 dp bar: mode toggle at bottom-left, the toolbar's pinned
@@ -163,6 +195,7 @@ final class ComposerBar {
         bar.addView(enter, enterParams);
         keysRow.setBackgroundColor(chrome.surface);
         styleField();
+        queued.style(chrome);
         apply();
         return bar;
     }
@@ -261,13 +294,23 @@ final class ComposerBar {
         field.setVisibility(composing ? View.VISIBLE : View.GONE);
         if (!composing && field.hasFocus()) field.clearFocus();
         updateMicPanel();
+        updateStack();
+    }
+
+    /** Shows the floating stack while it holds the field or queued messages. */
+    private void updateStack() {
+        boolean shown = field.getVisibility() == View.VISIBLE || !queued.isEmpty();
+        stack.setVisibility(shown ? View.VISIBLE : View.GONE);
         placeField();
     }
 
-    /** Aligns the floating field with the slot, bottom to the bar's bottom. */
+    /**
+     * Aligns the floating stack with the slot: the field's bottom on the bar's
+     * bottom, or, without a field (mic-only, a shell), the strip on the bar's top.
+     */
     private void placeField() {
-        if (slot == null || !(field.getParent() instanceof ViewGroup) || slot.getWidth() == 0) return;
-        ViewGroup frame = (ViewGroup) field.getParent();
+        if (slot == null || !(stack.getParent() instanceof ViewGroup) || slot.getWidth() == 0) return;
+        ViewGroup frame = (ViewGroup) stack.getParent();
         int[] at = new int[2];
         int[] origin = new int[2];
         slot.getLocationInWindow(at);
@@ -276,10 +319,11 @@ final class ComposerBar {
                 Gravity.BOTTOM | Gravity.START);
         params.leftMargin = at[0] - origin[0];
         params.bottomMargin = Math.max(0, origin[1] + frame.getHeight() - at[1] - slot.getHeight());
-        FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) field.getLayoutParams();
+        if (field.getVisibility() != View.VISIBLE) params.bottomMargin += slot.getHeight();
+        FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) stack.getLayoutParams();
         if (old != null && old.width == params.width && old.leftMargin == params.leftMargin
                 && old.bottomMargin == params.bottomMargin && old.gravity == params.gravity) return;
-        field.setLayoutParams(params);
+        stack.setLayoutParams(params);
     }
 
     private EditText createField() {

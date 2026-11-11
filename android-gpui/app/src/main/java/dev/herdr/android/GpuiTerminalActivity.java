@@ -1970,6 +1970,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
             composer.setPane(current == null ? "" : current.paneId, "claude".equals(kind) || "codex".equals(kind));
+            refreshQueued();
         }
         boolean show = current != null && !shellMode() && current.tabs != null;
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
@@ -3848,6 +3849,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 Toast.makeText(GpuiTerminalActivity.this, message, Toast.LENGTH_SHORT).show();
             }
 
+            @Override public void queuedTapped(Outbox.Message message) { queuedActions(message); }
+
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -3926,11 +3929,42 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return ids;
     }
 
-    /** The outbox changed (any thread): the status line counts what waits. */
+    /** The outbox changed (any thread): the strip and the status line follow. */
     private final Runnable outboxChanged = () -> main.post(() -> {
         if (destroyed) return;
+        refreshQueued();
         showLinkDown();
     });
+
+    /** Shows the outbox's messages for the pane on screen above the composer. Main thread. */
+    private void refreshQueued() {
+        if (composer == null || outbox == null) return;
+        String host;
+        String pane;
+        synchronized (stateLock) {
+            host = connection == null ? currentHostId : connection.hostId;
+            pane = connection == null ? "" : connection.paneId;
+        }
+        composer.showQueued(host == null ? java.util.Collections.emptyList()
+                : outbox.outbox().shown(host, pane, System.currentTimeMillis()));
+    }
+
+    /** What can be done with one queued message; an unsure one is resent only from here. */
+    private void queuedActions(Outbox.Message message) {
+        if (message.state == Outbox.State.SENDING) {
+            Toast.makeText(this, "Sending…", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        ActionSheet sheet = new ActionSheet(this, chrome, "❯ " + QueuedStrip.oneLine(message.text));
+        if (message.state == Outbox.State.UNSURE) {
+            // The core may have typed it: look at the pane before sending it twice.
+            sheet.add("Send again (check the pane first)", () -> outbox.resend(message.id));
+        }
+        sheet.add("Edit as draft", () -> composer.takeBack(outbox.take(message.id)));
+        sheet.add("Copy", () -> ActionSheet.copy(this, "Message", message.text));
+        sheet.danger("Drop", () -> outbox.take(message.id));
+        sheet.show();
+    }
 
     /** False leaves the composer's draft in place: unlike a key, it is never lost. */
     private boolean queueComposerInput(String commandJson) {
