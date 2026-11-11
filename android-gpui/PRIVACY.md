@@ -36,7 +36,7 @@ The app reads clipboard text only when you tap Paste for an Iroh endpoint. It wr
 
 ## Dictation
 
-The app uses the microphone only between your tap on the microphone button and your next tap, and only if you grant microphone permission. If your device administrator has provisioned a dictation server (a speech-to-text server on your own network), the audio streams to that server and its text comes back; nothing is saved on the phone. If no server is provisioned, or it cannot be reached, the app uses the phone's own speech recognizer (on most phones, Google's), which follows that recognizer's own terms; the app asks it to prefer its offline model.
+The app uses the microphone only between your tap on the microphone button and your next tap, and only if you grant microphone permission. If your device administrator has provisioned a dictation server (a speech-to-text server on your own network), the audio streams to that server and its text comes back; nothing is saved on the phone. If no server is provisioned, or it cannot be reached, the app recognizes speech on the phone itself with a speech model built into the app; that audio never leaves the phone.
 
 ## Notifications
 
