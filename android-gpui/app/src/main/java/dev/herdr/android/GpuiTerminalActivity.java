@@ -114,6 +114,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private LinearLayout railColumns;
     private View railScrim, railEdge, railFade;
     private View shortcutBar;
+    /** The bar's composer, mic-only mode and folded keys; see {@link ComposerBar}. */
+    private ComposerBar composer;
     /** Size class the toolbar was built for, so a fold rebuilds it only on change. */
     private boolean toolbarCompact;
     /** Tabletop posture from the device's window extensions, while started. */
@@ -372,8 +374,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         content.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
             if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
         });
+        composer = new ComposerBar(this, chrome, new dev.herdr.android.dictation.NoopDictationEngine(),
+                composerHost());
+        content.addView(composer.keysRow(), new LinearLayout.LayoutParams(-1, dp(48)));
         shortcutBar = createShortcutBar();
         content.addView(shortcutBar, new LinearLayout.LayoutParams(-1, dp(48)));
+        // The composer floats over this column, so a growing draft never resizes the pane.
+        FrameLayout column = new FrameLayout(this);
+        column.addView(content, new FrameLayout.LayoutParams(-1, -1));
+        // Zero width until the bar is laid out and the composer aligns it to its slot.
+        column.addView(composer.field(), new FrameLayout.LayoutParams(0, -2, android.view.Gravity.BOTTOM));
         // The sidebar rail mirrors the desktop's list of workspaces and agents.
         sidebar = new LinearLayout(this);
         sidebar.setOrientation(LinearLayout.HORIZONTAL);
@@ -397,7 +407,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railColumns = new LinearLayout(this);
         railColumns.setOrientation(LinearLayout.HORIZONTAL);
         railColumns.addView(sidebar, new LinearLayout.LayoutParams(0, -1));
-        railColumns.addView(content, new LinearLayout.LayoutParams(0, -1, 1));
+        railColumns.addView(column, new LinearLayout.LayoutParams(0, -1, 1));
         root.addView(railColumns, new FrameLayout.LayoutParams(-1, -1));
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
@@ -778,10 +788,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private View createShortcutBar() {
         boolean compact = compactWindow();
         toolbarCompact = compact;
-        LinearLayout shell = new LinearLayout(this);
-        shell.setOrientation(LinearLayout.HORIZONTAL);
-        shell.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        shell.setBackgroundColor(chrome.surface);
         // Navigation and actions stay put; only the key strip scrolls, so no
         // control can be scrolled out of reach on a narrow panel.
         LinearLayout pinned = new LinearLayout(this);
@@ -815,15 +821,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             pinned.addView(iconButton(R.drawable.ic_bar_close, "Close",
                     "Close this terminal and return to the host list", view -> finish()));
         }
-        View divider = new View(this);
-        divider.setBackgroundColor(chrome.outline);
-        divider.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(dp(1), dp(24));
-        dividerParams.setMargins(dp(4), 0, dp(4), 0);
         LinearLayout keys = new LinearLayout(this);
         keys.setOrientation(LinearLayout.HORIZONTAL);
         keys.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        keys.setPadding(0, 0, dp(16), 0);
+        keys.setPadding(dp(4), 0, dp(8), 0);
         // Panning is client-side: it is how a wide pane stays readable at a type
         // size that actually fits this display. A shell fits its own width.
         for (float panStep : shellMode() ? new float[0] : new float[]{-96f, 96f}) {
@@ -857,12 +858,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         FrameLayout.LayoutParams fadeParams = new FrameLayout.LayoutParams(dp(20), dp(48));
         fadeParams.gravity = android.view.Gravity.END;
         scrolling.addView(fade, fadeParams);
-        shell.addView(pinned, new LinearLayout.LayoutParams(-2, dp(48)));
-        shell.addView(divider, dividerParams);
-        shell.addView(scrolling, new LinearLayout.LayoutParams(0, dp(48), 1));
+        View bar = composer.bar(chrome, pinned, scrolling);
         updateControlButton();
         updateRailToggle();
-        return shell;
+        return bar;
     }
 
     /** The Ctrl latch and the host's shortcut keys, wherever this layout puts them. */
@@ -880,6 +879,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronousTouch(controlButton);
         keycaps.add(controlButton);
         for (Shortcut shortcut : shortcuts) {
+            // Enter has its own place at the end of the bar.
+            if (!shortcut.isText() && shortcut.getKeys().size() == 1
+                    && "enter".equals(shortcut.getKeys().get(0))) continue;
             Button button = keycap(shortcut.getLabel());
             button.setOnClickListener(view -> sendShortcut(shortcut));
             synchronousTouch(button);
@@ -1141,6 +1143,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (Build.VERSION.SDK_INT >= 30 && root.getRootWindowInsets() != null) {
             shown = root.getRootWindowInsets().isVisible(WindowInsets.Type.ime());
         }
+        // Typing in the composer: this button means raw terminal input instead.
+        if (composer != null && composer.ownsKeys()) shown = false;
         if (shown) {
             allowNextKeyboardShow = false;
             super.gpuiHideKeyboard(imeSession);
@@ -1888,6 +1892,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
+        if (composer != null) {
+            String kind = current == null || shellMode() ? "" : agentKind(current);
+            composer.setPane(current == null ? "" : current.paneId, "claude".equals(kind) || "codex".equals(kind));
+        }
         boolean show = current != null && !shellMode() && current.tabs != null;
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
         if (!show) return;
@@ -3708,6 +3716,46 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /** The composer's way in: the same queue and checks as the toolbar keys. */
+    private ComposerBar.Host composerHost() {
+        return new ComposerBar.Host() {
+            @Override public boolean queue(String commandJson) { return queueComposerInput(commandJson); }
+
+            @Override public void enterKey() {
+                queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
+            }
+
+            @Override public void hideKeyboard() {
+                allowNextKeyboardShow = false;
+                GpuiTerminalActivity.super.gpuiHideKeyboard(imeSession);
+                if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
+                    getWindow().getInsetsController().hide(WindowInsets.Type.ime());
+                }
+            }
+
+            @Override public void notice(String message) {
+                Toast.makeText(GpuiTerminalActivity.this, message, Toast.LENGTH_SHORT).show();
+            }
+        };
+    }
+
+    /** False leaves the composer's draft in place: unlike a key, it is never lost. */
+    private boolean queueComposerInput(String commandJson) {
+        if (displayDialog != null && displayDialog.isShowing()) return false;
+        clearControl();
+        synchronized (stateLock) {
+            Connection target = connection;
+            if (target == null || target.isClosed() || !target.ready) {
+                Toast.makeText(this, "Not connected; the draft is kept", Toast.LENGTH_SHORT).show();
+                return false;
+            }
+            if (compositionBlocksInput(target)) return false;
+            if (nativeSendCommand(target.generation, commandJson)) return true;
+            publish(target, "Input queue is full; the draft is kept");
+            return false;
+        }
+    }
+
     @Override public void surfaceCreated(SurfaceHolder holder) {
         if (hostStarted) nativeSurfaceCreated(holder.getSurface(), getResources().getDisplayMetrics().density);
     }
@@ -3938,6 +3986,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
+        if (composer != null) composer.destroy();
         stopHostSampling();
         stopConnection();
         worker.shutdownNow();
@@ -4278,6 +4327,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
+        if (composer != null && composer.ownsKeys()) return super.dispatchKeyEvent(event);
         boolean physical = imeKeyInFlight || event.isFromSource(InputDevice.SOURCE_KEYBOARD)
                 && event.getDevice() != null && !event.getDevice().isVirtual()
                 && (event.getFlags() & KeyEvent.FLAG_SOFT_KEYBOARD) == 0;
@@ -4419,7 +4469,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 if (!current(current)) return;
                 mutation = true;
-                if ("submit".equals(command.type)) {
+                if ("submit".equals(command.type) || "compose".equals(command.type)) {
                     GpuiTerminalProtocol.requireAck(current.client.sendText(current.paneId, command.text));
                     // One FIFO item owns both requests. Never submit after an uncertain text
                     // acknowledgment or after this connection was paused/replaced.
