@@ -3806,7 +3806,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (target != null && target.ready && terminalSurface != null) {
                     final long generation = target.generation;
                     terminalSurface.postDelayed(() -> {
-                        if (!destroyed) nativeShowKeyboard(generation);
+                        // A tapped file link opened the file page instead.
+                        if (!destroyed && (filePager == null || !filePager.showingFile())) {
+                            nativeShowKeyboard(generation);
+                        }
                     }, 150);
                 }
             }
@@ -4196,7 +4199,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         || connection.generation != expectedGeneration || connection.remoteHandle == 0) return;
                 pane = connection.paneId;
             }
-            if (filePager != null) filePager.open(pane, path, Math.max(0, line));
+            if (filePager == null) return;
+            filePager.open(pane, path, Math.max(0, line));
+            // The file is read, not typed into: the keyboard would only cover it.
+            android.view.inputmethod.InputMethodManager input =
+                    (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (input != null && terminalSurface != null) {
+                input.hideSoftInputFromWindow(terminalSurface.getWindowToken(), 0);
+            }
         });
     }
 
