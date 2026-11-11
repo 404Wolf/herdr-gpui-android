@@ -65,23 +65,25 @@ macro_rules! __bind_gpui {
                     session.set_theme(style.theme);
                     cx.new(|cx: &mut Context<Self>| {
                         let poll = cx.spawn(async move |this, cx| {
+                            let mut alive = true;
                             loop {
+                                // An ended session's final screen stays drawn and
+                                // can still be scrolled (a held frame while the
+                                // link is down), so it is still watched, slower.
+                                let wait = if alive { 16 } else { 100 };
                                 cx.background_executor()
-                                    .timer(Duration::from_millis(16))
+                                    .timer(Duration::from_millis(wait))
                                     .await;
-                                let alive = this
-                                    .update(cx, |this, cx| {
-                                        if this.session.take_dirty() && this.visible {
-                                            cx.notify();
-                                        }
-                                        this.session.is_alive()
-                                    })
-                                    .unwrap_or(false);
-                                if !alive {
-                                    // The final screen of an ended session stays drawn.
-                                    let _ = this.update(cx, |_, cx| cx.notify());
+                                let Ok(now) = this.update(cx, |this, cx| {
+                                    let now = this.session.is_alive();
+                                    if (this.session.take_dirty() && this.visible) || now != alive {
+                                        cx.notify();
+                                    }
+                                    now
+                                }) else {
                                     break;
-                                }
+                                };
+                                alive = now;
                             }
                         });
                         Self {

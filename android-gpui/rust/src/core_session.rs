@@ -864,6 +864,7 @@ impl Connection<'_> {
             terminal_session.set_grid(cols, rows);
         }
         *lock(&session_slot) = Arc::downgrade(&terminal_session);
+        crate::remote::release_held();
         self.channel = channel;
         self.output = Some(tx);
         let mut state = lock(&self.owner.state);
@@ -2558,6 +2559,35 @@ mod connection_tests {
         assert!(!seen.iter().any(|(m, _)| m == "terminal.run"));
     }
 
+    #[test]
+    fn a_held_frame_scrolls_its_own_history_with_no_link_and_lets_go_on_attach() {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        let lines: String = (0..30).map(|n| format!("line {n}\r\n")).collect();
+        tx.send(Chunk::Data(lines.into_bytes())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.grid().lock().history_size() < 20 {
+            assert!(Instant::now() < deadline, "the lines never reached the history");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The link is gone: the stream ends, the grid stays.
+        drop(tx);
+        crate::remote::hold(session.clone());
+        let offset = |reply: String| serde_json::from_str::<Value>(&reply).unwrap()["local_offset"].as_u64().unwrap();
+        assert_eq!(offset(crate::remote::scroll_held(5, false)), 5);
+        assert_eq!(offset(crate::remote::scroll_held(-2, false)), 3);
+        assert!(session.screen_text().contains("line"));
+        assert_eq!(offset(crate::remote::scroll_held(0, true)), 0);
+        // A new pane attached: nothing is held, and a scroll is a no-op.
+        crate::remote::release_held();
+        assert_eq!(offset(crate::remote::scroll_held(5, false)), 0);
+        assert_eq!(session.grid().lock().display_offset(), 0);
+    }
     #[test]
     fn a_resize_inside_a_synchronized_update_flushes_it_at_the_old_grid_first() {
         // BSU, then a move to column 30 on a 20-column grid plus "A" (buffered

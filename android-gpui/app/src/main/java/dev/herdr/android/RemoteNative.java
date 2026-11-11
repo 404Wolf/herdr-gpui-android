@@ -45,6 +45,11 @@ final class RemoteNative {
      */
     static native String deliver(long handle, String paneId, String text);
     static native String scrollTo(long handle, long offsetFromBottom);
+    /**
+     * Scrolls the frame held on screen while the link is down (the last
+     * closed session's grid), locally; {"local_offset": rows back}.
+     */
+    static native String scrollHeld(long deltaRows, boolean latest);
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);
     static native void close(long handle);

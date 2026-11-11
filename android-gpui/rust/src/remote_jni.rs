@@ -314,6 +314,16 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_sessionAction(
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollHeld(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    delta: jlong,
+    latest: jboolean,
+) -> jstring {
+    result_string(&mut env, Ok(remote::scroll_held(delta, latest != 0)))
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_deliver(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

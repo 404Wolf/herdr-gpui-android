@@ -1109,7 +1109,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean requestScroll(int lines) {
         final Connection target;
         synchronized (stateLock) { target = connection; }
-        if (target == null || target.isClosed() || target.remoteHandle <= 0) return false;
+        if (heldFrame(target)) return scrollHeld(lines, false);
+        if (target.remoteHandle <= 0) return false;
         if (lines > 0 && lastFollowSent) {
             lastFollowSent = false;
             nativeSetFollow(target.generation, false);
@@ -1161,6 +1162,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 catch (RuntimeException | LinkageError ignored) { }
             });
         } catch (java.util.concurrent.RejectedExecutionException busy) { }
+    }
+
+    /**
+     * Whether the terminal shows a held frame (the link is down or a reconnect
+     * has not attached yet) rather than a live Herdr pane. Null and closed
+     * count as held: there is nothing live to scroll.
+     */
+    private boolean heldFrame(Connection target) {
+        if (shellMode()) return false;
+        return target == null || target.isClosed() || (target.remoteHandle > 0 && !target.ready);
+    }
+
+    /**
+     * Scrolls the held frame's own history on the phone: nothing is sent, so
+     * it works with no link at all. The "Latest" pill follows its offset.
+     */
+    private boolean scrollHeld(int lines, boolean latest) {
+        try {
+            scrollWorker.execute(() -> {
+                try {
+                    long offset = new JSONObject(RemoteNative.scrollHeld(lines, latest)).optLong("local_offset", 0);
+                    main.post(() -> showLatest(offset > 0));
+                } catch (Exception | LinkageError ignored) {
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException busy) {
+            return false;
+        }
+        return true;
     }
 
     /** Nothing pends: local scrolling never waits on a round trip. */
@@ -1234,7 +1264,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void jumpToLive() {
         final Connection target;
         synchronized (stateLock) { target = connection; }
-        if (target == null || target.isClosed() || target.remoteHandle <= 0) return;
+        if (heldFrame(target)) {
+            scrollHeld(0, true);
+            return;
+        }
+        if (target.remoteHandle <= 0) return;
         desiredScroll = 0;
         lastSentScroll = -1;
         scrollSeeking = true;

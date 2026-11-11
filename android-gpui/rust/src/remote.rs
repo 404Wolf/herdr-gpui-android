@@ -333,9 +333,44 @@ pub fn set_visible(id: u64, visible: bool) -> Result<()> {
     Ok(())
 }
 pub fn close(id: u64) {
-    if let Some(owner) = lock(sessions()).remove(&id) {
-        owner.cancel.cancel();
+    let Some(owner) = lock(sessions()).remove(&id) else {
+        return;
+    };
+    owner.cancel.cancel();
+    // The phone keeps this terminal's last frame on screen while it reconnects
+    // (Mailbox::hold): keep its grid too, so the conversation still scrolls.
+    if let Some(terminal) = lock(&owner.state).terminal.take() {
+        hold(terminal);
     }
+}
+pub(crate) fn hold(terminal: Arc<gpui_rio::Session>) {
+    *lock(held()) = Some(terminal);
+}
+/// The terminal of the last closed session, which the held frame draws.
+fn held() -> &'static Mutex<Option<Arc<gpui_rio::Session>>> {
+    static HELD: OnceLock<Mutex<Option<Arc<gpui_rio::Session>>>> = OnceLock::new();
+    HELD.get_or_init(Mutex::default)
+}
+/// A new pane attached: its live grid is the one to scroll now.
+pub(crate) fn release_held() {
+    lock(held()).take();
+}
+/// Scrolls the held frame's own history, with no link: `delta` rows back
+/// (positive) or forward, or back to the newest line when `latest`. Never sends
+/// anything, so even a program that takes wheel input is scrolled locally.
+/// `{"local_offset": rows back from the newest}`; 0 when nothing is held.
+pub fn scroll_held(delta: i64, latest: bool) -> String {
+    let offset = lock(held()).as_ref().map_or(0, |terminal| {
+        let mut grid = terminal.grid().lock();
+        let scroll = if latest {
+            rio_vt::crosswords::grid::Scroll::Bottom
+        } else {
+            rio_vt::crosswords::grid::Scroll::Delta(delta.clamp(-1000, 1000) as i32)
+        };
+        grid.scroll_display(scroll);
+        grid.display_offset()
+    });
+    json!({"local_offset": offset}).to_string()
 }
 pub fn poll(id: u64, _since: u64, _mirror: bool) -> Result<String> {
     let owner = session(id)?;
