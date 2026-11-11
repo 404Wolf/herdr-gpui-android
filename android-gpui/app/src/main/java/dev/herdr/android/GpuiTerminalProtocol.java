@@ -58,6 +58,11 @@ final class GpuiTerminalProtocol {
             QuickCommand.validateText(text);
             return new Command(type, text, Collections.<String>emptyList());
         }
+        if ("compose".equals(type) && text != null && keys == null) {
+            Shortcut.validateText(text);
+            if (text.trim().isEmpty()) throw invalid();
+            return new Command(type, text, Collections.<String>emptyList());
+        }
         if ("keys".equals(type) && text == null && keys != null) {
             return new Command(type, null, KeyChord.validate(keys));
         }
@@ -111,6 +116,13 @@ final class GpuiTerminalProtocol {
         if (shortcut == null) throw new IllegalArgumentException("Shortcut is required");
         return new JSONObject(shortcut.toJsonBody())
                 .put("type", shortcut.isText() ? "text" : "keys").toString();
+    }
+
+    /** A composed message: one bracketed paste and Enter, in one input slot. */
+    static String composeCommand(String text) throws JSONException {
+        Shortcut.validateText(text);
+        if (text.trim().isEmpty()) throw new IllegalArgumentException("Nothing to send");
+        return new JSONObject().put("type", "compose").put("text", text).toString();
     }
 
     static String shortcuts(String configuration) throws JSONException {

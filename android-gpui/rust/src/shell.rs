@@ -149,6 +149,7 @@ pub(crate) fn send(session: &Session, command: &Command) -> bool {
         Command::Text { text } => session.type_text(text),
         Command::Keys { keys } => keys.iter().all(|key| send_key(session, key)),
         Command::Submit { text } => session.type_text(text) && send_key(session, "enter"),
+        Command::Compose { text } => session.paste(text) && send_key(session, "enter"),
         Command::Close => false,
     }
 }
@@ -221,7 +222,15 @@ mod tests {
         ));
         assert!(send(&session, &Command::Submit { text: "ls".into() }));
         assert!(send(&session, &Command::Text { text: "é".into() }));
-        let expected = "\x03\x1b\x1bx y7\x1b[Z\x1b[A\x1b[15~\x7fls\ré".as_bytes();
+        // Not bracketed: the shell never enabled bracketed paste. Escapes are
+        // dropped and line breaks become carriage returns before the Enter.
+        assert!(send(
+            &session,
+            &Command::Compose {
+                text: "a\nb\x1b".into()
+            }
+        ));
+        let expected = "\x03\x1b\x1bx y7\x1b[Z\x1b[A\x1b[15~\x7fls\réa\rb\r".as_bytes();
         let mut received = vec![0; expected.len()];
         remote.read_exact(&mut received).unwrap();
         assert_eq!(received, expected);
