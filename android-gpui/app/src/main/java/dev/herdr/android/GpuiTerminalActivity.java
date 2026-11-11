@@ -125,6 +125,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean keysOnDeck;
     /** Colors for every surface outside the painted grid, from the current palette. */
     private GpuiChrome chrome;
+    /** The terminal and, swiped to, a file an agent or a tapped path opened. */
+    private FilePager filePager;
     private volatile boolean sidebarOpen;
     /** When the last window switch was asked for, to log how long it took. */
     private volatile long switchAskedAt;
@@ -276,6 +278,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         appliedPalette = palette;
         nativeSetTheme(palette);
         chrome = GpuiChrome.load(palette);
+        if (filePager != null) filePager.applyChrome(chrome);
         applyChrome();
     }
 
@@ -360,7 +363,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
-        content.addView(surface, new LinearLayout.LayoutParams(-1, 0, 1));
+        filePager = new FilePager(this, surface, chrome, this::readFile, actionWorker);
+        content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));
         keyDeck = new android.widget.ScrollView(this);
@@ -525,7 +529,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (wanted) {
             edgeBack = EdgeBack.register(this, () -> {
                 if (shellMode()) leaveByBack(); else showRailOverlay();
-            }, this::leaveByBack);
+            }, () -> {
+                if (filePager == null || !filePager.hide()) leaveByBack();
+            });
         } else {
             EdgeBack.unregister(this, edgeBack);
             edgeBack = null;
@@ -575,6 +581,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             hideSidebar();
             return;
         }
+        if (filePager != null && filePager.hide()) return;
         super.onBackPressed();
     }
 
@@ -4180,6 +4187,34 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
     }
 
+    /** A tapped file path (or OSC 8 file link): shown in the file page, read from the pane's machine. */
+    public void gpuiOpenFile(long expectedGeneration, String path, int line) {
+        runOnUiThread(() -> {
+            String pane;
+            synchronized (stateLock) {
+                if (destroyed || isFinishing() || connection == null
+                        || connection.generation != expectedGeneration || connection.remoteHandle == 0) return;
+                pane = connection.paneId;
+            }
+            if (filePager != null) filePager.open(pane, path, Math.max(0, line));
+        });
+    }
+
+    /** Blocking, on a worker: core_session's file.read for the file page. */
+    private String readFile(String terminal, String path) {
+        Connection target;
+        synchronized (stateLock) { target = connection; }
+        if (target == null || target.remoteHandle == 0) {
+            return "{\"queued\":false,\"error\":\"Not connected\"}";
+        }
+        try {
+            JSONObject read = new JSONObject().put("op", "file.read").put("terminal", terminal).put("path", path);
+            return RemoteNative.sessionAction(target.remoteHandle, read.toString());
+        } catch (JSONException impossible) {
+            return "{\"queued\":false}";
+        }
+    }
+
     /** Called by GPUI directly, independent of the HTTP command queue and connection health. */
     public void gpuiClose(long expectedGeneration) {
         runOnUiThread(() -> {
@@ -4624,6 +4659,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 current.remotePhase = phase;
                 current.remoteRevision = state.optLong("token", state.optLong("revision", 0));
                 current.ready = selected;
+                // An agent's `hc open-file` for the pane on screen (core_session's open_file).
+                final JSONObject openFile = state.optJSONObject("open_file");
+                final String shownPane = current.paneId;
+                main.post(() -> { if (filePager != null) filePager.offer(openFile, shownPane); });
                 if (selected && !pane.equals(autoKeyboardPane)) {
                     // Opening an agent that is waiting on Wolf (a question or a
                     // permission) raises the keyboard once, ready for the answer.
