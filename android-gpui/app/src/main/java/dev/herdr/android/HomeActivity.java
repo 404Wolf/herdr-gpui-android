@@ -69,6 +69,15 @@ public final class HomeActivity extends Activity {
         String state = "connecting";
         String status = "";
         JSONObject view;
+        /**
+         * The session whose poll last carried the terminal list. Until it is
+         * the current one, the view is a cached one (from the last launch or
+         * the last session) and nothing on it can be opened or started.
+         */
+        long liveHandle;
+        /** The git look's text as the core sent it, kept for the cache. */
+        String gitText = "";
+        boolean gitTruncated;
         /** The machine's git look (FleetTree.parseGitLook), when it was asked, and what. */
         FleetTree.GitLook git;
         long gitAt;
@@ -118,6 +127,15 @@ public final class HomeActivity extends Activity {
     private long chatterAt;
     private static final long CHATTER_MS = 10_000;
     private boolean resumed, destroyed, opening;
+    /** Hosts (and the cached views) have been read once; until then Home draws skeleton rows. */
+    private boolean hostsLoaded, cacheRead;
+    /** When the cache was last queued for writing; written at most every CACHE_MS while shown. */
+    private long cacheQueuedAt;
+    private static final long CACHE_MS = 20_000;
+    /** The first frame waits this long at most for the cached view, so Home never opens blank. */
+    private static final long FIRST_FRAME_HOLD_MS = 250;
+    /** The cache text last written (worker side), so an unchanged tree is not rewritten. */
+    private volatile String cacheWritten = "";
     /** Hidden (onStop): no background sessions until the next onResume. */
     private boolean stopped;
     private String note;
@@ -153,12 +171,32 @@ public final class HomeActivity extends Activity {
             reopenPane = prefs.getString("last_pane", "");
         }
         build();
+        holdFirstFrame();
+    }
+
+    /**
+     * Holds the first frame (the window's starting background stays up) until
+     * the hosts and their cached views are read, briefly, so Home opens on
+     * the last tree instead of an empty page that then fills in.
+     */
+    private void holdFirstFrame() {
+        long until = android.os.SystemClock.uptimeMillis() + FIRST_FRAME_HOLD_MS;
+        View decor = getWindow().getDecorView();
+        decor.getViewTreeObserver().addOnPreDrawListener(new android.view.ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                if (!hostsLoaded && !destroyed && android.os.SystemClock.uptimeMillis() < until) return false;
+                android.view.ViewTreeObserver observer = decor.getViewTreeObserver();
+                if (observer.isAlive()) observer.removeOnPreDrawListener(this);
+                return true;
+            }
+        });
     }
 
     private String reopenHost = "", reopenPane = "";
 
     private void tryReopen(Machine machine) {
-        if (reopenPane.isEmpty() || !machine.host.id.equals(reopenHost) || !"ready".equals(machine.state)) return;
+        // Only a live list: a cached terminal may be gone.
+        if (reopenPane.isEmpty() || !machine.host.id.equals(reopenHost) || !live(machine)) return;
         Map<String, List<Agent>> spaces = spaces(machine);
         // The first ready poll can precede the terminal list; wait for it.
         if (spaces.isEmpty()) return;
@@ -201,6 +239,7 @@ public final class HomeActivity extends Activity {
      */
     @Override protected void onStop() {
         stopped = true;
+        saveCache(true);
         for (Machine machine : machines.values()) {
             if (machine.handle > 0) RemoteNative.close(machine.handle);
             machine.handle = 0;
@@ -230,9 +269,25 @@ public final class HomeActivity extends Activity {
 
     // ── Sessions ────────────────────────────────────────────────────────────
 
-    /** Imports the provisioned hosts, then connects each trusted host not yet connected. */
+    /**
+     * Imports the provisioned hosts, then connects each trusted host not yet
+     * connected. The first time, the saved hosts and their cached views are
+     * shown before any of that, so a cold launch draws the last tree at once.
+     */
     private void loadMachines() {
+        boolean first = !cacheRead;
+        cacheRead = true;
         worker.execute(() -> {
+            if (first) {
+                Map<String, HomeCache.Entry> cached = HomeCache.read(cacheFile());
+                try {
+                    List<SavedRemoteHost> early = store.read();
+                    boolean identity = identityStore.exists();
+                    main.post(() -> { if (!destroyed) applyHosts(early, identity, cached, false); });
+                } catch (Exception unreadable) {
+                    // The full read below reports it.
+                }
+            }
             String provisioned = ProvisionedHosts.importIfChanged(this, store);
             List<SavedRemoteHost> hosts;
             boolean identity;
@@ -240,37 +295,96 @@ public final class HomeActivity extends Activity {
                 hosts = store.read();
                 identity = identityStore.exists();
             } catch (Exception unreadable) {
-                main.post(() -> { note = "Saved hosts could not be read"; render(true); });
+                main.post(() -> { hostsLoaded = true; note = "Saved hosts could not be read"; render(true); });
                 return;
             }
             main.post(() -> {
                 if (destroyed) return;
                 if (provisioned != null) note = provisioned;
-                Map<String, Machine> next = new LinkedHashMap<>();
-                for (SavedRemoteHost host : hosts) {
-                    Machine machine = machines.remove(host.id);
-                    if (machine == null) machine = new Machine();
-                    machine.host = host;
-                    next.put(host.id, machine);
-                }
-                for (Machine gone : machines.values()) if (gone.handle > 0) RemoteNative.close(gone.handle);
-                machines.clear();
-                machines.putAll(next);
-                for (Machine machine : machines.values()) {
-                    if (!"tcp".equals(machine.host.transport) && !"iroh".equals(machine.host.transport)) continue;
-                    if (machine.host.expectedFingerprint.isEmpty()) {
-                        machine.state = "untrusted";
-                        machine.status = "Connect once from Hosts to trust its key";
-                    } else if (!identity) {
-                        machine.state = "nokey";
-                        machine.status = "Create a device key in Hosts";
-                    } else if (machine.handle <= 0 && !machine.connecting) {
-                        connect(machine);
-                    }
-                }
-                render(true);
+                applyHosts(hosts, identity, null, true);
             });
         });
+    }
+
+    /** Home's cache of last views; resolved on the worker (it may create the directory). */
+    private java.io.File cacheFile() {
+        return new java.io.File(getNoBackupFilesDir(), HomeCache.FILE_NAME);
+    }
+
+    /** The saved hosts as machines, each with its cached view when it has none yet; connects when asked. */
+    private void applyHosts(List<SavedRemoteHost> hosts, boolean identity, Map<String, HomeCache.Entry> cached,
+            boolean connect) {
+        hostsLoaded = true;
+        Map<String, Machine> next = new LinkedHashMap<>();
+        for (SavedRemoteHost host : hosts) {
+            Machine machine = machines.remove(host.id);
+            if (machine == null) machine = new Machine();
+            machine.host = host;
+            HomeCache.Entry entry = cached == null ? null : cached.get(host.id);
+            if (entry != null && machine.view == null) {
+                machine.view = entry.view;
+                machine.gitText = entry.git;
+                machine.gitTruncated = entry.gitTruncated;
+                if (machine.git == null) machine.git = entry.look();
+            }
+            next.put(host.id, machine);
+        }
+        for (Machine gone : machines.values()) if (gone.handle > 0) RemoteNative.close(gone.handle);
+        machines.clear();
+        machines.putAll(next);
+        for (Machine machine : machines.values()) {
+            if (!"tcp".equals(machine.host.transport) && !"iroh".equals(machine.host.transport)) continue;
+            if (machine.host.expectedFingerprint.isEmpty()) {
+                machine.state = "untrusted";
+                machine.status = "Connect once from Hosts to trust its key";
+            } else if (!identity) {
+                machine.state = "nokey";
+                machine.status = "Create a device key in Hosts";
+            } else if (connect && machine.handle <= 0 && !machine.connecting) {
+                connect(machine);
+            } else if (machine.handle <= 0 && !machine.connecting) {
+                machine.status = "Connecting…";
+            }
+        }
+        render(true);
+    }
+
+    /**
+     * Queues the machines' trees for the next launch: at most every CACHE_MS
+     * while Home is shown, and always when it is hidden. Poll views are
+     * replaced, never changed, so the worker reads them safely.
+     */
+    private void saveCache(boolean now) {
+        if (!hostsLoaded) return;
+        long at = System.currentTimeMillis();
+        if (!now && at - cacheQueuedAt < CACHE_MS) return;
+        cacheQueuedAt = at;
+        Map<String, HomeCache.Entry> entries = new LinkedHashMap<>();
+        for (Machine machine : machines.values()) {
+            if (HomeCache.hasTree(machine.view)) {
+                entries.put(machine.host.id, new HomeCache.Entry(machine.view, machine.gitText, machine.gitTruncated));
+            }
+        }
+        if (entries.isEmpty()) return;
+        try {
+            worker.execute(() -> {
+                try {
+                    String text = HomeCache.encode(entries);
+                    if (text.equals(cacheWritten)) return;
+                    HomeCache.write(cacheFile(), text);
+                    cacheWritten = text;
+                } catch (Exception unwritable) {
+                    // A cache is a convenience: the next launch just connects first.
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closing) {
+            // Shutting down.
+        }
+    }
+
+    /** Whether the machine's tree is its live session's (not a cached view). */
+    private static boolean live(Machine machine) {
+        return "ready".equals(machine.state) && machine.handle > 0 && machine.liveHandle == machine.handle;
     }
 
     private void connect(Machine machine) {
@@ -325,7 +439,12 @@ public final class HomeActivity extends Activity {
             main.post(() -> {
                 if (machine.handle != handle || destroyed) return;
                 String state = view.optString("state", "connecting");
-                machine.view = view;
+                // A poll without the terminal list (an early one) keeps the
+                // last tree, so Home never blanks out and then refills.
+                if (HomeCache.hasTree(view)) {
+                    machine.view = view;
+                    machine.liveHandle = handle;
+                }
                 machine.status = view.optString("status", "");
                 if ("closed".equals(state)) {
                     RemoteNative.close(handle);
@@ -659,7 +778,7 @@ public final class HomeActivity extends Activity {
         // themselves with spinner glyphs many times a second, and rebuilding
         // the whole tree for each made it flicker and dropped taps.
         for (Machine machine : machines.values()) {
-            key.append(machine.host.id).append(machine.state).append(machine.status).append(machine.ui)
+            key.append(machine.host.id).append(machine.state).append(machine.status).append(machine.ui).append(live(machine))
                     .append(machine.git == null ? 0 : System.identityHashCode(machine.git)).append('\n');
             for (Map.Entry<String, List<Agent>> space : spaces(machine).entrySet()) {
                 key.append(space.getKey()).append('\n');
@@ -679,6 +798,7 @@ public final class HomeActivity extends Activity {
         if (!force && next.equals(signature) && !chatty) return;
         signature = next;
         if (!said.equals(chatter)) { chatter = said; chatterAt = now; }
+        saveCache(false);
         List<Agent> all = allAgents();
         int[] counts = new int[6];
         for (Agent agent : all) counts[statusPriority(agent.status)]++;
@@ -691,7 +811,11 @@ public final class HomeActivity extends Activity {
             line.setPadding(dp(6), dp(4), dp(6), dp(4));
             machineBar.addView(line);
         }
-        if (machines.isEmpty()) {
+        if (machines.isEmpty() && !hostsLoaded) {
+            // Hosts not read yet (the first frame waits for them only briefly).
+            machineBar.addView(skeletonMachineRow());
+            skeletonFleet();
+        } else if (machines.isEmpty()) {
             TextView empty = text("No hosts yet. Add one under ⋯ Hosts, or let the device's "
                     + "provisioned hosts file add them.", 13, chrome.onSurfaceVariant);
             empty.setPadding(dp(8), dp(16), dp(8), dp(16));
@@ -764,7 +888,7 @@ public final class HomeActivity extends Activity {
         }
         render(true);
         // Only a connected computer's list is live; a cached one is never focused.
-        boolean connected = "ready".equals(machine.state) && machine.handle > 0;
+        boolean connected = live(machine);
         switch (FleetTree.pick(connected, members(machine))) {
             case FOCUS: openAgent((Agent) FleetTree.pickTarget(members(machine))); break;
             case START:
@@ -818,7 +942,8 @@ public final class HomeActivity extends Activity {
             machine.gitAt = Math.max(machine.gitAt, FleetPanes.LOOKED_AT.getOrDefault(machine.host.id, 0L));
         }
         FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
-        boolean ready = "ready".equals(machine.state);
+        // A cached view is drawn as it was, dimmed; it is live only once this session lists terminals.
+        boolean ready = live(machine);
         if (fleet.deacon != null && deaconGuard(machine) > 0 && machine.deaconPending.isEmpty()) clearDeaconGuard(machine);
         // Claude runs there again (Wolf started it): the failure no longer applies.
         if (fleet.deacon != null && machine.deaconPending.isEmpty() && !fleet.deacon.status.isEmpty()) {
@@ -847,10 +972,11 @@ public final class HomeActivity extends Activity {
                 break;
             case START: row.addView(chip("Start Deacon", true, () -> startDeacon(machine))); break;
             case STARTING: row.addView(chip("Starting…", false, null)); break;
-            default: break;
+            // Offline or not live yet: the same chip, disabled, so nothing shifts when it goes live.
+            default: row.addView(chip(fleet.deacon != null ? "Deacon" : "Start Deacon", false, null)); break;
         }
-        if (ready) {
-            TextView plus = chip("+", !machine.projectBusy && !machine.deaconBusy, () -> {
+        {
+            TextView plus = chip("+", ready && !machine.projectBusy && !machine.deaconBusy, () -> {
                 if (fleet.deacon != null) newProject(machine, (Agent) fleet.deacon);
                 else startDeacon(machine);
             });
@@ -881,6 +1007,12 @@ public final class HomeActivity extends Activity {
         });
         machineBar.addView(row);
 
+        // Never seen (no cache) and still connecting: fixed-height skeleton
+        // rows in the shape of the tree, which the live rows then replace.
+        if (machine.view == null && "connecting".equals(machine.state)) {
+            skeletonFleet();
+            return;
+        }
         deaconRows(machine, fleet, ready);
 
         LinearLayout rows = column();
@@ -906,7 +1038,15 @@ public final class HomeActivity extends Activity {
             return;
         }
         Agent deacon = (Agent) fleet.deacon;
-        deaconCard.addView(agentLine("", deacon, "Deacon " + deacon.id, null));
+        // Deacon › PMs at rest: its own helpers wait behind its chevron.
+        Row top = new Row((guide, self) -> agentLine(guide, deacon, "Deacon " + deacon.id, self));
+        top.fold = machine.host.id + "/deacon";
+        top.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.DEACON, fleet.helpers.size(), false);
+        for (FleetTree.Member helper : fleet.helpers) {
+            Agent agent = (Agent) helper;
+            top.kids.add(new Row((guide, self) -> agentLine(guide, agent, roleTag(agent), null)));
+        }
+        emit(deaconCard, top, "", true, 0);
         if (deacon.id.equals(machine.deaconPending)) {
             deaconCard.addView(actionLine("   ", null, "◆", "Starting the Deacon on " + machine.host.name + "…",
                     chrome.onSurfaceVariant, null));
@@ -915,7 +1055,6 @@ public final class HomeActivity extends Activity {
             deaconCard.addView(actionLine("   ", null, "!", said + ". Tap to open it.", chrome.danger,
                     () -> openAgent(deacon)));
         }
-        for (FleetTree.Member helper : fleet.helpers) deaconCard.addView(agentLine("   ", (Agent) helper, roleTag((Agent) helper), null));
         // Needs you: agents whose own status says they wait on Wolf; each opens its chat.
         List<FleetTree.Member> needs = FleetTree.needsYou(fleet);
         if (!needs.isEmpty()) {
@@ -984,7 +1123,8 @@ public final class HomeActivity extends Activity {
                     : pms + (pms == 1 ? " PM" : " PMs") + (tally.isEmpty() ? "" : "  " + tally);
             Row repo = new Row((guide, self) -> groupLine(guide, self, group.name, count));
             repo.fold = key;
-            repo.foldedByDefault = group.outside();
+            repo.foldedByDefault = FleetTree.foldedByDefault(group.outside() ? FleetTree.Fold.OUTSIDE
+                    : FleetTree.Fold.REPO, group.projects.size(), group.tally[0] > 0);
             for (FleetTree.Project project : group.projects) repo.kids.add(projectRow(machine, project));
             for (FleetTree.SpaceNode node : group.loose) repo.kids.add(spaceRow(machine, node, null));
             if (group.owner != null) repo.kids.add(unopenedRow(machine, group));
@@ -993,6 +1133,7 @@ public final class HomeActivity extends Activity {
         if (!fleet.others.isEmpty()) {
             Row others = new Row((guide, self) -> groupLine(guide, self, "Other agents", fleet.others.size() + ""));
             others.fold = m + "/others";
+            others.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.OTHERS, fleet.others.size(), false);
             for (FleetTree.Member other : fleet.others) {
                 Agent agent = (Agent) other;
                 String tag = "deacon".equals(agent.role) ? "another deacon" : roleTag(agent);
@@ -1011,7 +1152,7 @@ public final class HomeActivity extends Activity {
         Row row = new Row((guide, self) -> groupLine(guide, self, total + (total == 1 ? " worktree" : " worktrees")
                 + " with no space" + (owner.closedIncomplete ? " (list cut short)" : ""), ""));
         row.fold = key;
-        row.foldedByDefault = true;
+        row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.UNOPENED, total, false);
         int pages = closedPages.getOrDefault(key, 0);
         int shown = FleetTree.shownClosed(owner, pages);
         for (int i = 0; i < shown; i++) row.kids.add(closedRow(machine, owner.closed.get(i)));
@@ -1043,7 +1184,7 @@ public final class HomeActivity extends Activity {
         row.fold = key;
         // Projects start folded, as on the desktop: a repo shows its PM rows,
         // opening one shows its worktrees and workers. Home reveals nothing on its own.
-        row.foldedByDefault = true;
+        row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT, project.agents(), project.tally[0] > 0);
         boolean flat = FleetTree.flat(project);
         for (FleetTree.SpaceNode entry : project.entries) {
             if (flat) {
@@ -1086,7 +1227,8 @@ public final class HomeActivity extends Activity {
             line.addView(dot(statusColor(worstStatus)));
             LinearLayout lines = column();
             lines.addView(single(text(mark + node.name, 12, chrome.primary)));
-            if (!sub.isEmpty()) lines.addView(single(text(sub, 10, chrome.onSurfaceVariant)));
+            // Always two lines, so a branch arriving with git never moves the rows below.
+            lines.addView(single(text(sub, 10, chrome.onSurfaceVariant)));
             line.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
             String counts = tally(tally);
             if (!counts.isEmpty()) line.addView(tag(counts, chrome.onSurfaceVariant));
@@ -1096,7 +1238,9 @@ public final class HomeActivity extends Activity {
             return line;
         });
         row.fold = key;
-        row.foldedByDefault = node.members.size() > 6 && tally[0] == 0;
+        // A space with no project folds its terminals; a checkout of an opened project shows them.
+        row.foldedByDefault = FleetTree.foldedByDefault(project == null ? FleetTree.Fold.LOOSE_SPACE
+                : FleetTree.Fold.CHECKOUT, node.members.size(), tally[0] > 0);
         for (FleetTree.AgentNode agent : node.agents) row.kids.add(agentTree(machine.host.id, agent, null));
         return row;
     }
@@ -1107,7 +1251,7 @@ public final class HomeActivity extends Activity {
         boolean busy = machine.opening.contains(wt.path);
         return new Row((guide, self) -> {
             View line = actionLine(guide, null, "○", busy ? name + " · opening…" : name, chrome.onSurfaceVariant,
-                    busy || !"ready".equals(machine.state) ? null : () -> closedWorktreeActions(machine, wt, name));
+                    busy || !live(machine) ? null : () -> closedWorktreeActions(machine, wt, name));
             line.setContentDescription("Worktree " + name + ", not open. Choose who works there.");
             return line;
         });
@@ -1144,15 +1288,95 @@ public final class HomeActivity extends Activity {
         }
         if (fold != null && fold.fold != null && !fold.kids.isEmpty()) {
             boolean folded = folded(fold);
-            TextView toggle = text(folded ? "▸" : "▾", 12, chrome.onSurfaceVariant);
-            toggle.setGravity(Gravity.CENTER);
-            toggle.setMinWidth(dp(18));
-            toggle.setMinHeight(dp(24));
+            TextView toggle = chevronSlot(folded ? "▸" : "▾");
             toggle.setContentDescription((folded ? "Show " : "Hide ") + fold.kids.size() + " rows under it");
             toggle.setOnClickListener(v -> toggleFold(fold.fold, fold.foldedByDefault));
             row.addView(toggle);
+        } else if (fold != null && fold.fold != null) {
+            // Nothing to fold yet: the same slot, empty, so a first worker never shifts the row.
+            TextView slot = chevronSlot("");
+            slot.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            row.addView(slot);
         }
         return row;
+    }
+
+    /** The chevron's column: an explicit tap target, the same width with or without a chevron. */
+    private TextView chevronSlot(String glyph) {
+        TextView toggle = text(glyph, 12, chrome.onSurfaceVariant);
+        toggle.setGravity(Gravity.CENTER);
+        toggle.setLayoutParams(new LinearLayout.LayoutParams(dp(22), dp(24)));
+        return toggle;
+    }
+
+    // ── Skeleton (no cached view yet) ───────────────────────────────────────
+
+    /** A blank bar where words will be, at the real text's size so the row keeps its height. */
+    private TextView bar(float size, int widthDp, boolean bold) {
+        TextView bar = text("\u00a0", size, chrome.onSurfaceVariant);
+        if (bold) bar.setTypeface(Typeface.DEFAULT_BOLD);
+        bar.setSingleLine(true);
+        GradientDrawable fill = new GradientDrawable();
+        fill.setColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x26));
+        fill.setCornerRadius(dp(3));
+        // Inset, not margined: the bars read as separate lines while the row measures as the real one.
+        bar.setBackground(new android.graphics.drawable.InsetDrawable(fill, 0, dp(2), 0, dp(2)));
+        bar.setLayoutParams(new LinearLayout.LayoutParams(dp(widthDp), -2));
+        return bar;
+    }
+
+    /** An agent row's skeleton: built as agentLine is (same slot, dot, two lines), so heights match. */
+    private View skeletonAgent(String guide, boolean lead, int widthDp) {
+        Row slot = new Row((g, self) -> null);
+        slot.fold = "skeleton";
+        LinearLayout row = treeLine(guide, slot);
+        row.setClickable(false);
+        row.setFocusable(false);
+        row.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        row.addView(dot(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x40)));
+        LinearLayout lines = column();
+        lines.addView(bar(lead ? 13 : 12, widthDp, lead));
+        TextView sub = bar(11, widthDp * 3 / 2, false);
+        sub.setPadding(0, dp(1), 0, 0);
+        lines.addView(sub);
+        row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
+        return row;
+    }
+
+    /** A heading's skeleton (a repo row): one line at groupLine's size. */
+    private View skeletonGroup(int widthDp) {
+        Row slot = new Row((g, self) -> null);
+        slot.fold = "skeleton";
+        LinearLayout row = treeLine("", slot);
+        row.setClickable(false);
+        row.setFocusable(false);
+        row.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        row.addView(bar(11, widthDp, false));
+        return row;
+    }
+
+    /** The machine row before hosts are read: the same paddings and chips, disabled. */
+    private View skeletonMachineRow() {
+        LinearLayout row = row();
+        row.setPadding(dp(4), dp(7), dp(4), dp(3));
+        row.setClickable(false);
+        row.addView(dot(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x40)));
+        row.addView(bar(14, 90, true));
+        row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        row.addView(chip("Deacon", false, null));
+        row.addView(chip("+", false, null));
+        row.setContentDescription("Loading computers");
+        return row;
+    }
+
+    /** Deacon › PMs in skeleton: the Deacon, + Project, a repo and three managers. */
+    private void skeletonFleet() {
+        deaconCard.addView(skeletonAgent("", true, 110));
+        deaconCard.addView(skeletonGroup(140));
+        body.addView(skeletonGroup(70));
+        body.addView(skeletonAgent("├ ", true, 96));
+        body.addView(skeletonAgent("├ ", true, 120));
+        body.addView(skeletonAgent("└ ", true, 80));
     }
 
     private TextView single(TextView view) {
@@ -1242,12 +1466,12 @@ public final class HomeActivity extends Activity {
         if (!state.isEmpty()) second.add(state);
         if (untitled) second.add(agent.id);
         String said = TextUtils.join(" · ", second);
-        if (!said.isEmpty()) {
-            TextView sub = single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
-                    : chrome.onSurfaceVariant));
-            sub.setPadding(0, dp(1), 0, 0);
-            lines.addView(sub);
-        }
+        // The second line is always there (empty when there is nothing to say),
+        // so a status or message arriving never changes the row's height.
+        TextView sub = single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
+                : chrome.onSurfaceVariant));
+        sub.setPadding(0, dp(1), 0, 0);
+        lines.addView(sub);
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
         if (!tag.isEmpty()) row.addView(tag(tag, "deacon".equals(tag) ? chrome.primary : chrome.onSurfaceVariant));
         row.setContentDescription(shown + (heading != null && !untitled ? ", " + agent.title : "") + ", "
@@ -1604,20 +1828,25 @@ public final class HomeActivity extends Activity {
         }
         worker.execute(() -> {
             FleetTree.GitLook look = null;
+            String said = "";
             try {
                 JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
                 if (result.optBoolean("queued", false)) {
-                    look = FleetTree.parseGitLook(result.optString("text", ""), FleetTree.PER_REPO);
+                    said = result.optString("text", "");
+                    look = FleetTree.parseGitLook(said, FleetTree.PER_REPO);
                     look.allTruncated = result.optBoolean("truncated", false);
                 }
             } catch (Exception | LinkageError error) {
                 look = null;
             }
             final FleetTree.GitLook answer = look;
+            final String text = said;
             main.post(() -> {
                 machine.gitBusy = false;
                 if (destroyed || answer == null) return;
                 machine.git = answer;
+                machine.gitText = text;
+                machine.gitTruncated = answer.allTruncated;
                 machine.gitAsked = paths;
                 FleetPanes.LOOKS.put(machine.host.id, answer);
                 FleetPanes.LOOKED_AT.put(machine.host.id, System.currentTimeMillis());
