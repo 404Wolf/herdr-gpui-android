@@ -26,6 +26,12 @@ repository's [LICENSE](../../../../LICENSE). The changes below are this copy's.
 - A cell is the font's own line height (ascent plus descent), not 1.35 × its
   size, as other terminals size cells: box drawing meets row to row, and no
   added leading takes rows from a phone screen.
+- `set_link_handler` makes links tappable: OSC 8 hyperlinks (http(s), and
+  `file://` as a path), plain http(s) URLs and file paths (`src/a.rs:12`,
+  `~/x`, `/etc/hosts`) in the text (`links.rs`). A link continues across rows
+  the terminal wrapped, and across a program's own break at its right edge or
+  box border, as Claude Code wraps long URLs. A tap highlights every row it
+  covers and hands the host a `Link::Web` or `Link::File`.
 - Errors are a typed `Error`; `anyhow` and the GPUI tests against a local PTY
   were removed. The tests here drive a real socket pair.
 

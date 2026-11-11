@@ -143,7 +143,12 @@ impl Connection<'_> {
             while let Some(end) = self.event_carry.iter().position(|b| *b == b'\n') {
                 let message: Value = serde_json::from_slice(&self.event_carry[..end])?;
                 self.event_carry.drain(..=end);
-                if message["method"] != "heartbeat" {
+                if let Some(open) = open_file_event(&message) {
+                    // Not a fact the projection needs: no refresh, only the view.
+                    let mut state = lock(&self.owner.state);
+                    state.view["open_file"] = open;
+                    bump(&mut state.view);
+                } else if message["method"] != "heartbeat" {
                     self.dirty = true;
                 }
             }
@@ -237,6 +242,13 @@ impl Connection<'_> {
                     return self.start_deacon(&machine, cols, rows);
                 }
                 Some(TabEdit::GitLook { paths }) => return self.git_look(&paths),
+                Some(TabEdit::FileRead { terminal, path }) => {
+                    return Ok(match self.read_file(&view, &terminal, &path) {
+                        Ok(reply) => reply,
+                        Err(error) => json!({"queued":false,"error":error.to_string()}),
+                    }
+                    .to_string());
+                }
                 Some(TabEdit::SpaceOpen { folder }) => {
                     // Fresh, not cached: a retry after a slow answer must find
                     // the space it already made instead of making a second.
@@ -391,16 +403,55 @@ impl Connection<'_> {
     /// once (FleetTree.parseGitLook reads it). Only folders the phone already
     /// shows are asked about; output is bounded.
     fn git_look(&mut self, paths: &[String]) -> Result<String> {
-        use base64::Engine;
-
         let mut argv = vec![json!("sh"), json!("-c"), json!(GIT_LOOK), json!("sh")];
         argv.extend(paths.iter().map(|p| json!(p)));
         let result = self.call("machine.exec", json!({"argv":argv,"timeout":10}))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(result["stdout"].as_str().unwrap_or(""))
-            .map_err(|_| Error::Protocol("invalid command output".into()))?;
-        let text = String::from_utf8_lossy(&bytes);
+        let text = exec_stdout(&result)?;
         Ok(json!({"queued":true,"text":text,"truncated":result["truncated"]}).to_string())
+    }
+    /// A text file for the file view, read on the machine `terminal` runs on:
+    /// a relative path from that terminal's folder, `~/` from its home.
+    /// Bounded to the first FILE_LINES lines (and file.read's 8 MB).
+    fn read_file(&mut self, view: &Value, terminal: &str, path: &str) -> Result<Value> {
+        let machine = terminal.rsplit_once('/').map(|(machine, _)| machine);
+        let cwd = view["panes"]
+            .as_array()
+            .and_then(|panes| panes.iter().find(|p| p["id"] == terminal))
+            .and_then(|pane| pane["cwd"].as_str())
+            .filter(|cwd| cwd.starts_with('/'))
+            .map(str::to_owned);
+        let (path, cwd) = match path.strip_prefix("~/") {
+            Some(rest) => {
+                let mut exec = json!({"argv":["sh","-c",r#"printf %s "$HOME""#],"timeout":5});
+                if let Some(machine) = machine {
+                    exec["on"] = json!(machine);
+                }
+                let result = self.call("machine.exec", exec)?;
+                let home = exec_stdout(&result)?;
+                (rest.to_owned(), Some(home).filter(|h| h.starts_with('/')))
+            }
+            None => (path.to_owned(), cwd),
+        };
+        let mut params = json!({"path":path,"offset":1,"limit":FILE_LINES});
+        if let Some(cwd) = &cwd {
+            params["cwd"] = json!(cwd);
+        }
+        if let Some(machine) = machine {
+            params["on"] = json!(machine);
+        }
+        let result = self.call("file.read", params)?;
+        let shown = if path.starts_with('/') {
+            path.clone()
+        } else {
+            cwd.map_or(path.clone(), |cwd| format!("{}/{path}", cwd.trim_end_matches('/')))
+        };
+        Ok(json!({
+            "queued": true,
+            "path": shown,
+            "text": result["text"],
+            "lines": result["lines"],
+            "last": result["last"],
+        }))
     }
     /// Changes herdr-app's layout document, which the desktop app reads too,
     /// so a rename or reorder made here shows there. Retries on a version race.
@@ -543,7 +594,10 @@ impl Connection<'_> {
                 self.refresh()
             }
             TabEdit::DeaconStart { machine } => self.start_deacon(&machine, cols, rows).map(drop),
-            TabEdit::GitLook { .. } | TabEdit::SpaceOpen { .. } | TabEdit::Send { .. } => {
+            TabEdit::GitLook { .. }
+            | TabEdit::FileRead { .. }
+            | TabEdit::SpaceOpen { .. }
+            | TabEdit::Send { .. } => {
                 Err(Error::StaleTarget)
             }
             TabEdit::ToSpace { space, tab, to } => {
@@ -710,6 +764,7 @@ pub(crate) enum TabEdit {
     Kill { terminal: String },
     DeaconStart { machine: String },
     GitLook { paths: Vec<String> },
+    FileRead { terminal: String, path: String },
     SpaceOpen { folder: String },
     Send { terminal: String, text: String },
 }
@@ -765,6 +820,13 @@ impl TabEdit {
                     }
                     list.iter().map(|p| folder(p)).collect::<Option<Vec<_>>>()?
                 },
+            },
+            "file.read" => Self::FileRead {
+                terminal: id("terminal")?,
+                path: value["path"]
+                    .as_str()
+                    .filter(|p| !p.is_empty() && p.len() <= 4096 && !p.chars().any(char::is_control))
+                    .map(str::to_owned)?,
             },
             "space.open" => Self::SpaceOpen { folder: folder(&value["folder"])? },
             "pane.send" => Self::Send {
@@ -870,6 +932,31 @@ fn deacon_dir(stdout: &str) -> Option<String> {
         && path.trim_end_matches('/').ends_with("/.herdr/deacon")
         && !path.chars().any(char::is_control))
     .then(|| path.to_owned())
+}
+/// Lines the file view reads at most; a longer file says it was cut.
+const FILE_LINES: u64 = 20_000;
+/// What machine.exec wrote to stdout, as text.
+fn exec_stdout(result: &Value) -> Result<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(result["stdout"].as_str().unwrap_or(""))
+        .map_err(|_| Error::Protocol("invalid command output".into()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+/// An `open_file` event (an agent's `hc open-file`, proposed for herdr-core):
+/// `{"terminal","path","line","seq"}` for the file view, or None for any
+/// other message or a malformed one.
+fn open_file_event(message: &Value) -> Option<Value> {
+    let params = &message["params"];
+    if message["method"] != "event" || params["type"] != "open_file" {
+        return None;
+    }
+    let terminal = params["terminal"].as_str().filter(|t| !t.is_empty() && t.len() <= 128)?;
+    let path = params["data"]["path"]
+        .as_str()
+        .filter(|p| p.starts_with('/') && p.len() <= 4096 && !p.chars().any(char::is_control))?;
+    let line = params["data"]["line"].as_u64().filter(|l| *l <= u64::from(u32::MAX)).unwrap_or(0);
+    Some(json!({"terminal":terminal,"path":path,"line":line,"seq":params["seq"].as_u64().unwrap_or(0)}))
 }
 /// One POSIX shell word for any text: single quotes, each ' as '\''.
 fn sh_quote(text: &str) -> String {
@@ -1585,6 +1672,33 @@ mod tests {
         assert_eq!(canonical_deacon(&none, &doc), None);
     }
     #[test]
+    fn open_file_events_are_read_and_bounded() {
+        let event = |data: Value| json!({"jsonrpc":"2.0","method":"event","params":{"type":"open_file","terminal":"server/t7","seq":9,"data":data}});
+        assert_eq!(
+            open_file_event(&event(json!({"path":"/w/a.rs","line":12}))),
+            Some(json!({"terminal":"server/t7","path":"/w/a.rs","line":12,"seq":9}))
+        );
+        assert_eq!(
+            open_file_event(&event(json!({"path":"/w/a.rs"}))).map(|v| v["line"].clone()),
+            Some(json!(0))
+        );
+        assert_eq!(open_file_event(&event(json!({"path":"rel.rs"}))), None);
+        assert_eq!(open_file_event(&event(json!({"path":"/a\nb"}))), None);
+        let other = json!({"method":"event","params":{"type":"status","terminal":"t1","data":{"path":"/x"}}});
+        assert_eq!(open_file_event(&other), None);
+    }
+    #[test]
+    fn file_reads_parse_a_terminal_and_a_bounded_path() {
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":"src/a.rs"}"#),
+            Some(TabEdit::FileRead { terminal: "t3".into(), path: "src/a.rs".into() })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":""}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"file.read","path":"/a"}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":"/a
+b"}"#), None);
+    }
+    #[test]
     fn tab_edits_parse_only_bounded_known_operations() {
         use super::TabEdit;
         assert_eq!(
@@ -1992,6 +2106,15 @@ mod connection_tests {
     fn start_deacon_against(
         answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
     ) -> (Result<String>, Vec<(String, Value)>) {
+        action_against(r#"{"op":"deacon.start","name":"laptop"}"#, answer)
+    }
+
+    /// Runs one phone action against a scripted core; returns its reply and
+    /// every request the core saw, in order.
+    fn action_against(
+        action: &str,
+        answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
+    ) -> (Result<String>, Vec<(String, Value)>) {
         let (phone, mut core) = UnixStream::pair().unwrap();
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
@@ -2041,7 +2164,7 @@ mod connection_tests {
             }
         });
         let (tx, reply) = mpsc::sync_channel(1);
-        commands.try_send(Operation::Action(r#"{"op":"deacon.start","name":"laptop"}"#.into(), tx)).unwrap();
+        commands.try_send(Operation::Action(action.into(), tx)).unwrap();
         let result = reply.recv_timeout(Duration::from_secs(10)).unwrap();
         owner.cancel.cancel();
         let _ = runtime.join();
@@ -2062,6 +2185,38 @@ mod connection_tests {
     fn exec_ok(path: &str) -> Value {
         use base64::Engine;
         json!({"code":0,"stdout":base64::engine::general_purpose::STANDARD.encode(format!("{path}\n")),"truncated":false})
+    }
+
+    #[test]
+    fn a_file_is_read_on_its_terminals_machine_from_its_folder_or_home() {
+        let answer = |method: &str, _: &Value, _| Ok(match method {
+            "terminal.list" => json!({"terminals":[{"address":"server/t7","state":"live","cwd":"/w/proj"}]}),
+            "terminal.attach" => json!({"channel":3}),
+            "machine.exec" => json!({"code":0,"stdout":"L2hvbWUvd29sZg==","truncated":false}),
+            "file.read" => json!({"text":"fn main() {}\n","first":1,"last":1,"lines":1}),
+            m => base_answer(m),
+        });
+        let (result, seen) = action_against(r#"{"op":"file.read","terminal":"server/t7","path":"src/main.rs"}"#, answer);
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!((reply["path"].as_str(), reply["text"].as_str()), (Some("/w/proj/src/main.rs"), Some("fn main() {}\n")));
+        let read = seen.iter().find(|(m, _)| m == "file.read").unwrap();
+        assert_eq!(read.1, json!({"path":"src/main.rs","cwd":"/w/proj","on":"server","offset":1,"limit":FILE_LINES}));
+        // ~/ is that machine's home, asked of that machine.
+        let (result, seen) = action_against(r#"{"op":"file.read","terminal":"server/t7","path":"~/notes.md"}"#, answer);
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(reply["path"], "/home/wolf/notes.md");
+        let exec = seen.iter().find(|(m, _)| m == "machine.exec").unwrap();
+        assert_eq!(exec.1["on"], "server");
+        let read = seen.iter().find(|(m, _)| m == "file.read").unwrap();
+        assert_eq!((read.1["path"].as_str(), read.1["cwd"].as_str()), (Some("notes.md"), Some("/home/wolf")));
+        // A failed read is the phone's message to show, not a dropped session.
+        let (result, _) = action_against(r#"{"op":"file.read","terminal":"server/t7","path":"/bin/sh"}"#, |method, _, _| match method {
+            "file.read" => Err("not_text"),
+            m => Ok(base_answer(m)),
+        });
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(reply["queued"], false);
+        assert!(reply["error"].as_str().unwrap().contains("not_text"));
     }
 
     #[test]

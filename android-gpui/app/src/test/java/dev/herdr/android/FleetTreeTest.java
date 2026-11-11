@@ -90,6 +90,52 @@ public final class FleetTreeTest {
         assertEquals(new HashSet<>(Arrays.asList("t9", "t1")), new HashSet<>(ids(fleet.others)));
     }
 
+    // ── The sidebar at rest ──────────────────────────────────────────────
+
+    @Test public void theSidebarAtRestIsTheDeaconThenEachPmWithEverythingElseFolded() {
+        FleetTree.Member deacon = label(m("t1", "sd", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member helper = m("t2", "sd", "deacon", 0, 1, "/h", "working");
+        FleetTree.Member pmA = label(m("t10", "sa", "alpha", 1, 0, "/a", "idle"), "pm", "alpha");
+        FleetTree.Member workerA = label(m("t11", "sa", "alpha", 1, 1, "/a", "working"), "worker", "alpha");
+        workerA.parent = "t10";
+        FleetTree.Member pmB = label(m("t20", "sb", "beta", 2, 0, "/b", "idle"), "pm", "beta");
+        // Blocked work stays folded too: Needs you, on the Deacon card, is where it surfaces.
+        FleetTree.Member workerB = label(m("t21", "sb2", "beta-wt", 3, 0, "/b-wt", "blocked"), "worker", "beta");
+        FleetTree.Member shell = m("t30", "sl", "scratch", 4, 0, "/tmp", "");
+        FleetTree.Member stray = m("t40", "", "", 9, 0, "/x", "working");
+        FleetTree.Fleet fleet = FleetTree.build(
+                Arrays.asList(stray, shell, workerB, pmB, workerA, pmA, helper, deacon), null);
+
+        assertEquals(Arrays.asList("t1", "t10", "t20"), ids(FleetTree.shownByDefault(fleet)));
+        // Folded, not dropped: every terminal is still in the tree behind a chevron.
+        assertEquals(Arrays.asList("t2"), ids(fleet.helpers));
+        assertEquals(Arrays.asList("t40"), ids(fleet.others));
+        assertEquals(Arrays.asList("t30"), ids(fleet.loose.get(0).members));
+        assertEquals(Arrays.asList("t11"), ids(project(fleet, "alpha").entries.get(0).members));
+        assertEquals(Arrays.asList("t21"), ids(FleetTree.needsYou(fleet)));
+    }
+
+    @Test public void onlyRepoHeadingsAndSubAgentsStartOpen() {
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.REPO, 3, false));
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.AGENT, 1, false));
+        for (FleetTree.Fold fold : new FleetTree.Fold[] {FleetTree.Fold.DEACON, FleetTree.Fold.PROJECT,
+                FleetTree.Fold.OUTSIDE, FleetTree.Fold.LOOSE_SPACE, FleetTree.Fold.UNOPENED, FleetTree.Fold.OTHERS}) {
+            assertTrue(fold.name(), FleetTree.foldedByDefault(fold, 1, false));
+            assertTrue(fold.name(), FleetTree.foldedByDefault(fold, 1, true));
+        }
+        // Inside an opened project, a checkout shows its agents unless it is crowded and calm.
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.CHECKOUT, 6, false));
+        assertTrue(FleetTree.foldedByDefault(FleetTree.Fold.CHECKOUT, 7, false));
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.CHECKOUT, 7, true));
+    }
+
+    @Test public void withNoDeaconTheSidebarAtRestIsJustThePms() {
+        FleetTree.Member pm = label(m("t10", "sa", "alpha", 0, 0, "/a", "idle"), "pm", "alpha");
+        FleetTree.Member worker = label(m("t11", "sa", "alpha", 0, 1, "/a", "working"), "worker", "alpha");
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(worker, pm), null);
+        assertEquals(Arrays.asList("t10"), ids(FleetTree.shownByDefault(fleet)));
+    }
+
     @Test public void anUnlabelledAgentInTheDeaconSpaceIsTheFallbackDeaconOnly() {
         FleetTree.Member shell = m("t0", "sd", "Deacon", 0, 0, "/h", "");
         FleetTree.Member first = m("t5", "sd", "Deacon", 0, 1, "/h", "idle");

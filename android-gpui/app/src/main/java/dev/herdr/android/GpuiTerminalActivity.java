@@ -127,6 +127,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean keysOnDeck;
     /** Colors for every surface outside the painted grid, from the current palette. */
     private GpuiChrome chrome;
+    /** The terminal and, swiped to, a file an agent or a tapped path opened. */
+    private FilePager filePager;
     private volatile boolean sidebarOpen;
     /** When the last window switch was asked for, to log how long it took. */
     private volatile long switchAskedAt;
@@ -278,6 +280,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         appliedPalette = palette;
         nativeSetTheme(palette);
         chrome = GpuiChrome.load(palette);
+        if (filePager != null) filePager.applyChrome(chrome);
         applyChrome();
     }
 
@@ -362,7 +365,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
-        content.addView(surface, new LinearLayout.LayoutParams(-1, 0, 1));
+        filePager = new FilePager(this, surface, chrome, this::readFile, actionWorker);
+        content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));
         keyDeck = new android.widget.ScrollView(this);
@@ -535,7 +539,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (wanted) {
             edgeBack = EdgeBack.register(this, () -> {
                 if (shellMode()) leaveByBack(); else showRailOverlay();
-            }, this::leaveByBack);
+            }, () -> {
+                if (filePager == null || !filePager.hide()) leaveByBack();
+            });
         } else {
             EdgeBack.unregister(this, edgeBack);
             edgeBack = null;
@@ -585,6 +591,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             hideSidebar();
             return;
         }
+        if (filePager != null && filePager.hide()) return;
         super.onBackPressed();
     }
 
@@ -904,8 +911,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         keycaps.add(controlButton);
         for (Shortcut shortcut : shortcuts) {
             // Enter has its own place at the end of the bar.
-            if (!shortcut.isText() && shortcut.getKeys().size() == 1
-                    && "enter".equals(shortcut.getKeys().get(0))) continue;
+            if (GpuiTerminalProtocol.isPlainEnter(shortcut)) continue;
             Button button = keycap(shortcut.getLabel());
             button.setOnClickListener(view -> sendShortcut(shortcut));
             synchronousTouch(button);
@@ -2455,7 +2461,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (railFolds().focusSeen(selectedPane, reveal)) {
             for (FleetTree.SpaceNode row : focusedProject.entries) {
                 if (containsMember(row.members, selectedPane)) {
-                    collapsedRepos().remove(railKey(host, "s/" + focusedProject.name + "/" + row.key));
+                    String rowKey = railKey(host, "s/" + focusedProject.name + "/" + row.key);
+                    collapsedRepos().remove(rowKey);
+                    collapsedRepos().add(rowKey + ":open"); // a crowded row folds by default
                 }
             }
             getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
@@ -2473,7 +2481,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 railNote(host, "deacon-state", "Claude isn't running in the Deacon's terminal. Tap to open it.",
                         chrome.danger, 1, () -> openRailPane(host, live, current, deacon.id), order, keep);
             }
-            for (FleetTree.Member helper : fleet.helpers) railAgent(host, live, current, helper, "", 1, selectedPane, order, keep);
+            // Deacon › PMs at rest, as Home: the Deacon's helpers wait behind a fold.
+            if (!fleet.helpers.isEmpty()) {
+                String hKey = railFold(railKey(host, "helpers"), FleetTree.Fold.DEACON, fleet.helpers.size(), false);
+                boolean hFolded = railFolded(hKey) && !containsMember(fleet.helpers, selectedPane);
+                railHeader(host, live, current, "helpers", "Deacon's helpers", String.valueOf(fleet.helpers.size()),
+                        hKey, hFolded, 1, "", order, keep);
+                if (!hFolded) {
+                    for (FleetTree.Member helper : fleet.helpers) railAgent(host, live, current, helper, "", 2, selectedPane, order, keep);
+                }
+            }
             java.util.List<FleetTree.Member> needs = FleetTree.needsYou(fleet);
             if (!needs.isEmpty()) {
                 railNote(host, "needs-head", "Needs you", chrome.danger, 1, null, order, keep);
@@ -2501,8 +2518,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         for (FleetTree.RepoGroup group : FleetTree.repoGroups(fleet)) {
             String repoKey = railKey(host, group.outside() ? "outside" : "r/" + group.repo);
             // Outside git starts folded (its key means "open"); repos start open.
-            String foldKey = group.outside() ? repoKey + ":open" : repoKey;
-            boolean repoFolded = group.outside() ? !collapsedRepos().contains(foldKey) : collapsedRepos().contains(foldKey);
+            String foldKey = railFold(repoKey, group.outside() ? FleetTree.Fold.OUTSIDE : FleetTree.Fold.REPO,
+                    group.projects.size(), group.tally[0] > 0);
+            boolean repoFolded = railFolded(foldKey);
             int pms = group.pms();
             String meta = group.outside() ? String.valueOf(group.projects.size() + group.loose.size())
                     : (group.tally[0] > 0 ? group.tally[0] + "! " : "") + pms + (pms == 1 ? " PM" : " PMs");
@@ -2510,13 +2528,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (repoFolded) continue;
             for (FleetTree.Project project : group.projects) railProject(host, live, current, project, members, selectedPane, order, keep);
             for (FleetTree.SpaceNode node : group.loose) {
-                for (FleetTree.Member m : node.members) railAgent(host, live, current, m, "", 1, selectedPane, order, keep);
+                // A space with no project folds its terminals, as on Home.
+                String lKey = railFold(railKey(host, "l/" + node.key), FleetTree.Fold.LOOSE_SPACE, node.members.size(), false);
+                boolean lFolded = railFolded(lKey) && !containsMember(node.members, selectedPane);
+                railHeader(host, live, current, "loose:" + node.key, node.name, String.valueOf(node.members.size()),
+                        lKey, lFolded, 1, node.members.isEmpty() ? "" : node.members.get(0).id, order, keep);
+                if (lFolded) continue;
+                for (FleetTree.Member m : node.members) railAgent(host, live, current, m, "", 2, selectedPane, order, keep);
             }
             FleetTree.Project owner = group.owner;
             if (owner == null) continue;
-            String uKey = railKey(host, "u/" + group.repo) + ":open";
-            boolean uFolded = !collapsedRepos().contains(uKey);
             int total = owner.closed.size();
+            String uKey = railFold(railKey(host, "u/" + group.repo), FleetTree.Fold.UNOPENED, total, false);
+            boolean uFolded = railFolded(uKey);
             railHeader(host, live, current, "unopened:" + group.repo, total + (total == 1 ? " worktree" : " worktrees")
                     + " with no space" + (owner.closedIncomplete ? " (list cut short)" : ""), "", uKey, uFolded, 1, "", order, keep);
             if (uFolded) continue;
@@ -2541,8 +2565,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         if (!fleet.others.isEmpty()) {
-            String key = railKey(host, "others");
-            boolean folded = collapsedRepos().contains(key);
+            String key = railFold(railKey(host, "others"), FleetTree.Fold.OTHERS, fleet.others.size(), false);
+            // The focused terminal is never hidden behind a fold it starts in.
+            boolean folded = railFolded(key) && !containsMember(fleet.others, selectedPane);
             railHeader(host, live, current, "group:others", "Other agents", String.valueOf(fleet.others.size()),
                     key, folded, 0, "", order, keep);
             if (!folded) {
@@ -2575,8 +2600,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         for (FleetTree.SpaceNode row : project.entries) {
             int depth = base + 1;
             if (!flat) {
-                String rowKey = railKey(host, "s/" + project.name + "/" + row.key);
-                boolean rowFolded = collapsedRepos().contains(rowKey);
+                boolean blocked = false;
+                for (FleetTree.Member m : row.members) blocked |= "blocked".equals(m.status) || "error".equals(m.status);
+                String rowKey = railFold(railKey(host, "s/" + project.name + "/" + row.key), FleetTree.Fold.CHECKOUT,
+                        row.members.size(), blocked);
+                boolean rowFolded = railFolded(rowKey);
                 String sub = row.branch.isEmpty() || row.branch.equals(row.name) ? "" : row.branch + " · ";
                 railHeader(host, live, current, "row:" + project.name + "/" + row.key, (row.worktree ? "⑂ " : "") + row.name,
                         sub + row.members.size(), row.members.isEmpty() ? null : rowKey, rowFolded, depth,
@@ -2592,6 +2620,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private FleetTree.Folds railFoldState;
+
+    /**
+     * A rail row's stored fold key under FleetTree's one policy (shared with
+     * Home): a row folded by default is stored as "<key>:open" while opened.
+     */
+    private static String railFold(String key, FleetTree.Fold fold, int members, boolean blocked) {
+        return FleetTree.foldedByDefault(fold, members, blocked) ? key + ":open" : key;
+    }
+
+    private boolean railFolded(String foldKey) {
+        return foldKey.endsWith(":open") != collapsedRepos().contains(foldKey);
+    }
 
     /** Project folds (opened projects live in the rail's fold set as ":open" keys). */
     private FleetTree.Folds railFolds() {
@@ -3899,7 +3939,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (target != null && target.ready && terminalSurface != null) {
                     final long generation = target.generation;
                     terminalSurface.postDelayed(() -> {
-                        if (!destroyed) nativeShowKeyboard(generation);
+                        // A tapped file link opened the file page instead.
+                        if (!destroyed && (filePager == null || !filePager.showingFile())) {
+                            nativeShowKeyboard(generation);
+                        }
                     }, 150);
                 }
             }
@@ -4290,6 +4333,41 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
             }
         });
+    }
+
+    /** A tapped file path (or OSC 8 file link): shown in the file page, read from the pane's machine. */
+    public void gpuiOpenFile(long expectedGeneration, String path, int line) {
+        runOnUiThread(() -> {
+            String pane;
+            synchronized (stateLock) {
+                if (destroyed || isFinishing() || connection == null
+                        || connection.generation != expectedGeneration || connection.remoteHandle == 0) return;
+                pane = connection.paneId;
+            }
+            if (filePager == null) return;
+            filePager.open(pane, path, Math.max(0, line));
+            // The file is read, not typed into: the keyboard would only cover it.
+            android.view.inputmethod.InputMethodManager input =
+                    (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (input != null && terminalSurface != null) {
+                input.hideSoftInputFromWindow(terminalSurface.getWindowToken(), 0);
+            }
+        });
+    }
+
+    /** Blocking, on a worker: core_session's file.read for the file page. */
+    private String readFile(String terminal, String path) {
+        Connection target;
+        synchronized (stateLock) { target = connection; }
+        if (target == null || target.remoteHandle == 0) {
+            return "{\"queued\":false,\"error\":\"Not connected\"}";
+        }
+        try {
+            JSONObject read = new JSONObject().put("op", "file.read").put("terminal", terminal).put("path", path);
+            return RemoteNative.sessionAction(target.remoteHandle, read.toString());
+        } catch (JSONException impossible) {
+            return "{\"queued\":false}";
+        }
     }
 
     /** Called by GPUI directly, independent of the HTTP command queue and connection health. */
@@ -4783,6 +4861,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.announced = true;
                     main.post(() -> { if (current(current)) showLinkUp(); });
                 }
+                // An agent's `hc open-file` for the pane on screen (core_session's open_file).
+                final JSONObject openFile = state.optJSONObject("open_file");
+                final String shownPane = current.paneId;
+                main.post(() -> { if (filePager != null) filePager.offer(openFile, shownPane); });
                 if (selected && !pane.equals(autoKeyboardPane)) {
                     // Opening an agent that is waiting on Wolf (a question or a
                     // permission) raises the keyboard once, ready for the answer.
