@@ -123,9 +123,16 @@ impl TerminalView {
                 terminal.update(cx, |terminal, _| {
                     terminal.set_host_input(true);
                     #[cfg(target_os = "android")]
-                    terminal.set_link_handler(|url| {
+                    terminal.set_link_handler(|link| {
                         let generation = model::mailbox().state().generation;
-                        crate::android::open_link(generation, &url);
+                        match link {
+                            gpui_rio::links::Link::Web(url) => {
+                                crate::android::open_link(generation, &url);
+                            }
+                            gpui_rio::links::Link::File { path, line } => {
+                                crate::android::open_file(generation, &path, line);
+                            }
+                        }
                     });
                 });
                 (handle, terminal)
