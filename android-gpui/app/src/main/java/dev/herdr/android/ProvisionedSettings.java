@@ -2,10 +2,12 @@ package dev.herdr.android;
 
 import android.content.Context;
 import android.content.res.Configuration;
+import dev.herdr.android.dictation.ServerDictationEngine;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -21,6 +23,7 @@ import org.json.JSONObject;
  *  "uiScale": 0.9,        every control and its text, 0.7..1.3
  *  "capturable": true,    allow screenshots and screen mirroring (no FLAG_SECURE)
  *  "scrollSpeed": 1.4,    lines scrolled per row of finger travel, 0.5..3
+ *  "dictationUrl": "ws://100.x.y.z:8770/v1/dictate",  the tailnet Whisper server
  *  "palette": {...}}      replaces Default: see model::set_default_palette_json
  * </pre>
  *
@@ -44,9 +47,12 @@ final class ProvisionedSettings {
     final Boolean capturable;
     final String paletteJson;
     final float scrollSpeed;
+    /** Null when unset or not a ws:// or wss:// URL: dictation uses the phone's recognizer. */
+    final URI dictationUrl;
 
     private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson,
-            float scrollSpeed) {
+            float scrollSpeed, URI dictationUrl) {
+        this.dictationUrl = dictationUrl;
         this.scrollSpeed = scrollSpeed;
         this.fontSize = fontSize;
         this.uiScale = uiScale;
@@ -62,7 +68,7 @@ final class ProvisionedSettings {
     }
 
     private static ProvisionedSettings read(Context context) {
-        ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED);
+        ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED, null);
         File dir = context.getExternalFilesDir(null);
         File file = dir == null ? null : new File(dir, FILE_NAME);
         if (file == null || !file.isFile() || file.length() > MAX_BYTES) return none;
@@ -85,7 +91,8 @@ final class ProvisionedSettings {
                     scale >= 0.7 && scale <= 1.3 ? (float) scale : 1,
                     root.has("capturable") ? root.optBoolean("capturable") : null,
                     palette == null ? null : palette.toString(),
-                    speed >= 0.5 && speed <= 3 ? (float) speed : DEFAULT_SCROLL_SPEED);
+                    speed >= 0.5 && speed <= 3 ? (float) speed : DEFAULT_SCROLL_SPEED,
+                    ServerDictationEngine.parseUrl(root.optString("dictationUrl", null)));
         } catch (IOException | JSONException | RuntimeException unreadable) {
             return none;
         }
