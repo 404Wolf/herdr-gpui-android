@@ -777,6 +777,69 @@ final class FleetTree {
         }
     }
 
+    /** The rows of the sidebar that can fold, for {@link #foldedByDefault}. */
+    enum Fold {
+        /** The Deacon's own helpers, under the Deacon row. */
+        DEACON,
+        /** A repo heading: its PM rows. */
+        REPO,
+        /** "Outside git": projects and spaces with no repo. */
+        OUTSIDE,
+        /** A project (its PM row): its checkouts, worktrees and workers. */
+        PROJECT,
+        /** A main checkout or worktree row inside an opened project. */
+        CHECKOUT,
+        /** A space with no project: its terminals. */
+        LOOSE_SPACE,
+        /** A repo's worktrees no space has open. */
+        UNOPENED,
+        /** "Other agents": extra deacons and agents with no space. */
+        OTHERS,
+        /** An agent's own sub-agents. */
+        AGENT
+    }
+
+    /**
+     * The sidebar at rest is Deacon › PMs, as the desktop Fleet: repo
+     * headings stay open so every PM shows, and everything under a PM or the
+     * Deacon (workers, worktrees, helpers, loose terminals, leftovers) waits
+     * behind its chevron. Only once Wolf opens a project do its checkout rows
+     * show their agents, unless a row is crowded with nothing blocked in it.
+     */
+    static boolean foldedByDefault(Fold fold, int members, boolean blocked) {
+        switch (fold) {
+            case REPO: case AGENT: return false;
+            case CHECKOUT: return members > 6 && !blocked;
+            default: return true;
+        }
+    }
+
+    /**
+     * The agents the sidebar shows before anything is opened: the Deacon,
+     * then each project's PM in repo order. Built on {@link #foldedByDefault}
+     * so Home's rows and this list cannot disagree.
+     */
+    static List<Member> shownByDefault(Fleet fleet) {
+        List<Member> out = new ArrayList<>();
+        if (fleet.deacon != null) {
+            out.add(fleet.deacon);
+            if (!foldedByDefault(Fold.DEACON, fleet.helpers.size(), false)) out.addAll(fleet.helpers);
+        }
+        for (RepoGroup group : repoGroups(fleet)) {
+            if (foldedByDefault(group.outside() ? Fold.OUTSIDE : Fold.REPO, group.projects.size(), false)) continue;
+            for (Project p : group.projects) {
+                if (p.pm != null) out.add(p.pm);
+                if (foldedByDefault(Fold.PROJECT, p.agents(), p.tally[0] > 0)) continue;
+                for (SpaceNode row : p.entries) out.addAll(row.members);
+            }
+            for (SpaceNode node : group.loose) {
+                if (!foldedByDefault(Fold.LOOSE_SPACE, node.members.size(), false)) out.addAll(node.members);
+            }
+        }
+        if (!foldedByDefault(Fold.OTHERS, fleet.others.size(), false)) out.addAll(fleet.others);
+        return out;
+    }
+
     /** The project holding terminal {@code id} (as its PM or in one of its rows), or null. */
     static Project projectOf(Fleet fleet, String id) {
         for (Project p : fleet.projects) {
