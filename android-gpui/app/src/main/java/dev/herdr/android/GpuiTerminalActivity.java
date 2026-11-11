@@ -685,6 +685,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             startShell();
             return;
         }
+        if (reconnectRunning) return;
+        reconnectRunning = true;
         final String id = currentHostId;
         hideReconnectBanner();
         publishCurrent("Reconnecting…");
@@ -699,7 +701,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 host = null;
             }
             if (host == null) {
-                runOnUiThread(() -> showReconnectBanner("Open the host list to reconnect"));
+                runOnUiThread(() -> {
+                    reconnectRunning = false;
+                    if (monitor != null) monitor.succeeded();
+                    showLinkUp();
+                    showReconnectBanner("Open the host list to reconnect");
+                });
                 return;
             }
             long handle = 0;
@@ -717,11 +724,28 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 final long readyHandle = handle;
                 final String readyPane = chosen;
                 final SavedRemoteHost readyHost = host;
-                runOnUiThread(() -> { hideReconnectBanner(); adoptHost(readyHost, readyHandle, readyPane); });
+                runOnUiThread(() -> {
+                    reconnectRunning = false;
+                    if (!hostResumed) {
+                        // Left the screen while connecting: onResume opens it again.
+                        RemoteNative.close(readyHandle);
+                        return;
+                    }
+                    hideReconnectBanner();
+                    adoptHost(readyHost, readyHandle, readyPane);
+                });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
                 if (handle != 0) RemoteNative.close(handle);
-                runOnUiThread(() -> showReconnectBanner("Reconnect failed. Check the host and network."));
+                android.util.Log.i("herdr-reconnect", "attempt failed: " + failure);
+                runOnUiThread(() -> {
+                    reconnectRunning = false;
+                    if (monitor != null && hostResumed) {
+                        // Keep trying, quickly, while the terminal is on screen.
+                        monitor.failed();
+                        showLinkDown();
+                    } else showReconnectBanner("Reconnect failed. Check the host and network.");
+                });
             }
         });
     }
@@ -1719,7 +1743,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             Connection previous = connection;
             connection = null;
             if (previous != null) previous.close();
+            // Resuming the same host keeps the last frame, the strip and the
+            // keyboard until the new session paints; another host starts clean.
+            boolean resume = previous != null && previous.remoteHandle > 0 && host.id.equals(currentHostId);
+            if (!resume) pendingInput.discardAll();
             next = new Connection(GENERATIONS.incrementAndGet(), handle);
+            if (resume) {
+                next.workspaces = previous.workspaces;
+                next.tabs = previous.tabs;
+                next.panes = previous.panes;
+            }
+            next.resumed = resume;
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -1729,7 +1763,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             connection = next;
             currentHostId = host.id;
             lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
-            nativeSetActive(next.generation, false);
+            if (next.resumed) {
+                nativeHold(next.generation);
+                if (imeSession > 0) nativeSetImeSession(next.generation, imeSession);
+            } else nativeSetActive(next.generation, false);
             publish(next, "Connecting to " + host.name + "…");
             next.poll = worker.scheduleWithFixedDelay(() -> pump(next), 0, COMMAND_POLL_MS, TimeUnit.MILLISECONDS);
         }
@@ -1880,6 +1917,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private android.widget.HorizontalScrollView tabScroll;
     private TextView crumb;
     private String crumbText = "";
+    /** Replaces the crumb while the link is down: the one status line, no overlay. */
+    private String linkStatus;
+    /** Reconnects a dropped remote session while this terminal is on screen. */
+    private ConnectionMonitor monitor;
+    /** Input that never left the phone, sent once the same pane is ready again. Under stateLock. */
+    private final PendingInput pendingInput = new PendingInput();
+    /** One reconnect at a time. Main thread. */
+    private boolean reconnectRunning;
     /** The pane the rail last scrolled into view. */
     private String revealedPane = "";
     private LinearLayout tabStrip;
@@ -2055,7 +2100,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void updateCrumb(Connection current, String space) {
-        if (crumb == null) return;
+        if (crumb == null || linkStatus != null) return;
         String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "", ownTitle = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -3745,6 +3790,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         clearControl();
         synchronized (stateLock) {
             Connection target = connection;
+            if (target != null && !target.ready && monitor != null && monitor.reconnecting()
+                    && !target.paneId.isEmpty()) {
+                // Sent once, in order, when the same pane is back.
+                if (!pendingInput.add(target.paneId, commandJson)) return false;
+                main.post(this::showLinkDown);
+                return true;
+            }
             if (target == null || target.isClosed() || !target.ready) {
                 Toast.makeText(this, "Not connected; the draft is kept", Toast.LENGTH_SHORT).show();
                 return false;
@@ -3907,6 +3959,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (isFinishing() || launch == null || shortcutJson == null || !hostStarted) return;
         hostResumed = true;
         nativeResumed();
+        if (monitor == null && !launch.shell) {
+            monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown);
+        }
+        if (monitor != null) monitor.start();
         updateHostSampling();
         if (launch.shell) {
             synchronized (stateLock) {
@@ -3943,6 +3999,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onPause() {
         hostResumed = false;
+        // Off screen nothing reconnects; onResume opens the session again.
+        if (monitor != null) {
+            monitor.stop();
+            monitor.succeeded();
+        }
+        // An attempt still in flight finishes on its own: it adopts if the
+        // terminal is back on screen by then and closes its session if not.
         // Mirrors are only useful on screen; three SSH sessions polling in the
         // background would spend battery for a rail nobody can see.
         stopHostSampling();
@@ -4571,7 +4634,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void pumpRemote(Connection current) {
         boolean mutation = false;
         try {
-            String raw = nativeTakeCommand(current.generation);
+            // Input held across a reconnect goes first, in order, once.
+            String held = null;
+            synchronized (stateLock) {
+                if (current(current) && current.ready) {
+                    held = pendingInput.next(current.paneId);
+                    int discarded = pendingInput.takeDiscarded();
+                    if (discarded > 0) {
+                        main.post(() -> Toast.makeText(this, discarded + (discarded == 1 ? " input" : " inputs")
+                                + " for another pane not sent", Toast.LENGTH_SHORT).show());
+                    }
+                }
+            }
+            if (held != null) {
+                mutation = true;
+                String result = RemoteNative.input(current.remoteHandle, current.paneId, held);
+                if (!new JSONObject(result).optBoolean("queued", false)) throw new IOException("Held input was not queued");
+                synchronized (stateLock) {
+                    pendingInput.sent();
+                    if (current(current)) publish(current, "Input queued over SSH");
+                }
+                current.fastUntil = SystemClock.uptimeMillis() + 1500;
+                mutation = false;
+            }
+            String raw = held != null ? null : nativeTakeCommand(current.generation);
             if (raw != null) {
                 GpuiTerminalProtocol.Command command = GpuiTerminalProtocol.command(raw);
                 if ("close".equals(command.type)) {
@@ -4584,7 +4670,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     main.post(() -> { if (current(current)) finish(); });
                     return;
                 }
-                if (!current(current) || !current.ready) return;
+                if (!current(current)) return;
+                if (!current.ready) {
+                    // Taken in the moment the pane stopped being ready: hold it
+                    // for the same pane rather than drop it.
+                    synchronized (stateLock) {
+                        if (!pendingInput.add(current.paneId, raw)) {
+                            main.post(() -> Toast.makeText(this, "Input not sent: the terminal is reconnecting",
+                                    Toast.LENGTH_SHORT).show());
+                        }
+                    }
+                    return;
+                }
                 mutation = true;
                 raw = doubleEnter(current, command, raw);
                 String result = RemoteNative.input(current.remoteHandle, current.paneId, raw);
@@ -4612,6 +4709,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         current.generation, current.hostName, shortcutJson);
                 if (rawState == null || rawState.length() > 1024 * 1024) throw new IOException("Oversized remote state");
                 JSONObject state = new JSONObject(rawState);
+                // herdr-core answers a refresh every two seconds; silence well
+                // past that is a dead path (TCP would take far longer to say so).
+                if (current.ready && monitor != null && monitor.dead(state.optLong("quiet_ms", 0))) {
+                    fail(current, "The host stopped answering");
+                    return;
+                }
                 if (state.optBoolean("unchanged", false)) {
                     String quietPhase = state.optString("state", "");
                     String quietPane = state.optString("pane_id", "");
@@ -4667,6 +4770,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 boolean selected = "ready".equals(phase) && !pane.isEmpty() && !boot.isEmpty();
                 boolean chromeChanged;
                 if (current.remoteBoot != null && !current.remoteBoot.equals(boot)) {
+                    // Held input was meant for programs that no longer exist.
+                    pendingInput.discardAll();
                     fail(current, "Herdr restarted. Reopen the remote session before sending input");
                     return;
                 }
@@ -4674,6 +4779,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 current.remotePhase = phase;
                 current.remoteRevision = state.optLong("token", state.optLong("revision", 0));
                 current.ready = selected;
+                if (selected && !current.announced) {
+                    current.announced = true;
+                    main.post(() -> { if (current(current)) showLinkUp(); });
+                }
                 if (selected && !pane.equals(autoKeyboardPane)) {
                     // Opening an agent that is waiting on Wolf (a question or a
                     // permission) raises the keyboard once, ready for the answer.
@@ -4780,15 +4889,91 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (!current(failed)) return;
             failed.cancel();
             if (failed.poll != null) failed.poll.cancel(false);
-            nativeSetActive(failed.generation, false);
-            publish(failed, message);
-            showReconnectBanner(message);
+            if (resumable(failed)) {
+                // The frame stays, dimmed, with the keyboard up; input not yet
+                // sent waits for the same pane and the monitor reconnects.
+                failed.ready = false;
+                holdUnsent(failed);
+                nativeHold(failed.generation);
+                publish(failed, message);
+                android.util.Log.i("herdr-reconnect", "link lost: " + message);
+                main.post(() -> {
+                    if (monitor == null || !hostResumed) return;
+                    monitor.lost();
+                    showLinkDown();
+                });
+            } else {
+                nativeSetActive(failed.generation, false);
+                publish(failed, message);
+                showReconnectBanner(message);
+            }
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Thread cleanup = new Thread(failed::close, "herdr-gpui-disconnect");
             cleanup.setDaemon(true);
             cleanup.start();
         } else failed.close();
+    }
+
+    /** A Herdr session on a saved host: the pane outlives the link, so it can be resumed. */
+    private boolean resumable(Connection failed) {
+        return failed.remoteHandle > 0 && !shellMode() && currentHostId != null && monitor != null;
+    }
+
+    /** Under stateLock, while the failed generation still owns the mailbox. */
+    private void holdUnsent(Connection failed) {
+        if (!failed.paneId.isEmpty()) rememberHostPane(failed.paneId);
+        for (int i = 0; i < PendingInput.MAX_COMMANDS; i++) {
+            String raw = nativeTakeCommand(failed.generation);
+            if (raw == null) break;
+            if (!holdable(raw)) continue;
+            if (!pendingInput.add(failed.paneId, raw)) break;
+        }
+    }
+
+    /** Input worth holding; a close means leave, not something to replay later. */
+    private static boolean holdable(String raw) {
+        try {
+            return !"close".equals(GpuiTerminalProtocol.command(raw).type);
+        } catch (IOException | RuntimeException invalid) {
+            return false;
+        }
+    }
+
+    /** The monitor's attempt. Main thread. */
+    private void autoReconnect() {
+        if (destroyed || isFinishing() || !hostResumed || currentHostId == null) return;
+        showLinkDown();
+        reconnectCurrentHost();
+    }
+
+    /** The status line while the link is down; dense, in the crumb's own slot. Main thread. */
+    private void showLinkDown() {
+        if (monitor == null || !monitor.reconnecting() || crumb == null) return;
+        String host;
+        int held;
+        synchronized (stateLock) {
+            host = connection == null ? "" : connection.hostName;
+            held = pendingInput.size();
+        }
+        StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
+        if (host != null && !host.isEmpty()) text.append(" to ").append(host);
+        text.append('…');
+        if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
+        linkStatus = text.toString();
+        crumb.setVisibility(View.VISIBLE);
+        crumb.setTextColor(chrome.warning);
+        crumb.setText(linkStatus);
+        crumb.setContentDescription(linkStatus);
+    }
+
+    /** The link is back: the crumb returns to where this window is. Main thread. */
+    private void showLinkUp() {
+        if (monitor != null) monitor.succeeded();
+        if (linkStatus == null) return;
+        linkStatus = null;
+        crumbText = null;
+        refreshTabStrip();
     }
 
     /** A raw SSH shell instead of a Herdr pane: no rail, panes or session changes. */
@@ -4912,6 +5097,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private final class Connection {
         long degradedSince;
+        /** Replaces a dropped session on the same host; its first ready ends the reconnect. */
+        boolean resumed;
+        /** The link-up was announced once for this session. */
+        boolean announced;
         final long generation;
         final CompanionClient client;
         final long remoteHandle;
@@ -5001,6 +5190,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String shortcutsJson);
     private static native String nativeCopyText(long generation);
     private static native void nativeSetActive(long generation, boolean active);
+    private static native void nativeHold(long generation);
     private static native void nativeSetFollow(long generation, boolean follow);
     private static native void nativeShowKeyboard(long generation);
     private static native String nativeTakeCommand(long generation);

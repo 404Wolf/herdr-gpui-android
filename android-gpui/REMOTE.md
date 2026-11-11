@@ -121,8 +121,12 @@ requires confirmation that OMP is idle with an empty prompt and never clears
 existing input. A failed connection can leave an action applied at the host;
 inspect the terminal before retrying. Nothing is replayed automatically.
 
-Leaving the remote terminal closes its connection and discards pending input.
-Reconnect from Remote hosts and enter credentials again. A daemon restart,
+While the terminal is on screen, a dropped core session is reopened over the
+saved host and key and lands on the same pane; input not yet sent is held for
+that pane and sent once, input in flight is never resent, and held input is
+discarded if the reconnect lands elsewhere or Herdr restarted. Leaving the remote
+terminal closes its connection; coming back reconnects to the pane that was
+showing. A daemon restart,
 deleted pane or stale launch cannot silently retarget a command.
 
 The remote renderer paints the validated binary surface frame: named, indexed and

@@ -85,6 +85,7 @@ impl Connection<'_> {
         match self.socket.read(&mut buffer) {
             Ok(0) => Err(Error::Closed),
             Ok(n) => {
+                self.owner.heard.mark();
                 self.decoder.bytes.extend_from_slice(&buffer[..n]);
                 self.decoder.next()
             }
@@ -1399,6 +1400,16 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 mod tests {
     use super::{DEACON_DIR, deacon_dir};
     #[test]
+    fn heard_reports_quiet_time_since_the_last_byte() {
+        let heard = crate::remote::Heard::default();
+        std::thread::sleep(Duration::from_millis(40));
+        let before = heard.quiet_ms();
+        assert!(before >= 40);
+        heard.mark();
+        assert!(heard.quiet_ms() < before);
+    }
+
+    #[test]
     fn the_deacons_folder_is_home_herdr_deacon_made_and_read_back() {
         // The script, run for real with HOME in a scratch folder (spaces and quotes included).
         let home = std::env::temp_dir().join(format!("herdr deacon 'home' {}", std::process::id()));
@@ -1805,6 +1816,7 @@ mod connection_tests {
             cancel: CancellationToken::new(),
             commands,
             focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -1896,6 +1908,7 @@ mod connection_tests {
             cancel: CancellationToken::new(),
             commands,
             focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -1987,6 +2000,7 @@ mod connection_tests {
             cancel: CancellationToken::new(),
             commands: commands.clone(),
             focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));

@@ -156,8 +156,16 @@ APK identities and verification scope. A `dumpsys SurfaceFlinger --latency` read
 the GPUI SurfaceView layer comes back empty while the surface is idle, so frame
 cadence has to be sampled during interaction rather than at rest.
 Terminal type follows the pane's own wrap width and Android's system font scale;
-pick a fixed size in **View** to override it. A lost transport offers **Hosts**
-and **Reconnect** instead of leaving the surface frozen. **Hosts** opens one tree
+pick a fixed size in **View** to override it. A lost link to a Herdr host is
+resumed on its own while the terminal is on screen: at once, then every 250 ms
+to 2 s, and again immediately when a network appears or changes. The last frame
+stays, dimmed, with the keyboard up, and the line under the tabs says
+"Reconnecting…" in place of the breadcrumb; nothing moves. A link that goes
+quiet (herdr-core is refreshed every two seconds) is replaced rather than left
+for TCP to time out. Input that never left the phone waits for the same pane
+and is sent once, in order; input that was being sent when the link failed is
+never resent. A raw shell, or a host that is no longer saved, still offers
+**Hosts** and **Reconnect**. **Hosts** opens one tree
 of saved hosts, workspaces and agents, with the current host marked. Background
 mirrors negotiate inactive surface interest in their initial hello: they keep
 receiving metadata without requesting terminal frames they never display.

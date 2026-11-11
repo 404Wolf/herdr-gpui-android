@@ -591,6 +591,7 @@ impl Render for TerminalView {
         let rows = snapshot.clone();
         let entity = cx.entity();
         let active = self.state.active;
+        let held = self.state.held;
         let generation = self.state.generation;
         let status = self
             .error
@@ -764,6 +765,9 @@ impl Render for TerminalView {
                     body.items_center().justify_center()
                 })
                 .when_some(shell, |body, shell| body.child(shell))
+                // A reconnect keeps the last frame readable, dimmed so it is
+                // not mistaken for a live pane.
+                .when(held, |body| body.opacity(0.55))
                 .when(pan > 0. && !shell_mode, |body| {
                     // A panned pane has no visible left edge; mark it so a cut
                     // line is never mistaken for a broken render.

@@ -200,6 +200,36 @@ pub(crate) struct Session {
     /// queue: a switch can never be refused because terminal output filled
     /// the queue, and quick taps collapse into the last one.
     pub(crate) focus: Mutex<Option<(String, std::time::Instant)>>,
+    /// When herdr-core last sent any byte, for the phone's liveness check.
+    pub(crate) heard: Heard,
+}
+
+/// The last time bytes arrived, lock-free: the socket loop marks it on every
+/// read and the phone's poll asks how long the link has been quiet. herdr-core
+/// is refreshed every two seconds, so a long silence means the path is dead
+/// (a subway tunnel), which TCP alone would report only after many seconds.
+pub(crate) struct Heard {
+    born: std::time::Instant,
+    at_ms: AtomicU64,
+}
+impl Default for Heard {
+    fn default() -> Self {
+        Self {
+            born: std::time::Instant::now(),
+            at_ms: AtomicU64::new(0),
+        }
+    }
+}
+impl Heard {
+    pub(crate) fn mark(&self) {
+        let now = u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.at_ms.store(now, Ordering::Relaxed);
+    }
+    /// Milliseconds since the last byte (or since the session began).
+    pub(crate) fn quiet_ms(&self) -> u64 {
+        let now = u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX);
+        now.saturating_sub(self.at_ms.load(Ordering::Relaxed))
+    }
 }
 pub(crate) enum Operation {
     Discover(mpsc::SyncSender<Result<String>>),
@@ -262,6 +292,7 @@ pub fn connect_credentials_grid(
         cancel: CancellationToken::new(),
         commands: tx,
         focus: Mutex::new(None),
+        heard: Heard::default(),
     });
     let worker = owner.clone();
     std::thread::Builder::new()
@@ -289,7 +320,10 @@ pub fn close(id: u64) {
     }
 }
 pub fn poll(id: u64, _since: u64, _mirror: bool) -> Result<String> {
-    Ok(lock(&session(id)?.state).view.to_string())
+    let owner = session(id)?;
+    let mut view = lock(&owner.state).view.clone();
+    view["quiet_ms"] = json!(owner.heard.quiet_ms());
+    Ok(view.to_string())
 }
 #[cfg(feature = "android-ui")]
 pub fn poll_terminal(
@@ -325,11 +359,13 @@ pub fn poll_terminal(
             "scroll": view["scroll"],
             "fetch": view["fetch"],
             "local_offset": local_offset,
+            "quiet_ms": owner.heard.quiet_ms(),
         })
         .to_string());
     }
     let mut view = view.clone();
     view["local_offset"] = json!(local_offset);
+    view["quiet_ms"] = json!(owner.heard.quiet_ms());
     Ok(view.to_string())
 }
 pub fn focus(id: u64, terminal: &str) -> Result<String> {

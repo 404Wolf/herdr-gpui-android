@@ -1155,6 +1155,8 @@ pub struct Mailbox {
     pub follow: bool,
     /// Raw SSH shell drawn instead of a Herdr pane, or 0.
     shell: u64,
+    /// The last frame is held, dimmed, while the connection is re-established.
+    held: bool,
 }
 
 /// Horizontal pan requested by a wheel or drag delta, if the gesture is
@@ -1186,6 +1188,8 @@ pub struct ViewState {
     pub pan: f32,
     /// Handle of the raw SSH shell this generation draws, or 0 for Herdr's pane.
     pub shell: u64,
+    /// A reconnect is holding the last frame on screen; input is closed.
+    pub held: bool,
 }
 
 impl Default for Mailbox {
@@ -1204,6 +1208,7 @@ impl Default for Mailbox {
             // A fresh session tails its pane until the user scrolls back.
             follow: true,
             shell: 0,
+            held: false,
         }
     }
 }
@@ -1231,6 +1236,30 @@ impl Mailbox {
             self.preedit = Arc::from("");
         }
         self.active = active;
+        self.held = false;
+        self.revision = self.revision.wrapping_add(1);
+        #[cfg(feature = "android-ui")]
+        signal_change();
+        true
+    }
+
+    /// Closes input for `generation` but keeps the last frame and shell on
+    /// screen, dimmed, while a reconnect replaces the session: unlike
+    /// `set_active(_, false)` nothing is blanked and the keyboard stays up.
+    /// A newer generation inherits the frame until its own shell attaches.
+    pub fn hold(&mut self, generation: i64) -> bool {
+        if generation <= 0 || generation < self.generation {
+            return false;
+        }
+        if generation == self.generation && self.held && !self.active {
+            return false;
+        }
+        self.generation = generation;
+        self.commands.clear();
+        self.ime_session = 0;
+        self.preedit = Arc::from("");
+        self.active = false;
+        self.held = true;
         self.revision = self.revision.wrapping_add(1);
         #[cfg(feature = "android-ui")]
         signal_change();
@@ -1392,6 +1421,7 @@ impl Mailbox {
             display_preferences: self.display_preferences,
             follow: self.follow,
             shell: self.shell,
+            held: self.held,
         }
     }
 
@@ -1844,6 +1874,34 @@ mod tests {
         assert_eq!(state.snapshot.widest_line_chars, original.widest_line_chars);
         assert!(!state.follow);
         assert_eq!(state.pan, 80.);
+    }
+
+    #[test]
+    fn a_held_frame_survives_a_reconnect_until_input_reopens() {
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        box_.set_shell(10, 7);
+        box_.set_ime_session(10, 3);
+        box_.enqueue(10, Command::Text { text: "a".into() }).unwrap();
+        // The link drops: input closes, the screen stays.
+        assert!(box_.hold(10));
+        assert!(!box_.hold(10), "an unchanged hold does not wake the view");
+        let held = box_.state();
+        assert!(held.held && !held.active);
+        assert_eq!(held.shell, 7);
+        assert!(box_.take_command(10).is_none(), "queued input is not replayed");
+        assert!(box_.enqueue(10, Command::Text { text: "a".into() }).is_err());
+        // The new session inherits the frame until its own shell attaches.
+        assert!(box_.hold(11));
+        assert_eq!(box_.state().generation, 11);
+        assert_eq!(box_.state().shell, 7);
+        assert!(!box_.hold(10), "an old generation cannot hold again");
+        assert!(box_.set_shell(11, 8));
+        assert!(box_.set_ime_session(11, 3));
+        assert!(box_.set_active(11, true));
+        let live = box_.state();
+        assert!(live.active && !live.held);
+        assert_eq!(live.shell, 8);
     }
 
     #[test]
