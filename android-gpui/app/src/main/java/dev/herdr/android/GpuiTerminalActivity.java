@@ -952,9 +952,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean deck = above >= 0;
         int height = deck ? above : 0;
         float weight = deck ? 0f : 1f;
-        LinearLayout.LayoutParams surfaceParams = (LinearLayout.LayoutParams) terminalSurface.getLayoutParams();
+        // The surface sits inside the file pager now; the pager is the column's child.
+        View pane = filePager != null ? filePager : terminalSurface;
+        if (!(pane.getLayoutParams() instanceof LinearLayout.LayoutParams)) return;
+        LinearLayout.LayoutParams surfaceParams = (LinearLayout.LayoutParams) pane.getLayoutParams();
         if (surfaceParams.height != height || surfaceParams.weight != weight) {
-            terminalSurface.setLayoutParams(new LinearLayout.LayoutParams(-1, height, weight));
+            pane.setLayoutParams(new LinearLayout.LayoutParams(-1, height, weight));
         }
         LinearLayout.LayoutParams deckParams = (LinearLayout.LayoutParams) keyDeck.getLayoutParams();
         int hinge = deck ? posture.foldBottom - posture.foldTop : 0;
