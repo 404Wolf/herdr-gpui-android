@@ -446,7 +446,8 @@ public final class RemoteHostsActivity extends Activity {
             // No pane is attached until reopenPane picks one, at the phone's grid.
             handle = RemoteNative.connectGrid(host.connectionJson(), credential, TerminalGrid.estimate(this), false);
             if (handle <= 0) throw new IllegalStateException("connect refused");
-            String focused = reopenPane(handle, wantedPane);
+            // Falling back to another host (no wanted pane) lands on its live Deacon.
+            String focused = reopenPane(handle, wantedPane, wantedPane.isEmpty());
             final long readyHandle = handle;
             final String readyPane = focused;
             main.post(() -> {
@@ -473,7 +474,7 @@ public final class RemoteHostsActivity extends Activity {
     }
 
     /** Waits for the session and focuses the remembered pane, or a live one. */
-    private String reopenPane(long handle, String remembered) throws Exception {
+    private String reopenPane(long handle, String remembered, boolean machineSwitch) throws Exception {
         long until = System.currentTimeMillis() + 30_000;
         JSONObject state = null;
         while (System.currentTimeMillis() < until) {
@@ -484,10 +485,15 @@ public final class RemoteHostsActivity extends Activity {
             if ("ready".equals(phase) || panes != null && panes.length() > 0) break;
             Thread.sleep(150);
         }
+        for (long spaces = System.currentTimeMillis() + 1_500; machineSwitch && !FleetPanes.hasSpaces(state)
+                && System.currentTimeMillis() < spaces; ) {
+            Thread.sleep(150);
+            state = new JSONObject(RemoteNative.poll(handle, 0, false));
+        }
         org.json.JSONArray panes = state == null ? null : state.optJSONArray("panes");
         if (panes == null || panes.length() == 0) throw new IllegalStateException("no panes");
-        String pane = "";
-        for (int i = 0; i < panes.length(); i++) {
+        String pane = machineSwitch ? FleetPanes.switchLanding(state, "") : "";
+        for (int i = 0; i < panes.length() && pane.isEmpty(); i++) {
             if (remembered.equals(panes.getJSONObject(i).optString("id", ""))) pane = remembered;
         }
         for (int i = 0; i < panes.length() && pane.isEmpty(); i++) {

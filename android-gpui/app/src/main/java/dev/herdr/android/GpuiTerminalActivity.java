@@ -721,7 +721,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 reconnectHandle = handle;
                 // Paused before the handle was published: attach nothing.
                 if (!hostResumed) throw new IllegalStateException("left the screen");
-                String chosen = awaitHostPane(handle, host.id, null);
+                // The same computer again: back to its remembered terminal, not its Deacon.
+                String chosen = awaitHostPane(handle, host.id, null, false);
                 reconnectHandle = 0;
                 final long readyHandle = handle;
                 final String readyPane = chosen;
@@ -1668,7 +1669,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), false);
                 if (handle <= 0) throw new IllegalStateException("connection refused");
-                String chosen = awaitHostPane(handle, host.id, forcedPane);
+                // Another computer: its live Deacon unless a terminal there was picked.
+                String chosen = awaitHostPane(handle, host.id, forcedPane, true);
                 final long readyHandle = handle;
                 final String readyPane = chosen;
                 runOnUiThread(() -> adoptHost(host, readyHandle, readyPane));
@@ -1684,8 +1686,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
     }
 
-    /** Waits for the new session, focuses its first pane and returns that id. */
-    private String awaitHostPane(long handle, String hostId, String forcedPane) throws Exception {
+    /**
+     * Waits for the new session, focuses its first pane and returns that id.
+     * {@code machineSwitch}: another computer was picked, so it lands on that
+     * computer's live Deacon (FleetTree.switchLanding) unless a live terminal
+     * there was named; with no Deacon, the usual choice below applies.
+     */
+    private String awaitHostPane(long handle, String hostId, String forcedPane, boolean machineSwitch) throws Exception {
         long until = SystemClock.uptimeMillis() + 45_000;
         JSONObject state = null;
         while (SystemClock.uptimeMillis() < until) {
@@ -1698,11 +1705,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if ("ready".equals(phase) || listed != null && listed.length() > 0) break;
             Thread.sleep(150);
         }
+        // A Deacon may be known only by its space's name: give the spaces a moment.
+        for (long spaces = SystemClock.uptimeMillis() + 1_500; machineSwitch && !FleetPanes.hasSpaces(state)
+                && SystemClock.uptimeMillis() < spaces; ) {
+            Thread.sleep(150);
+            state = new JSONObject(RemoteNative.poll(handle, 0, false));
+        }
         JSONArray panes = state == null ? null : state.optJSONArray("panes");
         if (panes == null || panes.length() == 0) throw new IllegalStateException("no panes");
-        // An explicit pick wins; then the pane this phone last used on that
-        // host; the daemon's own focus is often an idle shell.
-        String pane = forcedPane != null && !forcedPane.isEmpty() ? forcedPane : rememberedHostPane(hostId);
+        // An explicit pick wins; then (switching computers) its live Deacon;
+        // then the pane this phone last used on that host; the daemon's own
+        // focus is often an idle shell.
+        String landing = machineSwitch ? FleetPanes.switchLanding(state, forcedPane) : "";
+        String pane = !landing.isEmpty() ? landing
+                : forcedPane != null && !forcedPane.isEmpty() ? forcedPane : rememberedHostPane(hostId);
         // Then a pane that is actually doing something: an idle shell reads as
         // a blank terminal even though it is rendering.
         if (pane.isEmpty() || !hasPane(panes, pane)) {

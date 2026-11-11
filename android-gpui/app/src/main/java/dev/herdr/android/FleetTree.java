@@ -885,6 +885,21 @@ final class FleetTree {
         return canonicalDeacon(members);
     }
 
+    /**
+     * Where switching to a computer lands, on every path (a computer row, the
+     * rail's computer header or picker, falling back to another host): an
+     * explicit terminal that is live there wins; else that computer's
+     * canonical live Deacon; else "" and the caller keeps its own fallback
+     * (the remembered or a busy terminal). {@code liveMembers} must be the new
+     * session's own list, so a cached or vanished Deacon is never focused.
+     */
+    static String switchLanding(String explicit, List<? extends Member> liveMembers) {
+        String wanted = explicit == null ? "" : explicit;
+        if (!wanted.isEmpty()) for (Member m : liveMembers) if (m.id.equals(wanted)) return wanted;
+        Member deacon = pickTarget(liveMembers);
+        return deacon == null ? "" : deacon.id;
+    }
+
     /** What a pick does: focus the Deacon, offer Start Deacon, or nothing (offline). */
     enum Pick { FOCUS, START, OFFLINE }
 

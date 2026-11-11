@@ -78,6 +78,21 @@ final class FleetPanes {
         return out;
     }
 
+    /**
+     * {@link FleetTree#switchLanding} on a new session's poll: only its own
+     * live terminals count, so the Deacon focused is that computer's, now.
+     */
+    static String switchLanding(JSONObject state, String explicit) {
+        if (state == null) return "";
+        return FleetTree.switchLanding(explicit, members(state.optJSONArray("workspaces"), state.optJSONArray("tabs"),
+                state.optJSONArray("panes"), FleetTree.Member::new));
+    }
+
+    /** Whether a poll already carries the spaces (a Deacon may be known only by its space's name). */
+    static boolean hasSpaces(JSONObject state) {
+        return state != null && state.optJSONArray("workspaces") != null;
+    }
+
     /** A title worth showing: the agent's own, else its harness or "shell" and folder. */
     static String displayTitle(FleetTree.Member m) {
         if (!m.title.isEmpty() && !RailTree.isTerminalId(m.title)) return m.title;

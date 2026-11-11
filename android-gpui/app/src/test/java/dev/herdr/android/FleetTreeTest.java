@@ -90,6 +90,22 @@ public final class FleetTreeTest {
         assertEquals(new HashSet<>(Arrays.asList("t9", "t1")), new HashSet<>(ids(fleet.others)));
     }
 
+    // ── Switching computers ──────────────────────────────────────────────
+
+    @Test public void switchingComputersLandsOnTheLiveDeaconUnlessALiveTerminalWasPicked() {
+        FleetTree.Member deacon = label(m("t1", "sd", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member pm = label(m("t5", "sa", "app", 1, 0, "/a", "working"), "pm", "app");
+        List<FleetTree.Member> live = Arrays.asList(pm, deacon);
+        assertEquals("t1", FleetTree.switchLanding(null, live));
+        assertEquals("t1", FleetTree.switchLanding("", live));
+        assertEquals("t5", FleetTree.switchLanding("t5", live));
+        // A name from a cached list that the live one lacks: the live Deacon.
+        assertEquals("t1", FleetTree.switchLanding("t99", live));
+        // No Deacon: the caller's own fallback ("").
+        assertEquals("", FleetTree.switchLanding(null, Collections.singletonList(pm)));
+        assertEquals("", FleetTree.switchLanding("t99", Collections.<FleetTree.Member>emptyList()));
+    }
+
     // ── The sidebar at rest ──────────────────────────────────────────────
 
     @Test public void theSidebarAtRestIsTheDeaconThenEachPmWithEverythingElseFolded() {
