@@ -1,6 +1,6 @@
 # Remote for Herdr privacy policy
 
-Effective 8 November 2026 (Wolf fork)
+Effective 11 November 2026 (Wolf fork)
 
 Remote for Herdr is an unofficial client for Herdr, which is owned by an unrelated team. This policy explains what the app does with your information. In short: the app's developer collects nothing; when you connect, information goes to the computer and network services you choose to use.
 
@@ -33,6 +33,10 @@ The bootstrap host probes online SSH-capable peers with its existing SSH keys an
 ## Clipboard
 
 The app reads clipboard text only when you tap Paste for an Iroh endpoint. It writes text when you copy pane or screen text and when your Herdr host sends clipboard text using OSC 52.
+
+## Dictation
+
+The app uses the microphone only between your tap on the microphone button and your next tap, and only if you grant microphone permission. If your device administrator has provisioned a dictation server (a speech-to-text server on your own network), the audio streams to that server and its text comes back; nothing is saved on the phone. If no server is provisioned, or it cannot be reached, the app uses the phone's own speech recognizer (on most phones, Google's), which follows that recognizer's own terms; the app asks it to prefer its offline model.
 
 ## Notifications
 

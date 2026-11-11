@@ -236,7 +236,8 @@ The GPUI build requires Android 10+ because this mobile backend links an Android
 API 29 function; the original Java-only preview still supports Android 8+.
 It requires an ARM64 Android device, API 29+ (Android 10+), with the GPU capabilities required
 by GPUI Mobile. Remote sessions use the Internet permission, the terminal bell
-vibrates, and agent alerts post notifications; no accessibility, storage, root,
+vibrates, agent alerts post notifications, and dictation asks for the microphone
+on first use ([DICTATION.md](DICTATION.md)); no accessibility, storage, root,
 screen-capture or foreground-service permission is requested.
 
 1. Use an existing SSH account and compatible running Herdr session on the host.
