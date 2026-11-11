@@ -373,8 +373,8 @@ mod tests {
         assert_eq!(link(&rows, 1, 3), Some(url));
         assert_eq!(link(&rows, 1, 17), None);
         assert_eq!(
-            link_at(&rows, 1, 0).unwrap().spans,
-            vec![(0, 5..25), (1, 0..15)]
+            link_at(&rows, 1, 0).map(|found| found.spans),
+            Some(vec![(0, 5..25), (1, 0..15)])
         );
     }
 
