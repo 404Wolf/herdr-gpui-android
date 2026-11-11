@@ -45,11 +45,12 @@ macro_rules! __bind_gpui {
                 marked: String,
                 host_input: bool,
                 /// Opens a tapped link; without one, links are plain text.
-                link_handler: Option<std::rc::Rc<dyn Fn(String)>>,
+                link_handler: Option<std::rc::Rc<dyn Fn($crate::links::Link)>>,
                 /// Where the finger went down, while it may still be a tap.
                 press: Option<Point<Pixels>>,
-                /// The link under that finger: its row, columns and target.
-                pressed_link: Option<(Line, Range<usize>, String)>,
+                /// The link under that finger: the columns it covers on each row
+                /// (several when wrapped) and its target.
+                pressed_link: Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)>,
                 _poll: Task<()>,
             }
 
@@ -122,12 +123,13 @@ macro_rules! __bind_gpui {
                 pub fn set_host_input(&mut self, host_input: bool) {
                     self.host_input = host_input;
                 }
-                /// Tapping a link (OSC 8, or a plain http(s) URL in the text) calls `handler`.
-                pub fn set_link_handler(&mut self, handler: impl Fn(String) + 'static) {
+                /// Tapping a link (OSC 8, an http(s) URL or a file path in the text,
+                /// wrapped or not) calls `handler`.
+                pub fn set_link_handler(&mut self, handler: impl Fn($crate::links::Link) + 'static) {
                     self.link_handler = Some(std::rc::Rc::new(handler));
                 }
-                /// The link at `pos` on screen, with its columns.
-                fn link_at(&self, pos: Pos) -> Option<(Line, Range<usize>, String)> {
+                /// The link at `pos` on screen, with the columns it covers per row.
+                fn link_at(&self, pos: Pos) -> Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)> {
                     let grid = self.session.grid().lock();
                     let line = pos.row;
                     let columns = grid.columns();
@@ -141,14 +143,32 @@ macro_rules! __bind_gpui {
                         while end < columns && grid.cell_hyperlink_id(line, Column(end)) == id {
                             end += 1;
                         }
-                        return Some((line, start..end, link.uri().to_owned()));
+                        let link = $crate::links::Link::from_uri(link.uri())?;
+                        return Some((vec![(line, start..end)], link));
                     }
-                    let text: Vec<char> = (0..columns)
-                        .map(|col| grid.grid[line][Column(col)].c())
-                        .map(|c| if c == '\0' { ' ' } else { c })
+                    // The tapped row and the rows a wrapped link could span.
+                    const AROUND: i32 = 12;
+                    let top = Line(-(grid.history_size() as i32)).max(line - AROUND);
+                    let bottom = Line(grid.screen_lines() as i32 - 1).min(line + AROUND);
+                    let rows: Vec<$crate::links::Row> = (top.0..=bottom.0)
+                        .map(|row| {
+                            let cells = &grid.grid[Line(row)];
+                            $crate::links::Row {
+                                chars: (0..columns)
+                                    .map(|col| cells[Column(col)].c())
+                                    .map(|c| if c == '\0' { ' ' } else { c })
+                                    .collect(),
+                                wrapped: columns > 0 && cells[Column(columns - 1)].wrapline(),
+                            }
+                        })
                         .collect();
-                    let (range, url) = $crate::links::url_at(&text, pos.col.0)?;
-                    Some((line, range, url))
+                    let found = $crate::links::link_at(&rows, (line.0 - top.0) as usize, pos.col.0)?;
+                    let spans = found
+                        .spans
+                        .into_iter()
+                        .map(|(row, columns)| (Line(top.0 + row as i32), columns))
+                        .collect();
+                    Some((spans, found.link))
                 }
                 fn cancel_press(&mut self) -> bool {
                     self.press = None;
@@ -317,9 +337,8 @@ macro_rules! __bind_gpui {
                                     rgb_color(bg),
                                 ));
                             }
-                            if let Some((line, range, _)) = &self.pressed_link
-                                && *line == pos.row
-                                && range.contains(&col)
+                            if let Some((spans, _)) = &self.pressed_link
+                                && spans.iter().any(|(line, range)| *line == pos.row && range.contains(&col))
                             {
                                 // Pressed link: a soft wash and a rule under it.
                                 let mut wash = rgb_color(theme.foreground);
@@ -511,7 +530,7 @@ macro_rules! __bind_gpui {
                             cx.listener(|this, _, _, cx| {
                                 this.selecting = false;
                                 this.press = None;
-                                if let Some((_, _, url)) = this.pressed_link.take() {
+                                if let Some((_, url)) = this.pressed_link.take() {
                                     // A tap on a link opens it and selects nothing.
                                     this.session.grid().lock().selection = None;
                                     if let Some(handler) = this.link_handler.clone() {

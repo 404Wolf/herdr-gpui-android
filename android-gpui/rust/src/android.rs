@@ -343,6 +343,41 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
     .is_ok()
 }
 
+/// Shows a file named in the terminal (a tapped path or OSC 8 `file://`) in
+/// the file view. Java reads it from the terminal's machine with `file.read`;
+/// nothing on the phone is opened. `line` is 0 when none was written.
+pub(crate) fn open_file(generation: i64, path: &str, line: Option<u32>) -> bool {
+    let state = model::mailbox().state();
+    if state.generation != generation || !state.active {
+        return false;
+    }
+    if path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
+        return false;
+    }
+    let line = line.and_then(|l| i32::try_from(l).ok()).unwrap_or(0);
+    gpui_mobile::android::jni::with_env(|env| {
+        let activity = gpui_mobile::android::jni::activity(env)?;
+        let name = jni_mobile::strings::JNIString::from("gpuiOpenFile");
+        let signature =
+            jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;I)V")
+                .map_err(|e| e.to_string())?;
+        let value = env.new_string(path).map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            name,
+            signature.method_signature(),
+            &[
+                jni_mobile::objects::JValue::Long(generation),
+                jni_mobile::objects::JValue::Object(&value),
+                jni_mobile::objects::JValue::Int(line),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .is_ok()
+}
+
 pub(crate) fn close_activity(generation: i64) -> bool {
     if model::mailbox().state().generation != generation {
         return false;
