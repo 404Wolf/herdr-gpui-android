@@ -118,6 +118,14 @@ final class GpuiTerminalProtocol {
                 .put("type", shortcut.isText() ? "text" : "keys").toString();
     }
 
+    /**
+     * A shortcut that is exactly Enter. The bar pins its own Enter at the end,
+     * so a configured one would be a duplicate key in the row.
+     */
+    static boolean isPlainEnter(Shortcut shortcut) {
+        return !shortcut.isText() && shortcut.getKeys().size() == 1 && "enter".equals(shortcut.getKeys().get(0));
+    }
+
     /** A composed message: one bracketed paste and Enter, in one input slot. */
     static String composeCommand(String text) throws JSONException {
         Shortcut.validateText(text);

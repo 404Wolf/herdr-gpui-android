@@ -880,8 +880,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         keycaps.add(controlButton);
         for (Shortcut shortcut : shortcuts) {
             // Enter has its own place at the end of the bar.
-            if (!shortcut.isText() && shortcut.getKeys().size() == 1
-                    && "enter".equals(shortcut.getKeys().get(0))) continue;
+            if (GpuiTerminalProtocol.isPlainEnter(shortcut)) continue;
             Button button = keycap(shortcut.getLabel());
             button.setOnClickListener(view -> sendShortcut(shortcut));
             synchronousTouch(button);
