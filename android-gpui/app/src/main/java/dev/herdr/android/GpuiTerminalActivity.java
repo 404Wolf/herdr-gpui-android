@@ -227,6 +227,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         getWindow().getDecorView().setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         outbox = OutboxCourier.shared(this);
         outbox.listen(outboxChanged);
+        snapshots = PaneSnapshots.shared(this);
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         if (launch == null) {
@@ -1823,7 +1824,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             connection = next;
             currentHostId = host.id;
             lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
-            if (next.resumed) {
+            // A saved pane on screen stays, like a resumed frame, until this one paints.
+            if (next.resumed || host.id.equals(savedShownHost)) {
                 nativeHold(next.generation);
                 if (imeSession > 0) nativeSetImeSession(next.generation, imeSession);
             } else nativeSetActive(next.generation, false);
@@ -1985,6 +1987,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private final PendingInput pendingInput = new PendingInput();
     /** Composer messages not yet delivered, on disk; shared by every terminal activity. */
     private OutboxCourier outbox;
+    /** Each pane's last grid on disk, drawn when the terminal opens with no link. */
+    private PaneSnapshots snapshots;
+    /** The computer whose saved pane is on screen (until its live pane attaches), and when it was saved. */
+    private String savedShownHost;
+    private long savedShownAt;
+    /** The terminal has been on screen before (later resumes reopen the pane last shown). */
+    private boolean openedOnce;
     /** One reconnect at a time. Main thread. */
     private boolean reconnectRunning;
     /** The session a reconnect is opening; closed if the terminal leaves the screen first. */
@@ -4177,6 +4186,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         super.onResume();
         if (isFinishing() || launch == null || shortcutJson == null || !hostStarted) return;
         hostResumed = true;
+        boolean firstOpen = !openedOnce;
+        openedOnce = true;
         nativeResumed();
         if (monitor == null && !launch.shell) {
             monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown);
@@ -4200,6 +4211,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     // switcher) closed the session; this terminal used to give
                     // up and close. Reconnect to the same host and pane instead.
                     if (currentHostId != null) {
+                        // Opened with no session (Home offline): this launch's pane is the one to
+                        // show and to land on; later, the pane last shown.
+                        if (firstOpen && launch.paneId != null && !launch.paneId.isEmpty()) {
+                            rememberHostPane(currentHostId, launch.paneId);
+                        }
+                        showSaved(currentHostId, rememberedHostPane(currentHostId));
                         main.post(this::reconnectCurrentHost);
                         return;
                     }
@@ -5183,6 +5200,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         } else failed.close();
     }
 
+    /**
+     * Draws {@code pane}'s saved grid, dimmed and scrollable, while there is no
+     * live pane: the terminal opened with no link, or came back to the screen
+     * before reconnecting. The live pane replaces it as soon as it attaches.
+     */
+    private void showSaved(String host, String pane) {
+        if (snapshots == null || host == null || pane == null || pane.isEmpty()) return;
+        snapshots.open(host, pane, shown -> main.post(() -> {
+            synchronized (stateLock) {
+                Connection now = connection;
+                if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
+                long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
+                nativeHold(generation);
+                nativeAttachShell(generation, shown.renderId);
+                savedShownHost = host;
+                savedShownAt = shown.savedAt;
+            }
+            showLinkDown();
+        }));
+    }
+
     /** A Herdr session on a saved host: the pane outlives the link, so it can be resumed. */
     private boolean resumable(Connection failed) {
         return failed.remoteHandle > 0 && !shellMode() && currentHostId != null && monitor != null;
@@ -5230,6 +5268,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (host != null && !host.isEmpty()) text.append(" to ").append(host);
         text.append('…');
         if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
+        if (savedShownAt > 0) {
+            text.append(" · showing ").append(android.text.format.DateFormat.getTimeFormat(this)
+                    .format(new java.util.Date(savedShownAt)));
+        }
         linkStatus = text.toString();
         crumb.setVisibility(View.VISIBLE);
         crumb.setTextColor(chrome.warning);
@@ -5239,6 +5281,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** The link is back: the crumb returns to where this window is. Main thread. */
     private void showLinkUp() {
+        savedShownHost = null;
+        savedShownAt = 0;
         if (monitor != null) monitor.succeeded();
         if (linkStatus == null) return;
         linkStatus = null;
@@ -5429,13 +5473,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             closed = true;
             if (client != null) client.cancel();
             else if (shell) closeShell();
-            else RemoteNative.close(remoteHandle);
+            else closeRemote();
         }
         void close() {
             closed = true;
             if (client != null) client.close();
             else if (shell) closeShell();
-            else RemoteNative.close(remoteHandle);
+            else closeRemote();
+        }
+        private final java.util.concurrent.atomic.AtomicBoolean remoteClosed =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        /** Never blocks: the grid is saved on the snapshots' own thread. */
+        private void closeRemote() {
+            RemoteNative.close(remoteHandle);
+            // Its grid, for reading this conversation later with no link.
+            if (remoteHandle > 0 && hostId != null && remoteClosed.compareAndSet(false, true)) {
+                snapshots.saveClosed(hostId, paneId);
+            }
         }
         /** Never blocks, so it is safe under stateLock on the UI thread. */
         private void closeShell() {

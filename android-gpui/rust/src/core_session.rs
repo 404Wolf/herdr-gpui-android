@@ -13,6 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// A render id no session uses yet, for a terminal the UI draws.
+pub(crate) fn next_render_id() -> u64 {
+    NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
+}
 const RENDER_ID_BASE: u64 = 1 << 32;
 static NEXT_RENDER: AtomicU64 = AtomicU64::new(RENDER_ID_BASE);
 
@@ -2577,16 +2581,34 @@ mod connection_tests {
         }
         // The link is gone: the stream ends, the grid stays.
         drop(tx);
-        crate::remote::hold(session.clone());
+        crate::remote::hold(session.clone(), "t9".into());
         let offset = |reply: String| serde_json::from_str::<Value>(&reply).unwrap()["local_offset"].as_u64().unwrap();
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 5);
         assert_eq!(offset(crate::remote::scroll_held(-2, false)), 3);
         assert!(session.screen_text().contains("line"));
         assert_eq!(offset(crate::remote::scroll_held(0, true)), 0);
+        // Saved for its own pane only, then read back as the held frame.
+        let path = std::env::temp_dir().join(format!("herdr-held-{}.snap", std::process::id()));
+        let path = path.to_str().unwrap();
+        assert!(!crate::remote::save_closed("t1", path).unwrap());
+        crate::remote::closed_for_test(session.clone(), "t9");
+        assert!(!crate::remote::save_closed("t1", path).unwrap());
+        assert!(crate::remote::save_closed("t9", path).unwrap());
+        let id = crate::remote::open_saved(path).unwrap();
+        let restored = crate::remote::renderer(id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while restored.is_alive() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(restored.screen_text(), session.screen_text());
+        assert_eq!(offset(crate::remote::scroll_held(4, false)), 4);
+        assert_eq!(session.grid().lock().display_offset(), 0, "the restored copy scrolls, not the old grid");
+        std::fs::remove_file(path).unwrap();
         // A new pane attached: nothing is held, and a scroll is a no-op.
         crate::remote::release_held();
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 0);
-        assert_eq!(session.grid().lock().display_offset(), 0);
+        assert!(crate::remote::renderer(id).is_none());
     }
     #[test]
     fn a_resize_inside_a_synchronized_update_flushes_it_at_the_old_grid_first() {

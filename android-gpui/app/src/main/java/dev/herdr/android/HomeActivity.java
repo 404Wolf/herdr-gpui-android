@@ -1930,6 +1930,19 @@ public final class HomeActivity extends Activity {
                     .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_PANE, agent.id));
             return;
         }
+        if (!opening && (handle <= 0 || !"ready".equals(machine.state))
+                && PaneSnapshots.shared(this).file(machine.host.id, agent.id).isFile()) {
+            // Not reachable, but read before: open its saved conversation; the
+            // terminal connects by itself when it can.
+            try {
+                RemoteHostsActivity.rememberLastSession(this, machine.host, agent.id);
+                GpuiLaunch.launchSaved(this, machine.host, agent.id, FleetPanes.displayTitle(agent));
+            } catch (RuntimeException | LinkageError failed) {
+                note = "The terminal could not be opened";
+                render(true);
+            }
+            return;
+        }
         if (opening || handle <= 0 || !"ready".equals(machine.state)) {
             note = machine.host.name + " is not connected yet";
             render(true);

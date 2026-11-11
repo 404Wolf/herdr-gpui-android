@@ -39,7 +39,20 @@ public final class GpuiLaunch {
     }
 
     static void launchRemote(Activity activity, SavedRemoteHost host, long handle, String paneId, String title) {
-        if (activity == null || host == null || handle <= 0) throw new IllegalArgumentException("Remote session is required");
+        if (handle <= 0) throw new IllegalArgumentException("Remote session is required");
+        launch(activity, host, handle, paneId, title);
+    }
+
+    /**
+     * Opens {@code paneId} with no session: the terminal draws its saved grid
+     * and connects by itself (it reconnects as after a pause).
+     */
+    static void launchSaved(Activity activity, SavedRemoteHost host, String paneId, String title) {
+        launch(activity, host, 0, paneId, title);
+    }
+
+    private static void launch(Activity activity, SavedRemoteHost host, long handle, String paneId, String title) {
+        if (activity == null || host == null) throw new IllegalArgumentException("Remote host is required");
         RemoteNative.ensureLoaded(activity);
         final Session grant;
         synchronized (GpuiLaunch.class) {

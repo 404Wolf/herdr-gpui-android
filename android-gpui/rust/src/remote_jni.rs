@@ -324,6 +324,46 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollHeld(
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_saveClosed(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    pane: JString<'_>,
+    path: JString<'_>,
+) -> jboolean {
+    let Some(pane) = read(&mut env, &pane, 1024) else {
+        return 0;
+    };
+    let Some(path) = read(&mut env, &path, 4096) else {
+        return 0;
+    };
+    match remote::save_closed(&pane, &path) {
+        Ok(saved) => u8::from(saved),
+        Err(error) => {
+            fail(&mut env, &error.to_string());
+            0
+        }
+    }
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_openSaved(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    path: JString<'_>,
+) -> jlong {
+    let Some(path) = read(&mut env, &path, 4096) else {
+        return 0;
+    };
+    match remote::open_saved(&path) {
+        Ok(id) => id as jlong,
+        Err(error) => {
+            fail(&mut env, &error.to_string());
+            0
+        }
+    }
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_deliver(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

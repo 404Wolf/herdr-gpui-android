@@ -34,6 +34,8 @@ pub enum Error {
     /// the call would have done was refused, never half-sent.
     #[error("herdr-core protocol: \"{kind}\": {message}")]
     Rpc { kind: String, message: String },
+    #[error("Saved pane is unreadable")]
+    Snapshot,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -257,6 +259,11 @@ fn session(id: u64) -> Result<Arc<Session>> {
     lock(sessions()).get(&id).cloned().ok_or(Error::Closed)
 }
 pub fn renderer(id: u64) -> Option<Arc<gpui_rio::Session>> {
+    if let Some((cached, terminal)) = lock(cached()).as_ref()
+        && *cached == id
+    {
+        return Some(terminal.clone());
+    }
     for owner in lock(sessions()).values() {
         let state = lock(&owner.state);
         if state.render_id == id {
@@ -339,29 +346,79 @@ pub fn close(id: u64) {
     owner.cancel.cancel();
     // The phone keeps this terminal's last frame on screen while it reconnects
     // (Mailbox::hold): keep its grid too, so the conversation still scrolls.
-    if let Some(terminal) = lock(&owner.state).terminal.take() {
-        hold(terminal);
+    let mut state = lock(&owner.state);
+    if let Some(terminal) = state.terminal.take() {
+        let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+        *lock(closed()) = Some(Held { terminal: terminal.clone(), pane: pane.clone() });
+        hold(terminal, pane);
     }
 }
-pub(crate) fn hold(terminal: Arc<gpui_rio::Session>) {
-    *lock(held()) = Some(terminal);
+/// The last closed session's grid, kept for saving even after a new pane
+/// attaches (the save runs on a worker, maybe after that attach).
+#[cfg(test)]
+pub(crate) fn closed_for_test(terminal: Arc<gpui_rio::Session>, pane: &str) {
+    *lock(closed()) = Some(Held { terminal, pane: pane.into() });
 }
-/// The terminal of the last closed session, which the held frame draws.
-fn held() -> &'static Mutex<Option<Arc<gpui_rio::Session>>> {
-    static HELD: OnceLock<Mutex<Option<Arc<gpui_rio::Session>>>> = OnceLock::new();
+fn closed() -> &'static Mutex<Option<Held>> {
+    static CLOSED: OnceLock<Mutex<Option<Held>>> = OnceLock::new();
+    CLOSED.get_or_init(Mutex::default)
+}
+pub(crate) fn hold(terminal: Arc<gpui_rio::Session>, pane: String) {
+    *lock(held()) = Some(Held { terminal, pane });
+}
+/// The grid the held frame draws, and the pane it showed.
+struct Held {
+    terminal: Arc<gpui_rio::Session>,
+    pane: String,
+}
+/// The terminal of the last closed session (or a saved pane read back), which
+/// the held frame draws.
+fn held() -> &'static Mutex<Option<Held>> {
+    static HELD: OnceLock<Mutex<Option<Held>>> = OnceLock::new();
     HELD.get_or_init(Mutex::default)
 }
-/// A new pane attached: its live grid is the one to scroll now.
+/// A saved pane being drawn with no session: its render id and terminal.
+type Cached = Option<(u64, Arc<gpui_rio::Session>)>;
+fn cached() -> &'static Mutex<Cached> {
+    static CACHED: OnceLock<Mutex<Cached>> = OnceLock::new();
+    CACHED.get_or_init(Mutex::default)
+}
+/// A new pane attached: its live grid is the one to scroll and draw now.
 pub(crate) fn release_held() {
     lock(held()).take();
+    lock(cached()).take();
+}
+/// Saves the last closed session's grid to `path` when it was `pane`'s: the
+/// phone's copy of that conversation, for reading it later with no link. False
+/// when another pane (or nothing) was closed last. Disk work: never on the UI thread.
+pub fn save_closed(pane: &str, path: &str) -> Result<bool> {
+    let terminal = match lock(closed()).as_ref() {
+        Some(held) if !pane.is_empty() && held.pane == pane => held.terminal.clone(),
+        _ => return Ok(false),
+    };
+    let grid = terminal.grid().lock();
+    crate::snapshot::save(&grid, pane, std::path::Path::new(path))?;
+    Ok(true)
+}
+/// Reads a saved pane from `path` and makes it the held frame, drawn under a
+/// new render id (returned) until a live pane attaches. It scrolls like any
+/// held frame. Disk work: never on the UI thread.
+pub fn open_saved(path: &str) -> Result<u64> {
+    let saved = crate::snapshot::load(std::path::Path::new(path))?;
+    let pane = saved.pane.clone();
+    let terminal = crate::snapshot::restore(saved)?;
+    let id = crate::core_session::next_render_id();
+    *lock(cached()) = Some((id, terminal.clone()));
+    hold(terminal, pane);
+    Ok(id)
 }
 /// Scrolls the held frame's own history, with no link: `delta` rows back
 /// (positive) or forward, or back to the newest line when `latest`. Never sends
 /// anything, so even a program that takes wheel input is scrolled locally.
 /// `{"local_offset": rows back from the newest}`; 0 when nothing is held.
 pub fn scroll_held(delta: i64, latest: bool) -> String {
-    let offset = lock(held()).as_ref().map_or(0, |terminal| {
-        let mut grid = terminal.grid().lock();
+    let offset = lock(held()).as_ref().map_or(0, |held| {
+        let mut grid = held.terminal.grid().lock();
         let scroll = if latest {
             rio_vt::crosswords::grid::Scroll::Bottom
         } else {
@@ -392,7 +449,14 @@ pub fn poll_terminal(
     }
     let owner = session(id)?;
     let state = lock(&owner.state);
-    model::mailbox().set_shell(generation, state.render_id);
+    {
+        let mut mailbox = model::mailbox();
+        // Before its pane attaches, a session draws nothing: a held frame (the
+        // last one, or a saved pane) stays until there is something live.
+        if state.render_id != 0 || !mailbox.state().held {
+            mailbox.set_shell(generation, state.render_id);
+        }
+    }
     // How far the local history is scrolled back, for a "jump to latest" control.
     let local_offset = state
         .terminal

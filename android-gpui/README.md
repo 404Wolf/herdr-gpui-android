@@ -274,7 +274,16 @@ herdr-core's `terminal.send`, once that pane's computer is back. A message
 whose send was cut off is never resent automatically: it may have been typed,
 so it waits for the user to send it again or drop it. Messages for a pane that
 closed, or a core that restarted, are kept and offered back as drafts. Keys
-pressed while reconnecting are held in memory only. A dispatched action may
+pressed while reconnecting are held in memory only.
+
+The conversation stays readable with no link. While a reconnect runs, the last
+frame stays on screen, dimmed, and still scrolls through its own history on
+the phone. Whenever a session closes, the pane's terminal grid (history,
+screen and cursor, up to 4 MB) is saved in the app's no-backup storage, at
+most 16 panes and 32 MB in all. Opening a pane from Home while its computer is
+unreachable, or returning to the terminal before it reconnects, draws that
+saved grid exactly as the program drew it, dimmed, with "showing HH:MM" in
+the status line, until the live pane attaches. A dispatched action may
 already have reached the host when the connection fails. SSH semantic input is
 reported as queued and has no daemon receipt; see the remote guide.
 

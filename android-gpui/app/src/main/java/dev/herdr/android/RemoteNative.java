@@ -50,6 +50,10 @@ final class RemoteNative {
      * closed session's grid), locally; {"local_offset": rows back}.
      */
     static native String scrollHeld(long deltaRows, boolean latest);
+    /** Saves the last closed session's grid to {@code path} if it showed {@code paneId}; worker only. */
+    static native boolean saveClosed(String paneId, String path);
+    /** Reads a saved pane into the held frame; its render id for nativeAttachShell. Worker only. */
+    static native long openSaved(String path);
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);
     static native void close(long handle);

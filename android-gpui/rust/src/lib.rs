@@ -14,6 +14,8 @@ pub mod remote;
 mod remote_jni;
 #[cfg(all(feature = "remote", unix))]
 pub mod shell;
+#[cfg(all(feature = "remote", unix))]
+mod snapshot;
 
 #[cfg(all(feature = "android-ui", target_os = "android"))]
 mod android;
