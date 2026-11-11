@@ -1,0 +1,81 @@
+package dev.herdr.android;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
+import org.junit.Test;
+
+public final class ComposerDraftsTest {
+    @Test
+    public void draftsArePerPane() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        drafts.edit("hello");
+        assertEquals("", drafts.switchTo("b"));
+        drafts.edit("other");
+        assertEquals("hello", drafts.switchTo("a"));
+        assertEquals("other", drafts.switchTo("b"));
+    }
+
+    @Test
+    public void oldestPaneDraftIsDroppedPastTheBound() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        for (int i = 0; i <= ComposerDrafts.MAX_PANES; i++) {
+            drafts.switchTo("p" + i);
+            drafts.edit("t" + i);
+        }
+        assertEquals("", drafts.switchTo("p0"));
+        assertEquals("t1", drafts.switchTo("p1"));
+    }
+
+    @Test
+    public void partialsReplaceTheUtteranceNotAppend() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        drafts.edit("Fix");
+        drafts.dictationStarted();
+        assertTrue(drafts.dictating());
+        assertEquals("Fix the", drafts.dictationPartial("the"));
+        assertEquals("Fix the bug", drafts.dictationPartial("the bug"));
+        assertEquals("Fix the bug now", drafts.dictationFinal(" the bug now "));
+        assertFalse(drafts.dictating());
+        // A second utterance builds on the committed text.
+        drafts.dictationStarted();
+        assertEquals("Fix the bug now please", drafts.dictationPartial("please"));
+    }
+
+    @Test
+    public void abandonedDictationRestoresTheDraft() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        drafts.edit("keep ");
+        drafts.dictationStarted();
+        drafts.dictationPartial("garbage");
+        assertEquals("keep ", drafts.dictationAbandoned());
+    }
+
+    @Test
+    public void switchingPanesEndsTheUtteranceBase() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        drafts.dictationStarted();
+        drafts.switchTo("b");
+        assertFalse(drafts.dictating());
+    }
+
+    @Test
+    public void outgoingTrimsAndClearsOnlyWhenSent() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        assertNull(drafts.outgoing());
+        drafts.edit("  \n");
+        assertNull(drafts.outgoing());
+        drafts.edit("\n two\nlines \n");
+        assertEquals("two\nlines", drafts.outgoing());
+        assertEquals("\n two\nlines \n", drafts.text());
+        drafts.sent();
+        assertEquals("", drafts.text());
+    }
+}

@@ -593,6 +593,11 @@ pub enum Command {
     Submit {
         text: String,
     },
+    /// A composed message: one bracketed paste (when the program enabled
+    /// it) followed by Enter, in one FIFO slot so nothing can interleave.
+    Compose {
+        text: String,
+    },
 }
 
 impl Command {
@@ -609,6 +614,9 @@ impl Command {
                         .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')) =>
             {
                 Err(Error::InvalidCommand)
+            }
+            Self::Compose { text } if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES => {
+                Err(Error::InvalidText)
             }
             Self::Keys { keys }
                 if keys.is_empty() || keys.len() > 16 || !keys.iter().all(|key| valid_key(key)) =>
@@ -2553,6 +2561,25 @@ mod tests {
         ] {
             assert!(parse_command(bad).is_err(), "accepted {bad}");
         }
+        assert_eq!(
+            parse_command(r#"{"type":"compose","text":"two\nlines"}"#).unwrap(),
+            Command::Compose {
+                text: "two\nlines".into()
+            }
+        );
+        for bad in [
+            r#"{"type":"compose"}"#,
+            r#"{"type":"compose","text":""}"#,
+            r#"{"type":"compose","text":"  \n "}"#,
+            r#"{"type":"compose","text":"x","keys":[]}"#,
+        ] {
+            assert!(parse_command(bad).is_err(), "accepted {bad}");
+        }
+        let long = serde_json::to_string(&Command::Compose {
+            text: "a".repeat(MAX_TEXT_BYTES + 1),
+        })
+        .unwrap();
+        assert!(matches!(parse_command(&long), Err(Error::InvalidText)));
         for invalid in ["", "x\ny", "x\ry", "x\ty", "x\u{2028}y", "x\u{2029}y"] {
             let json = serde_json::to_string(&submit(invalid)).unwrap();
             assert!(matches!(parse_command(&json), Err(Error::InvalidCommand)));
