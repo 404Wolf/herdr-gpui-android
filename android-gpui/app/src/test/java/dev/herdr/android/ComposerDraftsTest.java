@@ -83,4 +83,24 @@ public final class ComposerDraftsTest {
         drafts.sent();
         assertEquals("", drafts.text());
     }
+
+    @Test
+    public void draftsSurviveARestartWithoutHidingWhatWasTypedSince() {
+        ComposerDrafts before = new ComposerDrafts();
+        before.switchTo("a");
+        before.edit("kept\nacross a kill");
+        before.switchTo("b");
+        before.edit("old b");
+        ComposerDrafts after = new ComposerDrafts();
+        after.switchTo("b");
+        after.edit("typed before the restore");
+        after.restore(before.encode());
+        assertEquals("typed before the restore", after.text());
+        after.switchTo("a");
+        assertEquals("kept\nacross a kill", after.text());
+        ComposerDrafts damaged = new ComposerDrafts();
+        damaged.restore("{not json");
+        damaged.switchTo("a");
+        assertEquals("", damaged.text());
+    }
 }

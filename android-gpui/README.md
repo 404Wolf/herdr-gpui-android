@@ -267,8 +267,14 @@ For the optional HTTPS workflow, open **Companion hosts** and use the
 [companion setup](../android/README.md#host-prerequisites), then tap **GPUI** from
 an existing terminal. That workflow still requires trusted HTTPS and a token.
 
-Closing or backgrounding this activity does not stop remote terminals. Pending
-input is discarded and never automatically replayed. A dispatched action may
+Closing or backgrounding this activity does not stop remote terminals. A
+composer message sent while the link is down waits in an on-device outbox
+(it survives the app being closed or killed) and goes out in order, through
+herdr-core's `terminal.send`, once that pane's computer is back. A message
+whose send was cut off is never resent automatically: it may have been typed,
+so it waits for the user to send it again or drop it. Messages for a pane that
+closed, or a core that restarted, are kept and offered back as drafts. Keys
+pressed while reconnecting are held in memory only. A dispatched action may
 already have reached the host when the connection fails. SSH semantic input is
 reported as queued and has no daemon receipt; see the remote guide.
 

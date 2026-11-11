@@ -30,6 +30,10 @@ pub enum Error {
     StaleTarget,
     #[error("herdr-core protocol: {0}")]
     Protocol(String),
+    /// The core answered an RPC with an error: a definite reply, so whatever
+    /// the call would have done was refused, never half-sent.
+    #[error("herdr-core protocol: \"{kind}\": {message}")]
+    Rpc { kind: String, message: String },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -436,6 +440,37 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
         .map_err(|_| Error::Capacity)?;
     rx.recv_timeout(Duration::from_secs(20))
         .map_err(|_| Error::Closed)?
+}
+/// Sends one outbox message with `terminal.send`, which pastes it and presses
+/// Enter, refusing a program that waits on a dialog. Blocks the caller (the
+/// outbox's own thread) until the core answers. `{"outcome": ..}` is `sent`,
+/// `blocked`, `gone`, `unsure` (it may have been typed: never resend it
+/// unasked), or `retry` (it never left the phone: the session was gone or full,
+/// or closed before taking the request).
+pub fn deliver(id: u64, terminal: &str, text: &str) -> Result<String> {
+    let action = json!({"op":"pane.deliver","terminal":terminal,"text":text}).to_string();
+    if crate::core_session::TabEdit::parse(&action).is_none() {
+        return Err(Error::Input(crate::Error::InvalidText));
+    }
+    let retry = || json!({"outcome":"retry"}).to_string();
+    let Ok(owner) = session(id) else {
+        return Ok(retry());
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    if owner.commands.try_send(Operation::Action(action, tx)).is_err() {
+        return Ok(retry());
+    }
+    let wait = crate::core_session::DELIVER_WAIT + Duration::from_secs(15);
+    Ok(match rx.recv_timeout(wait) {
+        Ok(Ok(reply)) => reply,
+        // The connection answered with an error after taking the request.
+        Ok(Err(error)) => json!({"outcome":"unsure","why":error.to_string()}).to_string(),
+        // Taken but unanswered: it may be typing right now.
+        Err(mpsc::RecvTimeoutError::Timeout) => json!({"outcome":"unsure","why":"no answer"}).to_string(),
+        // The worker dropped the request without running it (an action
+        // always replies once it ran), so nothing was sent.
+        Err(mpsc::RecvTimeoutError::Disconnected) => retry(),
+    })
 }
 pub struct UiPaint<'a> {
     pub generation: i64,

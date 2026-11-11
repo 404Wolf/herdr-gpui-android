@@ -41,6 +41,11 @@ final class ComposerBar {
     interface Host {
         /** Queues a mailbox command for the pane on screen; false when it was not queued. */
         boolean queue(String commandJson);
+        /**
+         * Sends a finished draft to the pane on screen: at once when the link
+         * is up, or through the outbox when it is not. False keeps the draft.
+         */
+        boolean send(String text);
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
@@ -57,6 +62,9 @@ final class ComposerBar {
     private static final String PREFS = "terminal-display";
     private static final String KEYS_OPEN = "keys_row_open";
     private static final String MIC_ONLY = "mic_only";
+    /** Every pane's draft, so a closed or killed app finds what was typed. */
+    private static final String DRAFTS = "composer_drafts";
+    private static final long SAVE_DRAFTS_MS = 400;
     private static final int MAX_LINES = 6;
 
     private final Context context;
@@ -99,6 +107,7 @@ final class ComposerBar {
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         keysOpen = preferences.getBoolean(KEYS_OPEN, false);
+        drafts.restore(preferences.getString(DRAFTS, ""));
         micOnly = preferences.getBoolean(MIC_ONLY, false);
         keysRow = new FrameLayout(context);
         field = createField();
@@ -182,6 +191,25 @@ final class ComposerBar {
 
     void destroy() {
         dictation.cancel();
+        persist();
+    }
+
+    /** Saves the drafts now (the activity is stopping: the process may be killed next). */
+    void persist() {
+        field.removeCallbacks(saveDrafts);
+        saveDrafts.run();
+    }
+
+    private final Runnable saveDrafts = this::saveDrafts;
+
+    private void saveDrafts() {
+        preferences.edit().putString(DRAFTS, drafts.encode()).apply();
+    }
+
+    /** Typing saves at most a few times a second; apply() writes off the main thread. */
+    private void saveDraftsSoon() {
+        field.removeCallbacks(saveDrafts);
+        field.postDelayed(saveDrafts, SAVE_DRAFTS_MS);
     }
 
     private void setMicOnly(boolean on) {
@@ -294,6 +322,7 @@ final class ComposerBar {
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
             @Override public void afterTextChanged(Editable s) {
                 if (!updatingField) drafts.edit(s.toString());
+                saveDraftsSoon();
             }
         });
         edit.setVisibility(View.GONE);
@@ -432,20 +461,14 @@ final class ComposerBar {
             host.enterKey();
             return;
         }
-        String command;
-        try {
-            command = GpuiTerminalProtocol.composeCommand(outgoing);
-        } catch (org.json.JSONException | IllegalArgumentException invalid) {
-            host.notice("Message is too long to send in one piece");
-            return;
-        }
-        // The draft stays until the input is queued, so a full queue loses nothing.
-        if (!host.queue(command)) return;
+        // The draft stays until the message is queued or kept, so nothing is lost.
+        if (!host.send(outgoing)) return;
         drafts.sent();
         showText("");
     }
 
     private void showText(String text) {
+        saveDraftsSoon();
         if (!field.getText().toString().equals(text)) {
             updatingField = true;
             try {

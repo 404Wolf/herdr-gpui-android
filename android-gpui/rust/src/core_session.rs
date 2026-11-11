@@ -218,6 +218,9 @@ impl Connection<'_> {
         }
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_within(method, params, Duration::from_secs(15))
+    }
+    fn call_within(&mut self, method: &str, params: Value, wait: Duration) -> Result<Value> {
         self.serial += 1;
         let id = self.serial;
         write_frame(
@@ -226,7 +229,7 @@ impl Connection<'_> {
             0,
             &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?,
         )?;
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
             let Some(frame) = self.read()? else { continue };
             if frame.channel == 0 && frame.kind == 0 {
@@ -235,10 +238,10 @@ impl Connection<'_> {
                     return Err(Error::Protocol("uncorrelated RPC reply".into()));
                 }
                 if let Some(error) = reply.get("error") {
-                    return Err(Error::Protocol(format!(
-                        "{}: {}",
-                        error["data"]["kind"], error["message"]
-                    )));
+                    return Err(Error::Rpc {
+                        kind: error["data"]["kind"].as_str().unwrap_or("").into(),
+                        message: error["message"].as_str().unwrap_or("").into(),
+                    });
                 }
                 return reply
                     .get("result")
@@ -386,9 +389,19 @@ impl Connection<'_> {
                     // and the phone says so instead of typing into its dialog.
                     return Ok(match self.call("terminal.send", json!({"terminal":terminal,"text":text})) {
                         Ok(_) => json!({"queued":true,"terminal":terminal}),
-                        Err(error) => send_refusal(&error.to_string()),
+                        Err(error) => send_refusal(&error),
                     }
                     .to_string());
+                }
+                Some(TabEdit::Deliver { terminal, text }) => {
+                    // The outbox's send: never forced, and the reply says
+                    // whether the text was typed, refused, or cannot be known.
+                    let sent = self.call_within(
+                        "terminal.send",
+                        json!({"terminal":terminal,"text":text}),
+                        DELIVER_WAIT,
+                    );
+                    return Ok(delivery(&sent).to_string());
                 }
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
                 None => return Err(Error::StaleTarget),
@@ -580,7 +593,7 @@ impl Connection<'_> {
                 json!({"name":"herdr-app","value":value,"version":doc["version"]}),
             ) {
                 Ok(_) => return self.refresh(),
-                Err(Error::Protocol(message)) if message.contains("conflict") => continue,
+                Err(Error::Rpc { kind, .. }) if kind == "conflict" => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -712,7 +725,8 @@ impl Connection<'_> {
             TabEdit::GitLook { .. }
             | TabEdit::FileRead { .. }
             | TabEdit::SpaceOpen { .. }
-            | TabEdit::Send { .. } => {
+            | TabEdit::Send { .. }
+            | TabEdit::Deliver { .. } => {
                 Err(Error::StaleTarget)
             }
             TabEdit::ToSpace { space, tab, to } => {
@@ -886,10 +900,16 @@ pub(crate) enum TabEdit {
     FileRead { terminal: String, path: String },
     SpaceOpen { folder: String },
     Send { terminal: String, text: String },
+    /// An outbox message: like `Send`, but a composer's draft, so it may hold
+    /// line breaks and tabs and be as long as one compose command.
+    Deliver { terminal: String, text: String },
 }
+/// A JSON edit's bound: an outbox message is up to one compose command's text,
+/// and JSON escaping at most doubles the line breaks and tabs it may hold.
+pub(crate) const MAX_ACTION: usize = 2 * crate::model::MAX_TEXT_BYTES + 1024;
 impl TabEdit {
     pub(crate) fn parse(action: &str) -> Option<Self> {
-        if !action.starts_with('{') || action.len() > 32 * 1024 {
+        if !action.starts_with('{') || action.len() > MAX_ACTION {
             return None;
         }
         let value: Value = serde_json::from_str(action).ok()?;
@@ -955,6 +975,17 @@ impl TabEdit {
                     .filter(|t| !t.trim().is_empty() && t.chars().count() <= 1000 && !t.chars().any(char::is_control))
                     .map(str::to_owned)?,
             },
+            "pane.deliver" => Self::Deliver {
+                terminal: id("terminal")?,
+                text: value["text"]
+                    .as_str()
+                    .filter(|t| {
+                        !t.trim().is_empty()
+                            && t.len() <= crate::model::MAX_TEXT_BYTES
+                            && !t.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+                    })
+                    .map(str::to_owned)?,
+            },
             _ => return None,
         })
     }
@@ -976,11 +1007,29 @@ fn add_space(doc: &mut Value, entry: &Value) -> Result<()> {
 }
 /// What the phone hears when terminal.send fails: `refused: "blocked"` (code
 /// 9, as hc exits) when the program waits on its own question, else the error.
-fn send_refusal(error: &str) -> Value {
-    if error.contains("\"blocked\"") || error.ends_with(": blocked") {
-        json!({"queued":false,"refused":"blocked","code":9})
-    } else {
-        json!({"queued":false,"error":error})
+fn send_refusal(error: &Error) -> Value {
+    match error {
+        Error::Rpc { kind, .. } if kind == "blocked" => {
+            json!({"queued":false,"refused":"blocked","code":9})
+        }
+        _ => json!({"queued":false,"error":error.to_string()}),
+    }
+}
+/// How long the outbox's `terminal.send` may take: the core waits for a
+/// starting agent to settle, for a person to pause typing, then for the turn
+/// to start, each a few seconds.
+pub(crate) const DELIVER_WAIT: Duration = Duration::from_secs(60);
+/// What an outbox send did, as `{"outcome": ..}`:
+/// `sent` (the core typed it), `blocked` (refused: the program waits on a
+/// dialog, nothing typed), `gone` (no such terminal, nothing typed), or
+/// `unsure` (anything else: the text may have been typed, so it must never be
+/// sent again without the user's word).
+fn delivery(sent: &Result<Value>) -> Value {
+    match sent {
+        Ok(_) => json!({"outcome":"sent"}),
+        Err(Error::Rpc { kind, .. }) if kind == "blocked" => json!({"outcome":"blocked"}),
+        Err(Error::Rpc { kind, .. }) if kind == "not_found" => json!({"outcome":"gone"}),
+        Err(error) => json!({"outcome":"unsure","why":error.to_string()}),
     }
 }
 /// The phone's git look, one `sh -c` over the folders it shows (see git_look).
@@ -1412,14 +1461,16 @@ fn serve(
                 // herdr-core refused (the window closed, an agent restarted
                 // under a new id): stay on the window that was showing and
                 // refresh, instead of ending the session.
-                Err(Error::Protocol(reason)) => {
+                Err(reason @ (Error::Protocol(_) | Error::Rpc { .. })) => {
                     #[cfg(feature = "android-ui")]
                     log::warn!("switch {terminal} refused: {reason}");
                     #[cfg(not(feature = "android-ui"))]
                     let _ = reason;
                     connection.refresh()?;
                     if !previous.is_empty() && previous != terminal {
-                        if let Err(Error::Protocol(_)) = connection.attach(&previous, cols, rows) {
+                        if let Err(Error::Protocol(_) | Error::Rpc { .. }) =
+                            connection.attach(&previous, cols, rows)
+                        {
                             connection.refresh()?;
                         }
                     }
@@ -1686,7 +1737,7 @@ mod tests {
         assert_eq!(deacon_dir("/a/.herdr/deacon\n/b\n"), None);
         assert_eq!(deacon_dir(""), None);
     }
-    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, existing_at, initial_grid, resize_frame, send_refusal};
+    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, delivery, existing_at, initial_grid, resize_frame, send_refusal};
     #[test]
     fn the_attach_replys_grid_is_used_only_when_negotiated() {
         let reply = json!({"channel":3,"resize_notifications":true,"terminal":{"cols":174,"rows":69}});
@@ -1711,15 +1762,43 @@ mod tests {
     }
     #[test]
     fn a_send_to_a_blocked_program_is_refused_never_forced() {
-        // call() reports an RPC error as "<data.kind>: <message>".
-        let refused = send_refusal("protocol error: \"blocked\": \"blocked\"");
+        let rpc = |kind: &str| Error::Rpc { kind: kind.into(), message: format!("t3 is {kind}") };
+        let refused = send_refusal(&rpc("blocked"));
         assert_eq!(refused["queued"], false);
         assert_eq!(refused["refused"], "blocked");
         assert_eq!(refused["code"], 9);
-        let other = send_refusal("protocol error: \"not_found\": \"not_found\"");
+        let other = send_refusal(&rpc("not_found"));
         assert_eq!(other["queued"], false);
         assert!(other["refused"].is_null());
         assert!(other["error"].as_str().is_some_and(|e| e.contains("not_found")));
+    }
+    #[test]
+    fn an_outbox_send_says_whether_it_was_typed() {
+        let rpc = |kind: &str| Err(Error::Rpc { kind: kind.into(), message: "m".into() });
+        assert_eq!(delivery(&Ok(json!({"turn":3})))["outcome"], "sent");
+        assert_eq!(delivery(&rpc("blocked"))["outcome"], "blocked");
+        assert_eq!(delivery(&rpc("not_found"))["outcome"], "gone");
+        // A core that may have typed before failing (its save timed out).
+        assert_eq!(delivery(&rpc("unavailable"))["outcome"], "unsure");
+        // The link failed or the reply never came: it may have been typed.
+        assert_eq!(delivery(&Err(Error::Closed))["outcome"], "unsure");
+        assert_eq!(delivery(&Err(Error::Protocol("terminal.send timed out".into())))["outcome"], "unsure");
+    }
+    #[test]
+    fn outbox_messages_keep_line_breaks_but_no_other_controls() {
+        let parse = |text: &str| {
+            TabEdit::parse(&json!({"op":"pane.deliver","terminal":"t3","text":text}).to_string())
+        };
+        assert_eq!(
+            parse("first line\n\tsecond"),
+            Some(TabEdit::Deliver { terminal: "t3".into(), text: "first line\n\tsecond".into() })
+        );
+        assert_eq!(parse("a\u{1b}[2J"), None);
+        assert_eq!(parse("ok\r"), None);
+        assert_eq!(parse(" \n "), None);
+        let longest = "é\n".repeat(crate::model::MAX_TEXT_BYTES / 3);
+        assert!(parse(&longest).is_some());
+        assert_eq!(parse(&"x".repeat(crate::model::MAX_TEXT_BYTES + 1)), None);
     }
     #[test]
     fn reopening_a_worktree_finds_the_space_already_there() {
@@ -2360,6 +2439,35 @@ mod connection_tests {
     fn exec_ok(path: &str) -> Value {
         use base64::Engine;
         json!({"code":0,"stdout":base64::engine::general_purpose::STANDARD.encode(format!("{path}\n")),"truncated":false})
+    }
+
+    #[test]
+    fn a_layout_edit_retries_when_the_core_reports_a_version_conflict() {
+        let action = r#"{"op":"tab.rename","space":"s1","tab":"a","name":"Bee"}"#;
+        let (result, seen) = action_against(action, |method, _, nth| match method {
+            "doc.get" => Ok(json!({"value":{"spaces":[{"id":"s1","tabs":[{"id":"a","name":"A"}]}]},"version":nth})),
+            "doc.set" if nth == 1 => Err("conflict"),
+            m => Ok(base_answer(m)),
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(seen.iter().filter(|(m, _)| m == "doc.set").count(), 2);
+    }
+
+    #[test]
+    fn an_outbox_message_is_sent_with_terminal_send_and_its_outcome_reported() {
+        let action = r#"{"op":"pane.deliver","terminal":"t3","text":"two\nlines"}"#;
+        let (result, seen) = action_against(action, |method, _, _| Ok(base_answer(method)));
+        assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["outcome"], "sent");
+        let send = seen.iter().find(|(m, _)| m == "terminal.send").unwrap();
+        // Never forced, and the line break survives as one paste.
+        assert_eq!(send.1, json!({"terminal":"t3","text":"two\nlines"}));
+        for (kind, outcome) in [("blocked", "blocked"), ("not_found", "gone"), ("internal", "unsure")] {
+            let (result, _) = action_against(action, move |method, _, _| match method {
+                "terminal.send" => Err(kind),
+                m => Ok(base_answer(m)),
+            });
+            assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["outcome"], outcome);
+        }
     }
 
     #[test]

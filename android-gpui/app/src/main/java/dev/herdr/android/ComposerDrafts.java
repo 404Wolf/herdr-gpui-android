@@ -14,6 +14,8 @@ import java.util.Map;
 final class ComposerDrafts {
     /** Drafts kept for panes not on screen; the oldest is dropped beyond this. */
     static final int MAX_PANES = 32;
+    /** A draft longer than this is not saved (it still lives while the app does). */
+    static final int MAX_SAVED_CHARS = 64 * 1024;
 
     private final Map<String, String> drafts = new LinkedHashMap<String, String>(16, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
@@ -86,6 +88,36 @@ final class ComposerDrafts {
     void sent() {
         drafts.remove(pane);
         dictationBase = null;
+    }
+
+    /** Each pane's draft, oldest first, for saving; at most {@link #MAX_PANES}. */
+    String encode() {
+        org.json.JSONObject out = new org.json.JSONObject();
+        try {
+            for (Map.Entry<String, String> draft : drafts.entrySet()) {
+                if (draft.getValue().length() <= MAX_SAVED_CHARS) out.put(draft.getKey(), draft.getValue());
+            }
+        } catch (org.json.JSONException impossible) {
+            return "{}";
+        }
+        return out.toString();
+    }
+
+    /** Restores what {@link #encode} saved, under drafts already typed since; a damaged value restores nothing. */
+    void restore(String saved) {
+        if (saved == null || saved.isEmpty()) return;
+        Map<String, String> typed = new LinkedHashMap<>(drafts);
+        try {
+            org.json.JSONObject in = new org.json.JSONObject(saved);
+            for (java.util.Iterator<String> keys = in.keys(); keys.hasNext(); ) {
+                String key = keys.next();
+                String text = in.optString(key, "");
+                if (!key.isEmpty() && !text.isEmpty() && text.length() <= MAX_SAVED_CHARS) drafts.put(key, text);
+            }
+        } catch (org.json.JSONException damaged) {
+            return;
+        }
+        drafts.putAll(typed);
     }
 
     static String join(String base, String utterance) {

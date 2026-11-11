@@ -307,10 +307,27 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_sessionAction(
 ) -> jstring {
     // JSON edits (space ids, folders, a git look over many folders) are far
     // longer than the plain action names; TabEdit::parse bounds each field.
-    let Some(action) = read(&mut env, &action, 32 * 1024) else {
+    let Some(action) = read(&mut env, &action, crate::core_session::MAX_ACTION) else {
         return std::ptr::null_mut();
     };
     result_string(&mut env, remote::session_action(handle as u64, &action))
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_deliver(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    terminal: JString<'_>,
+    text: JString<'_>,
+) -> jstring {
+    let Some(terminal) = read(&mut env, &terminal, 1024) else {
+        return std::ptr::null_mut();
+    };
+    let Some(text) = read(&mut env, &text, crate::model::MAX_TEXT_BYTES) else {
+        return std::ptr::null_mut();
+    };
+    result_string(&mut env, remote::deliver(handle as u64, &terminal, &text))
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]

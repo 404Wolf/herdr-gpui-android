@@ -38,6 +38,12 @@ final class RemoteNative {
     static native String focusTab(long handle, String tabId);
     static native String focusWorkspace(long handle, String workspaceId);
     static native String sessionAction(long handle, String action);
+    /**
+     * One outbox message through the core's terminal.send; blocks up to about
+     * a minute, so only the outbox's thread calls it. {"outcome":
+     * sent|blocked|gone|unsure|retry}.
+     */
+    static native String deliver(long handle, String paneId, String text);
     static native String scrollTo(long handle, long offsetFromBottom);
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);

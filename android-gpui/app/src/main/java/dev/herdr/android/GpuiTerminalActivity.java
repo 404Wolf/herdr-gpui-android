@@ -225,6 +225,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!capturable) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         getWindow().getDecorView().setSaveFromParentEnabled(false);
         getWindow().getDecorView().setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+        outbox = OutboxCourier.shared(this);
+        outbox.listen(outboxChanged);
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         if (launch == null) {
@@ -1777,6 +1779,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 next.panes = previous.panes;
             }
             next.resumed = resume;
+            next.hostId = host.id;
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -1946,6 +1949,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private ConnectionMonitor monitor;
     /** Input that never left the phone, sent once the same pane is ready again. Under stateLock. */
     private final PendingInput pendingInput = new PendingInput();
+    /** Composer messages not yet delivered, on disk; shared by every terminal activity. */
+    private OutboxCourier outbox;
     /** One reconnect at a time. Main thread. */
     private boolean reconnectRunning;
     /** The session a reconnect is opening; closed if the terminal leaves the screen first. */
@@ -3825,6 +3830,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return new ComposerBar.Host() {
             @Override public boolean queue(String commandJson) { return queueComposerInput(commandJson); }
 
+            @Override public boolean send(String text) { return sendComposerMessage(text); }
+
             @Override public void enterKey() {
                 queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
             }
@@ -3869,6 +3876,61 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             Toast.makeText(this, "Dictation needs the microphone", Toast.LENGTH_SHORT).show();
         }
     }
+
+    /**
+     * A composer message: typed into the pane at once when the link is up and
+     * nothing of the pane's is still waiting, otherwise kept in the outbox,
+     * which sends it in order when the link returns. False keeps the draft.
+     */
+    private boolean sendComposerMessage(String text) {
+        String host;
+        String pane;
+        boolean live;
+        synchronized (stateLock) {
+            Connection target = connection;
+            host = target == null ? currentHostId : target.hostId;
+            pane = target == null ? "" : target.paneId;
+            live = target != null && target.ready && !target.isClosed();
+        }
+        boolean queueable = host != null && !pane.isEmpty();
+        if (live && !(queueable && outbox.outbox().holds(host, pane))) {
+            String command;
+            try {
+                command = GpuiTerminalProtocol.composeCommand(text);
+            } catch (JSONException | IllegalArgumentException invalid) {
+                Toast.makeText(this, "Message is too long to send in one piece", Toast.LENGTH_SHORT).show();
+                return false;
+            }
+            return queueComposerInput(command);
+        }
+        if (!queueable) {
+            Toast.makeText(this, "Not connected; the draft is kept", Toast.LENGTH_SHORT).show();
+            return false;
+        }
+        if (outbox.add(host, pane, text) == null) {
+            Toast.makeText(this, Outbox.sendable(text) ? "Too many messages wait already; the draft is kept"
+                    : "This message cannot be sent in one piece; the draft is kept", Toast.LENGTH_SHORT).show();
+            return false;
+        }
+        return true;
+    }
+
+    /** Pane ids in a poll's pane list. */
+    private static java.util.Set<String> paneIds(JSONArray panes) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            String id = pane == null ? "" : pane.optString("id", "");
+            if (!id.isEmpty()) ids.add(id);
+        }
+        return ids;
+    }
+
+    /** The outbox changed (any thread): the status line counts what waits. */
+    private final Runnable outboxChanged = () -> main.post(() -> {
+        if (destroyed) return;
+        showLinkDown();
+    });
 
     /** False leaves the composer's draft in place: unlike a key, it is never lost. */
     private boolean queueComposerInput(String commandJson) {
@@ -4078,6 +4140,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     return;
                 }
                 next = new Connection(GENERATIONS.incrementAndGet(), remoteHandle);
+                next.hostId = currentHostId;
             } else next = new Connection(GENERATIONS.incrementAndGet(), new CompanionClient(launch.host.profile));
             connection = next;
             nativeSetActive(next.generation, false);
@@ -4132,6 +4195,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     @Override protected void onStop() {
+        if (composer != null) composer.persist();
         if (foldWatcher != null) {
             foldWatcher.stop();
             foldWatcher = null;
@@ -4142,6 +4206,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
+        if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
         stopHostSampling();
         stopConnection();
@@ -4956,6 +5021,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                 }
                 current.chromePane = pane;
+                if (selected && current.hostId != null) {
+                    outbox.ready(current.hostId, current.remoteHandle, boot, paneIds(current.panes));
+                }
                 final boolean scrolledBack = state.optLong("local_offset", 0) > 0;
                 main.post(() -> showLatest(scrolledBack));
                 current.renderedScroll = state.optLong("rendered_scroll", current.renderedScroll);
@@ -5087,6 +5155,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) {
             host = connection == null ? "" : connection.hostName;
             held = pendingInput.size();
+            String hostId = connection == null ? currentHostId : connection.hostId;
+            if (hostId != null && outbox != null) held += outbox.outbox().waiting(hostId);
         }
         StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
         if (host != null && !host.isEmpty()) text.append(" to ").append(host);
@@ -5241,6 +5311,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         volatile long shellHandle;
         volatile boolean closed;
         String remoteBoot;
+        /** The saved host this session belongs to, for the outbox; null for a companion or shell. */
+        volatile String hostId;
         volatile String paneId = launch.paneId;
         /** A pane switch asked for and not yet confirmed by the daemon, and until when to wait. */
         volatile String pendingPane = "";
