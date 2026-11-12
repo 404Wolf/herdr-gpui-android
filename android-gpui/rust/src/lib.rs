@@ -16,6 +16,8 @@ mod remote_jni;
 pub mod shell;
 #[cfg(all(feature = "remote", unix))]
 mod snapshot;
+#[cfg(all(feature = "remote", unix))]
+mod ghost_bridge;
 
 #[cfg(all(feature = "android-ui", target_os = "android"))]
 mod android;

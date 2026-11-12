@@ -7,6 +7,7 @@
 
 mod adapter;
 mod error;
+pub mod ghost;
 mod keys;
 #[doc(hidden)]
 pub mod links;

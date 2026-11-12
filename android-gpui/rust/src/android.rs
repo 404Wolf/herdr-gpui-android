@@ -343,6 +343,31 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
     .is_ok()
 }
 
+/// Tells Java where the drawn screen is busy (see `gpui_rio::ghost::LayoutHint`),
+/// so it floats its controls clear of the caret, ghost text and dialogs.
+pub(crate) fn layout_hint(generation: i64, json: &str) -> bool {
+    gpui_mobile::android::jni::with_env(|env| {
+        let activity = gpui_mobile::android::jni::activity(env)?;
+        let name = jni_mobile::strings::JNIString::from("gpuiLayoutHint");
+        let signature =
+            jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;)V")
+                .map_err(|e| e.to_string())?;
+        let value = env.new_string(json).map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            name,
+            signature.method_signature(),
+            &[
+                jni_mobile::objects::JValue::Long(generation),
+                jni_mobile::objects::JValue::Object(&value),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .is_ok()
+}
+
 /// Shows a file named in the terminal (a tapped path or OSC 8 `file://`) in
 /// the file view. Java reads it from the terminal's machine with `file.read`;
 /// nothing on the phone is opened. `line` is 0 when none was written.
@@ -523,6 +548,30 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetDisp
             "java/lang/IllegalArgumentException",
             "GPUI display font size must be 0 (auto) or finite 11-36 logical pixels, with a font scale of 0.5-3",
         );
+    }
+}
+
+/// Draws unsent words at the program's caret (JSON, see `ghost_bridge`); an
+/// empty string clears them. Throws on malformed JSON.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetGhost(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    json: JString<'_>,
+) {
+    let Ok(json) = env.get_string(&json).map(String::from) else {
+        return;
+    };
+    if json.is_empty() {
+        crate::ghost_bridge::set(None);
+        return;
+    }
+    match crate::ghost_bridge::parse(&json) {
+        Ok(ghost) => crate::ghost_bridge::set(Some(ghost)),
+        Err(_) => {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", "Invalid ghost text");
+        }
     }
 }
 

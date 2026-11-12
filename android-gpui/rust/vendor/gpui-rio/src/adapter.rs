@@ -51,6 +51,13 @@ macro_rules! __bind_gpui {
                 /// The link under that finger: the columns it covers on each row
                 /// (several when wrapped) and its target.
                 pressed_link: Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)>,
+                /// Unsent words drawn at the program's caret (see `ghost`).
+                ghost: Option<Arc<$crate::ghost::Ghost>>,
+                /// The prompt kind used to read the screen when no ghost is set.
+                prompt_kind: $crate::ghost::PromptKind,
+                /// Told where the screen is busy after each paint that changed it.
+                layout_listener: Option<std::rc::Rc<dyn Fn(&$crate::ghost::LayoutHint)>>,
+                last_hint: Option<$crate::ghost::LayoutHint>,
                 _poll: Task<()>,
             }
 
@@ -101,6 +108,10 @@ macro_rules! __bind_gpui {
                             link_handler: None,
                             press: None,
                             pressed_link: None,
+                            ghost: None,
+                            prompt_kind: $crate::ghost::PromptKind::Other,
+                            layout_listener: None,
+                            last_hint: None,
                             _poll: poll,
                         }
                     })
@@ -129,6 +140,19 @@ macro_rules! __bind_gpui {
                 /// wrapped or not) calls `handler`.
                 pub fn set_link_handler(&mut self, handler: impl Fn($crate::links::Link) + 'static) {
                     self.link_handler = Some(std::rc::Rc::new(handler));
+                }
+                /// Draws `ghost` (or nothing) over the screen from the next frame on.
+                pub fn set_ghost(&mut self, ghost: Option<Arc<$crate::ghost::Ghost>>) {
+                    self.ghost = ghost;
+                }
+                /// Whose prompt to look for when reporting busy cells without a ghost.
+                pub fn set_prompt_kind(&mut self, kind: $crate::ghost::PromptKind) {
+                    self.prompt_kind = kind;
+                }
+                /// Called after a paint whose layout hint differs from the last one.
+                pub fn set_layout_listener(&mut self, listener: impl Fn(&$crate::ghost::LayoutHint) + 'static) {
+                    self.layout_listener = Some(std::rc::Rc::new(listener));
+                    self.last_hint = None;
                 }
                 /// The link at `pos` on screen, with the columns it covers per row.
                 fn link_at(&self, pos: Pos) -> Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)> {
@@ -237,6 +261,82 @@ macro_rules! __bind_gpui {
                     )
                 }
 
+                /// Paints placed ghost runs over the grid on the program's background,
+                /// with a thin caret after the draft when it sits at the prompt.
+                #[allow(clippy::too_many_arguments)]
+                fn paint_ghost(
+                    &self,
+                    ghost: &$crate::ghost::Ghost,
+                    placed: &[$crate::ghost::Placed],
+                    anchor: Option<$crate::ghost::Anchor>,
+                    origin: Point<Pixels>,
+                    font: &Font,
+                    font_size: Pixels,
+                    window: &mut Window,
+                    cx: &mut App,
+                ) {
+                    use $crate::ghost::GhostStyle;
+                    let hex = |color: u32| -> Hsla { rgb(color & 0x00ff_ffff).into() };
+                    let colors = ghost.colors;
+                    let mut caret: Option<Point<Pixels>> = None;
+                    for run in placed {
+                        let len = run.text.chars().count();
+                        if len == 0 {
+                            continue;
+                        }
+                        let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
+                        let width = self.cell.width * len;
+                        window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(colors.background)));
+                        let color = match run.style {
+                            GhostStyle::Text | GhostStyle::Partial => colors.text,
+                            GhostStyle::Echo | GhostStyle::Tag => colors.dim,
+                            GhostStyle::Chip | GhostStyle::Warn => colors.warn,
+                        };
+                        let mut font = font.clone();
+                        if matches!(run.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Echo) {
+                            font.style = FontStyle::Italic;
+                        }
+                        let text_run = TextRun {
+                            len: run.text.len(),
+                            font,
+                            color: hex(color),
+                            background_color: None,
+                            underline: (run.style == GhostStyle::Partial).then_some(UnderlineStyle {
+                                color: Some(hex(colors.dim)),
+                                thickness: px(1.),
+                                wavy: false,
+                            }),
+                            strikethrough: None,
+                        };
+                        let line = window
+                            .text_system()
+                            .shape_line(run.text.clone().into(), font_size, &[text_run], None);
+                        let _ = line.paint(at, self.cell.height, TextAlign::Left, None, window, cx);
+                        if run.style == GhostStyle::Chip {
+                            // An outline marks the words still to come as one thing.
+                            let edge = px(1.);
+                            let box_bounds = Bounds::new(at + point(px(0.), px(1.)), size(width, self.cell.height - px(2.)));
+                            for side in [
+                                Bounds::new(box_bounds.origin, size(width, edge)),
+                                Bounds::new(box_bounds.bottom_left() - point(px(0.), edge), size(width, edge)),
+                                Bounds::new(box_bounds.origin, size(edge, box_bounds.size.height)),
+                                Bounds::new(box_bounds.top_right() - point(edge, px(0.)), size(edge, box_bounds.size.height)),
+                            ] {
+                                window.paint_quad(fill(side, hex(colors.warn)));
+                            }
+                        }
+                        if anchor.is_some()
+                            && matches!(run.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip)
+                            && anchor.is_some_and(|a| run.row >= a.row)
+                        {
+                            caret = Some(at + point(width, px(0.)));
+                        }
+                    }
+                    if let Some(at) = caret {
+                        window.paint_quad(fill(Bounds::new(at, size(px(1.5), self.cell.height)), hex(colors.text)));
+                    }
+                }
+
                 fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
                     self.bounds = bounds;
                     let font_size = px(if self.style.font_size.is_finite() {
@@ -299,10 +399,16 @@ macro_rules! __bind_gpui {
                     self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
+                    // The rows as drawn, for finding the program's prompt.
+                    let mut screen: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
                     for row in 0..rows {
                         for col in 0..cols {
                             let pos = Pos::new(Line(row as i32 + row_off - offset), Column(col + col_off));
                             let square = grid.grid[pos];
+                            screen[row][col] = match square.c() {
+                                '\0' => ' ',
+                                c => c,
+                            };
                             if square.wide() == Wide::Spacer {
                                 continue;
                             }
@@ -416,6 +522,45 @@ macro_rules! __bind_gpui {
                     }
                     grid.reset_damage();
                     drop(grid);
+                    // The caret as drawn, only while visible and the view is at the bottom.
+                    let caret = (cursor.content != CursorShape::Hidden && offset == 0)
+                        .then(|| {
+                            let row = cursor.pos.row.0 - row_off;
+                            let col = cursor.pos.col.0.checked_sub(col_off)?;
+                            (row >= 0 && (row as usize) < rows && col <= cols).then_some((row as usize, col))
+                        })
+                        .flatten();
+                    let kind = self.ghost.as_ref().map_or(self.prompt_kind, |ghost| ghost.kind);
+                    let anchor = $crate::ghost::locate(&screen, caret, kind);
+                    let placed = self
+                        .ghost
+                        .as_ref()
+                        .map(|ghost| $crate::ghost::place(ghost, anchor, rows, cols))
+                        .unwrap_or_default();
+                    if let Some(ghost) = self.ghost.clone() {
+                        self.paint_ghost(&ghost, &placed, anchor, bounds.origin, &font, font_size, window, cx);
+                    }
+                    if let Some(listener) = self.layout_listener.clone() {
+                        let hint = $crate::ghost::LayoutHint {
+                            left: f32::from(bounds.origin.x),
+                            top: f32::from(bounds.origin.y),
+                            cell_width: f32::from(self.cell.width),
+                            cell_height: f32::from(self.cell.height),
+                            cols,
+                            rows,
+                            anchored: anchor.is_some(),
+                            guard: 0,
+                            busy: $crate::ghost::busy_columns(&screen, anchor, &placed),
+                        };
+                        let hint = $crate::ghost::LayoutHint {
+                            guard: $crate::ghost::guard_row(&screen, anchor, &placed),
+                            ..hint
+                        };
+                        if self.last_hint.as_ref() != Some(&hint) {
+                            listener(&hint);
+                            self.last_hint = Some(hint);
+                        }
+                    }
                     if !self.host_input && !self.marked.is_empty() && self.focus.is_focused(window) {
                         let text = self.marked.replace(['\n', '\r'], " ");
                         let run = TextRun {

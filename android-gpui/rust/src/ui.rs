@@ -24,6 +24,9 @@ pub struct TerminalView {
     /// The style last given to the shell, so unchanged frames do not repaint it.
     #[cfg(unix)]
     shell_style: Option<gpui_rio::TerminalStyle>,
+    /// The ghost text last given to the shell, so it is handed over once.
+    #[cfg(unix)]
+    shell_ghost: Option<Arc<gpui_rio::ghost::Ghost>>,
     _updates: Task<()>,
 }
 
@@ -60,6 +63,8 @@ impl TerminalView {
             shell: None,
             #[cfg(unix)]
             shell_style: None,
+            #[cfg(unix)]
+            shell_ghost: None,
             _updates: updates,
         };
         // The window can open after a shell was attached, with no later change
@@ -115,6 +120,7 @@ impl TerminalView {
             return;
         }
         self.shell_style = None;
+        self.shell_ghost = None;
         self.shell = crate::shell::session(handle)
             .or_else(|| crate::remote::renderer(handle))
             .map(|session| {
@@ -122,6 +128,15 @@ impl TerminalView {
                 let terminal = crate::rio::Terminal::attach(session, style, cx);
                 terminal.update(cx, |terminal, _| {
                     terminal.set_host_input(true);
+                    // Where the screen is busy, so Java floats its controls clear of it.
+                    #[cfg(target_os = "android")]
+                    terminal.set_layout_listener(|hint| {
+                        let generation = model::mailbox().state().generation;
+                        crate::android::layout_hint(
+                            generation,
+                            &crate::ghost_bridge::hint_json(hint),
+                        );
+                    });
                     #[cfg(target_os = "android")]
                     terminal.set_link_handler(|link| {
                         let generation = model::mailbox().state().generation;
@@ -160,6 +175,23 @@ impl TerminalView {
                 cx.notify();
             });
             self.shell_style = Some(style);
+        }
+        #[cfg(feature = "android-ui")]
+        {
+            let ghost = crate::ghost_bridge::current();
+            let same = match (&ghost, &self.shell_ghost) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                let next = ghost.clone();
+                terminal.update(cx, |terminal, cx| {
+                    terminal.set_ghost(next);
+                    cx.notify();
+                });
+                self.shell_ghost = ghost;
+            }
         }
         Some(terminal.into_any_element())
     }

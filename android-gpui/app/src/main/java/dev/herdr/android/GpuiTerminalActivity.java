@@ -4559,6 +4559,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /**
+     * Rust, after a paint that changed it: where the drawn screen is busy
+     * (JSON, see ghost_bridge.rs), so the floating controls stay clear of the
+     * caret, ghost text and dialogs. Any thread.
+     */
+    public void gpuiLayoutHint(long expectedGeneration, String json) {
+        runOnUiThread(() -> {
+            synchronized (stateLock) {
+                if (destroyed || connection == null || connection.generation != expectedGeneration) return;
+            }
+            if (composer != null) composer.layoutHint(json);
+        });
+    }
+
     /** Opens a terminal link through the platform browser; never a file or custom scheme. */
     public void gpuiOpenLink(long expectedGeneration, String url) {
         runOnUiThread(() -> {
@@ -5553,6 +5567,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Drops the horizontal offset when a different pane is confirmed. */
     private static native void nativeResetPan();
     private static native void nativeSetTheme(int index);
+    /** Unsent words drawn at the program's caret (JSON, see ghost_bridge.rs); "" clears them. */
+    static native void nativeSetGhost(String json);
     private static native void nativeSetSnapshot(long generation, String title, String text, String status,
             String shortcutsJson);
     private static native void nativeSetSnapshotChrome(long generation, String title, String status,

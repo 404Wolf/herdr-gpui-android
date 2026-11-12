@@ -43,6 +43,11 @@ pub(crate) fn encode<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -
     let mut tail = String::from("\x1b[0m");
     let cursor = grid.grid.cursor.pos;
     let _ = write!(tail, "\x1b[{};{}H", cursor.row.0.max(0) + 1, cursor.col.0 + 1);
+    // A hidden cursor stays hidden: the composer reads a visible one as the
+    // program's input caret, so a cached dialog must not offer one.
+    if !grid.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR) {
+        tail.push_str("\x1b[?25l");
+    }
     // \r\n between rows, a reset and the cursor at the end.
     const START: &str = "\x1b[0m";
     let mut total = START.len() + tail.len() + lines.iter().map(|l| l.len() + 2).sum::<usize>();
@@ -209,6 +214,18 @@ mod tests {
                 (0..grid.columns()).map(|c| cells[Column(c)].c()).map(|c| if c == '\0' { ' ' } else { c }).collect::<String>().trim_end().to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_hidden_cursor_stays_hidden_and_a_shown_one_shown() {
+        use rio_vt::crosswords::Mode;
+        let cases = [("❯ draft".as_bytes(), true), ("\x1b[?25l│ 1. Yes".as_bytes(), false)];
+        for (program, shown) in cases {
+            let original = parsed(program, 24, 6);
+            let bytes = encode(&original.grid().lock(), MAX_BYTES);
+            let copy = parsed(&bytes, 24, 6);
+            assert_eq!(copy.grid().lock().mode().contains(Mode::SHOW_CURSOR), shown);
+        }
     }
 
     #[test]

@@ -156,6 +156,15 @@ final class ComposerBar {
         persist();
     }
 
+    /** The renderer's latest report of where the screen is busy (ClusterPlacement). */
+    private ClusterPlacement.Hint layout;
+
+    /** Where the drawn screen is busy, from the renderer after a paint that changed it. */
+    void layoutHint(String json) {
+        ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json);
+        if (hint != null) layout = hint;
+    }
+
     /** The collapsible keys row; the activity places it directly above the bar. */
     View keysRow() { return keysRow; }
 

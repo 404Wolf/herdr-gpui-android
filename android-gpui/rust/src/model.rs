@@ -1303,6 +1303,13 @@ impl Mailbox {
         true
     }
 
+    /// Wakes the view with nothing else changed, e.g. after new ghost text.
+    pub fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        #[cfg(feature = "android-ui")]
+        signal_change();
+    }
+
     /// Draws `shell` (0 for none) for the current generation only.
     pub fn set_shell(&mut self, generation: i64, shell: u64) -> bool {
         if generation <= 0 || generation != self.generation || shell == self.shell {
