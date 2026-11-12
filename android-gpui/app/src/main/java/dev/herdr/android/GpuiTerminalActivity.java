@@ -359,8 +359,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
         // An agent's pane has no bottom bar: the strip's end holds what the bar's
         // buttons did (panes, hosts, view, session, close).
-        tabRow = new LinearLayout(this);
+        tabRow = new PullDownRow(this);
         tabRow.setOrientation(LinearLayout.HORIZONTAL);
+        tabRow.setOnPull(this::showMachines);
         tabRow.addView(tabScroll, new LinearLayout.LayoutParams(0, -1, 1));
         ImageButton tabMenu = iconButton(R.drawable.ic_bar_more, "More", "Panes, hosts and terminal actions",
                 view -> showMoreActions(view, true));
@@ -397,6 +398,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         content.addView(shortcutBar, new LinearLayout.LayoutParams(-1, dp(48)));
         // The composer floats over this column, so a growing draft never resizes the pane.
         FrameLayout column = new FrameLayout(this);
+        terminalColumn = column;
         column.addView(content, new FrameLayout.LayoutParams(-1, -1));
         // On an agent's pane: the keys above its prompt, the chip of keyboard,
         // mic and Enter clear of its caret, and the typing box on the keyboard.
@@ -1015,6 +1017,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (navigation && !shellMode()) {
             menu.getMenu().add(0, 4, -2, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
             menu.getMenu().add(0, 5, -1, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts).setIconTintList(tint);
+            menu.getMenu().add(0, 6, 3, "Gestures");
         }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
@@ -1022,6 +1025,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             else if (item.getItemId() == 2) showSessionActions();
             else if (item.getItemId() == 4) showPanes();
             else if (item.getItemId() == 5) toggleSidebar();
+            else if (item.getItemId() == 6 && terminalColumn != null) {
+                GestureHint.maybeShow(this, terminalColumn, chrome, true);
+            }
             else finish();
             return true;
         });
@@ -2027,8 +2033,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** The pane the rail last scrolled into view. */
     private String revealedPane = "";
     private LinearLayout tabStrip;
-    /** The tab strip and its menu button. */
-    private LinearLayout tabRow;
+    /** The tab strip and its menu button; a pull down on it switches machine. */
+    private PullDownRow tabRow;
+    /** The frame over the terminal column, where the composer and hints float. */
+    private FrameLayout terminalColumn;
     private String tabSignature = "";
     /** The tab the strip last scrolled to, so a refresh does not scroll it again. */
     private String tabActive = "";
@@ -2041,6 +2049,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
             composer.setPane(current == null ? "" : current.paneId, kind);
+            // The bar's buttons are gone on an agent's pane: say once where they went.
+            if (ComposerBar.isAgent(kind) && terminalColumn != null) {
+                GestureHint.maybeShow(this, terminalColumn, chrome, false);
+            }
             refreshQueued();
         }
         boolean show = current != null && !shellMode() && current.tabs != null;
@@ -2286,6 +2298,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** One tab: the active one raised with an outline, the rest quiet on black. */
+    /** The tab strip's pull: every saved machine, the current one marked; a tap switches to it. */
+    private void showMachines() {
+        if (destroyed || isFinishing() || savedHosts.isEmpty()) return;
+        ActionSheet sheet = new ActionSheet(this, chrome, "Switch machine");
+        for (SavedRemoteHost host : savedHosts) {
+            boolean here = host.id.equals(currentHostId);
+            sheet.add(here ? host.name + "  · here" : host.name, () -> { if (!here) switchHost(host); });
+        }
+        sheet.show();
+    }
+
     /** Tags on the strip's pane pills, so a swipe on the chip steps through them. */
     private static final String PANE_PILL = "pane-pill", PANE_PILL_ACTIVE = "pane-pill-active";
 
