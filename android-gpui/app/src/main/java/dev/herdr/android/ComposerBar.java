@@ -496,6 +496,35 @@ final class ComposerBar {
     /** Whether the typing box (and its keyboard) is up. */
     boolean typing() { return typing; }
 
+    /** Our own Shift+Enter newline is being inserted: it is not a typed Enter. */
+    private boolean insertingNewline;
+
+    /**
+     * An Enter key while the box is up, wherever focus is: HeliBoard sends one
+     * (not an editor action) in apps it treats as terminals, and it must never
+     * reach the terminal instead. Enter sends (one loop later, so text the
+     * keyboard committed just before it lands first); Shift+Enter is a new
+     * line. True when it was Enter (press and release are both taken).
+     */
+    boolean enterKey(KeyEvent event) {
+        if (event == null || !typing || !EnterPaths.isEnter(event.getKeyCode())) return false;
+        if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
+        if (event.isShiftPressed()) {
+            Editable text = field.getText();
+            int from = Math.min(field.getSelectionStart(), field.getSelectionEnd());
+            int to = Math.max(field.getSelectionStart(), field.getSelectionEnd());
+            insertingNewline = true;
+            try {
+                text.replace(Math.max(0, from), Math.max(0, to), "\n");
+            } finally {
+                insertingNewline = false;
+            }
+        } else if (EnterPaths.sendsOnKey(event.getKeyCode(), event.getAction(), false)) {
+            field.post(this::enter);
+        }
+        return true;
+    }
+
     /** The "type" control: opens the keyboard, or closes it while it is up. */
     private void toggleTyping() {
         if (typing) hideKeyboard();
@@ -792,31 +821,37 @@ final class ComposerBar {
         edit.setMaxLines(MAX_LINES);
         edit.setMinHeight(dp(48));
         edit.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        // Every way a keyboard says "send" ends in enter(), the app's own send
+        // (EnterPaths): its action key, an Enter key event, a typed newline.
         edit.setOnEditorActionListener((view, action, event) -> {
-            if (action == EditorInfo.IME_ACTION_SEND
-                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
-                if (event == null || event.getAction() == KeyEvent.ACTION_DOWN) enter();
-                return true;
+            if (event != null && EnterPaths.isEnter(event.getKeyCode())) {
+                return enterKey(event);
             }
-            return false;
-        });
-        edit.setOnKeyListener((view, code, event) -> {
-            if (code != KeyEvent.KEYCODE_ENTER && code != KeyEvent.KEYCODE_NUMPAD_ENTER) return false;
-            if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
-            if (event.isShiftPressed()) {
-                Editable text = edit.getText();
-                text.replace(Math.min(edit.getSelectionStart(), edit.getSelectionEnd()),
-                        Math.max(edit.getSelectionStart(), edit.getSelectionEnd()), "\n");
-            } else {
-                enter();
-            }
+            if (!EnterPaths.sendsOnAction(action)) return false;
+            enter();
             return true;
         });
+        edit.setOnKeyListener((view, code, event) -> enterKey(event));
         edit.addTextChangedListener(new TextWatcher() {
+            private int changeStart, changeBefore, changeCount;
+
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                changeStart = start;
+                changeBefore = before;
+                changeCount = count;
+            }
             @Override public void afterTextChanged(Editable s) {
                 if (updatingField) return;
+                // A keyboard that types "\n" for Enter: send, as the button does.
+                String withoutNewline = insertingNewline ? null
+                        : EnterPaths.withoutTypedNewline(s, changeStart, changeBefore, changeCount);
+                if (withoutNewline != null) {
+                    showText(withoutNewline);
+                    drafts.edit(withoutNewline);
+                    edit.post(ComposerBar.this::enter);
+                    return;
+                }
                 // A backspace into a chip takes the whole chip; its text is
                 // appended to the draft when it comes, so nothing is lost.
                 String text = s.toString();
