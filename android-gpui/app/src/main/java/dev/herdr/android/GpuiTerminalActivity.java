@@ -3987,6 +3987,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public View surface() { return terminalSurface; }
 
+            @Override public void rawKeyboard() {
+                Connection target;
+                synchronized (stateLock) { target = connection; }
+                if (target == null || terminalSurface == null) return;
+                terminalSurface.requestFocus();
+                nativeShowKeyboard(target.generation);
+            }
+
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED) {

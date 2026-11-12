@@ -73,6 +73,8 @@ final class ComposerBar {
         void switchPane(int step);
         /** The terminal's surface: the renderer's layout hints are relative to it. */
         View surface();
+        /** Shows the keyboard typing straight into the program (its menus, y/n). */
+        void rawKeyboard();
     }
 
     private static final String PREFS = "terminal-display";
@@ -101,6 +103,8 @@ final class ComposerBar {
     private final FloatingCluster cluster;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
+    /** In the keys' overlay: the keyboard typing straight into the program. */
+    private final ImageView raw;
     /** Recording lengths of clips dictated this run, for their chips. */
     private final java.util.Map<String, Long> clipLengths = new java.util.HashMap<>();
     private GpuiChrome chrome;
@@ -170,6 +174,14 @@ final class ComposerBar {
         stack.setVisibility(View.GONE);
         keysOverlay = new KeysOverlay(context);
         keysOverlay.setVisibility(View.GONE);
+        raw = new ImageView(context);
+        raw.setImageResource(R.drawable.ic_bar_keyboard);
+        raw.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        raw.setPadding(dp(10), dp(12), dp(10), dp(12));
+        raw.setContentDescription("Type straight into the program");
+        raw.setTooltipText("Type straight into the program");
+        raw.setOnClickListener(v -> host.rawKeyboard());
+        keysOverlay.addView(raw, new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.START));
         style(chrome);
     }
 
@@ -385,6 +397,7 @@ final class ComposerBar {
         round.setColor(chrome.control);
         send.setBackground(round);
         keysOverlay.setBackgroundColor(chrome.surface);
+        raw.setImageTintList(ColorStateList.valueOf(chrome.primary));
         lastGhost = "";
         pushGhost();
     }
@@ -426,7 +439,11 @@ final class ComposerBar {
         if (keyStrip != null && slot != null) {
             detach(keyStrip);
             if (agent) {
-                if (keysOpen) keysOverlay.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
+                if (keysOpen) {
+                    FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(48));
+                    params.setMarginStart(dp(44));
+                    keysOverlay.addView(keyStrip, params);
+                }
             } else {
                 // A shell's keys are its main input: they stay in its bar.
                 slot.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
