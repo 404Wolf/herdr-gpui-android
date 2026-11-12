@@ -460,10 +460,11 @@ macro_rules! __bind_gpui {
                                     rgb_color(fg),
                                 ));
                             }
+                            // Drawn with stand-ins for what the font lacks (see `glyphs`).
                             let text: String = grid
                                 .grid
                                 .cell_text(pos)
-                                .map(|c| if c == '\0' { ' ' } else { c })
+                                .map(|c| if c == '\0' { ' ' } else { $crate::glyphs::stand_in(c) })
                                 .collect();
                             if (text != " "
                                 || style
