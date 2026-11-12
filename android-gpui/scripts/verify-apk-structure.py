@@ -106,9 +106,7 @@ def check_apks(paths, abi='arm64-v8a'):
     require(resource_tables > 0, 'No compiled resources.arsc found in the APK set')
     native_names = [name for name, _ in native_entries]
     require(expected_library in native_names, f'Actual GPUI {abi} native library missing')
-    # Offline dictation: Vosk and the JNA dispatcher its Java binding loads.
-    dictation = {f'lib/{abi}/libvosk.so', f'lib/{abi}/libjnidispatch.so'}
-    allowed = {expected_library, expected_runtime} | dictation
+    allowed = {expected_library, expected_runtime}
     require(set(native_names) <= allowed, 'Unexpected JNI library or ABI')
     for name, data in native_entries:
         native_check.verify_elf(data, runtime=name != expected_library, abi=abi)

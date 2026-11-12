@@ -33,9 +33,9 @@ shutil.copyfile(work / 'resources.apk', work / 'unsigned.apk')
 with zipfile.ZipFile(work / 'unsigned.apk', 'a', zipfile.ZIP_STORED) as apk:
     for path in sorted((work / 'dex').glob('*.dex')):
         apk.write(path, path.name)
-    for libraries in (pathlib.Path(sys.argv[2]), work / 'aar-jni'):  # GPUI, then Vosk and JNA
-        for path in sorted((libraries / sys.argv[3]).glob('*.so')):
-            apk.write(path, 'lib/' + path.relative_to(libraries).as_posix())
+    libraries = pathlib.Path(sys.argv[2])
+    for path in sorted((libraries / sys.argv[3]).glob('*.so')):
+        apk.write(path, 'lib/' + path.relative_to(libraries).as_posix())
 PY
 # Conventional development-only key, generated locally; never use for release/publication.
 if [[ ! -f "$BUILD/debug.keystore" ]]; then

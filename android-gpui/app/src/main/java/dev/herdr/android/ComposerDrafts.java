@@ -9,7 +9,10 @@ import java.util.Map;
  *
  * <p>Dictation joins the draft without owning it: {@link #dictationPartial}
  * replaces only the utterance in progress (engines send the whole utterance so
- * far, not a delta), and {@link #dictationFinal} commits it.
+ * far, not a delta), and {@link #dictationFinal} commits it. A dictation
+ * recorded while the desktop was away leaves a {@link DictationToken} where its
+ * text will go ({@link #dictationPending}); {@link #placeDictation} fills it in,
+ * in whichever pane's draft it is.
  */
 final class ComposerDrafts {
     /** Drafts kept for panes not on screen; the oldest is dropped beyond this. */
@@ -63,6 +66,45 @@ final class ComposerDrafts {
         String result = dictationPartial(utterance);
         dictationBase = null;
         return result;
+    }
+
+    /**
+     * The utterance was saved for the desktop to transcribe later: its token
+     * takes the place of the utterance, and the draft goes on after it.
+     */
+    String dictationPending(String clipId) {
+        return dictationFinal(DictationToken.of(clipId));
+    }
+
+    /**
+     * Puts a transcribed dictation where its token is, in any pane's draft;
+     * the pane whose draft held it, or null when no draft does (it was sent or
+     * deleted: the outbox, then {@link #append}, are next).
+     */
+    String placeDictation(String clipId, String spoken) {
+        for (Map.Entry<String, String> draft : drafts.entrySet()) {
+            String filled = DictationToken.fill(draft.getValue(), clipId, spoken);
+            if (filled == null) continue;
+            String pane = draft.getKey();
+            if (pane.equals(this.pane) && dictationBase != null) {
+                String inBase = DictationToken.fill(dictationBase, clipId, spoken);
+                if (inBase != null) dictationBase = inBase;
+            }
+            if (filled.isEmpty()) drafts.remove(pane);
+            else draft.setValue(filled);
+            return pane;
+        }
+        return null;
+    }
+
+    /** Adds {@code spoken} to the end of {@code pane}'s draft, e.g. a dictation whose token was deleted. */
+    String append(String pane, String spoken) {
+        String key = pane == null ? "" : pane;
+        String text = join(drafts.get(key), spoken);
+        if (text.isEmpty()) return text;
+        if (key.equals(this.pane) && dictationBase != null) dictationBase = join(dictationBase, spoken);
+        drafts.put(key, text);
+        return text;
     }
 
     /**

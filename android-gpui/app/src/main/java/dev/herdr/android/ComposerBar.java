@@ -22,6 +22,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import dev.herdr.android.dictation.DictationEngine;
 import dev.herdr.android.dictation.DictationException;
+import dev.herdr.android.dictation.PendingClip;
 
 /**
  * The bottom bar's input: a local-first composer over Claude and Codex panes,
@@ -102,6 +103,8 @@ final class ComposerBar {
     private DictationEngine.State dictationState = DictationEngine.State.IDLE;
     /** Enter was pressed while listening: send the utterance once it is final. */
     private boolean sendWhenFinal;
+    /** Recordings waiting for the desktop (the mic's badge). */
+    private int waiting;
     /** Our own setText calls, which must not count as user edits. */
     private boolean updatingField;
 
@@ -140,6 +143,30 @@ final class ComposerBar {
     void showQueued(java.util.List<Outbox.Message> messages) {
         queued.show(messages, drafts.pane());
         updateStack();
+    }
+
+    /**
+     * A dictation the desktop transcribed later: fills its token in whichever
+     * pane's draft holds it and saves the drafts at once; false when none does.
+     */
+    boolean placeDictation(String clipId, String text) {
+        String pane = drafts.placeDictation(clipId, text);
+        if (pane == null) return false;
+        if (pane.equals(drafts.pane())) showText(drafts.text());
+        persist();
+        return true;
+    }
+
+    /** A dictation whose token is gone from everywhere: it joins the end of its pane's draft. */
+    void appendDictation(String pane, String text) {
+        String draft = drafts.append(pane, text);
+        if ((pane == null ? "" : pane).equals(drafts.pane())) showText(draft);
+        persist();
+    }
+
+    /** Recordings waiting for the desktop, for the mic's badge. */
+    void setWaiting(int count) {
+        waiting = count;
     }
 
     /** A queued message taken back: its text joins the draft, on a line of its own. */
@@ -203,7 +230,7 @@ final class ComposerBar {
     /** The pane on screen changed, or what it runs did. Only agents get the composer. */
     void setPane(String paneId, boolean agentPane) {
         boolean switched = !drafts.pane().equals(paneId == null ? "" : paneId);
-        if (switched && dictationState != DictationEngine.State.IDLE) {
+        if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
             dictation.cancel();
             dictationState = DictationEngine.State.IDLE;
@@ -250,7 +277,7 @@ final class ComposerBar {
         micOnly = on;
         preferences.edit().putBoolean(MIC_ONLY, on).apply();
         if (on) host.hideKeyboard();
-        else if (dictationState != DictationEngine.State.IDLE) {
+        else if (dictating()) {
             dictation.cancel();
             dictationState = DictationEngine.State.IDLE;
             showText(drafts.dictationEnded());
@@ -398,7 +425,7 @@ final class ComposerBar {
         transcript.setPadding(dp(8), 0, dp(8), 0);
         transcript.setOnClickListener(v -> toggleDictation());
         transcript.setOnLongClickListener(v -> {
-            if (dictationState != DictationEngine.State.IDLE) return false;
+            if (dictating()) return false;
             drafts.sent();
             showText("");
             host.notice("Draft cleared");
@@ -410,7 +437,7 @@ final class ComposerBar {
 
     private void updateMicPanel() {
         if (record == null) return;
-        boolean live = dictationState != DictationEngine.State.IDLE;
+        boolean live = dictating();
         record.setImageTintList(ColorStateList.valueOf(live ? chrome.danger : chrome.onSurface));
         record.setBackground(fill(live ? GpuiChrome.withAlpha(chrome.danger, 0x33) : chrome.control, 24, dp(4)));
         String label = live ? "Stop dictating" : "Dictate";
@@ -425,18 +452,25 @@ final class ComposerBar {
         switch (dictationState) {
             case CONNECTING: return "Connecting…";
             case LISTENING: return "Listening…";
-            case FINISHING: return "Finishing…";
+            case TRANSCRIBING: return "Finishing…";
+            case OFFLINE_RECORDING: return "Desktop offline, recording…";
             default: return "Tap the mic and speak";
         }
     }
 
+    /** A session runs: IDLE and PENDING both mean none does. */
+    private boolean dictating() {
+        return dictationState != DictationEngine.State.IDLE && dictationState != DictationEngine.State.PENDING;
+    }
+
     private void toggleDictation() {
         if (dictationState == DictationEngine.State.LISTENING
-                || dictationState == DictationEngine.State.CONNECTING) {
+                || dictationState == DictationEngine.State.CONNECTING
+                || dictationState == DictationEngine.State.OFFLINE_RECORDING) {
             dictation.stop();
             return;
         }
-        if (dictationState != DictationEngine.State.IDLE) return;
+        if (dictating()) return;
         if (!dictation.isAvailable()) {
             host.notice("Dictation is not set up on this phone");
             return;
@@ -446,10 +480,10 @@ final class ComposerBar {
     }
 
     private void startDictation() {
-        if (!micOnly || dictationState != DictationEngine.State.IDLE) return;
+        if (!micOnly || dictating()) return;
         drafts.dictationStarted();
         final String pane = drafts.pane();
-        dictation.start(new DictationEngine.Listener() {
+        dictation.start(pane, new DictationEngine.Listener() {
             @Override public void onPartial(String text) {
                 if (pane.equals(drafts.pane())) showText(drafts.dictationPartial(text));
             }
@@ -459,6 +493,19 @@ final class ComposerBar {
                 showText(drafts.dictationFinal(text));
                 if (sendWhenFinal) {
                     sendWhenFinal = false;
+                    // The session is over (IDLE follows): Enter must send, not wait again.
+                    dictationState = DictationEngine.State.IDLE;
+                    enter();
+                }
+            }
+
+            @Override public void onPending(PendingClip clip) {
+                if (!pane.equals(drafts.pane())) return;
+                showText(drafts.dictationPending(clip.id));
+                if (sendWhenFinal) {
+                    // The message waits in the outbox until the desktop fills the dictation in.
+                    sendWhenFinal = false;
+                    dictationState = DictationEngine.State.PENDING;
                     enter();
                 }
             }
@@ -483,12 +530,13 @@ final class ComposerBar {
      */
     private void enter() {
         if (dictationState == DictationEngine.State.LISTENING
-                || dictationState == DictationEngine.State.CONNECTING) {
+                || dictationState == DictationEngine.State.CONNECTING
+                || dictationState == DictationEngine.State.OFFLINE_RECORDING) {
             sendWhenFinal = true;
             dictation.stop();
             return;
         }
-        if (dictationState == DictationEngine.State.FINISHING) {
+        if (dictationState == DictationEngine.State.TRANSCRIBING) {
             sendWhenFinal = true;
             return;
         }

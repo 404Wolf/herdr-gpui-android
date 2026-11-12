@@ -1,8 +1,8 @@
 # Dictation
 
-The composer's microphone button dictates text: tap to start, tap again to
-stop. Silence never ends a session. Text appears as you speak, and the final
-text replaces it about half a second after the second tap.
+The composer's microphone dictates text: tap to start, tap again to stop.
+Silence never ends a session. Speech is always transcribed on the desktop's
+Whisper; the phone never guesses at it with a weaker model.
 
 ## How it works
 
@@ -10,38 +10,43 @@ text replaces it about half a second after the second tap.
 tap → ServerDictationEngine ── ws:// over the tailnet ──▶ dictation server (desktop)
         16 kHz PCM16, 100 ms frames                       websocket bridge (server.py)
         ◀── partial (~every 0.6 s), final after stop ──    whisper.cpp, Vulkan, RX 6600
-                                                            large-v3-turbo q8_0
-   server unreachable before listening?
-        └─▶ VoskDictationEngine: offline, vosk-model-small-en-us-0.15 bundled in the APK
+        │                                                   large-v3-turbo q8_0
+        └─ the same audio, always, to app storage
+   desktop unreachable (or gone mid-session)?
+        └─▶ OFFLINE_RECORDING: keep recording to app storage; on stop the
+            recording is a PendingClip and its place in the draft a token
+   desktop back (network change, a live session, or backoff 10 s … 5 min)?
+        └─▶ PendingDictations uploads each clip, oldest first, and the text
+            replaces its token: in the draft, else in the queued message that
+            holds it (which then goes out), else at the end of the pane's draft
 ```
 
-- `dev.herdr.android.dictation.DictationEngine` is the composer's interface.
-  `Dictation.create(context)` picks the engine.
+- `dev.herdr.android.dictation.DictationEngine` is the composer's interface;
+  `Dictation.create(context)` picks the engine. A session goes CONNECTING,
+  LISTENING, TRANSCRIBING, then the final and IDLE; or OFFLINE_RECORDING, then
+  onPending and PENDING. IDLE and PENDING both end a session.
 - The server URL is provisioned, never built in: put `"dictationUrl":
   "ws://<desktop tailnet address>:8770/v1/dictate"` in
-  `remote-for-herdr-settings.json` (see `ProvisionedSettings`). Without it the
-  offline Vosk engine is used alone.
+  `remote-for-herdr-settings.json` (see `ProvisionedSettings`). Without it
+  dictation is not available.
 - Recording starts on the tap and is buffered while the socket connects, so the
-  first words are not lost.
-- If the server cannot be reached within 2.5 s, the same session continues on
-  offline Vosk, and the server is skipped for the next minute. A
-  drop after listening began is reported as an error; the partial text already
-  shown stays in the composer.
-- Vosk ends an utterance at each pause and the engine keeps going, so only the
-  second tap ends a session. The model (about 40 MB) is bundled by the build,
-  not committed: Gradle takes `-PvoskAssetsDir=<dir holding vosk-model/>` and
-  the manual scripts `HERDR_VOSK_ASSETS`; the Nix build in `~/Config/phone`
-  passes vosk-model-small-en-us-0.15, as HeliBoard's does. A build without it
-  has no offline fallback (the fallback reports UNAVAILABLE). The first offline
-  use after an install copies the model to app storage, which takes a moment.
-- Why not the phone's own SpeechRecognizer: on this GrapheneOS Fold the default
-  recognizer is the disabled Google app, and the only registered recognition
-  services are the Claude app's (online) and FUTO's placeholder, while
-  `SpeechRecognizer.isRecognitionAvailable()` still answers yes.
+  first words are not lost. If the server is not ready within 4 s, the session
+  records offline; a drop later does the same, and the partial already shown is
+  withdrawn, since the whole recording comes back as one text.
+- Recordings live in `noBackupFilesDir/dictation-pending/` (raw PCM plus an
+  index written atomically), survive a killed app, and are bounded: 15 minutes
+  per clip (the server's limit) and 30 minutes in all; recording stops at
+  either. A clip's audio is deleted once transcribed, and its text is kept
+  until the composer has placed it.
+- In a draft, a waiting dictation is `⟦dictation <clip id>⟧` (`DictationToken`),
+  which the composer shows as a chip. A message sent with one waits at the head
+  of its pane's outbox line until the text fills it in; an empty transcription
+  removes the token.
 - The server is a home-manager module, `users/wolf/programs/dictation` in
   `~/Config/home-manager` (`mine.dictation`): whisper-server on loopback, the
   websocket only on the tailnet address. Its protocol is documented at the top
-  of `server.py`.
+  of `server.py`; a waiting clip uses the same protocol, sent as fast as the
+  link allows.
 
 ## Why this design: measurements (11 November 2026)
 
@@ -55,7 +60,7 @@ engines (lower case, no punctuation).
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Desktop RX 6600, whisper.cpp large-v3-turbo q8, this server | **3.65%** | 3.56% | **0.95 s** | **0.50 / 0.75 s** | 1.0 s | ~0 (desktop already on) | tailnet only |
 | OpenAI `gpt-live-transcribe`, realtime | 5.65% | **2.67%** | 1.58 s | 0.61 / 0.75 s | **0.54 s** | $1.02 ($0.017/min) | no |
-| Vosk small-en 0.15 (the offline fallback; laptop, real-time chunks) | 15.2% | 17.3% | streams per chunk | 0.02 / 0.04 s | 0.02 s | 0 | yes |
+| Vosk small-en 0.15 (laptop, real-time chunks; not used) | 15.2% | 17.3% | streams per chunk | 0.02 / 0.04 s | 0.02 s | 0 | yes |
 | Fold CPU, whisper.cpp base.en q5_1 (4 threads, screen off) | 8.96% | 7.11% | n/a | ~5 s after a 6 s clip | 28 s (64 s clip) | 0 | yes |
 | Fold CPU, whisper.cpp small.en q5_1 | 5.48% | 4.00% | n/a | ~13 s after a 6 s clip | not run | 0 | yes |
 
@@ -74,11 +79,9 @@ engines (lower case, no punctuation).
 - The phone runs were with its screen off (a condition of running them), so
   its cores may have been held back; even 3× faster, base.en stays well behind.
 - On-device Whisper would need a model in the APK (60–190 MB) and is 10× slower
-  than the server even with the small model, so the offline fallback is Vosk:
-  it streams and finishes at once, but makes about four times the server's
-  errors. Its WER was measured with the same model on the laptop (accuracy does
-  not depend on the device); its speed on the phone was not measured, since
-  that needs driving the phone's UI.
+  than the server even with the small model; Vosk streams and finishes at once
+  but makes about four times the server's errors. Neither is used: while the
+  desktop is away the phone records, and the desktop transcribes later.
 
 Raw outputs and scripts for these runs were kept outside the repository; the
 numbers above are copied from them.

@@ -142,6 +142,11 @@ final class DictationSocket implements Closeable {
         }
     }
 
+    /** Bounds each later {@link #read} (0 waits for ever); a timeout throws an IOException. */
+    void readTimeout(int millis) throws IOException {
+        socket.setSoTimeout(millis);
+    }
+
     /** Closes without the closing handshake; unblocks a pending {@link #read}. */
     @Override
     public void close() {

@@ -69,13 +69,6 @@ build-time reference. Downloads are pinned by SHA-256 and cached locally:
 ./scripts/build-verification-apk.sh
 ```
 
-The app's only dependencies, the Vosk and JNA AARs for offline dictation, are
-provided by the scripts themselves (the `AARS` list in `android-tools.sh`,
-pinned by SHA-256): fetched like the tools, or taken from `HERDR_AAR_DIR` when
-the build has no network (Nix). Any other Gradle dependency stops the manual
-build. `HERDR_VOSK_ASSETS`, a directory holding `vosk-model/`, bundles the
-offline speech model; without it the APK has no offline dictation fallback.
-
 `HERDR_BUILD_CACHE=/absolute/cache/path` can reuse those Maven artifacts. It
 compiles the shared Java sources and the GPUI host, packages the real Rust
 library, signs with a locally generated development-only key, verifies APK

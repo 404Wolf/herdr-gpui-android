@@ -382,6 +382,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
         });
         composer = new ComposerBar(this, chrome, Dictation.create(this), composerHost());
+        Dictation.pending(this).setListener(pendingDictations);
         content.addView(composer.keysRow(), new LinearLayout.LayoutParams(-1, dp(48)));
         shortcutBar = createShortcutBar();
         content.addView(shortcutBar, new LinearLayout.LayoutParams(-1, dp(48)));
@@ -3939,7 +3940,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             live = target != null && target.ready && !target.isClosed();
         }
         boolean queueable = host != null && !pane.isEmpty();
-        if (live && !(queueable && outbox.outbox().holds(host, pane))) {
+        // A message waiting on a dictation goes through the outbox, which holds it until filled.
+        boolean awaits = DictationToken.in(text);
+        if (live && !awaits && !(queueable && outbox.outbox().holds(host, pane))) {
             String command;
             try {
                 command = GpuiTerminalProtocol.composeCommand(text);
@@ -3960,6 +3963,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         return true;
     }
+
+    /**
+     * Dictations the desktop transcribed after the fact: into the draft that
+     * holds their place, else the queued message that does (it then goes
+     * out), else the end of the pane's draft. Never sent unless the user sent
+     * the message that holds them.
+     */
+    private final dev.herdr.android.dictation.PendingDictations.Listener pendingDictations =
+            new dev.herdr.android.dictation.PendingDictations.Listener() {
+                @Override public void onTranscribed(dev.herdr.android.dictation.PendingClip clip, String text) {
+                    if (composer == null) return;
+                    if (!composer.placeDictation(clip.id, text) && !outbox.fillDictation(clip.id, text)) {
+                        composer.appendDictation(clip.target, text);
+                    }
+                    Dictation.pending(GpuiTerminalActivity.this).delivered(clip.id);
+                }
+
+                @Override public void onChanged() {
+                    if (composer != null) composer.setWaiting(Dictation.pending(GpuiTerminalActivity.this).count());
+                }
+            };
 
     /** Pane ids in a poll's pane list. */
     private static java.util.Set<String> paneIds(JSONArray panes) {
@@ -4293,6 +4317,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         destroyed = true;
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
+        Dictation.pending(this).setListener(null);
         stopHostSampling();
         stopConnection();
         worker.shutdownNow();
