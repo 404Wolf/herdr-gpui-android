@@ -48,6 +48,8 @@ final class FilePager extends FrameLayout {
     /** The last read asked for; a slower earlier answer is dropped. */
     private int request;
     private boolean shown;
+    /** Told when the file page opens or closes over the terminal. */
+    private Runnable onShownChanged;
     private long lastSeq;
     private boolean seeded;
     // Drag state: where it started, and whether this pager claimed it.
@@ -174,9 +176,13 @@ final class FilePager extends FrameLayout {
         list.setSelection(next.scrollRow());
     }
 
+    /** Runs {@code listener} whenever the file page opens or closes. */
+    void setOnShownChanged(Runnable listener) { onShownChanged = listener; }
+
     void show() {
         if (getWidth() == 0) {
             shown = true;
+            if (onShownChanged != null) onShownChanged.run();
             page.setVisibility(VISIBLE);
             handle.setVisibility(GONE);
             return;
@@ -192,7 +198,9 @@ final class FilePager extends FrameLayout {
     }
 
     private void settle(boolean open) {
+        boolean changed = shown != open;
         shown = open;
+        if (changed && onShownChanged != null) onShownChanged.run();
         page.setVisibility(VISIBLE);
         page.animate().translationX(open ? 0 : getWidth()).setDuration(160).withEndAction(() -> {
             if (!shown) page.setVisibility(INVISIBLE);

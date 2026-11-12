@@ -55,6 +55,20 @@ final class ComposerDrafts {
 
     boolean dictating() { return dictationBase != null; }
 
+    /**
+     * Where the utterance in progress starts in the draft (its words may still
+     * change), or -1 when none is in progress.
+     */
+    int partialFrom() {
+        if (dictationBase == null) return -1;
+        String text = text();
+        if (!text.startsWith(dictationBase) || text.length() == dictationBase.length()) return -1;
+        int from = dictationBase.length();
+        // Past the space join() put between the draft and the utterance.
+        while (from < text.length() && text.charAt(from) == ' ') from++;
+        return from;
+    }
+
     /** The whole utterance so far; it replaces the previous partial. */
     String dictationPartial(String utterance) {
         if (dictationBase == null) dictationBase = text();

@@ -51,8 +51,20 @@ final class MicButton {
     /** -1 until the first count, which is shown without a note. */
     private int waiting = -1;
 
+    /** How tall the round mic is, in dp. */
+    private final int size;
+    /** Where one-line notes go instead of above the pill, or null to show them there. */
+    private final java.util.function.Consumer<String> notes;
+
     MicButton(Context context, GpuiChrome chrome, View.OnClickListener tap) {
+        this(context, chrome, tap, 44, null);
+    }
+
+    MicButton(Context context, GpuiChrome chrome, View.OnClickListener tap, int sizeDp,
+            java.util.function.Consumer<String> notes) {
         this.context = context;
+        this.size = sizeDp;
+        this.notes = notes;
         this.chrome = chrome;
         density = context.getResources().getDisplayMetrics().density;
         view = new LinearLayout(context);
@@ -76,7 +88,7 @@ final class MicButton {
         pill = new LinearLayout(context);
         pill.setOrientation(LinearLayout.HORIZONTAL);
         pill.setGravity(Gravity.CENTER);
-        pill.setMinimumWidth(dp(44));
+        pill.setMinimumWidth(dp(size));
         pill.setOnClickListener(tap);
         pill.setFocusable(false);
         icon = new ImageView(context);
@@ -99,7 +111,7 @@ final class MicButton {
         stop.setScaleType(ImageView.ScaleType.FIT_CENTER);
         stop.setPadding(dp(4), dp(4), dp(4), dp(4));
         pill.addView(stop, square(26));
-        frame.addView(pill, new FrameLayout.LayoutParams(-2, dp(44), Gravity.END));
+        frame.addView(pill, new FrameLayout.LayoutParams(-2, dp(size), Gravity.END));
         badge = new TextView(context);
         badge.setTextSize(10);
         badge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
@@ -136,7 +148,7 @@ final class MicButton {
         if (recording(next) && !wasRecording) recordingSince = SystemClock.elapsedRealtime();
         if (!recording(next)) recordingSince = 0;
         if (next == DictationEngine.State.OFFLINE_RECORDING) {
-            showNote("Saved on the phone; transcribed when the desktop is back");
+            showNote("Desktop offline, recording; transcribed when it is back");
         }
         render();
     }
@@ -151,6 +163,10 @@ final class MicButton {
 
     /** A one-line note above the pill, in the warning colour, gone after a few seconds. */
     void showNote(String text) {
+        if (notes != null) {
+            notes.accept(text);
+            return;
+        }
         note.setText(text);
         note.setVisibility(View.VISIBLE);
         note.removeCallbacks(hideNote);
@@ -179,7 +195,7 @@ final class MicButton {
         DictationEngine.State s = state;
         int accent = accent(s);
         GradientDrawable shape = new GradientDrawable();
-        shape.setCornerRadius(dp(22));
+        shape.setCornerRadius(dp(size / 2f));
         shape.setColor(s == DictationEngine.State.IDLE || s == DictationEngine.State.PENDING
                 ? chrome.control : mix(chrome.surface, accent, 0.16f));
         shape.setStroke(Math.max(1, dp(1)), s == DictationEngine.State.IDLE || s == DictationEngine.State.PENDING
@@ -266,10 +282,12 @@ final class MicButton {
     /** The pill's words for a state; empty for the bare mic. */
     static String text(DictationEngine.State s, long elapsedMs) {
         switch (s) {
-            case CONNECTING: return "connecting";
+            // The spinner says it; words would widen the pill over the terminal.
+            case CONNECTING: return "";
             case LISTENING: return clock(elapsedMs);
-            case TRANSCRIBING: return "transcribing";
-            case OFFLINE_RECORDING: return "Desktop offline, recording " + clock(elapsedMs);
+            case TRANSCRIBING: return "";
+            // The cloud-off glyph and the note say offline; the pill keeps the clock.
+            case OFFLINE_RECORDING: return clock(elapsedMs);
             default: return "";
         }
     }

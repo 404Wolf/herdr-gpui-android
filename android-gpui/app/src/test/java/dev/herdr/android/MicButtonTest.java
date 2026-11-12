@@ -11,10 +11,12 @@ import org.junit.Test;
 public final class MicButtonTest {
     @Test public void eachStateHasItsWords() {
         assertEquals("", MicButton.text(State.IDLE, 0));
-        assertEquals("connecting", MicButton.text(State.CONNECTING, 0));
+        // A spinner says connecting and transcribing; the pill stays narrow.
+        assertEquals("", MicButton.text(State.CONNECTING, 0));
         assertEquals("0:07", MicButton.text(State.LISTENING, 7_900));
-        assertEquals("transcribing", MicButton.text(State.TRANSCRIBING, 0));
-        assertEquals("Desktop offline, recording 0:12", MicButton.text(State.OFFLINE_RECORDING, 12_000));
+        assertEquals("", MicButton.text(State.TRANSCRIBING, 0));
+        // Offline: the cloud-off glyph says it; the pill keeps the clock.
+        assertEquals("0:12", MicButton.text(State.OFFLINE_RECORDING, 12_000));
         assertEquals("", MicButton.text(State.PENDING, 0));
     }
 

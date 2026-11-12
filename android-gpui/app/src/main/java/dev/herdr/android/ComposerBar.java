@@ -9,7 +9,9 @@ import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
@@ -17,24 +19,28 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.TextView;
 import dev.herdr.android.dictation.DictationEngine;
 import dev.herdr.android.dictation.DictationException;
 import dev.herdr.android.dictation.PendingClip;
+import java.util.Collections;
+import java.util.List;
 
 /**
- * The bottom bar's input: a local-first composer over Claude and Codex panes,
- * one floating mic that dictates into it, and the terminal keys folded behind
- * a chevron.
+ * Input for the pane on screen.
  *
- * <p>The composer edits on the phone with no round trip: nothing reaches the
- * host until Enter, which queues the whole draft as one bracketed paste plus
- * Enter. Its field floats over the terminal, aligned to the bar's free middle,
- * so a long draft grows upward over the output without resizing the pane (a
- * resize would make the agent redraw over the link). The terminal keyboard
- * button keeps raw input one tap away.
+ * <p>On an agent's pane there is no bottom bar: the terminal takes the whole
+ * height, and a small chip floats over its bottom right ({@link FloatingCluster}:
+ * keyboard, mic, Enter), clear of the caret and of dialogs. What is spoken or
+ * typed is drawn as ghost text at the agent's own prompt caret by the renderer
+ * ({@link GhostText}), and reaches the agent only on Enter, as one bracketed
+ * paste plus Enter (through the outbox when the link is down). A typing box
+ * exists only while the keyboard is up. The terminal keys open over the
+ * terminal, above the prompt, on a swipe up or a long press on Enter.
+ *
+ * <p>A plain shell keeps a bar: its pinned controls, its keys and Enter, and
+ * raw typing.
  *
  * <p>Owns no connection: the activity sends through {@link Host}. Lives for the
  * activity; {@link #bar} may be called again when the toolbar is rebuilt.
@@ -55,20 +61,29 @@ final class ComposerBar {
         /** A short status for the user; the connection stays as it is. */
         void notice(String message);
         /** The Enter badge was tapped: list the pane's queued messages. */
-        void showQueue(java.util.List<Outbox.Message> messages);
+        void showQueue(List<Outbox.Message> messages);
         /**
          * Runs {@code granted} once the microphone may be used: at once when
          * RECORD_AUDIO is already granted, or after the user allows it.
          */
         void withMicrophone(Runnable granted);
+        /** Has the renderer draw ghost text ({@link GhostText} JSON); "" clears it. */
+        void setGhost(String json);
+        /** Shows the previous (-1) or next (+1) pane of the tab strip. */
+        void switchPane(int step);
+        /** The terminal's surface: the renderer's layout hints are relative to it. */
+        View surface();
     }
 
     private static final String PREFS = "terminal-display";
-    private static final String KEYS_OPEN = "keys_row_open";
     /** Every pane's draft, so a closed or killed app finds what was typed. */
     private static final String DRAFTS = "composer_drafts";
     private static final long SAVE_DRAFTS_MS = 400;
     private static final int MAX_LINES = 6;
+    /** Gap between the chip and the grid's right edge and the row under it, in dp. */
+    private static final int INSET = 4;
+    private static final java.util.Set<String> SHELLS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "shell", "sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh", "csh"));
 
     private final Context context;
     private final SharedPreferences preferences;
@@ -77,30 +92,39 @@ final class ComposerBar {
     private final ComposerDrafts drafts = new ComposerDrafts();
     private final float density;
 
-    /** Above the bar, holding the terminal keys while the chevron has them open. */
-    private final FrameLayout keysRow;
-    /** Floats over the terminal; the parent frame positions it over {@link #slot}. */
+    /** The typing box: present only while the keyboard is up. */
     private final EditText field;
-    /** What the activity floats over the terminal: the field. */
+    /** What the activity floats at the terminal's bottom: the box with its mic and send. */
     private final LinearLayout stack;
-    /** The outbox's messages for this pane, counted on Enter's badge. */
-    private java.util.List<Outbox.Message> queuedMessages = java.util.Collections.emptyList();
-    private TextView queueBadge;
-    /** Floats over the terminal straight above Enter; the activity adds it to the same frame. */
+    private final ImageView send;
     private final MicButton mic;
-    /** Recording lengths of clips dictated this run, for their chips in the draft. */
+    private final FloatingCluster cluster;
+    /** The terminal keys, floated above the prompt while open. */
+    private final KeysOverlay keysOverlay;
+    /** Recording lengths of clips dictated this run, for their chips. */
     private final java.util.Map<String, Long> clipLengths = new java.util.HashMap<>();
     private GpuiChrome chrome;
 
+    /** A shell's bar: pinned controls, keys, Enter. Gone on an agent's pane. */
     private LinearLayout bar;
-    private View pinned;
-    private View keyStrip;
     private FrameLayout slot;
-    private ImageButton chevron;
-    private View enterBox;
+    private View keyStrip;
 
+    /** The pane's program kind: "claude", "codex", another agent's, or "" for a shell. */
+    private String kind = "";
     private boolean agent;
+    /** The typing box is open (the keyboard was asked for). */
+    private boolean typing;
+    /** The keyboard has shown since typing began, so its hiding ends typing. */
+    private boolean imeShown;
     private boolean keysOpen;
+    /** Something (the file page) lies over the terminal: nothing floats over it. */
+    private boolean covered;
+    private List<Outbox.Message> queuedMessages = Collections.emptyList();
+    private ClusterPlacement.Hint layout;
+    private ClusterPlacement.Spot spot;
+    /** The ghost JSON last handed over, so an unchanged one is not sent again. */
+    private String lastGhost = "";
     private DictationEngine.State dictationState = DictationEngine.State.IDLE;
     /** Enter was pressed while listening: send the utterance once it is final. */
     private boolean sendWhenFinal;
@@ -114,26 +138,62 @@ final class ComposerBar {
         this.host = host;
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        keysOpen = preferences.getBoolean(KEYS_OPEN, false);
         drafts.restore(preferences.getString(DRAFTS, ""));
-        keysRow = new FrameLayout(context);
+        mic = new MicButton(context, chrome, v -> toggleDictation(), FloatingCluster.SIZE, host::notice);
+        cluster = new FloatingCluster(context, chrome, mic.view(), new FloatingCluster.Actions() {
+            @Override public void keyboard() { startTyping(); }
+            @Override public void enter() { ComposerBar.this.enter(); }
+            @Override public void keys() { setKeysOpen(!keysOpen); }
+            @Override public void queue() { if (!queuedMessages.isEmpty()) host.showQueue(queuedMessages); }
+            @Override public void pane(int step) { host.switchPane(step); }
+        });
+        cluster.view().setVisibility(View.GONE);
+        cluster.view().addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (r - l != or - ol || b - t != ob - ot) v.post(this::place);
+        });
         field = createField();
+        send = new ImageView(context);
+        send.setImageResource(R.drawable.ic_bar_enter);
+        send.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        send.setPadding(dp(8), dp(8), dp(8), dp(8));
+        send.setContentDescription("Send");
+        send.setOnClickListener(v -> enter());
         stack = new LinearLayout(context);
-        stack.setOrientation(LinearLayout.VERTICAL);
-        stack.addView(field, new LinearLayout.LayoutParams(-1, -2));
+        stack.setOrientation(LinearLayout.HORIZONTAL);
+        stack.setGravity(Gravity.BOTTOM);
+        stack.setPadding(dp(6), dp(4), dp(6), dp(4));
+        stack.addView(field, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(40), dp(40));
+        sendParams.setMarginStart(dp(4));
+        sendParams.bottomMargin = dp(4);
+        stack.addView(send, sendParams);
         stack.setVisibility(View.GONE);
-        mic = new MicButton(context, chrome, v -> toggleDictation());
-        mic.view().setVisibility(View.GONE);
+        keysOverlay = new KeysOverlay(context);
+        keysOverlay.setVisibility(View.GONE);
+        style(chrome);
     }
 
-    /** The floating mic; the activity adds it to the frame that holds {@link #field}. */
-    View mic() { return mic.view(); }
+    /** The typing box, floated at the bottom of the terminal's frame (over the keyboard). */
+    View field() { return stack; }
+
+    /** The floating chip; the activity adds it to the frame over the terminal. */
+    View cluster() { return cluster.view(); }
+
+    /** The terminal keys' overlay; the activity adds it to the frame over the terminal. */
+    View keysOverlay() { return keysOverlay; }
+
+    /** Whether {@code kind} (a pane's program, lowercase) gets the composer: any agent, not a shell. */
+    static boolean isAgent(String kind) {
+        return kind != null && !kind.isEmpty() && !SHELLS.contains(kind);
+    }
 
     /** Recordings waiting for the desktop, counted on the mic; their lengths label their chips. */
     void setWaiting(int count) {
         for (PendingClip clip : Dictation.pending(context).waiting()) clipLengths.put(clip.id, clip.durationMs);
         mic.setWaiting(count);
         DraftChips.apply(field.getText(), chip());
+        lastGhost = "";
+        pushGhost();
     }
 
     /**
@@ -156,25 +216,19 @@ final class ComposerBar {
         persist();
     }
 
-    /** The renderer's latest report of where the screen is busy (ClusterPlacement). */
-    private ClusterPlacement.Hint layout;
-
     /** Where the drawn screen is busy, from the renderer after a paint that changed it. */
     void layoutHint(String json) {
         ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json);
-        if (hint != null) layout = hint;
+        if (hint == null) return;
+        layout = hint;
+        place();
     }
 
-    /** The collapsible keys row; the activity places it directly above the bar. */
-    View keysRow() { return keysRow; }
-
-    /** The floating composer field; the activity adds it to a frame over the terminal column. */
-    View field() { return stack; }
-
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
-    void showQueued(java.util.List<Outbox.Message> messages) {
+    void showQueued(List<Outbox.Message> messages) {
         queuedMessages = messages;
-        updateQueueBadge();
+        cluster.setQueued(messages);
+        pushGhost();
     }
 
     /** A queued message taken back: its text joins the draft, on a line of its own. */
@@ -187,25 +241,20 @@ final class ComposerBar {
     }
 
     /**
-     * Builds the 48 dp bar: the toolbar's pinned controls, the middle slot
-     * (the composer, or a shell's keys), the keys chevron and Enter, which
-     * closes the bar so nothing sits dead beyond it.
+     * A shell's 48 dp bar: the toolbar's pinned controls, the keys and Enter.
+     * Built for every pane; hidden on an agent's, whose terminal takes its row.
      */
     View bar(GpuiChrome chrome, View pinnedControls, View keys) {
-        this.chrome = chrome;
+        style(chrome);
         detach(keyStrip);
-        pinned = pinnedControls;
         keyStrip = keys;
         bar = new LinearLayout(context);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(chrome.surface);
-        bar.addView(pinned, new LinearLayout.LayoutParams(-2, dp(48)));
+        bar.addView(pinnedControls, new LinearLayout.LayoutParams(-2, dp(48)));
         slot = new FrameLayout(context);
-        slot.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> v.post(this::placeField));
         bar.addView(slot, new LinearLayout.LayoutParams(0, dp(48), 1));
-        chevron = icon(R.drawable.ic_bar_expand, "Keys", v -> setKeysOpen(!keysOpen));
-        bar.addView(chevron);
         Button enter = new Button(context);
         enter.setText("Enter");
         enter.setTextSize(13);
@@ -220,36 +269,20 @@ final class ComposerBar {
         enter.setStateListAnimator(null);
         enter.setFocusable(false);
         enter.setSaveEnabled(false);
-        enter.setContentDescription("Enter: send the draft, or press Enter in the terminal");
-        enter.setOnClickListener(v -> enter());
-        enter.setOnLongClickListener(v -> {
-            if (queuedMessages.isEmpty()) return false;
-            host.showQueue(queuedMessages);
-            return true;
-        });
-        // The queue's count rides on Enter's corner, so queued messages cost
-        // no line over the terminal; it overhangs into the bar's own padding.
-        FrameLayout enterBox = new FrameLayout(context);
-        this.enterBox = enterBox;
-        enterBox.setClipChildren(false);
-        enterBox.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> v.post(this::placeMic));
-        enterBox.addView(enter, new FrameLayout.LayoutParams(-2, dp(48)));
-        queueBadge = createQueueBadge();
-        enterBox.addView(queueBadge, new FrameLayout.LayoutParams(-2, dp(18), Gravity.TOP | Gravity.START));
-        bar.setClipChildren(false);
+        enter.setContentDescription("Enter");
+        enter.setOnClickListener(v -> host.enterKey());
         LinearLayout.LayoutParams enterParams = new LinearLayout.LayoutParams(-2, dp(48));
         enterParams.setMargins(dp(2), 0, dp(6), 0);
-        bar.addView(enterBox, enterParams);
-        keysRow.setBackgroundColor(chrome.surface);
-        styleField();
-        updateQueueBadge();
-        mic.style(chrome);
+        bar.addView(enter, enterParams);
         apply();
         return bar;
     }
 
-    /** The pane on screen changed, or what it runs did. Only agents get the composer. */
-    void setPane(String paneId, boolean agentPane) {
+    /**
+     * The pane on screen changed, or what it runs did. {@code paneKind} is the
+     * program's kind ("claude", "codex", another agent's), or "" for a shell.
+     */
+    void setPane(String paneId, String paneKind) {
         boolean switched = !drafts.pane().equals(paneId == null ? "" : paneId);
         if (switched && dictationState == DictationEngine.State.OFFLINE_RECORDING) {
             // Keep the recording: its text finds its pane's draft later, by target.
@@ -264,21 +297,55 @@ final class ComposerBar {
             drafts.dictationEnded();
         }
         String text = drafts.switchTo(paneId);
-        if (switched) showText(text);
-        if (agentPane == agent && !switched) return;
-        agent = agentPane;
+        if (switched) {
+            keysOpen = false;
+            spot = null;
+            showText(text);
+        }
+        String next = paneKind == null ? "" : paneKind;
+        if (next.equals(kind) && !switched) return;
+        kind = next;
+        agent = isAgent(kind);
+        if (!agent && typing) stopTyping();
         apply();
     }
 
-    /** Physical keys go to the field, not the terminal, while it is being typed in. */
+    /**
+     * A tap on the terminal. On an agent's pane it opens the typing box (true);
+     * elsewhere the terminal's own keyboard is the caller's to show (false).
+     */
+    boolean terminalTapped() {
+        if (!agent) return false;
+        startTyping();
+        return true;
+    }
+
+    /** The file page opened or closed over the terminal. */
+    void setCovered(boolean coveredNow) {
+        if (covered == coveredNow) return;
+        covered = coveredNow;
+        apply();
+    }
+
+    /** The keyboard showed or hid; hiding it closes the typing box, the text stays as ghost text. */
+    void imeVisible(boolean visible) {
+        if (visible) {
+            if (typing) imeShown = true;
+            return;
+        }
+        if (typing && imeShown) stopTyping();
+    }
+
+    /** Physical keys go to the box, not the terminal, while it is being typed in. */
     boolean ownsKeys() {
-        return field.getVisibility() == View.VISIBLE && field.hasFocus();
+        return typing && field.hasFocus();
     }
 
     void destroy() {
         dictation.cancel();
         mic.destroy();
         persist();
+        host.setGhost("");
     }
 
     /** Saves the drafts now (the activity is stopping: the process may be killed next). */
@@ -299,91 +366,146 @@ final class ComposerBar {
         field.postDelayed(saveDrafts, SAVE_DRAFTS_MS);
     }
 
-    private void setKeysOpen(boolean open) {
-        keysOpen = open;
-        preferences.edit().putBoolean(KEYS_OPEN, open).apply();
-        apply();
-        mic.view().post(this::placeMic);
+    private void style(GpuiChrome next) {
+        chrome = next;
+        cluster.style(chrome);
+        mic.style(chrome);
+        field.setTextColor(chrome.onSurface);
+        field.setHintTextColor(chrome.onSurfaceVariant);
+        GradientDrawable box = new GradientDrawable();
+        box.setColor(chrome.control);
+        box.setStroke(Math.max(1, dp(1)), chrome.outline);
+        box.setCornerRadius(dp(10));
+        field.setBackground(new android.graphics.drawable.InsetDrawable(box, 0, dp(4), 0, dp(4)));
+        field.setPadding(dp(10), dp(8), dp(10), dp(8));
+        stack.setBackgroundColor(chrome.surface);
+        send.setImageTintList(ColorStateList.valueOf(chrome.onSurface));
+        GradientDrawable round = new GradientDrawable();
+        round.setShape(GradientDrawable.OVAL);
+        round.setColor(chrome.control);
+        send.setBackground(round);
+        keysOverlay.setBackgroundColor(chrome.surface);
+        lastGhost = "";
+        pushGhost();
     }
 
-    /** Puts every part where the current mode wants it. No view changes height. */
-    private void apply() {
-        if (bar == null) return;
-        boolean composing = agent;
-        detach(keyStrip);
-        slot.removeAllViews();
-        keysRow.removeAllViews();
-        if (composing) {
-            if (keysOpen) keysRow.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
-        } else {
-            // A shell's keys are its main input: they stay in the bar itself.
-            slot.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
+    private void startTyping() {
+        if (!agent) return;
+        if (!typing) {
+            typing = true;
+            imeShown = false;
+            // The box shows the draft now; the ghost would only repeat it.
+            showText(drafts.text());
+            apply();
         }
-        keysRow.setVisibility(composing && keysOpen ? View.VISIBLE : View.GONE);
-        chevron.setVisibility(composing ? View.VISIBLE : View.GONE);
-        chevron.setRotation(keysOpen ? 180f : 0f);
-        String keys = keysOpen ? "Hide the terminal keys" : "Show Ctrl, Esc, Tab and the other terminal keys";
-        chevron.setContentDescription(keys);
-        chevron.setTooltipText(keys);
-        field.setVisibility(composing ? View.VISIBLE : View.GONE);
-        if (!composing && field.hasFocus()) field.clearFocus();
-        // Dictation lands in the draft, so the mic is only where a draft is;
-        // with no server configured there is nothing for it to do.
-        mic.view().setVisibility(composing && dictation.isAvailable() ? View.VISIBLE : View.GONE);
-        updateStack();
-        placeMic();
+        field.requestFocus();
+        field.setSelection(field.getText().length());
+        InputMethodManager input = context.getSystemService(InputMethodManager.class);
+        if (input != null) input.showSoftInput(field, InputMethodManager.SHOW_IMPLICIT);
     }
 
-    /** Shows the floating stack while it holds the field. */
-    private void updateStack() {
-        boolean shown = field.getVisibility() == View.VISIBLE;
-        stack.setVisibility(shown ? View.VISIBLE : View.GONE);
-        placeField();
+    private void stopTyping() {
+        if (!typing) return;
+        // Commit the keyboard's underlined word into the draft before closing.
+        BaseInputConnection.removeComposingSpans(field.getText());
+        drafts.edit(field.getText().toString());
+        typing = false;
+        imeShown = false;
+        if (field.hasFocus()) field.clearFocus();
+        apply();
+    }
+
+    private void setKeysOpen(boolean open) {
+        keysOpen = open && agent;
+        apply();
+    }
+
+    /** Puts every part where the pane and mode want it; only a shell's bar takes terminal rows. */
+    private void apply() {
+        if (bar != null) bar.setVisibility(agent ? View.GONE : View.VISIBLE);
+        if (keyStrip != null && slot != null) {
+            detach(keyStrip);
+            if (agent) {
+                if (keysOpen) keysOverlay.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
+            } else {
+                // A shell's keys are its main input: they stay in its bar.
+                slot.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
+            }
+        }
+        keysOverlay.setVisibility(agent && keysOpen && !covered ? View.VISIBLE : View.GONE);
+        boolean dictates = agent && dictation.isAvailable();
+        mic.view().setVisibility(dictates ? View.VISIBLE : View.GONE);
+        if (typing) {
+            if (mic.view().getParent() != stack) {
+                detach(mic.view());
+                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+                params.setMarginStart(dp(4));
+                params.bottomMargin = dp(6);
+                stack.addView(mic.view(), 1, params);
+            }
+        } else {
+            cluster.takeMic(mic.view());
+        }
+        stack.setVisibility(agent && typing ? View.VISIBLE : View.GONE);
+        cluster.view().setVisibility(agent && !typing && !covered ? View.VISIBLE : View.GONE);
+        place();
+        pushGhost();
     }
 
     /**
-     * Aligns the floating field with the slot, its bottom on the bar's bottom.
+     * Floats the chip on the lowest free cells at the terminal's bottom right
+     * and the keys just above the prompt (or a dialog), from the renderer's
+     * last layout hint. A new spot narrows the ghost text's rows under it.
      */
-    private void placeField() {
-        if (slot == null || !(stack.getParent() instanceof ViewGroup) || slot.getWidth() == 0) return;
-        ViewGroup frame = (ViewGroup) stack.getParent();
+    private void place() {
+        View surface = host.surface();
+        View chip = cluster.view();
+        if (layout == null || surface == null || !(chip.getParent() instanceof ViewGroup)) return;
+        ViewGroup frame = (ViewGroup) chip.getParent();
         int[] at = new int[2];
         int[] origin = new int[2];
-        slot.getLocationInWindow(at);
+        surface.getLocationInWindow(at);
         frame.getLocationInWindow(origin);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(slot.getWidth(), -2,
-                Gravity.BOTTOM | Gravity.START);
-        params.leftMargin = at[0] - origin[0];
-        params.bottomMargin = Math.max(0, origin[1] + frame.getHeight() - at[1] - slot.getHeight());
-        FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) stack.getLayoutParams();
-        if (old != null && old.width == params.width && old.leftMargin == params.leftMargin
-                && old.bottomMargin == params.bottomMargin && old.gravity == params.gravity) return;
-        stack.setLayoutParams(params);
+        float left = at[0] - origin[0], top = at[1] - origin[1];
+        if (chip.getVisibility() == View.VISIBLE) {
+            chip.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+            float width = (chip.getMeasuredWidth() + dp(INSET)) / density;
+            float height = (chip.getMeasuredHeight() + dp(INSET)) / density;
+            ClusterPlacement.Spot next = ClusterPlacement.place(layout, width, height, spot);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
+            params.leftMargin = Math.round(left + next.right * density - chip.getMeasuredWidth() - dp(INSET));
+            params.topMargin = Math.round(top + next.bottom * density - chip.getMeasuredHeight() - dp(INSET) / 2f);
+            FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) chip.getLayoutParams();
+            if (old == null || old.leftMargin != params.leftMargin || old.topMargin != params.topMargin
+                    || old.gravity != params.gravity) {
+                chip.setLayoutParams(params);
+            }
+            cluster.setCrowded(next.crowded);
+            boolean moved = !next.equals(spot);
+            spot = next;
+            if (moved) pushGhost();
+        }
+        if (keysOverlay.getVisibility() == View.VISIBLE) {
+            float guardTop = top + (layout.top + layout.guard * layout.cellHeight) * density;
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(48), Gravity.TOP | Gravity.START);
+            params.topMargin = Math.max(Math.round(top), Math.round(guardTop) - dp(48));
+            keysOverlay.setLayoutParams(params);
+        }
     }
 
-    /**
-     * Stacks the mic straight above Enter, over the terminal: its right edge on
-     * Enter's, its bottom a little above the bar (or the open keys row), so the
-     * thumb goes from speaking to sending in one column.
-     */
-    private void placeMic() {
-        View view = mic.view();
-        if (enterBox == null || !(view.getParent() instanceof ViewGroup) || enterBox.getWidth() == 0) return;
-        ViewGroup frame = (ViewGroup) view.getParent();
-        View top = keysRow.getVisibility() == View.VISIBLE && keysRow.getHeight() > 0 ? keysRow : enterBox;
-        int[] enterAt = new int[2];
-        int[] topAt = new int[2];
-        int[] origin = new int[2];
-        enterBox.getLocationInWindow(enterAt);
-        top.getLocationInWindow(topAt);
-        frame.getLocationInWindow(origin);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.END);
-        params.rightMargin = Math.max(0, origin[0] + frame.getWidth() - enterAt[0] - enterBox.getWidth());
-        params.bottomMargin = Math.max(0, origin[1] + frame.getHeight() - topAt[1]) + dp(8);
-        FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) view.getLayoutParams();
-        if (old != null && old.rightMargin == params.rightMargin && old.bottomMargin == params.bottomMargin
-                && old.gravity == params.gravity) return;
-        view.setLayoutParams(params);
+    /** Hands the renderer the pane's draft and queued messages, unless unchanged. */
+    private void pushGhost() {
+        String json = "";
+        if (agent) {
+            boolean clustered = spot != null && !spot.crowded && cluster.view().getVisibility() == View.VISIBLE;
+            json = GhostText.json(GhostText.kind(kind), typing ? "" : drafts.text(),
+                    typing ? -1 : drafts.partialFrom(), clipLengths, queuedMessages, drafts.pane(),
+                    clustered ? spot.cols + 1 : 0, clustered ? spot.topRow : Integer.MAX_VALUE / 2,
+                    GhostText.Colors.of(chrome));
+        }
+        if (json.equals(lastGhost)) return;
+        lastGhost = json;
+        host.setGhost(json);
     }
 
     private EditText createField() {
@@ -440,59 +562,7 @@ final class ComposerBar {
                 saveDraftsSoon();
             }
         });
-        edit.setVisibility(View.GONE);
         return edit;
-    }
-
-    private void styleField() {
-        field.setTextColor(chrome.onSurface);
-        field.setHintTextColor(chrome.onSurfaceVariant);
-        GradientDrawable box = new GradientDrawable();
-        box.setColor(chrome.control);
-        box.setStroke(Math.max(1, dp(1)), chrome.outline);
-        box.setCornerRadius(dp(10));
-        field.setBackground(new android.graphics.drawable.InsetDrawable(box, 0, dp(4), 0, dp(4)));
-        field.setPadding(dp(10), dp(8), dp(10), dp(8));
-    }
-
-    private TextView createQueueBadge() {
-        TextView badge = new TextView(context);
-        badge.setTextSize(11);
-        badge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        badge.setGravity(Gravity.CENTER);
-        badge.setIncludeFontPadding(false);
-        badge.setMinWidth(dp(18));
-        badge.setPadding(dp(5), 0, dp(5), 0);
-        badge.setTranslationX(-dp(6));
-        badge.setTranslationY(-dp(1));
-        badge.setOnClickListener(v -> host.showQueue(queuedMessages));
-        badge.setVisibility(View.GONE);
-        return badge;
-    }
-
-    /** Enter's corner: how many messages wait for this pane, in the most pressing one's colour. */
-    private void updateQueueBadge() {
-        if (queueBadge == null) return;
-        String count = QueuedMessages.badge(queuedMessages.size());
-        queueBadge.setVisibility(count.isEmpty() ? View.GONE : View.VISIBLE);
-        if (count.isEmpty()) return;
-        int color;
-        switch (QueuedMessages.urgency(queuedMessages)) {
-            case GONE: color = chrome.danger; break;
-            case WAITING: color = chrome.warning; break;
-            case SENDING: color = chrome.info; break;
-            default: color = chrome.primary;
-        }
-        GradientDrawable pill = new GradientDrawable();
-        pill.setColor(color);
-        pill.setCornerRadius(dp(9));
-        pill.setStroke(dp(2), chrome.surface);
-        queueBadge.setBackground(pill);
-        queueBadge.setTextColor(chrome.light ? 0xffffffff : chrome.background);
-        queueBadge.setText(count);
-        String label = QueuedMessages.title(queuedMessages.size()) + "; tap to list";
-        queueBadge.setContentDescription(label);
-        queueBadge.setTooltipText(label);
     }
 
     /** A session runs: IDLE and PENDING both mean none does. */
@@ -522,6 +592,7 @@ final class ComposerBar {
 
     private void startDictation() {
         if (!agent || dictating()) return;
+        if (typing) drafts.edit(field.getText().toString());
         drafts.dictationStarted();
         final String pane = drafts.pane();
         dictation.start(pane, new DictationEngine.Listener() {
@@ -579,7 +650,7 @@ final class ComposerBar {
             sendWhenFinal = true;
             return;
         }
-        if (agent && field.getVisibility() == View.VISIBLE) {
+        if (typing) {
             // Commit the keyboard's underlined word into the draft before reading it.
             BaseInputConnection.removeComposingSpans(field.getText());
             InputMethodManager input = context.getSystemService(InputMethodManager.class);
@@ -597,6 +668,7 @@ final class ComposerBar {
         showText("");
     }
 
+    /** The draft changed under us (dictation, a pane switch): the box and the ghost follow. */
     private void showText(String text) {
         saveDraftsSoon();
         if (!field.getText().toString().equals(text)) {
@@ -609,27 +681,13 @@ final class ComposerBar {
             }
         }
         DraftChips.apply(field.getText(), chip());
+        pushGhost();
     }
 
-    /** How a waiting dictation's token reads in the field. */
+    /** How a waiting dictation's token reads in the box. */
     private DraftChips.Style chip() {
         return new DraftChips.Style(chrome.warning, density, clipLengths,
                 context.getDrawable(R.drawable.ic_bar_schedule));
-    }
-
-    private ImageButton icon(int drawable, String label, View.OnClickListener action) {
-        ImageButton button = new ImageButton(context);
-        button.setImageResource(drawable);
-        button.setImageTintList(ColorStateList.valueOf(chrome.onSurface));
-        button.setBackground(fill(0x00000000, 12, dp(4)));
-        button.setScaleType(android.widget.ImageView.ScaleType.CENTER);
-        button.setContentDescription(label);
-        button.setTooltipText(label);
-        button.setFocusable(false);
-        button.setSaveEnabled(false);
-        button.setOnClickListener(action);
-        button.setLayoutParams(new LinearLayout.LayoutParams(dp(44), dp(48)));
-        return button;
     }
 
     private android.graphics.drawable.Drawable fill(int color, int radiusDp, int inset) {
@@ -650,4 +708,32 @@ final class ComposerBar {
     }
 
     private int dp(float value) { return Math.round(value * density); }
+
+    /** The keys' overlay: a swipe down on it closes it; sideways drags scroll the keys. */
+    private final class KeysOverlay extends FrameLayout {
+        private final int slop = ViewConfiguration.get(context).getScaledTouchSlop();
+        private float downX, downY;
+
+        KeysOverlay(Context context) { super(context); }
+
+        @Override public boolean onInterceptTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                downX = event.getX();
+                downY = event.getY();
+                return false;
+            }
+            if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                float dx = event.getX() - downX, dy = event.getY() - downY;
+                return dy > slop * 2 && dy > Math.abs(dx);
+            }
+            return false;
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP && event.getY() - downY > dp(20)) {
+                setKeysOpen(false);
+            }
+            return true;
+        }
+    }
 }

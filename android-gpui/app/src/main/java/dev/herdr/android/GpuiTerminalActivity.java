@@ -325,6 +325,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 android.graphics.Insets bounds = insets.getInsets(WindowInsets.Type.systemBars()
                         | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
                 view.setPadding(bounds.left, bounds.top, bounds.right, bounds.bottom);
+                if (composer != null) composer.imeVisible(insets.isVisible(WindowInsets.Type.ime()));
             } else {
                 // Pre-R edge-to-edge uses adjustResize for IME and stable bars for our padding.
                 view.setPadding(insets.getStableInsetLeft(), insets.getStableInsetTop(),
@@ -356,7 +357,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabStrip.setGravity(android.view.Gravity.CENTER_VERTICAL);
         tabStrip.setPadding(dp(6), 0, dp(6), 0);
         tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
-        content.addView(tabScroll, new LinearLayout.LayoutParams(-1, dp(30)));
+        // An agent's pane has no bottom bar: the strip's end holds what the bar's
+        // buttons did (panes, hosts, view, session, close).
+        tabRow = new LinearLayout(this);
+        tabRow.setOrientation(LinearLayout.HORIZONTAL);
+        tabRow.addView(tabScroll, new LinearLayout.LayoutParams(0, -1, 1));
+        ImageButton tabMenu = iconButton(R.drawable.ic_bar_more, "More", "Panes, hosts and terminal actions",
+                view -> showMoreActions(view, true));
+        tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
+        content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
         // Where this window is: machine › repo › worktree › window, and why
         // it wants Wolf. Tapping it shows the window's row in the rail.
         crumb = new TextView(this);
@@ -384,17 +393,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         composer = new ComposerBar(this, chrome, Dictation.create(this), composerHost());
         Dictation.pending(this).setListener(pendingDictations);
         composer.setWaiting(Dictation.pending(this).count());
-        content.addView(composer.keysRow(), new LinearLayout.LayoutParams(-1, dp(48)));
         shortcutBar = createShortcutBar();
         content.addView(shortcutBar, new LinearLayout.LayoutParams(-1, dp(48)));
         // The composer floats over this column, so a growing draft never resizes the pane.
         FrameLayout column = new FrameLayout(this);
         column.addView(content, new FrameLayout.LayoutParams(-1, -1));
-        // Zero width until the bar is laid out and the composer aligns it to its slot.
-        column.addView(composer.field(), new FrameLayout.LayoutParams(0, -2, android.view.Gravity.BOTTOM));
-        // The one dictation control floats above Enter; the composer places it.
-        column.addView(composer.mic(), new FrameLayout.LayoutParams(-2, -2,
-                android.view.Gravity.BOTTOM | android.view.Gravity.END));
+        // On an agent's pane: the keys above its prompt, the chip of keyboard,
+        // mic and Enter clear of its caret, and the typing box on the keyboard.
+        // The composer places each from the renderer's layout hints.
+        column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
+        // Bottom right until the renderer's first hint places it.
+        FrameLayout.LayoutParams chipAt = new FrameLayout.LayoutParams(-2, -2,
+                android.view.Gravity.BOTTOM | android.view.Gravity.END);
+        chipAt.setMargins(0, 0, dp(4), dp(4));
+        column.addView(composer.cluster(), chipAt);
+        filePager.setOnShownChanged(() -> composer.setCovered(filePager.showingFile()));
+        column.addView(composer.field(), new FrameLayout.LayoutParams(-1, -2, android.view.Gravity.BOTTOM));
         // The sidebar rail mirrors the desktop's list of workspaces and agents.
         sidebar = new LinearLayout(this);
         sidebar.setOrientation(LinearLayout.HORIZONTAL);
@@ -848,7 +862,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // A compact bar keeps frequent controls and the keys in view; the
             // rest live in one overflow menu, as platform toolbars do.
             pinned.addView(iconButton(R.drawable.ic_bar_more, "More",
-                    "More terminal actions", this::showMoreActions));
+                    "More terminal actions", view -> showMoreActions(view, false)));
         } else {
             pinned.addView(iconButton(R.drawable.ic_bar_view, "View",
                     "Terminal display and keyboard options", view -> showDisplayOptions()));
@@ -990,17 +1004,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** Actions a compact toolbar keeps out of view, with the labels the wide one tooltips. */
-    private void showMoreActions(View anchor) {
+    /** The overflow menu; {@code navigation} adds panes and hosts, for an agent's barless pane. */
+    private void showMoreActions(View anchor, boolean navigation) {
         android.content.Context themed = new android.view.ContextThemeWrapper(this, chrome.popupTheme());
         android.widget.PopupMenu menu = new android.widget.PopupMenu(themed, anchor);
         ColorStateList tint = ColorStateList.valueOf(themeColor(themed, android.R.attr.textColorPrimary));
         menu.getMenu().add(0, 1, 0, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
         menu.getMenu().add(0, 2, 1, "Session actions").setIcon(R.drawable.ic_bar_session).setIconTintList(tint);
         menu.getMenu().add(0, 3, 2, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
+        if (navigation && !shellMode()) {
+            menu.getMenu().add(0, 4, -2, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
+            menu.getMenu().add(0, 5, -1, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts).setIconTintList(tint);
+        }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
             if (item.getItemId() == 1) showDisplayOptions();
             else if (item.getItemId() == 2) showSessionActions();
+            else if (item.getItemId() == 4) showPanes();
+            else if (item.getItemId() == 5) toggleSidebar();
             else finish();
             return true;
         });
@@ -2006,6 +2027,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** The pane the rail last scrolled into view. */
     private String revealedPane = "";
     private LinearLayout tabStrip;
+    /** The tab strip and its menu button. */
+    private LinearLayout tabRow;
     private String tabSignature = "";
     /** The tab the strip last scrolled to, so a refresh does not scroll it again. */
     private String tabActive = "";
@@ -2017,11 +2040,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { current = connection; }
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
-            composer.setPane(current == null ? "" : current.paneId, "claude".equals(kind) || "codex".equals(kind));
+            composer.setPane(current == null ? "" : current.paneId, kind);
             refreshQueued();
         }
         boolean show = current != null && !shellMode() && current.tabs != null;
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
+        // The menu stays wherever the bar is gone, tabs or not.
+        if (tabRow != null) tabRow.setVisibility(current != null && !shellMode() ? View.VISIBLE : View.GONE);
         if (!show) return;
         String space = "", paneTab = "";
         JSONArray panes = current.panes;
@@ -2085,6 +2110,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String id = item[0], status = item[2];
             boolean focused = !item[3].isEmpty();
             TextView pill = tabPill(item[1], focused, status);
+            pill.setTag(focused ? PANE_PILL_ACTIVE : PANE_PILL);
             final Connection target = current;
             final String tabSpace = space, tabLabel = item[1];
             pill.setOnClickListener(v -> { if (!focused) focusChrome(target, "tab", id); });
@@ -2139,6 +2165,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             boolean focused = item.id.equals(current.paneId);
             String label = ("worker".equals(item.role) ? "" : "pm".equals(item.role) ? "PM·" : "Deacon·") + item.label;
             TextView pill = tabPill(label, focused, item.status);
+            pill.setTag(focused ? PANE_PILL_ACTIVE : PANE_PILL);
             final Connection target = current;
             pill.setOnClickListener(v -> { if (!focused) focusRemotePane(target, item.id); });
             pill.setContentDescription((strip.mode.equals("pm") ? strip.name + ": " : "") + label
@@ -2259,6 +2286,31 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** One tab: the active one raised with an outline, the rest quiet on black. */
+    /** Tags on the strip's pane pills, so a swipe on the chip steps through them. */
+    private static final String PANE_PILL = "pane-pill", PANE_PILL_ACTIVE = "pane-pill-active";
+
+    /**
+     * Shows the pill {@code step} places from the current one in the tab strip
+     * (the chip's sideways swipe). It stops at either end: other machines are
+     * in the rail.
+     */
+    private void switchPane(int step) {
+        if (tabStrip == null || step == 0) return;
+        int count = tabStrip.getChildCount();
+        int active = -1;
+        for (int i = 0; i < count; i++) {
+            if (PANE_PILL_ACTIVE.equals(tabStrip.getChildAt(i).getTag())) active = i;
+        }
+        if (active < 0) return;
+        for (int i = active + Integer.signum(step); i >= 0 && i < count; i += Integer.signum(step)) {
+            View pill = tabStrip.getChildAt(i);
+            if (PANE_PILL.equals(pill.getTag())) {
+                pill.callOnClick();
+                return;
+            }
+        }
+    }
+
     private TextView tabPill(String label, boolean active, String status) {
         TextView pill = new TextView(this);
         android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
@@ -3899,6 +3951,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void showQueue(java.util.List<Outbox.Message> messages) { queueSheet(messages); }
 
+            @Override public void setGhost(String json) {
+                if (!hostStarted) return;
+                try {
+                    nativeSetGhost(json);
+                } catch (IllegalArgumentException refused) {
+                    // A ghost the renderer refuses is not drawn; the draft itself is kept.
+                }
+            }
+
+            @Override public void switchPane(int step) { GpuiTerminalActivity.this.switchPane(step); }
+
+            @Override public View surface() { return terminalSurface; }
+
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -4163,7 +4228,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 synchronized (stateLock) { target = connection; }
                 // After the tap itself reaches the renderer: its focus handling
                 // would otherwise hide the keyboard this just asked for.
-                if (target != null && target.ready && terminalSurface != null) {
+                // An agent's pane types into the composer's box instead.
+                boolean composing = composer != null && composer.terminalTapped();
+                if (!composing && target != null && target.ready && terminalSurface != null) {
                     final long generation = target.generation;
                     terminalSurface.postDelayed(() -> {
                         // A tapped file link opened the file page instead.
@@ -4565,7 +4632,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * caret, ghost text and dialogs. Any thread.
      */
     public void gpuiLayoutHint(long expectedGeneration, String json) {
-        runOnUiThread(() -> {
+        // Posted, never run inline: Rust calls this from inside a paint, and the
+        // composer answers with ghost text, which must not re-enter that frame.
+        main.post(() -> {
             synchronized (stateLock) {
                 if (destroyed || connection == null || connection.generation != expectedGeneration) return;
             }

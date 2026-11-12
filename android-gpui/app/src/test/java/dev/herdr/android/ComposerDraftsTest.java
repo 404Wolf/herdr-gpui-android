@@ -47,6 +47,21 @@ public final class ComposerDraftsTest {
     }
 
     @Test
+    public void thePartialStartsAfterTheSettledDraft() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        drafts.edit("Fix");
+        assertEquals(-1, drafts.partialFrom());
+        drafts.dictationStarted();
+        assertEquals(-1, drafts.partialFrom());
+        drafts.dictationPartial("the bug");
+        assertEquals(4, drafts.partialFrom());
+        assertEquals("the bug", drafts.text().substring(drafts.partialFrom()));
+        drafts.dictationFinal("the bug");
+        assertEquals(-1, drafts.partialFrom());
+    }
+
+    @Test
     public void anEndedUtteranceKeepsItsLastPartial() {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.switchTo("a");
