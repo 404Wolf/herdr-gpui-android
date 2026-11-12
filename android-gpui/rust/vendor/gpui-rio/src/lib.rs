@@ -8,6 +8,7 @@
 mod adapter;
 mod error;
 pub mod ghost;
+pub mod glyphs;
 mod keys;
 #[doc(hidden)]
 pub mod links;

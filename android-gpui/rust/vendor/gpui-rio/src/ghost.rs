@@ -130,7 +130,9 @@ pub fn locate(
     for prompt_row in (row.saturating_sub(MAX_INPUT_ROWS)..=row).rev() {
         let cells = &rows[prompt_row];
         let at = |i: usize| cells.get(i).copied().unwrap_or(' ');
-        if glyphs.contains(&at(0)) && at(1) == ' ' {
+        // Claude Code follows its glyph with a no-break space (U+00A0), so
+        // any whitespace counts, there and in the indent below.
+        if glyphs.contains(&at(0)) && at(1).is_whitespace() {
             // The caret sits after the glyph, never on it.
             return (prompt_row < row || col >= 2).then_some(Anchor {
                 prompt_row,
@@ -140,7 +142,7 @@ pub fn locate(
             });
         }
         // Only wrapped input, indented under the prompt, lies between.
-        if !(at(0) == ' ' && at(1) == ' ') {
+        if !(at(0).is_whitespace() && at(1).is_whitespace()) {
             return None;
         }
     }
@@ -161,11 +163,10 @@ pub const HINT_ROWS: usize = 20;
 
 /// The most rows the draft may take; the rest is elided at the start.
 pub const MAX_DRAFT_ROWS: usize = 6;
-/// The most rows the strip takes when no prompt is on screen.
-pub const MAX_STRIP_ROWS: usize = 3;
-
 /// Where every ghost run goes on a `rows`×`cols` view: the draft from the
-/// caret (or a strip on the bottom rows) and the queued messages above it.
+/// caret and the queued messages above the prompt. Without a prompt on screen
+/// nothing is drawn: ghost text never covers what the program drew (the host
+/// shows the draft in its own controls instead).
 pub fn place(ghost: &Ghost, anchor: Option<Anchor>, rows: usize, cols: usize) -> Vec<Placed> {
     if rows == 0 || cols == 0 {
         return Vec::new();
@@ -221,33 +222,7 @@ pub fn place(ghost: &Ghost, anchor: Option<Anchor>, rows: usize, cols: usize) ->
             // Claude frames its prompt with a rule above; Codex leaves a blank row.
             anchor.prompt_row.saturating_sub(1)
         }
-        None => {
-            let has_draft = ghost.draft.iter().any(|s| !s.text.is_empty());
-            // The strip is on the bottom rows, under the controls if anywhere.
-            let lines = if has_draft {
-                let mut lines = wrap(&ghost.draft, 1, 1, &|_| width_of(rows - 1));
-                lines.retain(|line| !line.is_empty());
-                lines
-            } else {
-                Vec::new()
-            };
-            let lines = &lines[lines.len().saturating_sub(MAX_STRIP_ROWS)..];
-            let top = rows.saturating_sub(lines.len());
-            for (i, line) in lines.iter().enumerate() {
-                let mut col = 1;
-                for span in line {
-                    let len = span.text.chars().count();
-                    out.push(Placed {
-                        row: top + i,
-                        col,
-                        text: span.text.clone(),
-                        style: span.style,
-                    });
-                    col += len;
-                }
-            }
-            top
-        }
+        None => return Vec::new(),
     };
     let shown = ghost.echoes.len().min(echoes_bottom);
     for (i, echo) in ghost.echoes[ghost.echoes.len() - shown..]
@@ -579,24 +554,58 @@ mod tests {
     }
 
     #[test]
-    fn without_a_prompt_the_draft_takes_a_strip_at_the_bottom() {
+    fn without_a_prompt_nothing_is_drawn_over_the_program() {
         let rows = screen(CLAUDE, 40);
+        let mut g = ghost(vec![text("no wait, keep the build dir")]);
+        g.echoes = vec![vec![text("❯ queued")]];
+        assert!(place(&g, None, rows.len(), 40).is_empty());
+    }
+
+    // Wolf's screen (Claude Code 2.1.319, vim mode, 74 columns): the prompt
+    // glyph is followed by a no-break space, the status line is the last
+    // row, and the cursor sits after the glyph. The draft must go on the
+    // prompt row, never on the status line below it.
+    #[test]
+    fn claudes_no_break_space_after_its_glyph_still_reads_as_the_prompt() {
+        let rows = screen(
+            &[
+                "✻ Brewed for 3s · done 11:35 AM",
+                "",
+                "──────────────────────────────────────────",
+                "❯\u{a0}",
+                "──────────────────────────────────────────",
+                "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            ],
+            74,
+        );
+        let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+        assert_eq!(
+            anchor,
+            Some(Anchor {
+                prompt_row: 3,
+                row: 3,
+                col: 2,
+                indent: 2
+            })
+        );
         let placed = place(
-            &ghost(vec![text("no wait, keep the build dir")]),
-            None,
+            &ghost(vec![text("Testing, this is a test.")]),
+            anchor,
             rows.len(),
-            40,
+            74,
         );
         assert_eq!(
             placed,
             vec![Placed {
-                row: 6,
-                col: 1,
-                text: "no wait, keep the build dir".into(),
+                row: 3,
+                col: 2,
+                text: "Testing, this is a test.".into(),
                 style: GhostStyle::Text
             }]
         );
-        assert!(place(&ghost(Vec::new()), None, rows.len(), 40).is_empty());
+        // Wrapped input under it may be indented with no-break spaces too.
+        let wrapped = screen(&["❯\u{a0}one two", "\u{a0}\u{a0}three"], 74);
+        assert!(locate(&wrapped, Some((1, 7)), PromptKind::Claude).is_some());
     }
 
     #[test]

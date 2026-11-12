@@ -105,6 +105,11 @@ final class ComposerBar {
     private final KeysOverlay keysOverlay;
     /** In the keys' overlay: the keyboard typing straight into the program. */
     private final ImageView raw;
+    /**
+     * The draft, above the chip, when the renderer finds no prompt to draw it
+     * at (a dialog, an unknown program): ghost text never covers the program.
+     */
+    private final android.widget.TextView fallback;
     /** Recording lengths of clips dictated this run, for their chips. */
     private final java.util.Map<String, Long> clipLengths = new java.util.HashMap<>();
     private GpuiChrome chrome;
@@ -182,6 +187,15 @@ final class ComposerBar {
         raw.setTooltipText("Type straight into the program");
         raw.setOnClickListener(v -> host.rawKeyboard());
         keysOverlay.addView(raw, new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.START));
+        fallback = new android.widget.TextView(context);
+        fallback.setTextSize(13);
+        fallback.setTypeface(android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE,
+                android.graphics.Typeface.ITALIC));
+        fallback.setMaxLines(3);
+        fallback.setEllipsize(android.text.TextUtils.TruncateAt.START);
+        fallback.setPadding(dp(8), dp(4), dp(8), dp(4));
+        fallback.setOnClickListener(v -> startTyping());
+        fallback.setVisibility(View.GONE);
         style(chrome);
     }
 
@@ -397,6 +411,12 @@ final class ComposerBar {
         round.setColor(chrome.control);
         send.setBackground(round);
         keysOverlay.setBackgroundColor(chrome.surface);
+        GradientDrawable label = new GradientDrawable();
+        label.setColor(chrome.surface);
+        label.setStroke(Math.max(1, dp(1)), chrome.outline);
+        label.setCornerRadius(dp(6));
+        fallback.setBackground(label);
+        fallback.setTextColor(chrome.onSurfaceVariant);
         raw.setImageTintList(ColorStateList.valueOf(chrome.primary));
         lastGhost = "";
         pushGhost();
@@ -501,6 +521,9 @@ final class ComposerBar {
             boolean moved = !next.equals(spot);
             spot = next;
             if (moved) pushGhost();
+            placeFallback(frame, params, chip.getMeasuredHeight());
+        } else {
+            fallback.setVisibility(View.GONE);
         }
         if (keysOverlay.getVisibility() == View.VISIBLE) {
             float guardTop = top + (layout.top + layout.guard * layout.cellHeight) * density;
@@ -508,6 +531,33 @@ final class ComposerBar {
             params.topMargin = Math.max(Math.round(top), Math.round(guardTop) - dp(48));
             keysOverlay.setLayoutParams(params);
         }
+    }
+
+    /** The draft above the chip while no prompt is found; gone otherwise. */
+    private void placeFallback(ViewGroup frame, FrameLayout.LayoutParams chipAt, int chipHeight) {
+        String draft = drafts.text();
+        boolean show = layout != null && !layout.anchored && !typing && !draft.trim().isEmpty();
+        if (!show) {
+            fallback.setVisibility(View.GONE);
+            return;
+        }
+        if (fallback.getParent() != frame) {
+            detach(fallback);
+            frame.addView(fallback);
+        }
+        android.text.SpannableString text = new android.text.SpannableString(draft.replace('\n', ' '));
+        DraftChips.apply(text, chip());
+        fallback.setText(text);
+        fallback.setVisibility(View.VISIBLE);
+        int width = Math.max(dp(80), frame.getWidth() - dp(16));
+        fallback.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.UNSPECIFIED);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
+        params.width = fallback.getMeasuredWidth();
+        int right = chipAt.leftMargin + cluster.view().getMeasuredWidth();
+        params.leftMargin = Math.max(dp(8), right - fallback.getMeasuredWidth());
+        params.topMargin = Math.max(0, chipAt.topMargin - fallback.getMeasuredHeight() - dp(4));
+        fallback.setLayoutParams(params);
     }
 
     /** Hands the renderer the pane's draft and queued messages, unless unchanged. */
@@ -699,6 +749,7 @@ final class ComposerBar {
         }
         DraftChips.apply(field.getText(), chip());
         pushGhost();
+        if (layout != null && !layout.anchored) place();
     }
 
     /** How a waiting dictation's token reads in the box. */
