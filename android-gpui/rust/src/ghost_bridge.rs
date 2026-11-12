@@ -4,17 +4,21 @@
 //! JSON: `{"kind":"claude"|"codex"|"other","reserve":N,"reserveFrom":ROW,
 //! "colors":{"text":RGB,"dim":RGB,"warn":RGB,"background":RGB},
 //! "draft":[{"t":"..","s":"text"|"partial"|"chip"}],
-//! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"}]]}`.
+//! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"}]],
+//! "controls":[{"id":"talk","spans":[{"t":"talk","s":"dim"|"bright"|"danger"|"info"|"warn"}]}]}`.
+//! Colours also take "bright", "danger" and "info".
 // The JNI entry points that call in here exist only on Android.
 #![cfg_attr(not(target_os = "android"), allow(dead_code, unused_imports))]
 use crate::{Error, Result};
-use gpui_rio::ghost::{Ghost, GhostColors, GhostSpan, GhostStyle, PromptKind};
+use gpui_rio::ghost::{Control, Ghost, GhostColors, GhostSpan, GhostStyle, PromptKind};
 use serde::Deserialize;
 
 /// The most text a ghost may carry; the composer's own bound is lower.
 const MAX_TEXT_BYTES: usize = 65_536;
 const MAX_SPANS: usize = 64;
 const MAX_ECHOES: usize = 8;
+const MAX_CONTROLS: usize = 4;
+const MAX_CONTROL_ID: usize = 16;
 /// Columns a host may keep clear; past this the draft would have no room.
 const MAX_RESERVE: usize = 64;
 
@@ -32,6 +36,15 @@ struct Wire {
     draft: Vec<WireSpan>,
     #[serde(default)]
     echoes: Vec<Vec<WireSpan>>,
+    #[serde(default)]
+    controls: Vec<WireControl>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireControl {
+    id: String,
+    spans: Vec<WireSpan>,
 }
 
 #[derive(Deserialize)]
@@ -41,6 +54,12 @@ struct WireColors {
     dim: u32,
     warn: u32,
     background: u32,
+    #[serde(default)]
+    bright: u32,
+    #[serde(default)]
+    danger: u32,
+    #[serde(default)]
+    info: u32,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +77,10 @@ fn span(wire: WireSpan, allowed: &[GhostStyle]) -> Result<GhostSpan> {
         "echo" => GhostStyle::Echo,
         "tag" => GhostStyle::Tag,
         "warn" => GhostStyle::Warn,
+        "dim" => GhostStyle::Dim,
+        "bright" => GhostStyle::Bright,
+        "danger" => GhostStyle::Danger,
+        "info" => GhostStyle::Info,
         _ => return Err(Error::InvalidCommand),
     };
     // Line breaks are drawn as spaces; other controls never reach the screen.
@@ -86,13 +109,27 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         "other" => PromptKind::Other,
         _ => return Err(Error::InvalidCommand),
     };
-    let spans = wire.draft.len() + wire.echoes.iter().map(Vec::len).sum::<usize>();
+    let control_spans = wire.controls.iter().map(|c| c.spans.len()).sum::<usize>();
+    let spans = wire.draft.len() + wire.echoes.iter().map(Vec::len).sum::<usize>() + control_spans;
     let bytes = wire
         .draft
         .iter()
         .chain(wire.echoes.iter().flatten())
+        .chain(wire.controls.iter().flat_map(|c| c.spans.iter()))
         .map(|s| s.t.len())
         .sum::<usize>();
+    if wire.controls.len() > MAX_CONTROLS
+        || wire.controls.iter().any(|c| {
+            c.id.is_empty()
+                || c.id.len() > MAX_CONTROL_ID
+                || !c
+                    .id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+    {
+        return Err(Error::InvalidCommand);
+    }
     if spans > MAX_SPANS
         || wire.echoes.len() > MAX_ECHOES
         || bytes > MAX_TEXT_BYTES
@@ -106,6 +143,13 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         GhostStyle::Tag,
         GhostStyle::Warn,
         GhostStyle::Chip,
+    ];
+    let control_styles = [
+        GhostStyle::Dim,
+        GhostStyle::Bright,
+        GhostStyle::Danger,
+        GhostStyle::Info,
+        GhostStyle::Warn,
     ];
     Ok(Ghost {
         kind,
@@ -123,6 +167,20 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
                     .collect::<Result<_>>()
             })
             .collect::<Result<_>>()?,
+        controls: wire
+            .controls
+            .into_iter()
+            .map(|c| {
+                Ok(Control {
+                    id: c.id,
+                    spans: c
+                        .spans
+                        .into_iter()
+                        .map(|s| span(s, &control_styles))
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect::<Result<_>>()?,
         reserve: wire.reserve,
         reserve_from: wire.reserve_from,
         colors: GhostColors {
@@ -130,6 +188,9 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
             dim: wire.colors.dim,
             warn: wire.colors.warn,
             background: wire.colors.background,
+            bright: wire.colors.bright,
+            danger: wire.colors.danger,
+            info: wire.colors.info,
         },
     })
 }
@@ -145,6 +206,13 @@ pub(crate) fn hint_json(hint: &gpui_rio::ghost::LayoutHint) -> String {
         "rows": hint.rows,
         "anchored": hint.anchored,
         "guard": hint.guard,
+        "targetsTop": hint.targets_top,
+        "draftShown": hint.draft_shown,
+        "controls": hint
+            .controls
+            .iter()
+            .map(|c| serde_json::json!({"id": c.id, "row": c.row, "start": c.start, "end": c.end}))
+            .collect::<Vec<_>>(),
         "busy": hint.busy,
         "busyFrom": hint.busy_from,
     })
@@ -197,6 +265,19 @@ mod tests {
         assert_eq!(ghost.draft[1].style, GhostStyle::Partial);
         assert_eq!(ghost.echoes[0][1].text, " queued");
         assert_eq!(ghost.colors.warn, 0xFFCB6B);
+        let with_controls = format!(
+            r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"● rec 0:06","s":"danger"}}]}},{{"id":"send","spans":[{{"t":"send","s":"bright"}},{{"t":"·2","s":"info"}}]}}]}}"#
+        );
+        let ghost = parse(&with_controls).expect("controls");
+        assert_eq!(ghost.controls[1].spans[1].style, GhostStyle::Info);
+        // A control's id is a short word; a draft style in a control is refused.
+        assert!(
+            parse(&format!(
+                r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"a b","spans":[]}}]}}"#
+            ))
+            .is_err()
+        );
+        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]}}"#)).is_err());
     }
 
     #[test]
@@ -245,11 +326,22 @@ mod tests {
             anchored: true,
             busy: vec![0, 12],
             busy_from: 38,
+            controls: vec![gpui_rio::ghost::PlacedControl {
+                id: "talk".into(),
+                row: 39,
+                start: 60,
+                end: 64,
+            }],
+            targets_top: 38,
+            draft_shown: false,
             guard: 1,
         };
         let value: serde_json::Value = serde_json::from_str(&hint_json(&hint)).expect("json");
         assert_eq!(value["cellHeight"], 15.0);
         assert_eq!(value["busy"][1], 12);
         assert_eq!(value["anchored"], true);
+        assert_eq!(value["controls"][0]["id"], "talk");
+        assert_eq!(value["controls"][0]["start"], 60);
+        assert_eq!(value["targetsTop"], 38);
     }
 }

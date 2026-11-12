@@ -404,6 +404,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // mic and Enter clear of its caret, and the typing box on the keyboard.
         // The composer places each from the renderer's layout hints.
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
+        column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
         // Bottom right until the renderer's first hint places it.
         FrameLayout.LayoutParams chipAt = new FrameLayout.LayoutParams(-2, -2,
                 android.view.Gravity.BOTTOM | android.view.Gravity.END);

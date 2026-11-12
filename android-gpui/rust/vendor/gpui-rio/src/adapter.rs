@@ -289,45 +289,44 @@ macro_rules! __bind_gpui {
                         window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(colors.background)));
                         let color = match run.style {
                             GhostStyle::Text | GhostStyle::Partial => colors.text,
-                            GhostStyle::Echo | GhostStyle::Tag => colors.dim,
+                            GhostStyle::Echo | GhostStyle::Tag | GhostStyle::Dim => colors.dim,
                             GhostStyle::Chip | GhostStyle::Warn => colors.warn,
+                            GhostStyle::Bright => colors.bright,
+                            GhostStyle::Danger => colors.danger,
+                            GhostStyle::Info => colors.info,
                         };
-                        let mut font = font.clone();
-                        if matches!(run.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Echo) {
-                            font.style = FontStyle::Italic;
+                        // One glyph per cell, in the terminal's own face (it has
+                        // no italic, and a fallback face would not keep the grid).
+                        for (i, c) in run.text.chars().enumerate() {
+                            if c == ' ' {
+                                continue;
+                            }
+                            let glyph = $crate::glyphs::stand_in(c).to_string();
+                            let text_run = TextRun {
+                                len: glyph.len(),
+                                font: font.clone(),
+                                color: hex(color),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let line = window.text_system().shape_line(glyph.into(), font_size, &[text_run], None);
+                            let cell_at = at + point(self.cell.width * i, px(0.));
+                            let _ = line.paint(cell_at, self.cell.height, TextAlign::Left, None, window, cx);
                         }
-                        let text_run = TextRun {
-                            len: run.text.len(),
-                            font,
-                            color: hex(color),
-                            background_color: None,
-                            underline: (run.style == GhostStyle::Partial).then_some(UnderlineStyle {
-                                color: Some(hex(colors.dim)),
-                                thickness: px(1.),
-                                wavy: false,
-                            }),
-                            strikethrough: None,
-                        };
-                        let line = window
-                            .text_system()
-                            .shape_line(run.text.clone().into(), font_size, &[text_run], None);
-                        let _ = line.paint(at, self.cell.height, TextAlign::Left, None, window, cx);
-                        if run.style == GhostStyle::Chip {
-                            // An outline marks the words still to come as one thing.
-                            let edge = px(1.);
-                            let box_bounds = Bounds::new(at + point(px(0.), px(1.)), size(width, self.cell.height - px(2.)));
-                            for side in [
-                                Bounds::new(box_bounds.origin, size(width, edge)),
-                                Bounds::new(box_bounds.bottom_left() - point(px(0.), edge), size(width, edge)),
-                                Bounds::new(box_bounds.origin, size(edge, box_bounds.size.height)),
-                                Bounds::new(box_bounds.top_right() - point(edge, px(0.)), size(edge, box_bounds.size.height)),
-                            ] {
-                                window.paint_quad(fill(side, hex(colors.warn)));
+                        if run.style == GhostStyle::Partial {
+                            // Dotted: the words an engine may still revise.
+                            let mut x = px(0.);
+                            while x < width {
+                                window.paint_quad(fill(
+                                    Bounds::new(at + point(x, self.cell.height - px(2.)), size(px(2.), px(1.))),
+                                    hex(colors.dim),
+                                ));
+                                x += px(4.);
                             }
                         }
-                        if anchor.is_some()
+                        if anchor.is_some_and(|a| run.row >= a.row)
                             && matches!(run.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip)
-                            && anchor.is_some_and(|a| run.row >= a.row)
                         {
                             caret = Some(at + point(width, px(0.)));
                         }
@@ -533,13 +532,14 @@ macro_rules! __bind_gpui {
                         .flatten();
                     let kind = self.ghost.as_ref().map_or(self.prompt_kind, |ghost| ghost.kind);
                     let anchor = $crate::ghost::locate(&screen, caret, kind);
-                    let placed = self
+                    let layout = self
                         .ghost
                         .as_ref()
-                        .map(|ghost| $crate::ghost::place(ghost, anchor, rows, cols))
+                        .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen))
                         .unwrap_or_default();
+                    let placed = &layout.placed;
                     if let Some(ghost) = self.ghost.clone() {
-                        self.paint_ghost(&ghost, &placed, anchor, bounds.origin, &font, font_size, window, cx);
+                        self.paint_ghost(&ghost, placed, anchor, bounds.origin, &font, font_size, window, cx);
                     }
                     if let Some(listener) = self.layout_listener.clone() {
                         let hint = $crate::ghost::LayoutHint {
@@ -553,11 +553,14 @@ macro_rules! __bind_gpui {
                             guard: 0,
                             busy: Vec::new(),
                             busy_from: rows.saturating_sub($crate::ghost::HINT_ROWS),
+                            controls: layout.controls.clone(),
+                            targets_top: layout.targets_top,
+                            draft_shown: layout.draft_shown,
                         };
-                        let mut busy = $crate::ghost::busy_columns(&screen, anchor, &placed);
+                        let mut busy = $crate::ghost::busy_columns(&screen, anchor, placed);
                         busy.drain(..hint.busy_from.min(busy.len()));
                         let hint = $crate::ghost::LayoutHint {
-                            guard: $crate::ghost::guard_row(&screen, anchor, &placed),
+                            guard: $crate::ghost::guard_row(&screen, anchor, placed),
                             busy,
                             ..hint
                         };

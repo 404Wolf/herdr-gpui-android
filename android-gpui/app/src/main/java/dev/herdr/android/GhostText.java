@@ -21,19 +21,34 @@ final class GhostText {
 
     /** Colours as 0xRRGGBB, from the chrome. */
     static final class Colors {
-        final int text, dim, warn, background;
+        final int text, dim, warn, background, bright, danger, info;
 
-        Colors(int text, int dim, int warn, int background) {
+        Colors(int text, int dim, int warn, int background, int bright, int danger, int info) {
             this.text = text & 0xffffff;
             this.dim = dim & 0xffffff;
             this.warn = warn & 0xffffff;
             this.background = background & 0xffffff;
+            this.bright = bright & 0xffffff;
+            this.danger = danger & 0xffffff;
+            this.info = info & 0xffffff;
         }
 
         static Colors of(GpuiChrome chrome) {
             return new Colors(chrome.onSurfaceVariant,
                     MicButton.mix(chrome.background, chrome.onSurfaceVariant, 0.55f),
-                    chrome.warning, chrome.background);
+                    chrome.warning, chrome.background, chrome.onSurface, chrome.danger, chrome.info);
+        }
+    }
+
+    /** One of the controls drawn in the prompt's frame: an id and its words. */
+    static final class Control {
+        final String id;
+        /** Pairs of (text, style): "dim", "bright", "danger", "info" or "warn". */
+        final String[] spans;
+
+        Control(String id, String... spans) {
+            this.id = id;
+            this.spans = spans;
         }
     }
 
@@ -52,15 +67,23 @@ final class GhostText {
      * @param reserve columns kept clear on rows from {@code reserveFrom} down
      */
     static String json(String kind, String draft, int partialFrom, Map<String, Long> lengths,
-            List<Outbox.Message> queued, String pane, int reserve, int reserveFrom, Colors colors) {
+            List<Outbox.Message> queued, String pane, List<Control> controls, Colors colors) {
         try {
             JSONObject o = new JSONObject();
             o.put("kind", kind);
-            o.put("reserve", Math.max(0, Math.min(64, reserve)));
-            o.put("reserveFrom", Math.max(0, reserveFrom));
             o.put("colors", new JSONObject()
                     .put("text", colors.text).put("dim", colors.dim)
-                    .put("warn", colors.warn).put("background", colors.background));
+                    .put("warn", colors.warn).put("background", colors.background)
+                    .put("bright", colors.bright).put("danger", colors.danger).put("info", colors.info));
+            JSONArray drawn = new JSONArray();
+            for (Control control : controls) {
+                JSONArray spans = new JSONArray();
+                for (int i = 0; i + 1 < control.spans.length; i += 2) {
+                    if (!control.spans[i].isEmpty()) spans.put(span(control.spans[i], control.spans[i + 1]));
+                }
+                drawn.put(new JSONObject().put("id", control.id).put("spans", spans));
+            }
+            o.put("controls", drawn);
             String text = draft == null ? "" : draft;
             if (text.length() > MAX_CHARS) text = "…" + text.substring(text.length() - MAX_CHARS);
             JSONArray spans = new JSONArray();
@@ -94,7 +117,8 @@ final class GhostText {
         int at = 0;
         while (m.find()) {
             if (m.start() > at) out.put(span(text.substring(at, m.start()), style));
-            out.put(span("◷ " + DraftChips.label(lengths.get(m.group(1))), "chip"));
+            // Brackets, in the terminal's own font: it has no clock glyph.
+            out.put(span("[" + DraftChips.label(lengths.get(m.group(1))) + "]", "chip"));
             at = m.end();
         }
         if (at < text.length()) out.put(span(text.substring(at), style));
