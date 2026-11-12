@@ -36,6 +36,10 @@ import org.json.JSONObject;
  * typed it. A message whose pane closed or whose core restarted is
  * {@link State#GONE}: kept, never sent, offered back as a draft.
  *
+ * <p>A message holding a {@link DictationToken} (a dictation recorded while
+ * the desktop was away) waits at the head of its pane's line, holding back the
+ * messages behind it, until {@link #fillDictation} puts the text in.
+ *
  * <p>Pure state plus a file; not thread-safe on its own (callers hold its
  * lock: every public method is synchronized). Disk work happens only in
  * {@link #load} and {@link #save}, which callers run off the main thread.
@@ -81,9 +85,12 @@ final class Outbox {
         final State state;
         /** The pane refused it a moment ago (a dialog is open); it waits, still queued. */
         final boolean blocked;
+        /** It holds a dictation the desktop has not transcribed yet; it waits, still queued. */
+        final boolean awaitsDictation;
 
         Message(String id, String host, String pane, String boot, String text, long created,
                 State state, boolean blocked) {
+            this.awaitsDictation = DictationToken.in(text);
             this.id = id;
             this.host = host;
             this.pane = pane;
@@ -100,7 +107,7 @@ final class Outbox {
         final String host;
         final String pane;
         String boot;
-        final String text;
+        String text;
         final long created;
         State state;
         /** Not saved: a refusal is only a reason to wait a little. */
@@ -254,7 +261,8 @@ final class Outbox {
             if (!entry.host.equals(host)) continue;
             // GONE messages never block their pane's line: they are not sent.
             if (entry.state == State.GONE || !headed.add(entry.pane)) continue;
-            if (entry.state == State.QUEUED && entry.blockedUntil <= now && !entry.boot.isEmpty()) {
+            if (entry.state == State.QUEUED && entry.blockedUntil <= now && !entry.boot.isEmpty()
+                    && !DictationToken.in(entry.text)) {
                 return entry.view(now);
             }
         }
@@ -293,6 +301,29 @@ final class Outbox {
                 break;
         }
         version++;
+    }
+
+    /**
+     * Puts a transcribed dictation where its token is; true when a message held
+     * it. A message left blank by an empty dictation is dropped, and one that
+     * grew past what a send can carry is gone (offered back as a draft).
+     */
+    synchronized boolean fillDictation(String clipId, String spoken) {
+        for (Entry entry : entries) {
+            if (entry.state == State.SENDING) continue;
+            String filled = DictationToken.fill(entry.text, clipId, spoken);
+            if (filled == null) continue;
+            if (filled.trim().isEmpty()) {
+                remove(entry);
+            } else {
+                chars += filled.length() - entry.text.length();
+                entry.text = filled;
+                if (!sendable(filled)) entry.state = State.GONE;
+            }
+            version++;
+            return true;
+        }
+        return false;
     }
 
     /** The user's "send again" on an unsure message: back in line where it was. */

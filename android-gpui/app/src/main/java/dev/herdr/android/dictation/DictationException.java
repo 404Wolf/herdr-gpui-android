@@ -10,11 +10,9 @@ public final class DictationException extends Exception {
         PERMISSION,
         /** The microphone could not be opened or stopped delivering audio. */
         AUDIO,
-        /** The transcription server or service could not be reached, or dropped the session. */
+        /** The desktop could not be reached and the recording could not be saved for later. */
         UNREACHABLE,
-        /** The server or service answered with an error. */
-        SERVER,
-        /** No engine is available (no server configured and no on-device model). */
+        /** No dictation server is configured. */
         UNAVAILABLE
     }
 

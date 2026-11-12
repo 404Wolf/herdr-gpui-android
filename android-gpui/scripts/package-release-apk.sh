@@ -36,8 +36,7 @@ import pathlib, shutil, sys, zipfile
 work, native, abi = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 shutil.copyfile(work / 'resources.apk', work / 'unsigned.apk')
 entries = [(path.name, path) for path in sorted((work / 'dex').glob('*.dex'))]
-for libraries in (native, work / 'aar-jni' / abi):  # the GPUI library, then Vosk and JNA's
-    entries += [(f'lib/{abi}/{path.name}', path) for path in sorted(libraries.glob('*.so'))]
+entries += [(f'lib/{abi}/{path.name}', path) for path in sorted(native.glob('*.so'))]
 with zipfile.ZipFile(work / 'unsigned.apk', 'a', zipfile.ZIP_STORED) as apk:
     for name, path in entries:
         # A fixed timestamp and mode keep the archive independent of build time.

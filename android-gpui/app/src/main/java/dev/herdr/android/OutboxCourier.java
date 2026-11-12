@@ -85,6 +85,14 @@ final class OutboxCourier {
         return message;
     }
 
+    /** A transcribed dictation for a queued message; true when one held its token. */
+    boolean fillDictation(String clipId, String spoken) {
+        if (!outbox.fillDictation(clipId, spoken)) return false;
+        thread.execute(outbox::save);
+        changed();
+        return true;
+    }
+
     /** Send again, or drop/take back, by the user's hand. */
     void resend(String id) {
         if (!outbox.resend(id)) return;

@@ -47,7 +47,7 @@ final class ProvisionedSettings {
     final Boolean capturable;
     final String paletteJson;
     final float scrollSpeed;
-    /** Null when unset or not a ws:// or wss:// URL: dictation uses offline Vosk alone. */
+    /** Null when unset or not a ws:// or wss:// URL: dictation is then not available. */
     final URI dictationUrl;
 
     private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson,
