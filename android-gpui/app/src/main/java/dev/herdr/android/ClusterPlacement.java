@@ -45,14 +45,19 @@ final class ClusterPlacement {
                 JSONObject o = new JSONObject(json);
                 JSONArray b = o.getJSONArray("busy");
                 int rows = o.getInt("rows");
-                if (rows < 0 || rows > 1000 || b.length() != rows) return null;
+                int cols = o.getInt("cols");
+                // Only the bottom rows are reported, from busyFrom down; the
+                // rest count as taken (the cluster never goes that high).
+                int from = o.optInt("busyFrom", 0);
+                if (rows < 0 || rows > 1000 || from < 0 || from > rows || b.length() != rows - from) return null;
                 int[] busy = new int[rows];
-                for (int i = 0; i < rows; i++) busy[i] = b.getInt(i);
+                java.util.Arrays.fill(busy, 0, from, cols);
+                for (int i = from; i < rows; i++) busy[i] = b.getInt(i - from);
                 float cellWidth = (float) o.getDouble("cellWidth");
                 float cellHeight = (float) o.getDouble("cellHeight");
                 if (!(cellWidth > 0) || !(cellHeight > 0)) return null;
                 return new Hint((float) o.getDouble("left"), (float) o.getDouble("top"),
-                        cellWidth, cellHeight, o.getInt("cols"), rows, o.optBoolean("anchored"), busy,
+                        cellWidth, cellHeight, cols, rows, o.optBoolean("anchored"), busy,
                         o.optInt("guard", rows));
             } catch (JSONException malformed) {
                 return null;

@@ -90,8 +90,11 @@ pub struct LayoutHint {
     pub rows: usize,
     /// Whether the program's prompt was found (the draft is at its caret).
     pub anchored: bool,
-    /// Per drawn row, see [`busy_columns`].
+    /// The bottom rows' [`busy_columns`], from row `busy_from` down: only
+    /// those can hold the host's controls, and output above them then never
+    /// changes the hint.
     pub busy: Vec<usize>,
+    pub busy_from: usize,
     /// The first row of the bottom block that must stay in view, see [`guard_row`].
     pub guard: usize,
 }
@@ -152,6 +155,9 @@ pub struct Placed {
     pub text: String,
     pub style: GhostStyle,
 }
+
+/// How many bottom rows a layout hint reports.
+pub const HINT_ROWS: usize = 20;
 
 /// The most rows the draft may take; the rest is elided at the start.
 pub const MAX_DRAFT_ROWS: usize = 6;

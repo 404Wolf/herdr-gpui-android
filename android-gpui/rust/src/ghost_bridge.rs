@@ -146,6 +146,7 @@ pub(crate) fn hint_json(hint: &gpui_rio::ghost::LayoutHint) -> String {
         "anchored": hint.anchored,
         "guard": hint.guard,
         "busy": hint.busy,
+        "busyFrom": hint.busy_from,
     })
     .to_string()
 }
@@ -243,6 +244,7 @@ mod tests {
             rows: 40,
             anchored: true,
             busy: vec![0, 12],
+            busy_from: 38,
             guard: 1,
         };
         let value: serde_json::Value = serde_json::from_str(&hint_json(&hint)).expect("json");

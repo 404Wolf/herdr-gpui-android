@@ -550,10 +550,14 @@ macro_rules! __bind_gpui {
                             rows,
                             anchored: anchor.is_some(),
                             guard: 0,
-                            busy: $crate::ghost::busy_columns(&screen, anchor, &placed),
+                            busy: Vec::new(),
+                            busy_from: rows.saturating_sub($crate::ghost::HINT_ROWS),
                         };
+                        let mut busy = $crate::ghost::busy_columns(&screen, anchor, &placed);
+                        busy.drain(..hint.busy_from.min(busy.len()));
                         let hint = $crate::ghost::LayoutHint {
                             guard: $crate::ghost::guard_row(&screen, anchor, &placed),
+                            busy,
                             ..hint
                         };
                         if self.last_hint.as_ref() != Some(&hint) {
