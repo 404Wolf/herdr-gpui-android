@@ -383,6 +383,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
         composer = new ComposerBar(this, chrome, Dictation.create(this), composerHost());
         Dictation.pending(this).setListener(pendingDictations);
+        composer.setWaiting(Dictation.pending(this).count());
         content.addView(composer.keysRow(), new LinearLayout.LayoutParams(-1, dp(48)));
         shortcutBar = createShortcutBar();
         content.addView(shortcutBar, new LinearLayout.LayoutParams(-1, dp(48)));
@@ -391,6 +392,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         column.addView(content, new FrameLayout.LayoutParams(-1, -1));
         // Zero width until the bar is laid out and the composer aligns it to its slot.
         column.addView(composer.field(), new FrameLayout.LayoutParams(0, -2, android.view.Gravity.BOTTOM));
+        // The one dictation control floats above Enter; the composer places it.
+        column.addView(composer.mic(), new FrameLayout.LayoutParams(-2, -2,
+                android.view.Gravity.BOTTOM | android.view.Gravity.END));
         // The sidebar rail mirrors the desktop's list of workspaces and agents.
         sidebar = new LinearLayout(this);
         sidebar.setOrientation(LinearLayout.HORIZONTAL);

@@ -26,7 +26,8 @@ import dev.herdr.android.dictation.PendingClip;
 
 /**
  * The bottom bar's input: a local-first composer over Claude and Codex panes,
- * a mic-only mode, and the terminal keys folded behind a chevron.
+ * one floating mic that dictates into it, and the terminal keys folded behind
+ * a chevron.
  *
  * <p>The composer edits on the phone with no round trip: nothing reaches the
  * host until Enter, which queues the whole draft as one bracketed paste plus
@@ -64,7 +65,6 @@ final class ComposerBar {
 
     private static final String PREFS = "terminal-display";
     private static final String KEYS_OPEN = "keys_row_open";
-    private static final String MIC_ONLY = "mic_only";
     /** Every pane's draft, so a closed or killed app finds what was typed. */
     private static final String DRAFTS = "composer_drafts";
     private static final long SAVE_DRAFTS_MS = 400;
@@ -86,26 +86,24 @@ final class ComposerBar {
     /** The outbox's messages for this pane, counted on Enter's badge. */
     private java.util.List<Outbox.Message> queuedMessages = java.util.Collections.emptyList();
     private TextView queueBadge;
+    /** Floats over the terminal straight above Enter; the activity adds it to the same frame. */
+    private final MicButton mic;
+    /** Recording lengths of clips dictated this run, for their chips in the draft. */
+    private final java.util.Map<String, Long> clipLengths = new java.util.HashMap<>();
     private GpuiChrome chrome;
 
     private LinearLayout bar;
     private View pinned;
     private View keyStrip;
     private FrameLayout slot;
-    private ImageButton modeButton;
     private ImageButton chevron;
-    private LinearLayout micPanel;
-    private ImageButton record;
-    private TextView transcript;
+    private View enterBox;
 
     private boolean agent;
     private boolean keysOpen;
-    private boolean micOnly;
     private DictationEngine.State dictationState = DictationEngine.State.IDLE;
     /** Enter was pressed while listening: send the utterance once it is final. */
     private boolean sendWhenFinal;
-    /** Recordings waiting for the desktop (the mic's badge). */
-    private int waiting;
     /** Our own setText calls, which must not count as user edits. */
     private boolean updatingField;
 
@@ -118,13 +116,44 @@ final class ComposerBar {
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         keysOpen = preferences.getBoolean(KEYS_OPEN, false);
         drafts.restore(preferences.getString(DRAFTS, ""));
-        micOnly = preferences.getBoolean(MIC_ONLY, false);
         keysRow = new FrameLayout(context);
         field = createField();
         stack = new LinearLayout(context);
         stack.setOrientation(LinearLayout.VERTICAL);
         stack.addView(field, new LinearLayout.LayoutParams(-1, -2));
         stack.setVisibility(View.GONE);
+        mic = new MicButton(context, chrome, v -> toggleDictation());
+        mic.view().setVisibility(View.GONE);
+    }
+
+    /** The floating mic; the activity adds it to the frame that holds {@link #field}. */
+    View mic() { return mic.view(); }
+
+    /** Recordings waiting for the desktop, counted on the mic; their lengths label their chips. */
+    void setWaiting(int count) {
+        for (PendingClip clip : Dictation.pending(context).waiting()) clipLengths.put(clip.id, clip.durationMs);
+        mic.setWaiting(count);
+        DraftChips.apply(field.getText(), chip());
+    }
+
+    /**
+     * A recording made offline came back as text: it replaces its chip in
+     * whichever pane's draft holds it, saved at once. False when no draft does.
+     */
+    boolean placeDictation(String clipId, String text) {
+        String pane = drafts.placeDictation(clipId, text);
+        if (pane == null) return false;
+        clipLengths.remove(clipId);
+        if (pane.equals(drafts.pane())) showText(drafts.text());
+        persist();
+        return true;
+    }
+
+    /** A dictation whose chip is gone from everywhere: it joins the end of its pane's draft. */
+    void appendDictation(String pane, String text) {
+        String draft = drafts.append(pane, text);
+        if ((pane == null ? "" : pane).equals(drafts.pane())) showText(draft);
+        persist();
     }
 
     /** The collapsible keys row; the activity places it directly above the bar. */
@@ -139,30 +168,6 @@ final class ComposerBar {
         updateQueueBadge();
     }
 
-    /**
-     * A dictation the desktop transcribed later: fills its token in whichever
-     * pane's draft holds it and saves the drafts at once; false when none does.
-     */
-    boolean placeDictation(String clipId, String text) {
-        String pane = drafts.placeDictation(clipId, text);
-        if (pane == null) return false;
-        if (pane.equals(drafts.pane())) showText(drafts.text());
-        persist();
-        return true;
-    }
-
-    /** A dictation whose token is gone from everywhere: it joins the end of its pane's draft. */
-    void appendDictation(String pane, String text) {
-        String draft = drafts.append(pane, text);
-        if ((pane == null ? "" : pane).equals(drafts.pane())) showText(draft);
-        persist();
-    }
-
-    /** Recordings waiting for the desktop, for the mic's badge. */
-    void setWaiting(int count) {
-        waiting = count;
-    }
-
     /** A queued message taken back: its text joins the draft, on a line of its own. */
     void takeBack(String text) {
         if (text == null || text.isEmpty()) return;
@@ -173,9 +178,9 @@ final class ComposerBar {
     }
 
     /**
-     * Builds the 48 dp bar: mode toggle at bottom-left, the toolbar's pinned
-     * controls, the middle slot (composer, keys or transcript), the keys
-     * chevron and Enter, which closes the bar so nothing sits dead beyond it.
+     * Builds the 48 dp bar: the toolbar's pinned controls, the middle slot
+     * (the composer, or a shell's keys), the keys chevron and Enter, which
+     * closes the bar so nothing sits dead beyond it.
      */
     View bar(GpuiChrome chrome, View pinnedControls, View keys) {
         this.chrome = chrome;
@@ -186,13 +191,10 @@ final class ComposerBar {
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(chrome.surface);
-        modeButton = icon(R.drawable.ic_bar_mic, "Mic only", v -> setMicOnly(!micOnly));
-        bar.addView(modeButton);
         bar.addView(pinned, new LinearLayout.LayoutParams(-2, dp(48)));
         slot = new FrameLayout(context);
         slot.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> v.post(this::placeField));
         bar.addView(slot, new LinearLayout.LayoutParams(0, dp(48), 1));
-        micPanel = createMicPanel();
         chevron = icon(R.drawable.ic_bar_expand, "Keys", v -> setKeysOpen(!keysOpen));
         bar.addView(chevron);
         Button enter = new Button(context);
@@ -219,7 +221,9 @@ final class ComposerBar {
         // The queue's count rides on Enter's corner, so queued messages cost
         // no line over the terminal; it overhangs into the bar's own padding.
         FrameLayout enterBox = new FrameLayout(context);
+        this.enterBox = enterBox;
         enterBox.setClipChildren(false);
+        enterBox.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> v.post(this::placeMic));
         enterBox.addView(enter, new FrameLayout.LayoutParams(-2, dp(48)));
         queueBadge = createQueueBadge();
         enterBox.addView(queueBadge, new FrameLayout.LayoutParams(-2, dp(18), Gravity.TOP | Gravity.START));
@@ -230,6 +234,7 @@ final class ComposerBar {
         keysRow.setBackgroundColor(chrome.surface);
         styleField();
         updateQueueBadge();
+        mic.style(chrome);
         apply();
         return bar;
     }
@@ -237,10 +242,15 @@ final class ComposerBar {
     /** The pane on screen changed, or what it runs did. Only agents get the composer. */
     void setPane(String paneId, boolean agentPane) {
         boolean switched = !drafts.pane().equals(paneId == null ? "" : paneId);
-        if (switched && dictating()) {
+        if (switched && dictationState == DictationEngine.State.OFFLINE_RECORDING) {
+            // Keep the recording: its text finds its pane's draft later, by target.
+            sendWhenFinal = false;
+            dictation.stop();
+            drafts.dictationEnded();
+        } else if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
             dictation.cancel();
-            dictationState = DictationEngine.State.IDLE;
+            setDictationState(DictationEngine.State.IDLE);
             sendWhenFinal = false;
             drafts.dictationEnded();
         }
@@ -258,6 +268,7 @@ final class ComposerBar {
 
     void destroy() {
         dictation.cancel();
+        mic.destroy();
         persist();
     }
 
@@ -279,41 +290,21 @@ final class ComposerBar {
         field.postDelayed(saveDrafts, SAVE_DRAFTS_MS);
     }
 
-    private void setMicOnly(boolean on) {
-        if (micOnly == on) return;
-        micOnly = on;
-        preferences.edit().putBoolean(MIC_ONLY, on).apply();
-        if (on) host.hideKeyboard();
-        else if (dictating()) {
-            dictation.cancel();
-            dictationState = DictationEngine.State.IDLE;
-            showText(drafts.dictationEnded());
-        }
-        apply();
-    }
-
     private void setKeysOpen(boolean open) {
         keysOpen = open;
         preferences.edit().putBoolean(KEYS_OPEN, open).apply();
         apply();
+        mic.view().post(this::placeMic);
     }
 
     /** Puts every part where the current mode wants it. No view changes height. */
     private void apply() {
         if (bar == null) return;
-        boolean composing = agent && !micOnly;
-        // Mic-only shows the mic, the transcript and Enter: nothing that types.
-        pinned.setVisibility(micOnly ? View.GONE : View.VISIBLE);
-        modeButton.setImageResource(micOnly ? R.drawable.ic_bar_keyboard : R.drawable.ic_bar_mic);
-        String mode = micOnly ? "Leave mic-only mode" : "Mic only: dictate and send, no keyboard";
-        modeButton.setContentDescription(mode);
-        modeButton.setTooltipText(mode);
+        boolean composing = agent;
         detach(keyStrip);
-        detach(micPanel);
         slot.removeAllViews();
         keysRow.removeAllViews();
-        if (micOnly) slot.addView(micPanel, new FrameLayout.LayoutParams(-1, -1));
-        else if (composing) {
+        if (composing) {
             if (keysOpen) keysRow.addView(keyStrip, new FrameLayout.LayoutParams(-1, dp(48)));
         } else {
             // A shell's keys are its main input: they stay in the bar itself.
@@ -327,8 +318,11 @@ final class ComposerBar {
         chevron.setTooltipText(keys);
         field.setVisibility(composing ? View.VISIBLE : View.GONE);
         if (!composing && field.hasFocus()) field.clearFocus();
-        updateMicPanel();
+        // Dictation lands in the draft, so the mic is only where a draft is;
+        // with no server configured there is nothing for it to do.
+        mic.view().setVisibility(composing && dictation.isAvailable() ? View.VISIBLE : View.GONE);
         updateStack();
+        placeMic();
     }
 
     /** Shows the floating stack while it holds the field. */
@@ -339,8 +333,7 @@ final class ComposerBar {
     }
 
     /**
-     * Aligns the floating stack with the slot: the field's bottom on the bar's
-     * bottom, or, without a field (mic-only, a shell), the strip on the bar's top.
+     * Aligns the floating field with the slot, its bottom on the bar's bottom.
      */
     private void placeField() {
         if (slot == null || !(stack.getParent() instanceof ViewGroup) || slot.getWidth() == 0) return;
@@ -353,11 +346,35 @@ final class ComposerBar {
                 Gravity.BOTTOM | Gravity.START);
         params.leftMargin = at[0] - origin[0];
         params.bottomMargin = Math.max(0, origin[1] + frame.getHeight() - at[1] - slot.getHeight());
-        if (field.getVisibility() != View.VISIBLE) params.bottomMargin += slot.getHeight();
         FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) stack.getLayoutParams();
         if (old != null && old.width == params.width && old.leftMargin == params.leftMargin
                 && old.bottomMargin == params.bottomMargin && old.gravity == params.gravity) return;
         stack.setLayoutParams(params);
+    }
+
+    /**
+     * Stacks the mic straight above Enter, over the terminal: its right edge on
+     * Enter's, its bottom a little above the bar (or the open keys row), so the
+     * thumb goes from speaking to sending in one column.
+     */
+    private void placeMic() {
+        View view = mic.view();
+        if (enterBox == null || !(view.getParent() instanceof ViewGroup) || enterBox.getWidth() == 0) return;
+        ViewGroup frame = (ViewGroup) view.getParent();
+        View top = keysRow.getVisibility() == View.VISIBLE && keysRow.getHeight() > 0 ? keysRow : enterBox;
+        int[] enterAt = new int[2];
+        int[] topAt = new int[2];
+        int[] origin = new int[2];
+        enterBox.getLocationInWindow(enterAt);
+        top.getLocationInWindow(topAt);
+        frame.getLocationInWindow(origin);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.END);
+        params.rightMargin = Math.max(0, origin[0] + frame.getWidth() - enterAt[0] - enterBox.getWidth());
+        params.bottomMargin = Math.max(0, origin[1] + frame.getHeight() - topAt[1]) + dp(8);
+        FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) view.getLayoutParams();
+        if (old != null && old.rightMargin == params.rightMargin && old.bottomMargin == params.bottomMargin
+                && old.gravity == params.gravity) return;
+        view.setLayoutParams(params);
     }
 
     private EditText createField() {
@@ -399,7 +416,18 @@ final class ComposerBar {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
             @Override public void afterTextChanged(Editable s) {
-                if (!updatingField) drafts.edit(s.toString());
+                if (updatingField) return;
+                // A backspace into a chip takes the whole chip; its text is
+                // appended to the draft when it comes, so nothing is lost.
+                String text = s.toString();
+                String repaired = DraftChips.repair(text);
+                if (!repaired.equals(text)) {
+                    showText(repaired);
+                    drafts.edit(repaired);
+                    return;
+                }
+                DraftChips.apply(s, chip());
+                drafts.edit(text);
                 saveDraftsSoon();
             }
         });
@@ -458,62 +486,19 @@ final class ComposerBar {
         queueBadge.setTooltipText(label);
     }
 
-    private LinearLayout createMicPanel() {
-        LinearLayout panel = new LinearLayout(context);
-        panel.setOrientation(LinearLayout.HORIZONTAL);
-        panel.setGravity(Gravity.CENTER_VERTICAL);
-        record = icon(R.drawable.ic_bar_mic, "Dictate", v -> toggleDictation());
-        panel.addView(record);
-        transcript = new TextView(context);
-        transcript.setTextSize(13);
-        transcript.setSingleLine(true);
-        transcript.setEllipsize(android.text.TextUtils.TruncateAt.START);
-        transcript.setGravity(Gravity.CENTER_VERTICAL);
-        transcript.setPadding(dp(8), 0, dp(8), 0);
-        transcript.setOnClickListener(v -> toggleDictation());
-        transcript.setOnLongClickListener(v -> {
-            if (dictating()) return false;
-            drafts.sent();
-            showText("");
-            host.notice("Draft cleared");
-            return true;
-        });
-        panel.addView(transcript, new LinearLayout.LayoutParams(0, -1, 1));
-        return panel;
-    }
-
-    private void updateMicPanel() {
-        if (record == null) return;
-        boolean live = dictating();
-        record.setImageTintList(ColorStateList.valueOf(live ? chrome.danger : chrome.onSurface));
-        record.setBackground(fill(live ? GpuiChrome.withAlpha(chrome.danger, 0x33) : chrome.control, 24, dp(4)));
-        String label = live ? "Stop dictating" : "Dictate";
-        record.setContentDescription(label);
-        record.setTooltipText(label);
-        transcript.setTextColor(drafts.text().isEmpty() ? chrome.onSurfaceVariant : chrome.onSurface);
-        transcript.setText(transcriptText());
-    }
-
-    private String transcriptText() {
-        if (!drafts.text().isEmpty()) return drafts.text();
-        switch (dictationState) {
-            case CONNECTING: return "Connecting…";
-            case LISTENING: return "Listening…";
-            case TRANSCRIBING: return "Finishing…";
-            case OFFLINE_RECORDING: return "Desktop offline, recording…";
-            default: return "Tap the mic and speak";
-        }
-    }
-
     /** A session runs: IDLE and PENDING both mean none does. */
     private boolean dictating() {
         return dictationState != DictationEngine.State.IDLE && dictationState != DictationEngine.State.PENDING;
     }
 
+    private void setDictationState(DictationEngine.State state) {
+        dictationState = state;
+        mic.setState(state);
+    }
+
+    /** The mic's one tap: start, or stop what is recording. Transcribing ignores it. */
     private void toggleDictation() {
-        if (dictationState == DictationEngine.State.LISTENING
-                || dictationState == DictationEngine.State.CONNECTING
-                || dictationState == DictationEngine.State.OFFLINE_RECORDING) {
+        if (MicButton.recording(dictationState)) {
             dictation.stop();
             return;
         }
@@ -522,12 +507,12 @@ final class ComposerBar {
             host.notice("Dictation is not set up on this phone");
             return;
         }
-        // The engines refuse to start without RECORD_AUDIO; ask first, start on yes.
+        // The engine refuses to start without RECORD_AUDIO; ask first, start on yes.
         host.withMicrophone(this::startDictation);
     }
 
     private void startDictation() {
-        if (!micOnly || dictating()) return;
+        if (!agent || dictating()) return;
         drafts.dictationStarted();
         final String pane = drafts.pane();
         dictation.start(pane, new DictationEngine.Listener() {
@@ -541,29 +526,29 @@ final class ComposerBar {
                 if (sendWhenFinal) {
                     sendWhenFinal = false;
                     // The session is over (IDLE follows): Enter must send, not wait again.
-                    dictationState = DictationEngine.State.IDLE;
+                    setDictationState(DictationEngine.State.IDLE);
                     enter();
                 }
             }
 
             @Override public void onPending(PendingClip clip) {
+                clipLengths.put(clip.id, clip.durationMs);
                 if (!pane.equals(drafts.pane())) return;
                 showText(drafts.dictationPending(clip.id));
                 if (sendWhenFinal) {
                     // The message waits in the outbox until the desktop fills the dictation in.
                     sendWhenFinal = false;
-                    dictationState = DictationEngine.State.PENDING;
+                    setDictationState(DictationEngine.State.PENDING);
                     enter();
                 }
             }
 
             @Override public void onState(DictationEngine.State state) {
-                dictationState = state;
-                updateMicPanel();
+                setDictationState(state);
             }
 
             @Override public void onError(DictationException error) {
-                dictationState = DictationEngine.State.IDLE;
+                setDictationState(DictationEngine.State.IDLE);
                 sendWhenFinal = false;
                 if (pane.equals(drafts.pane())) showText(drafts.dictationEnded());
                 host.notice(error.getMessage() == null ? "Dictation stopped" : error.getMessage());
@@ -572,13 +557,11 @@ final class ComposerBar {
     }
 
     /**
-     * Enter: while listening, finish the utterance and send it; with a draft,
+     * Enter: while recording, finish the utterance and send it; with a draft,
      * queue it as one paste plus Enter; otherwise Enter goes to the program.
      */
     private void enter() {
-        if (dictationState == DictationEngine.State.LISTENING
-                || dictationState == DictationEngine.State.CONNECTING
-                || dictationState == DictationEngine.State.OFFLINE_RECORDING) {
+        if (MicButton.recording(dictationState)) {
             sendWhenFinal = true;
             dictation.stop();
             return;
@@ -587,15 +570,14 @@ final class ComposerBar {
             sendWhenFinal = true;
             return;
         }
-        boolean drafting = micOnly || agent;
-        if (drafting && field.getVisibility() == View.VISIBLE) {
+        if (agent && field.getVisibility() == View.VISIBLE) {
             // Commit the keyboard's underlined word into the draft before reading it.
             BaseInputConnection.removeComposingSpans(field.getText());
             InputMethodManager input = context.getSystemService(InputMethodManager.class);
             if (input != null && field.hasFocus()) input.restartInput(field);
             drafts.edit(field.getText().toString());
         }
-        String outgoing = drafting ? drafts.outgoing() : null;
+        String outgoing = agent ? drafts.outgoing() : null;
         if (outgoing == null) {
             host.enterKey();
             return;
@@ -617,7 +599,13 @@ final class ComposerBar {
                 updatingField = false;
             }
         }
-        updateMicPanel();
+        DraftChips.apply(field.getText(), chip());
+    }
+
+    /** How a waiting dictation's token reads in the field. */
+    private DraftChips.Style chip() {
+        return new DraftChips.Style(chrome.warning, density, clipLengths,
+                context.getDrawable(R.drawable.ic_bar_schedule));
     }
 
     private ImageButton icon(int drawable, String label, View.OnClickListener action) {
