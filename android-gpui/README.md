@@ -184,13 +184,19 @@ live output** returns to the newest line. The activity converts a drag into
 a short tap still reaches the terminal.
 
 **Session** controls the focused session through allowlisted daemon methods: new
-tab, split right or down, zoom toggle, close pane and close tab (both confirmed).
+tab, split right or down, zoom toggle, close pane and close tab (both confirmed
+on their own row: the first tap says what a second tap ends).
 The client follows whichever pane the daemon focuses afterwards.
 
-Agent alerts the daemon broadcasts appear as Android notifications on one
-bounded channel (newest per pane, at most eight pending), and a terminal bell
-gives a short vibration instead of overriding the ring mode. Notifications need
-the system notification permission; without it the terminal still runs.
+Herdr shows no toasts, snackbars, notifications or pop-ups it was not asked
+for. Something worth knowing (a failed action, a refused send) appears for a
+few seconds in the status line under the tabs; destructive actions confirm on
+their own row with a second tap; the gesture card opens only from ⋯ >
+Gestures. Agent alerts the daemon broadcasts become Android notifications only
+when **View > Agent alerts** is turned on (it is off by default, and they also
+need the system notification permission), on one bounded channel (newest per
+pane, at most eight pending). A terminal bell gives a short vibration instead
+of overriding the ring mode.
 
 An OSC 52 clipboard write from a pane reaches the Android clipboard as
 plain text only: the payload must be base64 of valid UTF-8 within 256 KiB, and
@@ -244,7 +250,7 @@ The GPUI build requires Android 10+ because this mobile backend links an Android
 API 29 function; the original Java-only preview still supports Android 8+.
 It requires an ARM64 Android device, API 29+ (Android 10+), with the GPU capabilities required
 by GPUI Mobile. Remote sessions use the Internet permission, the terminal bell
-vibrates, agent alerts post notifications, and dictation asks for the microphone
+vibrates, agent alerts post notifications only when turned on, and dictation asks for the microphone
 on first use ([DICTATION.md](DICTATION.md)); no accessibility, storage, root,
 screen-capture or foreground-service permission is requested.
 
@@ -252,8 +258,8 @@ screen-capture or foreground-service permission is requested.
    Iroh additionally needs its SSH receiver. See [remote setup](REMOTE.md).
 2. Install the Remote preview and add a TCP or Iroh profile. Each host shows one
    **Connect** action; its ⋮ menu holds **Edit profile**, **Edit extra keys**,
-   **Forget SSH trust** and **Delete profile**, and the last two still ask for
-   confirmation.
+   **Forget SSH trust** and **Delete profile**; the last two act on a second
+   tap of the same row.
 3. Independently verify its SSH fingerprint, authenticate, and select a pane.
 4. Use **Hosts**, the first toolbar icon, for the workspace/agent rail (it opens
    by default where width allows) or **Panes** for the same session tree as a

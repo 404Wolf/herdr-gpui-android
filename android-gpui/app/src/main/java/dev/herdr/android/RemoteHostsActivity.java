@@ -766,6 +766,8 @@ public final class RemoteHostsActivity extends Activity {
         if (identityPresent) {
             Button remove = textButton("Remove", chrome.danger, this::removeIdentity);
             remove.setContentDescription("Remove the saved SSH key");
+            // Confirmed on the button itself: it reads "Tap again" for a few seconds.
+            ConfirmInPlace.bind(remove, "Remove", "Tap again", this::removeIdentity);
             LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(-2, dp(48));
             removeParams.setMarginStart(dp(4));
             actions.addView(remove, removeParams);
@@ -896,29 +898,19 @@ public final class RemoteHostsActivity extends Activity {
         return row;
     }
 
-    /** Every secondary action keeps its own confirmation; the menu only gathers them. */
+    /**
+     * The host's secondary actions. The destructive ones confirm on their own
+     * row (a second tap), never in a second pop-up.
+     */
     private void showHostActions(View anchor, SavedRemoteHost host) {
-        Context themed = new android.view.ContextThemeWrapper(this, chrome.popupTheme());
-        android.widget.PopupMenu menu = new android.widget.PopupMenu(themed, anchor);
+        ActionSheet sheet = new ActionSheet(this, chrome, host.name);
         // A raw shell needs the same pinned key and saved identity as Connect.
-        if (!host.expectedFingerprint.isEmpty() && identityPresent) {
-            menu.getMenu().add(0, 5, 0, "Open shell");
-        }
-        menu.getMenu().add(0, 1, 0, "Edit profile");
-        menu.getMenu().add(0, 2, 1, "Edit extra keys");
-        if (!host.expectedFingerprint.isEmpty()) menu.getMenu().add(0, 3, 2, destructive("Forget SSH trust"));
-        menu.getMenu().add(0, 4, 3, destructive("Delete profile"));
-        menu.setOnMenuItemClickListener(item -> {
-            switch (item.getItemId()) {
-                case 5: openShell(host); break;
-                case 1: editProfile(host); break;
-                case 2: editShortcuts(host); break;
-                case 3: forgetTrust(host); break;
-                default: deleteProfile(host); break;
-            }
-            return true;
-        });
-        menu.show();
+        if (!host.expectedFingerprint.isEmpty() && identityPresent) sheet.add("Open shell", () -> openShell(host));
+        sheet.add("Edit profile", () -> editProfile(host));
+        sheet.add("Edit extra keys", () -> editShortcuts(host));
+        if (!host.expectedFingerprint.isEmpty()) sheet.danger("Forget SSH trust", () -> forgetTrust(host));
+        sheet.danger("Delete profile", () -> deleteProfile(host));
+        sheet.show();
     }
 
     /** The host's own login shell, without Herdr's panes or agent status. */
@@ -929,12 +921,6 @@ public final class RemoteHostsActivity extends Activity {
             String message = failure.getMessage();
             setStatus(Tone.ERROR, host.name + ": " + (message == null || message.isEmpty() ? "could not open a shell" : message));
         }
-    }
-
-    private CharSequence destructive(String title) {
-        android.text.SpannableString text = new android.text.SpannableString(title);
-        text.setSpan(new android.text.style.ForegroundColorSpan(chrome.danger), 0, title.length(), 0);
-        return text;
     }
 
     private TextView sectionLabel(String text) {
@@ -1080,24 +1066,23 @@ public final class RemoteHostsActivity extends Activity {
         }, failure -> setStatus(Tone.ERROR, failure));
     }
 
+    /**
+     * Permanently removes the device-wide encrypted SSH key and its Android
+     * Keystore key; profiles and fingerprints stay. Confirmed in place.
+     */
     private void removeIdentity() {
-        generation++;
-        showDialog(sheet().setTitle("Remove saved SSH key?")
-                .setMessage("Permanently remove the device-wide encrypted SSH key and its Android Keystore key. Saved SSH profiles and host fingerprints are unchanged.")
-                .setNegativeButton("Cancel", null).setPositiveButton("Remove key", (which, index) -> {
-                    int token = generation;
-                    run(token, () -> {
-                        identityStore.delete();
-                        java.io.File file = publicKeyFile();
-                        if (file != null && file.exists() && !file.delete()) {
-                            throw new IOException("The old public key file could not be removed");
-                        }
-                        return true;
-                    }, ignored -> {
-                        identityPresent = false;
-                        showProfiles();
-                    });
-                }).create());
+        int token = ++generation;
+        run(token, () -> {
+            identityStore.delete();
+            java.io.File file = publicKeyFile();
+            if (file != null && file.exists() && !file.delete()) {
+                throw new IOException("The old public key file could not be removed");
+            }
+            return true;
+        }, ignored -> {
+            identityPresent = false;
+            showProfiles();
+        });
     }
 
     private void editProfile(SavedRemoteHost old) {
@@ -1189,14 +1174,10 @@ public final class RemoteHostsActivity extends Activity {
         }
     }
 
+    /** Removes the saved fingerprint; its next one must be verified again. Confirmed in place. */
     private void forgetTrust(SavedRemoteHost host) {
-        generation++;
-        showDialog(sheet().setTitle("Forget SSH trust?")
-                .setMessage("Remove the saved fingerprint for " + host.name + "? Verify its next fingerprint independently before trusting it again.")
-                .setNegativeButton("Cancel", null).setPositiveButton("Forget trust", (which, index) -> {
-                    int token = generation;
-                    run(token, () -> store.forgetTrust(host), ignored -> showProfiles());
-                }).create());
+        int token = ++generation;
+        run(token, () -> store.forgetTrust(host), ignored -> showProfiles());
     }
 
     private void editShortcuts(SavedRemoteHost host) {
@@ -1232,14 +1213,10 @@ public final class RemoteHostsActivity extends Activity {
         });
     }
 
+    /** Removes the host and its saved SSH trust from this device. Confirmed in place. */
     private void deleteProfile(SavedRemoteHost host) {
-        generation++;
-        showDialog(sheet().setTitle("Delete remote profile?")
-                .setMessage("Remove " + host.name + " and its saved SSH trust from this device?")
-                .setNegativeButton("Cancel", null).setPositiveButton("Delete", (which, index) -> {
-                    int token = generation;
-                    run(token, () -> { store.delete(host); return true; }, ignored -> showProfiles());
-                }).create());
+        int token = ++generation;
+        run(token, () -> { store.delete(host); return true; }, ignored -> showProfiles());
     }
 
     /** What a hosts file holds, before either picker opens. */

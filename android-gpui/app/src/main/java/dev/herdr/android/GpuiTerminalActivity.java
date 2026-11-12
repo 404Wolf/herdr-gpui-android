@@ -30,7 +30,6 @@ import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.FrameLayout;
 import android.widget.ScrollView;
-import android.widget.Toast;
 import android.widget.TextView;
 import android.widget.Spinner;
 import android.widget.ArrayAdapter;
@@ -231,7 +230,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         if (launch == null) {
-            Toast.makeText(this, "Reopen the terminal from the host list", Toast.LENGTH_LONG).show();
+            android.util.Log.w("herdr-gpui", "Reopen the terminal from the host list");
             finish();
             return;
         }
@@ -259,13 +258,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             hostStarted = true;
             createSurface();
         } catch (IllegalArgumentException invalid) {
-            Toast.makeText(this, "Check this host's shortcut settings", Toast.LENGTH_LONG).show();
+            android.util.Log.w("herdr-gpui", "Check this host's shortcut settings");
             finish();
         } catch (LinkageError unavailable) {
-            Toast.makeText(this, "The GPUI renderer could not be started", Toast.LENGTH_LONG).show();
+            android.util.Log.w("herdr-gpui", "The GPUI renderer could not be started");
             finish();
         } catch (IllegalStateException unavailable) {
-            Toast.makeText(this, "The GPUI renderer could not be started", Toast.LENGTH_LONG).show();
+            android.util.Log.w("herdr-gpui", "The GPUI renderer could not be started");
             finish();
         }
     }
@@ -822,14 +821,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void writePaneTextToClipboard(String text) {
         if (text == null || text.isEmpty()) {
-            Toast.makeText(this, "No pane text to copy yet", Toast.LENGTH_SHORT).show();
             return;
         }
         android.content.ClipboardManager clipboard =
                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (clipboard == null) return;
         clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Herdr pane", text));
-        Toast.makeText(this, "Copied " + text.length() + " characters", Toast.LENGTH_SHORT).show();
     }
 
     private void publishCurrent(String status) {
@@ -1026,7 +1023,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             else if (item.getItemId() == 4) showPanes();
             else if (item.getItemId() == 5) toggleSidebar();
             else if (item.getItemId() == 6 && terminalColumn != null) {
-                GestureHint.maybeShow(this, terminalColumn, chrome, true);
+                GestureHint.show(this, terminalColumn, chrome);
             }
             else finish();
             return true;
@@ -1503,6 +1500,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         options.addView(optionLabel(context, "Physical Alt key"));
         Spinner alt = optionSpinner(context, new String[]{"Default (device symbols)", "Device symbols", "Terminal Alt shortcuts"}, displayOptions.altMode);
         options.addView(alt);
+        options.addView(optionLabel(context, "Agent alerts"));
+        Spinner alerts = optionSpinner(context, new String[]{"Off", "Notify when an agent needs me"},
+                agentAlertsOn() ? 1 : 0);
+        options.addView(alerts);
         // One line of guidance; the host and status it used to repeat are already
         // in the header this sheet opens over.
         TextView help = optionLabel(context, "Compact keeps more rows visible. Opening this sheet cancels an unsent draft.");
@@ -1518,7 +1519,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     themeIndex = theme.getSelectedItemPosition();
                     getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
                             .putInt("mode", displayOptions.mode).putInt("font", displayOptions.fontSize)
-                            .putInt("alt", displayOptions.altMode).putInt("theme", themeIndex).apply();
+                            .putInt("alt", displayOptions.altMode).putInt("theme", themeIndex)
+                            .putBoolean(AGENT_ALERTS, alerts.getSelectedItemPosition() == 1).apply();
                     applyTheme();
             // Host switching needs the saved hosts before the first rail paint.
             worker.execute(() -> {
@@ -1714,7 +1716,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void switchHost(SavedRemoteHost host, String pane) {
         if (host == null || switchingHost || host.id.equals(currentHostId)) return;
         if (host.expectedFingerprint.isEmpty()) {
-            Toast.makeText(this, "Trust " + host.name + " from Remote hosts first", Toast.LENGTH_LONG).show();
+            note("Trust " + host.name + " from Remote hosts first");
             return;
         }
         switchingHost = true;
@@ -1752,7 +1754,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 runOnUiThread(() -> {
                     switchingHost = false;
                     switchingTo = null;
-                    Toast.makeText(this, "Could not switch to " + host.name, Toast.LENGTH_LONG).show();
+                    note("Could not switch to " + host.name);
                 });
             }
         });
@@ -1912,7 +1914,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         android.view.PixelCopy.request(getWindow(), image, result -> {
             if (result != android.view.PixelCopy.SUCCESS) {
                 decor.draw(new android.graphics.Canvas(image));
-                Toast.makeText(this, "Window copy failed: " + result, Toast.LENGTH_SHORT).show();
+                note("Window copy failed: " + result);
             }
             saveScreenshot(image);
         }, new Handler(Looper.getMainLooper()));
@@ -1931,7 +1933,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }, "herdr-screenshot");
         writer.setDaemon(true);
         writer.start();
-        Toast.makeText(this, "Screenshot saved", Toast.LENGTH_SHORT).show();
     }
 
     private void hideSidebar() {
@@ -2049,10 +2050,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
             composer.setPane(current == null ? "" : current.paneId, kind);
-            // The bar's buttons are gone on an agent's pane: say once where they went.
-            if (ComposerBar.isAgent(kind) && terminalColumn != null) {
-                GestureHint.maybeShow(this, terminalColumn, chrome, false);
-            }
             refreshQueued();
         }
         boolean show = current != null && !shellMode() && current.tabs != null;
@@ -2218,7 +2215,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void updateCrumb(Connection current, String space) {
-        if (crumb == null || linkStatus != null) return;
+        if (crumb == null || linkStatus != null || crumbNote != null) return;
         String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "", ownTitle = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -2995,7 +2992,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (destroyed) return;
                 if (reason == null) { ok.accept(reply); return; }
                 if (failed != null) failed.run();
-                Toast.makeText(this, "Could not " + label + ": " + reason, Toast.LENGTH_LONG).show();
+                note("Could not " + label + ": " + reason);
             });
         });
     }
@@ -3011,7 +3008,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             railDeaconBusy.remove(host.id);
             String terminal = reply.optString("terminal", "");
             if (!reply.optString("layout_error", "").isEmpty()) {
-                Toast.makeText(this, "The Deacon started, but " + reply.optString("layout_error"), Toast.LENGTH_LONG).show();
+                note("The Deacon started, but " + reply.optString("layout_error"));
             }
             if (reply.optBoolean("started", false) && !terminal.isEmpty()) {
                 // Starting… until claude is seen running there (checkRailDeacon).
@@ -3036,10 +3033,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (health == FleetTree.StartHealth.WAITING) return;
         railDeaconPending.remove(host.id);
         if (health == FleetTree.StartHealth.FAILED) {
-            Toast.makeText(this, launched == null
+            note(launched == null
                     ? "The Deacon on " + host.name + " stopped right away. Check that claude is installed and signed in there."
-                    : "The Deacon's terminal opened on " + host.name + ", but claude didn't start in it.",
-                    Toast.LENGTH_LONG).show();
+                    : "The Deacon's terminal opened on " + host.name + ", but claude didn't start in it.");
         }
         if (launched != null) main.post(() -> focusRemotePane(current, pending));
     }
@@ -3829,7 +3825,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (paneId.isEmpty() || paneId.length() > 128
                 || !paneId.matches("[A-Za-z0-9_./:-]+")) return;
         if (target.remoteHandle <= 0) {
-            Toast.makeText(this, "Switch panes from Remote hosts for this connection", Toast.LENGTH_LONG).show();
+            note("Switch panes from Remote hosts for this connection");
             return;
         }
         try {
@@ -3883,7 +3879,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         if (target.remoteHandle <= 0) {
-            Toast.makeText(this, "Switch workspaces from Remote hosts for this connection", Toast.LENGTH_LONG).show();
+            note("Switch workspaces from Remote hosts for this connection");
             return;
         }
         try {
@@ -3969,7 +3965,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
 
             @Override public void notice(String message) {
-                Toast.makeText(GpuiTerminalActivity.this, message, Toast.LENGTH_SHORT).show();
+                note(message);
             }
 
             @Override public void showQueue(java.util.List<Outbox.Message> messages) { queueSheet(messages); }
@@ -4020,7 +4016,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
             granted.run();
         } else {
-            Toast.makeText(this, "Dictation needs the microphone", Toast.LENGTH_SHORT).show();
+            note("Dictation needs the microphone");
         }
     }
 
@@ -4047,18 +4043,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             try {
                 command = GpuiTerminalProtocol.composeCommand(text);
             } catch (JSONException | IllegalArgumentException invalid) {
-                Toast.makeText(this, "Message is too long to send in one piece", Toast.LENGTH_SHORT).show();
+                note("Message is too long to send in one piece");
                 return false;
             }
             return queueComposerInput(command);
         }
         if (!queueable) {
-            Toast.makeText(this, "Not connected; the draft is kept", Toast.LENGTH_SHORT).show();
+            note("Not connected; the draft is kept");
             return false;
         }
         if (outbox.add(host, pane, text) == null) {
-            Toast.makeText(this, Outbox.sendable(text) ? "Too many messages wait already; the draft is kept"
-                    : "This message cannot be sent in one piece; the draft is kept", Toast.LENGTH_SHORT).show();
+            note(Outbox.sendable(text) ? "Too many messages wait already; the draft is kept"
+                    : "This message cannot be sent in one piece; the draft is kept");
             return false;
         }
         return true;
@@ -4133,7 +4129,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** What can be done with one queued message; an unsure one is resent only from here. */
     private void queuedActions(Outbox.Message message) {
         if (message.state == Outbox.State.SENDING) {
-            Toast.makeText(this, "Sending…", Toast.LENGTH_SHORT).show();
             return;
         }
         ActionSheet sheet = new ActionSheet(this, chrome, QueuedMessages.PROMPT + QueuedMessages.oneLine(message.text));
@@ -4161,7 +4156,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 return true;
             }
             if (target == null || target.isClosed() || !target.ready) {
-                Toast.makeText(this, "Not connected; the draft is kept", Toast.LENGTH_SHORT).show();
+                note("Not connected; the draft is kept");
                 return false;
             }
             if (compositionBlocksInput(target)) return false;
@@ -4360,7 +4355,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         main.post(this::reconnectCurrentHost);
                         return;
                     }
-                    Toast.makeText(this, "Remote session was paused. Reconnect from Remote hosts", Toast.LENGTH_LONG).show();
+                    android.util.Log.w("herdr-gpui", "Remote session was paused. Reconnect from Remote hosts");
                     finish();
                     return;
                 }
@@ -4452,7 +4447,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { target = connection; }
         if (target == null || target.isClosed()) return;
         if (!target.shell && target.remoteHandle <= 0) {
-            Toast.makeText(this, "Session controls need the SSH workflow", Toast.LENGTH_LONG).show();
+            note("Session controls need the SSH workflow");
             return;
         }
         // A raw shell has no Herdr panes or tabs to change.
@@ -4498,10 +4493,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             row.setBackground(controlBackground(false, 0x00000000, 0, 0));
             row.setSaveEnabled(false);
             final int index = i;
-            row.setOnClickListener(view -> {
+            Runnable choose = () -> {
                 sheet.dismiss();
                 runSessionChoice(target, shownLabels[index], shownActions[index]);
-            });
+            };
+            // A close ends processes: it asks on this same row, never in a second pop-up.
+            if (destructive) {
+                String warning = "pane.close".equals(shownActions[i])
+                        ? "Tap again: its processes end, no undo"
+                        : "Tap again: its panes and processes end, no undo";
+                ConfirmInPlace.bind(row, shownLabels[i], warning, choose);
+            } else row.setOnClickListener(view -> choose.run());
             list.addView(row);
         }
         showLocalDialog(sheet);
@@ -4535,7 +4537,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         if ("pane.close".equals(action) || "tab.close".equals(action)) {
-            confirmSessionAction(target, action, label);
+            // Confirmed on its own row (showSessionActions).
+            runSessionAction(target, action, label);
         } else if ("pane.zoom.on".equals(action)) {
             // One control toggles: the daemon reports the current zoom state.
             runSessionAction(target, zoomed(target) ? "pane.zoom.off" : "pane.zoom.on", "Zoom");
@@ -4552,17 +4555,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (tab != null && tab.optBoolean("focused") && tab.optBoolean("zoomed")) return true;
         }
         return false;
-    }
-
-    private void confirmSessionAction(Connection target, String action, String label) {
-        sheetBuilder()
-                .setTitle(label + "?")
-                .setMessage("pane.close".equals(action)
-                        ? "Closing the pane terminates its processes. This cannot be undone."
-                        : "Closing the tab terminates its panes and processes. This cannot be undone.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton(label, (dialog, which) -> runSessionAction(target, action, label))
-                .show();
     }
 
     /**
@@ -4584,7 +4576,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (failure == null) return;
             final String reason = failure;
             main.post(() -> {
-                if (!destroyed) Toast.makeText(this, "Could not apply " + label + ": " + reason, Toast.LENGTH_LONG).show();
+                if (!destroyed) note("Could not apply " + label + ": " + reason);
             });
         });
     }
@@ -4612,9 +4604,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    /** Agent alerts from the daemon, posted on one bounded channel. */
+    /** Off unless turned on in View options: Herdr posts no notifications by default. */
+    static final String AGENT_ALERTS = "agent_alerts";
+
+    private boolean agentAlertsOn() {
+        return getSharedPreferences("terminal-display", MODE_PRIVATE).getBoolean(AGENT_ALERTS, false);
+    }
+
+    /** Agent alerts from the daemon, posted on one bounded channel, only when turned on. */
     private void postNotice(String title, String body, String paneId) {
-        if (destroyed || isFinishing()) return;
+        if (destroyed || isFinishing() || !agentAlertsOn()) return;
         android.app.NotificationManager manager =
                 (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (manager == null) return;
@@ -4651,7 +4650,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (manager == null) return;
         try {
             manager.setPrimaryClip(android.content.ClipData.newPlainText("Herdr", text));
-            Toast.makeText(this, "Copied from terminal", Toast.LENGTH_SHORT).show();
         } catch (RuntimeException rejected) {
             // A locked device may refuse clipboard writes; the session stays usable.
         }
@@ -4687,7 +4685,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
                         android.net.Uri.parse(url)).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK));
             } catch (RuntimeException noBrowser) {
-                Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+                note("No app can open this link");
             }
         });
     }
@@ -5039,7 +5037,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return raw;
         }
         lastEnterAt = 0;
-        main.post(() -> { if (!destroyed) Toast.makeText(this, "Sent now", Toast.LENGTH_SHORT).show(); });
         return "{\"type\":\"keys\",\"keys\":[\"ctrl+enter\"]}";
     }
 
@@ -5076,8 +5073,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     held = pendingInput.next(current.paneId);
                     int discarded = pendingInput.takeDiscarded();
                     if (discarded > 0) {
-                        main.post(() -> Toast.makeText(this, discarded + (discarded == 1 ? " input" : " inputs")
-                                + " for another pane not sent", Toast.LENGTH_SHORT).show());
+                        main.post(() -> note(discarded + (discarded == 1 ? " input" : " inputs")
+                                + " for another pane not sent"));
                     }
                 }
             }
@@ -5111,8 +5108,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     // for the same pane rather than drop it.
                     synchronized (stateLock) {
                         if (!pendingInput.add(current.paneId, raw)) {
-                            main.post(() -> Toast.makeText(this, "Input not sent: the terminal is reconnecting",
-                                    Toast.LENGTH_SHORT).show());
+                            main.post(() -> note("Input not sent: the terminal is reconnecting"));
                         }
                     }
                     return;
@@ -5430,11 +5426,48 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     .format(new java.util.Date(savedShownAt)));
         }
         linkStatus = text.toString();
+        // A note on screen keeps its moment; the link status follows it.
+        if (crumbNote != null) return;
         crumb.setVisibility(View.VISIBLE);
         crumb.setTextColor(chrome.warning);
         crumb.setText(linkStatus);
         crumb.setContentDescription(linkStatus);
     }
+
+    /** A short note in the crumb's own slot, in place of any pop-up; null while none shows. */
+    private String crumbNote;
+    private final Runnable clearNote = () -> {
+        crumbNote = null;
+        crumbText = null;
+        if (crumb == null) return;
+        if (linkStatus != null) {
+            crumb.setTextColor(chrome.warning);
+            crumb.setText(linkStatus);
+            crumb.setContentDescription(linkStatus);
+        } else refreshTabStrip();
+    };
+
+    /**
+     * Says something worth knowing (a failed action, a refused send) quietly,
+     * in the status line where the crumb sits, for a few seconds; Herdr shows
+     * no toasts, snackbars or pop-ups. Any thread.
+     */
+    private void note(String text) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            main.post(() -> note(text));
+            return;
+        }
+        if (destroyed || crumb == null || text == null || text.isEmpty()) return;
+        crumbNote = text;
+        crumb.setVisibility(View.VISIBLE);
+        crumb.setTextColor(chrome.warning);
+        crumb.setText(text);
+        crumb.setContentDescription(text);
+        main.removeCallbacks(clearNote);
+        main.postDelayed(clearNote, NOTE_MS);
+    }
+
+    private static final long NOTE_MS = 5_000;
 
     /** The link is back: the crumb returns to where this window is. Main thread. */
     private void showLinkUp() {

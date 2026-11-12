@@ -15,7 +15,6 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
-import android.widget.Toast;
 
 /**
  * Version, licences and the privacy policy, from pages bundled in the app.
@@ -106,7 +105,7 @@ public final class AboutActivity extends Activity {
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, url));
         } catch (ActivityNotFoundException none) {
-            Toast.makeText(this, "No app on this device can open that link", Toast.LENGTH_LONG).show();
+            // No browser: the link simply does nothing (no pop-ups from Herdr).
         }
     }
 }

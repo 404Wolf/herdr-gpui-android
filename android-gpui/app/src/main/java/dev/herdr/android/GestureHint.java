@@ -1,7 +1,6 @@
 package dev.herdr.android;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.graphics.drawable.GradientDrawable;
 import android.view.Gravity;
 import android.view.View;
@@ -10,13 +9,13 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 /**
- * A one-time card over an agent's terminal that names its gestures, since the
- * bar's buttons are gone: the rail from the left, the file from the right,
- * panes and keys on the chip, machines from the tab strip. Any tap dismisses
- * it for good; the More menu can show it again.
+ * A card over an agent's terminal that names its gestures, since the bar's
+ * buttons are gone: the rail from the left, the file from the right, panes and
+ * keys on the chip, machines from the tab strip. Shown only from ⋯ > Gestures,
+ * never on its own (Herdr shows no pop-ups it was not asked for). Any tap
+ * dismisses it.
  */
 final class GestureHint {
-    static final String SHOWN = "gesture_hint_shown";
     static final String TEXT = "Swipe → from the left half: machines, spaces and agents\n"
             + "Swipe ← from the right half: the open file\n"
             + "Swipe ↔ on the mic and ↵ chip: previous or next pane\n"
@@ -26,11 +25,8 @@ final class GestureHint {
 
     private GestureHint() { }
 
-    /** Shows the card over {@code frame} unless it was shown before (or {@code force}). */
-    static void maybeShow(Context context, FrameLayout frame, GpuiChrome chrome, boolean force) {
-        SharedPreferences preferences = context.getSharedPreferences("terminal-display", Context.MODE_PRIVATE);
-        if (!force && preferences.getBoolean(SHOWN, false)) return;
-        preferences.edit().putBoolean(SHOWN, true).apply();
+    /** Shows the card over {@code frame}; the user asked for it. */
+    static void show(Context context, FrameLayout frame, GpuiChrome chrome) {
         float density = context.getResources().getDisplayMetrics().density;
         FrameLayout scrim = new FrameLayout(context);
         scrim.setBackgroundColor(GpuiChrome.withAlpha(chrome.background, 0xb8));

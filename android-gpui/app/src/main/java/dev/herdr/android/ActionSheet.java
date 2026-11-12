@@ -19,7 +19,6 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -47,7 +46,10 @@ final class ActionSheet {
         return this;
     }
 
-    /** Closing or stopping something: shown in the danger colour. */
+    /**
+     * Closing or stopping something: shown in the danger colour, and done only
+     * on a second tap of the same row (it says so after the first).
+     */
     ActionSheet danger(String label, Runnable action) {
         items.add(new Object[] {label, action, true});
         return this;
@@ -72,7 +74,9 @@ final class ActionSheet {
             row.setBackground(ripple(chrome));
             row.setFocusable(true);
             Runnable action = (Runnable) item[1];
-            row.setOnClickListener(v -> { dialog.dismiss(); action.run(); });
+            Runnable run = () -> { dialog.dismiss(); action.run(); };
+            if ((Boolean) item[2]) ConfirmInPlace.bind(row, (String) item[0], ConfirmInPlace.again((String) item[0]), run);
+            else row.setOnClickListener(v -> run.run());
             list.addView(row, new LinearLayout.LayoutParams(-1, -2));
         }
         ScrollView scroll = new ScrollView(activity);
@@ -127,8 +131,8 @@ final class ActionSheet {
     static void copy(Context context, String label, String text) {
         ClipboardManager clipboard = context.getSystemService(ClipboardManager.class);
         if (clipboard == null || text == null || text.isEmpty()) return;
+        // Android itself shows what was copied; nothing more pops up.
         clipboard.setPrimaryClip(ClipData.newPlainText(label, text));
-        Toast.makeText(context, "Copied " + label.toLowerCase(java.util.Locale.ROOT), Toast.LENGTH_SHORT).show();
     }
 
     private static LinearLayout card(Context context, GpuiChrome chrome) {
