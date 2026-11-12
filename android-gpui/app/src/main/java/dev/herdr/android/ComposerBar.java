@@ -52,8 +52,8 @@ final class ComposerBar {
         void hideKeyboard();
         /** A short status for the user; the connection stays as it is. */
         void notice(String message);
-        /** A queued message was tapped: offer what can be done with it. */
-        void queuedTapped(Outbox.Message message);
+        /** The Enter badge was tapped: list the pane's queued messages. */
+        void showQueue(java.util.List<Outbox.Message> messages);
         /**
          * Runs {@code granted} once the microphone may be used: at once when
          * RECORD_AUDIO is already granted, or after the user allows it.
@@ -80,10 +80,11 @@ final class ComposerBar {
     private final FrameLayout keysRow;
     /** Floats over the terminal; the parent frame positions it over {@link #slot}. */
     private final EditText field;
-    /** The outbox's messages for this pane, directly above the field. */
-    private final QueuedStrip queued;
-    /** The queued strip over the field: what the activity floats over the terminal. */
+    /** What the activity floats over the terminal: the field. */
     private final LinearLayout stack;
+    /** The outbox's messages for this pane, counted on Enter's badge. */
+    private java.util.List<Outbox.Message> queuedMessages = java.util.Collections.emptyList();
+    private TextView queueBadge;
     private GpuiChrome chrome;
 
     private LinearLayout bar;
@@ -117,12 +118,8 @@ final class ComposerBar {
         micOnly = preferences.getBoolean(MIC_ONLY, false);
         keysRow = new FrameLayout(context);
         field = createField();
-        queued = new QueuedStrip(context, chrome, host::queuedTapped);
         stack = new LinearLayout(context);
         stack.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams above = new LinearLayout.LayoutParams(-1, -2);
-        above.bottomMargin = dp(2);
-        stack.addView(queued.view(), above);
         stack.addView(field, new LinearLayout.LayoutParams(-1, -2));
         stack.setVisibility(View.GONE);
     }
@@ -130,16 +127,13 @@ final class ComposerBar {
     /** The collapsible keys row; the activity places it directly above the bar. */
     View keysRow() { return keysRow; }
 
-    /**
-     * The floating composer field with the queued strip above it; the activity
-     * adds it to a frame over the terminal column.
-     */
+    /** The floating composer field; the activity adds it to a frame over the terminal column. */
     View field() { return stack; }
 
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
     void showQueued(java.util.List<Outbox.Message> messages) {
-        queued.show(messages, drafts.pane());
-        updateStack();
+        queuedMessages = messages;
+        updateQueueBadge();
     }
 
     /** A queued message taken back: its text joins the draft, on a line of its own. */
@@ -190,12 +184,25 @@ final class ComposerBar {
         enter.setSaveEnabled(false);
         enter.setContentDescription("Enter: send the draft, or press Enter in the terminal");
         enter.setOnClickListener(v -> enter());
+        enter.setOnLongClickListener(v -> {
+            if (queuedMessages.isEmpty()) return false;
+            host.showQueue(queuedMessages);
+            return true;
+        });
+        // The queue's count rides on Enter's corner, so queued messages cost
+        // no line over the terminal; it overhangs into the bar's own padding.
+        FrameLayout enterBox = new FrameLayout(context);
+        enterBox.setClipChildren(false);
+        enterBox.addView(enter, new FrameLayout.LayoutParams(-2, dp(48)));
+        queueBadge = createQueueBadge();
+        enterBox.addView(queueBadge, new FrameLayout.LayoutParams(-2, dp(18), Gravity.TOP | Gravity.START));
+        bar.setClipChildren(false);
         LinearLayout.LayoutParams enterParams = new LinearLayout.LayoutParams(-2, dp(48));
         enterParams.setMargins(dp(2), 0, dp(6), 0);
-        bar.addView(enter, enterParams);
+        bar.addView(enterBox, enterParams);
         keysRow.setBackgroundColor(chrome.surface);
         styleField();
-        queued.style(chrome);
+        updateQueueBadge();
         apply();
         return bar;
     }
@@ -297,9 +304,9 @@ final class ComposerBar {
         updateStack();
     }
 
-    /** Shows the floating stack while it holds the field or queued messages. */
+    /** Shows the floating stack while it holds the field. */
     private void updateStack() {
-        boolean shown = field.getVisibility() == View.VISIBLE || !queued.isEmpty();
+        boolean shown = field.getVisibility() == View.VISIBLE;
         stack.setVisibility(shown ? View.VISIBLE : View.GONE);
         placeField();
     }
@@ -382,6 +389,46 @@ final class ComposerBar {
         box.setCornerRadius(dp(10));
         field.setBackground(new android.graphics.drawable.InsetDrawable(box, 0, dp(4), 0, dp(4)));
         field.setPadding(dp(10), dp(8), dp(10), dp(8));
+    }
+
+    private TextView createQueueBadge() {
+        TextView badge = new TextView(context);
+        badge.setTextSize(11);
+        badge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        badge.setGravity(Gravity.CENTER);
+        badge.setIncludeFontPadding(false);
+        badge.setMinWidth(dp(18));
+        badge.setPadding(dp(5), 0, dp(5), 0);
+        badge.setTranslationX(-dp(6));
+        badge.setTranslationY(-dp(1));
+        badge.setOnClickListener(v -> host.showQueue(queuedMessages));
+        badge.setVisibility(View.GONE);
+        return badge;
+    }
+
+    /** Enter's corner: how many messages wait for this pane, in the most pressing one's colour. */
+    private void updateQueueBadge() {
+        if (queueBadge == null) return;
+        String count = QueuedMessages.badge(queuedMessages.size());
+        queueBadge.setVisibility(count.isEmpty() ? View.GONE : View.VISIBLE);
+        if (count.isEmpty()) return;
+        int color;
+        switch (QueuedMessages.urgency(queuedMessages)) {
+            case GONE: color = chrome.danger; break;
+            case WAITING: color = chrome.warning; break;
+            case SENDING: color = chrome.info; break;
+            default: color = chrome.primary;
+        }
+        GradientDrawable pill = new GradientDrawable();
+        pill.setColor(color);
+        pill.setCornerRadius(dp(9));
+        pill.setStroke(dp(2), chrome.surface);
+        queueBadge.setBackground(pill);
+        queueBadge.setTextColor(chrome.light ? 0xffffffff : chrome.background);
+        queueBadge.setText(count);
+        String label = QueuedMessages.title(queuedMessages.size()) + "; tap to list";
+        queueBadge.setContentDescription(label);
+        queueBadge.setTooltipText(label);
     }
 
     private LinearLayout createMicPanel() {

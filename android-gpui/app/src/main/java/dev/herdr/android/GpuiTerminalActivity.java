@@ -3892,7 +3892,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 Toast.makeText(GpuiTerminalActivity.this, message, Toast.LENGTH_SHORT).show();
             }
 
-            @Override public void queuedTapped(Outbox.Message message) { queuedActions(message); }
+            @Override public void showQueue(java.util.List<Outbox.Message> messages) { queueSheet(messages); }
 
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
@@ -3979,7 +3979,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         showLinkDown();
     });
 
-    /** Shows the outbox's messages for the pane on screen above the composer. Main thread. */
+    /** Counts the outbox's messages for the pane on screen on Enter's badge. Main thread. */
     private void refreshQueued() {
         if (composer == null || outbox == null) return;
         String host;
@@ -3992,13 +3992,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 : outbox.outbox().shown(host, pane, System.currentTimeMillis()));
     }
 
+    /** The pane's queued messages, one row each; a row opens its actions. */
+    private void queueSheet(java.util.List<Outbox.Message> messages) {
+        if (messages.isEmpty()) return;
+        String pane;
+        synchronized (stateLock) {
+            pane = connection == null ? "" : connection.paneId;
+        }
+        ActionSheet sheet = new ActionSheet(this, chrome, QueuedMessages.title(messages.size()));
+        for (Outbox.Message message : messages) {
+            sheet.add(QueuedMessages.row(message, pane), () -> queuedActions(message));
+        }
+        sheet.show();
+    }
+
     /** What can be done with one queued message; an unsure one is resent only from here. */
     private void queuedActions(Outbox.Message message) {
         if (message.state == Outbox.State.SENDING) {
             Toast.makeText(this, "Sending…", Toast.LENGTH_SHORT).show();
             return;
         }
-        ActionSheet sheet = new ActionSheet(this, chrome, "❯ " + QueuedStrip.oneLine(message.text));
+        ActionSheet sheet = new ActionSheet(this, chrome, QueuedMessages.PROMPT + QueuedMessages.oneLine(message.text));
         if (message.state == Outbox.State.UNSURE) {
             // The core may have typed it: look at the pane before sending it twice.
             sheet.add("Send again (check the pane first)", () -> outbox.resend(message.id));
