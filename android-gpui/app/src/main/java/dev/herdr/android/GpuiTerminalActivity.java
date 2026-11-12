@@ -4832,6 +4832,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
+        // Enter while the composer's box is up is its send, whichever view has
+        // focus: it must never reach the terminal as a bare Enter instead.
+        if (composer != null && composer.typing() && composer.enterKey(event)) return true;
         if (composer != null && composer.ownsKeys()) return super.dispatchKeyEvent(event);
         boolean physical = imeKeyInFlight || event.isFromSource(InputDevice.SOURCE_KEYBOARD)
                 && event.getDevice() != null && !event.getDevice().isVirtual()
