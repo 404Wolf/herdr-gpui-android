@@ -97,7 +97,9 @@ final class ComposerBar {
     /** The typing box: present only while the keyboard is up. */
     private final EditText field;
     /** What the activity floats at the terminal's bottom: the box with its mic and send. */
-    private final LinearLayout stack;
+    private final PullDownRow stack;
+    /** In the box: closes the keyboard (and the box); the draft stays as ghost text. */
+    private final android.widget.TextView hide;
     private final ImageView send;
     private final MicButton mic;
     private final FloatingCluster cluster;
@@ -173,8 +175,20 @@ final class ComposerBar {
         send.setPadding(dp(8), dp(8), dp(8), dp(8));
         send.setContentDescription("Send");
         send.setOnClickListener(v -> enter());
-        stack = new LinearLayout(context);
+        stack = new PullDownRow(context);
         stack.setOrientation(LinearLayout.HORIZONTAL);
+        // A swipe down on the box puts the keyboard away, as chat apps do.
+        stack.setOnPull(this::hideKeyboard);
+        hide = new android.widget.TextView(context);
+        hide.setText("hide ▾");
+        hide.setTextSize(13);
+        hide.setTypeface(android.graphics.Typeface.MONOSPACE);
+        hide.setGravity(Gravity.CENTER);
+        hide.setMinWidth(dp(48));
+        hide.setPadding(dp(4), 0, dp(6), 0);
+        hide.setContentDescription("Hide the keyboard");
+        hide.setOnClickListener(v -> hideKeyboard());
+        stack.addView(hide, new LinearLayout.LayoutParams(-2, dp(48)));
         stack.setGravity(Gravity.BOTTOM);
         stack.setPadding(dp(6), dp(4), dp(6), dp(4));
         stack.addView(field, new LinearLayout.LayoutParams(0, -2, 1));
@@ -431,6 +445,7 @@ final class ComposerBar {
         round.setColor(chrome.control);
         send.setBackground(round);
         keysOverlay.setBackgroundColor(chrome.surface);
+        hide.setTextColor(chrome.onSurfaceVariant);
         GradientDrawable label = new GradientDrawable();
         label.setColor(chrome.surface);
         label.setStroke(Math.max(1, dp(1)), chrome.outline);
@@ -451,10 +466,40 @@ final class ComposerBar {
             showText(drafts.text());
             apply();
         }
-        field.requestFocus();
-        field.setSelection(field.getText().length());
+        // After the box is laid out: a just-shown field cannot take focus or
+        // the keyboard in the same frame, and SHOW_IMPLICIT may be ignored.
+        field.post(() -> {
+            if (!typing) return;
+            field.requestFocus();
+            field.setSelection(field.getText().length());
+            InputMethodManager input = context.getSystemService(InputMethodManager.class);
+            if (input != null) input.showSoftInput(field, 0);
+            if (android.os.Build.VERSION.SDK_INT >= 30 && field.getWindowInsetsController() != null) {
+                field.getWindowInsetsController().show(android.view.WindowInsets.Type.ime());
+            }
+        });
+    }
+
+    /**
+     * Puts the keyboard and its box away; the draft stays as ghost text at the
+     * prompt. False when they were not up (Back then does its usual thing).
+     */
+    boolean hideKeyboard() {
+        if (!typing) return false;
+        host.hideKeyboard();
         InputMethodManager input = context.getSystemService(InputMethodManager.class);
-        if (input != null) input.showSoftInput(field, InputMethodManager.SHOW_IMPLICIT);
+        if (input != null) input.hideSoftInputFromWindow(field.getWindowToken(), 0);
+        stopTyping();
+        return true;
+    }
+
+    /** Whether the typing box (and its keyboard) is up. */
+    boolean typing() { return typing; }
+
+    /** The "type" control: opens the keyboard, or closes it while it is up. */
+    private void toggleTyping() {
+        if (typing) hideKeyboard();
+        else startTyping();
     }
 
     private void stopTyping() {
@@ -527,7 +572,9 @@ final class ComposerBar {
         surface.getLocationInWindow(at);
         frame.getLocationInWindow(origin);
         float left = at[0] - origin[0], top = at[1] - origin[1];
-        boolean showing = agent && !typing && !covered;
+        // While typing the box lies over the prompt; where it does not, the
+        // rule's "hide" still works.
+        boolean showing = agent && !covered;
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
         View chip = cluster.view();
@@ -618,7 +665,7 @@ final class ComposerBar {
     private void targetTapped(View target) {
         String id = String.valueOf(target.getTag());
         switch (id) {
-            case "type": startTyping(); break;
+            case "type": toggleTyping(); break;
             case "talk": toggleDictation(); break;
             case "send": {
                 // The count after "send" lists the queue; the word itself sends.
@@ -636,7 +683,7 @@ final class ComposerBar {
 
     private static String describe(String id) {
         switch (id) {
-            case "type": return "Type a message";
+            case "type": return "Type a message, or hide the keyboard";
             case "talk": return "Dictate; tap again to stop";
             case "send": return "Send, or press Enter; hold for the terminal keys";
             default: return id;
@@ -676,14 +723,24 @@ final class ComposerBar {
 
     /** The controls drawn in the program's frame, for the current state. */
     private java.util.List<GhostText.Control> controls() {
-        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
-        if (typing) return out;
-        out.add(new GhostText.Control("type", "type", "dim"));
-        if (dictation.isAvailable()) out.add(talk());
         String count = queuedMessages.isEmpty() ? "" : "·" + QueuedMessages.badge(queuedMessages.size());
         sendCount = count.length();
+        return controls(typing, dictation.isAvailable() ? talk() : null, queuedMessages);
+    }
+
+    /**
+     * "type ─ talk ─ send": "type" reads "hide" while the keyboard is up (it
+     * toggles it), "talk" is left out with no dictation, and "send" carries the
+     * queued count in the most pressing message's colour.
+     */
+    static java.util.List<GhostText.Control> controls(boolean typing, GhostText.Control talk,
+            List<Outbox.Message> queued) {
+        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
+        out.add(new GhostText.Control("type", typing ? "hide" : "type", "dim"));
+        if (talk != null) out.add(talk);
+        String count = queued.isEmpty() ? "" : "·" + QueuedMessages.badge(queued.size());
         String countStyle;
-        switch (QueuedMessages.urgency(queuedMessages)) {
+        switch (QueuedMessages.urgency(queued)) {
             case GONE: countStyle = "danger"; break;
             case WAITING: countStyle = "warn"; break;
             default: countStyle = "info";

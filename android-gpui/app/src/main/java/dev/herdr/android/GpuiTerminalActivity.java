@@ -561,8 +561,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (Build.VERSION.SDK_INT < 34 || wanted == (edgeBack != null)) return;
         if (wanted) {
             edgeBack = EdgeBack.register(this, () -> {
+                if (composer != null && composer.hideKeyboard()) return;
                 if (shellMode()) leaveByBack(); else showRailOverlay();
             }, () -> {
+                if (composer != null && composer.hideKeyboard()) return;
                 if (filePager == null || !filePager.hide()) leaveByBack();
             });
         } else {
@@ -610,6 +612,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
+        // Back puts the keyboard and its box away first.
+        if (composer != null && composer.hideKeyboard()) return;
         if (sidebarOpen && railAsDrawer()) {
             hideSidebar();
             return;
@@ -4222,6 +4226,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (edgeClaimed) return true;
             if (!scrolling && Math.abs(event.getY() - touchDownY) > dp(8)) {
                 scrolling = true;
+                // Dragging the conversation down while typing puts the keyboard away.
+                if (event.getY() > touchDownY && composer != null) composer.hideKeyboard();
                 // The drag is ours from here: the renderer's press (a link's
                 // highlight, a selection) ends now, not at a lift it never sees.
                 nativeTouch(MotionEvent.ACTION_CANCEL, 0, new int[] {event.getPointerId(0)},
