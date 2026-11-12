@@ -180,6 +180,30 @@ public final class PendingDictationsTest {
         assertEquals(0, restarted.count());
     }
 
+    @Test public void eachPassLogsCountsAndTimingsButNeverText() {
+        ClipStore store = store();
+        record(store, "secret target", ClipStore.BYTES_PER_SECOND * 3);
+        record(store, "t", 10);
+        List<String> lines = new ArrayList<>();
+        boolean[] up = {false};
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> {
+            if (!up[0]) throw new IOException("refused with private details");
+            return "private words";
+        }, worker, Runnable::run, lines::add);
+        pending.pass();
+        up[0] = true;
+        pending.pass();
+        pending.pass(); // nothing waiting: no line
+        assertEquals(4, lines.size());
+        assertTrue(lines.get(0), lines.get(0).matches(
+                "dictation: 0 sent \\(0 s of audio\\) in \\d+ ms, 2 waiting, desktop unreachable \\(IOException\\), retry in 10 s"));
+        assertTrue(lines.get(1), lines.get(1).matches("dictation: sent a 3 s clip in \\d+ ms"));
+        assertTrue(lines.get(3), lines.get(3).matches("dictation: 2 sent \\(3 s of audio\\) in \\d+ ms, 0 waiting, all sent"));
+        for (String line : lines) {
+            assertFalse(line, line.contains("private") || line.contains("secret"));
+        }
+    }
+
     @Test public void aDroppedClipIsNotTranscribed() {
         ClipStore store = store();
         PendingClip a = record(store, "1", 10);

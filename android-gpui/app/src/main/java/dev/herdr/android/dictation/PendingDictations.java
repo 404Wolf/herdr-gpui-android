@@ -49,6 +49,7 @@ public final class PendingDictations {
         String transcribe(PendingClip clip, File audio) throws IOException;
     }
 
+    static final String TAG = "HerdrDictation";
     static final long FIRST_RETRY_MS = 10_000;
     static final long MAX_RETRY_MS = 5 * 60_000;
     /** After the network comes back, give the tailnet a moment before trying. */
@@ -61,6 +62,8 @@ public final class PendingDictations {
     private final ScheduledExecutorService worker;
     /** Posts to the main thread. */
     private final Executor main;
+    /** One line per courier pass, counts and timings only (never audio or text); logcat in the app. */
+    private final java.util.function.Consumer<String> log;
     /** Main thread only. */
     private Listener listener;
     /** Clips offered to the current listener and not yet delivered; main thread only. */
@@ -82,7 +85,7 @@ public final class PendingDictations {
                     Thread t = new Thread(r, "dictation-pending");
                     t.setDaemon(true);
                     return t;
-                }), new Handler(Looper.getMainLooper())::post);
+                }), new Handler(Looper.getMainLooper())::post, line -> android.util.Log.i(TAG, line));
         ConnectivityManager net = app.getSystemService(ConnectivityManager.class);
         if (net != null && uri != null) {
             net.registerDefaultNetworkCallback(new ConnectivityManager.NetworkCallback() {
@@ -96,10 +99,16 @@ public final class PendingDictations {
     }
 
     PendingDictations(ClipStore store, Transcriber transcriber, ScheduledExecutorService worker, Executor main) {
+        this(store, transcriber, worker, main, line -> { });
+    }
+
+    PendingDictations(ClipStore store, Transcriber transcriber, ScheduledExecutorService worker, Executor main,
+            java.util.function.Consumer<String> log) {
         this.store = store;
         this.transcriber = transcriber;
         this.worker = worker;
         this.main = main;
+        this.log = log;
     }
 
     ClipStore store() {
@@ -163,18 +172,37 @@ public final class PendingDictations {
     /** Worker thread: transcribes waiting clips, oldest first, until one fails. */
     void pass() {
         scheduled = null;
-        for (PendingClip clip : store.untranscribed()) {
+        List<PendingClip> waiting = store.untranscribed();
+        if (waiting.isEmpty()) return;
+        int sent = 0;
+        long sentMs = 0;
+        long started = System.nanoTime();
+        for (PendingClip clip : waiting) {
             String text;
+            long t = System.nanoTime();
             try {
                 text = transcriber.transcribe(clip, store.audio(clip.id));
             } catch (IOException e) {
+                log.accept(line(sent, sentMs, waiting.size() - sent, started)
+                        + ", desktop unreachable (" + e.getClass().getSimpleName() + "), retry in "
+                        + retryMs / 1000 + " s");
                 schedule(retryMs);
                 retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
                 return;
             }
+            sent++;
+            sentMs += clip.durationMs;
+            log.accept("dictation: sent a " + clip.durationMs / 1000 + " s clip in "
+                    + (System.nanoTime() - t) / 1_000_000 + " ms");
             if (store.transcribed(clip.id, text)) main.execute(this::offer);
         }
+        log.accept(line(sent, sentMs, 0, started) + ", all sent");
         retryMs = FIRST_RETRY_MS;
+    }
+
+    private static String line(int sent, long sentMs, int left, long started) {
+        return "dictation: " + sent + " sent (" + sentMs / 1000 + " s of audio) in "
+                + (System.nanoTime() - started) / 1_000_000 + " ms, " + left + " waiting";
     }
 
     /** Main thread: hands the listener every held text it has not been offered. */
