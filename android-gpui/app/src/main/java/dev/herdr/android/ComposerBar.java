@@ -103,6 +103,12 @@ final class ComposerBar {
     private final FloatingCluster cluster;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
+    /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
+    private final TargetStrip targets;
+    /** Recordings waiting for the desktop, counted after "talk". */
+    private int waiting;
+    /** When the microphone opened, for the clock in the controls; 0 while not recording. */
+    private long recordingSince;
     /** In the keys' overlay: the keyboard typing straight into the program. */
     private final ImageView raw;
     /**
@@ -177,6 +183,8 @@ final class ComposerBar {
         sendParams.bottomMargin = dp(4);
         stack.addView(send, sendParams);
         stack.setVisibility(View.GONE);
+        targets = new TargetStrip(context);
+        targets.setVisibility(View.GONE);
         keysOverlay = new KeysOverlay(context);
         keysOverlay.setVisibility(View.GONE);
         raw = new ImageView(context);
@@ -208,6 +216,9 @@ final class ComposerBar {
     /** The terminal keys' overlay; the activity adds it to the frame over the terminal. */
     View keysOverlay() { return keysOverlay; }
 
+    /** The controls' touch targets; the activity adds them to the frame over the terminal. */
+    View targets() { return targets; }
+
     /** Whether {@code kind} (a pane's program, lowercase) gets the composer: any agent, not a shell. */
     static boolean isAgent(String kind) {
         return kind != null && !kind.isEmpty() && !SHELLS.contains(kind);
@@ -217,6 +228,7 @@ final class ComposerBar {
     void setWaiting(int count) {
         for (PendingClip clip : Dictation.pending(context).waiting()) clipLengths.put(clip.id, clip.durationMs);
         mic.setWaiting(count);
+        waiting = Math.max(0, count);
         DraftChips.apply(field.getText(), chip());
         lastGhost = "";
         pushGhost();
@@ -382,6 +394,14 @@ final class ComposerBar {
 
     private final Runnable saveDrafts = this::saveDrafts;
 
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            if (recordingSince == 0) return;
+            pushGhost();
+            field.postDelayed(this, 1000);
+        }
+    };
+
     private void saveDrafts() {
         preferences.edit().putString(DRAFTS, drafts.encode()).apply();
     }
@@ -484,26 +504,36 @@ final class ComposerBar {
             cluster.takeMic(mic.view());
         }
         stack.setVisibility(agent && typing ? View.VISIBLE : View.GONE);
-        cluster.view().setVisibility(agent && !typing && !covered ? View.VISIBLE : View.GONE);
+        if (!agent || typing || covered) {
+            cluster.view().setVisibility(View.GONE);
+            targets.setVisibility(View.GONE);
+        }
         place();
         pushGhost();
     }
 
     /**
-     * Floats the chip on the lowest free cells at the terminal's bottom right
-     * and the keys just above the prompt (or a dialog), from the renderer's
-     * last layout hint. A new spot narrows the ghost text's rows under it.
+     * Puts the touch targets on the words the renderer drew in the program's
+     * frame ("type ─ talk ─ send"), from its last layout hint. When it had no
+     * room for them (a full screen), the floating chip stands in, on the lowest
+     * free cells. The keys float just above the prompt (or a dialog).
      */
     private void place() {
         View surface = host.surface();
-        View chip = cluster.view();
-        if (layout == null || surface == null || !(chip.getParent() instanceof ViewGroup)) return;
-        ViewGroup frame = (ViewGroup) chip.getParent();
+        if (layout == null || surface == null || !(targets.getParent() instanceof ViewGroup)) return;
+        ViewGroup frame = (ViewGroup) targets.getParent();
         int[] at = new int[2];
         int[] origin = new int[2];
         surface.getLocationInWindow(at);
         frame.getLocationInWindow(origin);
         float left = at[0] - origin[0], top = at[1] - origin[1];
+        boolean showing = agent && !typing && !covered;
+        boolean drawn = !layout.controls.isEmpty();
+        placeTargets(showing && drawn, left, top, surface.getHeight() / density);
+        View chip = cluster.view();
+        chip.setVisibility(showing && !drawn ? View.VISIBLE : View.GONE);
+        FrameLayout.LayoutParams anchorAt = null;
+        int anchorWidth = 0;
         if (chip.getVisibility() == View.VISIBLE) {
             chip.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
             float width = (chip.getMeasuredWidth() + dp(INSET)) / density;
@@ -518,13 +548,15 @@ final class ComposerBar {
                 chip.setLayoutParams(params);
             }
             cluster.setCrowded(next.crowded);
-            boolean moved = !next.equals(spot);
             spot = next;
-            if (moved) pushGhost();
-            placeFallback(frame, params, chip.getMeasuredHeight());
-        } else {
-            fallback.setVisibility(View.GONE);
+            anchorAt = params;
+            anchorWidth = chip.getMeasuredWidth();
+        } else if (drawn) {
+            FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) targets.getLayoutParams();
+            anchorAt = t;
+            anchorWidth = t.width;
         }
+        placeFallback(frame, showing ? anchorAt : null, anchorWidth);
         if (keysOverlay.getVisibility() == View.VISIBLE) {
             float guardTop = top + (layout.top + layout.guard * layout.cellHeight) * density;
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(48), Gravity.TOP | Gravity.START);
@@ -533,10 +565,89 @@ final class ComposerBar {
         }
     }
 
-    /** The draft above the chip while no prompt is found; gone otherwise. */
-    private void placeFallback(ViewGroup frame, FrameLayout.LayoutParams chipAt, int chipHeight) {
+    /** Lays the invisible targets over the drawn words ({@link ControlTargets}). */
+    private void placeTargets(boolean show, float left, float top, float surfaceBottom) {
+        if (!show) {
+            targets.setVisibility(View.GONE);
+            return;
+        }
+        float right = layout.left + layout.cols * layout.cellWidth;
+        java.util.List<ControlTargets.Rect> rects = ControlTargets.layout(layout.controls, layout.left,
+                layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right);
+        if (rects.isEmpty()) {
+            targets.setVisibility(View.GONE);
+            return;
+        }
+        float l = Float.MAX_VALUE, t = Float.MAX_VALUE, rr = 0, b = 0;
+        for (ControlTargets.Rect rect : rects) {
+            l = Math.min(l, rect.left);
+            t = Math.min(t, rect.top);
+            rr = Math.max(rr, rect.right);
+            b = Math.max(b, rect.bottom);
+        }
+        targets.removeAllViews();
+        for (ControlTargets.Rect rect : rects) {
+            View target = new View(context);
+            target.setTag(rect.id);
+            target.setContentDescription(describe(rect.id));
+            target.setOnClickListener(this::targetTapped);
+            if ("send".equals(rect.id)) {
+                target.setOnLongClickListener(v -> { setKeysOpen(!keysOpen); return true; });
+                target.setOnTouchListener((v, e) -> {
+                    if (e.getActionMasked() == MotionEvent.ACTION_DOWN) sendTouchX = e.getX() / density + rect.left;
+                    return false;
+                });
+            }
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                    Math.round(rect.width() * density), Math.round(rect.height() * density), Gravity.TOP | Gravity.START);
+            params.leftMargin = Math.round((rect.left - l) * density);
+            params.topMargin = Math.round((rect.top - t) * density);
+            targets.addView(target, params);
+        }
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                Math.round((rr - l) * density), Math.round((b - t) * density), Gravity.TOP | Gravity.START);
+        params.leftMargin = Math.round(left + l * density);
+        params.topMargin = Math.round(top + t * density);
+        targets.setLayoutParams(params);
+        targets.setVisibility(View.VISIBLE);
+    }
+
+    /** Where the last touch on "send" went down (dp, surface), to tell its count apart. */
+    private float sendTouchX = -1;
+
+    private void targetTapped(View target) {
+        String id = String.valueOf(target.getTag());
+        switch (id) {
+            case "type": startTyping(); break;
+            case "talk": toggleDictation(); break;
+            case "send": {
+                // The count after "send" lists the queue; the word itself sends.
+                ControlTargets.Cells cells = null;
+                for (ControlTargets.Cells c : layout.controls) if (c.id.equals("send")) cells = c;
+                float countFrom = cells == null ? Float.MAX_VALUE
+                        : layout.left + (cells.end - sendCount) * layout.cellWidth - layout.cellWidth / 2;
+                if (sendCount > 0 && sendTouchX >= countFrom) host.showQueue(queuedMessages);
+                else enter();
+                break;
+            }
+            default:
+        }
+    }
+
+    private static String describe(String id) {
+        switch (id) {
+            case "type": return "Type a message";
+            case "talk": return "Dictate; tap again to stop";
+            case "send": return "Send, or press Enter; hold for the terminal keys";
+            default: return id;
+        }
+    }
+
+    /** The draft beside the controls when the renderer could not draw it (no prompt, no room). */
+    private void placeFallback(ViewGroup frame, FrameLayout.LayoutParams nearAt, int nearWidth) {
         String draft = drafts.text();
-        boolean show = layout != null && !layout.anchored && !typing && !draft.trim().isEmpty();
+        boolean show = nearAt != null && layout != null && !layout.draftShown && !typing
+                && !draft.trim().isEmpty();
         if (!show) {
             fallback.setVisibility(View.GONE);
             return;
@@ -554,21 +665,55 @@ final class ComposerBar {
                 View.MeasureSpec.UNSPECIFIED);
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
         params.width = fallback.getMeasuredWidth();
-        int right = chipAt.leftMargin + cluster.view().getMeasuredWidth();
+        int right = nearAt.leftMargin + nearWidth;
         params.leftMargin = Math.max(dp(8), right - fallback.getMeasuredWidth());
-        params.topMargin = Math.max(0, chipAt.topMargin - fallback.getMeasuredHeight() - dp(4));
+        params.topMargin = Math.max(0, nearAt.topMargin - fallback.getMeasuredHeight() - dp(4));
         fallback.setLayoutParams(params);
     }
 
-    /** Hands the renderer the pane's draft and queued messages, unless unchanged. */
+    /** Characters of the queued count drawn after "send" ("·2"), 0 when none. */
+    private int sendCount;
+
+    /** The controls drawn in the program's frame, for the current state. */
+    private java.util.List<GhostText.Control> controls() {
+        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
+        if (typing) return out;
+        out.add(new GhostText.Control("type", "type", "dim"));
+        if (dictation.isAvailable()) out.add(talk());
+        String count = queuedMessages.isEmpty() ? "" : "·" + QueuedMessages.badge(queuedMessages.size());
+        sendCount = count.length();
+        String countStyle;
+        switch (QueuedMessages.urgency(queuedMessages)) {
+            case GONE: countStyle = "danger"; break;
+            case WAITING: countStyle = "warn"; break;
+            default: countStyle = "info";
+        }
+        out.add(new GhostText.Control("send", "send", "bright", count, countStyle));
+        return out;
+    }
+
+    /** "talk", or what the dictation is doing, as TUI-style words. */
+    private GhostText.Control talk() {
+        long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
+        String clock = MicButton.clock(elapsed);
+        switch (dictationState) {
+            case CONNECTING: return new GhostText.Control("talk", "connecting…", "info");
+            case LISTENING: return new GhostText.Control("talk", "● rec " + clock + " · tap to stop", "danger");
+            case TRANSCRIBING: return new GhostText.Control("talk", "transcribing…", "info");
+            case OFFLINE_RECORDING:
+                return new GhostText.Control("talk", "desktop offline · rec " + clock + " · tap to stop", "warn");
+            default:
+                return new GhostText.Control("talk", "talk", "dim", waiting > 0 ? "·" + waiting : "", "warn");
+        }
+    }
+
+    /** Hands the renderer the pane's draft, queued messages and controls, unless unchanged. */
     private void pushGhost() {
         String json = "";
         if (agent) {
-            boolean clustered = spot != null && !spot.crowded && cluster.view().getVisibility() == View.VISIBLE;
             json = GhostText.json(GhostText.kind(kind), typing ? "" : drafts.text(),
                     typing ? -1 : drafts.partialFrom(), clipLengths, queuedMessages, drafts.pane(),
-                    clustered ? spot.cols + 1 : 0, clustered ? spot.topRow : Integer.MAX_VALUE / 2,
-                    GhostText.Colors.of(chrome));
+                    controls(), GhostText.Colors.of(chrome));
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;
@@ -638,8 +783,16 @@ final class ComposerBar {
     }
 
     private void setDictationState(DictationEngine.State state) {
+        boolean wasRecording = MicButton.recording(dictationState);
         dictationState = state;
         mic.setState(state);
+        boolean recording = MicButton.recording(state);
+        if (recording && !wasRecording) recordingSince = android.os.SystemClock.elapsedRealtime();
+        if (!recording) recordingSince = 0;
+        // The clock in the controls ticks while the microphone is open.
+        field.removeCallbacks(tick);
+        if (recording) field.postDelayed(tick, 1000);
+        pushGhost();
     }
 
     /** The mic's one tap: start, or stop what is recording. Transcribing ignores it. */
@@ -776,6 +929,38 @@ final class ComposerBar {
     }
 
     private int dp(float value) { return Math.round(value * density); }
+
+    /**
+     * The controls' targets: a sideways swipe goes to the previous or next
+     * pane, a swipe up opens the terminal keys; taps reach the targets.
+     */
+    private final class TargetStrip extends FrameLayout {
+        private final int slop = ViewConfiguration.get(context).getScaledTouchSlop();
+        private float downX, downY;
+
+        TargetStrip(Context context) { super(context); }
+
+        @Override public boolean onInterceptTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                downX = event.getX();
+                downY = event.getY();
+                return false;
+            }
+            if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                float dx = event.getX() - downX, dy = event.getY() - downY;
+                return Math.abs(dx) > slop * 2 || -dy > slop * 2;
+            }
+            return false;
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() != MotionEvent.ACTION_UP) return true;
+            float dx = event.getX() - downX, dy = event.getY() - downY;
+            if (Math.abs(dx) > dp(28) && Math.abs(dx) > Math.abs(dy)) host.switchPane(dx < 0 ? 1 : -1);
+            else if (-dy > dp(20) && -dy > Math.abs(dx)) setKeysOpen(!keysOpen);
+            return true;
+        }
+    }
 
     /** The keys' overlay: a swipe down on it closes it; sideways drags scroll the keys. */
     private final class KeysOverlay extends FrameLayout {

@@ -7,11 +7,14 @@
 //! park the visible terminal cursor at their input caret, on a row that starts
 //! with their prompt glyph (`❯ ` / `› `), and indent wrapped input by two
 //! columns. When that shape is not on screen (a dialog, a hidden cursor, the
-//! view scrolled into history, another program), the words go to a strip on
-//! the bottom rows instead, never somewhere that merely looks plausible.
+//! view scrolled into history, another program), nothing is drawn over what
+//! the program drew: the draft goes to free cells at the bottom right, or the
+//! host shows it itself.
 //!
-//! Also here: which cells near the bottom hold something, so the host can float
-//! its controls where they cover nothing that matters.
+//! The host's controls are drawn here too, as words set into the program's own
+//! frame ([`Control`]): into the rule under Claude's prompt like a box title,
+//! at the right end of Codex's prompt row, or on free cells at the bottom right.
+//! The host puts its touch targets on the cells reported for them.
 
 /// Whose prompt the screen shows, as the host knows from the pane's agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +50,31 @@ pub enum GhostStyle {
     Tag,
     /// A message that may have been sent: warning colour.
     Warn,
+    /// A control's quiet word ("type"), and the rule drawn around controls.
+    Dim,
+    /// The main action's word ("send").
+    Bright,
+    /// Recording.
+    Danger,
+    /// Connecting, transcribing, a queued count.
+    Info,
+}
+
+/// One of the host's controls, drawn as words in the program's frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Control {
+    /// What the host calls it; reported back with its cells.
+    pub id: String,
+    pub spans: Vec<GhostSpan>,
+}
+
+/// Where a control's words were drawn: `start..end` on drawn row `row`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedControl {
+    pub id: String,
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +90,9 @@ pub struct GhostColors {
     pub dim: u32,
     pub warn: u32,
     pub background: u32,
+    pub bright: u32,
+    pub danger: u32,
+    pub info: u32,
 }
 
 /// What to draw: the draft at the caret and queued messages above the prompt.
@@ -71,6 +102,8 @@ pub struct Ghost {
     pub draft: Vec<GhostSpan>,
     /// Queued messages, oldest first, one line each.
     pub echoes: Vec<Vec<GhostSpan>>,
+    /// The host's controls, right to left in reading order (drawn left to right).
+    pub controls: Vec<Control>,
     /// Columns kept clear on the right, where the host floats its controls,
     /// on drawn rows from `reserve_from` down.
     pub reserve: usize,
@@ -97,6 +130,13 @@ pub struct LayoutHint {
     pub busy_from: usize,
     /// The first row of the bottom block that must stay in view, see [`guard_row`].
     pub guard: usize,
+    /// The controls as drawn; empty when there was no room for them.
+    pub controls: Vec<PlacedControl>,
+    /// The first row the host's touch targets may cover: the prompt's caret
+    /// row (text above it is the program's, to scroll and select).
+    pub targets_top: usize,
+    /// Whether the draft was drawn; when not, the host shows it itself.
+    pub draft_shown: bool,
 }
 
 /// The program's input caret, in the rows as drawn.
@@ -168,9 +208,6 @@ pub const MAX_DRAFT_ROWS: usize = 6;
 /// nothing is drawn: ghost text never covers what the program drew (the host
 /// shows the draft in its own controls instead).
 pub fn place(ghost: &Ghost, anchor: Option<Anchor>, rows: usize, cols: usize) -> Vec<Placed> {
-    if rows == 0 || cols == 0 {
-        return Vec::new();
-    }
     // A row under the host's controls is narrower; never narrower than 8 cells.
     let width_of = |row: usize| {
         if row >= ghost.reserve_from {
@@ -179,6 +216,19 @@ pub fn place(ghost: &Ghost, anchor: Option<Anchor>, rows: usize, cols: usize) ->
             cols
         }
     };
+    place_with(ghost, anchor, rows, cols, &width_of)
+}
+
+fn place_with(
+    ghost: &Ghost,
+    anchor: Option<Anchor>,
+    rows: usize,
+    cols: usize,
+    width_of: &dyn Fn(usize) -> usize,
+) -> Vec<Placed> {
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     // Where the queued messages end: just above the prompt's frame, or the strip.
     let echoes_bottom = match anchor {
@@ -248,6 +298,159 @@ pub fn place(ghost: &Ghost, anchor: Option<Anchor>, rows: usize, cols: usize) ->
         }
     }
     out
+}
+
+/// Everything drawn over the screen in one frame, with where the controls went.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub placed: Vec<Placed>,
+    pub controls: Vec<PlacedControl>,
+    pub targets_top: usize,
+    pub draft_shown: bool,
+}
+
+/// A row that only frames: a rule of `─` (Claude's prompt box edges).
+fn rule(cells: &[char]) -> bool {
+    let drawn = cells.iter().filter(|&&c| c == '─').count();
+    drawn * 2 >= cells.len() && cells.iter().all(|&c| c == '─' || c == ' ')
+}
+
+/// Cells free at the end of a row: trailing blanks.
+fn free_tail(cells: &[char]) -> usize {
+    cells.iter().rev().take_while(|c| c.is_whitespace()).count()
+}
+
+/// The controls as one line: ` a ─ b ─ c ──`, each control's cells marked.
+fn control_line(ghost: &Ghost) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+    let mut spans = Vec::new();
+    let mut marks = Vec::new();
+    let mut col = 0;
+    let push = |text: &str, style: GhostStyle, spans: &mut Vec<GhostSpan>, col: &mut usize| {
+        spans.push(GhostSpan {
+            text: text.to_owned(),
+            style,
+        });
+        *col += text.chars().count();
+    };
+    for (i, control) in ghost.controls.iter().enumerate() {
+        push(
+            if i == 0 { " " } else { " ─ " },
+            GhostStyle::Dim,
+            &mut spans,
+            &mut col,
+        );
+        let start = col;
+        for span in &control.spans {
+            push(&span.text, span.style, &mut spans, &mut col);
+        }
+        marks.push((control.id.clone(), start, col));
+    }
+    if !ghost.controls.is_empty() {
+        push(" ──", GhostStyle::Dim, &mut spans, &mut col);
+    }
+    (spans, marks)
+}
+
+/// The draft, queued messages and the host's controls for one frame over
+/// `screen` (the rows as drawn). With Claude's prompt the controls are set
+/// into the rule under it; with another prompt (Codex), at the right end of
+/// the caret row, the draft wrapping short of them; with no prompt, on the
+/// lowest row whose right end is blank, the draft on the row above it when
+/// that end is blank too. Nothing is ever drawn over the program's text.
+pub fn place_all(ghost: &Ghost, anchor: Option<Anchor>, screen: &[Vec<char>]) -> Layout {
+    let rows = screen.len();
+    let cols = screen.first().map_or(0, Vec::len);
+    if rows == 0 || cols == 0 {
+        return Layout::default();
+    }
+    let (line, marks) = control_line(ghost);
+    let len: usize = line.iter().map(|s| s.text.chars().count()).sum();
+    let fits = len > 0 && len + 8 <= cols;
+    let mut layout = Layout::default();
+    // The row the controls go on, if any.
+    let controls_row = match anchor {
+        Some(anchor) if fits => {
+            let below = (anchor.row + 1..rows.min(anchor.row + 3)).find(|&r| rule(&screen[r]));
+            Some(below.unwrap_or(anchor.row))
+        }
+        None if fits => (rows.saturating_sub(16)..rows)
+            .rev()
+            .find(|&r| free_tail(&screen[r]) > len),
+        _ => None,
+    };
+    layout.targets_top = anchor.map_or(controls_row.unwrap_or(rows), |a| a.row);
+    if let Some(row) = controls_row {
+        let mut col = cols - len;
+        for span in &line {
+            let n = span.text.chars().count();
+            layout.placed.push(Placed {
+                row,
+                col,
+                text: span.text.clone(),
+                style: span.style,
+            });
+            col += n;
+        }
+        layout.controls = marks
+            .into_iter()
+            .map(|(id, start, end)| PlacedControl {
+                id,
+                row,
+                start: cols - len + start,
+                end: cols - len + end,
+            })
+            .collect();
+    }
+    let has_draft = ghost.draft.iter().any(|s| !s.text.trim().is_empty());
+    match anchor {
+        Some(anchor) => {
+            // The draft and the echoes, short of the controls on their row.
+            let width_of = |row: usize| {
+                if Some(row) == controls_row && !layout.controls.is_empty() {
+                    cols.saturating_sub(len + 1).max(8)
+                } else {
+                    cols
+                }
+            };
+            layout
+                .placed
+                .extend(place_with(ghost, Some(anchor), rows, cols, &width_of));
+            layout.draft_shown = has_draft;
+        }
+        None => {
+            // One line on the row above the controls, only on its blank end.
+            if let Some(row) = controls_row
+                .and_then(|r| r.checked_sub(1))
+                .filter(|_| has_draft)
+            {
+                let room = free_tail(&screen[row]).saturating_sub(1).min(cols / 2);
+                if room >= 12 {
+                    let text: String = ghost
+                        .draft
+                        .iter()
+                        .map(|s| s.text.replace(['\n', '\r', '\t'], " "))
+                        .collect();
+                    let text = text.trim();
+                    let count = text.chars().count();
+                    let shown: String = if count <= room {
+                        text.to_owned()
+                    } else {
+                        let tail: String = text.chars().skip(count - (room - 1)).collect();
+                        format!("…{tail}")
+                    };
+                    let n = shown.chars().count();
+                    layout.placed.push(Placed {
+                        row,
+                        col: cols - n - 1,
+                        text: shown,
+                        style: GhostStyle::Text,
+                    });
+                    layout.draft_shown = true;
+                }
+            }
+        }
+    }
+    layout
 }
 
 /// `text` cut to `room` cells, marked with an ellipsis when cut.
@@ -450,6 +653,7 @@ mod tests {
             kind: PromptKind::Claude,
             draft,
             echoes: Vec::new(),
+            controls: Vec::new(),
             reserve: 0,
             reserve_from: 0,
             colors: GhostColors {
@@ -457,8 +661,124 @@ mod tests {
                 dim: 0,
                 warn: 0,
                 background: 0,
+                bright: 0,
+                danger: 0,
+                info: 0,
             },
         }
+    }
+
+    fn control(id: &str, word: &str) -> Control {
+        Control {
+            id: id.into(),
+            spans: vec![GhostSpan {
+                text: word.into(),
+                style: GhostStyle::Dim,
+            }],
+        }
+    }
+
+    fn controls(mut g: Ghost) -> Ghost {
+        g.controls = vec![
+            control("type", "type"),
+            control("talk", "talk"),
+            control("send", "send"),
+        ];
+        g
+    }
+
+    /// The text drawn on `row`, cell by cell, over a blank row of `cols`.
+    fn drawn(layout: &Layout, row: usize, cols: usize) -> String {
+        let mut cells = vec![' '; cols];
+        for run in layout.placed.iter().filter(|p| p.row == row) {
+            for (i, c) in run.text.chars().enumerate() {
+                cells[run.col + i] = c;
+            }
+        }
+        cells.into_iter().collect::<String>().trim_end().to_owned()
+    }
+
+    #[test]
+    fn claudes_controls_are_set_into_the_rule_under_its_prompt() {
+        let rows = screen(
+            &[
+                "* Brewed for 3s",
+                "",
+                "────────────────────────────────────────────────────────────",
+                "❯\u{a0}",
+                "────────────────────────────────────────────────────────────",
+                "  -- INSERT -- ⏵⏵ bypass permissions on",
+            ],
+            60,
+        );
+        let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+        let layout = place_all(&controls(ghost(vec![text("Testing")])), anchor, &rows);
+        assert_eq!(drawn(&layout, 4, 60).trim_start(), "type ─ talk ─ send ──");
+        assert!(drawn(&layout, 4, 60).ends_with("send ──"));
+        let talk = layout
+            .controls
+            .iter()
+            .find(|c| c.id == "talk")
+            .expect("talk drawn");
+        assert_eq!((talk.row, talk.end - talk.start), (4, 4));
+        assert_eq!(&drawn(&layout, 3, 60)[2..], "Testing");
+        // Targets may cover the caret row and below, never the transcript above.
+        assert_eq!(layout.targets_top, 3);
+        assert!(layout.draft_shown);
+    }
+
+    #[test]
+    fn codex_gets_its_controls_at_the_end_of_its_prompt_row_and_the_draft_wraps_short() {
+        let rows = screen(&["", "› ", "", "  ? for shortcuts"], 40);
+        let anchor = locate(&rows, Some((1, 2)), PromptKind::Codex);
+        let mut g = controls(ghost(vec![text(&"word ".repeat(8))]));
+        g.kind = PromptKind::Codex;
+        let layout = place_all(&g, anchor, &rows);
+        assert!(drawn(&layout, 1, 40).ends_with("send ──"));
+        let first_control = layout
+            .controls
+            .iter()
+            .map(|c| c.start)
+            .min()
+            .expect("controls");
+        // Draft runs on the caret row end before the controls begin.
+        assert!(
+            layout
+                .placed
+                .iter()
+                .filter(|p| p.row == 1 && p.style == GhostStyle::Text)
+                .all(|p| p.col + p.text.chars().count() < first_control)
+        );
+    }
+
+    #[test]
+    fn with_a_dialog_the_controls_and_draft_take_free_cells_only() {
+        let rows = screen(
+            &[
+                "╭──────────────────╮",
+                "│ Do you want to?  │",
+                "│ ❯ 1. Yes         │",
+                "╰──────────────────╯",
+                "",
+                "",
+            ],
+            60,
+        );
+        let layout = place_all(
+            &controls(ghost(vec![text("no wait, keep the build dir")])),
+            None,
+            &rows,
+        );
+        let row = layout.controls[0].row;
+        assert_eq!(row, 5);
+        assert!(drawn(&layout, 5, 60).ends_with("send ──"));
+        assert!(drawn(&layout, 4, 60).ends_with("no wait, keep the build dir"));
+        // Nothing over the dialog's rows.
+        assert!(layout.placed.iter().all(|p| p.row >= 4));
+        // A screen whose bottom rows are all text has no room: nothing drawn.
+        let full = screen(&["x".repeat(60).as_str(); 4], 60);
+        let layout = place_all(&controls(ghost(vec![text("hi")])), None, &full);
+        assert!(layout.placed.is_empty() && layout.controls.is_empty() && !layout.draft_shown);
     }
 
     // Captured from Claude Code 2.1.322 at 100x30 (trimmed): the cursor sits
