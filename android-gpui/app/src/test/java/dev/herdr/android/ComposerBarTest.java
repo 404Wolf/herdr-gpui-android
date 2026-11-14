@@ -126,4 +126,50 @@ public final class ComposerBarTest {
         assertEquals("type talk send", ids(folded));
         assertEquals("● offline 0:05 stop", folded.get(1).spans[0]);
     }
+
+    @Test public void theMicrophoneIsOpenWhileConnectingListeningOrRecordingOffline() {
+        assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.CONNECTING));
+        assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.LISTENING));
+        assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.OFFLINE_RECORDING));
+        assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.TRANSCRIBING));
+        assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.PENDING));
+        assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.IDLE));
+    }
+
+    @Test public void theKeyboardsUnderlinedWordIsTheRevisableTailOnlyAtTheEnd() {
+        // "fix the bu|g": composing "bug" at the end of an 11-character draft.
+        assertEquals(8, ComposerBar.composingFrom(11, 8, 11));
+        // No composing word, an empty one, or one not at the end (the ghost
+        // caret is always at the end, so nothing is marked).
+        assertEquals(-1, ComposerBar.composingFrom(11, -1, -1));
+        assertEquals(-1, ComposerBar.composingFrom(11, 11, 11));
+        assertEquals(-1, ComposerBar.composingFrom(11, 0, 3));
+        assertEquals(0, ComposerBar.composingFrom(3, 0, 3));
+    }
+
+    @Test public void theTypedDraftsCursorAlwaysGoesBackToTheEnd() {
+        // "abc" with the cursor after it: where the ghost caret is drawn.
+        assertFalse(ComposerBar.keepsAtEnd(3, 3, 3));
+        // Left arrow (ab|c), a spacebar swipe to the start, a selection, a
+        // selection running to the end: all go back.
+        assertTrue(ComposerBar.keepsAtEnd(2, 2, 3));
+        assertTrue(ComposerBar.keepsAtEnd(0, 0, 3));
+        assertTrue(ComposerBar.keepsAtEnd(0, 3, 3));
+        assertTrue(ComposerBar.keepsAtEnd(1, 3, 3));
+        // No selection at all (the field is not focused), and an empty draft.
+        assertFalse(ComposerBar.keepsAtEnd(-1, -1, 3));
+        assertFalse(ComposerBar.keepsAtEnd(0, 0, 0));
+    }
+
+    @Test public void cursorKeysDoNothingWhileTypingButEnterAndLettersStillWork() {
+        for (int code : new int[] {android.view.KeyEvent.KEYCODE_DPAD_LEFT, android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+                android.view.KeyEvent.KEYCODE_DPAD_UP, android.view.KeyEvent.KEYCODE_DPAD_DOWN,
+                android.view.KeyEvent.KEYCODE_MOVE_HOME, android.view.KeyEvent.KEYCODE_MOVE_END,
+                android.view.KeyEvent.KEYCODE_PAGE_UP, android.view.KeyEvent.KEYCODE_PAGE_DOWN}) {
+            assertTrue(String.valueOf(code), ComposerBar.movesCursor(code));
+        }
+        assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_ENTER));
+        assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_DEL));
+        assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_A));
+    }
 }

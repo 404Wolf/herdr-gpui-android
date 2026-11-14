@@ -75,6 +75,14 @@ final class GpuiChrome {
         return (color & 0x00ffffff) | (alpha << 24);
     }
 
+    /** {@code over} laid on {@code base} at {@code amount}: an opaque tint of the surface. */
+    static int mix(int base, int over, float amount) {
+        int r = Math.round(((base >> 16) & 0xff) * (1 - amount) + ((over >> 16) & 0xff) * amount);
+        int g = Math.round(((base >> 8) & 0xff) * (1 - amount) + ((over >> 8) & 0xff) * amount);
+        int b = Math.round((base & 0xff) * (1 - amount) + (over & 0xff) * amount);
+        return 0xff000000 | (r << 16) | (g << 8) | b;
+    }
+
     /** Replaces the Default palette; see ProvisionedSettings. */
     static void setDefaultPalette(String json) {
         nativeSetDefaultPalette(json);

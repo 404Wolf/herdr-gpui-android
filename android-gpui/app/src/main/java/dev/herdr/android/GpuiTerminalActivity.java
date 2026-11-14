@@ -399,18 +399,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         FrameLayout column = new FrameLayout(this);
         terminalColumn = column;
         column.addView(content, new FrameLayout.LayoutParams(-1, -1));
-        // On an agent's pane: the keys above its prompt, the chip of keyboard,
-        // mic and Enter clear of its caret, and the typing box on the keyboard.
-        // The composer places each from the renderer's layout hints.
+        // On an agent's pane: the keys above its prompt, the touch targets over
+        // the controls drawn in its prompt box, and the keyboard's invisible
+        // field. The composer places each from the renderer's layout hints.
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
         column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
-        // Bottom right until the renderer's first hint places it.
-        FrameLayout.LayoutParams chipAt = new FrameLayout.LayoutParams(-2, -2,
-                android.view.Gravity.BOTTOM | android.view.Gravity.END);
-        chipAt.setMargins(0, 0, dp(4), dp(4));
-        column.addView(composer.cluster(), chipAt);
         filePager.setOnShownChanged(() -> composer.setCovered(filePager.showingFile()));
-        column.addView(composer.field(), new FrameLayout.LayoutParams(-1, -2, android.view.Gravity.BOTTOM));
+        column.addView(composer.field(), new FrameLayout.LayoutParams(-1, ComposerBar.FIELD_HEIGHT_PX,
+                android.view.Gravity.BOTTOM));
         // The sidebar rail mirrors the desktop's list of workspaces and agents.
         sidebar = new LinearLayout(this);
         sidebar.setOrientation(LinearLayout.HORIZONTAL);
@@ -612,7 +608,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
-        // Back puts the keyboard and its box away first.
+        // Back puts the composer's keyboard away first.
         if (composer != null && composer.hideKeyboard()) return;
         if (sidebarOpen && railAsDrawer()) {
             hideSidebar();
@@ -4294,7 +4290,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 synchronized (stateLock) { target = connection; }
                 // After the tap itself reaches the renderer: its focus handling
                 // would otherwise hide the keyboard this just asked for.
-                // An agent's pane types into the composer's box instead.
+                // An agent's pane types into the composer's draft instead.
                 boolean composing = composer != null && composer.terminalTapped();
                 if (!composing && target != null && target.ready && terminalSurface != null) {
                     final long generation = target.generation;
@@ -4863,7 +4859,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
-        // Enter while the composer's box is up is its send, whichever view has
+        // Enter while typing into the composer is its send, whichever view has
         // focus: it must never reach the terminal as a bare Enter instead.
         if (composer != null && composer.typing() && composer.enterKey(event)) return true;
         if (composer != null && composer.ownsKeys()) return super.dispatchKeyEvent(event);
