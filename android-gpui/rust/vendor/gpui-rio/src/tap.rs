@@ -96,6 +96,66 @@ pub fn cell_at(
     (row < rows && col < columns).then_some((col, row))
 }
 
+/// What a host view with no program to click reports for a lifted press,
+/// from its own [`Touch`]: a held finger is no tap, any other is a tap no
+/// program took. A press whose touch began on another view (the view was
+/// replaced mid-tap) carries no stamp of this one: `u64::MAX`, which a host
+/// never hands out, so the report is dropped and nothing opens twice.
+pub fn plain_view_tap(lifted: Option<(bool, u64)>) -> (Tapped, u64) {
+    match lifted {
+        Some((true, stamp)) => (Tapped::Ignored, stamp),
+        Some((false, stamp)) => (Tapped::Plain, stamp),
+        None => (Tapped::Plain, u64::MAX),
+    }
+}
+
+/// The stamps a host sends along with each touch-down, matched to the
+/// touches GPUI starts from them. A host's own state (which view it shows)
+/// changes at once, while the touch waits in GPUI's queue. So the stamp
+/// travels with the down, queued in the same order, and is taken back when
+/// GPUI starts that touch: by position, since GPUI may start no touch for a
+/// down (one that catches a fling), and those downs are passed over.
+#[derive(Debug)]
+pub struct DownStamps {
+    /// (x, y) in the host's physical pixels, and the stamp, oldest first.
+    queue: std::collections::VecDeque<(f32, f32, u64)>,
+}
+
+impl Default for DownStamps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DownStamps {
+    /// Downs kept waiting at most; the oldest is dropped past it.
+    pub const CAPACITY: usize = 64;
+
+    pub const fn new() -> Self {
+        Self { queue: std::collections::VecDeque::new() }
+    }
+
+    /// A down at physical pixel (`x`, `y`) went into GPUI's queue with `stamp`.
+    pub fn queued(&mut self, x: f32, y: f32, stamp: u64) {
+        if self.queue.len() == Self::CAPACITY {
+            self.queue.pop_front();
+        }
+        self.queue.push_back((x, y, stamp));
+    }
+
+    /// GPUI started a touch at logical (`x`, `y`) under `scale`: the stamp
+    /// its down was queued with, or `None` when none matches. Older downs
+    /// GPUI started no touch for are dropped; later ones stay queued.
+    pub fn started(&mut self, (x, y): (f32, f32), scale: f32) -> Option<u64> {
+        let scale = if scale > 0. { scale } else { 1. };
+        let at = self.queue.iter().position(|&(qx, qy, _)| {
+            (qx / scale - x).abs() < 0.5 && (qy / scale - y).abs() < 0.5
+        })?;
+        let (_, _, stamp) = self.queue.drain(..=at).last()?;
+        Some(stamp)
+    }
+}
+
 /// The finger on the terminal, from GPUI's gesture events: every touch is
 /// offered as a touch drag when it starts, and as a long press once held. A
 /// mouse has neither, so a mouse press is never held.
@@ -130,7 +190,7 @@ impl Touch {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lift, Press, Touch, cell_at, lift, next_id};
+    use super::{DownStamps, Lift, Press, Tapped, Touch, cell_at, lift, next_id, plain_view_tap};
 
     #[test]
     fn a_press_that_stays_in_place_is_a_click() {
@@ -252,5 +312,72 @@ mod tests {
         assert_eq!(cell_at((-0.5, 5.), CELL, (0, 0), GRID), None);
         assert_eq!(cell_at((5., f32::NAN), CELL, (0, 0), GRID), None);
         assert_eq!(cell_at((5., 5.), (0., 20.), (0, 0), GRID), None);
+    }
+
+    #[test]
+    fn a_touch_keeps_the_stamp_it_was_queued_with() {
+        // The host shows pane 1, a finger goes down, then the host switches to
+        // pane 2 before GPUI processes that down: the touch is still pane 1's.
+        let mut downs = DownStamps::default();
+        downs.queued(300., 600., 1);
+        downs.queued(450., 900., 2);
+        assert_eq!(downs.started((100., 200.), 3.), Some(1));
+        assert_eq!(downs.started((150., 300.), 3.), Some(2));
+        assert_eq!(downs.started((150., 300.), 3.), None);
+    }
+
+    #[test]
+    fn a_down_gpui_started_no_touch_for_is_passed_over() {
+        let mut downs = DownStamps::default();
+        downs.queued(10., 10., 1); // caught a fling: no touch started for it
+        downs.queued(20., 20., 2);
+        downs.queued(30., 30., 3);
+        assert_eq!(downs.started((20., 20.), 1.), Some(2));
+        // The later down is still waiting for its own touch.
+        assert_eq!(downs.started((30., 30.), 1.), Some(3));
+    }
+
+    #[test]
+    fn an_unmatched_touch_takes_nothing_from_the_queue() {
+        let mut downs = DownStamps::default();
+        downs.queued(10., 10., 1);
+        assert_eq!(downs.started((500., 500.), 1.), None);
+        assert_eq!(downs.started((10., 10.), 1.), Some(1));
+    }
+
+    #[test]
+    fn the_queue_is_bounded() {
+        let mut downs = DownStamps::default();
+        for i in 0..(DownStamps::CAPACITY as u64 + 5) {
+            downs.queued(i as f32, 0., i);
+        }
+        // The first five were dropped to keep the bound.
+        assert_eq!(downs.started((0., 0.), 1.), None);
+        assert_eq!(downs.started((5., 0.), 1.), Some(5));
+    }
+
+    #[test]
+    fn a_view_with_no_program_reports_its_taps_as_plain() {
+        let mut touch = Touch::default();
+        touch.began(4);
+        assert_eq!(plain_view_tap(touch.lifted()), (Tapped::Plain, 4));
+        touch.began(4);
+        touch.held();
+        assert_eq!(plain_view_tap(touch.lifted()), (Tapped::Ignored, 4));
+    }
+
+    #[test]
+    fn a_view_replaced_mid_tap_reports_nothing_to_act_on() {
+        // The touch began on the shell's view; the pane's own view replaced it
+        // before the lift. The new view saw no start: no stamp, so the host
+        // drops the report, and the old view, gone, sends no click.
+        let replacing = Touch::default().lifted();
+        assert_eq!(plain_view_tap(replacing), (Tapped::Plain, u64::MAX));
+        // The other way round: the down's stamp was taken by the view that
+        // started the touch, so the view that lifts it finds none.
+        let mut downs = DownStamps::default();
+        downs.queued(40., 40., 9);
+        assert_eq!(downs.started((40., 40.), 1.), Some(9));
+        assert_eq!(downs.started((40., 40.), 1.), None);
     }
 }

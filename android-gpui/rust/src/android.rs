@@ -180,6 +180,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
     ids: jni::objects::JIntArray<'_>,
     xs: jni::objects::JFloatArray<'_>,
     ys: jni::objects::JFloatArray<'_>,
+    stamp: jlong,
 ) -> jboolean {
     if !matches!(action, 0 | 1 | 2 | 3 | 5 | 6) || ids.is_null() || xs.is_null() || ys.is_null() {
         return 0;
@@ -222,11 +223,32 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
             y: y[i],
         });
     }
+    // The pane this press begins on goes into the queue with its down, so
+    // the renderer stamps the tap with it however late it processes it.
+    if action == 0 {
+        lock_downs().queued(x[0], y[0], stamp.max(0) as u64);
+    }
     u8::from(gpui_mobile::android::host::motion_event(
         action as u32,
         action_index as usize,
         &pointers,
     ))
+}
+
+/// The stamps queued with touch-downs, for the renderer to take back when it
+/// starts each touch (`touch_stamp`).
+static DOWNS: std::sync::Mutex<gpui_rio::tap::DownStamps> =
+    std::sync::Mutex::new(gpui_rio::tap::DownStamps::new());
+
+fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
+    DOWNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The stamp Java sent with the down of the touch the renderer starts at
+/// logical (`x`, `y`): the pane it began on. `u64::MAX`, which Java never
+/// hands out, when no queued down matches, so its report is dropped.
+pub(crate) fn touch_stamp(at: (f32, f32), scale: f32) -> u64 {
+    lock_downs().started(at, scale).unwrap_or(u64::MAX)
 }
 
 #[allow(unsafe_code)]
@@ -341,39 +363,6 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
         Ok(())
     })
     .is_ok()
-}
-
-/// The pane Java shows, as a number it raises on every change
-/// (`nativeSetTapStamp`). A tap is stamped with it when the finger goes down,
-/// so Java can drop the report of a tap made on a pane it has left since.
-static TAP_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn tap_stamp() -> u64 {
-    TAP_STAMP.load(std::sync::atomic::Ordering::Acquire)
-}
-
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetTapStamp(
-    _env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    stamp: jlong,
-) {
-    TAP_STAMP.store(stamp.max(0) as u64, std::sync::atomic::Ordering::Release);
-}
-
-/// Whether a terminal renderer is attached for this generation, so a tap on
-/// the terminal will be reported (`terminal_tapped`). Without one, Java
-/// decides taps itself, as before.
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeReportsTaps(
-    _env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    generation: jlong,
-) -> jboolean {
-    let state = model::mailbox().state();
-    u8::from(state.generation == generation && state.shell != 0)
 }
 
 /// Tells Java what the renderer did with a press on the terminal, once it has:

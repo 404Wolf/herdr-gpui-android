@@ -81,4 +81,38 @@ public final class TerminalTapTest {
         assertTrue(after > before);
         assertFalse(taps.accept(before, 5));
     }
+
+    @Test public void aTouchCarriesThePaneItBeganOnNotTheOneShownWhenItIsProcessed() {
+        // The down is queued with p1's stamp; p2 is shown before the renderer
+        // processes it. Its report comes back with p1's stamp and is dropped.
+        TerminalTap taps = new TerminalTap();
+        taps.show("1:p1");
+        long atDown = taps.stamp();
+        taps.show("1:p2");
+        assertFalse(taps.accept(atDown, 40));
+        // A touch that begins on p2 carries p2's stamp.
+        assertTrue(taps.accept(taps.stamp(), 41));
+    }
+
+    @Test public void aReportWithNoStampOfAnyPaneIsDropped() {
+        // A view replaced mid-tap reports with the stamp no pane ever has.
+        TerminalTap taps = new TerminalTap();
+        taps.show("1:p1");
+        assertFalse(taps.accept(Long.MAX_VALUE, 50));
+    }
+
+    @Test public void aDelayedKeyboardForATapIsCancelledByAPaneSwitch() {
+        // An accepted plain tap on a shell pane opens its keyboard a moment
+        // later; a switch to another pane in between leaves it shut.
+        TerminalTap taps = new TerminalTap();
+        taps.show("1:shell");
+        long tap = taps.stamp();
+        assertTrue(taps.accept(tap, 60));
+        assertTrue(taps.stillShown(tap));
+        taps.show("1:claude");
+        assertFalse(taps.stillShown(tap));
+        // Switching back is a new stamp: the old tap's keyboard stays shut.
+        taps.show("1:shell");
+        assertFalse(taps.stillShown(tap));
+    }
 }

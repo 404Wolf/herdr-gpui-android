@@ -158,12 +158,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private Button controlButton;
     /** Vertical swipe state: a short tap still reaches the terminal. */
     private float touchDownX, edgeStartX;
-    private boolean tapCandidate;
     /** Which taps the renderer reports belong to the pane shown now. Main thread. */
     private final TerminalTap terminalTap = new TerminalTap();
     /** The finger the renderer follows, until the activity takes a gesture over. */
     private final RendererTouch rendererTouch = new RendererTouch();
-    private long touchDownAt;
     private boolean edgeClaimed;
     private float touchDownY, lastTouchY, scrollFraction;
     private float scrollVelocity, flingRemainder;
@@ -2052,9 +2050,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
-        // Taps the renderer reports from now on are stamped with this pane.
-        long tapStamp = terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
-        if (tapStamp >= 0 && hostStarted) nativeSetTapStamp(tapStamp);
+        // A touch from now on carries this pane's stamp with its down.
+        terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
             composer.setPane(current == null ? "" : current.paneId, kind);
@@ -4232,14 +4229,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // A pinch is ours: the program never sees half of a two-finger
             // gesture, nor its last finger's lift as a tap.
             scrolling = false;
-            tapCandidate = false;
             claimRendererTouch();
             if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) rendererTouch.end();
             return true;
         }
         if (masked == MotionEvent.ACTION_DOWN) {
-            tapCandidate = true;
-            touchDownAt = SystemClock.uptimeMillis();
             stopFling();
             touchDownX = edgeStartX = event.getX();
             edgeClaimed = false;
@@ -4294,20 +4288,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
             // A plain tap on the terminal opens the keyboard: typing into an agent
-            // should not need the toolbar. The terminal renderer reports every
-            // tap itself, after it may have sent it to the program as a mouse
-            // click (gpuiTerminalTapped). Only without one is the tap decided here.
-            if (masked == MotionEvent.ACTION_UP && tapCandidate && !scrolling && !edgeClaimed
-                    && SystemClock.uptimeMillis() - touchDownAt < 350
-                    && Math.abs(event.getX() - touchDownX) < dp(10)
-                    && Math.abs(event.getY() - touchDownY) < dp(10)) {
-                Connection target;
-                synchronized (stateLock) { target = connection; }
-                if (target == null || !nativeReportsTaps(target.generation)) {
-                    terminalTapSettled(TerminalTap.Outcome.PLAIN);
-                }
-            }
-            tapCandidate = false;
+            // should not need the toolbar. Not decided here: the view that handles
+            // the lift reports every tap (gpuiTerminalTapped), after it may have
+            // sent it to the program as a mouse click.
             if (edgeClaimed) {
                 edgeClaimed = false;
                 return true;
@@ -4338,7 +4321,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             xs[i] = event.getX(i);
             ys[i] = event.getY(i);
         }
-        return nativeTouch(event.getActionMasked(), event.getActionIndex(), ids, xs, ys);
+        // A down carries the pane it begins on, through the renderer's queue.
+        return nativeTouch(event.getActionMasked(), event.getActionIndex(), ids, xs, ys,
+                terminalTap.stamp());
     }
 
     /** Tells the renderer, once, that the activity took the current gesture over. */
@@ -4346,7 +4331,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int pointer = rendererTouch.claim();
         if (pointer == RendererTouch.NONE) return;
         nativeTouch(MotionEvent.ACTION_CANCEL, 0, new int[] {pointer},
-                new float[] {touchDownX}, new float[] {touchDownY});
+                new float[] {touchDownX}, new float[] {touchDownY}, terminalTap.stamp());
     }
 
     /**
@@ -4748,16 +4733,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             boolean accepted = terminalTap.accept(stamp, id);
             if (debuggable()) {
-                android.util.Log.d("herdr-tap", "report id=" + id + " stamp=" + stamp + " outcome="
-                        + TerminalTap.Outcome.of(outcome) + (accepted ? "" : " dropped"));
+                android.util.Log.d("herdr-tap", "report id=" + id + " stamp=" + stamp + " shown="
+                        + terminalTap.stamp() + " outcome=" + TerminalTap.Outcome.of(outcome)
+                        + (accepted ? "" : " dropped"));
             }
             if (!accepted) return;
-            terminalTapSettled(TerminalTap.Outcome.of(outcome));
+            terminalTapSettled(TerminalTap.Outcome.of(outcome), stamp);
         });
     }
 
-    /** A tap on the terminal, once decided: typing opens only for a tap the program did not take. */
-    private void terminalTapSettled(TerminalTap.Outcome outcome) {
+    /**
+     * A tap on the terminal, once decided: typing opens only for a tap the
+     * program did not take, and only while its pane ({@code stamp}) is shown.
+     */
+    private void terminalTapSettled(TerminalTap.Outcome outcome, long stamp) {
         if (destroyed || outcome == TerminalTap.Outcome.IGNORED) return;
         boolean clicked = outcome == TerminalTap.Outcome.CLICKED;
         Connection target;
@@ -4771,8 +4760,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // After the renderer's own focus handling for the tap, which would
             // otherwise hide the keyboard this just asked for.
             terminalSurface.postDelayed(() -> {
-                // A tapped file link opened the file page instead.
-                if (!destroyed && (filePager == null || !filePager.showingFile())) {
+                // A tapped file link opened the file page instead, or another
+                // pane is shown by now: its keyboard is not this tap's to open.
+                if (!destroyed && terminalTap.stillShown(stamp)
+                        && (filePager == null || !filePager.showingFile())) {
                     nativeShowKeyboard(generation);
                 }
             }, 150);
@@ -5804,8 +5795,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             float systemFontScale);
     /** Draws the raw shell {@code handle} (0 for Herdr's pane) for this generation only. */
     private static native boolean nativeAttachShell(long generation, long handle);
-    private static native void nativeSetTapStamp(long stamp);
-    private static native boolean nativeReportsTaps(long generation);
 
     /** Moves the terminal horizontally by this many logical pixels. */
     private static native void nativePan(float delta);
@@ -5832,7 +5821,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeSurfaceDestroyed();
     private static native void nativeResumed();
     private static native void nativePaused();
-    private static native boolean nativeTouch(int action, int actionIndex, int[] ids, float[] xs, float[] ys);
+    private static native boolean nativeTouch(int action, int actionIndex, int[] ids, float[] xs, float[] ys,
+            long tapStamp);
     private static native boolean nativeKey(long generation, int keyCode, int action, int metaState, int unicodeCodepoint);
     private static native void nativeSetImeSession(long generation, long session);
     private static native boolean nativeImeEvent(long generation, long session, int kind, String text, int start, int end);
