@@ -1456,6 +1456,9 @@ public final class HomeActivity extends Activity {
         lines.addView(title);
         List<String> second = new ArrayList<>();
         if (!where.isEmpty()) second.add(where);
+        String changes = heading == null && !"deacon".equals(agent.role)
+                ? FleetTree.changes(agent.machine.git, agent.cwd) : "";
+        if (!changes.isEmpty()) second.add(changes);
         if (heading != null && !untitled && where.isEmpty()) second.add(agent.title);
         String state = detail(agent);
         if (!state.isEmpty()) second.add(state);
@@ -1477,6 +1480,7 @@ public final class HomeActivity extends Activity {
             row.addView(badge);
         }
         row.setContentDescription(shown + (where.isEmpty() ? "" : ", " + where)
+                + (changes.isEmpty() ? "" : ", " + changes)
                 + (heading != null && !untitled ? ", " + agent.title : "") + ", "
                 + statusWord(agent.status, agent.waitKind)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
@@ -1508,6 +1512,8 @@ public final class HomeActivity extends Activity {
         LinearLayout lines = column();
         lines.addView(single(text(breadcrumb(agent), 12, chrome.onSurface)));
         String said = detail(agent);
+        String changes = FleetTree.changes(agent.machine.git, agent.cwd);
+        if (!changes.isEmpty()) said = said.isEmpty() ? changes : said + " · " + changes;
         if (!said.isEmpty()) {
             lines.addView(single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
                     : chrome.onSurfaceVariant)));
@@ -1516,6 +1522,7 @@ public final class HomeActivity extends Activity {
         String tag = roleTag(agent);
         if (!tag.isEmpty()) row.addView(tag(tag, chrome.onSurfaceVariant));
         row.setContentDescription(FleetPanes.displayTitle(agent) + ", " + statusWord(agent.status, agent.waitKind)
+                + (changes.isEmpty() ? "" : ", " + changes)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
         row.setOnLongClickListener(v -> { agentActions(agent); return true; });

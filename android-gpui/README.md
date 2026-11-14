@@ -148,8 +148,10 @@ list. **Outside git** and **Other agents** appear folded at the foot when needed
 Repositories with the same name share a header and retain separate catalogs.
 PM rows show **≡N** agents beneath their PM or inferred lead, including nested
 agents and excluding shells, plus blocked, working and done totals. Folded repo
-headers sum their shown projects. Ahead-of-upstream commit counts are deferred
-until the existing git bridge supplies them.
+headers sum their shown projects. **↑N** sums commits ahead of each checkout's
+own upstream, once per distinct checkout in the project. Worker rows also show
+their checkout's **↑ahead ↓behind**. Missing counts stay unknown; a checkout
+without an upstream contributes zero.
 Repositories start expanded; workers stay folded until their project's chevron
 is tapped. Tap a PM or worker to open its terminal; a no-PM project opens its lead
 or first agent, falling back to a shell when no agent remains. Tap a catalog to

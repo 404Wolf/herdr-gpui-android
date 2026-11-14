@@ -2891,6 +2891,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             railPanes.put(paneKey, row);
         }
         String title = lead != null ? lead : chromeTitle(FleetPanes.displayTitle(m), m.id);
+        String changes = lead == null ? FleetTree.changes(FleetPanes.LOOKS.get(host.id), m.cwd) : "";
+        String shownSub = sub + (changes.isEmpty() ? "" : (sub.isEmpty() ? "" : " · ") + changes);
         row.foldKey = foldKey;
         row.worktrees = null;
         String mark = lead == null ? null : foldKey == null ? "" : folded ? "▸" : "▾";
@@ -2906,8 +2908,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (android.os.Build.VERSION.SDK_INT >= 30) {
             row.mark.setStateDescription(foldSays == null ? null : folded ? "collapsed" : "expanded");
         }
-        if (!sub.contentEquals(row.sub.getText())) row.sub.setText(sub);
-        row.sub.setVisibility(sub.isEmpty() ? View.GONE : View.VISIBLE);
+        if (!shownSub.contentEquals(row.sub.getText())) row.sub.setText(shownSub);
+        row.sub.setVisibility(shownSub.isEmpty() ? View.GONE : View.VISIBLE);
         if (row.lead != (lead != null)) {
             row.lead = lead != null;
             row.title.setTypeface(railMono(row.lead));

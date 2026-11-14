@@ -45,10 +45,17 @@ final class FleetTree {
     /** What git says of one folder: its repo (common dir), checkout top and branch. */
     static final class Place {
         final String common, top, branch;
+        /** Optional bounded counts: null is unknown, zero is a resolved no-ahead/no-behind answer. */
+        final Integer ahead, behind;
         Place(String common, String top, String branch) {
+            this(common, top, branch, null, null);
+        }
+        Place(String common, String top, String branch, Integer ahead, Integer behind) {
             this.common = trimSlash(common);
             this.top = trimSlash(top);
             this.branch = branch == null ? "" : branch;
+            this.ahead = ahead;
+            this.behind = behind;
         }
     }
 
@@ -68,6 +75,7 @@ final class FleetTree {
     static final class GitLook {
         final Map<String, Place> places = new HashMap<>();
         final Map<String, List<GitWorktree>> repos = new HashMap<>();
+        final Set<String> outside = new HashSet<>();
         /** Repos whose worktree list was cut short; all of them when the whole answer was. */
         final Set<String> truncated = new HashSet<>();
         boolean allTruncated;
@@ -577,14 +585,16 @@ final class FleetTree {
 
     /**
      * The machine's git look, as the core's "git.look" exec prints it:
-     * "P\t<folder>\t<common>\t<top>\t<branch>" per folder (just "P\t<folder>"
+     * "P\t<folder>\t<common>\t<top>\t<branch>[\t<ahead>\t<behind>]" (just "P\t<folder>"
      * outside git), then per repo "R\t<common>", its porcelain and "E".
      */
     static GitLook parseGitLook(String text, int perRepo) {
         GitLook look = new GitLook();
         String repo = null;
         StringBuilder porcelain = new StringBuilder();
-        for (String line : (text == null ? "" : text).split("\n", -1)) {
+        String[] lines = (text == null ? "" : text).split("\n", -1);
+        for (int at = 0; at < lines.length; at++) {
+            String line = lines[at];
             if (repo != null) {
                 if (line.equals("E")) {
                     List<GitWorktree> list = parsePorcelain(porcelain.toString(), perRepo + 1);
@@ -601,7 +611,13 @@ final class FleetTree {
             }
             String[] f = line.split("\t", -1);
             if (f.length >= 4 && f[0].equals("P")) {
-                look.places.put(trimSlash(f[1]), new Place(f[2], f[3], f.length > 4 ? f[4] : ""));
+                look.places.put(trimSlash(f[1]), new Place(f[2], f[3], f.length > 4 ? f[4] : "",
+                        at + 1 < lines.length && f.length > 5 ? refCount(f[5]) : null,
+                        at + 1 < lines.length && f.length > 6 ? refCount(f[6]) : null));
+                look.outside.remove(trimSlash(f[1]));
+            } else if (at + 1 < lines.length && f.length == 2 && f[0].equals("P")) {
+                look.outside.add(trimSlash(f[1]));
+                look.places.remove(trimSlash(f[1]));
             } else if (f.length >= 2 && f[0].equals("R")) {
                 repo = trimSlash(f[1]);
                 porcelain.setLength(0);
@@ -613,6 +629,24 @@ final class FleetTree {
             look.truncated.add(repo);
         }
         return look;
+    }
+
+    private static Integer refCount(String text) {
+        if (text.isEmpty() || text.length() > 10) return null;
+        for (int i = 0; i < text.length(); i++) if (text.charAt(i) < '0' || text.charAt(i) > '9') return null;
+        try { return Integer.valueOf(text); }
+        catch (NumberFormatException outOfRange) { return null; }
+    }
+
+    /** A folder's own checkout numbers, shown even when its branch label is suppressed. */
+    static String changes(GitLook git, String cwd) {
+        if (git == null) return "";
+        Place place = git.places.get(trimSlash(cwd));
+        if (place == null) return "";
+        List<String> words = new ArrayList<>();
+        if (place.ahead != null && place.ahead > 0) words.add("↑" + place.ahead);
+        if (place.behind != null && place.behind > 0) words.add("↓" + place.behind);
+        return String.join(" ", words);
     }
 
     /** `git worktree list --porcelain` → entries, main checkout first. */
@@ -762,6 +796,7 @@ final class FleetTree {
         final List<Project> catalogs = new ArrayList<>();
         int subAgents;
         boolean hasAgents;
+        Long ahead;
         PmRow(Project project) {
             this.project = project;
             this.pm = project.pm;
@@ -776,7 +811,7 @@ final class FleetTree {
             return pm != null && !project.pmInferred && "pm".equals(pm.role) && countedAgent(pm);
         }
 
-        String countsLabel() { return counts(subAgents, project.tally); }
+        String countsLabel() { return counts(subAgents, ahead, project.tally); }
 
         boolean contains(String id) {
             if (pm != null && pm.id.equals(id)) return true;
@@ -789,9 +824,10 @@ final class FleetTree {
     static boolean countedAgent(Member member) { return member.isAgent() && running(member); }
 
     /** Shared PM/repo totals: PM included in statuses, excluded from the agent subtotal. */
-    private static String counts(int subAgents, int[] tally) {
+    private static String counts(int subAgents, Long ahead, int[] tally) {
         List<String> words = new ArrayList<>();
         if (subAgents > 0) words.add("≡" + subAgents);
+        if (ahead != null && ahead > 0) words.add("↑" + ahead);
         if (tally[0] > 0) words.add(tally[0] + "!");
         if (tally[2] > 0) words.add(tally[2] + "~");
         if (tally[1] > 0) words.add(tally[1] + "✓");
@@ -831,6 +867,7 @@ final class FleetTree {
         final List<Project> catalogs = new ArrayList<>();
         private final int[] tally = new int[4];
         private int subAgents;
+        private Long ahead = 0L;
         private boolean git;
         RepoRow(String key, String name) { this.key = key; this.name = name; }
 
@@ -843,13 +880,14 @@ final class FleetTree {
         }
 
         String label(boolean folded) {
-            String totals = folded ? counts(subAgents, tally) : blocked() ? "!" : "";
+            String totals = folded ? counts(subAgents, ahead, tally) : blocked() ? "!" : "";
             return countLabel() + (totals.isEmpty() ? "" : "  " + totals);
         }
 
         private void add(PmRow row) {
             projects.add(row);
             subAgents += row.subAgents;
+            ahead = ahead == null || row.ahead == null ? null : ahead + row.ahead;
             for (int i = 0; i < tally.length; i++) tally[i] += row.project.tally[i];
         }
 
@@ -954,6 +992,45 @@ final class FleetTree {
         return node.branch.isEmpty() || node.branch.equals(name) ? name : name + " · " + node.branch;
     }
 
+    private static Long projectAhead(Project project, GitLook git, Map<String, Place> tops) {
+        Map<String, Integer> checkouts = new HashMap<>();
+        if (project.pm != null && !checkoutAhead(checkouts, project.pm, project.pmRow, git, tops)) return null;
+        for (SpaceNode node : project.entries) for (Member member : node.members) {
+            if (!checkoutAhead(checkouts, member, node, git, tops)) return null;
+        }
+        long total = 0;
+        for (int count : checkouts.values()) total += count;
+        return total;
+    }
+
+    /** Unknown folders cannot borrow another checkout's count through a shared space. */
+    private static boolean checkoutAhead(Map<String, Integer> counts, Member member, SpaceNode node,
+            GitLook git, Map<String, Place> tops) {
+        String cwd = trimSlash(member.cwd);
+        if (git.outside.contains(cwd)) return true;
+        Place place = cwd.isEmpty() ? (node == null ? null : tops.get(node.key)) : git.places.get(cwd);
+        if (place == null) return false;
+        if (place.common.isEmpty()) return true;
+        if (place.top.isEmpty()) return false;
+        Place canonical = tops.get(place.top);
+        Integer ahead = place.ahead != null ? place.ahead : (canonical == null ? null : canonical.ahead);
+        if (ahead == null) return false;
+        counts.putIfAbsent(place.top, ahead);
+        return true;
+    }
+
+    /** Copy/merge before nesting: exactly one row identity per checkout, including unplaced shells. */
+    private static void mergeLoose(Map<String, SpaceNode> rows, Set<String> members, SpaceNode source) {
+        SpaceNode row = rows.computeIfAbsent(source.key, SpaceNode::new);
+        if (row.name.isEmpty()) row.name = source.name;
+        if (row.repo.isEmpty()) row.repo = source.repo;
+        if (row.branch.isEmpty()) row.branch = source.branch;
+        row.worktree |= source.worktree;
+        row.order = Math.min(row.order, source.order);
+        for (String space : source.spaces) if (!row.spaces.contains(space)) row.spaces.add(space);
+        for (Member member : source.members) if (members.add(member.id)) row.members.add(member);
+    }
+
     /**
      * What the sidebar (the terminal's rail and Home) draws for one computer:
      * the Deacon, repository headings with PM/live projects, idle projects,
@@ -1032,6 +1109,10 @@ final class FleetTree {
         PmTree tree = new PmTree();
         tree.deacon = fleet.deacon;
         tree.helpers.addAll(fleet.helpers);
+        Map<String, Place> tops = new HashMap<>();
+        for (Place place : fleet.git.places.values()) {
+            if (!place.top.isEmpty() && (!tops.containsKey(place.top) || place.ahead != null)) tops.put(place.top, place);
+        }
         for (Project project : fleet.projects) {
             PmRow row = new PmRow(project);
             String own = managed(project) ? project.name : "";
@@ -1051,6 +1132,7 @@ final class FleetTree {
             }
             row.workers.addAll(nestAll(workers, project.pm, where));
             row.hasAgents = project.pm != null && countedAgent(project.pm);
+            row.ahead = projectAhead(project, fleet.git, tops);
             Set<String> counted = new HashSet<>();
             if (project.pm != null) counted.add(project.pm.id);
             for (Member member : flatten(row.workers)) {
@@ -1062,7 +1144,9 @@ final class FleetTree {
             tree.allProjects.add(row);
             if (managed(project)) tree.pms.add(row);
         }
-        List<SpaceNode> loose = new ArrayList<>(fleet.loose);
+        Map<String, SpaceNode> looseRows = new LinkedHashMap<>();
+        Set<String> looseMembers = new HashSet<>();
+        for (SpaceNode node : fleet.loose) mergeLoose(looseRows, looseMembers, node);
         for (Member member : fleet.others) {
             if (countedAgent(member)) { tree.otherMembers.add(member); continue; }
             Place place = fleet.git.places.get(trimSlash(member.cwd));
@@ -1070,8 +1154,7 @@ final class FleetTree {
             node.name = lastSegment(place == null ? member.cwd : place.top);
             if (place != null) { node.repo = place.common; node.branch = place.branch; }
             node.members.add(member);
-            nest(node, null);
-            loose.add(node);
+            mergeLoose(looseRows, looseMembers, node);
         }
         Collections.sort(tree.pms, (a, b) -> {
             int c = a.name().compareToIgnoreCase(b.name());
@@ -1085,6 +1168,12 @@ final class FleetTree {
                 for (PmRow row : tree.allProjects) if (row.project == project) { home = row; break; }
             }
             if (home != null) home.catalogs.add(project);
+        }
+        List<SpaceNode> loose = new ArrayList<>();
+        for (SpaceNode node : looseRows.values()) {
+            if (node.members.isEmpty()) continue;
+            nest(node, null);
+            loose.add(node);
         }
         groupSidebar(tree, fleet, loose);
         Collections.sort(tree.otherMembers, PLACE);

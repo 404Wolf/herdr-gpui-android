@@ -1040,11 +1040,36 @@ fn delivery(sent: &Result<Value>) -> Value {
 /// The phone's git look, one `sh -c` over the folders it shows (see git_look).
 const GIT_LOOK: &str = r#"seen='
 '
+tab=$(printf '\t')
+counts=''
 for p in "$@"; do
   c=$(git -C "$p" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { printf 'P\t%s\n' "$p"; continue; }
   t=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)
   b=$(git -C "$p" symbolic-ref --short -q HEAD 2>/dev/null)
-  printf 'P\t%s\t%s\t%s\t%s\n' "$p" "$c" "$t" "$b"
+  hit=0
+  a='?'; d='?'
+  while IFS="$tab" read -r top ahead behind; do
+    if [ "$top" = "$t" ]; then
+      a=$ahead; d=$behind; hit=1; break
+    fi
+  done <<EOF
+$counts
+EOF
+  if [ "$hit" = 0 ]; then
+    if git -C "$p" rev-parse --verify '@{upstream}' >/dev/null 2>&1; then
+      ab=$(git -C "$p" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null) || ab=''
+      if [ -n "$ab" ]; then
+        IFS="$tab" read -r a d <<EOF
+$ab
+EOF
+      fi
+    else
+      a=0; d=0
+    fi
+    counts="$counts
+$t$tab$a$tab$d"
+  fi
+  printf 'P\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$c" "$t" "$b" "$a" "$d"
   case "$seen" in *"
 $c
 "*) continue;; esac
@@ -1852,18 +1877,28 @@ mod tests {
             return; // no git on this host
         }
         assert!(run(&["-C", &m, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]));
+        assert!(run(&["-C", &m, "branch", "--no-track", "upstream"]));
         let lane = dir.join("custom place/lane 1");
         let l = lane.to_string_lossy().into_owned();
         assert!(run(&["-C", &m, "worktree", "add", "-q", "-b", "lane-1", &l]));
+        assert!(run(&["-C", &l, "branch", "--set-upstream-to=upstream", "lane-1"]));
+        assert!(run(&["-C", &l, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "ahead"]));
+        assert!(run(&["-C", &m, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "behind"]));
+        assert!(run(&["-C", &m, "branch", "-f", "upstream", "main"]));
+        let sub = lane.join("src");
+        assert!(std::fs::create_dir_all(&sub).is_ok());
+        let sub = sub.to_string_lossy().into_owned();
         let out = std::process::Command::new("sh")
-            .args(["-c", GIT_LOOK, "sh", &m, &l, &format!("{l}/"), "/nonexistent"])
+            .args(["-c", GIT_LOOK, "sh", &m, &l, &format!("{l}/"), &sub, "/nonexistent"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
         let common = format!("{m}/.git");
-        assert!(out.contains(&format!("P\t{m}\t{common}\t{m}\tmain\n")), "{out}");
-        assert!(out.contains(&format!("P\t{l}\t{common}\t{l}\tlane-1\n")), "{out}");
+        assert!(out.contains(&format!("P\t{m}\t{common}\t{m}\tmain\t0\t0\n")), "{out}");
+        assert!(out.contains(&format!("P\t{l}\t{common}\t{l}\tlane-1\t1\t1\n")), "{out}");
+        assert!(out.contains(&format!("P\t{l}/\t{common}\t{l}\tlane-1\t1\t1\n")), "{out}");
+        assert!(out.contains(&format!("P\t{sub}\t{common}\t{l}\tlane-1\t1\t1\n")), "{out}");
         assert!(out.contains("P\t/nonexistent\n"), "{out}");
         assert_eq!(out.matches("\nR\t").count() + usize::from(out.starts_with("R\t")), 1, "{out}");
         assert!(out.contains(&format!("worktree {l}\n")) && out.contains("branch refs/heads/lane-1\n"), "{out}");

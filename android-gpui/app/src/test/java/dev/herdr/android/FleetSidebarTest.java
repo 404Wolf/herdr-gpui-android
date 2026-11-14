@@ -14,7 +14,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.junit.Test;
 
@@ -69,7 +71,7 @@ public final class FleetSidebarTest {
         assertEquals(5, FleetTree.flatten(row.workers).size());
         assertEquals("1 project  ≡3 1! 2~ 1✓", tree.repos.get(0).label(true));
         assertEquals("1 project  !", tree.repos.get(0).label(false));
-        assertFalse(row.countsLabel().contains("↑")); // No upstream data is available through the current bridge.
+        assertFalse(row.countsLabel().contains("↑")); // Legacy place records do not invent a zero or a count.
     }
 
     @Test public void aNoPmProjectSubtractsOnlyItsActualInferredLead() {
@@ -215,6 +217,40 @@ public final class FleetSidebarTest {
         assertEquals(Collections.singletonList(b), tree.repos.get(1).loose.get(0).members);
     }
 
+    @Test public void spacedAndUnplacedShellsMergeOnceAndRemainTargetsAfterALateGitAnswer() {
+        FleetTree.Member spaced = member(1, "", "", "/repo", "");
+        FleetTree.Member loose = member(2, "", "", "/repo", "");
+        loose.space = "loose";
+        FleetTree.Member unplaced = member(3, "", "", "/repo", "");
+        unplaced.space = "";
+        List<FleetTree.Member> members = Arrays.asList(spaced, loose, unplaced);
+        FleetTree.PmTree early = FleetTree.pmTree(FleetTree.build(members, null));
+        assertEquals(ids(members), reachable(early));
+        assertEquals(3, early.outsideLoose.size());
+
+        FleetTree.GitLook git = new FleetTree.GitLook();
+        place(git, "/repo", "/repo/.git", "/repo");
+        FleetTree.Fleet fleet = FleetTree.build(members, git);
+        FleetTree.PmTree first = FleetTree.pmTree(fleet);
+        assertEquals(1, first.repos.get(0).loose.size());
+        FleetTree.SpaceNode checkout = first.repos.get(0).loose.get(0);
+        assertEquals("/repo", checkout.key);
+        assertEquals(3, checkout.members.size());
+        assertEquals(3, FleetTree.flatten(checkout.agents).size());
+        Map<String, String> rows = actualRows(first);
+        assertEquals(1L, rows.keySet().stream().filter(key -> key.startsWith("fleet:checkout:")).count());
+        assertTrue(rows.containsKey("pane:t1"));
+        assertTrue(rows.containsKey("pane:t2"));
+        assertTrue(rows.containsKey("pane:t3"));
+        assertEquals(ids(members), reachable(first));
+
+        FleetTree.PmTree again = FleetTree.pmTree(fleet);
+        assertEquals(new ArrayList<>(rows.entrySet()), new ArrayList<>(actualRows(again).entrySet()));
+        assertEquals(3, FleetTree.flatten(again.repos.get(0).loose.get(0).agents).size());
+        assertEquals(1, fleet.loose.get(0).members.size());
+        assertEquals(1, fleet.loose.get(0).agents.size()); // The source forest was not appended to or mutated.
+    }
+
     @Test public void projectsSharingASpaceAndDifferentComputersNeverShareCounts() {
         FleetTree.Member pmA = member(1, "pm", "alpha", "/repo", "idle");
         FleetTree.Member pmB = member(2, "pm", "beta", "/repo", "idle");
@@ -261,16 +297,58 @@ public final class FleetSidebarTest {
     }
 
     private static Set<String> reachable(FleetTree.PmTree tree) {
-        Set<String> out = new HashSet<>();
-        if (tree.deacon != null) out.add(tree.deacon.id);
-        out.addAll(ids(tree.helpers));
-        for (FleetTree.PmRow row : tree.allProjects) {
-            if (row.pm != null) out.add(row.pm.id);
-            out.addAll(ids(FleetTree.flatten(row.workers)));
+        Set<String> targets = new HashSet<>(actualRows(tree).values());
+        targets.remove("");
+        return targets;
+    }
+
+    /** Actual rail cache-key shapes with the constant host prefix omitted; every fold expanded. */
+    private static Map<String, String> actualRows(FleetTree.PmTree tree) {
+        Map<String, String> rows = new LinkedHashMap<>();
+        if (tree.deacon != null) row(rows, "pane:" + tree.deacon.id, tree.deacon);
+        for (FleetTree.Member helper : tree.helpers) row(rows, "pane:" + helper.id, helper);
+        for (FleetTree.RepoRow repo : tree.repos) {
+            row(rows, "fleet:repo:" + repo.key, null);
+            for (FleetTree.PmRow project : repo.projects) projectRows(rows, project);
+            if (!repo.idle.isEmpty()) {
+                row(rows, "fleet:idle:" + repo.key, null);
+                for (FleetTree.PmRow project : repo.idle) projectRows(rows, project);
+            }
+            for (FleetTree.SpaceNode checkout : repo.loose) checkoutRows(rows, checkout);
+            for (FleetTree.Project catalog : repo.catalogs) row(rows, "fleet:catalog:" + catalog.repo, null);
         }
-        for (FleetTree.RepoRow repo : tree.repos) for (FleetTree.SpaceNode node : repo.loose) out.addAll(ids(node.members));
-        for (FleetTree.SpaceNode node : tree.outsideLoose) out.addAll(ids(node.members));
-        out.addAll(ids(tree.otherMembers));
-        return out;
+        if (tree.outsideCount() > 0) {
+            row(rows, "fleet:group:outside", null);
+            for (FleetTree.PmRow project : tree.outside) projectRows(rows, project);
+            for (FleetTree.SpaceNode checkout : tree.outsideLoose) checkoutRows(rows, checkout);
+        }
+        if (!tree.others.isEmpty()) {
+            row(rows, "fleet:group:other-agents", null);
+            agentRows(rows, tree.others);
+        }
+        return rows;
+    }
+
+    private static void projectRows(Map<String, String> rows, FleetTree.PmRow project) {
+        row(rows, project.labelledPm() ? "pane:" + project.pm.id : "fleet:proj:" + project.name(),
+                FleetTree.projectTarget(project));
+        agentRows(rows, project.workers);
+    }
+
+    private static void checkoutRows(Map<String, String> rows, FleetTree.SpaceNode checkout) {
+        row(rows, "fleet:checkout:" + checkout.key, FleetTree.checkoutTarget(checkout));
+        if (checkout.members.size() > 1) agentRows(rows, checkout.agents);
+    }
+
+    private static void agentRows(Map<String, String> rows, List<FleetTree.AgentNode> agents) {
+        for (FleetTree.AgentNode agent : agents) {
+            row(rows, "pane:" + agent.member.id, agent.member);
+            agentRows(rows, agent.children);
+        }
+    }
+
+    private static void row(Map<String, String> rows, String key, FleetTree.Member target) {
+        assertFalse("duplicate actual row key " + key, rows.containsKey(key));
+        rows.put(key, target == null ? "" : target.id);
     }
 }
