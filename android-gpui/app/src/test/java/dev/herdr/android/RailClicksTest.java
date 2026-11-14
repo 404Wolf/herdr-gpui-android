@@ -113,10 +113,10 @@ public final class RailClicksTest {
         String rail = source("GpuiTerminalActivity");
         assertTrue(home.contains("FleetTree.projectTarget(pm)"));
         assertTrue(rail.contains("FleetTree.projectTarget(pm)"));
-        assertTrue(home.contains("addCatalogRows(row, machine, pm.catalogs)"));
-        assertTrue(home.contains("addCatalogRows(others, machine, tree.otherCatalogs)"));
-        assertTrue(rail.contains("railCatalogRows(host, live, current, pm.catalogs, depth + 1, order, keep)"));
-        assertTrue(rail.contains("railCatalogRows(host, live, current, tree.otherCatalogs, 1, order, keep)"));
+        assertTrue(home.contains("addCatalogRows(group, machine, repo)"));
+        assertTrue(rail.contains("railCatalogRows(host, live, current, repo, 1, order, keep)"));
+        assertFalse(home.contains("addCatalogRows(row, machine, pm.catalogs)"));
+        assertFalse(rail.contains("railCatalogRows(host, live, current, pm.catalogs"));
         assertTrue(home.contains("() -> openWorktree(machine, wt.path)"));
         assertTrue(rail.contains("() -> openRailWorktree(host, current, wt)"));
         assertFalse(home.contains("closedWorktreeActions("));

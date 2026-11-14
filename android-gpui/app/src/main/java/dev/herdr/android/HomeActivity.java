@@ -500,7 +500,7 @@ public final class HomeActivity extends Activity {
             if (agent.spaceLabel.isEmpty() && !"loose".equals(agent.space) && !agent.cwd.isEmpty()) {
                 agent.spaceLabel = FleetTree.lastSegment(agent.cwd);
             }
-            if (agent.spaceLabel.isEmpty()) agent.spaceLabel = "Other terminals";
+            if (agent.spaceLabel.isEmpty()) agent.spaceLabel = FleetTree.countedAgent(agent) ? "Other agents" : "Outside git";
             flat.computeIfAbsent(agent.space, key -> new ArrayList<>()).add(agent);
         }
         // The hierarchy spans spaces: a deacon's managers and their workers
@@ -935,9 +935,8 @@ public final class HomeActivity extends Activity {
 
     /**
      * One computer, as the terminal's rail draws it (FleetTree.pmTree): the
-     * computer picker, its Deacon, one row per PM with its workers folded
-     * under it (each terminal's checkout as its second line), then one folded
-     * "Other terminals" row for everything no Deacon or PM leads.
+     * computer picker, its Deacon, repository groups and their project/checkout
+     * rows, then the nonempty Outside git and Other agents foot groups.
      */
     private void renderMachine(Machine machine) {
         List<Agent> all = members(machine);
@@ -1112,42 +1111,61 @@ public final class HomeActivity extends Activity {
         for (int i = 0; i < row.kids.size(); i++) emit(into, row.kids.get(i), next, i == row.kids.size() - 1, depth + 1);
     }
 
-    /** Repository headings with their PMs, then Other terminals; workers stay behind each PM. */
+    /** Shared placement: repositories, then nonempty Outside git / Other agents foot groups. */
     private List<Row> bodyRows(Machine machine, FleetTree.PmTree tree, boolean ready) {
         String m = machine.host.id;
         List<Row> rows = new ArrayList<>();
         for (FleetTree.RepoRow repo : tree.repos) {
-            String count = (repo.blocked() ? "! " : "") + repo.countLabel();
-            Row group = new Row((guide, self) -> groupLine(guide, self, repo.name, count));
+            Row group = new Row((guide, self) -> groupLine(guide, self, repo.name, repo.label(folded(self))));
             group.fold = m + "/repo/" + repo.key;
             group.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.REPO);
             for (FleetTree.PmRow pm : repo.projects) group.kids.add(pmRow(machine, pm));
+            if (!repo.idle.isEmpty()) {
+                Row idle = new Row((guide, self) -> groupLine(guide, self, repo.idle.size() + " idle", ""));
+                idle.fold = m + "/idle/" + repo.key;
+                idle.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.IDLE);
+                for (FleetTree.PmRow pm : repo.idle) idle.kids.add(pmRow(machine, pm));
+                group.kids.add(idle);
+            }
+            for (FleetTree.SpaceNode node : repo.loose) group.kids.add(checkoutRow(machine, node));
+            addCatalogRows(group, machine, repo);
             rows.add(group);
         }
-        if (!tree.others.isEmpty() || !tree.otherCatalogs.isEmpty()) {
+        if (tree.outsideCount() > 0) {
+            Row outside = new Row((guide, self) -> groupLine(guide, self, "Outside git", "" + tree.outsideCount()));
+            outside.fold = m + "/outside";
+            outside.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.OUTSIDE);
+            for (FleetTree.PmRow pm : tree.outside) outside.kids.add(pmRow(machine, pm));
+            for (FleetTree.SpaceNode node : tree.outsideLoose) outside.kids.add(checkoutRow(machine, node));
+            rows.add(outside);
+        }
+        if (!tree.others.isEmpty()) {
             String count = (tree.othersBlocked() ? "! " : "") + tree.otherMembers.size();
-            Row others = new Row((guide, self) -> {
-                View line = groupLine(guide, self, "Other terminals", count);
-                if (!tree.otherCatalogs.isEmpty()) {
-                    line.setOnLongClickListener(v -> {
-                        beginNavigation();
-                        new ActionSheet(this, chrome, "Other terminals")
-                                .add("Worktrees…", () -> showCatalogs(machine, tree.otherCatalogs)).show();
-                        return true;
-                    });
-                }
-                return line;
-            });
-            others.fold = m + "/others";
+            Row others = new Row((guide, self) -> groupLine(guide, self, "Other agents", count));
+            others.fold = m + "/other-agents";
             others.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.OTHERS);
             for (FleetTree.AgentNode node : tree.others) {
                 String tag = "deacon".equals(node.member.role) ? "another deacon" : null;
                 others.kids.add(agentTree(m, node, tag));
             }
-            addCatalogRows(others, machine, tree.otherCatalogs);
             rows.add(others);
         }
         return rows;
+    }
+
+    /** Stray checkouts remain a single direct target, with every terminal reachable behind its fold. */
+    private Row checkoutRow(Machine machine, FleetTree.SpaceNode node) {
+        Row row = new Row((guide, self) -> actionLine(guide, self, "▪", FleetTree.checkoutLabel(node), chrome.primary, () -> {
+            FleetTree.Member target = FleetTree.checkoutTarget(node);
+            if (target != null) openAgent((Agent) target);
+            else if (node.key.startsWith("/")) openWorktree(machine, node.key);
+        }));
+        row.fold = machine.host.id + "/checkout/" + node.key;
+        row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT);
+        if (node.members.size() > 1) {
+            for (FleetTree.AgentNode agent : node.agents) row.kids.add(agentTree(machine.host.id, agent, null));
+        }
+        return row;
     }
 
     /**
@@ -1157,9 +1175,9 @@ public final class HomeActivity extends Activity {
      */
     private Row pmRow(Machine machine, FleetTree.PmRow pm) {
         String key = machine.host.id + "/p/" + pm.name();
-        String tally = tally(pm.project.tally);
+        String tally = pm.countsLabel();
         Row row;
-        if (pm.pm != null) {
+        if (pm.labelledPm()) {
             Agent lead = (Agent) pm.pm;
             String tag = "pm" + (tally.isEmpty() ? "" : "  " + tally);
             row = new Row((guide, self) -> {
@@ -1170,13 +1188,14 @@ public final class HomeActivity extends Activity {
         } else {
             row = new Row((guide, self) -> {
                 View line = actionLine(guide, self, "●", pm.name() + " · no PM"
-                        + (tally.isEmpty() ? "" : "  " + tally), pm.blocked() ? chrome.danger : chrome.onSurfaceVariant,
+                        + (tally.isEmpty() ? "" : "  " + tally), chrome.onSurfaceVariant,
                         () -> {
                             FleetTree.Member target = FleetTree.projectTarget(pm);
                             if (target != null) openAgent((Agent) target);
                             else if (!self.kids.isEmpty()) toggleFold(self.fold, self.foldedByDefault);
                             else askForManager(machine, pm.project);
                         });
+                line.setAlpha(0.65f);
                 line.setOnLongClickListener(v -> {
                     beginNavigation();
                     ActionSheet sheet = new ActionSheet(this, chrome, pm.name())
@@ -1192,15 +1211,14 @@ public final class HomeActivity extends Activity {
         // PM rows start folded, as on the desktop; Home reveals nothing on its own.
         row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT);
         for (FleetTree.AgentNode node : pm.workers) row.kids.add(agentTree(machine.host.id, node, null));
-        addCatalogRows(row, machine, pm.catalogs);
         return row;
     }
 
     /** Catalogs are reachable by tap as well as from the row's long-press menu. */
-    private void addCatalogRows(Row parent, Machine machine, List<FleetTree.Project> catalogs) {
-        for (FleetTree.Project project : catalogs) {
+    private void addCatalogRows(Row parent, Machine machine, FleetTree.RepoRow repo) {
+        for (FleetTree.Project project : repo.catalogs) {
             parent.kids.add(new Row((guide, self) -> actionLine(guide, null, "○",
-                    FleetTree.repoName(project.repo) + " · " + FleetTree.unopenedLabel(project), chrome.primary,
+                    repo.catalogName(project) + " · " + FleetTree.unopenedLabel(project), chrome.primary,
                     () -> showWorktrees(machine, project, 0))));
         }
     }
@@ -1243,15 +1261,6 @@ public final class HomeActivity extends Activity {
         row.fold = key;
         for (FleetTree.AgentNode kid : node.children) row.kids.add(agentTree(machineId, kid, null));
         return row;
-    }
-
-    /** "1! 2✓ 3▶" over blocked, done, working; idle is the rest. */
-    private static String tally(int[] n) {
-        List<String> parts = new ArrayList<>();
-        if (n[0] > 0) parts.add(n[0] + "!");
-        if (n[1] > 0) parts.add(n[1] + "✓");
-        if (n[2] > 0) parts.add(n[2] + "▶");
-        return TextUtils.join(" ", parts);
     }
 
     /** A tree row: guide lines, then ▾/▸ when it folds something (its own tap target). */
@@ -1388,13 +1397,13 @@ public final class HomeActivity extends Activity {
         return line;
     }
 
-    /** A repository or Other terminals heading: the whole row folds. */
+    /** A repository, idle or foot heading: the whole row folds. */
     private View groupLine(String guide, Row fold, String words, String count) {
         LinearLayout line = treeLine(guide, fold);
         TextView name = single(text(words, 12, chrome.primary));
         name.setTypeface(mono(false));
         line.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView meta = tag(count, count.startsWith("!") ? chrome.danger : chrome.onSurfaceVariant);
+        TextView meta = tag(count, count.contains("!") ? chrome.danger : chrome.onSurfaceVariant);
         meta.setTypeface(mono(false));
         line.addView(meta);
         line.setContentDescription(words + ", " + count + (folded(fold) ? ", folded" : ""));

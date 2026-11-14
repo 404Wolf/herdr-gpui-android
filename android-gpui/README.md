@@ -141,12 +141,19 @@ rail opens by default on panels 600 dp and wider (so the inner fold display, not
 the cover) and remembers whether you hid it. On a narrower window **Hosts** opens
 it as a modal drawer over the terminal instead; Back, a tap outside it or a
 choice closes it, and it never changes that remembered preference.
-Home and the terminal rail group project managers under collapsible repository
-headings with project counts. Repositories start expanded; each PM's workers
-stay folded until its chevron is tapped. Tap a PM or a worker to open its
-terminal; a project with no PM opens its first worker or agent, falling back to
-a shell only when no agent remains. Unopened-worktree counts
-under a group open its catalog. Tap a worktree to focus a terminal already there
+Home and the terminal rail group projects under collapsible repository headings.
+Live projects without a PM have dimmed rows; quiet projects sit behind an
+**N idle** fold. Stray checkouts and unopened-worktree catalogs sit in their repo's
+list. **Outside git** and **Other agents** appear folded at the foot when needed.
+Repositories with the same name share a header and retain separate catalogs.
+PM rows show **≡N** agents beneath their PM or inferred lead, including nested
+agents and excluding shells, plus blocked, working and done totals. Folded repo
+headers sum their shown projects. Ahead-of-upstream commit counts are deferred
+until the existing git bridge supplies them.
+Repositories start expanded; workers stay folded until their project's chevron
+is tapped. Tap a PM or worker to open its terminal; a no-PM project opens its lead
+or first agent, falling back to a shell when no agent remains. Tap a catalog to
+list its worktrees, then tap a worktree to focus a terminal already there
 or open a plain shell in that folder. Chips, catalog entries and fold chevrons
 show pressed feedback.
 Delayed opens honor the latest navigation choice, including switching computers

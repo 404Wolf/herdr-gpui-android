@@ -16,7 +16,7 @@ import java.util.Set;
  * One computer's Fleet tree (Deacon › projects/PM › main and worktree rows ›
  * workers), per the desktop's Fleet tree contract v1/v1.1 (spaces-wolf). It is
  * built per core connection, so agents of two computers never share a Deacon.
- * The sidebar draws {@link #pmTree}: the Deacon and PMs grouped by repo, with each
+ * The sidebar draws {@link #pmTree}: the Deacon and projects grouped by repo, with each
  * checkout reduced to a terminal's second line. Plain data in, plain data
  * out: tested without Android.
  */
@@ -125,6 +125,8 @@ final class FleetTree {
     }
 
     static final class Fleet {
+        private final GitLook git;
+        private Fleet(GitLook git) { this.git = git; }
         /** The one canonical Deacon, or null: then Home offers "Start Deacon". */
         Member deacon;
         /** Unlabelled agents of the deacon's own space: its helpers. */
@@ -208,7 +210,7 @@ final class FleetTree {
 
     static Fleet build(List<? extends Member> members, GitLook git) {
         if (git == null) git = new GitLook();
-        Fleet fleet = new Fleet();
+        Fleet fleet = new Fleet(git);
         List<Member> sorted = new ArrayList<>(members);
         Collections.sort(sorted, PLACE);
         fleet.deacon = canonicalDeacon(sorted);
@@ -226,7 +228,7 @@ final class FleetTree {
             }
             if (!m.hasSpace() && up != null && up.hasSpace()) adopted.put(m.id, up.space);
         }
-        // Spaces in order, with their members; terminals without a space go to Other terminals.
+        // Spaces in order; agents without one go to Other agents, shells to checkout rows.
         Map<String, List<Member>> spaces = new LinkedHashMap<>();
         for (Member m : sorted) {
             if (m == fleet.deacon) continue;
@@ -266,7 +268,7 @@ final class FleetTree {
         }
         Collections.sort(placed, PLACE);
         Map<String, String> projectOf = new HashMap<>();
-        for (Member m : placed) if (m.isAgent()) {
+        for (Member m : placed) if (m.isAgent() || !m.project.isEmpty()) {
             String p = labelledProject(m, byId, spaceOfMember, spaceLabels, new HashSet<>());
             if (!p.isEmpty()) projectOf.put(m.id, p);
         }
@@ -318,13 +320,17 @@ final class FleetTree {
             Place spacePlace = git.places.get(probe(spaces.get(space)));
             String name = projectOf.get(m.id);
             if (name == null) {
-                SpaceNode node = looseBySpace.get(space);
+                Place own = git.places.get(trimSlash(m.cwd));
+                Place use = own != null ? own : spacePlace;
+                String convention = conventionTop(Collections.singletonList(m));
+                String key = use != null && !use.top.isEmpty() ? use.top
+                        : convention != null ? convention : "space:" + space;
+                SpaceNode node = looseBySpace.get(key);
                 if (node == null) {
-                    String key = spacePlace != null && !spacePlace.top.isEmpty() ? spacePlace.top : "space:" + space;
-                    looseBySpace.put(space, node = new SpaceNode(key));
+                    looseBySpace.put(key, node = new SpaceNode(key));
                 }
                 open.add(node.key);
-                fill(node, space, m, spacePlace, at, git);
+                fill(node, space, m, use, at, git);
                 continue;
             }
             Project project = projects.get(name);
@@ -351,15 +357,20 @@ final class FleetTree {
             List<Member> all = new ArrayList<>();
             for (SpaceNode row : rows) all.addAll(row.members);
             Collections.sort(all, PLACE);
-            boolean explicitWorker = false;
             for (Member m : all) {
                 if ("pm".equals(m.role) && project.pm == null) project.pm = m;
-                if ("worker".equals(m.role)) explicitWorker = true;
             }
-            // Unlabelled projects infer their lead from space/tab order; an
-            // explicit worker is never promoted, a missing PM shows as missing.
-            if (project.pm == null && !explicitWorker) {
-                for (Member m : all) if (m.role.isEmpty() && m.isAgent()) { project.pm = m; project.pmInferred = true; break; }
+            // Infer only an unlabelled root agent, never a worker or its nested sub-agent.
+            if (project.pm == null) {
+                Set<String> ids = new HashSet<>();
+                for (Member member : all) ids.add(member.id);
+                for (Member m : all) {
+                    if (m.role.isEmpty() && countedAgent(m) && !ids.contains(m.parent)) {
+                        project.pm = m;
+                        project.pmInferred = true;
+                        break;
+                    }
+                }
             }
             // The repo listed: the PM's own; a PM outside git uses its own
             // members' repo, never another project's checkout.
@@ -372,6 +383,7 @@ final class FleetTree {
                 }
             }
             // Main checkout first, then worktrees, in space order.
+            Set<String> tallied = new HashSet<>();
             Collections.sort(rows, (a, b) -> a.worktree != b.worktree ? (a.worktree ? 1 : 0) - (b.worktree ? 1 : 0)
                     : Integer.compare(a.order, b.order));
             for (SpaceNode row : rows) {
@@ -380,10 +392,14 @@ final class FleetTree {
                 // A row that only held the PM is the PM row itself: no ghost checkout row.
                 if (row.members.isEmpty()) continue;
                 nest(row, project.pm);
-                for (Member m : row.members) count(project.tally, m.status);
+                for (Member m : row.members) {
+                    if (countedAgent(m) && tallied.add(m.id)) count(project.tally, m.status);
+                }
                 project.entries.add(row);
             }
-            if (project.pm != null) count(project.tally, project.pm.status);
+            if (project.pm != null && countedAgent(project.pm) && tallied.add(project.pm.id)) {
+                count(project.tally, project.pm.status);
+            }
             fleet.projects.add(project);
         }
         for (SpaceNode node : fleet.loose) nest(node, null);
@@ -714,7 +730,11 @@ final class FleetTree {
         DEACON,
         /** A PM row: its workers, nested by parent. */
         PROJECT,
-        /** "Other terminals": everything no Deacon or PM leads. */
+        /** No-PM projects without an agent, nested under their repository. */
+        IDLE,
+        /** Projects and checkouts without a known repository. */
+        OUTSIDE,
+        /** Agents that have no project/checkout placement. */
         OTHERS,
         /** An agent's own sub-agents. */
         AGENT
@@ -740,6 +760,8 @@ final class FleetTree {
         final List<AgentNode> workers = new ArrayList<>();
         /** Projects whose unopened-worktree catalog this row's menu offers ("Worktrees…"). */
         final List<Project> catalogs = new ArrayList<>();
+        int subAgents;
+        boolean hasAgents;
         PmRow(Project project) {
             this.project = project;
             this.pm = project.pm;
@@ -749,19 +771,44 @@ final class FleetTree {
 
         /** The PM or any of its workers is blocked: the row says so even while folded. */
         boolean blocked() { return project.tally[0] > 0; }
+
+        boolean labelledPm() {
+            return pm != null && !project.pmInferred && "pm".equals(pm.role) && countedAgent(pm);
+        }
+
+        String countsLabel() { return counts(subAgents, project.tally); }
+
+        boolean contains(String id) {
+            if (pm != null && pm.id.equals(id)) return true;
+            for (SpaceNode node : project.entries) for (Member member : node.members) if (member.id.equals(id)) return true;
+            return false;
+        }
+    }
+
+    /** A kept terminal running a shell contributes no agent, even if it retains role/harness labels. */
+    static boolean countedAgent(Member member) { return member.isAgent() && running(member); }
+
+    /** Shared PM/repo totals: PM included in statuses, excluded from the agent subtotal. */
+    private static String counts(int subAgents, int[] tally) {
+        List<String> words = new ArrayList<>();
+        if (subAgents > 0) words.add("≡" + subAgents);
+        if (tally[0] > 0) words.add(tally[0] + "!");
+        if (tally[2] > 0) words.add(tally[2] + "~");
+        if (tally[1] > 0) words.add(tally[1] + "✓");
+        return String.join(" ", words);
     }
 
     /** PM, else the first agent in display order, falling back to a shell when no agent remains. */
     static Member projectTarget(PmRow row) {
-        if (row.pm != null) return row.pm;
+        if (row.pm != null && countedAgent(row.pm)) return row.pm;
         Member agent = firstAgent(row.workers);
-        return agent != null ? agent : row.workers.isEmpty() ? null : row.workers.get(0).member;
+        return agent != null ? agent : row.pm != null ? row.pm : row.workers.isEmpty() ? null : row.workers.get(0).member;
     }
 
     /** Prefer agents in display preorder, including a worker nested beneath a shell parent. */
     private static Member firstAgent(List<AgentNode> nodes) {
         for (AgentNode node : nodes) {
-            if (node.member.isAgent()) return node.member;
+            if (countedAgent(node.member)) return node.member;
             Member child = firstAgent(node.children);
             if (child != null) return child;
         }
@@ -779,6 +826,12 @@ final class FleetTree {
     static final class RepoRow {
         final String key, name;
         final List<PmRow> projects = new ArrayList<>();
+        final List<PmRow> idle = new ArrayList<>();
+        final List<SpaceNode> loose = new ArrayList<>();
+        final List<Project> catalogs = new ArrayList<>();
+        private final int[] tally = new int[4];
+        private int subAgents;
+        private boolean git;
         RepoRow(String key, String name) { this.key = key; this.name = name; }
 
         String countLabel() {
@@ -786,37 +839,125 @@ final class FleetTree {
         }
 
         boolean blocked() {
-            for (PmRow project : projects) if (project.blocked()) return true;
-            return false;
+            return tally[0] > 0;
+        }
+
+        String label(boolean folded) {
+            String totals = folded ? counts(subAgents, tally) : blocked() ? "!" : "";
+            return countLabel() + (totals.isEmpty() ? "" : "  " + totals);
+        }
+
+        private void add(PmRow row) {
+            projects.add(row);
+            subAgents += row.subAgents;
+            for (int i = 0; i < tally.length; i++) tally[i] += row.project.tally[i];
+        }
+
+        String catalogName(Project owner) {
+            if (catalogs.size() < 2) return name;
+            String path = trimSlash(owner.repo);
+            if (path.endsWith("/.git")) path = path.substring(0, path.length() - 5);
+            int parent = path.lastIndexOf('/', Math.max(0, path.lastIndexOf('/') - 1));
+            return path.substring(parent + 1);
         }
     }
 
-    /** PM cwd's repo, else its project's repo, then the conventional worktree path or project label. */
-    private static List<RepoRow> groupRepos(List<PmRow> pms) {
-        Map<String, RepoRow> groups = new LinkedHashMap<>();
-        for (PmRow row : pms) {
-            // build() resolves the PM's own git first, then only this project's other members.
-            String common = row.project.repo;
-            Member target = projectTarget(row);
-            String convention = target == null ? null : RailTree.repoOfPath(target.cwd);
-            String name = !common.isEmpty() ? repoName(common) : convention != null ? convention : row.name();
-            // Separate distinct repositories with the same basename once git identifies them.
-            String key = common.isEmpty() ? "name:" + name : common;
-            groups.computeIfAbsent(key, k -> new RepoRow(k, name)).projects.add(row);
+    private static String repoGroup(PmRow row) {
+        if (!row.project.repo.isEmpty()) return repoName(row.project.repo);
+        Member lead = projectTarget(row);
+        String convention = lead == null ? null : RailTree.repoOfPath(lead.cwd);
+        return convention == null ? row.name() : convention;
+    }
+
+    private static String repoGroup(SpaceNode node) {
+        if (!node.repo.isEmpty()) return repoName(node.repo);
+        for (Member member : node.members) {
+            String convention = RailTree.repoOfPath(member.cwd);
+            if (convention != null) return convention;
         }
-        List<RepoRow> rows = new ArrayList<>(groups.values());
-        Collections.sort(rows, (a, b) -> {
-            int c = a.name.compareToIgnoreCase(b.name);
-            return c != 0 ? c : a.key.compareTo(b.key);
-        });
-        return rows;
+        return "";
+    }
+
+    /** Same display name shares a header; canonical repo ids still separate catalogs. */
+    private static RepoRow repoGroup(Map<String, RepoRow> groups, String name, boolean git) {
+        RepoRow group = groups.computeIfAbsent(name, k -> new RepoRow(k, k));
+        group.git |= git;
+        return group;
+    }
+
+    private static void groupSidebar(PmTree tree, Fleet fleet, List<SpaceNode> loose) {
+        Map<String, RepoRow> groups = new LinkedHashMap<>();
+        Set<String> known = new HashSet<>();
+        // Collect every known name before placing a gitless project, including later checkouts.
+        for (PmRow row : tree.allProjects) {
+            Member lead = projectTarget(row);
+            if (row.labelledPm() || !row.project.repo.isEmpty()
+                    || lead != null && RailTree.repoOfPath(lead.cwd) != null) known.add(repoGroup(row));
+        }
+        for (SpaceNode node : loose) {
+            String name = repoGroup(node);
+            if (!name.isEmpty()) known.add(name);
+        }
+        for (PmRow row : tree.allProjects) {
+            if (row.labelledPm()) repoGroup(groups, repoGroup(row), !row.project.repo.isEmpty()).add(row);
+        }
+        for (PmRow row : tree.allProjects) {
+            if (row.labelledPm()) continue;
+            String name = repoGroup(row);
+            if (!known.contains(name)) { tree.outside.add(row); continue; }
+            RepoRow group = repoGroup(groups, name, !row.project.repo.isEmpty());
+            if (row.hasAgents) group.add(row);
+            else group.idle.add(row);
+        }
+        for (SpaceNode node : loose) {
+            String name = repoGroup(node);
+            if (name.isEmpty()) tree.outsideLoose.add(node);
+            else repoGroup(groups, name, !node.repo.isEmpty()).loose.add(node);
+        }
+        Set<String> catalogs = new HashSet<>();
+        Set<String> scanned = new HashSet<>();
+        for (Project project : fleet.projects) {
+            if (!project.repo.isEmpty()) scanned.add(project.repo);
+            if (!project.closed.isEmpty() && catalogs.add(project.repo)) {
+                repoGroup(groups, repoName(project.repo), true).catalogs.add(project);
+            }
+        }
+        // A repository known only through shells/stray checkouts still owns its unopened list.
+        Set<String> open = new HashSet<>();
+        for (Member member : fleet.all) {
+            Place place = fleet.git.places.get(trimSlash(member.cwd));
+            if (place != null && !place.top.isEmpty()) open.add(place.top);
+            String convention = conventionTop(Collections.singletonList(member));
+            if (convention != null) open.add(convention);
+        }
+        List<String> repos = new ArrayList<>(fleet.git.repos.keySet());
+        Collections.sort(repos);
+        for (String common : repos) {
+            if (scanned.contains(common)) continue;
+            Project owner = new Project(repoName(common));
+            owner.repo = common;
+            closedWorktrees(owner, fleet.git, open);
+            if (!owner.closed.isEmpty()) repoGroup(groups, owner.name, true).catalogs.add(owner);
+        }
+        for (RepoRow group : groups.values()) if (group.git) tree.repos.add(group);
+        for (RepoRow group : groups.values()) if (!group.git) tree.repos.add(group);
+    }
+
+    /** A checkout row opens an agent when present, otherwise its first shell. */
+    static Member checkoutTarget(SpaceNode node) {
+        Member agent = firstAgent(node.agents);
+        return agent != null ? agent : node.members.isEmpty() ? null : node.members.get(0);
+    }
+
+    static String checkoutLabel(SpaceNode node) {
+        String name = node.name.isEmpty() ? "Terminal" : node.name;
+        return node.branch.isEmpty() || node.branch.equals(name) ? name : name + " · " + node.branch;
     }
 
     /**
      * What the sidebar (the terminal's rail and Home) draws for one computer:
-     * the Deacon, repository headings containing PM rows, and one folded row
-     * for everything else. A terminal's checkout is its second line; workers
-     * and catalogs stay behind the PM's fold.
+     * the Deacon, repository headings with PM/live projects, idle projects,
+     * stray checkouts and catalogs, then the two nonempty foot groups.
      */
     static final class PmTree {
         Member deacon;
@@ -824,16 +965,20 @@ final class FleetTree {
         final List<Member> helpers = new ArrayList<>();
         /** One per project a labelled PM (or labelled workers) leads, by project name. */
         final List<PmRow> pms = new ArrayList<>();
-        /** Repository headings in name order; the PMs in each retain project name order. */
+        /** All project rows, including inferred/no-PM and idle projects, in first space order. */
+        final List<PmRow> allProjects = new ArrayList<>();
+        /** Git repositories first, then other groups; project order within each category. */
         final List<RepoRow> repos = new ArrayList<>();
-        /** Unlabelled projects, loose spaces, extra deacons and agents with no space, nested by parent. */
+        /** Unplaced/extra agents, nested by parent; shells stay reachable as checkouts. */
         final List<AgentNode> others = new ArrayList<>();
         /** The same terminals flat, in place order. */
         final List<Member> otherMembers = new ArrayList<>();
-        /** Catalogs of unopened worktrees no PM row can offer: on Other terminals' menu. */
-        final List<Project> otherCatalogs = new ArrayList<>();
+        final List<PmRow> outside = new ArrayList<>();
+        final List<SpaceNode> outsideLoose = new ArrayList<>();
 
-        /** Anything under Other terminals is blocked. */
+        int outsideCount() { return outside.size() + outsideLoose.size(); }
+
+        /** Anything under Other agents is blocked. */
         boolean othersBlocked() {
             for (Member m : otherMembers) if (blocked(m)) return true;
             return false;
@@ -879,67 +1024,78 @@ final class FleetTree {
     }
 
     /**
-     * The sidebar for {@code fleet}: the Deacon; one row per PM, ordered by
-     * project name, its workers (every other terminal of its project, by role,
-     * project and parent labels) nested under it by parent; and everything
-     * else in Other terminals, so no terminal is ever dropped.
+     * Shared placement and counts for the sidebar. PMs and live no-PM projects
+     * lead their repo; idle projects, checkouts and catalogs remain reachable,
+     * with Outside git and Other agents folded at the foot.
      */
     static PmTree pmTree(Fleet fleet) {
         PmTree tree = new PmTree();
         tree.deacon = fleet.deacon;
         tree.helpers.addAll(fleet.helpers);
-        Map<Member, String> where = new HashMap<>();
-        List<Member> rest = new ArrayList<>(fleet.others);
         for (Project project : fleet.projects) {
-            boolean managed = managed(project);
-            String own = managed ? project.name : "";
-            List<Member> workers = new ArrayList<>();
-            for (SpaceNode row : project.entries) {
-                for (Member m : row.members) {
-                    workers.add(m);
-                    where.put(m, where(row, own));
-                }
-            }
-            if (!managed) {
-                if (project.pm != null) {
-                    rest.add(project.pm);
-                    where.put(project.pm, where(project.pmRow, ""));
-                }
-                rest.addAll(workers);
-                continue;
-            }
             PmRow row = new PmRow(project);
-            row.where = where(project.pmRow, project.name);
-            row.workers.addAll(nestAll(workers, project.pm, where));
-            tree.pms.add(row);
-        }
-        for (SpaceNode node : fleet.loose) {
-            for (Member m : node.members) {
-                rest.add(m);
-                where.put(m, where(node, ""));
+            String own = managed(project) ? project.name : "";
+            row.where = where(project.pmRow, own);
+            Map<Member, String> where = new HashMap<>();
+            List<Member> workers = new ArrayList<>();
+            for (SpaceNode checkout : project.entries) {
+                for (Member member : checkout.members) {
+                    workers.add(member);
+                    where.put(member, where(checkout, own));
+                }
             }
+            // A kept lead running a shell is still reachable as a child of its no-PM row.
+            if (project.pm != null && !countedAgent(project.pm)) {
+                workers.add(project.pm);
+                where.put(project.pm, row.where);
+            }
+            row.workers.addAll(nestAll(workers, project.pm, where));
+            row.hasAgents = project.pm != null && countedAgent(project.pm);
+            Set<String> counted = new HashSet<>();
+            if (project.pm != null) counted.add(project.pm.id);
+            for (Member member : flatten(row.workers)) {
+                if (countedAgent(member)) {
+                    row.hasAgents = true;
+                    if (counted.add(member.id)) row.subAgents++;
+                }
+            }
+            tree.allProjects.add(row);
+            if (managed(project)) tree.pms.add(row);
+        }
+        List<SpaceNode> loose = new ArrayList<>(fleet.loose);
+        for (Member member : fleet.others) {
+            if (countedAgent(member)) { tree.otherMembers.add(member); continue; }
+            Place place = fleet.git.places.get(trimSlash(member.cwd));
+            SpaceNode node = new SpaceNode(place != null && !place.top.isEmpty() ? place.top : "terminal:" + member.id);
+            node.name = lastSegment(place == null ? member.cwd : place.top);
+            if (place != null) { node.repo = place.common; node.branch = place.branch; }
+            node.members.add(member);
+            nest(node, null);
+            loose.add(node);
         }
         Collections.sort(tree.pms, (a, b) -> {
             int c = a.name().compareToIgnoreCase(b.name());
             return c != 0 ? c : a.name().compareTo(b.name());
         });
-        tree.repos.addAll(groupRepos(tree.pms));
-        // Each repo's unopened worktrees stay reachable from exactly one menu.
+        // Preserve optional long-press shortcuts; visible catalogs live on the repo, once.
         for (Project project : fleet.projects) {
             if (project.closed.isEmpty()) continue;
             PmRow home = catalogRow(tree.pms, project);
-            (home == null ? tree.otherCatalogs : home.catalogs).add(project);
+            if (home == null) {
+                for (PmRow row : tree.allProjects) if (row.project == project) { home = row; break; }
+            }
+            if (home != null) home.catalogs.add(project);
         }
-        Collections.sort(rest, PLACE);
-        tree.otherMembers.addAll(rest);
-        tree.others.addAll(nestAll(rest, null, where));
+        groupSidebar(tree, fleet, loose);
+        Collections.sort(tree.otherMembers, PLACE);
+        tree.others.addAll(nestAll(tree.otherMembers, null, Collections.emptyMap()));
         return tree;
     }
 
     /**
      * The PM row whose menu offers {@code owner}'s catalog: its own row when
      * it has one; else (an owner inferred from folders) the first PM row, by
-     * name, working in the same repo; else null (Other terminals' menu).
+     * name, working in the same repo; otherwise the caller keeps the owner's shortcut.
      */
     private static PmRow catalogRow(List<PmRow> pms, Project owner) {
         for (PmRow row : pms) if (row.project == owner) return row;
@@ -970,8 +1126,9 @@ final class FleetTree {
             out.add(tree.deacon);
             if (!foldedByDefault(Fold.DEACON)) out.addAll(tree.helpers);
         }
-        for (PmRow row : tree.pms) {
-            if (row.pm != null) out.add(row.pm);
+        for (RepoRow repo : tree.repos) for (PmRow row : repo.projects) {
+            Member target = projectTarget(row);
+            if (target != null) out.add(target);
             if (!foldedByDefault(Fold.PROJECT)) out.addAll(flatten(row.workers));
         }
         if (!foldedByDefault(Fold.OTHERS)) out.addAll(tree.otherMembers);
