@@ -109,8 +109,6 @@ public final class HomeActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newFixedThreadPool(4);
     private final Map<String, Machine> machines = new LinkedHashMap<>();
-    /** Pages of unopened worktrees shown per project ("+N more" taps). */
-    private final Map<String, Integer> closedPages = new HashMap<>();
     /** Folded rows (and "open:" rows that start folded), kept across launches. */
     private final Set<String> collapsed = new HashSet<>();
     /** Git looks: at most every GIT_MS per machine, sooner (GIT_NEW_MS) for a new folder. */
@@ -929,10 +927,10 @@ public final class HomeActivity extends Activity {
     }
 
     /**
-     * One computer, as the desktop's single-machine sidebar: the computer
-     * picker, its Deacon card (status, Needs you, the message box, + Project),
-     * then its repos with their projects, worktrees and workers, unopened
-     * worktrees folded per repo, Outside git folded, Other agents.
+     * One computer, as the terminal's rail draws it (FleetTree.pmTree): the
+     * computer picker, its Deacon, one row per PM with its workers folded
+     * under it (each terminal's checkout as its second line), then one folded
+     * "Other terminals" row for everything no Deacon or PM leads.
      */
     private void renderMachine(Machine machine) {
         List<Agent> all = members(machine);
@@ -942,6 +940,7 @@ public final class HomeActivity extends Activity {
             machine.gitAt = Math.max(machine.gitAt, FleetPanes.LOOKED_AT.getOrDefault(machine.host.id, 0L));
         }
         FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
+        FleetTree.PmTree tree = FleetTree.pmTree(fleet);
         // A cached view is drawn as it was, dimmed; it is live only once this session lists terminals.
         boolean ready = live(machine);
         if (fleet.deacon != null && deaconGuard(machine) > 0 && machine.deaconPending.isEmpty()) clearDeaconGuard(machine);
@@ -1013,21 +1012,25 @@ public final class HomeActivity extends Activity {
             skeletonFleet();
             return;
         }
-        deaconRows(machine, fleet, ready);
+        deaconRows(machine, tree, ready);
 
         LinearLayout rows = column();
         // Offline: what was last seen stays, dimmed; nothing can be started there.
         if (!ready) rows.setAlpha(0.5f);
-        for (Row top : bodyRows(machine, fleet, ready)) emit(rows, top, "", true, 0);
+        for (Row top : bodyRows(machine, tree, ready)) emit(rows, top, "", true, 0);
         body.addView(rows);
     }
 
     private LinearLayout header, body, machineBar, deaconCard;
     private String selectedHost;
 
-    /** The Deacon card: the Deacon (id, status), its state, Needs you, + Project. */
-    private void deaconRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
-        if (fleet.deacon == null) {
+    /**
+     * The Deacon card: the Deacon (id, status; a red ! while blocked work is
+     * folded under it), its state, and New project's state while it asks.
+     * New project itself is the computer row's +.
+     */
+    private void deaconRows(Machine machine, FleetTree.PmTree tree, boolean ready) {
+        if (tree.deacon == null) {
             boolean busy = machine.deaconBusy || deaconGuard(machine) > 0;
             String said = !ready ? "No Deacon. Connect this computer to start one."
                     : busy ? "Starting the Deacon…"
@@ -1037,14 +1040,16 @@ public final class HomeActivity extends Activity {
                     ? chrome.onSurfaceVariant : chrome.danger, ready && !busy ? () -> startDeacon(machine) : null));
             return;
         }
-        Agent deacon = (Agent) fleet.deacon;
+        Agent deacon = (Agent) tree.deacon;
         // Deacon › PMs at rest: its own helpers wait behind its chevron.
-        Row top = new Row((guide, self) -> agentLine(guide, deacon, "Deacon " + deacon.id, self));
+        Row top = new Row(null);
         top.fold = machine.host.id + "/deacon";
-        top.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.DEACON, fleet.helpers.size(), false);
-        for (FleetTree.Member helper : fleet.helpers) {
+        top.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.DEACON);
+        top.view = (guide, self) -> agentLine(guide, deacon, "Deacon " + deacon.id
+                + (folded(self) && tree.deaconBlocked() ? "  !" : ""), self, null, "");
+        for (FleetTree.Member helper : tree.helpers) {
             Agent agent = (Agent) helper;
-            top.kids.add(new Row((guide, self) -> agentLine(guide, agent, roleTag(agent), null)));
+            top.kids.add(new Row((guide, self) -> agentLine(guide, agent, roleTag(agent), null, null, "")));
         }
         emit(deaconCard, top, "", true, 0);
         if (deacon.id.equals(machine.deaconPending)) {
@@ -1055,25 +1060,12 @@ public final class HomeActivity extends Activity {
             deaconCard.addView(actionLine("   ", null, "!", said + ". Tap to open it.", chrome.danger,
                     () -> openAgent(deacon)));
         }
-        // Needs you: agents whose own status says they wait on Wolf; each opens its chat.
-        List<FleetTree.Member> needs = FleetTree.needsYou(fleet);
-        if (!needs.isEmpty()) {
-            TextView heading = text("Needs you", 11, chrome.danger);
-            heading.setPadding(dp(14), dp(4), dp(4), dp(1));
-            deaconCard.addView(heading);
-            for (FleetTree.Member waiting : needs) {
-                Agent agent = (Agent) waiting;
-                String who = "deacon".equals(agent.role) ? "Deacon · "
-                        : "pm".equals(agent.role) ? "PM " + (agent.project.isEmpty() ? "" : agent.project + " · ") : "";
-                deaconCard.addView(actionLine("   ", null, "!", who + FleetPanes.displayTitle(agent), chrome.danger,
-                        () -> openAgent(agent)));
-            }
+        if (machine.projectBusy) {
+            deaconCard.addView(actionLine("   ", null, "+", "Asking the Deacon…", chrome.onSurfaceVariant, null));
+        } else if (!machine.projectError.isEmpty()) {
+            deaconCard.addView(actionLine("   ", null, "+", "Could not reach the Deacon: " + machine.projectError
+                    + ". Tap to try again.", chrome.danger, ready ? () -> newProject(machine, deacon) : null));
         }
-        String said = machine.projectBusy ? "Asking the Deacon…"
-                : machine.projectError.isEmpty() ? "+ Project (asks the Deacon)"
-                : "Could not reach the Deacon: " + machine.projectError + ". Tap to try again.";
-        deaconCard.addView(actionLine("   ", null, "+", said, machine.projectError.isEmpty() ? chrome.primary : chrome.danger,
-                ready && !machine.projectBusy ? () -> newProject(machine, deacon) : null));
     }
 
     /** One row of the tree and the rows it folds. */
@@ -1111,156 +1103,109 @@ public final class HomeActivity extends Activity {
         for (int i = 0; i < row.kids.size(); i++) emit(into, row.kids.get(i), next, i == row.kids.size() - 1, depth + 1);
     }
 
-    /** Repos (each with its projects, loose spaces and unopened worktrees), Outside git, Other agents. */
-    private List<Row> bodyRows(Machine machine, FleetTree.Fleet fleet, boolean ready) {
+    /** One row per PM (by project name), then Other terminals; no repo, worktree or space rows. */
+    private List<Row> bodyRows(Machine machine, FleetTree.PmTree tree, boolean ready) {
         String m = machine.host.id;
         List<Row> rows = new ArrayList<>();
-        for (FleetTree.RepoGroup group : FleetTree.repoGroups(fleet)) {
-            String key = m + (group.outside() ? "/outside" : "/r/" + group.repo);
-            int pms = group.pms();
-            String tally = tally(group.tally);
-            String count = group.outside() ? String.valueOf(group.projects.size() + group.loose.size())
-                    : pms + (pms == 1 ? " PM" : " PMs") + (tally.isEmpty() ? "" : "  " + tally);
-            Row repo = new Row((guide, self) -> groupLine(guide, self, group.name, count));
-            repo.fold = key;
-            repo.foldedByDefault = FleetTree.foldedByDefault(group.outside() ? FleetTree.Fold.OUTSIDE
-                    : FleetTree.Fold.REPO, group.projects.size(), group.tally[0] > 0);
-            for (FleetTree.Project project : group.projects) repo.kids.add(projectRow(machine, project));
-            for (FleetTree.SpaceNode node : group.loose) repo.kids.add(spaceRow(machine, node, null));
-            if (group.owner != null) repo.kids.add(unopenedRow(machine, group));
-            rows.add(repo);
-        }
-        if (!fleet.others.isEmpty()) {
-            Row others = new Row((guide, self) -> groupLine(guide, self, "Other agents", fleet.others.size() + ""));
+        for (FleetTree.PmRow pm : tree.pms) rows.add(pmRow(machine, pm));
+        if (!tree.others.isEmpty()) {
+            String count = (tree.othersBlocked() ? "! " : "") + tree.otherMembers.size();
+            Row others = new Row((guide, self) -> {
+                View line = groupLine(guide, self, "Other terminals", count);
+                if (!tree.otherCatalogs.isEmpty()) {
+                    line.setOnLongClickListener(v -> {
+                        new ActionSheet(this, chrome, "Other terminals")
+                                .add("Worktrees…", () -> showCatalogs(machine, tree.otherCatalogs)).show();
+                        return true;
+                    });
+                }
+                return line;
+            });
             others.fold = m + "/others";
-            others.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.OTHERS, fleet.others.size(), false);
-            for (FleetTree.Member other : fleet.others) {
-                Agent agent = (Agent) other;
-                String tag = "deacon".equals(agent.role) ? "another deacon" : roleTag(agent);
-                others.kids.add(new Row((guide, self) -> agentLine(guide, agent, tag, null)));
+            others.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.OTHERS);
+            for (FleetTree.AgentNode node : tree.others) {
+                String tag = "deacon".equals(node.member.role) ? "another deacon" : null;
+                others.kids.add(agentTree(m, node, tag));
             }
             rows.add(others);
         }
         return rows;
     }
 
-    /** A repo's unopened worktrees: ONE folded row; open, a page at a time. */
-    private Row unopenedRow(Machine machine, FleetTree.RepoGroup group) {
-        FleetTree.Project owner = group.owner;
-        String key = machine.host.id + "/u/" + group.repo;
-        int total = owner.closed.size();
-        Row row = new Row((guide, self) -> groupLine(guide, self, total + (total == 1 ? " worktree" : " worktrees")
-                + " with no space" + (owner.closedIncomplete ? " (list cut short)" : ""), ""));
-        row.fold = key;
-        row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.UNOPENED, total, false);
-        int pages = closedPages.getOrDefault(key, 0);
-        int shown = FleetTree.shownClosed(owner, pages);
-        for (int i = 0; i < shown; i++) row.kids.add(closedRow(machine, owner.closed.get(i)));
-        int more = total - shown;
-        if (more > 0) {
-            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "○", "+" + more + " more worktrees",
-                    chrome.primary, () -> { closedPages.put(key, pages + 1); machine.ui++; render(true); })));
-        }
-        if (owner.closedIncomplete) {
-            row.kids.add(new Row((guide, self) -> actionLine(guide, null, "!", "Git's list was cut short;"
-                    + " some worktrees may be missing", chrome.warning, null)));
-        }
-        return row;
-    }
-
-    private Row projectRow(Machine machine, FleetTree.Project project) {
-        String key = machine.host.id + "/p/" + project.name;
-        String tally = tally(project.tally);
+    /**
+     * A PM row: the project's name, the PM's checkout as its second line, and
+     * its workers (nested by parent, each with its own checkout) behind the
+     * chevron. Blocked work anywhere in it shows as a red count on the row.
+     */
+    private Row pmRow(Machine machine, FleetTree.PmRow pm) {
+        String key = machine.host.id + "/p/" + pm.name();
+        String tally = tally(pm.project.tally);
         Row row;
-        if (project.pm != null) {
-            Agent pm = (Agent) project.pm;
-            // The project's name leads its row; the manager's own title is the second line.
-            String tag = "PM" + (tally.isEmpty() ? "" : "  " + tally);
-            row = new Row((guide, self) -> agentLine(guide, pm, tag, self, project.name));
+        if (pm.pm != null) {
+            Agent lead = (Agent) pm.pm;
+            String tag = "pm" + (tally.isEmpty() ? "" : "  " + tally);
+            row = new Row((guide, self) -> {
+                View line = agentLine(guide, lead, tag, self, pm.name(), pm.where);
+                line.setOnLongClickListener(v -> { agentActions(lead, machine, pm.catalogs); return true; });
+                return line;
+            });
         } else {
-            row = new Row((guide, self) -> actionLine(guide, self, "●", project.name + " · no PM"
-                    + (tally.isEmpty() ? "" : "  " + tally), chrome.onSurfaceVariant, () -> askForManager(machine, project)));
+            row = new Row((guide, self) -> {
+                View line = actionLine(guide, self, "●", pm.name() + " · no PM"
+                        + (tally.isEmpty() ? "" : "  " + tally), pm.blocked() ? chrome.danger : chrome.onSurfaceVariant,
+                        () -> askForManager(machine, pm.project));
+                line.setOnLongClickListener(v -> {
+                    ActionSheet sheet = new ActionSheet(this, chrome, pm.name())
+                            .add("Ask for a manager", () -> askForManager(machine, pm.project));
+                    if (!pm.catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, pm.catalogs));
+                    sheet.show();
+                    return true;
+                });
+                return line;
+            });
         }
         row.fold = key;
-        // Projects start folded, as on the desktop: a repo shows its PM rows,
-        // opening one shows its worktrees and workers. Home reveals nothing on its own.
-        row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT, project.agents(), project.tally[0] > 0);
-        boolean flat = FleetTree.flat(project);
-        for (FleetTree.SpaceNode entry : project.entries) {
-            if (flat) {
-                for (FleetTree.AgentNode node : entry.agents) row.kids.add(agentTree(machine.host.id, node, null));
-            } else {
-                row.kids.add(spaceRow(machine, entry, project));
-            }
-        }
-        // Unopened worktrees are listed once per repo (unopenedRow), not under projects.
+        // PM rows start folded, as on the desktop; Home reveals nothing on its own.
+        row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT);
+        for (FleetTree.AgentNode node : pm.workers) row.kids.add(agentTree(machine.host.id, node, null));
         return row;
     }
 
-    /** A main checkout or worktree with its agents; every space at that checkout is one row. */
-    private Row spaceRow(Machine machine, FleetTree.SpaceNode node, FleetTree.Project project) {
-        // Namespaced by project: one checkout can show in two projects' groups.
-        String key = machine.host.id + "/s/" + (project == null ? "" : project.name) + "/" + node.key;
-        Agent first = null;
-        int[] tally = new int[4];
-        int worst = 5;
-        for (FleetTree.Member member : node.members) {
-            if (first == null) first = (Agent) member;
-            worst = Math.min(worst, statusPriority(member.status));
-            switch (member.status) {
-                case "blocked": case "error": tally[0]++; break;
-                case "done": tally[1]++; break;
-                case "working": tally[2]++; break;
-                case "idle": tally[3]++; break;
-                default: break;
-            }
+    /** A row's "Worktrees…": straight to the one repo's catalog, else a choice of repo first. */
+    private void showCatalogs(Machine machine, List<FleetTree.Project> catalogs) {
+        if (catalogs.size() == 1) { showWorktrees(machine, catalogs.get(0), 0); return; }
+        ActionSheet sheet = new ActionSheet(this, chrome, "Worktrees with no space");
+        for (FleetTree.Project project : catalogs) {
+            sheet.add(FleetTree.repoName(project.repo) + " · " + project.closed.size() + "…",
+                    () -> showWorktrees(machine, project, 0));
         }
-        final Agent open = first;
-        final String worstStatus = worst == 0 ? "blocked" : worst == 1 ? "error" : worst == 2 ? "working"
-                : worst == 3 ? "idle" : worst == 4 ? "done" : "";
-        String sub = (!node.branch.isEmpty() && !node.branch.equals(node.name) ? node.branch : "")
-                + (node.spaces.size() > 1 ? (node.branch.isEmpty() || node.branch.equals(node.name) ? "" : " · ")
-                        + node.spaces.size() + " spaces" : "");
-        String mark = node.worktree ? "⑂ " : "";
-        Row row = new Row((guide, self) -> {
-            LinearLayout line = treeLine(guide, self);
-            line.addView(dot(statusColor(worstStatus)));
-            LinearLayout lines = column();
-            lines.addView(single(text(mark + node.name, 12, chrome.primary)));
-            // Always two lines, so a branch arriving with git never moves the rows below.
-            lines.addView(single(text(sub, 10, chrome.onSurfaceVariant)));
-            line.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
-            String counts = tally(tally);
-            if (!counts.isEmpty()) line.addView(tag(counts, chrome.onSurfaceVariant));
-            line.setContentDescription((node.worktree ? "Worktree " : "Checkout ") + node.name
-                    + (sub.isEmpty() ? "" : ", " + sub) + ", " + node.members.size() + " terminals");
-            if (open != null) line.setOnClickListener(v -> openAgent(open));
-            return line;
-        });
-        row.fold = key;
-        // A space with no project folds its terminals; a checkout of an opened project shows them.
-        row.foldedByDefault = FleetTree.foldedByDefault(project == null ? FleetTree.Fold.LOOSE_SPACE
-                : FleetTree.Fold.CHECKOUT, node.members.size(), tally[0] > 0);
-        for (FleetTree.AgentNode agent : node.agents) row.kids.add(agentTree(machine.host.id, agent, null));
-        return row;
+        sheet.show();
     }
 
-    /** A worktree no space has open: dim; a tap opens a shell space there. */
-    private Row closedRow(Machine machine, FleetTree.GitWorktree wt) {
-        String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
-        boolean busy = machine.opening.contains(wt.path);
-        return new Row((guide, self) -> {
-            View line = actionLine(guide, null, "○", busy ? name + " · opening…" : name, chrome.onSurfaceVariant,
-                    busy || !live(machine) ? null : () -> closedWorktreeActions(machine, wt, name));
-            line.setContentDescription("Worktree " + name + ", not open. Choose who works there.");
-            return line;
-        });
+    /** "Worktrees…" for one repo: its worktrees no terminal has open, a page at a time. */
+    private void showWorktrees(Machine machine, FleetTree.Project project, int pages) {
+        int total = project.closed.size();
+        ActionSheet sheet = new ActionSheet(this, chrome, project.name + " · " + total
+                + (total == 1 ? " worktree" : " worktrees") + " with no space"
+                + (project.closedIncomplete ? " (git's list was cut short)" : ""));
+        int shown = FleetTree.shownClosed(project, pages);
+        for (int i = 0; i < shown; i++) {
+            FleetTree.GitWorktree wt = project.closed.get(i);
+            String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
+            boolean busy = machine.opening.contains(wt.path);
+            sheet.add("○ " + name + (busy ? " · opening…" : ""), () -> {
+                if (!busy && live(machine)) closedWorktreeActions(machine, wt, name);
+            });
+        }
+        if (total > shown) sheet.add("+" + (total - shown) + " more", () -> showWorktrees(machine, project, pages + 1));
+        sheet.show();
     }
 
     private Row agentTree(String machineId, FleetTree.AgentNode node, String tagOverride) {
         Agent agent = (Agent) node.member;
         String key = machineId + "/a/" + agent.id;
-        Row row = new Row((guide, self) -> agentLine(guide, agent, tagOverride != null ? tagOverride : roleTag(agent), self));
+        Row row = new Row((guide, self) -> agentLine(guide, agent, tagOverride != null ? tagOverride : roleTag(agent),
+                self, null, node.where));
         row.fold = key;
         for (FleetTree.AgentNode kid : node.children) row.kids.add(agentTree(machineId, kid, null));
         return row;
@@ -1398,7 +1343,9 @@ public final class HomeActivity extends Activity {
         mark.setPadding(0, 0, dp(6), 0);
         mark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         line.addView(mark);
-        line.addView(single(text(words, 12, color)), new LinearLayout.LayoutParams(0, -2, 1));
+        TextView said = single(text(words, 12, color));
+        said.setTypeface(mono(false));
+        line.addView(said, new LinearLayout.LayoutParams(0, -2, 1));
         line.setContentDescription(words);
         if (action != null) line.setOnClickListener(v -> action.run());
         else line.setClickable(false);
@@ -1408,8 +1355,12 @@ public final class HomeActivity extends Activity {
     /** "Spaces", "Other agents": the whole row folds. */
     private View groupLine(String guide, Row fold, String words, String count) {
         LinearLayout line = treeLine(guide, fold);
-        line.addView(single(text(words, 11, chrome.primary)), new LinearLayout.LayoutParams(0, -2, 1));
-        line.addView(tag(count, chrome.onSurfaceVariant));
+        TextView name = single(text(words, 12, chrome.primary));
+        name.setTypeface(mono(false));
+        line.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView meta = tag(count, count.startsWith("!") ? chrome.danger : chrome.onSurfaceVariant);
+        meta.setTypeface(mono(false));
+        line.addView(meta);
         line.setContentDescription(words + ", " + count + (folded(fold) ? ", folded" : ""));
         line.setOnClickListener(v -> toggleFold(fold.fold, fold.foldedByDefault));
         return line;
@@ -1439,17 +1390,13 @@ public final class HomeActivity extends Activity {
      * One agent in the tree: guide, fold toggle when it has children, status
      * dot, title and, for the skill's agents or any agent that said something,
      * its status in words, for how long, and its latest message.
-     */
-    private View agentLine(String guide, Agent agent, String tag, Row fold) {
-        return agentLine(guide, agent, tag, fold, null);
-    }
-
-    /**
      * {@code heading}, when given (a project's name), leads the row and the
-     * agent's own title moves to the second line. An untitled terminal reads
-     * as its harness and folder; its id only ever sits on the second line.
+     * agent's own title moves to the second line, after {@code where} (its
+     * checkout: a worktree or branch, never a row of its own). An untitled
+     * terminal reads as its harness and folder; its id only ever sits on the
+     * second line.
      */
-    private View agentLine(String guide, Agent agent, String tag, Row fold, String heading) {
+    private View agentLine(String guide, Agent agent, String tag, Row fold, String heading, String where) {
         LinearLayout row = treeLine(guide, fold);
         row.addView(dot(statusColor(agent.status)));
         LinearLayout lines = column();
@@ -1457,11 +1404,12 @@ public final class HomeActivity extends Activity {
                 || tag.startsWith("deacon") || tag.startsWith("pm");
         boolean untitled = agent.title.isEmpty() || RailTree.isTerminalId(agent.title);
         String shown = heading != null ? heading : FleetPanes.displayTitle(agent);
-        TextView title = single(text(shown, lead ? 13 : 12, chrome.onSurface));
-        if (lead) title.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView title = single(text(shown, 13, chrome.onSurface));
+        title.setTypeface(mono(lead));
         lines.addView(title);
         List<String> second = new ArrayList<>();
-        if (heading != null && !untitled) second.add(agent.title);
+        if (!where.isEmpty()) second.add(where);
+        if (heading != null && !untitled && where.isEmpty()) second.add(agent.title);
         String state = detail(agent);
         if (!state.isEmpty()) second.add(state);
         if (untitled) second.add(agent.id);
@@ -1471,10 +1419,18 @@ public final class HomeActivity extends Activity {
         TextView sub = single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
                 : chrome.onSurfaceVariant));
         sub.setPadding(0, dp(1), 0, 0);
+        sub.setTypeface(mono(false));
         lines.addView(sub);
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
-        if (!tag.isEmpty()) row.addView(tag(tag, "deacon".equals(tag) ? chrome.primary : chrome.onSurfaceVariant));
-        row.setContentDescription(shown + (heading != null && !untitled ? ", " + agent.title : "") + ", "
+        if (!tag.isEmpty()) {
+            // Blocked work folded under a Deacon or PM row turns its tag red ("1!", "!").
+            TextView badge = tag(tag, tag.contains("!") ? chrome.danger
+                    : "deacon".equals(tag) ? chrome.primary : chrome.onSurfaceVariant);
+            badge.setTypeface(mono(false));
+            row.addView(badge);
+        }
+        row.setContentDescription(shown + (where.isEmpty() ? "" : ", " + where)
+                + (heading != null && !untitled ? ", " + agent.title : "") + ", "
                 + statusWord(agent.status, agent.waitKind)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
@@ -1483,7 +1439,13 @@ public final class HomeActivity extends Activity {
     }
 
     private void agentActions(Agent agent) {
+        agentActions(agent, null, java.util.Collections.emptyList());
+    }
+
+    /** A PM's menu also offers the unopened-worktree catalogs its row holds. */
+    private void agentActions(Agent agent, Machine machine, List<FleetTree.Project> catalogs) {
         ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent)).add("Open", () -> openAgent(agent));
+        if (machine != null && !catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, catalogs));
         if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
         if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
         sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
@@ -2133,6 +2095,11 @@ public final class HomeActivity extends Activity {
         mask.setCornerRadius(dp(6));
         return new android.graphics.drawable.RippleDrawable(
                 android.content.res.ColorStateList.valueOf(chrome.selected), null, mask);
+    }
+
+    /** The sidebar's chrome face, as the rail's: monospace; medium is the only emphasis. */
+    private static Typeface mono(boolean medium) {
+        return Typeface.create(Typeface.MONOSPACE, medium ? 500 : 400, false);
     }
 
     private TextView text(String value, float size, int color) {
