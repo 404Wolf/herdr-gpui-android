@@ -27,4 +27,10 @@ public final class DraftChipsTest {
         assertEquals("0:12 waiting for desktop", DraftChips.label(12_400L));
         assertEquals("waiting for desktop", DraftChips.label(null));
     }
+
+    @Test public void aRecordingsClockIsMinutesAndSeconds() {
+        assertEquals("1:05", DraftChips.clock(65_000));
+        assertEquals("0:00", DraftChips.clock(-5));
+        assertEquals("10:00", DraftChips.clock(600_000));
+    }
 }

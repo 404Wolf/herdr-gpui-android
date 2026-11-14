@@ -35,7 +35,7 @@ final class GhostText {
 
         static Colors of(GpuiChrome chrome) {
             return new Colors(chrome.onSurfaceVariant,
-                    MicButton.mix(chrome.background, chrome.onSurfaceVariant, 0.55f),
+                    GpuiChrome.mix(chrome.background, chrome.onSurfaceVariant, 0.55f),
                     chrome.warning, chrome.background, chrome.onSurface, chrome.danger, chrome.info);
         }
     }

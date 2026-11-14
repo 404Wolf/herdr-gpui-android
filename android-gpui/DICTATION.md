@@ -1,6 +1,8 @@
 # Dictation
 
-The composer's microphone dictates text: tap to start, tap again to stop.
+The **talk** control drawn in an agent's prompt box (`type ─ talk ─ send`)
+dictates text: tap to start, tap it again (it reads `● rec 0:05 · tap to stop`,
+or `● 0:05 stop` on a narrow screen) to stop.
 Silence never ends a session. Speech is always transcribed on the desktop's
 Whisper; the phone never guesses at it with a weaker model.
 

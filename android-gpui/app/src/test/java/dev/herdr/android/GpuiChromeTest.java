@@ -35,4 +35,9 @@ public final class GpuiChromeTest {
         assertEquals(0x29123456, GpuiChrome.withAlpha(0xff123456, 0x29));
         assertEquals(0x00abcdef, GpuiChrome.withAlpha(0x80abcdef, 0));
     }
+
+    @Test public void mixTintsTheSurfaceOpaquely() {
+        assertEquals(0xff000000, GpuiChrome.mix(0xff000000, 0xffF07178, 0f));
+        assertEquals(0xff261213, GpuiChrome.mix(0xff000000, 0xffF07178, 0.16f));
+    }
 }

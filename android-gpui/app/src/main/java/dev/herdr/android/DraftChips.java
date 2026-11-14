@@ -58,7 +58,7 @@ final class DraftChips {
     /** The words on a chip. */
     static String label(Long durationMs) {
         return durationMs == null ? "waiting for desktop"
-                : MicButton.clock(durationMs) + " waiting for desktop";
+                : clock(durationMs) + " waiting for desktop";
     }
 
     /** Puts a chip over every token in {@code text}, replacing the old ones. */
@@ -126,5 +126,11 @@ final class DraftChips {
             paint.setStyle(paintStyle);
             paint.setStrokeWidth(stroke);
         }
+    }
+
+    /** m:ss, the clock a recording shows. */
+    static String clock(long elapsedMs) {
+        long seconds = Math.max(0, elapsedMs) / 1000;
+        return String.format(java.util.Locale.ROOT, "%d:%02d", seconds / 60, seconds % 60);
     }
 }

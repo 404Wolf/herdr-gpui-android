@@ -36,9 +36,11 @@ import java.util.List;
  * What is spoken or typed is drawn as ghost text at the agent's own prompt
  * caret by the renderer ({@link GhostText}), and reaches the agent only on
  * Enter, as one bracketed paste plus Enter (through the outbox when the link
- * is down). A typing box exists only while the keyboard is up. The terminal
- * keys open over the terminal, above the prompt, on a swipe up or a long press
- * on "send".
+ * is down). There is no typing box: while the keyboard is up it types into an
+ * invisible field only it sees ({@link #field}), and the typed words are drawn
+ * at the prompt like dictated ones, the caret at their end. The terminal keys
+ * open over the terminal, above the prompt, on a swipe up or a long press on
+ * "send".
  *
  * <p>A plain shell keeps a bar: its pinned controls, its keys and Enter, and
  * raw typing.
@@ -83,8 +85,6 @@ final class ComposerBar {
     private static final String DRAFTS = "composer_drafts";
     private static final long SAVE_DRAFTS_MS = 400;
     private static final int MAX_LINES = 6;
-    /** The mic's height in the typing box, in dp. */
-    private static final int MIC_SIZE = 36;
     private static final java.util.Set<String> SHELLS = new java.util.HashSet<>(java.util.Arrays.asList(
             "shell", "sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh", "csh"));
 
@@ -95,14 +95,11 @@ final class ComposerBar {
     private final ComposerDrafts drafts = new ComposerDrafts();
     private final float density;
 
-    /** The typing box: present only while the keyboard is up. */
+    /**
+     * What the keyboard types into while it is up: invisible and one pixel
+     * high, never seen or touched. Its text is the draft, drawn as ghost text.
+     */
     private final EditText field;
-    /** What the activity floats at the terminal's bottom: the box with its mic and send. */
-    private final PullDownRow stack;
-    /** In the box: closes the keyboard (and the box); the draft stays as ghost text. */
-    private final android.widget.TextView hide;
-    private final ImageView send;
-    private final MicButton mic;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
     /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
@@ -130,7 +127,7 @@ final class ComposerBar {
     /** The pane's program kind: "claude", "codex", another agent's, or "" for a shell. */
     private String kind = "";
     private boolean agent;
-    /** The typing box is open (the keyboard was asked for). */
+    /** The keyboard was asked for: it types into {@link #field}. */
     private boolean typing;
     /** The keyboard has shown since typing began, so its hiding ends typing. */
     private boolean imeShown;
@@ -155,36 +152,8 @@ final class ComposerBar {
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         drafts.restore(preferences.getString(DRAFTS, ""));
-        mic = new MicButton(context, chrome, v -> toggleDictation(), MIC_SIZE, host::notice);
         field = createField();
-        send = new ImageView(context);
-        send.setImageResource(R.drawable.ic_bar_enter);
-        send.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-        send.setPadding(dp(8), dp(8), dp(8), dp(8));
-        send.setContentDescription("Send");
-        send.setOnClickListener(v -> enter());
-        stack = new PullDownRow(context);
-        stack.setOrientation(LinearLayout.HORIZONTAL);
-        // A swipe down on the box puts the keyboard away, as chat apps do.
-        stack.setOnPull(this::hideKeyboard);
-        hide = new android.widget.TextView(context);
-        hide.setText("hide ▾");
-        hide.setTextSize(13);
-        hide.setTypeface(android.graphics.Typeface.MONOSPACE);
-        hide.setGravity(Gravity.CENTER);
-        hide.setMinWidth(dp(48));
-        hide.setPadding(dp(4), 0, dp(6), 0);
-        hide.setContentDescription("Hide the keyboard");
-        hide.setOnClickListener(v -> hideKeyboard());
-        stack.addView(hide, new LinearLayout.LayoutParams(-2, dp(48)));
-        stack.setGravity(Gravity.BOTTOM);
-        stack.setPadding(dp(6), dp(4), dp(6), dp(4));
-        stack.addView(field, new LinearLayout.LayoutParams(0, -2, 1));
-        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(40), dp(40));
-        sendParams.setMarginStart(dp(4));
-        sendParams.bottomMargin = dp(4);
-        stack.addView(send, sendParams);
-        stack.setVisibility(View.GONE);
+        field.setVisibility(View.GONE);
         targets = new TargetStrip(context);
         targets.setVisibility(View.GONE);
         keysOverlay = new KeysOverlay(context);
@@ -209,8 +178,14 @@ final class ComposerBar {
         style(chrome);
     }
 
-    /** The typing box, floated at the bottom of the terminal's frame (over the keyboard). */
-    View field() { return stack; }
+    /**
+     * The keyboard's invisible field; the activity adds it to the frame over
+     * the terminal, one pixel high ({@link #FIELD_HEIGHT_PX}) at its bottom.
+     */
+    View field() { return field; }
+
+    /** The field's height: one pixel row, so it never takes a touch meant for the terminal. */
+    static final int FIELD_HEIGHT_PX = 1;
 
     /** The terminal keys' overlay; the activity adds it to the frame over the terminal. */
     View keysOverlay() { return keysOverlay; }
@@ -223,10 +198,9 @@ final class ComposerBar {
         return kind != null && !kind.isEmpty() && !SHELLS.contains(kind);
     }
 
-    /** Recordings waiting for the desktop, counted on the mic; their lengths label their chips. */
+    /** Recordings waiting for the desktop, counted after "talk"; their lengths label their chips. */
     void setWaiting(int count) {
         for (PendingClip clip : Dictation.pending(context).waiting()) clipLengths.put(clip.id, clip.durationMs);
-        mic.setWaiting(count);
         waiting = Math.max(0, count);
         DraftChips.apply(field.getText(), chip());
         lastGhost = "";
@@ -348,8 +322,9 @@ final class ComposerBar {
     }
 
     /**
-     * A tap on the terminal. On an agent's pane it opens the typing box (true);
-     * elsewhere the terminal's own keyboard is the caller's to show (false).
+     * A tap on the terminal. On an agent's pane it opens the keyboard into the
+     * draft (true); elsewhere the terminal's own keyboard is the caller's to
+     * show (false).
      */
     boolean terminalTapped() {
         if (!agent) return false;
@@ -364,7 +339,7 @@ final class ComposerBar {
         apply();
     }
 
-    /** The keyboard showed or hid; hiding it closes the typing box, the text stays as ghost text. */
+    /** The keyboard showed or hid; hiding it ends typing, the text stays as ghost text. */
     void imeVisible(boolean visible) {
         if (visible) {
             if (typing) imeShown = true;
@@ -373,14 +348,13 @@ final class ComposerBar {
         if (typing && imeShown) stopTyping();
     }
 
-    /** Physical keys go to the box, not the terminal, while it is being typed in. */
+    /** Physical keys go to the draft, not the terminal, while typing. */
     boolean ownsKeys() {
         return typing && field.hasFocus();
     }
 
     void destroy() {
         dictation.cancel();
-        mic.destroy();
         persist();
         host.setGhost("");
     }
@@ -413,23 +387,7 @@ final class ComposerBar {
 
     private void style(GpuiChrome next) {
         chrome = next;
-        mic.style(chrome);
-        field.setTextColor(chrome.onSurface);
-        field.setHintTextColor(chrome.onSurfaceVariant);
-        GradientDrawable box = new GradientDrawable();
-        box.setColor(chrome.control);
-        box.setStroke(Math.max(1, dp(1)), chrome.outline);
-        box.setCornerRadius(dp(10));
-        field.setBackground(new android.graphics.drawable.InsetDrawable(box, 0, dp(4), 0, dp(4)));
-        field.setPadding(dp(10), dp(8), dp(10), dp(8));
-        stack.setBackgroundColor(chrome.surface);
-        send.setImageTintList(ColorStateList.valueOf(chrome.onSurface));
-        GradientDrawable round = new GradientDrawable();
-        round.setShape(GradientDrawable.OVAL);
-        round.setColor(chrome.control);
-        send.setBackground(round);
         keysOverlay.setBackgroundColor(chrome.surface);
-        hide.setTextColor(chrome.onSurfaceVariant);
         GradientDrawable label = new GradientDrawable();
         label.setColor(chrome.surface);
         label.setStroke(Math.max(1, dp(1)), chrome.outline);
@@ -446,11 +404,11 @@ final class ComposerBar {
         if (!typing) {
             typing = true;
             imeShown = false;
-            // The box shows the draft now; the ghost would only repeat it.
+            // The keyboard edits the draft from its end, where the ghost caret is.
             showText(drafts.text());
             apply();
         }
-        // After the box is laid out: a just-shown field cannot take focus or
+        // After the field is laid out: a just-shown field cannot take focus or
         // the keyboard in the same frame, and SHOW_IMPLICIT may be ignored.
         field.post(() -> {
             if (!typing) return;
@@ -465,8 +423,8 @@ final class ComposerBar {
     }
 
     /**
-     * Puts the keyboard and its box away; the draft stays as ghost text at the
-     * prompt. False when they were not up (Back then does its usual thing).
+     * Puts the keyboard away; the draft stays as ghost text at the prompt.
+     * False when it was not up (Back then does its usual thing).
      */
     boolean hideKeyboard() {
         if (!typing) return false;
@@ -477,14 +435,14 @@ final class ComposerBar {
         return true;
     }
 
-    /** Whether the typing box (and its keyboard) is up. */
+    /** Whether the keyboard is up, typing into the draft. */
     boolean typing() { return typing; }
 
     /** Our own Shift+Enter newline is being inserted: it is not a typed Enter. */
     private boolean insertingNewline;
 
     /**
-     * An Enter key while the box is up, wherever focus is: HeliBoard sends one
+     * An Enter key while typing, wherever focus is: HeliBoard sends one
      * (not an editor action) in apps it treats as terminals, and it must never
      * reach the terminal instead. Enter sends (one loop later, so text the
      * keyboard committed just before it lands first); Shift+Enter is a new
@@ -548,20 +506,7 @@ final class ComposerBar {
             }
         }
         keysOverlay.setVisibility(agent && keysOpen && !covered ? View.VISIBLE : View.GONE);
-        boolean dictates = agent && dictation.isAvailable();
-        mic.view().setVisibility(dictates ? View.VISIBLE : View.GONE);
-        if (typing) {
-            if (mic.view().getParent() != stack) {
-                detach(mic.view());
-                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
-                params.setMarginStart(dp(4));
-                params.bottomMargin = dp(6);
-                stack.addView(mic.view(), 1, params);
-            }
-        } else {
-            detach(mic.view());
-        }
-        stack.setVisibility(agent && typing ? View.VISIBLE : View.GONE);
+        field.setVisibility(agent && typing ? View.VISIBLE : View.GONE);
         if (!agent || covered) targets.setVisibility(View.GONE);
         place();
         pushGhost();
@@ -582,8 +527,7 @@ final class ComposerBar {
         surface.getLocationInWindow(at);
         frame.getLocationInWindow(origin);
         float left = at[0] - origin[0], top = at[1] - origin[1];
-        // While typing the box lies over the prompt; where it does not, the
-        // rule's "hide" still works.
+        // While typing too: "type" reads "hide", and "talk" and "send" work.
         boolean showing = agent && !covered;
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
@@ -684,8 +628,7 @@ final class ComposerBar {
     /** The draft beside the controls when the renderer could not draw it (no prompt, no room). */
     private void placeFallback(ViewGroup frame, FrameLayout.LayoutParams nearAt, int nearWidth) {
         String draft = drafts.text();
-        boolean show = nearAt != null && layout != null && !layout.draftShown && !typing
-                && !draft.trim().isEmpty();
+        boolean show = nearAt != null && layout != null && !layout.draftShown && !draft.trim().isEmpty();
         if (!show) {
             fallback.setVisibility(View.GONE);
             return;
@@ -799,7 +742,7 @@ final class ComposerBar {
     /** "talk", or what the dictation is doing, as TUI-style words. */
     private GhostText.Control talk(Words words) {
         long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
-        String clock = MicButton.clock(elapsed);
+        String clock = DraftChips.clock(elapsed);
         switch (dictationState) {
             case CONNECTING:
                 return new GhostText.Control("talk", words == Words.TINY ? "…" : "connecting…", "info");
@@ -833,30 +776,91 @@ final class ComposerBar {
     private void pushGhost() {
         String json = "";
         if (agent) {
-            json = GhostText.json(GhostText.kind(kind), typing ? "" : drafts.text(),
-                    typing ? -1 : drafts.partialFrom(), clipLengths, queuedMessages, drafts.pane(),
-                    controls(), GhostText.Colors.of(chrome));
+            // While typing, the keyboard's underlined word reads as the
+            // revisable tail, as an engine's partial words do.
+            int partialFrom = drafts.partialFrom();
+            if (partialFrom < 0 && typing) {
+                // Against the draft's length: a field out of step marks nothing.
+                Editable typed = field.getText();
+                partialFrom = composingFrom(drafts.text().length(), BaseInputConnection.getComposingSpanStart(typed),
+                        BaseInputConnection.getComposingSpanEnd(typed));
+            }
+            json = GhostText.json(GhostText.kind(kind), drafts.text(), partialFrom, clipLengths,
+                    queuedMessages, drafts.pane(), controls(), GhostText.Colors.of(chrome));
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;
         host.setGhost(json);
     }
 
+    /**
+     * Where the keyboard's underlined (composing) word starts in a typed draft
+     * of {@code length} characters, when it is the draft's tail; else -1. The
+     * renderer only draws a revisable tail, and the caret is at the end.
+     */
+    static int composingFrom(int length, int start, int end) {
+        return start >= 0 && start < end && end == length ? start : -1;
+    }
+
+    /**
+     * Whether a selection {@code start..end} in a typed draft of
+     * {@code length} characters must go back to the end: the ghost caret is
+     * drawn only there, so a cursor anywhere else would take typing to a
+     * place nobody can see. A negative start means no selection.
+     */
+    static boolean keepsAtEnd(int start, int end, int length) {
+        return start >= 0 && (start != length || end != length);
+    }
+
+    /** Keys that would move the hidden cursor; while typing they do nothing. */
+    static boolean movesCursor(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+            case KeyEvent.KEYCODE_DPAD_UP:
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_MOVE_HOME:
+            case KeyEvent.KEYCODE_MOVE_END:
+            case KeyEvent.KEYCODE_PAGE_UP:
+            case KeyEvent.KEYCODE_PAGE_DOWN:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private EditText createField() {
-        EditText edit = new EditText(context);
+        // The cursor never leaves the end, whoever moves it (arrow keys, a
+        // keyboard's spacebar swipe or its own setSelection): the ghost caret
+        // is drawn at the end of the draft, and typing must land where it is.
+        EditText edit = new EditText(context) {
+            @Override protected void onSelectionChanged(int start, int end) {
+                super.onSelectionChanged(start, end);
+                if (keepsAtEnd(start, end, length())) setSelection(length());
+            }
+        };
         edit.setSaveEnabled(false);
         edit.setTextSize(14);
         edit.setHint("Message");
-        edit.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
-        // Single-line input type so the keyboard's action key sends; it still
-        // wraps and grows to MAX_LINES. Shift+Enter on a hardware keyboard and
-        // pasted text keep their line breaks.
+        // Never seen: the keyboard's target only. The draft is drawn as ghost
+        // text at the agent's prompt, so nothing non-native shows.
+        edit.setAlpha(0f);
+        edit.setBackground(null);
+        edit.setPadding(0, 0, 0, 0);
+        edit.setCursorVisible(false);
+        edit.setLongClickable(false);
+        edit.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        edit.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        // Single-line input type so the keyboard's action key sends; the text
+        // still keeps line breaks from Shift+Enter on a hardware keyboard and
+        // from pasted text.
         edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
                 | InputType.TYPE_TEXT_FLAG_AUTO_CORRECT);
         edit.setHorizontallyScrolling(false);
         edit.setMaxLines(MAX_LINES);
-        edit.setMinHeight(dp(48));
-        edit.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        // No full-screen extract box in landscape either: that would be a typing box again.
+        edit.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | EditorInfo.IME_FLAG_NO_FULLSCREEN);
         // Every way a keyboard says "send" ends in enter(), the app's own send
         // (EnterPaths): its action key, an Enter key event, a typed newline.
         edit.setOnEditorActionListener((view, action, event) -> {
@@ -867,7 +871,7 @@ final class ComposerBar {
             enter();
             return true;
         });
-        edit.setOnKeyListener((view, code, event) -> enterKey(event));
+        edit.setOnKeyListener((view, code, event) -> movesCursor(code) || enterKey(event));
         edit.addTextChangedListener(new TextWatcher() {
             private int changeStart, changeBefore, changeCount;
 
@@ -900,9 +904,17 @@ final class ComposerBar {
                 DraftChips.apply(s, chip());
                 drafts.edit(text);
                 saveDraftsSoon();
+                // What was typed shows at the prompt as it is typed.
+                pushGhost();
             }
         });
         return edit;
+    }
+
+    /** The microphone is open: the clock runs, and "talk" stops it. */
+    static boolean recording(DictationEngine.State s) {
+        return s == DictationEngine.State.CONNECTING || s == DictationEngine.State.LISTENING
+                || s == DictationEngine.State.OFFLINE_RECORDING;
     }
 
     /** A session runs: IDLE and PENDING both mean none does. */
@@ -911,10 +923,9 @@ final class ComposerBar {
     }
 
     private void setDictationState(DictationEngine.State state) {
-        boolean wasRecording = MicButton.recording(dictationState);
+        boolean wasRecording = recording(dictationState);
         dictationState = state;
-        mic.setState(state);
-        boolean recording = MicButton.recording(state);
+        boolean recording = recording(state);
         if (recording && !wasRecording) recordingSince = android.os.SystemClock.elapsedRealtime();
         if (!recording) recordingSince = 0;
         // The clock in the controls ticks while the microphone is open.
@@ -923,9 +934,9 @@ final class ComposerBar {
         pushGhost();
     }
 
-    /** The mic's one tap: start, or stop what is recording. Transcribing ignores it. */
+    /** The "talk" control's one tap: start, or stop what is recording. Transcribing ignores it. */
     private void toggleDictation() {
-        if (MicButton.recording(dictationState)) {
+        if (recording(dictationState)) {
             dictation.stop();
             return;
         }
@@ -989,7 +1000,7 @@ final class ComposerBar {
      * queue it as one paste plus Enter; otherwise Enter goes to the program.
      */
     private void enter() {
-        if (MicButton.recording(dictationState)) {
+        if (recording(dictationState)) {
             sendWhenFinal = true;
             dictation.stop();
             return;
@@ -1016,7 +1027,7 @@ final class ComposerBar {
         showText("");
     }
 
-    /** The draft changed under us (dictation, a pane switch): the box and the ghost follow. */
+    /** The draft changed under us (dictation, a pane switch): the field and the ghost follow. */
     private void showText(String text) {
         saveDraftsSoon();
         if (!field.getText().toString().equals(text)) {
@@ -1033,7 +1044,7 @@ final class ComposerBar {
         if (layout != null && !layout.anchored) place();
     }
 
-    /** How a waiting dictation's token reads in the box. */
+    /** How a waiting dictation's token reads in the field and the fallback. */
     private DraftChips.Style chip() {
         return new DraftChips.Style(chrome.warning, density, clipLengths,
                 context.getDrawable(R.drawable.ic_bar_schedule));
