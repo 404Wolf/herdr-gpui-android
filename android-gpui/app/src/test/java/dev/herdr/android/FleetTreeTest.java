@@ -47,6 +47,12 @@ public final class FleetTreeTest {
         return out;
     }
 
+    private static List<String> pmNames(FleetTree.PmTree tree) {
+        List<String> out = new ArrayList<>();
+        for (FleetTree.PmRow row : tree.pms) out.add(row.name());
+        return out;
+    }
+
     private static List<String> agentIds(FleetTree.SpaceNode node) {
         List<String> out = new ArrayList<>();
         for (FleetTree.AgentNode a : node.agents) out.add(a.member.id);
@@ -115,7 +121,7 @@ public final class FleetTreeTest {
         FleetTree.Member workerA = label(m("t11", "sa", "alpha", 1, 1, "/a", "working"), "worker", "alpha");
         workerA.parent = "t10";
         FleetTree.Member pmB = label(m("t20", "sb", "beta", 2, 0, "/b", "idle"), "pm", "beta");
-        // Blocked work stays folded too: Needs you, on the Deacon card, is where it surfaces.
+        // Blocked work stays folded too: its PM row says so with a red "!".
         FleetTree.Member workerB = label(m("t21", "sb2", "beta-wt", 3, 0, "/b-wt", "blocked"), "worker", "beta");
         FleetTree.Member shell = m("t30", "sl", "scratch", 4, 0, "/tmp", "");
         FleetTree.Member stray = m("t40", "", "", 9, 0, "/x", "working");
@@ -128,21 +134,20 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("t40"), ids(fleet.others));
         assertEquals(Arrays.asList("t30"), ids(fleet.loose.get(0).members));
         assertEquals(Arrays.asList("t11"), ids(project(fleet, "alpha").entries.get(0).members));
-        assertEquals(Arrays.asList("t21"), ids(FleetTree.needsYou(fleet)));
+        FleetTree.PmTree tree = FleetTree.pmTree(fleet);
+        assertEquals(Arrays.asList("alpha", "beta"), pmNames(tree));
+        assertFalse(tree.pms.get(0).blocked());
+        assertTrue(tree.pms.get(1).blocked());
+        assertEquals(Arrays.asList("t21"), ids(FleetTree.flatten(tree.pms.get(1).workers)));
+        assertEquals(Arrays.asList("t30", "t40"), ids(tree.otherMembers));
     }
 
-    @Test public void onlyRepoHeadingsAndSubAgentsStartOpen() {
-        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.REPO, 3, false));
-        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.AGENT, 1, false));
+    @Test public void onlySubAgentsStartOpen() {
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.AGENT));
         for (FleetTree.Fold fold : new FleetTree.Fold[] {FleetTree.Fold.DEACON, FleetTree.Fold.PROJECT,
-                FleetTree.Fold.OUTSIDE, FleetTree.Fold.LOOSE_SPACE, FleetTree.Fold.UNOPENED, FleetTree.Fold.OTHERS}) {
-            assertTrue(fold.name(), FleetTree.foldedByDefault(fold, 1, false));
-            assertTrue(fold.name(), FleetTree.foldedByDefault(fold, 1, true));
+                FleetTree.Fold.OTHERS}) {
+            assertTrue(fold.name(), FleetTree.foldedByDefault(fold));
         }
-        // Inside an opened project, a checkout shows its agents unless it is crowded and calm.
-        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.CHECKOUT, 6, false));
-        assertTrue(FleetTree.foldedByDefault(FleetTree.Fold.CHECKOUT, 7, false));
-        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.CHECKOUT, 7, true));
     }
 
     @Test public void withNoDeaconTheSidebarAtRestIsJustThePms() {
@@ -590,16 +595,22 @@ public final class FleetTreeTest {
             assertTrue(row.worktree);
             assertEquals("smoke-marker", row.name);
             assertEquals(Arrays.asList("t6x"), agentIds(row));
-            // Not flattened under the PM: the "⑂ smoke-marker" row is drawn.
-            assertFalse(FleetTree.flat(p));
             assertTrue(p.closed.isEmpty() || !closedPaths(p).contains(row.key));
+            // No worktree row in the sidebar: the worktree is the worker's second line.
+            FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker), git));
+            assertEquals(1, tree.pms.size());
+            assertEquals("t6x", tree.pms.get(0).workers.get(0).member.id);
+            assertEquals("⑂ smoke-marker", tree.pms.get(0).workers.get(0).where);
         }
-        // A worker in the PM's own checkout is still drawn flat under the PM.
+        // The PM's own checkout is its row's second line; a worker beside it says the same.
         FleetTree.Member beside = label(m("t7", "sp9", "herdr-flow-smoke", 0, 2, "/tmp/smoke", "idle"), "worker", "herdr-flow-smoke");
-        assertTrue(FleetTree.flat(FleetTree.build(Arrays.asList(pm, beside), fresh).projects.get(0)));
+        FleetTree.PmRow row = FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker, beside), fresh)).pms.get(0);
+        assertEquals("smoke · main", row.where);
+        assertEquals(Arrays.asList("⑂ smoke-marker", "smoke · main"),
+                Arrays.asList(row.workers.get(0).where, row.workers.get(1).where));
     }
 
-    @Test public void reposGroupTheirProjectsAndOutsideGitComesLast() {
+    @Test public void theSidebarHasNoRepoRowsOnlyPmsByNameWithTheirCheckoutBelow() {
         FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
         FleetTree.Member hm = label(m("t67", "hm", "home-manager", 1, 0, "/c/hm", "working"), "pm", "home-manager");
         FleetTree.Member hypr = label(m("t4m", "hy", "hypr2d", 2, 0, "/wt/hypr", "idle"), "pm", "hypr2d");
@@ -612,35 +623,120 @@ public final class FleetTreeTest {
                 {"/c/hm/sub", "/c/hm/.git", "/c/hm", "main"}, {"/c"}, {"/tmp/x"}},
                 "/c/hm/.git", "/c/hm=main", "/wt/hypr=hypr", "/wt/idle=idle"), 200);
         FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(deacon, hm, hypr, botd, stray, kept), git);
-        List<FleetTree.RepoGroup> groups = FleetTree.repoGroups(fleet);
-        assertEquals(3, groups.size());
-        FleetTree.RepoGroup repo = groups.get(0);
-        assertEquals("hm", repo.name);
-        assertEquals(2, repo.pms());
-        assertEquals(Arrays.asList("home-manager", "hypr2d"), Arrays.asList(repo.projects.get(0).name, repo.projects.get(1).name));
-        // Unopened worktrees: ONE owner per repo.
-        assertEquals(Arrays.asList("/wt/idle"), closedPaths(repo.owner));
-        // botd's PM is explicitly labelled but outside git: its own heading, not Outside git.
-        FleetTree.RepoGroup noGit = groups.get(1);
-        assertTrue(noGit.noGit());
-        assertEquals("botd · no git", noGit.name);
-        assertEquals("botd", noGit.projects.get(0).name);
-        FleetTree.RepoGroup outside = groups.get(2);
-        assertTrue(outside.outside());
-        assertTrue(outside.projects.isEmpty());
-        assertEquals(1, outside.loose.size());
-        assertEquals("t9", outside.loose.get(0).members.get(0).id);
-        // Needs you: the blocked PM, by its own status.
-        assertEquals(Arrays.asList("t5t"), ids(FleetTree.needsYou(fleet)));
+        FleetTree.PmTree tree = FleetTree.pmTree(fleet);
+        assertSame(deacon, tree.deacon);
+        // One row per PM, by project name; the repo (or worktree) is the PM's second line.
+        assertEquals(Arrays.asList("botd", "home-manager", "hypr2d"), pmNames(tree));
+        assertEquals(Arrays.asList("c", "hm · main", "⑂ hypr"),
+                Arrays.asList(tree.pms.get(0).where, tree.pms.get(1).where, tree.pms.get(2).where));
+        // Blocked is on the row itself (botd's PM), not in a separate list.
+        assertTrue(tree.pms.get(0).blocked());
+        assertFalse(tree.pms.get(1).blocked());
+        // The repo's unopened worktrees stay with ONE owner (offered from its PM's menu).
+        assertEquals(Arrays.asList("/wt/idle"), closedPaths(tree.pms.get(1).project));
+        assertTrue(tree.pms.get(2).project.closed.isEmpty());
+        // Loose shells are kept, under Other terminals.
+        assertEquals(Arrays.asList("t9", "t8"), ids(tree.otherMembers));
+        assertFalse(tree.othersBlocked());
     }
 
-    @Test public void needsYouListsTheDeaconFirstThenPmsThenTheRest() {
-        FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "blocked"), "deacon", "");
-        FleetTree.Member worker = label(m("t1", "a", "app", 1, 1, "/w/app", "blocked"), "worker", "app");
-        FleetTree.Member pm = label(m("t2", "a", "app", 1, 0, "/w/app", "blocked"), "pm", "app");
-        FleetTree.Member idle = label(m("t4", "a", "app", 1, 2, "/w/app", "idle"), "worker", "app");
-        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(worker, idle, pm, deacon), null);
-        assertEquals(Arrays.asList("t3", "t2", "t1"), ids(FleetTree.needsYou(fleet)));
+    @Test public void blockedWorkBubblesToItsPmAndTheDeacon() {
+        FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member helper = m("t5", "d", "deacon", 0, 1, "/h", "blocked");
+        FleetTree.Member worker = label(m("t1", "a", "app", 1, 1, "/w/app", "error"), "worker", "app");
+        FleetTree.Member pm = label(m("t2", "a", "app", 1, 0, "/w/app", "idle"), "pm", "app");
+        FleetTree.Member idle = label(m("t4", "b", "web", 2, 0, "/w/web", "idle"), "pm", "web");
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(worker, idle, pm, deacon, helper), null));
+        assertTrue(tree.deaconBlocked());
+        assertEquals(Arrays.asList("app", "web"), pmNames(tree));
+        assertTrue(tree.pms.get(0).blocked());
+        assertFalse(tree.pms.get(1).blocked());
+        assertTrue(FleetTree.blocked(worker));
+        assertFalse(FleetTree.blocked(pm));
+    }
+
+    @Test public void workersNestUnderTheirPmByParentAcrossCheckouts() {
+        FleetTree.Member pm = label(m("t1", "a", "app", 0, 0, "/w/app", "idle"), "pm", "app");
+        FleetTree.Member fix = label(m("t2", "b", "fix", 1, 0, "/h/.herdr/worktrees/app/fix", "working"), "worker", "app");
+        fix.parent = "t1";
+        // A sub-agent of that worker, in yet another space: one step deeper, not a sibling.
+        FleetTree.Member sub = m("t3", "c", "sub", 2, 0, "/h/.herdr/worktrees/app/fix-sub", "working");
+        sub.parent = "t2";
+        FleetTree.Member loose = label(m("t4", "a", "app", 0, 1, "/w/app", "idle"), "worker", "app");
+        // A parent loop never hides anyone.
+        FleetTree.Member x = label(m("t5", "a", "app", 0, 2, "/w/app", "idle"), "worker", "app");
+        FleetTree.Member y = label(m("t6", "a", "app", 0, 3, "/w/app", "idle"), "worker", "app");
+        x.parent = "t6";
+        y.parent = "t5";
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(y, x, loose, sub, fix, pm), null));
+        assertEquals(1, tree.pms.size());
+        FleetTree.PmRow row = tree.pms.get(0);
+        assertSame(pm, row.pm);
+        List<String> roots = new ArrayList<>();
+        for (FleetTree.AgentNode node : row.workers) roots.add(node.member.id);
+        assertEquals(Arrays.asList("t4", "t5", "t6", "t2"), roots);
+        FleetTree.AgentNode fixNode = row.workers.get(3);
+        assertEquals("⑂ fix", fixNode.where);
+        assertEquals(Arrays.asList("t3"), Collections.singletonList(fixNode.children.get(0).member.id));
+        assertEquals("⑂ fix-sub", fixNode.children.get(0).where);
+        assertTrue(tree.others.isEmpty());
+    }
+
+    @Test public void onlyLabelledProjectsLeadARowAndEveryTerminalIsShownOnce() {
+        FleetTree.Member deacon = label(m("t1", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member helper = m("t2", "d", "deacon", 0, 1, "/h", "working");
+        FleetTree.Member pm = label(m("t10", "a", "Zeta", 1, 0, "/w/zeta", "idle"), "pm", "Zeta");
+        FleetTree.Member worker = label(m("t11", "a", "Zeta", 1, 1, "/w/zeta", "working"), "worker", "Zeta");
+        // Labelled workers whose PM is gone keep their project's row ("no PM").
+        FleetTree.Member orphan = label(m("t20", "b", "alpha", 2, 0, "/w/alpha", "working"), "worker", "alpha");
+        // An unlabelled agent in its own repo is not a PM: it goes under Other terminals.
+        FleetTree.Member unlabelled = m("t30", "c", "notes", 3, 0, "/w/notes", "idle");
+        FleetTree.Member shell = m("t31", "c", "notes", 3, 1, "/w/notes", "");
+        FleetTree.Member another = label(m("t40", "e", "misc", 4, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member stray = m("t50", "", "", 9, 0, "/x", "working");
+        List<FleetTree.Member> all = Arrays.asList(stray, another, shell, unlabelled, orphan, worker, pm, helper, deacon);
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(all, null));
+        // Case-insensitive by name: alpha before Zeta.
+        assertEquals(Arrays.asList("alpha", "Zeta"), pmNames(tree));
+        assertNull(tree.pms.get(0).pm);
+        assertEquals(Arrays.asList("t20"), ids(FleetTree.flatten(tree.pms.get(0).workers)));
+        assertSame(pm, tree.pms.get(1).pm);
+        assertEquals(Arrays.asList("t30", "t31", "t40", "t50"), ids(tree.otherMembers));
+        List<String> shown = new ArrayList<>();
+        shown.add(tree.deacon.id);
+        shown.addAll(ids(tree.helpers));
+        for (FleetTree.PmRow row : tree.pms) {
+            if (row.pm != null) shown.add(row.pm.id);
+            shown.addAll(ids(FleetTree.flatten(row.workers)));
+        }
+        shown.addAll(ids(FleetTree.flatten(tree.others)));
+        Collections.sort(shown);
+        List<String> every = ids(all);
+        Collections.sort(every);
+        assertEquals(every, shown);
+        // At rest: the Deacon and the PMs only.
+        assertEquals(Arrays.asList("t1", "t10"), ids(FleetTree.shownByDefault(FleetTree.build(all, null))));
+    }
+
+    @Test public void aCheckoutIsOneShortLine() {
+        FleetTree.SpaceNode wt = new FleetTree.SpaceNode("/h/.herdr/worktrees/app/fix");
+        wt.worktree = true;
+        wt.name = "fix";
+        assertEquals("⑂ fix", FleetTree.where(wt, "app"));
+        wt.branch = "wolf/fix";
+        assertEquals("⑂ wolf/fix", FleetTree.where(wt, "app"));
+        FleetTree.SpaceNode main = new FleetTree.SpaceNode("/w/app");
+        main.name = "app";
+        main.repo = "/w/app/.git";
+        main.branch = "main";
+        assertEquals("main", FleetTree.where(main, "app"));
+        assertEquals("app · main", FleetTree.where(main, "billing"));
+        main.branch = "";
+        assertEquals("", FleetTree.where(main, "app"));
+        FleetTree.SpaceNode plain = new FleetTree.SpaceNode("space:s");
+        plain.name = "scratch";
+        assertEquals("scratch", FleetTree.where(plain, ""));
+        assertEquals("", FleetTree.where(null, ""));
     }
 
     @Test public void projectsStartFoldedNothingOpensAtStartupAndAManualFoldIsKept() {
@@ -669,18 +765,16 @@ public final class FleetTreeTest {
         assertNull(FleetTree.projectOf(fleet, "t9"));
     }
 
-    @Test public void aLabelledPmOutsideGitHasItsOwnHeadingAnUnlabelledOneDoesNot() {
+    @Test public void aLabelledPmOutsideGitHasItsOwnRowAnUnlabelledOneDoesNot() {
         // project "phone", PM t2x in ~/Config (not a git repo).
         FleetTree.Member phone = label(m("t2x", "hm", "home-manager", 0, 3, "/c", "working"), "pm", "phone");
         FleetTree.Member loose = m("t9", "n", "notes", 1, 0, "/notes", "idle"); // unlabelled agent, no git
         FleetTree.GitLook git = FleetTree.parseGitLook("P\t/c\nP\t/notes\n", 200);
-        List<FleetTree.RepoGroup> groups = FleetTree.repoGroups(FleetTree.build(Arrays.asList(phone, loose), git));
-        assertEquals(2, groups.size());
-        assertEquals("phone · no git", groups.get(0).name);
-        assertSame(phone, groups.get(0).projects.get(0).pm);
-        assertNull(groups.get(0).owner);
-        assertTrue(groups.get(1).outside());
-        assertEquals("notes", groups.get(1).projects.get(0).name);
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(phone, loose), git));
+        assertEquals(Arrays.asList("phone"), pmNames(tree));
+        assertSame(phone, tree.pms.get(0).pm);
+        assertEquals("c", tree.pms.get(0).where);
+        assertEquals(Arrays.asList("t9"), ids(tree.otherMembers));
     }
 
     @Test public void aWorkerBadgeShowsItsTaskNotAGenericTabName() {
@@ -840,20 +934,6 @@ public final class FleetTreeTest {
         assertEquals("worker·smoke-marker", FleetTree.roleBadge("worker", "t6x", " smoke-marker "));
         assertEquals("worker·t6x", FleetTree.roleBadge("worker", "t6x", ""));
         assertEquals("", FleetTree.roleBadge("", "t1", "x"));
-    }
-
-    @Test public void onlyAWholeSpaceOffersTheSpacesOwnMenu() {
-        // The shared laptop space: t67's and t5t's projects each see a slice of it.
-        FleetTree.Member t67 = label(m("t67", "hm", "home-manager", 0, 0, "/c/hm", "idle"), "pm", "home-manager");
-        FleetTree.Member w = label(m("t2", "hm", "home-manager", 0, 1, "/c/hm", "working"), "worker", "home-manager");
-        FleetTree.Member t5t = label(m("t5t", "hm", "home-manager", 0, 2, "/c", "idle"), "pm", "botd");
-        FleetTree.Member bw = label(m("t5h", "b", "botd", 1, 0, "/w/botd", "working"), "worker", "botd");
-        List<FleetTree.Member> all = Arrays.asList(t67, w, t5t, bw);
-        FleetTree.Fleet fleet = FleetTree.build(all, null);
-        // home-manager's row is a slice of the shared space (t67 and t5t are elsewhere): scoped.
-        for (FleetTree.SpaceNode row : project(fleet, "home-manager").entries) assertNull(FleetTree.wholeSpace(row, all));
-        // botd's worker row is its whole space: the space's own menu is fine there.
-        assertEquals("b", FleetTree.wholeSpace(project(fleet, "botd").entries.get(0), all));
     }
 
     // ── Leftovers are never dropped ─────────────────────────────────────

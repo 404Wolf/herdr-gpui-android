@@ -16,7 +16,9 @@ import java.util.Set;
  * One computer's Fleet tree (Deacon › projects/PM › main and worktree rows ›
  * workers), per the desktop's Fleet tree contract v1/v1.1 (spaces-wolf). It is
  * built per core connection, so agents of two computers never share a Deacon.
- * Plain data in, plain data out: tested without Android.
+ * The sidebar draws {@link #pmTree}: the Deacon and one row per PM, with each
+ * checkout reduced to a terminal's second line. Plain data in, plain data
+ * out: tested without Android.
  */
 final class FleetTree {
     private FleetTree() { }
@@ -74,6 +76,8 @@ final class FleetTree {
     /** An agent and the agents that name it as parent within the same project. */
     static final class AgentNode {
         final Member member;
+        /** Its checkout, as the row's second line ({@link #where}); "" when unknown. */
+        String where = "";
         final List<AgentNode> children = new ArrayList<>();
         AgentNode(Member member) { this.member = member; }
     }
@@ -107,8 +111,8 @@ final class FleetTree {
         boolean closedIncomplete;
         /** The repo (git common dir) whose worktrees are listed, or "". */
         String repo = "";
-        /** The row key of the PM's own checkout (its row is not drawn: the PM is the project row). */
-        String pmKey = "";
+        /** The PM's own checkout row (kept even when it held only the PM), for its second line. */
+        SpaceNode pmRow;
         /** blocked, done, working, idle over the project's agents. */
         final int[] tally = new int[4];
         Project(String name) { this.name = name; }
@@ -133,79 +137,6 @@ final class FleetTree {
         /** Every terminal of this computer, in space/tab order. */
         final List<Member> all = new ArrayList<>();
     }
-
-    /**
-     * A repo header (or "Outside git" when {@code repo} is empty): the
-     * projects working in it, its loose spaces, and its unopened worktrees
-     * once (from the one project fleet() listed them under).
-     */
-    /** The repo key of a labelled PM's own heading outside git. */
-    static final String NO_GIT = "nogit:";
-
-    static final class RepoGroup {
-        final String repo, name;
-        final List<Project> projects = new ArrayList<>();
-        final List<SpaceNode> loose = new ArrayList<>();
-        /** The project holding the repo's unopened worktrees, or null. */
-        Project owner;
-        final int[] tally = new int[4];
-        RepoGroup(String repo, String name) { this.repo = repo; this.name = name; }
-
-        int pms() {
-            int n = 0;
-            for (Project p : projects) if (p.pm != null) n++;
-            return n;
-        }
-
-        boolean outside() { return repo.isEmpty(); }
-
-        /** A labelled PM's own heading outside git: no repo, no unopened worktrees. */
-        boolean noGit() { return repo.startsWith(NO_GIT); }
-    }
-
-    /**
-     * The desktop sidebar's middle: repos in project order, each with the
-     * projects (PMs) working in it, its loose spaces and its unopened
-     * worktrees; then "Outside git" (projects and spaces with no repo) last.
-     */
-    static List<RepoGroup> repoGroups(Fleet fleet) {
-        Map<String, RepoGroup> repos = new LinkedHashMap<>();
-        RepoGroup outside = new RepoGroup("", "Outside git");
-        for (Project p : fleet.projects) {
-            // An explicitly labelled PM outside git gets its own heading ("phone · no git").
-            boolean labelledPm = p.pm != null && "pm".equals(p.pm.role) && p.name.equals(p.pm.project);
-            RepoGroup g = !p.repo.isEmpty() ? repos.computeIfAbsent(p.repo, r -> new RepoGroup(r, repoName(r)))
-                    : labelledPm ? repos.computeIfAbsent(NO_GIT + p.name, r -> new RepoGroup(r, p.name + " · no git"))
-                    : outside;
-            g.projects.add(p);
-            for (int i = 0; i < 4; i++) g.tally[i] += p.tally[i];
-            if (g.owner == null && !p.closed.isEmpty()) g.owner = p;
-        }
-        for (SpaceNode node : fleet.loose) {
-            RepoGroup g = node.repo.isEmpty() ? outside
-                    : repos.computeIfAbsent(node.repo, r -> new RepoGroup(r, repoName(r)));
-            g.loose.add(node);
-        }
-        List<RepoGroup> out = new ArrayList<>(repos.values());
-        if (!outside.projects.isEmpty() || !outside.loose.isEmpty()) out.add(outside);
-        return out;
-    }
-
-    /**
-     * Needs you: this computer's agents whose own status is blocked (no
-     * invented questions), the deacon first, then PMs in project order, then
-     * the rest in space/tab order.
-     */
-    static List<Member> needsYou(Fleet fleet) {
-        List<Member> order = new ArrayList<>();
-        if (fleet.deacon != null) order.add(fleet.deacon);
-        for (Project p : fleet.projects) if (p.pm != null && !order.contains(p.pm)) order.add(p.pm);
-        for (Member m : fleet.all) if (!order.contains(m)) order.add(m);
-        List<Member> out = new ArrayList<>();
-        for (Member m : order) if ("blocked".equals(m.status)) out.add(m);
-        return out;
-    }
-
 
     /** Unopened worktrees shown before "+N more"; a tap shows a page more. */
     static final int CLOSED_CAP = 30;
@@ -378,7 +309,6 @@ final class FleetTree {
         Map<String, SpaceNode> looseBySpace = new LinkedHashMap<>();
         // Every checkout some terminal (a PM too) is in: never listed as unopened.
         Set<String> open = new HashSet<>();
-        Map<String, String> rowOf = new HashMap<>();
         Map<String, Integer> spaceOrder = new HashMap<>();
         for (String space : spaces.keySet()) spaceOrder.put(space, spaceOrder.size());
         for (Member m : placed) {
@@ -412,7 +342,6 @@ final class FleetTree {
             if (node == null) rows.put(key, node = new SpaceNode(key));
             fill(node, space, m, use, at, git);
             open.add(key);
-            rowOf.put(m.id, key);
         }
         fleet.loose.addAll(looseBySpace.values());
 
@@ -445,6 +374,7 @@ final class FleetTree {
             Collections.sort(rows, (a, b) -> a.worktree != b.worktree ? (a.worktree ? 1 : 0) - (b.worktree ? 1 : 0)
                     : Integer.compare(a.order, b.order));
             for (SpaceNode row : rows) {
+                if (project.pm != null && row.members.contains(project.pm)) project.pmRow = row;
                 row.members.remove(project.pm);
                 // A row that only held the PM is the PM row itself: no ghost checkout row.
                 if (row.members.isEmpty()) continue;
@@ -453,7 +383,6 @@ final class FleetTree {
                 project.entries.add(row);
             }
             if (project.pm != null) count(project.tally, project.pm.status);
-            if (project.pm != null) project.pmKey = rowOf.getOrDefault(project.pm.id, "");
             fleet.projects.add(project);
         }
         for (SpaceNode node : fleet.loose) nest(node, null);
@@ -515,8 +444,22 @@ final class FleetTree {
     /** Agents nest under their parent when it is shown in the same row; the PM is the project row. */
     private static void nest(SpaceNode row, Member pm) {
         Collections.sort(row.members, PLACE);
+        row.agents.addAll(nestAll(row.members, pm, Collections.emptyMap()));
+    }
+
+    /**
+     * {@code members} in place order, each under its parent when that parent
+     * is among them; the rest (the PM's own children among them) are roots.
+     */
+    private static List<AgentNode> nestAll(List<Member> members, Member pm, Map<Member, String> where) {
+        List<Member> sorted = new ArrayList<>(members);
+        Collections.sort(sorted, PLACE);
         Map<String, AgentNode> nodes = new LinkedHashMap<>();
-        for (Member m : row.members) nodes.put(m.id, new AgentNode(m));
+        for (Member m : sorted) {
+            AgentNode node = new AgentNode(m);
+            node.where = where.getOrDefault(m, "");
+            nodes.putIfAbsent(m.id, node);
+        }
         Set<String> placed = new HashSet<>();
         for (AgentNode node : nodes.values()) {
             String parent = node.member.parent;
@@ -525,7 +468,9 @@ final class FleetTree {
             // A parent cycle would hide both; only an ancestor chain that ends nests.
             if (up != null && !cycles(node.member, nodes)) { up.children.add(node); placed.add(node.member.id); }
         }
-        for (AgentNode node : nodes.values()) if (!placed.contains(node.member.id)) row.agents.add(node);
+        List<AgentNode> roots = new ArrayList<>();
+        for (AgentNode node : nodes.values()) if (!placed.contains(node.member.id)) roots.add(node);
+        return roots;
     }
 
     private static boolean cycles(Member start, Map<String, AgentNode> nodes) {
@@ -729,29 +674,6 @@ final class FleetTree {
     }
 
     /**
-     * The physical space a checkout row may offer the space's own menu for
-     * (Rename, Move, New agent): only when the row is that one space, wholly,
-     * every terminal of it in this row. Otherwise null: the row is a virtual
-     * slice of a shared space, and its menu stays scoped to its terminals.
-     */
-    static String wholeSpace(SpaceNode row, List<? extends Member> all) {
-        if (row.spaces.size() != 1) return null;
-        String space = row.spaces.get(0);
-        for (Member m : all) if (space.equals(m.space) && !row.members.contains(m)) return null;
-        return space;
-    }
-
-    /**
-     * Whether a project's agents are drawn straight under its PM row: only
-     * when its one checkout row is the PM's own checkout. A worker in another
-     * checkout (a linked worktree, even in the PM's space) keeps its row.
-     */
-    static boolean flat(Project project) {
-        return project.pm != null && project.entries.size() == 1
-                && project.entries.get(0).key.equals(project.pmKey);
-    }
-
-    /**
      * Project folds as the desktop sidebar keeps them: every project starts
      * folded (a repo shows only its PM rows; opening one shows its worktrees
      * and workers). {@code opened} holds the projects Wolf opened. Nothing is
@@ -781,62 +703,183 @@ final class FleetTree {
     enum Fold {
         /** The Deacon's own helpers, under the Deacon row. */
         DEACON,
-        /** A repo heading: its PM rows. */
-        REPO,
-        /** "Outside git": projects and spaces with no repo. */
-        OUTSIDE,
-        /** A project (its PM row): its checkouts, worktrees and workers. */
+        /** A PM row: its workers, nested by parent. */
         PROJECT,
-        /** A main checkout or worktree row inside an opened project. */
-        CHECKOUT,
-        /** A space with no project: its terminals. */
-        LOOSE_SPACE,
-        /** A repo's worktrees no space has open. */
-        UNOPENED,
-        /** "Other agents": extra deacons and agents with no space. */
+        /** "Other terminals": everything no Deacon or PM leads. */
         OTHERS,
         /** An agent's own sub-agents. */
         AGENT
     }
 
     /**
-     * The sidebar at rest is Deacon › PMs, as the desktop Fleet: repo
-     * headings stay open so every PM shows, and everything under a PM or the
-     * Deacon (workers, worktrees, helpers, loose terminals, leftovers) waits
-     * behind its chevron. Only once Wolf opens a project do its checkout rows
-     * show their agents, unless a row is crowded with nothing blocked in it.
+     * The sidebar at rest is Deacon › PMs, as the desktop Fleet: everything
+     * under the Deacon or a PM (helpers, workers, leftovers) waits behind its
+     * chevron; once a PM is opened, its workers show their own sub-agents.
      */
-    static boolean foldedByDefault(Fold fold, int members, boolean blocked) {
-        switch (fold) {
-            case REPO: case AGENT: return false;
-            case CHECKOUT: return members > 6 && !blocked;
-            default: return true;
+    static boolean foldedByDefault(Fold fold) {
+        return fold != Fold.AGENT;
+    }
+
+    /** One PM row of the sidebar: a project's manager, where it works, and its workers. */
+    static final class PmRow {
+        final Project project;
+        /** The project's labelled PM, or null when its labelled workers have none ("no PM"). */
+        final Member pm;
+        /** The PM's checkout, as the row's second line ({@link #where}). */
+        String where = "";
+        /** Every other terminal of the project, across its checkouts, nested by parent. */
+        final List<AgentNode> workers = new ArrayList<>();
+        PmRow(Project project) {
+            this.project = project;
+            this.pm = project.pm;
         }
+
+        String name() { return project.name; }
+
+        /** The PM or any of its workers is blocked: the row says so even while folded. */
+        boolean blocked() { return project.tally[0] > 0; }
+    }
+
+    /**
+     * What the sidebar (the terminal's rail and Home) draws for one computer:
+     * the Deacon, one row per PM, and one folded row for everything else.
+     * There are no repo, worktree or space rows; a terminal's checkout is its
+     * second line instead.
+     */
+    static final class PmTree {
+        Member deacon;
+        /** Unlabelled agents of the Deacon's space, behind the Deacon's chevron. */
+        final List<Member> helpers = new ArrayList<>();
+        /** One per project a labelled PM (or labelled workers) leads, by project name. */
+        final List<PmRow> pms = new ArrayList<>();
+        /** Unlabelled projects, loose spaces, extra deacons and agents with no space, nested by parent. */
+        final List<AgentNode> others = new ArrayList<>();
+        /** The same terminals flat, in place order. */
+        final List<Member> otherMembers = new ArrayList<>();
+
+        /** Anything under Other terminals is blocked. */
+        boolean othersBlocked() {
+            for (Member m : otherMembers) if (blocked(m)) return true;
+            return false;
+        }
+
+        /** The Deacon or one of its helpers is blocked. */
+        boolean deaconBlocked() {
+            if (deacon != null && blocked(deacon)) return true;
+            for (Member m : helpers) if (blocked(m)) return true;
+            return false;
+        }
+    }
+
+    static boolean blocked(Member m) {
+        return "blocked".equals(m.status) || "error".equals(m.status);
+    }
+
+    /**
+     * A project leads its own sidebar row when an agent in it is labelled
+     * pm, or (its PM gone) when its agents are labelled workers. A project
+     * inferred from folders and space order alone is not a PM.
+     */
+    static boolean managed(Project project) {
+        if (project.pmInferred) return false;
+        if (project.pm != null) return true;
+        for (SpaceNode row : project.entries) for (Member m : row.members) if ("worker".equals(m.role)) return true;
+        return false;
+    }
+
+    /**
+     * A checkout as one short line: "⑂ branch" for a linked worktree (its
+     * folder when detached), else "repo · branch", leaving out the repo when
+     * it is the project's own name.
+     */
+    static String where(SpaceNode node, String project) {
+        if (node == null) return "";
+        if (node.worktree) return "⑂ " + (node.branch.isEmpty() ? node.name : node.branch);
+        String name = node.repo.isEmpty() ? node.name : repoName(node.repo);
+        if (name.equals(project)) name = "";
+        String branch = node.branch.equals(name) ? "" : node.branch;
+        if (name.isEmpty()) return branch;
+        return branch.isEmpty() ? name : name + " · " + branch;
+    }
+
+    /**
+     * The sidebar for {@code fleet}: the Deacon; one row per PM, ordered by
+     * project name, its workers (every other terminal of its project, by role,
+     * project and parent labels) nested under it by parent; and everything
+     * else in Other terminals, so no terminal is ever dropped.
+     */
+    static PmTree pmTree(Fleet fleet) {
+        PmTree tree = new PmTree();
+        tree.deacon = fleet.deacon;
+        tree.helpers.addAll(fleet.helpers);
+        Map<Member, String> where = new HashMap<>();
+        List<Member> rest = new ArrayList<>(fleet.others);
+        for (Project project : fleet.projects) {
+            boolean managed = managed(project);
+            String own = managed ? project.name : "";
+            List<Member> workers = new ArrayList<>();
+            for (SpaceNode row : project.entries) {
+                for (Member m : row.members) {
+                    workers.add(m);
+                    where.put(m, where(row, own));
+                }
+            }
+            if (!managed) {
+                if (project.pm != null) {
+                    rest.add(project.pm);
+                    where.put(project.pm, where(project.pmRow, ""));
+                }
+                rest.addAll(workers);
+                continue;
+            }
+            PmRow row = new PmRow(project);
+            row.where = where(project.pmRow, project.name);
+            row.workers.addAll(nestAll(workers, project.pm, where));
+            tree.pms.add(row);
+        }
+        for (SpaceNode node : fleet.loose) {
+            for (Member m : node.members) {
+                rest.add(m);
+                where.put(m, where(node, ""));
+            }
+        }
+        Collections.sort(tree.pms, (a, b) -> {
+            int c = a.name().compareToIgnoreCase(b.name());
+            return c != 0 ? c : a.name().compareTo(b.name());
+        });
+        Collections.sort(rest, PLACE);
+        tree.otherMembers.addAll(rest);
+        tree.others.addAll(nestAll(rest, null, where));
+        return tree;
+    }
+
+    /** Every terminal under {@code nodes}, depth first. */
+    static List<Member> flatten(List<AgentNode> nodes) {
+        List<Member> out = new ArrayList<>();
+        for (AgentNode node : nodes) {
+            out.add(node.member);
+            out.addAll(flatten(node.children));
+        }
+        return out;
     }
 
     /**
      * The agents the sidebar shows before anything is opened: the Deacon,
-     * then each project's PM in repo order. Built on {@link #foldedByDefault}
-     * so Home's rows and this list cannot disagree.
+     * then each PM by project name. Built on {@link #foldedByDefault} so Home,
+     * the rail and this list cannot disagree.
      */
     static List<Member> shownByDefault(Fleet fleet) {
+        PmTree tree = pmTree(fleet);
         List<Member> out = new ArrayList<>();
-        if (fleet.deacon != null) {
-            out.add(fleet.deacon);
-            if (!foldedByDefault(Fold.DEACON, fleet.helpers.size(), false)) out.addAll(fleet.helpers);
+        if (tree.deacon != null) {
+            out.add(tree.deacon);
+            if (!foldedByDefault(Fold.DEACON)) out.addAll(tree.helpers);
         }
-        for (RepoGroup group : repoGroups(fleet)) {
-            if (foldedByDefault(group.outside() ? Fold.OUTSIDE : Fold.REPO, group.projects.size(), false)) continue;
-            for (Project p : group.projects) {
-                if (p.pm != null) out.add(p.pm);
-                if (foldedByDefault(Fold.PROJECT, p.agents(), p.tally[0] > 0)) continue;
-                for (SpaceNode row : p.entries) out.addAll(row.members);
-            }
-            for (SpaceNode node : group.loose) {
-                if (!foldedByDefault(Fold.LOOSE_SPACE, node.members.size(), false)) out.addAll(node.members);
-            }
+        for (PmRow row : tree.pms) {
+            if (row.pm != null) out.add(row.pm);
+            if (!foldedByDefault(Fold.PROJECT)) out.addAll(flatten(row.workers));
         }
-        if (!foldedByDefault(Fold.OTHERS, fleet.others.size(), false)) out.addAll(fleet.others);
+        if (!foldedByDefault(Fold.OTHERS)) out.addAll(tree.otherMembers);
         return out;
     }
 
