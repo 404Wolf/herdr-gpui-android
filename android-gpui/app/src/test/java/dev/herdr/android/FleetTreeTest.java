@@ -139,14 +139,15 @@ public final class FleetTreeTest {
         assertFalse(tree.pms.get(0).blocked());
         assertTrue(tree.pms.get(1).blocked());
         assertEquals(Arrays.asList("t21"), ids(FleetTree.flatten(tree.pms.get(1).workers)));
-        assertEquals(Arrays.asList("t30", "t40"), ids(tree.otherMembers));
+        assertEquals(Arrays.asList("t40"), ids(tree.otherMembers));
+        assertEquals(Arrays.asList("t30"), ids(tree.outsideLoose.get(0).members));
     }
 
     @Test public void repositoriesAndSubAgentsStartOpenWhileWorkersStayFolded() {
         assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.REPO));
         assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.AGENT));
         for (FleetTree.Fold fold : new FleetTree.Fold[] {FleetTree.Fold.DEACON, FleetTree.Fold.PROJECT,
-                FleetTree.Fold.OTHERS}) {
+                FleetTree.Fold.OTHERS, FleetTree.Fold.IDLE, FleetTree.Fold.OUTSIDE}) {
             assertTrue(fold.name(), FleetTree.foldedByDefault(fold));
         }
     }
@@ -629,10 +630,10 @@ public final class FleetTreeTest {
         // One row per PM, by project name; the repo (or worktree) is the PM's second line.
         assertEquals(Arrays.asList("botd", "home-manager", "hypr2d"), pmNames(tree));
         assertEquals(2, tree.repos.size());
-        assertEquals("botd", tree.repos.get(0).name);
-        assertEquals("1 project", tree.repos.get(0).countLabel());
-        assertEquals("hm", tree.repos.get(1).name);
-        assertEquals("2 projects", tree.repos.get(1).countLabel());
+        assertEquals("hm", tree.repos.get(0).name);
+        assertEquals("2 projects", tree.repos.get(0).countLabel());
+        assertEquals("botd", tree.repos.get(1).name);
+        assertEquals("1 project", tree.repos.get(1).countLabel());
         assertEquals(Arrays.asList("c", "hm · main", "⑂ hypr"),
                 Arrays.asList(tree.pms.get(0).where, tree.pms.get(1).where, tree.pms.get(2).where));
         // Blocked is on the row itself (botd's PM), not in a separate list.
@@ -641,8 +642,10 @@ public final class FleetTreeTest {
         // The repo's unopened worktrees stay with ONE owner (offered from its PM's menu).
         assertEquals(Arrays.asList("/wt/idle"), closedPaths(tree.pms.get(1).project));
         assertTrue(tree.pms.get(2).project.closed.isEmpty());
-        // Loose shells are kept, under Other terminals.
-        assertEquals(Arrays.asList("t9", "t8"), ids(tree.otherMembers));
+        // Loose shells are kept under their repo or Outside git.
+        assertTrue(tree.otherMembers.isEmpty());
+        assertEquals(Arrays.asList("t8"), ids(tree.repos.get(0).loose.get(0).members));
+        assertEquals(Arrays.asList("t9"), ids(tree.outsideLoose.get(0).members));
         assertFalse(tree.othersBlocked());
     }
 
@@ -710,14 +713,18 @@ public final class FleetTreeTest {
         assertNull(tree.pms.get(0).pm);
         assertEquals(Arrays.asList("t20"), ids(FleetTree.flatten(tree.pms.get(0).workers)));
         assertSame(pm, tree.pms.get(1).pm);
-        assertEquals(Arrays.asList("t30", "t31", "t40", "t50", "t60"), ids(tree.otherMembers));
+        assertEquals(Arrays.asList("t40", "t50"), ids(tree.otherMembers));
+        assertEquals(2, tree.outside.size());
+        assertEquals(Arrays.asList("t60"), ids(tree.outsideLoose.get(0).members));
         List<String> shown = new ArrayList<>();
         shown.add(tree.deacon.id);
         shown.addAll(ids(tree.helpers));
-        for (FleetTree.PmRow row : tree.pms) {
+        for (FleetTree.PmRow row : tree.allProjects) {
             if (row.pm != null) shown.add(row.pm.id);
             shown.addAll(ids(FleetTree.flatten(row.workers)));
         }
+        for (FleetTree.RepoRow repo : tree.repos) for (FleetTree.SpaceNode node : repo.loose) shown.addAll(ids(node.members));
+        for (FleetTree.SpaceNode node : tree.outsideLoose) shown.addAll(ids(node.members));
         shown.addAll(ids(FleetTree.flatten(tree.others)));
         Collections.sort(shown);
         List<String> every = ids(all);
@@ -748,8 +755,9 @@ public final class FleetTreeTest {
         FleetTree.PmTree tree = FleetTree.pmTree(fleet);
         assertEquals(Arrays.asList("feature"), pmNames(tree));
         assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.pms.get(0).catalogs));
-        assertTrue(tree.otherCatalogs.isEmpty());
-        assertEquals(Arrays.asList("t2"), ids(tree.otherMembers));
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.repos.get(0).catalogs));
+        assertTrue(tree.otherMembers.isEmpty());
+        assertEquals(2, tree.repos.get(0).projects.size());
     }
 
     @Test public void aProjectWithWorkersButNoPmOffersItsCatalogOnItsOwnRow() {
@@ -758,16 +766,16 @@ public final class FleetTreeTest {
         assertEquals(1, tree.pms.size());
         assertNull(tree.pms.get(0).pm);
         assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.pms.get(0).catalogs));
-        assertTrue(tree.otherCatalogs.isEmpty());
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.repos.get(0).catalogs));
     }
 
-    @Test public void aCatalogNoPmRowCanOfferGoesOnOtherTerminals() {
+    @Test public void aCatalogWithoutALabelledPmStaysUnderItsRepo() {
         FleetTree.Member inferred = m("t2", "s2", "repo", 0, 0, "/w/repo", "working");
         FleetTree.Member elsewhere = label(m("t1", "s1", "web", 1, 0, "/w/web", "idle"), "pm", "web");
         FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(inferred, elsewhere), REPO));
         assertEquals(Arrays.asList("web"), pmNames(tree));
         assertTrue(tree.pms.get(0).catalogs.isEmpty());
-        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.otherCatalogs));
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.repos.get(0).catalogs));
     }
 
     @Test public void aCheckoutIsOneShortLine() {
@@ -826,7 +834,8 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("phone"), pmNames(tree));
         assertSame(phone, tree.pms.get(0).pm);
         assertEquals("c", tree.pms.get(0).where);
-        assertEquals(Arrays.asList("t9"), ids(tree.otherMembers));
+        assertTrue(tree.otherMembers.isEmpty());
+        assertSame(loose, tree.outside.get(0).pm);
     }
 
     @Test public void aWorkerBadgeShowsItsTaskNotAGenericTabName() {
