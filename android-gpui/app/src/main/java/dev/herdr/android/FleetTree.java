@@ -743,6 +743,18 @@ final class FleetTree {
         boolean blocked() { return project.tally[0] > 0; }
     }
 
+    /** A project's main tap opens its PM, or its first worker when the PM is gone. */
+    static Member projectTarget(PmRow row) {
+        return row.pm != null ? row.pm : row.workers.isEmpty() ? null : row.workers.get(0).member;
+    }
+
+    /** A visible tap target for the full catalog, including entries beyond the first page. */
+    static String unopenedLabel(Project project) {
+        int count = project.closed.size();
+        return count + (count == 1 ? " unopened worktree" : " unopened worktrees")
+                + (project.closedIncomplete ? " (incomplete)" : "");
+    }
+
     /**
      * What the sidebar (the terminal's rail and Home) draws for one computer:
      * the Deacon, one row per PM, and one folded row for everything else.

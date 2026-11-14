@@ -985,11 +985,11 @@ public final class HomeActivity extends Activity {
             row.addView(plus);
         }
         row.setOnClickListener(v -> {
-            if (machines.size() > 1) showMachinePicker();
             if ("closed".equals(machine.state) && machine.handle <= 0 && !machine.connecting) connect(machine);
+            showMachinePicker();
         });
         row.setContentDescription("Computer " + machine.host.name + ", " + detail
-                + (machines.size() > 1 ? ", tap to pick another" : ""));
+                + ", tap to pick a computer");
         row.setOnLongClickListener(v -> {
             ActionSheet sheet = new ActionSheet(this, chrome, machine.host.name);
             if (fleet.deacon != null) sheet.add("Open the Deacon", () -> openAgent((Agent) fleet.deacon));
@@ -1108,7 +1108,7 @@ public final class HomeActivity extends Activity {
         String m = machine.host.id;
         List<Row> rows = new ArrayList<>();
         for (FleetTree.PmRow pm : tree.pms) rows.add(pmRow(machine, pm));
-        if (!tree.others.isEmpty()) {
+        if (!tree.others.isEmpty() || !tree.otherCatalogs.isEmpty()) {
             String count = (tree.othersBlocked() ? "! " : "") + tree.otherMembers.size();
             Row others = new Row((guide, self) -> {
                 View line = groupLine(guide, self, "Other terminals", count);
@@ -1127,6 +1127,7 @@ public final class HomeActivity extends Activity {
                 String tag = "deacon".equals(node.member.role) ? "another deacon" : null;
                 others.kids.add(agentTree(m, node, tag));
             }
+            addCatalogRows(others, machine, tree.otherCatalogs);
             rows.add(others);
         }
         return rows;
@@ -1153,7 +1154,12 @@ public final class HomeActivity extends Activity {
             row = new Row((guide, self) -> {
                 View line = actionLine(guide, self, "●", pm.name() + " · no PM"
                         + (tally.isEmpty() ? "" : "  " + tally), pm.blocked() ? chrome.danger : chrome.onSurfaceVariant,
-                        () -> askForManager(machine, pm.project));
+                        () -> {
+                            FleetTree.Member target = FleetTree.projectTarget(pm);
+                            if (target != null) openAgent((Agent) target);
+                            else if (!self.kids.isEmpty()) toggleFold(self.fold, self.foldedByDefault);
+                            else askForManager(machine, pm.project);
+                        });
                 line.setOnLongClickListener(v -> {
                     ActionSheet sheet = new ActionSheet(this, chrome, pm.name())
                             .add("Ask for a manager", () -> askForManager(machine, pm.project));
@@ -1168,7 +1174,17 @@ public final class HomeActivity extends Activity {
         // PM rows start folded, as on the desktop; Home reveals nothing on its own.
         row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT);
         for (FleetTree.AgentNode node : pm.workers) row.kids.add(agentTree(machine.host.id, node, null));
+        addCatalogRows(row, machine, pm.catalogs);
         return row;
+    }
+
+    /** Catalogs are reachable by tap as well as from the row's long-press menu. */
+    private void addCatalogRows(Row parent, Machine machine, List<FleetTree.Project> catalogs) {
+        for (FleetTree.Project project : catalogs) {
+            parent.kids.add(new Row((guide, self) -> actionLine(guide, null, "○",
+                    FleetTree.repoName(project.repo) + " · " + FleetTree.unopenedLabel(project), chrome.primary,
+                    () -> showWorktrees(machine, project, 0))));
+        }
     }
 
     /** A row's "Worktrees…": straight to the one repo's catalog, else a choice of repo first. */
@@ -1193,9 +1209,7 @@ public final class HomeActivity extends Activity {
             FleetTree.GitWorktree wt = project.closed.get(i);
             String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
             boolean busy = machine.opening.contains(wt.path);
-            sheet.add("○ " + name + (busy ? " · opening…" : ""), () -> {
-                if (!busy && live(machine)) closedWorktreeActions(machine, wt, name);
-            });
+            sheet.add("○ " + name + (busy ? " · opening…" : ""), () -> openWorktree(machine, wt.path));
         }
         if (total > shown) sheet.add("+" + (total - shown) + " more", () -> showWorktrees(machine, project, pages + 1));
         sheet.show();
@@ -1235,6 +1249,8 @@ public final class HomeActivity extends Activity {
             boolean folded = folded(fold);
             TextView toggle = chevronSlot(folded ? "▸" : "▾");
             toggle.setContentDescription((folded ? "Show " : "Hide ") + fold.kids.size() + " rows under it");
+            toggle.setBackground(ripple());
+            toggle.setFocusable(true);
             toggle.setOnClickListener(v -> toggleFold(fold.fold, fold.foldedByDefault));
             row.addView(toggle);
         } else if (fold != null && fold.fold != null) {
@@ -1373,8 +1389,10 @@ public final class HomeActivity extends Activity {
         GradientDrawable border = new GradientDrawable();
         border.setCornerRadius(dp(10));
         border.setStroke(Math.max(1, dp(1)), enabled ? chrome.primary : chrome.outline);
-        chip.setBackground(border);
+        chip.setBackground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(chrome.selected), border, new ColorDrawable(0xffffffff)));
         chip.setEnabled(enabled);
+        chip.setFocusable(enabled);
         if (enabled) chip.setOnClickListener(v -> action.run());
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
         params.setMarginStart(dp(6));
@@ -1702,39 +1720,30 @@ public final class HomeActivity extends Activity {
         });
     }
 
-    /**
-     * An unopened worktree: work there goes through the Deacon (it starts a
-     * labelled worker); a bare shell is only the secondary choice.
-     */
-    private void closedWorktreeActions(Machine machine, FleetTree.GitWorktree wt, String name) {
-        // The git cache can lag: a terminal already there (a slow first open) is opened instead.
-        FleetTree.Member there = FleetTree.memberAt(members(machine), wt.path);
-        if (there != null) { openAgent((Agent) there); return; }
-        FleetTree.Member deacon = FleetTree.canonicalDeacon(members(machine));
-        ActionSheet sheet = new ActionSheet(this, chrome, name);
-        if (deacon != null) {
-            sheet.add("Ask the Deacon to start work here", () -> sendToDeacon(machine, (Agent) deacon,
-                    "I want to work in the " + name.replaceAll("\\p{Cntrl}", "") + " worktree ("
-                            + wt.path.replaceAll("\\p{Cntrl}", "") + ") on " + machine.host.name
-                            + ". Help me set up a worker there."));
-        } else {
-            sheet.add("Start the Deacon first", () -> startDeacon(machine));
-        }
-        sheet.add("Open a plain shell there", () -> openWorktree(machine, wt.path));
-        sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", wt.path));
-        sheet.show();
-    }
-
     /** A closed worktree: a shell space there (no agent), then that shell. */
     private void openWorktree(Machine machine, String path) {
         long handle = machine.handle;
-        if (handle <= 0 || !"ready".equals(machine.state) || !machine.opening.add(path)) return;
+        if (!live(machine)) {
+            note = machine.host.name + " is offline. Connect it before opening a worktree.";
+            render(true);
+            return;
+        }
+        // The git catalog can lag a live poll: reuse any terminal already there.
+        FleetTree.Member there = FleetTree.memberAt(members(machine), path);
+        if (there != null) { openAgent((Agent) there); return; }
+        if (!machine.opening.add(path)) {
+            note = "Opening " + FleetTree.lastSegment(path) + "…";
+            render(true);
+            return;
+        }
+        note = "Opening " + FleetTree.lastSegment(path) + "…";
         machine.ui++;
         render(true);
         String action;
         try {
             action = new JSONObject().put("op", "space.open").put("folder", path).toString();
         } catch (org.json.JSONException impossible) {
+            machine.opening.remove(path);
             return;
         }
         worker.execute(() -> {
@@ -1751,9 +1760,11 @@ public final class HomeActivity extends Activity {
                 if (destroyed) return;
                 machine.opening.remove(path);
                 machine.ui++;
-                note = reason == null ? null : "Could not open " + FleetTree.lastSegment(path) + ": " + reason;
+                if (machine.handle != handle) return;
+                note = reason != null ? "Could not open " + FleetTree.lastSegment(path) + ": " + reason
+                        : address.isEmpty() ? "The computer did not return a terminal for " + FleetTree.lastSegment(path) : null;
                 render(true);
-                if (!address.isEmpty() && machine.handle == handle) openTerminal(machine, address, FleetTree.lastSegment(path));
+                if (reason == null && !address.isEmpty()) openTerminal(machine, address, FleetTree.lastSegment(path));
             });
         });
     }
@@ -1874,6 +1885,8 @@ public final class HomeActivity extends Activity {
             line.setSingleLine(true);
             line.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(line, new LinearLayout.LayoutParams(0, -2, 1));
+            row.setContentDescription("Open " + machine.host.name + ", " + detail);
+            row.setOnClickListener(v -> pickMachine(machine));
             fleet.addView(row);
         }
     }
