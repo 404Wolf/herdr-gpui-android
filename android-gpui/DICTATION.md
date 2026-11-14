@@ -2,11 +2,12 @@
 
 The **talk** control drawn in an agent's prompt box (`type ─ talk ─ send`)
 dictates text: tap to start, tap it again (it reads `● rec 0:05 · tap to stop`,
-or `● 0:05 stop` on a narrow screen) to stop. While recording, the whole
-bottom-right corner of the terminal is the stop, and **send** is hidden so a tap
-meant for stop never sends; Enter on the keyboard still stops and sends.
-Silence never ends a session. Speech is always transcribed on the desktop's
-Whisper; the phone never guesses at it with a weaker model.
+or `● 0:05 stop` on a narrow screen) to stop. While the keyboard is up, `↓ hide`
+(in place of `type`) puts it away. While recording, the whole bottom-right
+corner of the terminal is the stop, and **send** is hidden so a tap meant for
+stop never sends; Enter on the keyboard still stops and sends. Silence never
+ends a session. Speech is always transcribed on the desktop's Whisper; the phone
+never guesses at it with a weaker model.
 
 ## How it works
 
