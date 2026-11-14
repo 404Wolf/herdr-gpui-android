@@ -39,6 +39,9 @@ macro_rules! __bind_gpui {
                 bounds: Bounds<Pixels>,
                 /// The grid cell (row, column) drawn at the pane's top-left.
                 view_origin: (i32, usize),
+                /// The rows the last paint drew with (the controls' last row is
+                /// carried from them to the next paint's).
+                drawn_rows: $crate::ghost::DrawnRows,
                 cell: Size<Pixels>,
                 selecting: bool,
                 scroll_delta: f32,
@@ -100,6 +103,7 @@ macro_rules! __bind_gpui {
                             visible: true,
                             bounds: Bounds::default(),
                             view_origin: (0, 0),
+                            drawn_rows: $crate::ghost::DrawnRows::default(),
                             cell: size(px(8.), px(18.)),
                             selecting: false,
                             scroll_delta: 0.,
@@ -247,18 +251,22 @@ macro_rules! __bind_gpui {
                     }
                 }
 
-                fn position(&self, point: Point<Pixels>) -> Pos {
+                /// The grid cell painted under `point`, through the origin the last
+                /// paint drew with (a window following the caret on a larger grid,
+                /// or a short grid's place at the pane's bottom). `None` over the
+                /// pane's empty area, so a touch there selects and opens nothing.
+                fn position(&self, point: Point<Pixels>) -> Option<Pos> {
                     let grid = self.session.grid().lock();
-                    let row =
-                        (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor() as i32;
-                    let col =
-                        (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor() as usize;
-                    // Through the window drawn (it may follow the caret on a larger grid).
-                    let (row_off, col_off) = self.view_origin;
-                    Pos::new(
-                        Line((row + row_off).clamp(0, grid.screen_lines() as i32 - 1) - grid.display_offset() as i32),
-                        Column((col + col_off).min(grid.columns() - 1)),
-                    )
+                    let (col, row) = $crate::cell_at(
+                        (
+                            f32::from(point.x - self.bounds.left()),
+                            f32::from(point.y - self.bounds.top()),
+                        ),
+                        (f32::from(self.cell.width), f32::from(self.cell.height)),
+                        self.view_origin,
+                        (grid.columns(), grid.screen_lines()),
+                    )?;
+                    Some(Pos::new(Line(row as i32 - grid.display_offset() as i32), Column(col)))
                 }
 
                 /// Paints placed ghost runs over the grid on the program's background,
@@ -373,15 +381,13 @@ macro_rules! __bind_gpui {
                         f32::from(bounds.size.width) as u16,
                         f32::from(bounds.size.height) as u16,
                     );
-                    // The grid may be the remote side's negotiated one. Smaller than
-                    // the pane: drawn whole, the rest left empty (letterboxed).
-                    // Larger: a pane-sized window into it that follows the caret.
+                    // The grid may be the remote side's negotiated one. Shorter than
+                    // the pane: drawn whole against its bottom, the rows above left
+                    // empty. Narrower: the rest of each row left empty. Larger: a
+                    // pane-sized window into it that follows the caret.
                     let (grid_cols, grid_rows) = self.session.grid_size();
                     let pane = (cols, rows);
-                    let (cols, rows) = (
-                        usize::from(cols.min(grid_cols)),
-                        usize::from(rows.min(grid_rows)),
-                    );
+                    let cols = usize::from(cols.min(grid_cols));
                     let theme = self.style.theme;
                     let mut grid = self.session.grid().lock();
                     let selection = grid
@@ -390,17 +396,35 @@ macro_rules! __bind_gpui {
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
                     let offset = grid.display_offset() as i32;
-                    let (row_off, col_off) = if offset == 0 {
-                        $crate::viewport_origin((grid_cols, grid_rows), pane, (cursor.pos.row.0, cursor.pos.col.0))
-                    } else {
-                        (0, 0)
+                    // Scrolled into history there is no caret to follow; a short grid
+                    // keeps its place at the pane's bottom either way.
+                    let caret_cell = (offset == 0).then_some((cursor.pos.row.0, cursor.pos.col.0));
+                    let (row_off, col_off) =
+                        $crate::viewport_origin((grid_cols, grid_rows), pane, caret_cell);
+                    // Rows drawn: the pane's when a short grid sits at its bottom
+                    // (row_off < 0, the rows above the grid's first stay empty).
+                    let rows = usize::from(if row_off < 0 { pane.1 } else { pane.1.min(grid_rows) });
+                    // For a frame without a caret, the controls' last row is carried
+                    // from the last paint's rows to these: kept, rebased onto the same
+                    // grid row when only the pane's height changed (a keyboard hidden
+                    // with the link down puts the short grid at the new bottom), or
+                    // dropped when the host's grid changed height.
+                    let drawn_rows = $crate::ghost::DrawnRows {
+                        pane: pane.1,
+                        grid: grid_rows,
+                        origin: row_off,
                     };
+                    let last_rows = std::mem::replace(&mut self.drawn_rows, drawn_rows);
                     self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
                     // The rows as drawn, for finding the program's prompt.
                     let mut screen: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
                     for row in 0..rows {
+                        // Above a short grid drawn at the pane's bottom: nothing.
+                        if row as i32 + row_off < 0 {
+                            continue;
+                        }
                         for col in 0..cols {
                             let pos = Pos::new(Line(row as i32 + row_off - offset), Column(col + col_off));
                             let square = grid.grid[pos];
@@ -540,7 +564,8 @@ macro_rules! __bind_gpui {
                         .map(|control| $crate::ghost::Previous {
                             row: control.row,
                             scrolled: offset != 0,
-                        });
+                        })
+                        .and_then(|previous| previous.carried(last_rows, drawn_rows));
                     let layout = self
                         .ghost
                         .as_ref()
@@ -655,16 +680,16 @@ macro_rules! __bind_gpui {
                                 if !this.host_input {
                                     this.focus(window, cx);
                                 }
+                                // Over the pane's empty area there is no cell: no link,
+                                // no selection, before either is looked for.
                                 let pos = this.position(event.position);
                                 this.press = Some(event.position);
-                                this.pressed_link = if this.link_handler.is_some() {
-                                    this.link_at(pos)
-                                } else {
-                                    None
-                                };
+                                this.pressed_link = pos
+                                    .filter(|_| this.link_handler.is_some())
+                                    .and_then(|pos| this.link_at(pos));
                                 this.session.grid().lock().selection =
-                                    Some(Selection::new(SelectionType::Simple, pos, Side::Left));
-                                this.selecting = true;
+                                    pos.map(|pos| Selection::new(SelectionType::Simple, pos, Side::Left));
+                                this.selecting = pos.is_some();
                                 cx.notify();
                             }),
                         )
@@ -680,8 +705,10 @@ macro_rules! __bind_gpui {
                                 }
                             }
                             if this.selecting && event.pressed_button == Some(MouseButton::Left) {
-                                let pos = this.position(event.position);
-                                if let Some(selection) = &mut this.session.grid().lock().selection {
+                                // Dragged over the empty area, the selection keeps its end.
+                                if let Some(pos) = this.position(event.position)
+                                    && let Some(selection) = &mut this.session.grid().lock().selection
+                                {
                                     selection.update(pos, Side::Right);
                                 }
                                 cx.notify();

@@ -529,25 +529,65 @@ impl Reader {
 }
 
 #[doc(hidden)]
-/// Which part of a grid larger than the pane is drawn: the top-left cell
-/// (row, column) of the pane's window into the grid. Policy: the window starts
+/// Which part of the grid is drawn: the grid cell (row, column) at the pane's
+/// top-left. A grid larger than the pane gets a pane-sized window that starts
 /// at the top-left and moves only as far as needed to keep the caret on
-/// screen (it follows the caret); a grid that fits is drawn whole from (0, 0),
-/// with the rest of the pane left empty (letterboxed).
-pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize)) -> (i32, usize) {
+/// screen (it follows the caret); scrolled into history there is no caret to
+/// follow (`cursor` is `None`) and the window stays at the top-left. A grid
+/// shorter than the pane is drawn whole against the pane's bottom, scrolled
+/// or not, so it never jumps when the view scrolls: the row is negative, the
+/// rows above it are left empty, so the program's prompt stays at the bottom
+/// by the host's controls (the remote side's grid can be shorter, e.g. kept
+/// at its keyboard-up size while the link is down). A narrower grid is drawn
+/// from column 0, the rest of each row left empty.
+pub fn viewport_origin(
+    grid: (u16, u16),
+    pane: (u16, u16),
+    cursor: Option<(i32, usize)>,
+) -> (i32, usize) {
     let (grid_cols, grid_rows) = (usize::from(grid.0), i32::from(grid.1));
     let (pane_cols, pane_rows) = (usize::from(pane.0.max(1)), i32::from(pane.1.max(1)));
     let row = if grid_rows > pane_rows {
-        (cursor.0 - pane_rows + 1).clamp(0, grid_rows - pane_rows)
+        cursor.map_or(0, |cursor| {
+            (cursor.0 - pane_rows + 1).clamp(0, grid_rows - pane_rows)
+        })
     } else {
-        0
+        grid_rows - pane_rows
     };
     let col = if grid_cols > pane_cols {
-        (cursor.1 + 1).saturating_sub(pane_cols).min(grid_cols - pane_cols)
+        cursor.map_or(0, |cursor| {
+            (cursor.1 + 1)
+                .saturating_sub(pane_cols)
+                .min(grid_cols - pane_cols)
+        })
     } else {
         0
     };
     (row, col)
+}
+
+#[doc(hidden)]
+/// The grid cell (column, row) painted under the point `(x, y)` in the pane,
+/// with `cell` the cell's width and height and `origin` the grid cell drawn
+/// at the pane's top-left (see [`viewport_origin`]). The row counts the
+/// grid's screen rows from 0, as drawn: a view scrolled into history shifts
+/// them, which the caller applies. `None` where no grid cell is painted: the
+/// empty rows above a grid drawn against the pane's bottom and the empty
+/// columns right of a narrower grid, so a touch there reaches nothing (no
+/// link, no selection, no click) instead of the nearest edge cell.
+pub fn cell_at(
+    (x, y): (f32, f32),
+    (width, height): (f32, f32),
+    (row_off, col_off): (i32, usize),
+    (columns, rows): (usize, usize),
+) -> Option<(usize, usize)> {
+    if !(x >= 0. && y >= 0. && width > 0. && height > 0.) {
+        return None;
+    }
+    let row = (y / height).floor() as i64 + i64::from(row_off);
+    let col = (x / width).floor() as i64 + i64::try_from(col_off).ok()?;
+    let (row, col) = (usize::try_from(row).ok()?, usize::try_from(col).ok()?);
+    (row < rows && col < columns).then_some((col, row))
 }
 
 pub fn resolve_index(grid: &Crosswords<Listener>, theme: TerminalTheme, index: usize) -> ColorRgb {
@@ -725,15 +765,91 @@ mod tests {
     #[test]
     fn a_grid_larger_than_the_pane_follows_the_caret() {
         use super::viewport_origin;
-        // Fits: drawn whole from the top-left (the rest is letterboxed).
-        assert_eq!(viewport_origin((40, 10), (80, 24), (9, 39)), (0, 0));
+        // Fills the pane exactly: drawn whole from the top-left.
+        assert_eq!(viewport_origin((80, 24), (80, 24), Some((23, 79))), (0, 0));
+        // Narrower, as tall: from column 0, the rest of each row empty.
+        assert_eq!(viewport_origin((40, 24), (80, 24), Some((9, 39))), (0, 0));
         // Larger, caret in view: no movement.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (5, 10)), (0, 0));
+        assert_eq!(viewport_origin((120, 40), (80, 24), Some((5, 10))), (0, 0));
         // Caret below and right of the pane: just far enough to show it.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (30, 100)), (7, 21));
+        assert_eq!(
+            viewport_origin((120, 40), (80, 24), Some((30, 100))),
+            (7, 21)
+        );
         // Never past the grid's end.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (39, 119)), (16, 40));
-        assert_eq!(viewport_origin((120, 40), (80, 24), (60, 500)), (16, 40));
+        assert_eq!(
+            viewport_origin((120, 40), (80, 24), Some((39, 119))),
+            (16, 40)
+        );
+        assert_eq!(
+            viewport_origin((120, 40), (80, 24), Some((60, 500))),
+            (16, 40)
+        );
+    }
+
+    #[test]
+    fn a_grid_shorter_than_the_pane_sits_at_its_bottom() {
+        use super::viewport_origin;
+        // The Fold's cover screen: the host's grid from when the keyboard was up
+        // (24 rows) in a pane of 52 rows once it hid with the link down. The
+        // grid's row 0 is drawn on pane row 28, its last row on the pane's last.
+        assert_eq!(viewport_origin((50, 24), (50, 52), Some((22, 2))), (-28, 0));
+        // Unfolded: a wider, taller pane; the same rule.
+        assert_eq!(
+            viewport_origin((110, 30), (110, 61), Some((28, 2))),
+            (-31, 0)
+        );
+        // Shorter and narrower: bottom, from column 0.
+        assert_eq!(viewport_origin((40, 10), (80, 24), Some((9, 39))), (-14, 0));
+        // One row short: one empty row on top.
+        assert_eq!(viewport_origin((80, 23), (80, 24), Some((22, 2))), (-1, 0));
+    }
+
+    #[test]
+    fn scrolled_into_history_a_short_grid_stays_at_the_bottom() {
+        use super::viewport_origin;
+        // Scrolled (no caret to follow): the short offline grid keeps its place
+        // at the pane's bottom, so neither it nor the controls drawn on it jump.
+        assert_eq!(viewport_origin((50, 24), (50, 52), None), (-28, 0));
+        assert_eq!(viewport_origin((110, 30), (110, 61), None), (-31, 0));
+        assert_eq!(viewport_origin((40, 10), (80, 24), None), (-14, 0));
+        // A grid that fills the pane is drawn from the top-left as before.
+        assert_eq!(viewport_origin((80, 24), (80, 24), None), (0, 0));
+        // A larger grid's history view starts at its top-left, as it did.
+        assert_eq!(viewport_origin((120, 40), (80, 24), None), (0, 0));
+    }
+
+    #[test]
+    fn a_touch_above_a_bottom_anchored_grid_reaches_no_cell() {
+        use super::{cell_at, viewport_origin};
+        // The cover screen offline: a 50x24 grid at the bottom of a 52-row pane.
+        let origin = viewport_origin((50, 24), (50, 52), Some((22, 2)));
+        assert_eq!(origin, (-28, 0));
+        let at = |x, y| cell_at((x, y), (10., 20.), origin, (50, 24));
+        // The grid's first row is drawn on pane row 28, its last on row 51.
+        assert_eq!(at(5., 28. * 20.), Some((0, 0)));
+        assert_eq!(at(495., 51. * 20. + 19.), Some((49, 23)));
+        // The empty rows above it: nothing, not row 0 (where a link could be).
+        assert_eq!(at(5., 27. * 20. + 19.), None);
+        assert_eq!(at(5., 0.), None);
+    }
+
+    #[test]
+    fn a_touch_outside_the_drawn_grid_reaches_no_cell() {
+        use super::cell_at;
+        let at = |x, y, origin, grid| cell_at((x, y), (10., 20.), origin, grid);
+        // A grid that fills the pane: every cell is its own.
+        assert_eq!(at(0., 0., (0, 0), (80, 24)), Some((0, 0)));
+        assert_eq!(at(799.9, 479.9, (0, 0), (80, 24)), Some((79, 23)));
+        // Right of a narrower grid, and below or left of the pane: nothing.
+        assert_eq!(at(400., 5., (0, 0), (40, 24)), None);
+        assert_eq!(at(5., 480., (0, 0), (80, 24)), None);
+        assert_eq!(at(-0.5, 5., (0, 0), (80, 24)), None);
+        // A window into a larger grid that follows the caret is offset by it.
+        assert_eq!(at(5., 5., (16, 40), (120, 40)), Some((40, 16)));
+        assert_eq!(at(795., 465., (16, 40), (120, 40)), Some((119, 39)));
+        // A degenerate cell size maps nothing.
+        assert_eq!(cell_at((5., 5.), (0., 20.), (0, 0), (80, 24)), None);
     }
 
     #[test]

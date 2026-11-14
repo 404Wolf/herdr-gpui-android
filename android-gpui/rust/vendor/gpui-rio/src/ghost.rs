@@ -363,6 +363,43 @@ pub struct Previous {
     pub scrolled: bool,
 }
 
+/// The rows a frame was drawn with: the pane's and the grid's heights and
+/// the grid row drawn at the pane's top (the view origin's row, negative for
+/// a grid drawn against the pane's bottom).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrawnRows {
+    pub pane: u16,
+    pub grid: u16,
+    pub origin: i32,
+}
+
+impl Previous {
+    /// The controls' row from a frame drawn with `from`, for one drawn with
+    /// `to`. The same heights: unchanged, whatever the origin did (scrolling
+    /// a larger grid into history moves its origin but changes no height, and
+    /// the controls stay pinned to their pane row while scrolled). The same
+    /// grid in a pane of another height (a keyboard shown or hidden before the host resizes,
+    /// as while the link is down): rebased by the origin's move, onto the
+    /// same grid row. A grid of another height (the host's resize arrived):
+    /// `None`, as its rows need not hold what they held. `None` too when the
+    /// rebased row is above the pane; one past its bottom is left to
+    /// [`place_all`], which ignores it. Either way the controls then find
+    /// their row afresh.
+    pub fn carried(self, from: DrawnRows, to: DrawnRows) -> Option<Self> {
+        if from.grid != to.grid {
+            return None;
+        }
+        if from.pane == to.pane {
+            return Some(self);
+        }
+        let row = i64::try_from(self.row).ok()? + i64::from(from.origin) - i64::from(to.origin);
+        Some(Self {
+            row: usize::try_from(row).ok()?,
+            ..self
+        })
+    }
+}
+
 /// The draft, queued messages and the host's controls for one frame over
 /// `screen` (the rows as drawn). With Claude's prompt the controls are set
 /// into the rule under it; with another prompt (Codex), at the right end of
@@ -1099,6 +1136,160 @@ mod tests {
         };
         let layout = place_all(&g, None, &rows, Some(gone));
         assert!(layout.controls.iter().all(|c| c.row == 8));
+    }
+
+    #[test]
+    fn a_hidden_caret_after_the_keyboard_hides_offline_keeps_the_controls_at_the_bottom() {
+        // A 24-row grid filling a 24-row pane, the controls in the rule on its
+        // last row (pane row 23). The keyboard hides with the link down: the
+        // pane is 52 rows, the grid still 24, drawn against the bottom (origin
+        // row -28), so its rule is on pane row 51 and rows 0..28 are empty.
+        let mut lines = vec!["older output that fills the whole row with text, edge to edge"; 23];
+        lines.push("────────────────────────────────────────────────────────────");
+        let grid = screen(&lines, 60);
+        let g = recording(ghost(Vec::new()));
+        let before = place_all(&g, None, &grid, None);
+        assert!(before.controls.iter().all(|c| c.row == 23));
+        let mut tall = vec![vec![' '; 60]; 28];
+        tall.extend(grid);
+        let filled = DrawnRows {
+            pane: 24,
+            grid: 24,
+            origin: 0,
+        };
+        let anchored = DrawnRows {
+            pane: 52,
+            grid: 24,
+            origin: -28,
+        };
+        // A frame with no caret: the controls' last row, carried from origin
+        // row 0 to -28, is the same rule, now at the pane's bottom.
+        let previous = Previous {
+            row: 23,
+            scrolled: false,
+        };
+        let carried = previous.carried(filled, anchored);
+        assert_eq!(
+            carried,
+            Some(Previous {
+                row: 51,
+                scrolled: false
+            })
+        );
+        let layout = place_all(&g, None, &tall, carried);
+        assert!(!layout.controls.is_empty());
+        assert!(
+            layout.controls.iter().all(|c| c.row == 51),
+            "{:?}",
+            layout.controls
+        );
+        assert_eq!(drawn(&layout, 51, 60), drawn(&before, 23, 60));
+        // Uncarried, the stale row 23 is a blank one above the grid, which
+        // place_all would keep: the adapter carries it before calling it.
+        let stale = place_all(&g, None, &tall, Some(previous));
+        assert!(stale.controls.iter().all(|c| c.row == 23));
+        // The keyboard shown again before the host resizes: back on row 23.
+        assert_eq!(
+            carried.and_then(|p| p.carried(anchored, filled)),
+            Some(previous)
+        );
+        // Unchanged rows (a scroll, a repaint): the row is kept as it was.
+        assert_eq!(previous.carried(filled, filled), Some(previous));
+        // Moved above the pane: dropped. The keyboard shown with the link down
+        // over a grid filling the pane: a 12-row pane, the window following
+        // the caret at the grid's bottom (origin row 12), row 5 now above it.
+        let shrunk = DrawnRows {
+            pane: 12,
+            grid: 24,
+            origin: 12,
+        };
+        let high = Previous {
+            row: 5,
+            scrolled: false,
+        };
+        assert_eq!(high.carried(filled, shrunk), None);
+        let kept = previous.carried(filled, shrunk);
+        assert_eq!(kept.map(|p| p.row), Some(11));
+    }
+
+    #[test]
+    fn scrolling_a_larger_grid_keeps_the_controls_row() {
+        // A 40-row grid in a 24-row pane: at the bottom its window follows the
+        // caret (origin row 16); scrolled into history it starts at the top
+        // (origin row 0). Neither height changes, so the row is not moved.
+        let following = DrawnRows {
+            pane: 24,
+            grid: 40,
+            origin: 16,
+        };
+        let history = DrawnRows {
+            origin: 0,
+            ..following
+        };
+        let previous = Previous {
+            row: 23,
+            scrolled: true,
+        };
+        assert_eq!(previous.carried(following, history), Some(previous));
+        assert_eq!(previous.carried(history, following), Some(previous));
+        // Scrolled, the controls stay on that pane row over the history drawn
+        // there, so stop never moves from under the thumb.
+        let rows = screen(
+            &["older output that fills the whole row with text, edge to edge"; 24],
+            60,
+        );
+        let g = recording(ghost(Vec::new()));
+        let layout = place_all(&g, None, &rows, previous.carried(following, history));
+        assert!(!layout.controls.is_empty());
+        assert!(
+            layout.controls.iter().all(|c| c.row == 23),
+            "{:?}",
+            layout.controls
+        );
+    }
+
+    #[test]
+    fn a_host_grid_of_a_new_height_drops_the_controls_last_row() {
+        // After the keyboard hid offline (a 24-row grid at the bottom of a
+        // 52-row pane, the controls on pane row 51), the link is back and the
+        // host's grid catches up to 52 rows: drawn from the top, origin 0. Its
+        // rows are the program's new layout; row 23 holds nothing now.
+        let anchored = DrawnRows {
+            pane: 52,
+            grid: 24,
+            origin: -28,
+        };
+        let caught_up = DrawnRows {
+            pane: 52,
+            grid: 52,
+            origin: 0,
+        };
+        let mut lines = vec!["older output that fills the whole row with text, edge to edge"; 23];
+        lines.resize(52, "");
+        let rows = screen(&lines, 60);
+        let g = recording(ghost(Vec::new()));
+        let previous = Previous {
+            row: 51,
+            scrolled: false,
+        };
+        // Not rebased onto row 23 (the old keyboard boundary): dropped, so a
+        // frame with no caret finds the controls' row afresh, at the bottom.
+        let carried = previous.carried(anchored, caught_up);
+        assert_eq!(carried, None);
+        let layout = place_all(&g, None, &rows, carried);
+        assert!(!layout.controls.is_empty());
+        assert!(
+            layout.controls.iter().all(|c| c.row == 51),
+            "{:?}",
+            layout.controls
+        );
+        // Rebased by the origin's move instead, it would sit on row 23.
+        let rebased = Previous {
+            row: 23,
+            scrolled: false,
+        };
+        let stuck = place_all(&g, None, &rows, Some(rebased));
+        assert!(stuck.controls.iter().all(|c| c.row == 23));
     }
 
     #[test]
