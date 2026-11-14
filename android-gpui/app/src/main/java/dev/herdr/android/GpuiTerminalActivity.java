@@ -4724,6 +4724,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * caret, ghost text and dialogs. Any thread.
      */
     public void gpuiLayoutHint(long expectedGeneration, String json) {
+        // The drawn grid's geometry, for a debug build's tap tests (logcat tag herdr-tap).
+        if (debuggable()) android.util.Log.d("herdr-tap", "layout " + json);
         // Posted, never run inline: Rust calls this from inside a paint, and the
         // composer answers with ghost text, which must not re-enter that frame.
         main.post(() -> {
@@ -4744,7 +4746,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             synchronized (stateLock) {
                 if (destroyed || connection == null || connection.generation != expectedGeneration) return;
             }
-            if (!terminalTap.accept(stamp, id)) return;
+            boolean accepted = terminalTap.accept(stamp, id);
+            if (debuggable()) {
+                android.util.Log.d("herdr-tap", "report id=" + id + " stamp=" + stamp + " outcome="
+                        + TerminalTap.Outcome.of(outcome) + (accepted ? "" : " dropped"));
+            }
+            if (!accepted) return;
             terminalTapSettled(TerminalTap.Outcome.of(outcome));
         });
     }
