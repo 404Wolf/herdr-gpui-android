@@ -113,28 +113,6 @@ pub fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The screen cell (column, row) under the point `(x, y)` in the pane, in
-/// the units of `cell` (its width and height), counted as the program
-/// counts them from 0. `origin` is the grid cell drawn at the pane's
-/// top-left, as painting uses it: a negative row when a grid shorter than
-/// the pane is drawn against its bottom, a positive one when a larger grid's
-/// window follows the caret. `None` above, left of or past the grid (the
-/// empty rows over a bottom-anchored grid, the letterbox beside a narrow one).
-pub fn cell_at(
-    (x, y): (f32, f32),
-    (width, height): (f32, f32),
-    (row_off, col_off): (i32, usize),
-    (columns, rows): (usize, usize),
-) -> Option<(usize, usize)> {
-    if !(x >= 0. && y >= 0. && width > 0. && height > 0.) {
-        return None;
-    }
-    let row = (y / height).floor() as i64 + i64::from(row_off);
-    let col = (x / width).floor() as i64 + i64::try_from(col_off).ok()?;
-    let (row, col) = (usize::try_from(row).ok()?, usize::try_from(col).ok()?);
-    (row < rows && col < columns).then_some((col, row))
-}
-
 /// The stamp no touch-down carries: the host found none queued for the
 /// touch, so nothing may act on it.
 pub const NO_STAMP: u64 = u64::MAX;
@@ -308,9 +286,10 @@ impl Touch {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownStamps, Gesture, Lift, NO_STAMP, Press, Tapped, Touch, cell_at, lift, next_id, owns,
+        DownStamps, Gesture, Lift, NO_STAMP, Press, Tapped, Touch, lift, next_id, owns,
         plain_view_tap,
     };
+    use crate::cell_at;
 
     fn g(id: u64, stamp: u64) -> Gesture {
         Gesture { id, stamp }
