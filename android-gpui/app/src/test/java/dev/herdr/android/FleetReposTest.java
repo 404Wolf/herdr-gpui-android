@@ -51,12 +51,12 @@ public final class FleetReposTest {
         FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(linked, main), git));
         assertEquals(1, tree.repos.size());
         FleetTree.RepoRow repo = tree.repos.get(0);
-        assertEquals("/repos/monopoly/.git", repo.key);
+        assertEquals("monopoly", repo.key);
         assertEquals("monopoly", repo.name);
         assertEquals("2 projects", repo.countLabel());
-        assertEquals(Arrays.asList("alpha", "Zeta"), names(repo));
-        assertSame(tree.pms.get(0), repo.projects.get(0));
-        assertSame(tree.pms.get(1), repo.projects.get(1));
+        assertEquals(Arrays.asList("Zeta", "alpha"), names(repo));
+        assertSame(tree.pms.get(1), repo.projects.get(0));
+        assertSame(tree.pms.get(0), repo.projects.get(1));
     }
 
     @Test public void beforeGitArrivesTheConventionalWorktreePathGroupsDifferentProjectLabels() {
@@ -64,7 +64,7 @@ public final class FleetReposTest {
         FleetTree.Member b = member("t2", "pm", "desktop", "/h/.herdr/worktrees/herdr-android/desktop");
         FleetTree.RepoRow repo = FleetTree.pmTree(FleetTree.build(Arrays.asList(a, b), null)).repos.get(0);
         assertEquals("herdr-android", repo.name);
-        assertEquals(Arrays.asList("desktop", "phone"), names(repo));
+        assertEquals(Arrays.asList("phone", "desktop"), names(repo));
         assertEquals("2 projects", repo.countLabel());
     }
 
@@ -91,18 +91,16 @@ public final class FleetReposTest {
         assertEquals("android-renamed", fresh.repos.get(0).name);
     }
 
-    @Test public void twoRepositoriesWithTheSameBasenameRemainSeparateAndSortDeterministically() {
+    @Test public void twoRepositoriesWithTheSameBasenameShareOneHeader() {
         FleetTree.Member a = member("t1", "pm", "beta", "/a/repo");
         FleetTree.Member b = member("t2", "pm", "alpha", "/b/repo");
         FleetTree.GitLook git = new FleetTree.GitLook();
         place(git, a.cwd, "/a/repo/.git", a.cwd);
         place(git, b.cwd, "/b/repo/.git", b.cwd);
         FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(b, a), git));
-        assertEquals(2, tree.repos.size());
-        assertEquals("/a/repo/.git", tree.repos.get(0).key);
-        assertEquals("/b/repo/.git", tree.repos.get(1).key);
-        assertEquals(Collections.singletonList("beta"), names(tree.repos.get(0)));
-        assertEquals(Collections.singletonList("alpha"), names(tree.repos.get(1)));
+        assertEquals(1, tree.repos.size());
+        assertEquals("repo", tree.repos.get(0).key);
+        assertEquals(Arrays.asList("beta", "alpha"), names(tree.repos.get(0)));
     }
 
     @Test public void missingPmProjectsStayClickableAndBlockedWorkBubblesToTheRepo() {
@@ -117,16 +115,16 @@ public final class FleetReposTest {
         assertSame(orphan, FleetTree.projectTarget(repo.projects.get(0)));
     }
 
-    @Test public void headersSortByRepoNameAndEveryProjectAppearsOnce() {
+    @Test public void headersKeepProjectOrderAndEveryProjectAppearsOnce() {
         FleetTree.Member a = member("t1", "pm", "A project", "/h/.herdr/worktrees/Zulip/feature");
         FleetTree.Member b = member("t2", "pm", "B project", "/h/.herdr/worktrees/gitea/feature");
         FleetTree.Member c = member("t3", "pm", "C project", "/h/.herdr/worktrees/Zulip/another");
         FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(c, b, a), null));
         assertEquals(2, tree.repos.size());
-        assertEquals("gitea", tree.repos.get(0).name);
-        assertEquals(Collections.singletonList("B project"), names(tree.repos.get(0)));
-        assertEquals("Zulip", tree.repos.get(1).name);
-        assertEquals(Arrays.asList("A project", "C project"), names(tree.repos.get(1)));
+        assertEquals("Zulip", tree.repos.get(0).name);
+        assertEquals(Arrays.asList("A project", "C project"), names(tree.repos.get(0)));
+        assertEquals("gitea", tree.repos.get(1).name);
+        assertEquals(Collections.singletonList("B project"), names(tree.repos.get(1)));
         List<FleetTree.PmRow> shown = new ArrayList<>();
         for (FleetTree.RepoRow repo : tree.repos) shown.addAll(repo.projects);
         assertEquals(tree.pms.size(), shown.size());
@@ -148,7 +146,7 @@ public final class FleetReposTest {
         assertEquals(1, tree.repos.size());
         assertEquals("1 project", tree.repos.get(0).countLabel());
         assertSame(pm, tree.repos.get(0).projects.get(0).pm);
-        assertTrue(tree.otherMembers.contains(plain));
+        assertTrue(tree.outsideLoose.stream().anyMatch(node -> node.members.contains(plain)));
     }
 
     @Test public void reposStartOpenAndSelectionRevealsOnlyOnARealFocusChange() {
@@ -187,7 +185,7 @@ public final class FleetReposTest {
                     StandardCharsets.UTF_8);
             assertTrue(activity, source.contains("FleetTree.RepoRow repo : tree.repos"));
             assertTrue(activity, source.contains("FleetTree.PmRow pm : repo.projects"));
-            assertTrue(activity, source.contains("repo.countLabel()"));
+            assertTrue(activity, source.contains("repo.label("));
             assertTrue(activity, source.contains("FleetTree.Fold.REPO"));
         }
     }
