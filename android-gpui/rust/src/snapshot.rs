@@ -187,6 +187,7 @@ pub(crate) fn restore(saved: Saved) -> Result<Arc<gpui_rio::Session>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use std::time::{Duration, Instant};
 

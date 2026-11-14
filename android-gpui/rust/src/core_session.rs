@@ -515,10 +515,10 @@ impl Connection<'_> {
         // still has them (an agent labelling itself is the last backup). A
         // failure here is reported, never a reason to launch again.
         let mut label_error = None;
-        if labels.as_object().is_some_and(|l| !l.is_empty()) {
-            if let Err(error) = self.call("terminal.label", json!({"terminal":terminal,"labels":labels})) {
-                label_error = Some(format!("it could not be labelled ({error}); it will label itself"));
-            }
+        if labels.as_object().is_some_and(|l| !l.is_empty())
+            && let Err(error) = self.call("terminal.label", json!({"terminal":terminal,"labels":labels}))
+        {
+            label_error = Some(format!("it could not be labelled ({error}); it will label itself"));
         }
         let folder = folder.map(|f| json!(f)).unwrap_or_else(|| result["cwd"].clone());
         let root = json!({"children":[{"content":{"terminal":terminal},"id":block,"type":"block"}],"id":tab,"type":"row"});
@@ -962,7 +962,7 @@ impl TabEdit {
                     if list.is_empty() || list.len() > 96 {
                         return None;
                     }
-                    list.iter().map(|p| folder(p)).collect::<Option<Vec<_>>>()?
+                    list.iter().map(&folder).collect::<Option<Vec<_>>>()?
                 },
             },
             "file.read" => Self::FileRead {
@@ -1472,12 +1472,12 @@ fn serve(
                     #[cfg(not(feature = "android-ui"))]
                     let _ = reason;
                     connection.refresh()?;
-                    if !previous.is_empty() && previous != terminal {
-                        if let Err(Error::Protocol(_) | Error::Rpc { .. }) =
+                    if !previous.is_empty()
+                        && previous != terminal
+                        && let Err(Error::Protocol(_) | Error::Rpc { .. }) =
                             connection.attach(&previous, cols, rows)
-                        {
-                            connection.refresh()?;
-                        }
+                    {
+                        connection.refresh()?;
                     }
                 }
                 Err(error) => return Err(error),
@@ -1707,6 +1707,7 @@ fn discovery_peers(status: &Value) -> Result<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::{DEACON_DIR, deacon_dir};
     #[test]
     fn heard_reports_quiet_time_since_the_last_byte() {
