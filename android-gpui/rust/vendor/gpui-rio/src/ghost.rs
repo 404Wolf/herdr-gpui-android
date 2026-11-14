@@ -13,7 +13,9 @@
 //!
 //! The host's controls are drawn here too, as words set into the program's own
 //! frame ([`Control`]): into the rule under Claude's prompt like a box title,
-//! at the right end of Codex's prompt row, or on free cells at the bottom right.
+//! at the right end of Codex's prompt row, or, without a prompt, where they
+//! were last drawn or on free cells at the bottom right. They are never
+//! dropped: with no free cells they cover the end of the bottom row.
 //! The host puts its touch targets on the cells reported for them.
 
 /// Whose prompt the screen shows, as the host knows from the pane's agent.
@@ -321,7 +323,7 @@ fn free_tail(cells: &[char]) -> usize {
 }
 
 /// The controls as one line: ` a ─ b ─ c ──`, each control's cells marked.
-fn control_line(ghost: &Ghost) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
     let mut spans = Vec::new();
     let mut marks = Vec::new();
     let mut col = 0;
@@ -332,7 +334,7 @@ fn control_line(ghost: &Ghost) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) 
         });
         *col += text.chars().count();
     };
-    for (i, control) in ghost.controls.iter().enumerate() {
+    for (i, control) in controls.iter().enumerate() {
         push(
             if i == 0 { " " } else { " ─ " },
             GhostStyle::Dim,
@@ -345,27 +347,74 @@ fn control_line(ghost: &Ghost) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) 
         }
         marks.push((control.id.clone(), start, col));
     }
-    if !ghost.controls.is_empty() {
+    if !controls.is_empty() {
         push(" ──", GhostStyle::Dim, &mut spans, &mut col);
     }
     (spans, marks)
 }
 
+/// Where the controls were drawn in the frame before, for a frame without
+/// the program's caret (a hidden cursor, the view scrolled into history).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Previous {
+    pub row: usize,
+    /// The view is scrolled into history: the controls stay on that row over
+    /// whatever scrolled under them, so stop never moves from under the thumb.
+    pub scrolled: bool,
+}
+
 /// The draft, queued messages and the host's controls for one frame over
 /// `screen` (the rows as drawn). With Claude's prompt the controls are set
 /// into the rule under it; with another prompt (Codex), at the right end of
-/// the caret row, the draft wrapping short of them; with no prompt, on the
-/// lowest row whose right end is blank, the draft on the row above it when
-/// that end is blank too. Nothing is ever drawn over the program's text.
-pub fn place_all(ghost: &Ghost, anchor: Option<Anchor>, screen: &[Vec<char>]) -> Layout {
+/// the caret row, the draft wrapping short of them. With no prompt they stay
+/// on the row they had (`previous`) while it is still a rule or blank there,
+/// or always while scrolled; else on the lowest row whose right end is blank,
+/// the draft on the row above it when that end is blank too. The controls are
+/// never dropped for lack of room: when the host's line is too wide for the
+/// grid (its words follow the last layout hint, which lags a fold or a zoom),
+/// only its "talk" control is drawn, cut to the grid if need be; and with no
+/// free row they cover the right end of the bottom row. The draft is never
+/// drawn over the program's text.
+pub fn place_all(
+    ghost: &Ghost,
+    anchor: Option<Anchor>,
+    screen: &[Vec<char>],
+    previous: Option<Previous>,
+) -> Layout {
     let rows = screen.len();
     let cols = screen.first().map_or(0, Vec::len);
     if rows == 0 || cols == 0 {
         return Layout::default();
     }
-    let (line, marks) = control_line(ghost);
-    let len: usize = line.iter().map(|s| s.text.chars().count()).sum();
-    let fits = len > 0 && len + 8 <= cols;
+    let width = |line: &[GhostSpan]| -> usize { line.iter().map(|s| s.text.chars().count()).sum() };
+    let (mut line, mut marks) = control_line(&ghost.controls);
+    let mut len = width(&line);
+    // At the prompt the draft needs room beside the controls.
+    let roomy = len + if anchor.is_some() { 8 } else { 0 } <= cols;
+    if len > 0 && !roomy {
+        // The host's words are for a wider grid (it picks them from the last
+        // layout hint, which lags a fold or a zoom): its main control alone,
+        // "talk" (the stop while recording), cut to the grid if need be, so
+        // stop is never missing for a frame or for good.
+        // Under 8 cells the frame's ` ` and ` ──` would leave the words no room.
+        let framed = cols >= 8;
+        let room = if framed { cols - 4 } else { cols };
+        let main = ghost
+            .controls
+            .iter()
+            .find(|c| c.id == "talk")
+            .or(ghost.controls.last())
+            .map(|c| clip_control(c, room));
+        (line, marks) = match main {
+            Some(main) if !framed => {
+                let end = width(&main.spans);
+                (main.spans, vec![(main.id, 0, end)])
+            }
+            main => control_line(main.as_slice()),
+        };
+        len = width(&line);
+    }
+    let fits = len > 0 && len <= cols && marks.iter().any(|(_, start, end)| end > start);
     let mut layout = Layout::default();
     // The row the controls go on, if any.
     let controls_row = match anchor {
@@ -373,9 +422,18 @@ pub fn place_all(ghost: &Ghost, anchor: Option<Anchor>, screen: &[Vec<char>]) ->
             let below = (anchor.row + 1..rows.min(anchor.row + 3)).find(|&r| rule(&screen[r]));
             Some(below.unwrap_or(anchor.row))
         }
-        None if fits => (rows.saturating_sub(16)..rows)
-            .rev()
-            .find(|&r| free_tail(&screen[r]) > len),
+        None if fits => previous
+            .filter(|p| {
+                p.row < rows
+                    && (p.scrolled || rule(&screen[p.row]) || free_tail(&screen[p.row]) > len)
+            })
+            .map(|p| p.row)
+            .or_else(|| {
+                (rows.saturating_sub(16)..rows)
+                    .rev()
+                    .find(|&r| free_tail(&screen[r]) > len)
+            })
+            .or(Some(rows - 1)),
         _ => None,
     };
     layout.targets_top = anchor.map_or(controls_row.unwrap_or(rows), |a| a.row);
@@ -412,9 +470,23 @@ pub fn place_all(ghost: &Ghost, anchor: Option<Anchor>, screen: &[Vec<char>]) ->
                     cols
                 }
             };
-            layout
-                .placed
-                .extend(place_with(ghost, Some(anchor), rows, cols, &width_of));
+            // The controls win their cells: a wrapped draft line on their row
+            // (wrap never narrows a line below 8 cells) is cut short of them.
+            let controls_from = cols - len;
+            let draft = place_with(ghost, Some(anchor), rows, cols, &width_of)
+                .into_iter()
+                .filter_map(|mut run| {
+                    if Some(run.row) != controls_row || layout.controls.is_empty() {
+                        return Some(run);
+                    }
+                    let room = controls_from.saturating_sub(run.col);
+                    if room == 0 {
+                        return None;
+                    }
+                    run.text = clip(&run.text, room);
+                    Some(run)
+                });
+            layout.placed.extend(draft);
             layout.draft_shown = has_draft;
         }
         None => {
@@ -451,6 +523,41 @@ pub fn place_all(ghost: &Ghost, anchor: Option<Anchor>, screen: &[Vec<char>]) ->
         }
     }
     layout
+}
+
+/// `control`'s words cut to `room` cells, marked with an ellipsis when cut.
+fn clip_control(control: &Control, room: usize) -> Control {
+    let total: usize = control.spans.iter().map(|s| s.text.chars().count()).sum();
+    if total <= room {
+        return control.clone();
+    }
+    let mut left = room.saturating_sub(1);
+    let mut spans: Vec<GhostSpan> = Vec::new();
+    for span in &control.spans {
+        let text: String = span.text.chars().take(left).collect();
+        left -= text.chars().count();
+        if !text.is_empty() {
+            spans.push(GhostSpan {
+                text,
+                style: span.style,
+            });
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    match spans.last_mut() {
+        Some(last) => last.text.push('…'),
+        None if room > 0 => spans.push(GhostSpan {
+            text: "…".into(),
+            style: GhostStyle::Dim,
+        }),
+        None => {}
+    }
+    Control {
+        id: control.id.clone(),
+        spans,
+    }
 }
 
 /// `text` cut to `room` cells, marked with an ellipsis when cut.
@@ -712,7 +819,7 @@ mod tests {
             60,
         );
         let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
-        let layout = place_all(&controls(ghost(vec![text("Testing")])), anchor, &rows);
+        let layout = place_all(&controls(ghost(vec![text("Testing")])), anchor, &rows, None);
         assert_eq!(drawn(&layout, 4, 60).trim_start(), "type ─ talk ─ send ──");
         assert!(drawn(&layout, 4, 60).ends_with("send ──"));
         let talk = layout
@@ -733,7 +840,7 @@ mod tests {
         let anchor = locate(&rows, Some((1, 2)), PromptKind::Codex);
         let mut g = controls(ghost(vec![text(&"word ".repeat(8))]));
         g.kind = PromptKind::Codex;
-        let layout = place_all(&g, anchor, &rows);
+        let layout = place_all(&g, anchor, &rows, None);
         assert!(drawn(&layout, 1, 40).ends_with("send ──"));
         let first_control = layout
             .controls
@@ -768,6 +875,7 @@ mod tests {
             &controls(ghost(vec![text("no wait, keep the build dir")])),
             None,
             &rows,
+            None,
         );
         let row = layout.controls[0].row;
         assert_eq!(row, 5);
@@ -775,10 +883,254 @@ mod tests {
         assert!(drawn(&layout, 4, 60).ends_with("no wait, keep the build dir"));
         // Nothing over the dialog's rows.
         assert!(layout.placed.iter().all(|p| p.row >= 4));
-        // A screen whose bottom rows are all text has no room: nothing drawn.
+        // A screen whose bottom rows are all text has no free cells: the
+        // controls still cover the bottom row's end, the draft is not drawn.
         let full = screen(&["x".repeat(60).as_str(); 4], 60);
-        let layout = place_all(&controls(ghost(vec![text("hi")])), None, &full);
-        assert!(layout.placed.is_empty() && layout.controls.is_empty() && !layout.draft_shown);
+        let layout = place_all(&controls(ghost(vec![text("hi")])), None, &full, None);
+        assert_eq!(layout.controls.len(), 3);
+        assert!(layout.controls.iter().all(|c| c.row == 3));
+        assert!(drawn(&layout, 3, 60).ends_with(" type ─ talk ─ send ──"));
+        assert!(!layout.draft_shown);
+        assert_eq!(layout.targets_top, 3);
+    }
+
+    /// Claude's prompt box with the stop control while recording, as the host
+    /// sends it when there is room.
+    fn recording(mut g: Ghost) -> Ghost {
+        g.controls = vec![
+            control("type", "type"),
+            control("talk", "● rec 0:05 · tap to stop"),
+            control("send", "send"),
+        ];
+        g
+    }
+
+    /// Claude's prompt box `cols` wide, the caret after `❯ ` on row 3 and its
+    /// lower rule on row 4.
+    fn claude_box(cols: usize) -> (Vec<Vec<char>>, Option<Anchor>) {
+        let rule = "─".repeat(cols);
+        let rows = screen(
+            &["* Brewing…", "", &rule, "❯\u{a0}", &rule, "  -- INSERT --"],
+            cols,
+        );
+        let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+        assert!(anchor.is_some());
+        (rows, anchor)
+    }
+
+    /// The host's full line while recording, with three messages queued.
+    fn full_line(talk: &str) -> Ghost {
+        let mut g = ghost(Vec::new());
+        g.controls = vec![
+            control("type", "type"),
+            control("talk", talk),
+            control("send", "send·3"),
+        ];
+        g
+    }
+
+    const ONLINE: &str = "● rec 0:05 · tap to stop";
+    const OFFLINE: &str = "desktop offline · rec 0:05 · tap to stop";
+
+    #[test]
+    fn stop_is_drawn_when_the_hosts_words_are_too_wide_for_a_tiny_grid() {
+        // Pinch zoom at 24 pt on the cover screen (~28 cols), and with a 1.25
+        // system font scale (~22 cols): the host's words are for a wider grid.
+        for cols in [22, 28] {
+            let (rows, anchor) = claude_box(cols);
+            for talk in [ONLINE, OFFLINE] {
+                let layout = place_all(&full_line(talk), anchor, &rows, None);
+                assert_eq!(layout.controls.len(), 1, "{cols} cols, {talk}");
+                let stop = &layout.controls[0];
+                assert_eq!(
+                    (stop.id.as_str(), stop.row),
+                    ("talk", 4),
+                    "{cols} cols, {talk}"
+                );
+                assert!(stop.end <= cols && stop.end > stop.start);
+                // Whole when it fits the grid, else cut with an ellipsis.
+                let line = drawn(&layout, 4, cols);
+                if talk.chars().count() + 4 <= cols {
+                    assert!(
+                        line.ends_with(&format!(" {talk} ──")),
+                        "{cols} cols: {line:?}"
+                    );
+                } else {
+                    assert!(line.ends_with("… ──"), "{cols} cols: {line:?}");
+                    assert!(line.trim_start().starts_with(&talk[..3]), "{line:?}");
+                }
+            }
+        }
+        // The host's own shortest words fit as they are, with the draft's margin.
+        let (rows, anchor) = claude_box(22);
+        let mut g = ghost(Vec::new());
+        g.controls = vec![control("talk", "● stop")];
+        let layout = place_all(&g, anchor, &rows, None);
+        assert_eq!(drawn(&layout, 4, 22).trim_start(), "● stop ──");
+    }
+
+    #[test]
+    fn the_first_frame_after_a_fold_still_draws_stop() {
+        // Unfolded at 100 cols the full offline line fits; folded to 62 it
+        // does not, and the host's narrower words come only with the next
+        // layout hint. This frame already draws the stop, whole.
+        let g = full_line(OFFLINE);
+        let (wide, anchor) = claude_box(100);
+        assert_eq!(place_all(&g, anchor, &wide, None).controls.len(), 3);
+        let (folded, anchor) = claude_box(62);
+        let layout = place_all(&g, anchor, &folded, None);
+        assert_eq!(layout.controls.len(), 1);
+        assert_eq!(layout.controls[0].id, "talk");
+        assert!(drawn(&layout, 4, 62).ends_with(&format!(" {OFFLINE} ──")));
+    }
+
+    #[test]
+    fn a_wrapped_draft_never_covers_the_stop() {
+        // The host's words from a wider grid: only the stop is drawn, in the
+        // rule under the prompt, and a long draft wraps onto that row. The
+        // stop keeps its cells; the draft there is cut short of them, or left
+        // out where the stop takes the whole row.
+        let draft = "please keep the build directory and rerun only the failing tests";
+        for (cols, talk) in [(22, OFFLINE), (34, ONLINE)] {
+            let (rows, anchor) = claude_box(cols);
+            let mut g = full_line(talk);
+            g.draft = vec![text(draft)];
+            let layout = place_all(&g, anchor, &rows, None);
+            let stop = layout.controls.first().expect("stop drawn");
+            assert_eq!((stop.id.as_str(), stop.row), ("talk", 4));
+            let cells: Vec<char> = drawn(&layout, 4, cols).chars().collect();
+            let label: String = cells[stop.start..stop.end].iter().collect();
+            assert!(
+                talk.starts_with(label.trim_end_matches('…')),
+                "{cols}: {label:?}"
+            );
+            for run in layout
+                .placed
+                .iter()
+                .filter(|p| p.row == 4 && p.style == GhostStyle::Text)
+            {
+                assert!(
+                    run.col + run.text.chars().count() < stop.start,
+                    "{run:?} covers {stop:?}"
+                );
+            }
+            assert!(layout.draft_shown);
+        }
+        // With a few cells to spare, the wrapped line keeps them.
+        let (rows, anchor) = claude_box(34);
+        let mut g = full_line(ONLINE);
+        g.draft = vec![text(draft)];
+        let layout = place_all(&g, anchor, &rows, None);
+        let kept = layout
+            .placed
+            .iter()
+            .find(|p| p.row == 4 && p.style == GhostStyle::Text)
+            .expect("the draft keeps the cells left of the stop");
+        assert_eq!(kept.col, 2);
+    }
+
+    #[test]
+    fn under_eight_columns_the_stop_drops_its_frame() {
+        for cols in 2..8 {
+            let rows = screen(&["x".repeat(cols).as_str(); 3], cols);
+            let layout = place_all(&full_line(OFFLINE), None, &rows, None);
+            let stop = layout.controls.first().expect("stop drawn");
+            assert_eq!(stop.id, "talk");
+            assert_eq!((stop.start, stop.end), (0, cols), "{cols} cols");
+            assert!(drawn(&layout, 2, cols).starts_with('d'), "{cols} cols");
+        }
+    }
+
+    #[test]
+    fn a_control_is_cut_across_its_spans() {
+        let talk = Control {
+            id: "talk".into(),
+            spans: vec![
+                GhostSpan {
+                    text: "talk".into(),
+                    style: GhostStyle::Dim,
+                },
+                GhostSpan {
+                    text: "·12".into(),
+                    style: GhostStyle::Warn,
+                },
+            ],
+        };
+        assert_eq!(clip_control(&talk, 7), talk);
+        let cut = clip_control(&talk, 6);
+        let words: Vec<&str> = cut.spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(words, ["talk", "·…"]);
+        assert_eq!(clip_control(&talk, 1).spans[0].text, "…");
+        assert!(clip_control(&talk, 0).spans.is_empty());
+    }
+
+    #[test]
+    fn scrolled_into_history_the_controls_stay_on_their_row() {
+        let mut lines = vec!["older output that fills the whole row with text, edge to edge"; 9];
+        lines[8] = "  -- INSERT -- ⏵⏵ bypass permissions on";
+        let rows = screen(&lines, 60);
+        let g = recording(ghost(vec![text("half a thought")]));
+        // Scrolled: no caret, and history covers the rule's row. The controls
+        // stay where they were drawn, over what scrolled under them.
+        let previous = Previous {
+            row: 6,
+            scrolled: true,
+        };
+        let layout = place_all(&g, None, &rows, Some(previous));
+        let talk = layout
+            .controls
+            .iter()
+            .find(|c| c.id == "talk")
+            .expect("stop drawn while scrolled");
+        assert_eq!(talk.row, 6);
+        assert!(drawn(&layout, 6, 60).ends_with("● rec 0:05 · tap to stop ─ send ──"));
+        assert_eq!(layout.targets_top, 6);
+        // Not scrolled, the old row holds text now (a dialog): it is not kept.
+        let live = Previous {
+            row: 6,
+            scrolled: false,
+        };
+        let layout = place_all(&g, None, &rows, Some(live));
+        assert!(layout.controls.iter().all(|c| c.row == 8));
+        // A previous row past the bottom (the view shrank) is ignored.
+        let gone = Previous {
+            row: 40,
+            scrolled: true,
+        };
+        let layout = place_all(&g, None, &rows, Some(gone));
+        assert!(layout.controls.iter().all(|c| c.row == 8));
+    }
+
+    #[test]
+    fn a_hidden_caret_keeps_the_controls_in_claudes_rule() {
+        let rows = screen(
+            &[
+                "* Working… (12s · esc to interrupt)",
+                "",
+                "────────────────────────────────────────────────────────────",
+                "❯\u{a0}",
+                "────────────────────────────────────────────────────────────",
+                "  -- INSERT -- ⏵⏵ bypass permissions on",
+            ],
+            60,
+        );
+        let g = recording(ghost(Vec::new()));
+        let anchored = place_all(
+            &g,
+            locate(&rows, Some((3, 2)), PromptKind::Claude),
+            &rows,
+            None,
+        );
+        let row = anchored.controls[0].row;
+        assert_eq!(row, 4);
+        // Claude hides its cursor for a frame while it redraws: no caret, but
+        // the rule is still there, so the controls do not jump.
+        let previous = Previous {
+            row,
+            scrolled: false,
+        };
+        let layout = place_all(&g, None, &rows, Some(previous));
+        assert_eq!(layout.controls, anchored.controls);
     }
 
     // Captured from Claude Code 2.1.322 at 100x30 (trimmed): the cursor sits

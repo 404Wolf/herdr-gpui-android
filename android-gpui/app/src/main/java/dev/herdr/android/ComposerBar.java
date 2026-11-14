@@ -274,6 +274,8 @@ final class ComposerBar {
         if (hint == null) return;
         layout = hint;
         place();
+        // The grid's width picks the controls' words (a fold or unfold changes it).
+        pushGhost();
     }
 
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
@@ -750,23 +752,41 @@ final class ComposerBar {
     /** Characters of the queued count drawn after "send" ("·2"), 0 when none. */
     private int sendCount;
 
-    /** The controls drawn in the program's frame, for the current state. */
+    /** The controls drawn in the program's frame, for the current state and the grid's width. */
     private java.util.List<GhostText.Control> controls() {
-        String count = queuedMessages.isEmpty() ? "" : "·" + QueuedMessages.badge(queuedMessages.size());
-        sendCount = count.length();
-        return controls(typing, dictation.isAvailable() ? talk() : null, queuedMessages);
+        boolean dictates = dictation.isAvailable();
+        int cols = layout == null ? Integer.MAX_VALUE : layout.cols;
+        java.util.List<GhostText.Control> talks = dictates
+                ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
+                : java.util.Collections.emptyList();
+        java.util.List<GhostText.Control> out = controls(typing, talks, queuedMessages, cols);
+        sendCount = 0;
+        for (GhostText.Control control : out) {
+            if ("send".equals(control.id) && control.spans.length > 2) sendCount = control.spans[2].length();
+        }
+        return out;
     }
 
     /**
-     * "type ─ talk ─ send": "type" reads "hide" while the keyboard is up (it
-     * toggles it), "talk" is left out with no dictation, and "send" carries the
-     * queued count in the most pressing message's colour.
+     * Cells the renderer wants free beside the controls' line at the prompt,
+     * or it draws only "talk", cut to fit (gpui-rio ghost.rs, {@code place_all}).
      */
-    static java.util.List<GhostText.Control> controls(boolean typing, GhostText.Control talk,
-            List<Outbox.Message> queued) {
-        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
-        out.add(new GhostText.Control("type", typing ? "hide" : "type", "dim"));
-        if (talk != null) out.add(talk);
+    static final int CONTROLS_MARGIN = 8;
+
+    /**
+     * "type ─ talk ─ send", made to fit {@code cols}: "type" reads "hide" while
+     * the keyboard is up (it toggles it), "talk" is left out with no dictation,
+     * and "send" carries the queued count in the most pressing message's
+     * colour. {@code talks} are "talk"'s words from the fullest to the
+     * shortest, none without dictation. When the full line is too wide for
+     * the grid (the Fold's cover screen while recording), "talk" takes its
+     * short words, then "type", the count and "send" are left out in turn,
+     * and last "talk" takes its shortest words. "talk", the stop while
+     * recording, is never left out.
+     */
+    static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
+            List<Outbox.Message> queued, int cols) {
+        GhostText.Control type = new GhostText.Control("type", typing ? "hide" : "type", "dim");
         String count = queued.isEmpty() ? "" : "·" + QueuedMessages.badge(queued.size());
         String countStyle;
         switch (QueuedMessages.urgency(queued)) {
@@ -774,20 +794,76 @@ final class ComposerBar {
             case WAITING: countStyle = "warn"; break;
             default: countStyle = "info";
         }
-        out.add(new GhostText.Control("send", "send", "bright", count, countStyle));
+        GhostText.Control send = new GhostText.Control("send", "send", "bright", count, countStyle);
+        GhostText.Control bareSend = new GhostText.Control("send", "send", "bright");
+        GhostText.Control talk = talks.isEmpty() ? null : talks.get(0);
+        GhostText.Control shorter = talks.isEmpty() ? null : talks.get(Math.min(1, talks.size() - 1));
+        GhostText.Control shortest = talks.isEmpty() ? null : talks.get(talks.size() - 1);
+        java.util.List<java.util.List<GhostText.Control>> ladder = java.util.Arrays.asList(
+                line(type, talk, send),
+                line(type, shorter, send),
+                line(null, shorter, send),
+                line(null, shorter, bareSend),
+                line(null, shorter, null),
+                line(null, shortest, null));
+        java.util.List<GhostText.Control> barest = null;
+        for (java.util.List<GhostText.Control> line : ladder) {
+            if (line.isEmpty()) continue;
+            if (lineWidth(line) + CONTROLS_MARGIN <= cols) return line;
+            barest = line;
+        }
+        return barest == null ? java.util.Collections.emptyList() : barest;
+    }
+
+    private static java.util.List<GhostText.Control> line(GhostText.Control... controls) {
+        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
+        for (GhostText.Control control : controls) if (control != null) out.add(control);
         return out;
     }
 
+    /** Cells the renderer's line takes for {@code controls}: " a ─ b ─ c ──". */
+    static int lineWidth(List<GhostText.Control> controls) {
+        if (controls.isEmpty()) return 0;
+        int width = 1 + 3 * (controls.size() - 1) + 3;
+        for (GhostText.Control control : controls) {
+            for (int i = 0; i + 1 < control.spans.length; i += 2) {
+                width += control.spans[i].codePointCount(0, control.spans[i].length());
+            }
+        }
+        return width;
+    }
+
+    /** How many words "talk" may take: all of them, a narrow grid's, or a tiny grid's. */
+    private enum Words { FULL, SHORT, TINY }
+
     /** "talk", or what the dictation is doing, as TUI-style words. */
-    private GhostText.Control talk() {
+    private GhostText.Control talk(Words words) {
         long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
         String clock = MicButton.clock(elapsed);
         switch (dictationState) {
-            case CONNECTING: return new GhostText.Control("talk", "connecting…", "info");
-            case LISTENING: return new GhostText.Control("talk", "● rec " + clock + " · tap to stop", "danger");
-            case TRANSCRIBING: return new GhostText.Control("talk", "transcribing…", "info");
-            case OFFLINE_RECORDING:
-                return new GhostText.Control("talk", "desktop offline · rec " + clock + " · tap to stop", "warn");
+            case CONNECTING:
+                return new GhostText.Control("talk", words == Words.TINY ? "…" : "connecting…", "info");
+            case LISTENING: {
+                String text;
+                switch (words) {
+                    case FULL: text = "● rec " + clock + " · tap to stop"; break;
+                    case SHORT: text = "● " + clock + " stop"; break;
+                    default: text = "● stop";
+                }
+                return new GhostText.Control("talk", text, "danger");
+            }
+            case TRANSCRIBING:
+                return new GhostText.Control("talk", words == Words.TINY ? "…" : "transcribing…", "info");
+            case OFFLINE_RECORDING: {
+                // The warning colour still says offline when the words cannot.
+                String text;
+                switch (words) {
+                    case FULL: text = "desktop offline · rec " + clock + " · tap to stop"; break;
+                    case SHORT: text = "● offline " + clock + " stop"; break;
+                    default: text = "● stop";
+                }
+                return new GhostText.Control("talk", text, "warn");
+            }
             default:
                 return new GhostText.Control("talk", "talk", "dim", waiting > 0 ? "·" + waiting : "", "warn");
         }
