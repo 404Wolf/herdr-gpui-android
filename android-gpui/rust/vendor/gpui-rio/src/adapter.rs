@@ -242,7 +242,9 @@ macro_rules! __bind_gpui {
                 }
                 /// The screen cell (column, row) under `point`, counted as the
                 /// program counts them: only on the live screen, not in history,
-                /// and not in the letterbox beside a smaller grid.
+                /// and never on the pane's empty area (above a grid drawn against
+                /// its bottom, beside a narrower one). The same mapping as
+                /// `position`, which links and selection use.
                 fn screen_cell(&self, point: Point<Pixels>) -> Option<(usize, usize)> {
                     if !self.bounds.contains(&point) {
                         return None;
@@ -253,7 +255,7 @@ macro_rules! __bind_gpui {
                     }
                     // The geometry the last paint drew with: cell size (font scale,
                     // pinch zoom) and the grid cell at the pane's top-left.
-                    $crate::tap::cell_at(
+                    $crate::cell_at(
                         (
                             f32::from(point.x - self.bounds.left()),
                             f32::from(point.y - self.bounds.top()),
