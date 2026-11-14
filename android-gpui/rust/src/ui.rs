@@ -137,6 +137,15 @@ impl TerminalView {
                             &crate::ghost_bridge::hint_json(hint),
                         );
                     });
+                    // A tap the program took as a mouse click opens no keyboard.
+                    #[cfg(target_os = "android")]
+                    terminal.set_tap_listener(|done| {
+                        let generation = model::mailbox().state().generation;
+                        crate::android::terminal_tapped(
+                            generation,
+                            done == gpui_rio::tap::Lift::Click,
+                        );
+                    });
                     #[cfg(target_os = "android")]
                     terminal.set_link_handler(|link| {
                         let generation = model::mailbox().state().generation;

@@ -343,6 +343,30 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
     .is_ok()
 }
 
+/// Tells Java what the renderer did with a tap on the terminal, once it has:
+/// whether the program took it as a mouse click. Java opens the keyboard for
+/// a tap only when it did not.
+pub(crate) fn terminal_tapped(generation: i64, clicked: bool) -> bool {
+    gpui_mobile::android::jni::with_env(|env| {
+        let activity = gpui_mobile::android::jni::activity(env)?;
+        let name = jni_mobile::strings::JNIString::from("gpuiTerminalTapped");
+        let signature = jni_mobile::signature::RuntimeMethodSignature::from_str("(JZ)V")
+            .map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            name,
+            signature.method_signature(),
+            &[
+                jni_mobile::objects::JValue::Long(generation),
+                jni_mobile::objects::JValue::Bool(clicked),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .is_ok()
+}
+
 /// Tells Java where the drawn screen is busy (see `gpui_rio::ghost::LayoutHint`),
 /// so it floats its controls clear of the caret, ghost text and dialogs.
 pub(crate) fn layout_hint(generation: i64, json: &str) -> bool {

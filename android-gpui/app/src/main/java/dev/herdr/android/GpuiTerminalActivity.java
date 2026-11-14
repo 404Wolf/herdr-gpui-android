@@ -159,6 +159,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Vertical swipe state: a short tap still reaches the terminal. */
     private float touchDownX, edgeStartX;
     private boolean tapCandidate;
+    /** A counted tap waiting for the renderer to say whether the program clicked. */
+    private final TerminalTap terminalTap = new TerminalTap();
+    private final Runnable terminalTapTimeout = () -> {
+        if (terminalTap.settle()) terminalTapSettled(false);
+    };
     private long touchDownAt;
     private boolean edgeClaimed;
     private float touchDownY, lastTouchY, scrollFraction;
@@ -4283,26 +4288,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
             // A plain tap on the terminal opens the keyboard: typing into an agent
-            // should not need the toolbar. The tap still reaches the program.
+            // should not need the toolbar. The tap reaches the renderer first,
+            // which may send it to the program as a mouse click; what it did
+            // comes back in gpuiTerminalTapped, and only then is typing opened.
             if (masked == MotionEvent.ACTION_UP && tapCandidate && !scrolling && !edgeClaimed
                     && SystemClock.uptimeMillis() - touchDownAt < 350
                     && Math.abs(event.getX() - touchDownX) < dp(10)
                     && Math.abs(event.getY() - touchDownY) < dp(10)) {
-                Connection target;
-                synchronized (stateLock) { target = connection; }
-                // After the tap itself reaches the renderer: its focus handling
-                // would otherwise hide the keyboard this just asked for.
-                // An agent's pane types into the composer's draft instead.
-                boolean composing = composer != null && composer.terminalTapped();
-                if (!composing && target != null && target.ready && terminalSurface != null) {
-                    final long generation = target.generation;
-                    terminalSurface.postDelayed(() -> {
-                        // A tapped file link opened the file page instead.
-                        if (!destroyed && (filePager == null || !filePager.showingFile())) {
-                            nativeShowKeyboard(generation);
-                        }
-                    }, 150);
-                }
+                terminalTap.tapped();
+                main.removeCallbacks(terminalTapTimeout);
+                main.postDelayed(terminalTapTimeout, TerminalTap.REPORT_WAIT_MS);
             }
             tapCandidate = false;
             if (edgeClaimed) {
@@ -4464,6 +4459,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
+        main.removeCallbacks(terminalTapTimeout);
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
         Dictation.pending(this).setListener(null);
@@ -4715,6 +4711,43 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (composer != null) composer.layoutHint(json);
         });
+    }
+
+    /**
+     * The renderer had a tap on the terminal: {@code clicked} when it sent it
+     * to the program as a mouse click. Settles a tap this activity counted.
+     */
+    public void gpuiTerminalTapped(long expectedGeneration, boolean clicked) {
+        main.post(() -> {
+            synchronized (stateLock) {
+                if (destroyed || connection == null || connection.generation != expectedGeneration) return;
+            }
+            if (!terminalTap.settle()) return;
+            main.removeCallbacks(terminalTapTimeout);
+            terminalTapSettled(clicked);
+        });
+    }
+
+    /** A counted tap, after the renderer had it: typing opens unless the program clicked. */
+    private void terminalTapSettled(boolean clicked) {
+        if (destroyed) return;
+        Connection target;
+        synchronized (stateLock) { target = connection; }
+        // An agent's pane types into the composer's draft instead.
+        boolean handled = composer != null
+                ? composer.terminalTapped(clicked)
+                : TerminalTap.after(clicked, false) == TerminalTap.Action.NOTHING;
+        if (!handled && target != null && target.ready && terminalSurface != null) {
+            final long generation = target.generation;
+            // After the renderer's own focus handling for the tap, which would
+            // otherwise hide the keyboard this just asked for.
+            terminalSurface.postDelayed(() -> {
+                // A tapped file link opened the file page instead.
+                if (!destroyed && (filePager == null || !filePager.showingFile())) {
+                    nativeShowKeyboard(generation);
+                }
+            }, 150);
+        }
     }
 
     /** Opens a terminal link through the platform browser; never a file or custom scheme. */

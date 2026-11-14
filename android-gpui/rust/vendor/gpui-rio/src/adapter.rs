@@ -46,6 +46,8 @@ macro_rules! __bind_gpui {
                 host_input: bool,
                 /// Opens a tapped link; without one, links are plain text.
                 link_handler: Option<std::rc::Rc<dyn Fn($crate::links::Link)>>,
+                /// Told what each lifted press did, so the host can act on taps.
+                tap_listener: Option<std::rc::Rc<dyn Fn($crate::tap::Lift)>>,
                 /// Where the finger went down, while it may still be a tap.
                 press: Option<Point<Pixels>>,
                 /// The link under that finger: the columns it covers on each row
@@ -108,6 +110,7 @@ macro_rules! __bind_gpui {
                             marked: String::new(),
                             host_input: false,
                             link_handler: None,
+                            tap_listener: None,
                             press: None,
                             pressed_link: None,
                             touch: $crate::tap::Touch::default(),
@@ -143,6 +146,12 @@ macro_rules! __bind_gpui {
                 /// wrapped or not) calls `handler`.
                 pub fn set_link_handler(&mut self, handler: impl Fn($crate::links::Link) + 'static) {
                     self.link_handler = Some(std::rc::Rc::new(handler));
+                }
+                /// Told what each lifted press did, after it was done: `Click` only
+                /// when the program was sent one. A host that opens a keyboard on
+                /// a tap leaves it shut for a tap the program took as a click.
+                pub fn set_tap_listener(&mut self, listener: impl Fn($crate::tap::Lift) + 'static) {
+                    self.tap_listener = Some(std::rc::Rc::new(listener));
                 }
                 /// Draws `ghost` (or nothing) over the screen from the next frame on.
                 pub fn set_ghost(&mut self, ghost: Option<Arc<$crate::ghost::Ghost>>) {
@@ -721,7 +730,7 @@ macro_rules! __bind_gpui {
                                     held: this.touch.lifted(),
                                 };
                                 let link = this.pressed_link.take();
-                                match $crate::tap::lift(press) {
+                                let done = match $crate::tap::lift(press) {
                                     $crate::tap::Lift::OpenLink => {
                                         // A tap on a link opens it and selects nothing.
                                         this.session.grid().lock().selection = None;
@@ -729,6 +738,7 @@ macro_rules! __bind_gpui {
                                             handler(url);
                                         }
                                         cx.notify();
+                                        $crate::tap::Lift::OpenLink
                                     }
                                     // A program that asked for mouse events (Claude Code's
                                     // fullscreen view, other TUIs) gets the tap as a click;
@@ -739,9 +749,15 @@ macro_rules! __bind_gpui {
                                         {
                                             this.session.grid().lock().selection = None;
                                             cx.notify();
+                                            $crate::tap::Lift::Click
+                                        } else {
+                                            $crate::tap::Lift::Nothing
                                         }
                                     }
-                                    $crate::tap::Lift::Nothing => {}
+                                    $crate::tap::Lift::Nothing => $crate::tap::Lift::Nothing,
+                                };
+                                if let Some(listener) = this.tap_listener.clone() {
+                                    listener(done);
                                 }
                             }),
                         )

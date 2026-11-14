@@ -38,7 +38,8 @@ repository's [LICENSE](../../../../LICENSE). The changes below are this copy's.
   cell, SGR-encoded when it asked for 1006 (`mouse.rs`, `Session::click`).
   This is how Claude Code's fullscreen view gets clicks. Without mouse
   reporting a tap does what it did before. `Session::wheel` uses the same
-  encoder.
+  encoder. `set_tap_listener` tells the host what each lifted press did, so
+  a host that opens a keyboard on a tap can leave it shut for a click.
 - Errors are a typed `Error`; `anyhow` and the GPUI tests against a local PTY
   were removed. The tests here drive a real socket pair.
 

@@ -322,14 +322,21 @@ final class ComposerBar {
     }
 
     /**
-     * A tap on the terminal. On an agent's pane it opens the keyboard into the
-     * draft (true); elsewhere the terminal's own keyboard is the caller's to
-     * show (false).
+     * A tap on the terminal, once the renderer had it. A tap the program took
+     * as a mouse click opens nothing (true). On an agent's pane any other tap
+     * opens the keyboard into the draft (true); elsewhere the terminal's own
+     * keyboard is the caller's to show (false). See {@link TerminalTap}.
      */
-    boolean terminalTapped() {
-        if (!agent) return false;
-        startTyping();
-        return true;
+    boolean terminalTapped(boolean clickedProgram) {
+        switch (TerminalTap.after(clickedProgram, agent)) {
+            case NOTHING:
+                return true;
+            case TYPE_INTO_DRAFT:
+                startTyping();
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** The file page opened or closed over the terminal. */
