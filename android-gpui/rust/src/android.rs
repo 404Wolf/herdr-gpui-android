@@ -252,11 +252,11 @@ pub(crate) fn touch_handled() {
     lock_downs().handled();
 }
 
-/// The stamp Java sent with the down of the touch GPUI is handling: the pane
-/// it began on. `tap::NO_STAMP`, which Java never hands out, when none was
-/// queued, so nothing acts on it and its report is dropped.
-pub(crate) fn touch_stamp() -> u64 {
-    lock_downs().current()
+/// The gesture GPUI is handling: the down it handled last, with the stamp
+/// Java sent with it (the pane it began on). Its stamp is `tap::NO_STAMP`,
+/// which Java never hands out, when none was queued, so nothing acts on it.
+pub(crate) fn touch_stamp() -> gpui_rio::tap::Gesture {
+    lock_downs().now()
 }
 
 #[allow(unsafe_code)]

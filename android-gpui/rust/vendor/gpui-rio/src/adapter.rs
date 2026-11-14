@@ -51,7 +51,7 @@ macro_rules! __bind_gpui {
                 /// its touch begin (see `tap::owns`).
                 touch_presses: bool,
                 tap_listener: Option<(
-                    std::rc::Rc<dyn Fn() -> u64>,
+                    std::rc::Rc<dyn Fn() -> $crate::tap::Gesture>,
                     std::rc::Rc<dyn Fn($crate::tap::Report)>,
                 )>,
                 /// Where the finger went down, while it may still be a tap.
@@ -141,6 +141,10 @@ macro_rules! __bind_gpui {
                 }
                 pub fn set_visible(&mut self, visible: bool) {
                     self.visible = visible;
+                    if !visible {
+                        // A view put away holds no touch to act on when it is back.
+                        self.touch.clear();
+                    }
                 }
                 /// For hosts that deliver keys and text to the session themselves, as on
                 /// Android, where one IME bridge commits input. The entity then registers
@@ -158,11 +162,12 @@ macro_rules! __bind_gpui {
                 /// when the program was sent a click. A host that opens a keyboard on
                 /// a tap leaves it shut for a click. `stamp` is asked when a press
                 /// begins and comes back in its report: a host that queues a stamp
-                /// with each touch-down (`tap::DownStamps`) answers with the one of
-                /// the down being handled, so it learns which view the press began on.
+                /// with each touch-down (`tap::DownStamps`) answers with the gesture
+                /// being handled, so it learns which view the press began on, and
+                /// this view acts only on the gesture it saw begin.
                 pub fn set_tap_listener(
                     &mut self,
-                    stamp: impl Fn() -> u64 + 'static,
+                    stamp: impl Fn() -> $crate::tap::Gesture + 'static,
                     listener: impl Fn($crate::tap::Report) + 'static,
                 ) {
                     self.tap_listener = Some((std::rc::Rc::new(stamp), std::rc::Rc::new(listener)));
@@ -173,8 +178,8 @@ macro_rules! __bind_gpui {
                 pub fn set_touch_presses(&mut self, touch: bool) {
                     self.touch_presses = touch;
                 }
-                fn tap_stamp(&self) -> u64 {
-                    self.tap_listener.as_ref().map_or($crate::tap::NO_STAMP, |(stamp, _)| stamp())
+                fn tap_stamp(&self) -> $crate::tap::Gesture {
+                    self.tap_listener.as_ref().map_or($crate::tap::Gesture::NONE, |(stamp, _)| stamp())
                 }
                 /// Draws `ghost` (or nothing) over the screen from the next frame on.
                 pub fn set_ghost(&mut self, ghost: Option<Arc<$crate::ghost::Ghost>>) {
@@ -753,13 +758,16 @@ macro_rules! __bind_gpui {
                                 this.selecting = false;
                                 let pressed_at = this.press.take();
                                 let touch = this.touch.lifted();
+                                // The gesture lifting now: a touch this view holds from an
+                                // earlier one (cancelled, or begun elsewhere) is not it.
+                                let now = this.tap_stamp();
                                 let press = $crate::tap::Press {
                                     on_link: this.pressed_link.is_some(),
                                     travelled: pressed_at.is_none(),
                                     held: touch.is_some_and(|(held, _)| held),
                                 };
-                                let stamp = touch.map_or_else(|| this.tap_stamp(), |(_, stamp)| stamp);
-                                let owned = $crate::tap::owns(this.touch_presses, touch);
+                                let stamp = touch.map_or(now.stamp, |(_, began)| began.stamp);
+                                let owned = $crate::tap::owns(this.touch_presses, touch, now);
                                 let link = this.pressed_link.take();
                                 // A program that asked for mouse events (Claude Code's
                                 // fullscreen view, other TUIs) gets an owned tap as a

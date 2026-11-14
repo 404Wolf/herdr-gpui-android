@@ -134,27 +134,42 @@ pub fn cell_at(
 /// touch, so nothing may act on it.
 pub const NO_STAMP: u64 = u64::MAX;
 
+/// One touch-down as GPUI handled it: its place in the order GPUI handles
+/// downs (unique, increasing), and the stamp the host queued with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gesture {
+    pub id: u64,
+    pub stamp: u64,
+}
+
+impl Gesture {
+    /// Before any down: matches no touch a view saw begin.
+    pub const NONE: Self = Self { id: 0, stamp: NO_STAMP };
+}
+
 /// Whether a view owns a lifted press, and so may act on it (send a click,
-/// open a link): it saw that press's touch begin, with a stamp the host
-/// queued for it. When presses come from touch (`touch_presses`), a press
-/// with no touch begun here began on another view, one this view replaced
-/// mid-tap, and is not this view's to act on. A mouse press (no touch at all)
-/// is owned by the view it lands on.
-pub fn owns(touch_presses: bool, lifted: Option<(bool, u64)>) -> bool {
-    match lifted {
-        Some((_, stamp)) => stamp != NO_STAMP,
-        None => !touch_presses,
+/// open a link). When presses come from touch (`touch_presses`), it must have
+/// seen this very gesture begin: the touch it holds is the down GPUI handled
+/// last (`now`), with a stamp the host queued for it. A touch it holds from
+/// an earlier gesture (cancelled by the host, or one that lifted elsewhere) or
+/// none at all (it replaced the view the touch began on) is not its to act on.
+/// Where presses do not come from touch, a press is the view's it lands on.
+pub fn owns(touch_presses: bool, lifted: Option<(bool, Gesture)>, now: Gesture) -> bool {
+    if !touch_presses {
+        return true;
     }
+    lifted.is_some_and(|(_, began)| began.id == now.id && began.stamp != NO_STAMP)
 }
 
 /// What a host view with no program to click reports for a lifted press,
-/// from its own [`Touch`]: a tap no program took, for a press it owns; no
-/// tap for a held finger, or a press whose touch began on another view.
-pub fn plain_view_tap(lifted: Option<(bool, u64)>) -> (Tapped, u64) {
+/// from its own [`Touch`]: a tap no program took, for a press it owns (see
+/// [`owns`]); no tap for a held finger, or a press that is not its own.
+pub fn plain_view_tap(lifted: Option<(bool, Gesture)>, now: Gesture) -> (Tapped, u64) {
     match lifted {
-        Some((false, stamp)) if stamp != NO_STAMP => (Tapped::Plain, stamp),
-        Some((_, stamp)) => (Tapped::Ignored, stamp),
-        None => (Tapped::Ignored, NO_STAMP),
+        Some((held, began)) if owns(true, lifted, now) => {
+            (if held { Tapped::Ignored } else { Tapped::Plain }, began.stamp)
+        }
+        _ => (Tapped::Ignored, NO_STAMP),
     }
 }
 
@@ -173,8 +188,8 @@ pub struct DownStamps {
     dropped: usize,
     /// The stamps of the other downs queued and not yet handled, oldest first.
     queue: std::collections::VecDeque<u64>,
-    /// The stamp of the down GPUI handled last: the touch in progress.
-    current: u64,
+    /// The down GPUI handled last: the touch in progress.
+    current: Gesture,
 }
 
 impl Default for DownStamps {
@@ -188,7 +203,7 @@ impl DownStamps {
     pub const CAPACITY: usize = 64;
 
     pub const fn new() -> Self {
-        Self { dropped: 0, queue: std::collections::VecDeque::new(), current: NO_STAMP }
+        Self { dropped: 0, queue: std::collections::VecDeque::new(), current: Gesture::NONE }
     }
 
     /// A down went into GPUI's queue with `stamp`. Past the bound the oldest
@@ -210,17 +225,23 @@ impl DownStamps {
     /// GPUI handled the next queued down: its stamp is the touch in progress
     /// now, and is returned. [`NO_STAMP`] when none was queued.
     pub fn handled(&mut self) -> u64 {
-        self.current = if self.dropped > 0 {
+        let stamp = if self.dropped > 0 {
             self.dropped -= 1;
             NO_STAMP
         } else {
             self.queue.pop_front().unwrap_or(NO_STAMP)
         };
-        self.current
+        self.current = Gesture { id: self.current.id + 1, stamp };
+        stamp
     }
 
     /// The stamp of the touch in progress: the down GPUI handled last.
     pub fn current(&self) -> u64 {
+        self.current.stamp
+    }
+
+    /// The gesture in progress: the down GPUI handled last.
+    pub fn now(&self) -> Gesture {
         self.current
     }
 }
@@ -232,14 +253,14 @@ impl DownStamps {
 pub struct Touch {
     /// While a finger is down: whether it has been held, and the host's
     /// stamp when it went down.
-    down: Option<(bool, u64)>,
+    down: Option<(bool, Gesture)>,
 }
 
 impl Touch {
     /// A finger went down, with the host's stamp then. Whatever an earlier
     /// touch left is forgotten.
-    pub fn began(&mut self, stamp: u64) {
-        self.down = Some((false, stamp));
+    pub fn began(&mut self, gesture: Gesture) {
+        self.down = Some((false, gesture));
     }
 
     /// The finger was held in place for a long press.
@@ -251,14 +272,19 @@ impl Touch {
 
     /// Whether the finger down now began on this view with a stamp: its
     /// press is this view's to act on (see [`owns`]), before it lifts.
-    pub fn owned_now(&self) -> bool {
-        self.down.is_some_and(|(_, stamp)| stamp != NO_STAMP)
+    pub fn owned_now(&self, now: Gesture) -> bool {
+        owns(true, self.down, now)
+    }
+
+    /// Forgets the touch: the view was swapped out or deactivated.
+    pub fn clear(&mut self) {
+        self.down = None;
     }
 
     /// At the press GPUI synthesizes when the finger lifts: whether that
     /// finger was held, and its stamp. `None` for a mouse press (no touch
     /// began). The touch is over either way.
-    pub fn lifted(&mut self) -> Option<(bool, u64)> {
+    pub fn lifted(&mut self) -> Option<(bool, Gesture)> {
         self.down.take()
     }
 }
@@ -266,8 +292,13 @@ impl Touch {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownStamps, Lift, NO_STAMP, Press, Tapped, Touch, cell_at, lift, next_id, owns, plain_view_tap,
+        DownStamps, Gesture, Lift, NO_STAMP, Press, Tapped, Touch, cell_at, lift, next_id, owns,
+        plain_view_tap,
     };
+
+    fn g(id: u64, stamp: u64) -> Gesture {
+        Gesture { id, stamp }
+    }
 
     #[test]
     fn a_press_that_stays_in_place_is_a_click() {
@@ -310,22 +341,22 @@ mod tests {
     #[test]
     fn a_held_finger_is_remembered_until_it_lifts() {
         let mut touch = Touch::default();
-        touch.began(7);
+        touch.began(g(1, 7));
         touch.held();
-        assert_eq!(touch.lifted(), Some((true, 7)));
+        assert_eq!(touch.lifted(), Some((true, g(1, 7))));
         // The next tap starts afresh, with its own stamp.
-        touch.began(8);
-        assert_eq!(touch.lifted(), Some((false, 8)));
+        touch.began(g(2, 8));
+        assert_eq!(touch.lifted(), Some((false, g(2, 8))));
     }
 
     #[test]
     fn a_new_touch_forgets_one_that_never_lifted_as_a_tap() {
         // Held, then dragged into a scroll: no press ever comes for it.
         let mut touch = Touch::default();
-        touch.began(1);
+        touch.began(g(1, 1));
         touch.held();
-        touch.began(2);
-        assert_eq!(touch.lifted(), Some((false, 2)));
+        touch.began(g(2, 2));
+        assert_eq!(touch.lifted(), Some((false, g(2, 2))));
     }
 
     #[test]
@@ -474,36 +505,67 @@ mod tests {
     }
 
     #[test]
-    fn only_a_press_whose_touch_began_on_this_view_is_acted_on() {
-        // Touch presses (Android): this view saw the touch begin, with a stamp.
-        assert!(owns(true, Some((false, 4))));
+    fn only_a_press_whose_touch_began_on_this_view_in_this_gesture_is_acted_on() {
+        let now = g(5, 4);
+        // Touch presses (Android): this view saw this gesture begin, with a stamp.
+        assert!(owns(true, Some((false, now)), now));
         // A touch begun on the view this one replaced: nothing to act on.
-        assert!(!owns(true, None));
+        assert!(!owns(true, None, now));
         // The host had no stamp for the touch.
-        assert!(!owns(true, Some((false, NO_STAMP))));
+        assert!(!owns(true, Some((false, g(5, NO_STAMP))), g(5, NO_STAMP)));
+        // A touch this view saw in an earlier gesture (cancelled, or lifted
+        // elsewhere) never stands in for the gesture lifting now.
+        assert!(!owns(true, Some((false, g(4, 4))), now));
         // A mouse press, where presses do not come from touch.
-        assert!(owns(false, None));
+        assert!(owns(false, None, now));
     }
 
     #[test]
     fn a_view_with_no_program_reports_its_own_taps_as_plain() {
         let mut touch = Touch::default();
-        touch.began(4);
-        assert_eq!(plain_view_tap(touch.lifted()), (Tapped::Plain, 4));
-        touch.began(4);
+        touch.began(g(1, 4));
+        assert_eq!(plain_view_tap(touch.lifted(), g(1, 4)), (Tapped::Plain, 4));
+        touch.began(g(2, 4));
         touch.held();
-        assert_eq!(plain_view_tap(touch.lifted()), (Tapped::Ignored, 4));
+        assert_eq!(plain_view_tap(touch.lifted(), g(2, 4)), (Tapped::Ignored, 4));
     }
 
     #[test]
     fn a_view_replaced_mid_tap_acts_on_nothing() {
         // The touch began on the other view; this one saw no start.
-        assert_eq!(plain_view_tap(Touch::default().lifted()), (Tapped::Ignored, NO_STAMP));
+        assert_eq!(plain_view_tap(Touch::default().lifted(), g(1, 4)), (Tapped::Ignored, NO_STAMP));
         let mut touch = Touch::default();
-        touch.began(NO_STAMP);
-        assert!(!touch.owned_now());
-        assert_eq!(plain_view_tap(touch.lifted()), (Tapped::Ignored, NO_STAMP));
-        touch.began(3);
-        assert!(touch.owned_now());
+        touch.began(g(1, NO_STAMP));
+        assert!(!touch.owned_now(g(1, NO_STAMP)));
+        assert_eq!(plain_view_tap(touch.lifted(), g(1, NO_STAMP)), (Tapped::Ignored, NO_STAMP));
+        touch.began(g(2, 3));
+        assert!(touch.owned_now(g(2, 3)));
+    }
+
+    #[test]
+    fn a_cancelled_touch_is_not_the_next_gestures() {
+        // A down on the view, cancelled by the host (a pinch, a scroll): the
+        // view keeps its touch. The next down starts off the view (the header)
+        // and lifts just inside it: the view saw no new start.
+        let mut downs = DownStamps::default();
+        let mut touch = Touch::default();
+        downs.queued(1);
+        downs.handled();
+        touch.began(downs.now());
+        downs.queued(1);
+        downs.handled(); // off the view: no began
+        assert!(!touch.owned_now(downs.now()));
+        assert_eq!(plain_view_tap(touch.lifted(), downs.now()), (Tapped::Ignored, NO_STAMP));
+    }
+
+    #[test]
+    fn gesture_ids_rise_with_every_down_handled() {
+        let mut downs = DownStamps::default();
+        assert_eq!(downs.now(), Gesture::NONE);
+        downs.queued(3);
+        downs.handled();
+        assert_eq!(downs.now(), g(1, 3));
+        downs.handled(); // nothing queued: still a new gesture, no stamp
+        assert_eq!(downs.now(), g(2, NO_STAMP));
     }
 }

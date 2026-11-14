@@ -749,26 +749,37 @@ mod tests {
         (session, remote)
     }
 
+    /// The host's side: each down queued with its pane's stamp, then handled.
+    fn handled(downs: &mut crate::tap::DownStamps, stamp: u64) -> crate::tap::Gesture {
+        downs.queued(stamp);
+        downs.handled();
+        downs.now()
+    }
+
     #[test]
     fn an_owned_tap_reaches_the_program_as_a_click() {
-        use crate::tap::{Lifted, Press, Touch, lift_on, owns};
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
         let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
         let mut touch = Touch::default();
-        touch.began(7);
-        let owned = owns(true, touch.lifted());
+        touch.began(handled(&mut downs, 7));
+        let owned = owns(true, touch.lifted(), downs.now());
         assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Clicked);
         reply(&mut remote, b"\x1b[<0;3;2M\x1b[<0;3;2m");
     }
 
     #[test]
     fn a_shell_view_that_replaced_the_panes_own_view_mid_touch_sends_nothing() {
-        use crate::tap::{Lifted, Press, Touch, lift_on, owns};
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
         // The touch began on the pane's own view (it took the down's stamp);
         // the shell's view replaced it before the lift. GPUI's tap lands on the
         // new view, which saw no touch begin: no click reaches the program.
         let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut own_view = Touch::default();
+        own_view.began(handled(&mut downs, 7));
         let mut replacing = Touch::default();
-        let owned = owns(true, replacing.lifted());
+        let owned = owns(true, replacing.lifted(), downs.now());
         assert!(!owned);
         assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
         silent(&mut remote);
@@ -776,13 +787,14 @@ mod tests {
 
     #[test]
     fn a_shell_view_that_replaced_another_mid_touch_sends_nothing() {
-        use crate::tap::{Lifted, NO_STAMP, Press, Touch, lift_on, owns};
+        use crate::tap::{DownStamps, Lifted, NO_STAMP, Press, Touch, lift_on, owns};
         // Shell view A saw the touch begin; B replaced A before the lift.
         let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
         let mut a = Touch::default();
-        a.began(7);
+        a.began(handled(&mut downs, 7));
         let mut b = Touch::default();
-        let owned = owns(true, b.lifted());
+        let owned = owns(true, b.lifted(), downs.now());
         assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
         // Nor does a link open: lift_on says Ignored for a press on one too.
         let on_link = Press { on_link: true, ..Press::default() };
@@ -790,13 +802,48 @@ mod tests {
         silent(&mut remote);
         // A touch the host had no stamp for is no view's either.
         let mut stampless = Touch::default();
-        stampless.began(NO_STAMP);
-        let owned = owns(true, stampless.lifted());
+        stampless.began(handled(&mut downs, NO_STAMP));
+        let owned = owns(true, stampless.lifted(), downs.now());
         assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
         silent(&mut remote);
-        // A, gone, never lifts: its stale touch is forgotten by its next start.
-        a.began(8);
-        assert_eq!(a.lifted(), Some((false, 8)));
+    }
+
+    #[test]
+    fn a_cancelled_touch_then_a_tap_begun_off_the_view_sends_nothing() {
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
+        // A down on the terminal, then the host's CANCEL (a pinch, a scroll):
+        // the view still holds that touch. The next down starts off the view
+        // (the header) and lifts just inside it, within GPUI's slop, so GPUI's
+        // tap lands on the view, which saw no new start.
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut view = Touch::default();
+        view.began(handled(&mut downs, 7));
+        handled(&mut downs, 7); // off the view: it sees no start
+        let owned = owns(true, view.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        let on_link = Press { on_link: true, ..Press::default() };
+        assert_eq!(lift_on(&session, on_link, owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+    }
+
+    #[test]
+    fn a_view_shown_again_after_a_swap_sends_nothing_for_its_old_touch() {
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
+        // The view saw a touch begin, was swapped out (shell <-> pane) before
+        // the lift, and is shown again; the next tap begins elsewhere.
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut view = Touch::default();
+        view.began(handled(&mut downs, 7));
+        handled(&mut downs, 8); // the swap's taps, on another view
+        let owned = owns(true, view.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+        // A swap also clears the touch outright.
+        view.began(handled(&mut downs, 9));
+        view.clear();
+        assert_eq!(view.lifted(), None);
     }
 
     #[test]
