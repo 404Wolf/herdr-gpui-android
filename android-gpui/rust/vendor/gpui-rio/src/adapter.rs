@@ -47,8 +47,11 @@ macro_rules! __bind_gpui {
                 /// Opens a tapped link; without one, links are plain text.
                 link_handler: Option<std::rc::Rc<dyn Fn($crate::links::Link)>>,
                 /// Told what each lifted press did, so the host can act on taps.
+                /// Presses come from touch: one is acted on only when this view saw
+                /// its touch begin (see `tap::owns`).
+                touch_presses: bool,
                 tap_listener: Option<(
-                    std::rc::Rc<dyn Fn((f32, f32), f32) -> u64>,
+                    std::rc::Rc<dyn Fn() -> u64>,
                     std::rc::Rc<dyn Fn($crate::tap::Report)>,
                 )>,
                 /// Where the finger went down, while it may still be a tap.
@@ -113,6 +116,7 @@ macro_rules! __bind_gpui {
                             marked: String::new(),
                             host_input: false,
                             link_handler: None,
+                            touch_presses: false,
                             tap_listener: None,
                             press: None,
                             pressed_link: None,
@@ -153,20 +157,24 @@ macro_rules! __bind_gpui {
                 /// Told what every lifted press did, once it was done: `Clicked` only
                 /// when the program was sent a click. A host that opens a keyboard on
                 /// a tap leaves it shut for a click. `stamp` is asked when a press
-                /// begins, with where (window logical pixels) and the scale, and comes
-                /// back in its report: a host that queued a stamp with its touch-down
-                /// (`tap::DownStamps`) learns which view the press began on.
+                /// begins and comes back in its report: a host that queues a stamp
+                /// with each touch-down (`tap::DownStamps`) answers with the one of
+                /// the down being handled, so it learns which view the press began on.
                 pub fn set_tap_listener(
                     &mut self,
-                    stamp: impl Fn((f32, f32), f32) -> u64 + 'static,
+                    stamp: impl Fn() -> u64 + 'static,
                     listener: impl Fn($crate::tap::Report) + 'static,
                 ) {
                     self.tap_listener = Some((std::rc::Rc::new(stamp), std::rc::Rc::new(listener)));
                 }
-                fn tap_stamp(&self, at: Point<Pixels>, scale: f32) -> u64 {
-                    self.tap_listener
-                        .as_ref()
-                        .map_or(0, |(stamp, _)| stamp((f32::from(at.x), f32::from(at.y)), scale))
+                /// For hosts whose presses all come from touch, as on Android: a
+                /// press is then acted on (a click, a link) only when this view saw
+                /// its touch begin, never one begun on a view it replaced mid-tap.
+                pub fn set_touch_presses(&mut self, touch: bool) {
+                    self.touch_presses = touch;
+                }
+                fn tap_stamp(&self) -> u64 {
+                    self.tap_listener.as_ref().map_or($crate::tap::NO_STAMP, |(stamp, _)| stamp())
                 }
                 /// Draws `ghost` (or nothing) over the screen from the next frame on.
                 pub fn set_ghost(&mut self, ghost: Option<Arc<$crate::ghost::Ghost>>) {
@@ -741,7 +749,7 @@ macro_rules! __bind_gpui {
                         }))
                         .on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
                                 this.selecting = false;
                                 let pressed_at = this.press.take();
                                 let touch = this.touch.lifted();
@@ -750,13 +758,15 @@ macro_rules! __bind_gpui {
                                     travelled: pressed_at.is_none(),
                                     held: touch.is_some_and(|(held, _)| held),
                                 };
-                                let stamp = touch.map_or_else(
-                                    || this.tap_stamp(pressed_at.unwrap_or(event.position), window.scale_factor()),
-                                    |(_, stamp)| stamp,
-                                );
+                                let stamp = touch.map_or_else(|| this.tap_stamp(), |(_, stamp)| stamp);
+                                let owned = $crate::tap::owns(this.touch_presses, touch);
                                 let link = this.pressed_link.take();
-                                let tapped = match $crate::tap::lift(press) {
-                                    $crate::tap::Lift::OpenLink => {
+                                // A program that asked for mouse events (Claude Code's
+                                // fullscreen view, other TUIs) gets an owned tap as a
+                                // click, press and release on the cell it went down on.
+                                let cell = pressed_at.and_then(|at| this.screen_cell(at));
+                                let tapped = match $crate::tap::lift_on(&this.session, press, owned, cell) {
+                                    $crate::tap::Lifted::OpenLink => {
                                         // A tap on a link opens it and selects nothing.
                                         this.session.grid().lock().selection = None;
                                         if let (Some((_, url)), Some(handler)) = (link, this.link_handler.clone()) {
@@ -765,23 +775,14 @@ macro_rules! __bind_gpui {
                                         cx.notify();
                                         $crate::tap::Tapped::Plain
                                     }
-                                    // A program that asked for mouse events (Claude Code's
-                                    // fullscreen view, other TUIs) gets the tap as a click,
-                                    // press and release on the cell it went down on; it, not
-                                    // a local selection, owns the cell then.
-                                    $crate::tap::Lift::Click => {
-                                        if let Some((column, row)) =
-                                            pressed_at.and_then(|at| this.screen_cell(at))
-                                            && this.session.click(column, row)
-                                        {
-                                            this.session.grid().lock().selection = None;
-                                            cx.notify();
-                                            $crate::tap::Tapped::Clicked
-                                        } else {
-                                            $crate::tap::Tapped::Plain
-                                        }
+                                    // The program, not a local selection, owns the cell.
+                                    $crate::tap::Lifted::Clicked => {
+                                        this.session.grid().lock().selection = None;
+                                        cx.notify();
+                                        $crate::tap::Tapped::Clicked
                                     }
-                                    $crate::tap::Lift::Nothing => $crate::tap::Tapped::Ignored,
+                                    $crate::tap::Lifted::Plain => $crate::tap::Tapped::Plain,
+                                    $crate::tap::Lifted::Ignored => $crate::tap::Tapped::Ignored,
                                 };
                                 if let Some((_, listener)) = this.tap_listener.clone() {
                                     listener($crate::tap::Report { id: $crate::tap::next_id(), stamp, tapped });
@@ -808,14 +809,13 @@ macro_rules! __bind_gpui {
                                     // tap (see `tap`) and both still behave as before.
                                     window.on_mouse_event({
                                         let entity = paint_entity.clone();
-                                        move |event: &TouchDragEvent, phase, window, cx| {
+                                        move |event: &TouchDragEvent, phase, _, cx| {
                                             if phase == DispatchPhase::Bubble
                                                 && event.phase == TouchPhase::Started
                                                 && bounds.contains(&event.start_position)
                                             {
-                                                let scale = window.scale_factor();
                                                 entity.update(cx, |this, _| {
-                                                    let stamp = this.tap_stamp(event.start_position, scale);
+                                                    let stamp = this.tap_stamp();
                                                     this.touch.began(stamp);
                                                 });
                                             }

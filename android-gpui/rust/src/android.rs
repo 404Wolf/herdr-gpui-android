@@ -223,16 +223,19 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
             y: y[i],
         });
     }
-    // The pane this press begins on goes into the queue with its down, so
-    // the renderer stamps the tap with it however late it processes it.
-    if action == 0 {
-        lock_downs().queued(x[0], y[0], stamp.max(0) as u64);
+    // The pane this press begins on goes into the queue with its down, in the
+    // order GPUI gets the downs (the lock is held across the post), so the
+    // renderer stamps the tap with it however late it handles it.
+    let mut downs = (action == 0).then(lock_downs);
+    if let Some(downs) = downs.as_mut() {
+        downs.queued(stamp.max(0) as u64);
     }
-    u8::from(gpui_mobile::android::host::motion_event(
-        action as u32,
-        action_index as usize,
-        &pointers,
-    ))
+    let posted = gpui_mobile::android::host::motion_event(action as u32, action_index as usize, &pointers);
+    if !posted && let Some(downs) = downs.as_mut() {
+        // A platform view took it: GPUI never handles this down.
+        downs.withdrawn();
+    }
+    u8::from(posted)
 }
 
 /// The stamps queued with touch-downs, for the renderer to take back when it
@@ -244,11 +247,16 @@ fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
     DOWNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The stamp Java sent with the down of the touch the renderer starts at
-/// logical (`x`, `y`): the pane it began on. `u64::MAX`, which Java never
-/// hands out, when no queued down matches, so its report is dropped.
-pub(crate) fn touch_stamp(at: (f32, f32), scale: f32) -> u64 {
-    lock_downs().started(at, scale).unwrap_or(u64::MAX)
+/// GPUI handled the next queued touch-down (see `ui::down_watch`).
+pub(crate) fn touch_handled() {
+    lock_downs().handled();
+}
+
+/// The stamp Java sent with the down of the touch GPUI is handling: the pane
+/// it began on. `tap::NO_STAMP`, which Java never hands out, when none was
+/// queued, so nothing acts on it and its report is dropped.
+pub(crate) fn touch_stamp() -> u64 {
+    lock_downs().current()
 }
 
 #[allow(unsafe_code)]

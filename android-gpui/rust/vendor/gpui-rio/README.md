@@ -43,7 +43,11 @@ repository's [LICENSE](../../../../LICENSE). The changes below are this copy's.
   grid drawn against the pane's bottom): `tap::cell_at`. `set_tap_listener`
   reports every lifted press to the host (clicked, a tap the program did not
   take, or no tap), with a stamp the host gave when the press began, so a
-  host that opens a keyboard on a tap leaves it shut for a click.
+  host that opens a keyboard on a tap leaves it shut for a click. With
+  `set_touch_presses`, a view acts (clicks, opens a link) only on a press
+  whose touch began on it, never on one begun on a view it replaced
+  mid-tap; `tap::DownStamps` carries a host's stamps with its touch-downs in
+  the order GPUI handles them.
 - Errors are a typed `Error`; `anyhow` and the GPUI tests against a local PTY
   were removed. The tests here drive a real socket pair.
 
