@@ -529,7 +529,7 @@ final class ComposerBar {
         surface.getLocationInWindow(at);
         frame.getLocationInWindow(origin);
         float left = at[0] - origin[0], top = at[1] - origin[1];
-        // While typing too: "type" reads "hide", and "talk" and "send" work.
+        // While typing too: "↓ hide" takes "type"'s place, and "talk" and "send" work.
         boolean showing = agent && !covered;
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
@@ -604,6 +604,7 @@ final class ComposerBar {
         String id = String.valueOf(target.getTag());
         switch (id) {
             case "type": toggleTyping(); break;
+            case "hide": hideKeyboard(); break;
             case "talk": toggleDictation(); break;
             case "send": {
                 // The count after "send" lists the queue; the word itself sends.
@@ -621,7 +622,8 @@ final class ComposerBar {
 
     private static String describe(String id) {
         switch (id) {
-            case "type": return "Type a message, or hide the keyboard";
+            case "type": return "Type a message";
+            case "hide": return "Hide the keyboard";
             case "talk": return "Dictate; tap again to stop";
             case "send": return "Send, or press Enter; hold for the terminal keys";
             default: return id;
@@ -681,13 +683,13 @@ final class ComposerBar {
     static final int CONTROLS_MARGIN = 8;
 
     /**
-     * "type ─ talk ─ send", made to fit {@code cols}: "type" reads "hide" while
-     * the keyboard is up (it toggles it), "talk" is left out with no dictation,
+     * "type ─ talk ─ send", made to fit {@code cols}: "type" gives way to
+     * "↓ hide" while the keyboard is up, "talk" is left out with no dictation,
      * and "send" carries the queued count in the most pressing message's
      * colour. {@code talks} are "talk"'s words from the fullest to the
      * shortest, none without dictation. When the full line is too wide for
      * the grid (the Fold's cover screen while recording), "talk" takes its
-     * short words, then "type", the count and "send" are left out in turn,
+     * short words, then "type" (never "↓ hide"), the count and "send" are left out in turn,
      * and last "talk" takes its shortest words. "talk", the stop while
      * recording, is never left out.
      */
@@ -703,7 +705,11 @@ final class ComposerBar {
      */
     static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
             List<Outbox.Message> queued, int cols, boolean recording) {
-        GhostText.Control type = new GhostText.Control("type", typing ? "hide" : "type", "dim");
+        // While the keyboard is up "type" gives way to "↓ hide", in colour so it is
+        // found, and it stays on narrow grids, where "type" would be left out.
+        GhostText.Control lead = typing ? new GhostText.Control("hide", "↓ hide", "info")
+                : new GhostText.Control("type", "type", "dim");
+        GhostText.Control narrowLead = typing ? lead : null;
         String count = queued.isEmpty() ? "" : "·" + QueuedMessages.badge(queued.size());
         String countStyle;
         switch (QueuedMessages.urgency(queued)) {
@@ -718,11 +724,12 @@ final class ComposerBar {
         GhostText.Control shorter = talks.isEmpty() ? null : talks.get(Math.min(1, talks.size() - 1));
         GhostText.Control shortest = talks.isEmpty() ? null : talks.get(talks.size() - 1);
         java.util.List<java.util.List<GhostText.Control>> ladder = java.util.Arrays.asList(
-                line(type, talk, send),
-                line(type, shorter, send),
-                line(null, shorter, send),
-                line(null, shorter, bareSend),
-                line(null, shorter, null),
+                line(lead, talk, send),
+                line(lead, shorter, send),
+                line(narrowLead, shorter, send),
+                line(narrowLead, shorter, bareSend),
+                line(narrowLead, shorter, null),
+                line(narrowLead, shortest, null),
                 line(null, shortest, null));
         java.util.List<GhostText.Control> barest = null;
         for (java.util.List<GhostText.Control> line : ladder) {

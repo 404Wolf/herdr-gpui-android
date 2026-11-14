@@ -36,16 +36,17 @@ public final class ComposerBarTest {
         assertFalse(ComposerBar.isAgent("bash"));
     }
 
-    @Test public void typeTogglesTheKeyboardAndReadsHideWhileItIsUp() {
+    @Test public void whileTheKeyboardIsUpAHideControlTakesTypesPlace() {
         java.util.List<GhostText.Control> idle = ComposerBar.controls(false,
                 IDLE, java.util.Collections.emptyList(), Integer.MAX_VALUE);
         assertEquals("type", idle.get(0).id);
         assertEquals("type", idle.get(0).spans[0]);
         java.util.List<GhostText.Control> typing = ComposerBar.controls(true,
                 IDLE, java.util.Collections.emptyList(), Integer.MAX_VALUE);
-        // Same control, same place: only its word changes, so the target stays put.
-        assertEquals("type", typing.get(0).id);
-        assertEquals("hide", typing.get(0).spans[0]);
+        // The same place, so the target stays put, but its own control, word and colour.
+        assertEquals("hide", typing.get(0).id);
+        assertEquals("↓ hide", typing.get(0).spans[0]);
+        assertEquals("info", typing.get(0).spans[1]);
         assertEquals(3, typing.size());
     }
 
@@ -228,5 +229,24 @@ public final class ComposerBarTest {
         // Agent to agent, shell to shell: no restart, no flicker.
         assertFalse(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(agent, ComposerBar.privateImeOptions(true)));
         assertFalse(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(shell, ComposerBar.privateImeOptions(false)));
+    }
+
+    @Test public void hideStaysOnNarrowGridsWhereTypeWouldBeLeftOut() {
+        java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED, QUEUED);
+        // Not typing, 38 columns while recording: "type" is left out.
+        assertEquals("talk send", ids(ComposerBar.controls(false, RECORDING, queued, 38)));
+        // Typing: "↓ hide" stays, down to the tiny grid's bare stop.
+        for (int cols : new int[] {100, 50, 38, 30}) {
+            java.util.List<GhostText.Control> line = ComposerBar.controls(true, RECORDING, queued, cols);
+            assertEquals("hide at " + cols, "hide", line.get(0).id);
+            assertTrue("talk at " + cols, ids(line).contains("talk"));
+            assertTrue("fits at " + cols, ComposerBar.lineWidth(line) + ComposerBar.CONTROLS_MARGIN <= cols);
+        }
+        // While recording (no send) and typing: hide and the stop, the stop last.
+        assertEquals("hide talk", ids(ComposerBar.controls(true, RECORDING, queued, 50, true)));
+        // Only the narrowest grid leaves nothing but the stop.
+        assertEquals("talk", ids(ComposerBar.controls(true, RECORDING, queued, 22)));
+        // Without dictation, typing on a narrow grid: hide before send.
+        assertEquals("hide", ids(ComposerBar.controls(true, NONE, queued, 14)));
     }
 }
