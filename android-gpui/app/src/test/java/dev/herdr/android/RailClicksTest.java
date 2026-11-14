@@ -84,8 +84,8 @@ public final class RailClicksTest {
         assertTrue(rail.contains("FleetTree.projectTarget(pm)"));
         assertTrue(home.contains("addCatalogRows(row, machine, pm.catalogs)"));
         assertTrue(home.contains("addCatalogRows(others, machine, tree.otherCatalogs)"));
-        assertTrue(rail.contains("railCatalogRows(host, live, current, pm.catalogs, order, keep)"));
-        assertTrue(rail.contains("railCatalogRows(host, live, current, tree.otherCatalogs, order, keep)"));
+        assertTrue(rail.contains("railCatalogRows(host, live, current, pm.catalogs, depth + 1, order, keep)"));
+        assertTrue(rail.contains("railCatalogRows(host, live, current, tree.otherCatalogs, 1, order, keep)"));
         assertTrue(home.contains("() -> openWorktree(machine, wt.path)"));
         assertTrue(rail.contains("() -> openRailWorktree(host, current, wt)"));
         assertFalse(home.contains("closedWorktreeActions("));
@@ -103,6 +103,7 @@ public final class RailClicksTest {
         assertTrue(home.contains("if (machine.handle != handle) return;"));
         assertTrue(rail.indexOf("FleetTree.memberAt(") < rail.indexOf("railWorktreeOpening.add(key)"));
         assertTrue(rail.contains("railWorktreeOpening.remove(key)"));
+        assertTrue(rail.contains("!current.ready"));
         assertTrue(rail.contains("if (connection != current) return;"));
     }
 
@@ -124,6 +125,9 @@ public final class RailClicksTest {
         }
         String pill = section(rail, "private TextView tabPill(", "private void showTabActions(");
         assertTrue(pill.contains("RippleDrawable("));
+        String header = section(rail, "private RailWorkspaceRow createRailWorkspaceRow(", "private void updateRailWorkspaceRow(");
+        String primary = header.substring(header.indexOf("holder.row.setOnClickListener("));
+        assertTrue(primary.indexOf("holder.firstPane.isEmpty()") < primary.indexOf("holder.foldKey != null"));
     }
 
     private static String source(String name) throws IOException {

@@ -1103,11 +1103,18 @@ public final class HomeActivity extends Activity {
         for (int i = 0; i < row.kids.size(); i++) emit(into, row.kids.get(i), next, i == row.kids.size() - 1, depth + 1);
     }
 
-    /** One row per PM (by project name), then Other terminals; no repo, worktree or space rows. */
+    /** Repository headings with their PMs, then Other terminals; workers stay behind each PM. */
     private List<Row> bodyRows(Machine machine, FleetTree.PmTree tree, boolean ready) {
         String m = machine.host.id;
         List<Row> rows = new ArrayList<>();
-        for (FleetTree.PmRow pm : tree.pms) rows.add(pmRow(machine, pm));
+        for (FleetTree.RepoRow repo : tree.repos) {
+            String count = (repo.blocked() ? "! " : "") + repo.countLabel();
+            Row group = new Row((guide, self) -> groupLine(guide, self, repo.name, count));
+            group.fold = m + "/repo/" + repo.key;
+            group.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.REPO);
+            for (FleetTree.PmRow pm : repo.projects) group.kids.add(pmRow(machine, pm));
+            rows.add(group);
+        }
         if (!tree.others.isEmpty() || !tree.otherCatalogs.isEmpty()) {
             String count = (tree.othersBlocked() ? "! " : "") + tree.otherMembers.size();
             Row others = new Row((guide, self) -> {
@@ -1368,7 +1375,7 @@ public final class HomeActivity extends Activity {
         return line;
     }
 
-    /** "Spaces", "Other agents": the whole row folds. */
+    /** A repository or Other terminals heading: the whole row folds. */
     private View groupLine(String guide, Row fold, String words, String count) {
         LinearLayout line = treeLine(guide, fold);
         TextView name = single(text(words, 12, chrome.primary));

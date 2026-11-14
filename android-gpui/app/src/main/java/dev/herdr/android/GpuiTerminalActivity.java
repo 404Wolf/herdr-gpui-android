@@ -2608,16 +2608,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // window later opens its PM row once, and a fold after that is kept.
         FleetTree.Project focusedProject = FleetTree.projectOf(fleet, selectedPane);
         java.util.List<String> reveal = new java.util.ArrayList<>();
+        java.util.List<String> revealRepos = new java.util.ArrayList<>();
         if (focusedProject != null) reveal.add(railProjectKey(host, focusedProject));
-        if (railFolds().focusSeen(selectedPane, reveal)) {
+        for (FleetTree.RepoRow repo : tree.repos) {
+            for (FleetTree.PmRow pm : repo.projects) {
+                if (pm.project == focusedProject) revealRepos.add(railKey(host, "repo/" + repo.key));
+            }
+        }
+        String focus = selectedPane.isEmpty() ? "" : host.id + "/" + selectedPane;
+        if (railFolds().focusSeen(focus, reveal, revealRepos)) {
             getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
                     .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
         }
         updateRailFleetButtons(header, host, live, current, fleet);
         FleetTree.Member deacon = fleet.deacon;
-        // The sidebar is the Deacon and one row per PM (FleetTree.pmTree, as
-        // Home): workers wait behind their PM's chevron with their checkout as
-        // a second line; there are no repo, worktree or space rows.
+        // Repositories contain PMs (as on Home); workers and catalogs wait behind
+        // their PM's chevron, with each terminal's checkout as its second line.
         if (deacon != null) {
             String hKey = railFold(railKey(host, "helpers"), FleetTree.Fold.DEACON);
             boolean hFolded = railFolded(hKey) && !containsMember(tree.helpers, selectedPane);
@@ -2649,7 +2655,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     live && !railDeaconBusy.contains(host.id) ? () -> railStartDeacon(host, current) : null,
                     order, keep);
         }
-        for (FleetTree.PmRow pm : tree.pms) railPm(host, live, current, pm, selectedPane, order, keep);
+        for (FleetTree.RepoRow repo : tree.repos) {
+            String key = railFold(railKey(host, "repo/" + repo.key), FleetTree.Fold.REPO);
+            boolean folded = railFolded(key);
+            String meta = (repo.blocked() ? "! " : "") + repo.countLabel();
+            railHeader(host, live, current, "repo:" + repo.key, repo.name, meta, key, folded, 0, "", order, keep);
+            if (!folded) {
+                for (FleetTree.PmRow pm : repo.projects) railPm(host, live, current, pm, 1, selectedPane, order, keep);
+            }
+        }
         if (!tree.others.isEmpty() || !tree.otherCatalogs.isEmpty()) {
             String key = railFold(railKey(host, "others"), FleetTree.Fold.OTHERS);
             // The focused terminal is never hidden behind a fold it starts in.
@@ -2662,14 +2676,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (!folded) {
                 for (FleetTree.AgentNode node : tree.others) railAgentTree(host, live, current, node, 1, selectedPane, order, keep);
-                railCatalogRows(host, live, current, tree.otherCatalogs, order, keep);
+                railCatalogRows(host, live, current, tree.otherCatalogs, 1, order, keep);
             }
         }
     }
 
     /** One PM row (its project's name, the PM's checkout below), then its workers when unfolded. */
     private void railPm(SavedRemoteHost host, boolean live, Connection current,
-            FleetTree.PmRow pm, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
+            FleetTree.PmRow pm, int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
         String key = railProjectKey(host, pm.project);
         boolean folded = railFolds().folded(key);
         String foldKey = pm.workers.isEmpty() && pm.catalogs.isEmpty() ? null : key;
@@ -2679,27 +2693,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             FleetTree.Member target = FleetTree.projectTarget(pm);
             String meta = (pm.blocked() ? "! " : "") + workers.size();
             RailWorkspaceRow header = railHeader(host, live, current, "proj:" + pm.name(), pm.name() + " · no PM", meta,
-                    foldKey, folded, 0, target == null ? "" : target.id, order, keep);
+                    foldKey, folded, depth, target == null ? "" : target.id, order, keep);
             if (live && !pm.catalogs.isEmpty()) header.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
         } else {
             String sub = pm.pm.id + (pm.where.isEmpty() ? "" : " · " + pm.where);
-            RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, 0, foldKey, folded,
+            RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, depth, foldKey, folded,
                     folded && pm.blocked(), selectedPane, order, keep);
             if (row != null && live && !pm.catalogs.isEmpty()) {
                 row.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
             }
         }
         if (folded) return;
-        for (FleetTree.AgentNode node : pm.workers) railAgentTree(host, live, current, node, 1, selectedPane, order, keep);
-        railCatalogRows(host, live, current, pm.catalogs, order, keep);
+        for (FleetTree.AgentNode node : pm.workers) railAgentTree(host, live, current, node, depth + 1, selectedPane, order, keep);
+        railCatalogRows(host, live, current, pm.catalogs, depth + 1, order, keep);
     }
 
     /** Visible catalogs, behind the same fold as the group's terminals. */
     private void railCatalogRows(SavedRemoteHost host, boolean live, Connection current,
-            java.util.List<FleetTree.Project> catalogs, java.util.List<View> order, java.util.Set<String> keep) {
+            java.util.List<FleetTree.Project> catalogs, int depth, java.util.List<View> order, java.util.Set<String> keep) {
         for (FleetTree.Project project : catalogs) {
             RailWorkspaceRow row = railHeader(host, live, current, "catalog:" + project.repo,
-                    FleetTree.repoName(project.repo), FleetTree.unopenedLabel(project), null, false, 1, "", order, keep);
+                    FleetTree.repoName(project.repo), FleetTree.unopenedLabel(project), null, false, depth, "", order, keep);
             row.action = () -> showRailWorktrees(host, live ? current : null, project, 0);
             row.row.setContentDescription("Show " + FleetTree.unopenedLabel(project) + " in " + row.label.getText());
         }
@@ -2851,6 +2865,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         row.meta.setTextColor(meta.startsWith("!") ? chrome.danger : chrome.onSurfaceVariant);
         String mark = foldKey == null ? "▪" : folded ? "▸" : "▾";
         if (!mark.contentEquals(row.mark.getText())) row.mark.setText(mark);
+        row.mark.setContentDescription((foldKey == null ? "Open " : folded ? "Show " : "Hide ") + label);
+        row.mark.setFocusable(true);
         int pad = dp(2 + 12 * depth);
         if (row.row.getPaddingLeft() != pad) {
             row.row.setPadding(pad, dp(2), dp(4), dp(2));
@@ -3065,7 +3081,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** One tap reuses a live terminal in the worktree, or opens a plain shell there. */
     private void openRailWorktree(SavedRemoteHost host, Connection current, FleetTree.GitWorktree wt) {
         synchronized (stateLock) {
-            if (current == null || connection != current || !host.id.equals(currentHostId)) {
+            if (current == null || !current.ready || connection != current || !host.id.equals(currentHostId)) {
                 note("Connect to " + host.name + " before opening a worktree.");
                 return;
             }
