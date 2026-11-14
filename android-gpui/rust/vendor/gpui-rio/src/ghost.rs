@@ -238,27 +238,21 @@ fn place_with(
     // Where the queued messages end: just above the prompt's frame, or the strip.
     let echoes_bottom = match anchor {
         Some(anchor) => {
-            let mut lines = wrap(&ghost.draft, anchor.col, anchor.indent, &|line| {
-                width_of(anchor.row + line)
-            });
-            // Rows past the room it has are dropped from the front: the
-            // caret end of a long draft is the part being spoken.
+            let width_at = |line: usize| width_of(anchor.row + line);
             let room = draft_rows.min(rows - anchor.row).clamp(1, MAX_DRAFT_ROWS);
-            let keep = lines.len().saturating_sub(room);
-            if keep > 0 {
-                lines.drain(..keep);
-                // The first kept line starts where wrapped input does.
-                if let Some(first) = lines.first_mut()
-                    && let Some(run) = first.first_mut()
-                {
-                    run.text.insert(0, '…');
-                }
+            let mut lines = wrap(&ghost.draft, anchor.col, anchor.indent, &width_at);
+            // Too long for its rows: the caret end, where the words are being
+            // typed or spoken, is packed into them against each row's own free
+            // width, from where wrapped input starts, behind an ellipsis.
+            let elided = lines.len() > room;
+            if elided {
+                lines = tail(&ghost.draft, room, anchor.indent, &width_at);
             }
             for (i, line) in lines.into_iter().enumerate() {
                 if line.is_empty() {
                     continue;
                 }
-                let mut col = if i == 0 && keep == 0 {
+                let mut col = if i == 0 && !elided {
                     anchor.col
                 } else {
                     anchor.indent
@@ -467,8 +461,9 @@ pub fn place_all(
         Some(anchor) => {
             // The draft and the echoes, short of the controls on their row.
             let width_of = |row: usize| {
+                // On the controls' row, the draft ends a cell short of them.
                 if Some(row) == controls_row && !layout.controls.is_empty() {
-                    cols.saturating_sub(len + 1).max(8)
+                    (cols - len).saturating_sub(1)
                 } else {
                     cols
                 }
@@ -570,6 +565,67 @@ fn clip_control(control: &Control, room: usize) -> Control {
         id: control.id.clone(),
         spans,
     }
+}
+
+/// The most of the end of `spans` that, behind "…", wraps into `room` lines
+/// from column `indent` (line `i` ending at `width_of(i)`): what a long draft
+/// shows so that its caret end is always on screen.
+fn tail(
+    spans: &[GhostSpan],
+    room: usize,
+    indent: usize,
+    width_of: &dyn Fn(usize) -> usize,
+) -> Vec<Vec<GhostSpan>> {
+    let total: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+    let packed = |drop: usize| {
+        let mut rest = vec![GhostSpan {
+            text: "…".into(),
+            style: GhostStyle::Text,
+        }];
+        rest.extend(drop_front(spans, drop));
+        wrap(&rest, indent, indent, width_of)
+    };
+    // The fewest characters dropped from the front that still fit.
+    let (mut lo, mut hi) = (0, total);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if packed(mid).len() <= room {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let lines = packed(lo);
+    // Wrapping is not strictly monotone (a word moves whole): step on until it fits.
+    if lines.len() <= room {
+        return lines;
+    }
+    (lo + 1..=total)
+        .map(packed)
+        .find(|lines| lines.len() <= room)
+        .unwrap_or_default()
+}
+
+/// `spans` without their first `n` characters; a chip cut into goes whole.
+fn drop_front(spans: &[GhostSpan], mut n: usize) -> Vec<GhostSpan> {
+    let mut out = Vec::new();
+    for span in spans {
+        let len = span.text.chars().count();
+        if n >= len {
+            n -= len;
+            continue;
+        }
+        if n > 0 && span.style == GhostStyle::Chip {
+            n = 0;
+            continue;
+        }
+        out.push(GhostSpan {
+            text: span.text.chars().skip(n).collect(),
+            style: span.style,
+        });
+        n = 0;
+    }
+    out
 }
 
 /// `text` cut to `room` cells, marked with an ellipsis when cut.
@@ -1091,6 +1147,101 @@ mod tests {
             .join(" ");
         assert!(shown.ends_with("button"), "{shown:?}");
         assert!(layout.draft_shown);
+    }
+
+    /// Claude's box at `cols` with a status line right under its rule: caret
+    /// row 3, rule row 4, status row 5.
+    fn claude_status_screen(cols: usize) -> (Vec<Vec<char>>, Option<Anchor>) {
+        let rule = "─".repeat(cols);
+        let rows = screen(
+            &["", "", &rule, "❯", &rule, "  ? status: must stay readable"],
+            cols,
+        );
+        let anchor = Some(Anchor {
+            prompt_row: 3,
+            row: 3,
+            col: 2,
+            indent: 2,
+        });
+        (rows, anchor)
+    }
+
+    fn draft_runs(layout: &Layout) -> Vec<&Placed> {
+        layout
+            .placed
+            .iter()
+            .filter(|p| p.style == GhostStyle::Text)
+            .collect()
+    }
+
+    #[test]
+    fn the_caret_end_survives_a_narrow_rule_row() {
+        // 40 cols, idle "talk", a 103-cell draft, two rows of room (the caret
+        // row and the rule, narrower by the controls): the end is packed into
+        // those rows' own widths, never clipped away.
+        let (rows, anchor) = claude_status_screen(40);
+        let mut g = ghost(vec![text(&format!("{} END", "z".repeat(99)))]);
+        g.controls = vec![control("talk", "talk")];
+        let layout = place_all(&g, anchor, &rows, None);
+        let runs = draft_runs(&layout);
+        assert!(runs.iter().all(|p| p.row < 5), "{runs:?}");
+        let shown: String = runs.iter().map(|p| p.text.as_str()).collect();
+        assert!(
+            shown.starts_with('…') && shown.ends_with(" END"),
+            "{runs:?}"
+        );
+        let talk = &layout.controls[0];
+        for run in runs.iter().filter(|p| p.row == talk.row) {
+            assert!(run.col + run.text.chars().count() < talk.start, "{run:?}");
+        }
+    }
+
+    #[test]
+    fn the_caret_end_survives_when_the_controls_fill_the_rule_row() {
+        // 22 cols with the full offline controls: the stop takes the whole rule
+        // row, so the draft's end goes on the caret row alone.
+        let (rows, anchor) = claude_status_screen(22);
+        let mut g = full_line(OFFLINE);
+        g.draft = vec![text(&format!("{} END", "z".repeat(99)))];
+        let layout = place_all(&g, anchor, &rows, None);
+        let runs = draft_runs(&layout);
+        assert!(runs.iter().all(|p| p.row == 3), "{runs:?}");
+        let shown: String = runs.iter().map(|p| p.text.as_str()).collect();
+        assert!(shown.ends_with(" END"), "{runs:?}");
+        assert!(layout.controls.iter().any(|c| c.id == "talk"));
+    }
+
+    #[test]
+    fn an_elided_draft_stays_inside_the_grid() {
+        // 76 cells with program text right under the caret row: one row of
+        // room; the ellipsis counts against it, nothing runs past column 40.
+        let (mut rows, anchor) = claude_status_screen(40);
+        rows[4] = vec!['x'; 40];
+        let g = ghost(vec![text(&"z".repeat(76))]);
+        let layout = place_all(&g, anchor, &rows, None);
+        assert!(!layout.placed.is_empty());
+        assert!(
+            layout
+                .placed
+                .iter()
+                .all(|p| p.row == 3 && p.col + p.text.chars().count() <= 40),
+            "{:?}",
+            layout.placed
+        );
+    }
+
+    #[test]
+    fn a_chip_cut_at_the_front_goes_whole() {
+        let spans = vec![
+            GhostSpan {
+                text: "⟦clip⟧".into(),
+                style: GhostStyle::Chip,
+            },
+            text(" and the rest"),
+        ];
+        assert_eq!(drop_front(&spans, 2), vec![text(" and the rest")]);
+        assert_eq!(drop_front(&spans, 0), spans);
+        assert_eq!(drop_front(&spans, 8), vec![text("nd the rest")]);
     }
 
     #[test]
