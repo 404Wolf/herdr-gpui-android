@@ -772,10 +772,19 @@ mod tests {
         // Larger, caret in view: no movement.
         assert_eq!(viewport_origin((120, 40), (80, 24), Some((5, 10))), (0, 0));
         // Caret below and right of the pane: just far enough to show it.
-        assert_eq!(viewport_origin((120, 40), (80, 24), Some((30, 100))), (7, 21));
+        assert_eq!(
+            viewport_origin((120, 40), (80, 24), Some((30, 100))),
+            (7, 21)
+        );
         // Never past the grid's end.
-        assert_eq!(viewport_origin((120, 40), (80, 24), Some((39, 119))), (16, 40));
-        assert_eq!(viewport_origin((120, 40), (80, 24), Some((60, 500))), (16, 40));
+        assert_eq!(
+            viewport_origin((120, 40), (80, 24), Some((39, 119))),
+            (16, 40)
+        );
+        assert_eq!(
+            viewport_origin((120, 40), (80, 24), Some((60, 500))),
+            (16, 40)
+        );
     }
 
     #[test]
@@ -786,7 +795,10 @@ mod tests {
         // grid's row 0 is drawn on pane row 28, its last row on the pane's last.
         assert_eq!(viewport_origin((50, 24), (50, 52), Some((22, 2))), (-28, 0));
         // Unfolded: a wider, taller pane; the same rule.
-        assert_eq!(viewport_origin((110, 30), (110, 61), Some((28, 2))), (-31, 0));
+        assert_eq!(
+            viewport_origin((110, 30), (110, 61), Some((28, 2))),
+            (-31, 0)
+        );
         // Shorter and narrower: bottom, from column 0.
         assert_eq!(viewport_origin((40, 10), (80, 24), Some((9, 39))), (-14, 0));
         // One row short: one empty row on top.

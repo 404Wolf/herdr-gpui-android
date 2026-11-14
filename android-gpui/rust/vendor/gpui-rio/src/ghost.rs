@@ -1178,14 +1178,21 @@ mod tests {
         );
         let layout = place_all(&g, None, &tall, carried);
         assert!(!layout.controls.is_empty());
-        assert!(layout.controls.iter().all(|c| c.row == 51), "{:?}", layout.controls);
+        assert!(
+            layout.controls.iter().all(|c| c.row == 51),
+            "{:?}",
+            layout.controls
+        );
         assert_eq!(drawn(&layout, 51, 60), drawn(&before, 23, 60));
         // Uncarried, the stale row 23 is a blank one above the grid, which
         // place_all would keep: the adapter carries it before calling it.
         let stale = place_all(&g, None, &tall, Some(previous));
         assert!(stale.controls.iter().all(|c| c.row == 23));
         // The keyboard shown again before the host resizes: back on row 23.
-        assert_eq!(carried.and_then(|p| p.carried(anchored, filled)), Some(previous));
+        assert_eq!(
+            carried.and_then(|p| p.carried(anchored, filled)),
+            Some(previous)
+        );
         // Unchanged rows (a scroll, a repaint): the row is kept as it was.
         assert_eq!(previous.carried(filled, filled), Some(previous));
         // Moved above the pane: dropped. The keyboard shown with the link down
@@ -1234,7 +1241,11 @@ mod tests {
         let g = recording(ghost(Vec::new()));
         let layout = place_all(&g, None, &rows, previous.carried(following, history));
         assert!(!layout.controls.is_empty());
-        assert!(layout.controls.iter().all(|c| c.row == 23), "{:?}", layout.controls);
+        assert!(
+            layout.controls.iter().all(|c| c.row == 23),
+            "{:?}",
+            layout.controls
+        );
     }
 
     #[test]
@@ -1267,7 +1278,11 @@ mod tests {
         assert_eq!(carried, None);
         let layout = place_all(&g, None, &rows, carried);
         assert!(!layout.controls.is_empty());
-        assert!(layout.controls.iter().all(|c| c.row == 51), "{:?}", layout.controls);
+        assert!(
+            layout.controls.iter().all(|c| c.row == 51),
+            "{:?}",
+            layout.controls
+        );
         // Rebased by the origin's move instead, it would sit on row 23.
         let rebased = Previous {
             row: 23,
