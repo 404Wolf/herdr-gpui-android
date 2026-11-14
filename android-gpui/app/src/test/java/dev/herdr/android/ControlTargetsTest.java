@@ -18,7 +18,7 @@ public final class ControlTargetsTest {
                 new ControlTargets.Cells("type", 41, 64, 68),
                 new ControlTargets.Cells("talk", 41, 71, 75),
                 new ControlTargets.Cells("send", 41, 78, 82)),
-                0, 0, CW, CH, 40, 43 * CH, 84 * CW);
+                0, 0, CW, CH, 40, 43 * CH, 84 * CW, false);
     }
 
     private static ControlTargets.Rect find(List<ControlTargets.Rect> rects, String id) {
@@ -47,5 +47,54 @@ public final class ControlTargetsTest {
         // Nothing past the grid's right edge.
         for (ControlTargets.Rect r : rects) assertTrue(r.right <= 84 * CW + 0.01f);
         assertEquals(43 * CH, find(rects, "send").bottom, 0.01f);
+    }
+
+    /** While recording the host draws " type ─ ● rec 0:05 · tap to stop ──". */
+    private static List<ControlTargets.Rect> recording() {
+        return ControlTargets.layout(Arrays.asList(
+                new ControlTargets.Cells("type", 41, 53, 57),
+                new ControlTargets.Cells("talk", 41, 60, 81)),
+                0, 0, CW, CH, 40, 43 * CH, 84 * CW, true);
+    }
+
+    @Test public void whileRecordingTheStopTakesTheWholeBottomRightBlock() {
+        List<ControlTargets.Rect> rects = recording();
+        ControlTargets.Rect stop = find(rects, "talk");
+        // To the grid's right edge and down to the surface's bottom.
+        assertEquals(84 * CW, stop.right, 0.01f);
+        assertEquals(43 * CH, stop.bottom, 0.01f);
+        assertTrue(stop.width() >= ControlTargets.STOP_MIN_WIDTH_DP - 0.01f);
+        assertTrue(stop.height() >= ControlTargets.STOP_MIN_HEIGHT_DP - 0.01f);
+        // Far bigger than "talk" is at rest.
+        ControlTargets.Rect talk = find(targets(), "talk");
+        assertTrue(stop.width() * stop.height() > 3 * talk.width() * talk.height());
+        // "type" is still there, left of it, never under it.
+        ControlTargets.Rect type = find(rects, "type");
+        assertTrue(type.right <= stop.left + 0.01f);
+        assertTrue(type.width() > 0);
+    }
+
+    @Test public void theStopIsBigEvenWhenItsWordsAreShort() {
+        // " ● stop ──" on a tiny grid: the words are 6 cells, the stop is not.
+        List<ControlTargets.Rect> rects = ControlTargets.layout(Arrays.asList(
+                new ControlTargets.Cells("talk", 41, 75, 81),
+                new ControlTargets.Cells("send", 41, 84, 88)),
+                0, 0, CW, CH, 40, 43 * CH, 90 * CW, true);
+        ControlTargets.Rect stop = find(rects, "talk");
+        assertEquals(90 * CW - ControlTargets.STOP_MIN_WIDTH_DP, stop.left, 0.01f);
+        assertEquals(43 * CH - ControlTargets.STOP_MIN_HEIGHT_DP, stop.top, 0.01f);
+        // What lay under it (a stale "send") is gone: a tap there is the stop.
+        assertEquals(1, rects.size());
+    }
+
+    @Test public void theStopNeverLeavesTheGrid() {
+        // A grid narrower and shorter than the stop's least size.
+        List<ControlTargets.Rect> rects = ControlTargets.layout(Arrays.asList(
+                new ControlTargets.Cells("talk", 3, 2, 8)),
+                10, 20, CW, CH, 3, 20 + 5 * CH, 10 + 12 * CW, true);
+        ControlTargets.Rect stop = find(rects, "talk");
+        assertEquals(10, stop.left, 0.01f);
+        assertEquals(20, stop.top, 0.01f);
+        assertEquals(10 + 12 * CW, stop.right, 0.01f);
     }
 }
