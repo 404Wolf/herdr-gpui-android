@@ -218,14 +218,17 @@ pub fn place(ghost: &Ghost, anchor: Option<Anchor>, rows: usize, cols: usize) ->
             cols
         }
     };
-    place_with(ghost, anchor, rows, cols, &width_of)
+    let draft_rows = anchor.map_or(0, |a| rows.saturating_sub(a.row));
+    place_with(ghost, anchor, rows, cols, draft_rows, &width_of)
 }
 
+/// `draft_rows`: how many rows from the caret's down the draft may use.
 fn place_with(
     ghost: &Ghost,
     anchor: Option<Anchor>,
     rows: usize,
     cols: usize,
+    draft_rows: usize,
     width_of: &dyn Fn(usize) -> usize,
 ) -> Vec<Placed> {
     if rows == 0 || cols == 0 {
@@ -238,9 +241,9 @@ fn place_with(
             let mut lines = wrap(&ghost.draft, anchor.col, anchor.indent, &|line| {
                 width_of(anchor.row + line)
             });
-            // Rows past the view's bottom are dropped from the front: the
+            // Rows past the room it has are dropped from the front: the
             // caret end of a long draft is the part being spoken.
-            let room = (rows - anchor.row).min(MAX_DRAFT_ROWS);
+            let room = draft_rows.min(rows - anchor.row).clamp(1, MAX_DRAFT_ROWS);
             let keep = lines.len().saturating_sub(room);
             if keep > 0 {
                 lines.drain(..keep);
@@ -473,7 +476,16 @@ pub fn place_all(
             // The controls win their cells: a wrapped draft line on their row
             // (wrap never narrows a line below 8 cells) is cut short of them.
             let controls_from = cols - len;
-            let draft = place_with(ghost, Some(anchor), rows, cols, &width_of)
+            // The draft never paints over the program's text below the caret:
+            // it may use the caret's row and then only rows holding nothing of
+            // the program's, blank ones and the prompt's frame (Claude's rule),
+            // so Claude's status line under the rule stays readable. A longer
+            // draft shows its caret end, as at the view's bottom.
+            let free_below = screen[anchor.row + 1..]
+                .iter()
+                .take_while(|cells| rule(cells) || cells.iter().all(|c| c.is_whitespace()))
+                .count();
+            let draft = place_with(ghost, Some(anchor), rows, cols, 1 + free_below, &width_of)
                 .into_iter()
                 .filter_map(|mut run| {
                     if Some(run.row) != controls_row || layout.controls.is_empty() {
@@ -1039,6 +1051,73 @@ mod tests {
             assert_eq!((stop.start, stop.end), (0, cols), "{cols} cols");
             assert!(drawn(&layout, 2, cols).starts_with('d'), "{cols} cols");
         }
+    }
+
+    #[test]
+    fn a_long_draft_never_paints_over_claudes_status_line() {
+        // Claude's box at 40 cols: caret row 3, rule row 4, the status line on
+        // row 5. A draft of several lines may use the caret row and the rule,
+        // never the status line; it shows its caret end.
+        let (rows, anchor) = claude_box(40);
+        let mut g = full_line("talk");
+        g.controls = vec![control("talk", "talk")];
+        let draft = "make the stop button bigger and keep it reachable while I scroll and fix the hide button";
+        g.draft = vec![text(draft)];
+        let layout = place_all(&g, anchor, &rows, None);
+        let draft_runs: Vec<_> = layout
+            .placed
+            .iter()
+            .filter(|p| p.style == GhostStyle::Text)
+            .collect();
+        assert!(
+            draft_runs.iter().all(|p| p.row == 3 || p.row == 4),
+            "{draft_runs:?}"
+        );
+        assert!(
+            layout.placed.iter().all(|p| p.row != 5),
+            "{:?}",
+            layout.placed
+        );
+        // The caret end is the part kept; the start is elided.
+        assert!(
+            drawn(&layout, 3, 40).contains('…'),
+            "{:?}",
+            drawn(&layout, 3, 40)
+        );
+        let shown: String = draft_runs
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(shown.ends_with("button"), "{shown:?}");
+        assert!(layout.draft_shown);
+    }
+
+    #[test]
+    fn blank_rows_under_the_caret_still_take_the_draft() {
+        // Nothing of the program's under the caret: the draft may wrap there.
+        let rows = screen(&["older output", "", "› ", "", "", ""], 30);
+        let anchor = locate(&rows, Some((2, 2)), PromptKind::Codex);
+        let mut g = ghost(vec![text(
+            "one two three four five six seven eight nine ten eleven",
+        )]);
+        g.kind = PromptKind::Codex;
+        let layout = place_all(&g, anchor, &rows, None);
+        let last = layout
+            .placed
+            .iter()
+            .map(|p| p.row)
+            .max()
+            .expect("draft drawn");
+        assert_eq!(last, 3, "wrapped onto the blank row: {:?}", layout.placed);
+        // A row with text below them stops it.
+        let rows = screen(&["older output", "", "› ", "  ? for shortcuts", "", ""], 30);
+        let layout = place_all(&g, anchor, &rows, None);
+        assert!(
+            layout.placed.iter().all(|p| p.row == 2),
+            "{:?}",
+            layout.placed
+        );
     }
 
     #[test]
