@@ -373,15 +373,13 @@ macro_rules! __bind_gpui {
                         f32::from(bounds.size.width) as u16,
                         f32::from(bounds.size.height) as u16,
                     );
-                    // The grid may be the remote side's negotiated one. Smaller than
-                    // the pane: drawn whole, the rest left empty (letterboxed).
-                    // Larger: a pane-sized window into it that follows the caret.
+                    // The grid may be the remote side's negotiated one. Shorter than
+                    // the pane: drawn whole against its bottom, the rows above left
+                    // empty. Narrower: the rest of each row left empty. Larger: a
+                    // pane-sized window into it that follows the caret.
                     let (grid_cols, grid_rows) = self.session.grid_size();
                     let pane = (cols, rows);
-                    let (cols, rows) = (
-                        usize::from(cols.min(grid_cols)),
-                        usize::from(rows.min(grid_rows)),
-                    );
+                    let cols = usize::from(cols.min(grid_cols));
                     let theme = self.style.theme;
                     let mut grid = self.session.grid().lock();
                     let selection = grid
@@ -395,12 +393,19 @@ macro_rules! __bind_gpui {
                     } else {
                         (0, 0)
                     };
+                    // Rows drawn: the pane's when a short grid sits at its bottom
+                    // (row_off < 0, the rows above the grid's first stay empty).
+                    let rows = usize::from(if row_off < 0 { pane.1 } else { pane.1.min(grid_rows) });
                     self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
                     // The rows as drawn, for finding the program's prompt.
                     let mut screen: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
                     for row in 0..rows {
+                        // Above a short grid drawn at the pane's bottom: nothing.
+                        if row as i32 + row_off < 0 {
+                            continue;
+                        }
                         for col in 0..cols {
                             let pos = Pos::new(Line(row as i32 + row_off - offset), Column(col + col_off));
                             let square = grid.grid[pos];
