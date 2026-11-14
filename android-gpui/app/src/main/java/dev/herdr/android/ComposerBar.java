@@ -322,14 +322,22 @@ final class ComposerBar {
     }
 
     /**
-     * A tap on the terminal. On an agent's pane it opens the keyboard into the
-     * draft (true); elsewhere the terminal's own keyboard is the caller's to
-     * show (false).
+     * A tap on the terminal, once the renderer had it. A tap the program took
+     * as a mouse click opens nothing (true). On an agent's pane any other tap
+     * opens the keyboard into the draft (true); elsewhere the terminal's own
+     * keyboard is the caller's to show (false). See {@link TerminalTap}.
      */
-    boolean terminalTapped() {
-        if (!agent) return false;
-        startTyping();
-        return true;
+    boolean terminalTapped(boolean clickedProgram) {
+        switch (TerminalTap.after(
+                clickedProgram ? TerminalTap.Outcome.CLICKED : TerminalTap.Outcome.PLAIN, agent)) {
+            case NOTHING:
+                return true;
+            case TYPE_INTO_DRAFT:
+                startTyping();
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** The file page opened or closed over the terminal. */
@@ -1151,12 +1159,25 @@ final class ComposerBar {
         }
 
         @Override public boolean onTouchEvent(MotionEvent event) {
+            if (!stripKeeps(event.getActionMasked())) return false;
             if (event.getActionMasked() != MotionEvent.ACTION_UP) return true;
             float dx = event.getX() - downX, dy = event.getY() - downY;
             if (Math.abs(dx) > dp(28) && Math.abs(dx) > Math.abs(dy)) host.switchPane(dx < 0 ? 1 : -1);
             else if (-dy > dp(20) && -dy > Math.abs(dx)) setKeysOpen(!keysOpen);
             return true;
         }
+    }
+
+    /**
+     * Whether the targets' strip keeps a touch that reached the strip itself.
+     * The strip spans the box around every target, so a finger that goes down
+     * there and on no target is on the terminal between them (a program's own
+     * button or tab, say) and must reach it. A swipe begun on a target is
+     * still the strip's: it takes over from the target after the first move,
+     * so only moves and lifts reach it.
+     */
+    static boolean stripKeeps(int action) {
+        return action != MotionEvent.ACTION_DOWN;
     }
 
     /** The keys' overlay: a swipe down on it closes it; sideways drags scroll the keys. */

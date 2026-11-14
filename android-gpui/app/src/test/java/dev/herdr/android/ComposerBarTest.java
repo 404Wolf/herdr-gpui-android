@@ -249,4 +249,13 @@ public final class ComposerBarTest {
         // Without dictation, typing on a narrow grid: hide before send.
         assertEquals("hide", ids(ComposerBar.controls(true, NONE, queued, 14)));
     }
+
+    @Test public void aTouchBetweenTheControlsTargetsReachesTheTerminal() {
+        // The strip around the targets lets a finger that went down on none of
+        // them through to the terminal (a program's own tab under the gap)...
+        assertFalse(ComposerBar.stripKeeps(android.view.MotionEvent.ACTION_DOWN));
+        // ...and keeps the rest of a swipe it took over from a target.
+        assertTrue(ComposerBar.stripKeeps(android.view.MotionEvent.ACTION_MOVE));
+        assertTrue(ComposerBar.stripKeeps(android.view.MotionEvent.ACTION_UP));
+    }
 }

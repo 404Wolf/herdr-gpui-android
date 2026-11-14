@@ -32,6 +32,22 @@ repository's [LICENSE](../../../../LICENSE). The changes below are this copy's.
   the terminal wrapped, and across a program's own break at its right edge or
   box border, as Claude Code wraps long URLs. A tap highlights every row it
   covers and hands the host a `Link::Web` or `Link::File`.
+- A tap or click that is not on a link, and that neither travelled nor was a
+  held finger (`tap.rs`), reaches a program that asked for mouse events
+  (DECSET 9, 1000, 1002 or 1003) as a left-button press and release on that
+  cell, SGR-encoded when it asked for 1006 (`mouse.rs`, `Session::click`).
+  This is how Claude Code's fullscreen view gets clicks. Without mouse
+  reporting a tap does what it did before. `Session::wheel` uses the same
+  encoder. The cell comes from the geometry the last paint used (cell size
+  under font scale and pinch zoom, a window into a larger grid, a shorter
+  grid drawn against the pane's bottom): `tap::cell_at`. `set_tap_listener`
+  reports every lifted press to the host (clicked, a tap the program did not
+  take, or no tap), with a stamp the host gave when the press began, so a
+  host that opens a keyboard on a tap leaves it shut for a click. With
+  `set_touch_presses`, a view acts (clicks, opens a link) only on a press
+  whose touch began on it, never on one begun on a view it replaced
+  mid-tap; `tap::DownStamps` carries a host's stamps with its touch-downs in
+  the order GPUI handles them.
 - Errors are a typed `Error`; `anyhow` and the GPUI tests against a local PTY
   were removed. The tests here drive a real socket pair.
 
