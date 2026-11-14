@@ -51,6 +51,8 @@ macro_rules! __bind_gpui {
                 /// The link under that finger: the columns it covers on each row
                 /// (several when wrapped) and its target.
                 pressed_link: Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)>,
+                /// The finger on the screen, so a held one is not taken for a tap.
+                touch: $crate::tap::Touch,
                 /// Unsent words drawn at the program's caret (see `ghost`).
                 ghost: Option<Arc<$crate::ghost::Ghost>>,
                 /// The prompt kind used to read the screen when no ghost is set.
@@ -108,6 +110,7 @@ macro_rules! __bind_gpui {
                             link_handler: None,
                             press: None,
                             pressed_link: None,
+                            touch: $crate::tap::Touch::default(),
                             ghost: None,
                             prompt_kind: $crate::ghost::PromptKind::Other,
                             layout_listener: None,
@@ -195,6 +198,25 @@ macro_rules! __bind_gpui {
                         .map(|(row, columns)| (Line(top.0 + row as i32), columns))
                         .collect();
                     Some((spans, found.link))
+                }
+                /// The screen cell (column, row) under `point`, counted as the
+                /// program counts them: only on the live screen, not in history,
+                /// and not in the letterbox beside a smaller grid.
+                fn screen_cell(&self, point: Point<Pixels>) -> Option<(usize, usize)> {
+                    if !self.bounds.contains(&point) {
+                        return None;
+                    }
+                    let grid = self.session.grid().lock();
+                    if grid.display_offset() != 0 {
+                        return None;
+                    }
+                    let row = (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor();
+                    let col = (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor();
+                    // Through the window drawn (it may follow the caret on a larger grid).
+                    let (row_off, col_off) = self.view_origin;
+                    let row = usize::try_from(row as i64 + i64::from(row_off)).ok()?;
+                    let col = usize::try_from(col as i64).ok()? + col_off;
+                    (row < grid.screen_lines() && col < grid.columns()).then_some((col, row))
                 }
                 fn cancel_press(&mut self) -> bool {
                     self.press = None;
@@ -691,16 +713,35 @@ macro_rules! __bind_gpui {
                         }))
                         .on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
+                            cx.listener(|this, event: &MouseUpEvent, _, cx| {
                                 this.selecting = false;
-                                this.press = None;
-                                if let Some((_, url)) = this.pressed_link.take() {
-                                    // A tap on a link opens it and selects nothing.
-                                    this.session.grid().lock().selection = None;
-                                    if let Some(handler) = this.link_handler.clone() {
-                                        handler(url);
+                                let press = $crate::tap::Press {
+                                    on_link: this.pressed_link.is_some(),
+                                    travelled: this.press.take().is_none(),
+                                    held: this.touch.lifted(),
+                                };
+                                let link = this.pressed_link.take();
+                                match $crate::tap::lift(press) {
+                                    $crate::tap::Lift::OpenLink => {
+                                        // A tap on a link opens it and selects nothing.
+                                        this.session.grid().lock().selection = None;
+                                        if let (Some((_, url)), Some(handler)) = (link, this.link_handler.clone()) {
+                                            handler(url);
+                                        }
+                                        cx.notify();
                                     }
-                                    cx.notify();
+                                    // A program that asked for mouse events (Claude Code's
+                                    // fullscreen view, other TUIs) gets the tap as a click;
+                                    // it, not a local selection, owns the cell then.
+                                    $crate::tap::Lift::Click => {
+                                        if let Some((column, row)) = this.screen_cell(event.position)
+                                            && this.session.click(column, row)
+                                        {
+                                            this.session.grid().lock().selection = None;
+                                            cx.notify();
+                                        }
+                                    }
+                                    $crate::tap::Lift::Nothing => {}
                                 }
                             }),
                         )
@@ -718,6 +759,29 @@ macro_rules! __bind_gpui {
                             canvas(
                                 |_, _, _| {},
                                 move |bounds, _, window, cx| {
+                                    // GPUI offers every touch as a touch drag when it
+                                    // starts and as a long press once held. Watched, never
+                                    // claimed, so a held finger's lift is not taken for a
+                                    // tap (see `tap`) and both still behave as before.
+                                    window.on_mouse_event({
+                                        let entity = paint_entity.clone();
+                                        move |event: &TouchDragEvent, phase, _, cx| {
+                                            if phase == DispatchPhase::Bubble
+                                                && event.phase == TouchPhase::Started
+                                                && bounds.contains(&event.start_position)
+                                            {
+                                                entity.update(cx, |this, _| this.touch.began());
+                                            }
+                                        }
+                                    });
+                                    window.on_mouse_event({
+                                        let entity = paint_entity.clone();
+                                        move |event: &LongPressEvent, phase, _, cx| {
+                                            if phase == DispatchPhase::Bubble && event.phase == TouchPhase::Started {
+                                                entity.update(cx, |this, _| this.touch.held());
+                                            }
+                                        }
+                                    });
                                     let this = paint_entity.read(cx);
                                     if !this.host_input {
                                         let focus = this.focus.clone();

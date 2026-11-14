@@ -12,8 +12,11 @@ pub mod glyphs;
 mod keys;
 #[doc(hidden)]
 pub mod links;
+mod mouse;
 mod options;
 mod session;
+#[doc(hidden)]
+pub mod tap;
 
 pub use error::{Error, Result};
 pub use keys::{KeyPress, key_bytes};

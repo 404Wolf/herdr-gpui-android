@@ -3,7 +3,10 @@
 //! owes the program (device and cursor reports, colour and size queries) are
 //! answered as they are parsed and leave through the same input queue.
 
-use crate::{Error, KeyPress, Result, TerminalTheme, key_bytes};
+use crate::{
+    Error, KeyPress, Result, TerminalTheme, key_bytes,
+    mouse::{self, Gesture},
+};
 use rio_vt::{
     ansi::CursorShape,
     config::colors::{AnsiColor, ColorRgb},
@@ -411,17 +414,11 @@ impl Session {
         };
         let count = lines.unsigned_abs().min(30) as usize;
         let up = lines > 0;
-        let bytes = if mode.intersects(Mode::MOUSE_MODE) {
-            // Report at the middle of the screen: the pane under the finger is
-            // the whole terminal here.
-            let (column, row) = (columns / 2 + 1, rows / 2 + 1);
-            let button = if up { 64 } else { 65 };
-            let one = if mode.contains(Mode::SGR_MOUSE) {
-                format!("\x1b[<{button};{column};{row}M").into_bytes()
-            } else {
-                let encode = |value: usize| u8::try_from(32 + value.min(223)).unwrap_or(255);
-                vec![0x1b, b'[', b'M', 32 + button, encode(column), encode(row)]
-            };
+        let gesture = if up { Gesture::WheelUp } else { Gesture::WheelDown };
+        // Reported at the middle of the screen: the pane under the finger is
+        // the whole terminal here.
+        let report = mouse::report(mode, gesture, columns / 2 + 1, rows / 2 + 1);
+        let bytes = if let Some(one) = report {
             one.repeat(count)
         } else if mode.contains(Mode::ALT_SCREEN) {
             let one: &[u8] = match (up, mode.contains(Mode::APP_CURSOR)) {
@@ -435,6 +432,23 @@ impl Session {
             return false;
         };
         self.write(bytes)
+    }
+
+    /// A tap or click on the screen cell (`column`, `row`), counted from 0 at
+    /// the screen's top-left, reported to the program as a left-button press
+    /// and release when it asked for mouse events. Returns false, sending
+    /// nothing, when it asked for none, or the cell is off the screen.
+    /// Like the wheel, it leaves the view where it is.
+    pub fn click(&self, column: usize, row: usize) -> bool {
+        let (mode, columns, rows) = {
+            let grid = self.grid.lock();
+            (grid.mode(), grid.columns(), grid.screen_lines())
+        };
+        if column >= columns || row >= rows {
+            return false;
+        }
+        mouse::report(mode, Gesture::Click, column + 1, row + 1)
+            .is_some_and(|bytes| self.write(bytes))
     }
 
     fn follow_input(&self) -> Mode {
@@ -690,6 +704,32 @@ mod tests {
             key: "a".into(),
             ..KeyPress::default()
         }));
+    }
+
+    #[test]
+    fn a_click_reaches_only_a_program_that_asked_for_mouse_events() {
+        use rio_vt::crosswords::Mode;
+        let (session, mut remote, _) = session();
+        let mode = |session: &Session| session.grid().lock().mode();
+        // No mouse reporting: nothing is sent, and the caller is told so.
+        assert!(!session.click(4, 2));
+        // 1000 then 1006: clicks are reported, as SGR, at 1-based cells.
+        remote.write_all(b"\x1b[?1000h\x1b[?1006h").unwrap();
+        until(|| mode(&session).contains(Mode::MOUSE_REPORT_CLICK | Mode::SGR_MOUSE));
+        assert!(session.click(4, 2));
+        reply(&mut remote, b"\x1b[<0;5;3M\x1b[<0;5;3m");
+        // Off the 20x4 screen: nothing.
+        assert!(!session.click(20, 0));
+        assert!(!session.click(0, 4));
+        // The program turned reporting off again: taps are its own no more.
+        remote.write_all(b"\x1b[?1000l").unwrap();
+        until(|| !mode(&session).intersects(Mode::MOUSE_MODE));
+        assert!(!session.click(4, 2));
+        // The wheel, sharing the encoder, still scrolls by reports when asked.
+        remote.write_all(b"\x1b[?1002h").unwrap();
+        until(|| mode(&session).contains(Mode::MOUSE_DRAG));
+        assert!(session.wheel(2));
+        reply(&mut remote, b"\x1b[<64;11;3M\x1b[<64;11;3M");
     }
 
     #[test]
