@@ -339,7 +339,6 @@ fn apply_grid(
 }
 
 impl Session {
-
     /// Typed text, sent as is. Returns false when the input queue is full.
     pub fn type_text(&self, text: &str) -> bool {
         self.follow_input();
@@ -543,7 +542,9 @@ pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize))
         0
     };
     let col = if grid_cols > pane_cols {
-        (cursor.1 + 1).saturating_sub(pane_cols).min(grid_cols - pane_cols)
+        (cursor.1 + 1)
+            .saturating_sub(pane_cols)
+            .min(grid_cols - pane_cols)
     } else {
         0
     };

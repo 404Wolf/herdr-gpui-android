@@ -1318,7 +1318,6 @@ mod tests {
 
     #[test]
     fn a_long_draft_keeps_its_caret_end_on_screen() {
-        let rows = screen(CLAUDE, 20);
         let anchor = Some(Anchor {
             prompt_row: 5,
             row: 5,

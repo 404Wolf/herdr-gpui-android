@@ -10,10 +10,57 @@ const MAX_ROWS: usize = 12;
 const BORDERS: [char; 4] = ['\u{2502}', '\u{2503}', '\u{2551}', '|'];
 /// Extensions that make a bare `name.ext` a file, without a slash to say so.
 const EXTENSIONS: &[&str] = &[
-    "c", "cc", "cfg", "conf", "cpp", "css", "csv", "diff", "ex", "exs", "go", "gradle", "h", "hpp",
-    "hs", "html", "ini", "java", "js", "json", "jsx", "kt", "kts", "lock", "log", "lua", "md", "mk",
-    "ml", "nix", "patch", "properties", "proto", "py", "rb", "rs", "scss", "sh", "sql", "svelte",
-    "swift", "toml", "ts", "tsx", "txt", "vue", "xml", "yaml", "yml", "zig", "zsh",
+    "c",
+    "cc",
+    "cfg",
+    "conf",
+    "cpp",
+    "css",
+    "csv",
+    "diff",
+    "ex",
+    "exs",
+    "go",
+    "gradle",
+    "h",
+    "hpp",
+    "hs",
+    "html",
+    "ini",
+    "java",
+    "js",
+    "json",
+    "jsx",
+    "kt",
+    "kts",
+    "lock",
+    "log",
+    "lua",
+    "md",
+    "mk",
+    "ml",
+    "nix",
+    "patch",
+    "properties",
+    "proto",
+    "py",
+    "rb",
+    "rs",
+    "scss",
+    "sh",
+    "sql",
+    "svelte",
+    "swift",
+    "toml",
+    "ts",
+    "tsx",
+    "txt",
+    "vue",
+    "xml",
+    "yaml",
+    "yml",
+    "zig",
+    "zsh",
 ];
 
 /// What a tap on a link opens.
@@ -43,7 +90,10 @@ impl Link {
             Some((path, line)) => (path, line.parse().ok().filter(|l| *l > 0)),
             None => (path, None),
         };
-        Some(Self::File { path: percent_decode(path)?, line })
+        Some(Self::File {
+            path: percent_decode(path)?,
+            line,
+        })
     }
 }
 
@@ -57,7 +107,10 @@ pub struct Row {
 
 impl Row {
     pub fn new(text: &str, wrapped: bool) -> Self {
-        Self { chars: text.chars().collect(), wrapped }
+        Self {
+            chars: text.chars().collect(),
+            wrapped,
+        }
     }
 }
 
@@ -82,7 +135,10 @@ pub fn link_at(rows: &[Row], row: usize, col: usize) -> Option<Found> {
         first -= 1;
     }
     let mut last = row;
-    while last + 1 < rows.len() && last - row < MAX_ROWS && joins(&rows[last], &rows[last + 1]).is_some() {
+    while last + 1 < rows.len()
+        && last - row < MAX_ROWS
+        && joins(&rows[last], &rows[last + 1]).is_some()
+    {
         last += 1;
     }
     // The logical line: each row's part, and where in it each char came from.
@@ -90,8 +146,16 @@ pub fn link_at(rows: &[Row], row: usize, col: usize) -> Option<Found> {
     let mut origin = Vec::new();
     let mut tapped = None;
     for r in first..=last {
-        let start = if r > first { joins(&rows[r - 1], &rows[r]).map_or(0, |j| j.next_start) } else { 0 };
-        let end = if r < last { joins(&rows[r], &rows[r + 1]).map_or(0, |j| j.end) } else { rows[r].chars.len() };
+        let start = if r > first {
+            joins(&rows[r - 1], &rows[r]).map_or(0, |j| j.next_start)
+        } else {
+            0
+        };
+        let end = if r < last {
+            joins(&rows[r], &rows[r + 1]).map_or(0, |j| j.end)
+        } else {
+            rows[r].chars.len()
+        };
         if r == row {
             if !(start..end).contains(&col) {
                 // Indentation or a border outside the joined text: only this row.
@@ -132,7 +196,10 @@ struct Join {
 
 fn joins(a: &Row, b: &Row) -> Option<Join> {
     if a.wrapped {
-        return Some(Join { end: a.chars.len(), next_start: 0 });
+        return Some(Join {
+            end: a.chars.len(),
+            next_start: 0,
+        });
     }
     // A program's own break: text to the right edge, its last word link-like,
     // and the next row's first word (after the same kind of margin) goes on.
@@ -147,19 +214,30 @@ fn joins(a: &Row, b: &Row) -> Option<Join> {
     if end == 0 || end + 1 < edge {
         return None;
     }
-    let word_start = chars[..end].iter().rposition(|c| !part_of_link(*c)).map_or(0, |i| i + 1);
+    let word_start = chars[..end]
+        .iter()
+        .rposition(|c| !part_of_link(*c))
+        .map_or(0, |i| i + 1);
     if word_start == end {
         return None;
     }
     let word: String = chars[word_start..end].iter().collect();
-    let margin = chars[..word_start].iter().all(|c| c.is_whitespace() || BORDERS.contains(c));
+    let margin = chars[..word_start]
+        .iter()
+        .all(|c| c.is_whitespace() || BORDERS.contains(c));
     // A row that is one word (a continuation itself), or a word that starts a
     // URL or a path; prose that happens to reach the edge never joins.
     if !(margin || word.contains("://") || word.contains('/')) {
         return None;
     }
-    let next_start = b.chars.iter().position(|c| !(c.is_whitespace() || BORDERS.contains(c)))?;
-    let next_end = b.chars[next_start..].iter().position(|c| !part_of_link(*c)).map_or(b.chars.len(), |i| next_start + i);
+    let next_start = b
+        .chars
+        .iter()
+        .position(|c| !(c.is_whitespace() || BORDERS.contains(c)))?;
+    let next_end = b.chars[next_start..]
+        .iter()
+        .position(|c| !part_of_link(*c))
+        .map_or(b.chars.len(), |i| next_start + i);
     if next_end == next_start {
         return None;
     }
@@ -198,15 +276,32 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     }
     let word: String = text[start..end].iter().collect();
     // Byte offset of each char of the word, to map matches back.
-    let offsets: Vec<usize> = word.char_indices().map(|(i, _)| i).chain([word.len()]).collect();
-    let index_of = |byte: usize| offsets.iter().position(|&b| b == byte).unwrap_or(offsets.len() - 1);
+    let offsets: Vec<usize> = word
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([word.len()])
+        .collect();
+    let index_of = |byte: usize| {
+        offsets
+            .iter()
+            .position(|&b| b == byte)
+            .unwrap_or(offsets.len() - 1)
+    };
     let tapped = at - start;
     // URLs first: a word may hold one after other text ("(see:https://…").
     let mut search = 0;
-    while let Some(found) = SCHEMES.iter().filter_map(|s| word[search..].find(s).map(|i| search + i)).min() {
+    while let Some(found) = SCHEMES
+        .iter()
+        .filter_map(|s| word[search..].find(s).map(|i| search + i))
+        .min()
+    {
         let url = trim_url(&word[found..]);
         let (first, last) = (index_of(found), index_of(found + url.len()));
-        if url.len() > SCHEMES.iter().find(|s| url.starts_with(**s)).map_or(0, |s| s.len())
+        if url.len()
+            > SCHEMES
+                .iter()
+                .find(|s| url.starts_with(**s))
+                .map_or(0, |s| s.len())
             && (first..last).contains(&tapped)
         {
             return Some((start + first..start + last, Link::Web(url.to_owned())));
@@ -217,14 +312,24 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
         return None;
     }
     // A path: drop wrapping punctuation and brackets, then a `:line:col`.
-    let lead = word.find(|c: char| !matches!(c, '(' | '[' | '{' | ',' | ':' | ';')).unwrap_or(word.len());
+    let lead = word
+        .find(|c: char| !matches!(c, '(' | '[' | '{' | ',' | ':' | ';'))
+        .unwrap_or(word.len());
     let body = trim_url(&word[lead..]);
     let (path, line) = split_line(body);
     if !looks_like_file(path) {
         return None;
     }
     let (first, last) = (index_of(lead), index_of(lead + body.len()));
-    (first..last).contains(&tapped).then(|| (start + first..start + last, Link::File { path: path.to_owned(), line }))
+    (first..last).contains(&tapped).then(|| {
+        (
+            start + first..start + last,
+            Link::File {
+                path: path.to_owned(),
+                line,
+            },
+        )
+    })
 }
 
 /// Drops sentence punctuation and an unbalanced closing bracket from the end.
@@ -267,7 +372,13 @@ fn split_line(text: &str) -> (&str, Option<u32>) {
         numbers.push(tail);
         path = head;
     }
-    (path, numbers.last().and_then(|line| line.parse().ok()).filter(|l| *l > 0))
+    (
+        path,
+        numbers
+            .last()
+            .and_then(|line| line.parse().ok())
+            .filter(|l| *l > 0),
+    )
 }
 
 fn looks_like_file(path: &str) -> bool {
@@ -278,10 +389,16 @@ fn looks_like_file(path: &str) -> bool {
         return false;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
-    let extension = name
-        .rsplit_once('.')
-        .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.chars().any(|c| c.is_ascii_alphabetic()));
-    let rooted = path.starts_with('/') || path.starts_with("~/") || path.starts_with("./") || path.starts_with("../");
+    let extension = name.rsplit_once('.').filter(|(stem, ext)| {
+        !stem.is_empty()
+            && !ext.is_empty()
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && ext.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    let rooted = path.starts_with('/')
+        || path.starts_with("~/")
+        || path.starts_with("./")
+        || path.starts_with("../");
     if path.contains('/') {
         // `and/or` is prose; a rooted path or one ending in a file name is not.
         return (rooted && path.len() > 1) || extension.is_some();
@@ -304,15 +421,23 @@ fn percent_decode(text: &str) -> Option<String> {
             i += 1;
         }
     }
-    String::from_utf8(out).ok().filter(|s| !s.chars().any(char::is_control))
+    String::from_utf8(out)
+        .ok()
+        .filter(|s| !s.chars().any(char::is_control))
 }
 
 /// The http(s) URL covering column `col` of a single row, with its columns.
 #[doc(hidden)]
 pub fn url_at(row: &[char], col: usize) -> Option<(Range<usize>, String)> {
-    let rows = [Row { chars: row.to_vec(), wrapped: false }];
+    let rows = [Row {
+        chars: row.to_vec(),
+        wrapped: false,
+    }];
     match link_at(&rows, 0, col)? {
-        Found { link: Link::Web(url), spans } => Some((spans.first()?.1.clone(), url)),
+        Found {
+            link: Link::Web(url),
+            spans,
+        } => Some((spans.first()?.1.clone(), url)),
         _ => None,
     }
 }
@@ -330,7 +455,10 @@ mod tests {
     }
 
     fn file(path: &str, line: Option<u32>) -> Link {
-        Link::File { path: path.into(), line }
+        Link::File {
+            path: path.into(),
+            line,
+        }
     }
 
     fn link(rows: &[Row], row: usize, col: usize) -> Option<Link> {
@@ -340,7 +468,10 @@ mod tests {
     #[test]
     fn finds_the_url_under_a_column_and_drops_trailing_punctuation() {
         let row = "see https://github.com/o/r/pull/1315. done";
-        assert_eq!(at(row, 10), Some((4..36, "https://github.com/o/r/pull/1315".into())));
+        assert_eq!(
+            at(row, 10),
+            Some((4..36, "https://github.com/o/r/pull/1315".into()))
+        );
         assert_eq!(at(row, 2), None);
         assert_eq!(at(row, 37), None);
     }
@@ -351,7 +482,10 @@ mod tests {
             at("(https://en.wikipedia.org/wiki/A_(b))", 3).map(|(_, url)| url),
             Some("https://en.wikipedia.org/wiki/A_(b)".into())
         );
-        assert_eq!(at("[http://x.dev/a]", 2).map(|(_, url)| url), Some("http://x.dev/a".into()));
+        assert_eq!(
+            at("[http://x.dev/a]", 2).map(|(_, url)| url),
+            Some("http://x.dev/a".into())
+        );
     }
 
     #[test]
@@ -398,17 +532,26 @@ mod tests {
 
     #[test]
     fn prose_that_reaches_the_edge_never_joins_the_next_row() {
-        let rows = [Row::new("a sentence ending here", false), Row::new("https://x.io next", false)];
+        let rows = [
+            Row::new("a sentence ending here", false),
+            Row::new("https://x.io next", false),
+        ];
         assert_eq!(link(&rows, 1, 3), Some(web("https://x.io")));
         // A URL that stops short of the edge does not take the next row's word.
-        let short = [Row::new("https://x.io/a      ", false), Row::new("words", false)];
+        let short = [
+            Row::new("https://x.io/a      ", false),
+            Row::new("words", false),
+        ];
         assert_eq!(link(&short, 0, 3), Some(web("https://x.io/a")));
         assert_eq!(link(&short, 1, 1), None);
     }
 
     #[test]
     fn file_paths_with_lines_open_as_files() {
-        let rows = [Row::new("error at src/links.rs:42:7 and ./run.sh, see /etc/hosts.", false)];
+        let rows = [Row::new(
+            "error at src/links.rs:42:7 and ./run.sh, see /etc/hosts.",
+            false,
+        )];
         assert_eq!(link(&rows, 0, 12), Some(file("src/links.rs", Some(42))));
         assert_eq!(link(&rows, 0, 33), Some(file("./run.sh", None)));
         assert_eq!(link(&rows, 0, 50), Some(file("/etc/hosts", None)));
@@ -420,7 +563,9 @@ mod tests {
 
     #[test]
     fn prose_numbers_and_abbreviations_are_not_files() {
-        for text in ["and/or", "e.g.", "v1.2.3", "3.14", "12:30", "/", "a//b", "TODO.", "src/"] {
+        for text in [
+            "and/or", "e.g.", "v1.2.3", "3.14", "12:30", "/", "a//b", "TODO.", "src/",
+        ] {
             let rows = [Row::new(text, false)];
             assert_eq!(link(&rows, 0, 1), None, "{text}");
         }
@@ -432,15 +577,27 @@ mod tests {
             Row::new("  edited /home/wolf/Code/proj", false),
             Row::new("  /src/main.rs:10", false),
         ];
-        assert_eq!(link(&rows, 1, 4), Some(file("/home/wolf/Code/proj/src/main.rs", Some(10))));
+        assert_eq!(
+            link(&rows, 1, 4),
+            Some(file("/home/wolf/Code/proj/src/main.rs", Some(10)))
+        );
     }
 
     #[test]
     fn osc8_targets_classify_by_scheme() {
-        assert_eq!(Link::from_uri("https://a.io/x"), Some(web("https://a.io/x")));
+        assert_eq!(
+            Link::from_uri("https://a.io/x"),
+            Some(web("https://a.io/x"))
+        );
         assert_eq!(Link::from_uri("HTTP://a.io"), Some(web("HTTP://a.io")));
-        assert_eq!(Link::from_uri("file://host/home/w/a%20b.rs"), Some(file("/home/w/a b.rs", None)));
-        assert_eq!(Link::from_uri("file:///tmp/x.rs#L9"), Some(file("/tmp/x.rs", Some(9))));
+        assert_eq!(
+            Link::from_uri("file://host/home/w/a%20b.rs"),
+            Some(file("/home/w/a b.rs", None))
+        );
+        assert_eq!(
+            Link::from_uri("file:///tmp/x.rs#L9"),
+            Some(file("/tmp/x.rs", Some(9)))
+        );
         assert_eq!(Link::from_uri("mailto:a@b"), None);
         assert_eq!(Link::from_uri("file:///a%0a"), None);
         assert_eq!(Link::from_uri("https://a.io/\n"), None);
