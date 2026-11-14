@@ -375,9 +375,10 @@ pub struct DrawnRows {
 
 impl Previous {
     /// The controls' row from a frame drawn with `from`, for one drawn with
-    /// `to`. The same rows: unchanged (scrolling changes no height, so the
-    /// controls stay pinned while scrolled). The same grid in a pane of
-    /// another height (a keyboard shown or hidden before the host resizes,
+    /// `to`. The same heights: unchanged, whatever the origin did (scrolling
+    /// a larger grid into history moves its origin but changes no height, and
+    /// the controls stay pinned to their pane row while scrolled). The same
+    /// grid in a pane of another height (a keyboard shown or hidden before the host resizes,
     /// as while the link is down): rebased by the origin's move, onto the
     /// same grid row. A grid of another height (the host's resize arrived):
     /// `None`, as its rows need not hold what they held. `None` too when the
@@ -387,6 +388,9 @@ impl Previous {
     pub fn carried(self, from: DrawnRows, to: DrawnRows) -> Option<Self> {
         if from.grid != to.grid {
             return None;
+        }
+        if from.pane == to.pane {
+            return Some(self);
         }
         let row = i64::try_from(self.row).ok()? + i64::from(from.origin) - i64::from(to.origin);
         Some(Self {
@@ -1184,12 +1188,53 @@ mod tests {
         assert_eq!(carried.and_then(|p| p.carried(anchored, filled)), Some(previous));
         // Unchanged rows (a scroll, a repaint): the row is kept as it was.
         assert_eq!(previous.carried(filled, filled), Some(previous));
-        // Moved above the pane: dropped.
-        let shifted = DrawnRows {
-            origin: 30,
-            ..filled
+        // Moved above the pane: dropped. The keyboard shown with the link down
+        // over a grid filling the pane: a 12-row pane, the window following
+        // the caret at the grid's bottom (origin row 12), row 5 now above it.
+        let shrunk = DrawnRows {
+            pane: 12,
+            grid: 24,
+            origin: 12,
         };
-        assert_eq!(previous.carried(filled, shifted), None);
+        let high = Previous {
+            row: 5,
+            scrolled: false,
+        };
+        assert_eq!(high.carried(filled, shrunk), None);
+        let kept = previous.carried(filled, shrunk);
+        assert_eq!(kept.map(|p| p.row), Some(11));
+    }
+
+    #[test]
+    fn scrolling_a_larger_grid_keeps_the_controls_row() {
+        // A 40-row grid in a 24-row pane: at the bottom its window follows the
+        // caret (origin row 16); scrolled into history it starts at the top
+        // (origin row 0). Neither height changes, so the row is not moved.
+        let following = DrawnRows {
+            pane: 24,
+            grid: 40,
+            origin: 16,
+        };
+        let history = DrawnRows {
+            origin: 0,
+            ..following
+        };
+        let previous = Previous {
+            row: 23,
+            scrolled: true,
+        };
+        assert_eq!(previous.carried(following, history), Some(previous));
+        assert_eq!(previous.carried(history, following), Some(previous));
+        // Scrolled, the controls stay on that pane row over the history drawn
+        // there, so stop never moves from under the thumb.
+        let rows = screen(
+            &["older output that fills the whole row with text, edge to edge"; 24],
+            60,
+        );
+        let g = recording(ghost(Vec::new()));
+        let layout = place_all(&g, None, &rows, previous.carried(following, history));
+        assert!(!layout.controls.is_empty());
+        assert!(layout.controls.iter().all(|c| c.row == 23), "{:?}", layout.controls);
     }
 
     #[test]
