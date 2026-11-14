@@ -16,7 +16,7 @@ import java.util.Set;
  * One computer's Fleet tree (Deacon › projects/PM › main and worktree rows ›
  * workers), per the desktop's Fleet tree contract v1/v1.1 (spaces-wolf). It is
  * built per core connection, so agents of two computers never share a Deacon.
- * The sidebar draws {@link #pmTree}: the Deacon and one row per PM, with each
+ * The sidebar draws {@link #pmTree}: the Deacon and PMs grouped by repo, with each
  * checkout reduced to a terminal's second line. Plain data in, plain data
  * out: tested without Android.
  */
@@ -677,31 +677,39 @@ final class FleetTree {
     /**
      * Project folds as the desktop sidebar keeps them: every project starts
      * folded (a repo shows only its PM rows; opening one shows its worktrees
-     * and workers). {@code opened} holds the projects Wolf opened. Nothing is
-     * revealed at startup; a later focus change opens the focused agent's
+     * and workers). Stored keys mark open projects and collapsed repositories.
+     * Nothing is revealed at startup; a later focus change opens the focused agent's
      * project once, and a fold made after that is kept.
      */
     static final class Folds {
-        final Set<String> opened;
+        final Set<String> stored;
         private String focus;
-        Folds(Set<String> opened) { this.opened = opened; }
+        Folds(Set<String> stored) { this.stored = stored; }
 
-        boolean folded(String projectKey) { return !opened.contains(projectKey); }
+        boolean folded(String projectKey) { return !stored.contains(projectKey); }
 
-        void toggle(String projectKey) { if (!opened.remove(projectKey)) opened.add(projectKey); }
+        void toggle(String projectKey) { if (!stored.remove(projectKey)) stored.add(projectKey); }
 
         /** The focused terminal, seen on a refresh: true when this reveals (opens) {@code keys}. */
         boolean focusSeen(String now, java.util.Collection<String> keys) {
+            return focusSeen(now, keys, Collections.emptyList());
+        }
+
+        /** Open the new selection's project and its repo; a manual fold survives subsequent polls. */
+        boolean focusSeen(String now, java.util.Collection<String> keys, java.util.Collection<String> collapsedRepos) {
             if (now == null || now.isEmpty()) return false;
             if (focus == null) { focus = now; return false; } // startup: record, reveal nothing
             if (now.equals(focus)) return false;
             focus = now;
-            return opened.addAll(keys);
+            boolean changed = stored.addAll(keys);
+            return stored.removeAll(collapsedRepos) || changed;
         }
     }
 
     /** The rows of the sidebar that can fold, for {@link #foldedByDefault}. */
     enum Fold {
+        /** Repository headings start open so their PMs are visible at rest. */
+        REPO,
         /** The Deacon's own helpers, under the Deacon row. */
         DEACON,
         /** A PM row: its workers, nested by parent. */
@@ -718,7 +726,7 @@ final class FleetTree {
      * chevron; once a PM is opened, its workers show their own sub-agents.
      */
     static boolean foldedByDefault(Fold fold) {
-        return fold != Fold.AGENT;
+        return fold != Fold.AGENT && fold != Fold.REPO;
     }
 
     /** One PM row of the sidebar: a project's manager, where it works, and its workers. */
@@ -743,11 +751,72 @@ final class FleetTree {
         boolean blocked() { return project.tally[0] > 0; }
     }
 
+    /** PM, else the first agent in display order, falling back to a shell when no agent remains. */
+    static Member projectTarget(PmRow row) {
+        if (row.pm != null) return row.pm;
+        Member agent = firstAgent(row.workers);
+        return agent != null ? agent : row.workers.isEmpty() ? null : row.workers.get(0).member;
+    }
+
+    /** Prefer agents in display preorder, including a worker nested beneath a shell parent. */
+    private static Member firstAgent(List<AgentNode> nodes) {
+        for (AgentNode node : nodes) {
+            if (node.member.isAgent()) return node.member;
+            Member child = firstAgent(node.children);
+            if (child != null) return child;
+        }
+        return null;
+    }
+
+    /** A visible tap target for the full catalog, including entries beyond the first page. */
+    static String unopenedLabel(Project project) {
+        int count = project.closed.size();
+        return count + (count == 1 ? " unopened worktree" : " unopened worktrees")
+                + (project.closedIncomplete ? " (incomplete)" : "");
+    }
+
+    /** A repository header and its project/PM rows. No physical spaces are added to this view. */
+    static final class RepoRow {
+        final String key, name;
+        final List<PmRow> projects = new ArrayList<>();
+        RepoRow(String key, String name) { this.key = key; this.name = name; }
+
+        String countLabel() {
+            return projects.size() + (projects.size() == 1 ? " project" : " projects");
+        }
+
+        boolean blocked() {
+            for (PmRow project : projects) if (project.blocked()) return true;
+            return false;
+        }
+    }
+
+    /** PM cwd's repo, else its project's repo, then the conventional worktree path or project label. */
+    private static List<RepoRow> groupRepos(List<PmRow> pms) {
+        Map<String, RepoRow> groups = new LinkedHashMap<>();
+        for (PmRow row : pms) {
+            // build() resolves the PM's own git first, then only this project's other members.
+            String common = row.project.repo;
+            Member target = projectTarget(row);
+            String convention = target == null ? null : RailTree.repoOfPath(target.cwd);
+            String name = !common.isEmpty() ? repoName(common) : convention != null ? convention : row.name();
+            // Separate distinct repositories with the same basename once git identifies them.
+            String key = common.isEmpty() ? "name:" + name : common;
+            groups.computeIfAbsent(key, k -> new RepoRow(k, name)).projects.add(row);
+        }
+        List<RepoRow> rows = new ArrayList<>(groups.values());
+        Collections.sort(rows, (a, b) -> {
+            int c = a.name.compareToIgnoreCase(b.name);
+            return c != 0 ? c : a.key.compareTo(b.key);
+        });
+        return rows;
+    }
+
     /**
      * What the sidebar (the terminal's rail and Home) draws for one computer:
-     * the Deacon, one row per PM, and one folded row for everything else.
-     * There are no repo, worktree or space rows; a terminal's checkout is its
-     * second line instead.
+     * the Deacon, repository headings containing PM rows, and one folded row
+     * for everything else. A terminal's checkout is its second line; workers
+     * and catalogs stay behind the PM's fold.
      */
     static final class PmTree {
         Member deacon;
@@ -755,6 +824,8 @@ final class FleetTree {
         final List<Member> helpers = new ArrayList<>();
         /** One per project a labelled PM (or labelled workers) leads, by project name. */
         final List<PmRow> pms = new ArrayList<>();
+        /** Repository headings in name order; the PMs in each retain project name order. */
+        final List<RepoRow> repos = new ArrayList<>();
         /** Unlabelled projects, loose spaces, extra deacons and agents with no space, nested by parent. */
         final List<AgentNode> others = new ArrayList<>();
         /** The same terminals flat, in place order. */
@@ -852,6 +923,7 @@ final class FleetTree {
             int c = a.name().compareToIgnoreCase(b.name());
             return c != 0 ? c : a.name().compareTo(b.name());
         });
+        tree.repos.addAll(groupRepos(tree.pms));
         // Each repo's unopened worktrees stay reachable from exactly one menu.
         for (Project project : fleet.projects) {
             if (project.closed.isEmpty()) continue;

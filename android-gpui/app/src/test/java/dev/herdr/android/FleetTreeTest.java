@@ -142,7 +142,8 @@ public final class FleetTreeTest {
         assertEquals(Arrays.asList("t30", "t40"), ids(tree.otherMembers));
     }
 
-    @Test public void onlySubAgentsStartOpen() {
+    @Test public void repositoriesAndSubAgentsStartOpenWhileWorkersStayFolded() {
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.REPO));
         assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.AGENT));
         for (FleetTree.Fold fold : new FleetTree.Fold[] {FleetTree.Fold.DEACON, FleetTree.Fold.PROJECT,
                 FleetTree.Fold.OTHERS}) {
@@ -610,7 +611,7 @@ public final class FleetTreeTest {
                 Arrays.asList(row.workers.get(0).where, row.workers.get(1).where));
     }
 
-    @Test public void theSidebarHasNoRepoRowsOnlyPmsByNameWithTheirCheckoutBelow() {
+    @Test public void theSidebarGroupsPmsByRepoWithTheirCheckoutBelow() {
         FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
         FleetTree.Member hm = label(m("t67", "hm", "home-manager", 1, 0, "/c/hm", "working"), "pm", "home-manager");
         FleetTree.Member hypr = label(m("t4m", "hy", "hypr2d", 2, 0, "/wt/hypr", "idle"), "pm", "hypr2d");
@@ -627,6 +628,11 @@ public final class FleetTreeTest {
         assertSame(deacon, tree.deacon);
         // One row per PM, by project name; the repo (or worktree) is the PM's second line.
         assertEquals(Arrays.asList("botd", "home-manager", "hypr2d"), pmNames(tree));
+        assertEquals(2, tree.repos.size());
+        assertEquals("botd", tree.repos.get(0).name);
+        assertEquals("1 project", tree.repos.get(0).countLabel());
+        assertEquals("hm", tree.repos.get(1).name);
+        assertEquals("2 projects", tree.repos.get(1).countLabel());
         assertEquals(Arrays.asList("c", "hm · main", "⑂ hypr"),
                 Arrays.asList(tree.pms.get(0).where, tree.pms.get(1).where, tree.pms.get(2).where));
         // Blocked is on the row itself (botd's PM), not in a separate list.
