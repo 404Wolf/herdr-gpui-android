@@ -392,11 +392,11 @@ macro_rules! __bind_gpui {
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
                     let offset = grid.display_offset() as i32;
-                    let (row_off, col_off) = if offset == 0 {
-                        $crate::viewport_origin((grid_cols, grid_rows), pane, (cursor.pos.row.0, cursor.pos.col.0))
-                    } else {
-                        (0, 0)
-                    };
+                    // Scrolled into history there is no caret to follow; a short grid
+                    // keeps its place at the pane's bottom either way.
+                    let caret_cell = (offset == 0).then_some((cursor.pos.row.0, cursor.pos.col.0));
+                    let (row_off, col_off) =
+                        $crate::viewport_origin((grid_cols, grid_rows), pane, caret_cell);
                     // Rows drawn: the pane's when a short grid sits at its bottom
                     // (row_off < 0, the rows above the grid's first stay empty).
                     let rows = usize::from(if row_off < 0 { pane.1 } else { pane.1.min(grid_rows) });

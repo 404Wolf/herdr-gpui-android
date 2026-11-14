@@ -532,22 +532,34 @@ impl Reader {
 /// Which part of the grid is drawn: the grid cell (row, column) at the pane's
 /// top-left. A grid larger than the pane gets a pane-sized window that starts
 /// at the top-left and moves only as far as needed to keep the caret on
-/// screen (it follows the caret). A grid shorter than the pane is drawn whole
-/// against the pane's bottom: the row is negative, the rows above it are left
-/// empty, so the program's prompt stays at the bottom by the host's controls
-/// (the remote side's grid can be shorter, e.g. kept at its keyboard-up size
-/// while the link is down). A narrower grid is drawn from column 0, the rest
-/// of each row left empty.
-pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize)) -> (i32, usize) {
+/// screen (it follows the caret); scrolled into history there is no caret to
+/// follow (`cursor` is `None`) and the window stays at the top-left. A grid
+/// shorter than the pane is drawn whole against the pane's bottom, scrolled
+/// or not, so it never jumps when the view scrolls: the row is negative, the
+/// rows above it are left empty, so the program's prompt stays at the bottom
+/// by the host's controls (the remote side's grid can be shorter, e.g. kept
+/// at its keyboard-up size while the link is down). A narrower grid is drawn
+/// from column 0, the rest of each row left empty.
+pub fn viewport_origin(
+    grid: (u16, u16),
+    pane: (u16, u16),
+    cursor: Option<(i32, usize)>,
+) -> (i32, usize) {
     let (grid_cols, grid_rows) = (usize::from(grid.0), i32::from(grid.1));
     let (pane_cols, pane_rows) = (usize::from(pane.0.max(1)), i32::from(pane.1.max(1)));
     let row = if grid_rows > pane_rows {
-        (cursor.0 - pane_rows + 1).clamp(0, grid_rows - pane_rows)
+        cursor.map_or(0, |cursor| {
+            (cursor.0 - pane_rows + 1).clamp(0, grid_rows - pane_rows)
+        })
     } else {
         grid_rows - pane_rows
     };
     let col = if grid_cols > pane_cols {
-        (cursor.1 + 1).saturating_sub(pane_cols).min(grid_cols - pane_cols)
+        cursor.map_or(0, |cursor| {
+            (cursor.1 + 1)
+                .saturating_sub(pane_cols)
+                .min(grid_cols - pane_cols)
+        })
     } else {
         0
     };
@@ -754,16 +766,16 @@ mod tests {
     fn a_grid_larger_than_the_pane_follows_the_caret() {
         use super::viewport_origin;
         // Fills the pane exactly: drawn whole from the top-left.
-        assert_eq!(viewport_origin((80, 24), (80, 24), (23, 79)), (0, 0));
+        assert_eq!(viewport_origin((80, 24), (80, 24), Some((23, 79))), (0, 0));
         // Narrower, as tall: from column 0, the rest of each row empty.
-        assert_eq!(viewport_origin((40, 24), (80, 24), (9, 39)), (0, 0));
+        assert_eq!(viewport_origin((40, 24), (80, 24), Some((9, 39))), (0, 0));
         // Larger, caret in view: no movement.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (5, 10)), (0, 0));
+        assert_eq!(viewport_origin((120, 40), (80, 24), Some((5, 10))), (0, 0));
         // Caret below and right of the pane: just far enough to show it.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (30, 100)), (7, 21));
+        assert_eq!(viewport_origin((120, 40), (80, 24), Some((30, 100))), (7, 21));
         // Never past the grid's end.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (39, 119)), (16, 40));
-        assert_eq!(viewport_origin((120, 40), (80, 24), (60, 500)), (16, 40));
+        assert_eq!(viewport_origin((120, 40), (80, 24), Some((39, 119))), (16, 40));
+        assert_eq!(viewport_origin((120, 40), (80, 24), Some((60, 500))), (16, 40));
     }
 
     #[test]
@@ -772,20 +784,34 @@ mod tests {
         // The Fold's cover screen: the host's grid from when the keyboard was up
         // (24 rows) in a pane of 52 rows once it hid with the link down. The
         // grid's row 0 is drawn on pane row 28, its last row on the pane's last.
-        assert_eq!(viewport_origin((50, 24), (50, 52), (22, 2)), (-28, 0));
+        assert_eq!(viewport_origin((50, 24), (50, 52), Some((22, 2))), (-28, 0));
         // Unfolded: a wider, taller pane; the same rule.
-        assert_eq!(viewport_origin((110, 30), (110, 61), (28, 2)), (-31, 0));
+        assert_eq!(viewport_origin((110, 30), (110, 61), Some((28, 2))), (-31, 0));
         // Shorter and narrower: bottom, from column 0.
-        assert_eq!(viewport_origin((40, 10), (80, 24), (9, 39)), (-14, 0));
+        assert_eq!(viewport_origin((40, 10), (80, 24), Some((9, 39))), (-14, 0));
         // One row short: one empty row on top.
-        assert_eq!(viewport_origin((80, 23), (80, 24), (22, 2)), (-1, 0));
+        assert_eq!(viewport_origin((80, 23), (80, 24), Some((22, 2))), (-1, 0));
+    }
+
+    #[test]
+    fn scrolled_into_history_a_short_grid_stays_at_the_bottom() {
+        use super::viewport_origin;
+        // Scrolled (no caret to follow): the short offline grid keeps its place
+        // at the pane's bottom, so neither it nor the controls drawn on it jump.
+        assert_eq!(viewport_origin((50, 24), (50, 52), None), (-28, 0));
+        assert_eq!(viewport_origin((110, 30), (110, 61), None), (-31, 0));
+        assert_eq!(viewport_origin((40, 10), (80, 24), None), (-14, 0));
+        // A grid that fills the pane is drawn from the top-left as before.
+        assert_eq!(viewport_origin((80, 24), (80, 24), None), (0, 0));
+        // A larger grid's history view starts at its top-left, as it did.
+        assert_eq!(viewport_origin((120, 40), (80, 24), None), (0, 0));
     }
 
     #[test]
     fn a_touch_above_a_bottom_anchored_grid_reaches_no_cell() {
         use super::{cell_at, viewport_origin};
         // The cover screen offline: a 50x24 grid at the bottom of a 52-row pane.
-        let origin = viewport_origin((50, 24), (50, 52), (22, 2));
+        let origin = viewport_origin((50, 24), (50, 52), Some((22, 2)));
         assert_eq!(origin, (-28, 0));
         let at = |x, y| cell_at((x, y), (10., 20.), origin, (50, 24));
         // The grid's first row is drawn on pane row 28, its last on row 51.
