@@ -137,14 +137,13 @@ impl TerminalView {
                             &crate::ghost_bridge::hint_json(hint),
                         );
                     });
-                    // A tap the program took as a mouse click opens no keyboard.
+                    // Every tap goes back to Java, which opens typing only for one
+                    // the program did not take as a click. Stamped with the pane
+                    // Java showed when the finger went down.
                     #[cfg(target_os = "android")]
-                    terminal.set_tap_listener(|done| {
+                    terminal.set_tap_listener(crate::android::tap_stamp, |report| {
                         let generation = model::mailbox().state().generation;
-                        crate::android::terminal_tapped(
-                            generation,
-                            done == gpui_rio::tap::Lift::Click,
-                        );
+                        crate::android::terminal_tapped(generation, report);
                     });
                     #[cfg(target_os = "android")]
                     terminal.set_link_handler(|link| {

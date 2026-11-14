@@ -159,11 +159,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Vertical swipe state: a short tap still reaches the terminal. */
     private float touchDownX, edgeStartX;
     private boolean tapCandidate;
-    /** A counted tap waiting for the renderer to say whether the program clicked. */
+    /** Which taps the renderer reports belong to the pane shown now. Main thread. */
     private final TerminalTap terminalTap = new TerminalTap();
-    private final Runnable terminalTapTimeout = () -> {
-        if (terminalTap.settle()) terminalTapSettled(false);
-    };
+    /** The finger the renderer follows, until the activity takes a gesture over. */
+    private final RendererTouch rendererTouch = new RendererTouch();
     private long touchDownAt;
     private boolean edgeClaimed;
     private float touchDownY, lastTouchY, scrollFraction;
@@ -2053,6 +2052,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
+        // Taps the renderer reports from now on are stamped with this pane.
+        long tapStamp = terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
+        if (tapStamp >= 0 && hostStarted) nativeSetTapStamp(tapStamp);
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
             composer.setPane(current == null ? "" : current.paneId, kind);
@@ -4224,11 +4226,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int count = event.getPointerCount();
         if (!hostStarted || count < 1 || count > 16) return false;
         int masked = event.getActionMasked();
+        if (masked == MotionEvent.ACTION_DOWN) rendererTouch.down(event.getPointerId(0));
         pinchDetector().onTouchEvent(event);
         if (pinching || count > 1 && masked != MotionEvent.ACTION_DOWN) {
-            // A pinch is ours: the program never sees half of a two-finger gesture.
+            // A pinch is ours: the program never sees half of a two-finger
+            // gesture, nor its last finger's lift as a tap.
             scrolling = false;
             tapCandidate = false;
+            claimRendererTouch();
+            if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) rendererTouch.end();
             return true;
         }
         if (masked == MotionEvent.ACTION_DOWN) {
@@ -4255,19 +4261,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 float needed = touchDownX < dp(40) ? dp(24) : dp(60);
                 if (dx > needed && dx > dy * 1.5f) {
                     edgeClaimed = true;
+                    claimRendererTouch();
                     showRailOverlay();
                     return true;
                 }
             }
             if (edgeClaimed) return true;
-            if (!scrolling && Math.abs(event.getY() - touchDownY) > dp(8)) {
+            if (!scrolling && Math.abs(event.getY() - touchDownY) > dp(RendererTouch.SLOP_DP)) {
                 scrolling = true;
                 // Dragging the conversation down while typing puts the keyboard away.
                 if (event.getY() > touchDownY && composer != null) composer.hideKeyboard();
                 // The drag is ours from here: the renderer's press (a link's
                 // highlight, a selection) ends now, not at a lift it never sees.
-                nativeTouch(MotionEvent.ACTION_CANCEL, 0, new int[] {event.getPointerId(0)},
-                        new float[] {touchDownX}, new float[] {touchDownY});
+                claimRendererTouch();
             }
             if (scrolling) {
                 long now = SystemClock.uptimeMillis();
@@ -4288,16 +4294,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
             // A plain tap on the terminal opens the keyboard: typing into an agent
-            // should not need the toolbar. The tap reaches the renderer first,
-            // which may send it to the program as a mouse click; what it did
-            // comes back in gpuiTerminalTapped, and only then is typing opened.
+            // should not need the toolbar. The terminal renderer reports every
+            // tap itself, after it may have sent it to the program as a mouse
+            // click (gpuiTerminalTapped). Only without one is the tap decided here.
             if (masked == MotionEvent.ACTION_UP && tapCandidate && !scrolling && !edgeClaimed
                     && SystemClock.uptimeMillis() - touchDownAt < 350
                     && Math.abs(event.getX() - touchDownX) < dp(10)
                     && Math.abs(event.getY() - touchDownY) < dp(10)) {
-                terminalTap.tapped();
-                main.removeCallbacks(terminalTapTimeout);
-                main.postDelayed(terminalTapTimeout, TerminalTap.REPORT_WAIT_MS);
+                Connection target;
+                synchronized (stateLock) { target = connection; }
+                if (target == null || !nativeReportsTaps(target.generation)) {
+                    terminalTapSettled(TerminalTap.Outcome.PLAIN);
+                }
             }
             tapCandidate = false;
             if (edgeClaimed) {
@@ -4317,6 +4325,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             stopFling();
         }
+        // A gesture the activity took over goes no further, its last lift included.
+        if (!rendererTouch.forwards()) {
+            if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) rendererTouch.end();
+            return true;
+        }
+        if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) rendererTouch.end();
         int[] ids = new int[count];
         float[] xs = new float[count], ys = new float[count];
         for (int i = 0; i < count; i++) {
@@ -4325,6 +4339,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             ys[i] = event.getY(i);
         }
         return nativeTouch(event.getActionMasked(), event.getActionIndex(), ids, xs, ys);
+    }
+
+    /** Tells the renderer, once, that the activity took the current gesture over. */
+    private void claimRendererTouch() {
+        int pointer = rendererTouch.claim();
+        if (pointer == RendererTouch.NONE) return;
+        nativeTouch(MotionEvent.ACTION_CANCEL, 0, new int[] {pointer},
+                new float[] {touchDownX}, new float[] {touchDownY});
     }
 
     /**
@@ -4459,7 +4481,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
-        main.removeCallbacks(terminalTapTimeout);
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
         Dictation.pending(this).setListener(null);
@@ -4714,29 +4735,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /**
-     * The renderer had a tap on the terminal: {@code clicked} when it sent it
-     * to the program as a mouse click. Settles a tap this activity counted.
+     * The renderer had a press on the terminal: report {@code id}, made under
+     * {@code stamp} (the pane shown when the finger went down), with what it
+     * did ({@link TerminalTap.Outcome}). Acted on once, for the pane shown now.
      */
-    public void gpuiTerminalTapped(long expectedGeneration, boolean clicked) {
+    public void gpuiTerminalTapped(long expectedGeneration, long stamp, long id, int outcome) {
         main.post(() -> {
             synchronized (stateLock) {
                 if (destroyed || connection == null || connection.generation != expectedGeneration) return;
             }
-            if (!terminalTap.settle()) return;
-            main.removeCallbacks(terminalTapTimeout);
-            terminalTapSettled(clicked);
+            if (!terminalTap.accept(stamp, id)) return;
+            terminalTapSettled(TerminalTap.Outcome.of(outcome));
         });
     }
 
-    /** A counted tap, after the renderer had it: typing opens unless the program clicked. */
-    private void terminalTapSettled(boolean clicked) {
-        if (destroyed) return;
+    /** A tap on the terminal, once decided: typing opens only for a tap the program did not take. */
+    private void terminalTapSettled(TerminalTap.Outcome outcome) {
+        if (destroyed || outcome == TerminalTap.Outcome.IGNORED) return;
+        boolean clicked = outcome == TerminalTap.Outcome.CLICKED;
         Connection target;
         synchronized (stateLock) { target = connection; }
         // An agent's pane types into the composer's draft instead.
         boolean handled = composer != null
                 ? composer.terminalTapped(clicked)
-                : TerminalTap.after(clicked, false) == TerminalTap.Action.NOTHING;
+                : TerminalTap.after(outcome, false) == TerminalTap.Action.NOTHING;
         if (!handled && target != null && target.ready && terminalSurface != null) {
             final long generation = target.generation;
             // After the renderer's own focus handling for the tap, which would
@@ -5775,6 +5797,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             float systemFontScale);
     /** Draws the raw shell {@code handle} (0 for Herdr's pane) for this generation only. */
     private static native boolean nativeAttachShell(long generation, long handle);
+    private static native void nativeSetTapStamp(long stamp);
+    private static native boolean nativeReportsTaps(long generation);
 
     /** Moves the terminal horizontally by this many logical pixels. */
     private static native void nativePan(float delta);

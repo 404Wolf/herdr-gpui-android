@@ -47,7 +47,10 @@ macro_rules! __bind_gpui {
                 /// Opens a tapped link; without one, links are plain text.
                 link_handler: Option<std::rc::Rc<dyn Fn($crate::links::Link)>>,
                 /// Told what each lifted press did, so the host can act on taps.
-                tap_listener: Option<std::rc::Rc<dyn Fn($crate::tap::Lift)>>,
+                tap_listener: Option<(
+                    std::rc::Rc<dyn Fn() -> u64>,
+                    std::rc::Rc<dyn Fn($crate::tap::Report)>,
+                )>,
                 /// Where the finger went down, while it may still be a tap.
                 press: Option<Point<Pixels>>,
                 /// The link under that finger: the columns it covers on each row
@@ -147,11 +150,20 @@ macro_rules! __bind_gpui {
                 pub fn set_link_handler(&mut self, handler: impl Fn($crate::links::Link) + 'static) {
                     self.link_handler = Some(std::rc::Rc::new(handler));
                 }
-                /// Told what each lifted press did, after it was done: `Click` only
-                /// when the program was sent one. A host that opens a keyboard on
-                /// a tap leaves it shut for a tap the program took as a click.
-                pub fn set_tap_listener(&mut self, listener: impl Fn($crate::tap::Lift) + 'static) {
-                    self.tap_listener = Some(std::rc::Rc::new(listener));
+                /// Told what every lifted press did, once it was done: `Clicked` only
+                /// when the program was sent a click. A host that opens a keyboard on
+                /// a tap leaves it shut for a click. `stamp` is asked when a press
+                /// begins and comes back in its report, so the host can drop a
+                /// report for a view it has left since.
+                pub fn set_tap_listener(
+                    &mut self,
+                    stamp: impl Fn() -> u64 + 'static,
+                    listener: impl Fn($crate::tap::Report) + 'static,
+                ) {
+                    self.tap_listener = Some((std::rc::Rc::new(stamp), std::rc::Rc::new(listener)));
+                }
+                fn tap_stamp(&self) -> u64 {
+                    self.tap_listener.as_ref().map_or(0, |(stamp, _)| stamp())
                 }
                 /// Draws `ghost` (or nothing) over the screen from the next frame on.
                 pub fn set_ghost(&mut self, ghost: Option<Arc<$crate::ghost::Ghost>>) {
@@ -219,13 +231,17 @@ macro_rules! __bind_gpui {
                     if grid.display_offset() != 0 {
                         return None;
                     }
-                    let row = (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor();
-                    let col = (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor();
-                    // Through the window drawn (it may follow the caret on a larger grid).
-                    let (row_off, col_off) = self.view_origin;
-                    let row = usize::try_from(row as i64 + i64::from(row_off)).ok()?;
-                    let col = usize::try_from(col as i64).ok()? + col_off;
-                    (row < grid.screen_lines() && col < grid.columns()).then_some((col, row))
+                    // The geometry the last paint drew with: cell size (font scale,
+                    // pinch zoom) and the grid cell at the pane's top-left.
+                    $crate::tap::cell_at(
+                        (
+                            f32::from(point.x - self.bounds.left()),
+                            f32::from(point.y - self.bounds.top()),
+                        ),
+                        (f32::from(self.cell.width), f32::from(self.cell.height)),
+                        self.view_origin,
+                        (grid.columns(), grid.screen_lines()),
+                    )
                 }
                 fn cancel_press(&mut self) -> bool {
                     self.press = None;
@@ -722,15 +738,18 @@ macro_rules! __bind_gpui {
                         }))
                         .on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
                                 this.selecting = false;
+                                let pressed_at = this.press.take();
+                                let touch = this.touch.lifted();
                                 let press = $crate::tap::Press {
                                     on_link: this.pressed_link.is_some(),
-                                    travelled: this.press.take().is_none(),
-                                    held: this.touch.lifted(),
+                                    travelled: pressed_at.is_none(),
+                                    held: touch.is_some_and(|(held, _)| held),
                                 };
+                                let stamp = touch.map_or_else(|| this.tap_stamp(), |(_, stamp)| stamp);
                                 let link = this.pressed_link.take();
-                                let done = match $crate::tap::lift(press) {
+                                let tapped = match $crate::tap::lift(press) {
                                     $crate::tap::Lift::OpenLink => {
                                         // A tap on a link opens it and selects nothing.
                                         this.session.grid().lock().selection = None;
@@ -738,26 +757,28 @@ macro_rules! __bind_gpui {
                                             handler(url);
                                         }
                                         cx.notify();
-                                        $crate::tap::Lift::OpenLink
+                                        $crate::tap::Tapped::Plain
                                     }
                                     // A program that asked for mouse events (Claude Code's
-                                    // fullscreen view, other TUIs) gets the tap as a click;
-                                    // it, not a local selection, owns the cell then.
+                                    // fullscreen view, other TUIs) gets the tap as a click,
+                                    // press and release on the cell it went down on; it, not
+                                    // a local selection, owns the cell then.
                                     $crate::tap::Lift::Click => {
-                                        if let Some((column, row)) = this.screen_cell(event.position)
+                                        if let Some((column, row)) =
+                                            pressed_at.and_then(|at| this.screen_cell(at))
                                             && this.session.click(column, row)
                                         {
                                             this.session.grid().lock().selection = None;
                                             cx.notify();
-                                            $crate::tap::Lift::Click
+                                            $crate::tap::Tapped::Clicked
                                         } else {
-                                            $crate::tap::Lift::Nothing
+                                            $crate::tap::Tapped::Plain
                                         }
                                     }
-                                    $crate::tap::Lift::Nothing => $crate::tap::Lift::Nothing,
+                                    $crate::tap::Lift::Nothing => $crate::tap::Tapped::Ignored,
                                 };
-                                if let Some(listener) = this.tap_listener.clone() {
-                                    listener(done);
+                                if let Some((_, listener)) = this.tap_listener.clone() {
+                                    listener($crate::tap::Report { id: $crate::tap::next_id(), stamp, tapped });
                                 }
                             }),
                         )
@@ -786,7 +807,10 @@ macro_rules! __bind_gpui {
                                                 && event.phase == TouchPhase::Started
                                                 && bounds.contains(&event.start_position)
                                             {
-                                                entity.update(cx, |this, _| this.touch.began());
+                                                entity.update(cx, |this, _| {
+                                                    let stamp = this.tap_stamp();
+                                                    this.touch.began(stamp);
+                                                });
                                             }
                                         }
                                     });

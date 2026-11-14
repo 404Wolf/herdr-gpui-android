@@ -343,14 +343,52 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
     .is_ok()
 }
 
-/// Tells Java what the renderer did with a tap on the terminal, once it has:
-/// whether the program took it as a mouse click. Java opens the keyboard for
-/// a tap only when it did not.
-pub(crate) fn terminal_tapped(generation: i64, clicked: bool) -> bool {
+/// The pane Java shows, as a number it raises on every change
+/// (`nativeSetTapStamp`). A tap is stamped with it when the finger goes down,
+/// so Java can drop the report of a tap made on a pane it has left since.
+static TAP_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn tap_stamp() -> u64 {
+    TAP_STAMP.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetTapStamp(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    stamp: jlong,
+) {
+    TAP_STAMP.store(stamp.max(0) as u64, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a terminal renderer is attached for this generation, so a tap on
+/// the terminal will be reported (`terminal_tapped`). Without one, Java
+/// decides taps itself, as before.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeReportsTaps(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    generation: jlong,
+) -> jboolean {
+    let state = model::mailbox().state();
+    u8::from(state.generation == generation && state.shell != 0)
+}
+
+/// Tells Java what the renderer did with a press on the terminal, once it has:
+/// its report id, the stamp it began under, and whether the program took it
+/// as a click (0), it was a tap the program did not take (1), or no tap (2).
+pub(crate) fn terminal_tapped(generation: i64, report: gpui_rio::tap::Report) -> bool {
+    let outcome = match report.tapped {
+        gpui_rio::tap::Tapped::Clicked => 0,
+        gpui_rio::tap::Tapped::Plain => 1,
+        gpui_rio::tap::Tapped::Ignored => 2,
+    };
     gpui_mobile::android::jni::with_env(|env| {
         let activity = gpui_mobile::android::jni::activity(env)?;
         let name = jni_mobile::strings::JNIString::from("gpuiTerminalTapped");
-        let signature = jni_mobile::signature::RuntimeMethodSignature::from_str("(JZ)V")
+        let signature = jni_mobile::signature::RuntimeMethodSignature::from_str("(JJJI)V")
             .map_err(|e| e.to_string())?;
         env.call_method(
             &activity,
@@ -358,7 +396,9 @@ pub(crate) fn terminal_tapped(generation: i64, clicked: bool) -> bool {
             signature.method_signature(),
             &[
                 jni_mobile::objects::JValue::Long(generation),
-                jni_mobile::objects::JValue::Bool(clicked),
+                jni_mobile::objects::JValue::Long(i64::try_from(report.stamp).unwrap_or(i64::MAX)),
+                jni_mobile::objects::JValue::Long(i64::try_from(report.id).unwrap_or(i64::MAX)),
+                jni_mobile::objects::JValue::Int(outcome),
             ],
         )
         .map_err(|e| e.to_string())?;
