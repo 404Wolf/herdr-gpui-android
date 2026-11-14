@@ -499,8 +499,13 @@ pub fn place_all(
             // shows the draft itself instead of losing it.
             layout.draft_shown = has_draft
                 && draft.iter().any(|p| {
-                    matches!(p.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip)
-                        && !p.text.trim_matches(|c: char| c == '…' || c.is_whitespace()).is_empty()
+                    matches!(
+                        p.style,
+                        GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip
+                    ) && !p
+                        .text
+                        .trim_matches(|c: char| c == '…' || c.is_whitespace())
+                        .is_empty()
                 });
             layout.placed.extend(draft);
         }
@@ -1251,11 +1256,17 @@ mod tests {
         g.draft = vec![text(&format!("{} END", "z".repeat(99)))];
         let layout = place_all(&g, anchor, &rows, None);
         assert!(layout.controls.iter().any(|c| c.id == "talk"));
-        assert!(layout.placed.iter().all(|p| p.row != 3), "{:?}", layout.placed);
-        let placed = layout
-            .placed
-            .iter()
-            .any(|p| matches!(p.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip));
+        assert!(
+            layout.placed.iter().all(|p| p.row != 3),
+            "{:?}",
+            layout.placed
+        );
+        let placed = layout.placed.iter().any(|p| {
+            matches!(
+                p.style,
+                GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip
+            )
+        });
         assert!(!placed && !layout.draft_shown, "{layout:?}");
         // With room, the same draft is placed and reported shown.
         let (rows, anchor) = claude_status_screen(40);
