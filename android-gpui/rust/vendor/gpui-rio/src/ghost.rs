@@ -363,6 +363,22 @@ pub struct Previous {
     pub scrolled: bool,
 }
 
+impl Previous {
+    /// The same grid row after the rows drawn moved: `from` and `to` are the
+    /// grid rows drawn at the pane's top in that frame and in this one (the
+    /// view origin's row, negative for a grid drawn against the pane's
+    /// bottom). `None` when that row is now above the pane; one past its
+    /// bottom is left to [`place_all`], which ignores it. Either way the
+    /// controls then find their row afresh.
+    pub fn rebased(self, from: i32, to: i32) -> Option<Self> {
+        let row = i64::try_from(self.row).ok()? + i64::from(from) - i64::from(to);
+        Some(Self {
+            row: usize::try_from(row).ok()?,
+            ..self
+        })
+    }
+}
+
 /// The draft, queued messages and the host's controls for one frame over
 /// `screen` (the rows as drawn). With Claude's prompt the controls are set
 /// into the rule under it; with another prompt (Codex), at the right end of
@@ -1099,6 +1115,48 @@ mod tests {
         };
         let layout = place_all(&g, None, &rows, Some(gone));
         assert!(layout.controls.iter().all(|c| c.row == 8));
+    }
+
+    #[test]
+    fn a_hidden_caret_after_the_keyboard_hides_offline_keeps_the_controls_at_the_bottom() {
+        // A 24-row grid filling a 24-row pane, the controls in the rule on its
+        // last row (pane row 23). The keyboard hides with the link down: the
+        // pane is 52 rows, the grid still 24, drawn against the bottom (origin
+        // row -28), so its rule is on pane row 51 and rows 0..28 are empty.
+        let mut lines = vec!["older output that fills the whole row with text, edge to edge"; 23];
+        lines.push("────────────────────────────────────────────────────────────");
+        let grid = screen(&lines, 60);
+        let g = recording(ghost(Vec::new()));
+        let before = place_all(&g, None, &grid, None);
+        assert!(before.controls.iter().all(|c| c.row == 23));
+        let mut tall = vec![vec![' '; 60]; 28];
+        tall.extend(grid);
+        // A frame with no caret: the controls' last row, rebased from origin
+        // row 0 to -28, is the same rule, now at the pane's bottom.
+        let previous = Previous {
+            row: 23,
+            scrolled: false,
+        };
+        let rebased = previous.rebased(0, -28);
+        assert_eq!(
+            rebased,
+            Some(Previous {
+                row: 51,
+                scrolled: false
+            })
+        );
+        let layout = place_all(&g, None, &tall, rebased);
+        assert!(!layout.controls.is_empty());
+        assert!(layout.controls.iter().all(|c| c.row == 51), "{:?}", layout.controls);
+        assert_eq!(drawn(&layout, 51, 60), drawn(&before, 23, 60));
+        // Back up (the keyboard shown again, the grid filling the pane): the
+        // same rule, back on row 23. A row moved above the pane is dropped.
+        assert_eq!(rebased.and_then(|p| p.rebased(-28, 0)), Some(previous));
+        assert_eq!(previous.rebased(0, 30), None);
+        // Unrebased, the stale row 23 is a blank one above the grid, which
+        // place_all would keep: the adapter rebases before calling it.
+        let stale = place_all(&g, None, &tall, Some(previous));
+        assert!(stale.controls.iter().all(|c| c.row == 23));
     }
 
     #[test]
