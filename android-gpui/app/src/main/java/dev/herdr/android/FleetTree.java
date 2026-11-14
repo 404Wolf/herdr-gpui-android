@@ -751,9 +751,21 @@ final class FleetTree {
         boolean blocked() { return project.tally[0] > 0; }
     }
 
-    /** A project's main tap opens its PM, or its first worker when the PM is gone. */
+    /** PM, else the first agent in display order, falling back to a shell when no agent remains. */
     static Member projectTarget(PmRow row) {
-        return row.pm != null ? row.pm : row.workers.isEmpty() ? null : row.workers.get(0).member;
+        if (row.pm != null) return row.pm;
+        Member agent = firstAgent(row.workers);
+        return agent != null ? agent : row.workers.isEmpty() ? null : row.workers.get(0).member;
+    }
+
+    /** Prefer agents in display preorder, including a worker nested beneath a shell parent. */
+    private static Member firstAgent(List<AgentNode> nodes) {
+        for (AgentNode node : nodes) {
+            if (node.member.isAgent()) return node.member;
+            Member child = firstAgent(node.children);
+            if (child != null) return child;
+        }
+        return null;
     }
 
     /** A visible tap target for the full catalog, including entries beyond the first page. */

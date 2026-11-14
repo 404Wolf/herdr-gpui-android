@@ -51,6 +51,37 @@ public final class RailClicksTest {
         assertNull(FleetTree.projectTarget(new FleetTree.PmRow(new FleetTree.Project("empty"))));
     }
 
+    @Test public void aNoPmTapSkipsABareShellBeforeItsFirstWorker() {
+        FleetTree.Member shell = member("t1", "", "", 0);
+        FleetTree.Member worker = member("t2", "worker", "", 1);
+        FleetTree.PmRow row = FleetTree.pmTree(FleetTree.build(Arrays.asList(worker, shell), null)).pms.get(0);
+        assertNull(row.pm);
+        assertSame(shell, row.workers.get(0).member);
+        assertSame(worker, FleetTree.projectTarget(row));
+    }
+
+    @Test public void aNoPmTapFindsAWorkerBeneathAShellBeforeALaterRootWorker() {
+        FleetTree.Member shell = member("t1", "", "", 0);
+        FleetTree.Member nested = member("t2", "worker", "t1", 1);
+        FleetTree.Member later = member("t3", "worker", "", 2);
+        FleetTree.PmRow row = FleetTree.pmTree(FleetTree.build(Arrays.asList(later, nested, shell), null)).pms.get(0);
+        assertNull(row.pm);
+        assertSame(shell, row.workers.get(0).member);
+        assertSame(nested, row.workers.get(0).children.get(0).member);
+        assertSame(nested, FleetTree.projectTarget(row));
+    }
+
+    @Test public void aShellIsTheFallbackOnlyWhenNoAgentIsLeft() {
+        FleetTree.PmRow row = new FleetTree.PmRow(new FleetTree.Project("app"));
+        FleetTree.Member shell = member("t1", "", "", 0);
+        row.workers.add(new FleetTree.AgentNode(shell));
+        assertSame(shell, FleetTree.projectTarget(row));
+        FleetTree.Member agent = member("t2", "", "t1", 1);
+        agent.status = "working";
+        row.workers.get(0).children.add(new FleetTree.AgentNode(agent));
+        assertSame(agent, FleetTree.projectTarget(row));
+    }
+
     @Test public void aCatalogRowCountsTheFullListAndSaysWhenItIsIncomplete() {
         FleetTree.Project project = new FleetTree.Project("app");
         project.closed.add(new FleetTree.GitWorktree("/work/wt0", "", false, false));
@@ -100,7 +131,7 @@ public final class RailClicksTest {
         String rail = section(source("GpuiTerminalActivity"), "private void openRailWorktree(", "private void maybeRailGitLook(");
         assertTrue(home.indexOf("FleetTree.memberAt(") < home.indexOf("machine.opening.add(path)"));
         assertTrue(home.contains("machine.opening.remove(path)"));
-        assertTrue(home.contains("if (machine.handle != handle) return;"));
+        assertTrue(home.contains("completeNavigation(machine, handle, intent"));
         assertTrue(rail.indexOf("FleetTree.memberAt(") < rail.indexOf("railWorktreeOpening.add(key)"));
         assertTrue(rail.contains("railWorktreeOpening.remove(key)"));
         assertTrue(rail.contains("!current.ready"));

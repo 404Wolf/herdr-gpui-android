@@ -89,6 +89,8 @@ public final class HomeActivity extends Activity {
         String deaconPending = "";
         long deaconPendingAt;
         String deaconError = "", projectError = "";
+        /** The navigation intent and session that requested this Deacon, including its polling stage. */
+        long deaconNavigation, deaconHandle;
         final Set<String> opening = new HashSet<>();
         /** Bumped whenever any of the above changes, so the tree redraws. */
         int ui;
@@ -107,6 +109,7 @@ public final class HomeActivity extends Activity {
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final HomeNavigation navigation = new HomeNavigation();
     private final ExecutorService worker = Executors.newFixedThreadPool(4);
     private final Map<String, Machine> machines = new LinkedHashMap<>();
     /** Folded rows (and "open:" rows that start folded), kept across launches. */
@@ -224,6 +227,7 @@ public final class HomeActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        beginNavigation();
         resumed = false;
         main.removeCallbacks(poll);
         super.onPause();
@@ -728,6 +732,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void openHosts() {
+        beginNavigation();
         startActivity(new Intent(this, RemoteHostsActivity.class).putExtra("skip_reopen", true));
     }
 
@@ -878,6 +883,7 @@ public final class HomeActivity extends Activity {
      * exact terminal). With none, its card offers Start Deacon; nothing starts.
      */
     private void pickMachine(Machine machine) {
+        beginNavigation();
         selectedHost = machine.host.id;
         try {
             getSharedPreferences("home", MODE_PRIVATE).edit().putString("machine", selectedHost).apply();
@@ -902,6 +908,7 @@ public final class HomeActivity extends Activity {
 
     /** Every computer, with how many agents it runs and how many wait on Wolf. */
     private void showMachinePicker() {
+        beginNavigation();
         ActionSheet sheet = new ActionSheet(this, chrome, "Computer");
         for (Machine machine : machines.values()) {
             int[] n = agentCounts(machine);
@@ -991,6 +998,7 @@ public final class HomeActivity extends Activity {
         row.setContentDescription("Computer " + machine.host.name + ", " + detail
                 + ", tap to pick a computer");
         row.setOnLongClickListener(v -> {
+            beginNavigation();
             ActionSheet sheet = new ActionSheet(this, chrome, machine.host.name);
             if (fleet.deacon != null) sheet.add("Open the Deacon", () -> openAgent((Agent) fleet.deacon));
             else if (ready) sheet.add("Start Deacon", () -> startDeacon(machine));
@@ -1084,6 +1092,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void toggleFold(String key, boolean foldedByDefault) {
+        beginNavigation();
         String stored = foldedByDefault ? "open:" + key : key;
         if (!collapsed.remove(stored)) collapsed.add(stored);
         try {
@@ -1121,6 +1130,7 @@ public final class HomeActivity extends Activity {
                 View line = groupLine(guide, self, "Other terminals", count);
                 if (!tree.otherCatalogs.isEmpty()) {
                     line.setOnLongClickListener(v -> {
+                        beginNavigation();
                         new ActionSheet(this, chrome, "Other terminals")
                                 .add("Worktrees…", () -> showCatalogs(machine, tree.otherCatalogs)).show();
                         return true;
@@ -1168,6 +1178,7 @@ public final class HomeActivity extends Activity {
                             else askForManager(machine, pm.project);
                         });
                 line.setOnLongClickListener(v -> {
+                    beginNavigation();
                     ActionSheet sheet = new ActionSheet(this, chrome, pm.name())
                             .add("Ask for a manager", () -> askForManager(machine, pm.project));
                     if (!pm.catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, pm.catalogs));
@@ -1196,6 +1207,7 @@ public final class HomeActivity extends Activity {
 
     /** A row's "Worktrees…": straight to the one repo's catalog, else a choice of repo first. */
     private void showCatalogs(Machine machine, List<FleetTree.Project> catalogs) {
+        beginNavigation();
         if (catalogs.size() == 1) { showWorktrees(machine, catalogs.get(0), 0); return; }
         ActionSheet sheet = new ActionSheet(this, chrome, "Worktrees with no space");
         for (FleetTree.Project project : catalogs) {
@@ -1207,6 +1219,7 @@ public final class HomeActivity extends Activity {
 
     /** "Worktrees…" for one repo: its worktrees no terminal has open, a page at a time. */
     private void showWorktrees(Machine machine, FleetTree.Project project, int pages) {
+        beginNavigation();
         int total = project.closed.size();
         ActionSheet sheet = new ActionSheet(this, chrome, project.name + " · " + total
                 + (total == 1 ? " worktree" : " worktrees") + " with no space"
@@ -1469,6 +1482,7 @@ public final class HomeActivity extends Activity {
 
     /** A PM's menu also offers the unopened-worktree catalogs its row holds. */
     private void agentActions(Agent agent, Machine machine, List<FleetTree.Project> catalogs) {
+        beginNavigation();
         ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent)).add("Open", () -> openAgent(agent));
         if (machine != null && !catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, catalogs));
         if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
@@ -1545,6 +1559,7 @@ public final class HomeActivity extends Activity {
     private void startDeacon(Machine machine) {
         long handle = machine.handle;
         if (machine.deaconBusy || deaconGuard(machine) > 0) return;
+        long intent = beginNavigation();
         if (handle <= 0 || !"ready".equals(machine.state)) {
             machine.deaconError = machine.host.name + " is offline";
             machine.ui++;
@@ -1552,6 +1567,8 @@ public final class HomeActivity extends Activity {
             return;
         }
         machine.deaconBusy = true;
+        machine.deaconNavigation = intent;
+        machine.deaconHandle = handle;
         machine.deaconError = "";
         machine.ui++;
         try {
@@ -1613,7 +1630,7 @@ public final class HomeActivity extends Activity {
                 }
                 machine.ui++;
                 render(true);
-                if (machine.handle == handle) openTerminal(machine, address, "Deacon");
+                openTerminal(machine, address, "Deacon", handle, intent);
             });
         });
     }
@@ -1658,7 +1675,7 @@ public final class HomeActivity extends Activity {
         }
         machine.ui++;
         render(true);
-        if (launched != null) openTerminal(machine, address, "Deacon");
+        if (launched != null) openTerminal(machine, address, "Deacon", machine.deaconHandle, machine.deaconNavigation);
     }
 
     /**
@@ -1669,6 +1686,7 @@ public final class HomeActivity extends Activity {
     private void newProject(Machine machine, Agent deacon) {
         long handle = machine.handle;
         if (machine.projectBusy) return;
+        beginNavigation();
         if (handle <= 0 || !"ready".equals(machine.state)) {
             machine.projectError = machine.host.name + " is offline";
             machine.ui++;
@@ -1680,6 +1698,7 @@ public final class HomeActivity extends Activity {
 
     /** A project with no manager: ask that machine's Deacon to set one up. */
     private void askForManager(Machine machine, FleetTree.Project project) {
+        beginNavigation();
         FleetTree.Member found = FleetTree.canonicalDeacon(members(machine));
         if (found == null) {
             note = "Start the Deacon on " + machine.host.name + " first; it sets up project managers.";
@@ -1696,6 +1715,7 @@ public final class HomeActivity extends Activity {
 
     private void sendToDeacon(Machine machine, Agent deacon, String text) {
         if (machine.projectBusy) return; // one send per tap
+        long intent = beginNavigation();
         long handle = machine.handle;
         String action;
         try {
@@ -1722,7 +1742,7 @@ public final class HomeActivity extends Activity {
                 machine.projectError = reason == null ? "" : reason;
                 machine.ui++;
                 render(true);
-                if (reason == null) openAgent(deacon);
+                if (reason == null) completeNavigation(machine, handle, intent, () -> openAgent(deacon, intent));
             });
         });
     }
@@ -1731,6 +1751,7 @@ public final class HomeActivity extends Activity {
     private void openWorktree(Machine machine, String path) {
         long handle = machine.handle;
         if (!live(machine)) {
+            beginNavigation();
             note = machine.host.name + " is offline. Connect it before opening a worktree.";
             render(true);
             return;
@@ -1743,6 +1764,7 @@ public final class HomeActivity extends Activity {
             render(true);
             return;
         }
+        long intent = beginNavigation();
         note = "Opening " + FleetTree.lastSegment(path) + "…";
         machine.ui++;
         render(true);
@@ -1767,22 +1789,25 @@ public final class HomeActivity extends Activity {
                 if (destroyed) return;
                 machine.opening.remove(path);
                 machine.ui++;
-                if (machine.handle != handle) return;
-                note = reason != null ? "Could not open " + FleetTree.lastSegment(path) + ": " + reason
-                        : address.isEmpty() ? "The computer did not return a terminal for " + FleetTree.lastSegment(path) : null;
-                render(true);
-                if (reason == null && !address.isEmpty()) openTerminal(machine, address, FleetTree.lastSegment(path));
+                completeNavigation(machine, handle, intent, () -> {
+                    note = reason != null ? "Could not open " + FleetTree.lastSegment(path) + ": " + reason
+                            : address.isEmpty() ? "The computer did not return a terminal for " + FleetTree.lastSegment(path) : null;
+                    render(true);
+                    if (reason == null && !address.isEmpty()) {
+                        openTerminal(machine, address, FleetTree.lastSegment(path), handle, intent);
+                    }
+                });
             });
         });
     }
 
     /** Opens a terminal the core just made or found, by address on this machine. */
-    private void openTerminal(Machine machine, String address, String title) {
+    private void openTerminal(Machine machine, String address, String title, long handle, long intent) {
         Agent agent = new Agent();
         agent.machine = machine;
         agent.id = address;
         agent.title = title;
-        openAgent(agent);
+        completeNavigation(machine, handle, intent, () -> openAgent(agent, intent));
     }
 
     /**
@@ -1900,8 +1925,24 @@ public final class HomeActivity extends Activity {
 
     // ── Actions ─────────────────────────────────────────────────────────────
 
+    private long beginNavigation() {
+        opening = false;
+        reopenPane = "";
+        return navigation.begin();
+    }
+
+    /** The only completion gate for asynchronous actions that can open a terminal. */
+    private void completeNavigation(Machine machine, long handle, long intent, Runnable action) {
+        if (!destroyed) navigation.complete(intent, handle, machine.handle, action);
+    }
+
     /** Hands this machine's session to the terminal, attached to the agent. */
     private void openAgent(Agent agent) {
+        openAgent(agent, beginNavigation());
+    }
+
+    /** Carries the original intent through a worktree/Deacon action and this asynchronous focus. */
+    private void openAgent(Agent agent, long intent) {
         Machine machine = agent.machine;
         long handle = machine.handle;
         if (GpuiLaunch.terminalOpen()) {
@@ -1940,8 +1981,7 @@ public final class HomeActivity extends Activity {
                 failure = "Not available";
             }
             final String reason = failure;
-            main.post(() -> {
-                if (destroyed || machine.handle != handle) { opening = false; return; }
+            main.post(() -> completeNavigation(machine, handle, intent, () -> {
                 if (reason != null) {
                     opening = false;
                     note = agent.title + ": " + reason;
@@ -1959,12 +1999,13 @@ public final class HomeActivity extends Activity {
                     note = "The terminal could not be opened";
                     render(true);
                 }
-            });
+            }));
         });
     }
 
     /** Fuzzy search over machines, spaces and agents, keyboard up at once. */
     private void openPicker() {
+        beginNavigation();
         AlertDialog.Builder builder = new AlertDialog.Builder(this, chrome.dialogTheme());
         LinearLayout body = column();
         body.setPadding(dp(8), dp(8), dp(8), 0);

@@ -144,10 +144,13 @@ choice closes it, and it never changes that remembered preference.
 Home and the terminal rail group project managers under collapsible repository
 headings with project counts. Repositories start expanded; each PM's workers
 stay folded until its chevron is tapped. Tap a PM or a worker to open its
-terminal; a project with no PM opens its first worker. Unopened-worktree counts
+terminal; a project with no PM opens its first worker or agent, falling back to
+a shell only when no agent remains. Unopened-worktree counts
 under a group open its catalog. Tap a worktree to focus a terminal already there
 or open a plain shell in that folder. Chips, catalog entries and fold chevrons
 show pressed feedback.
+Delayed opens honor the latest navigation choice, including switching computers
+while an earlier worktree or terminal focus request is still completing.
 Half-open with the fold across the screen (tabletop), the terminal ends at the
 fold and the host's keys move from the toolbar strip to a deck of large keys
 below it, over the unchanged toolbar. An open keyboard leaves no room under the
