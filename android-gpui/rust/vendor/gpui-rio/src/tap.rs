@@ -168,7 +168,10 @@ pub fn plain_view_tap(lifted: Option<(bool, u64)>) -> (Tapped, u64) {
 /// GPUI takes to stop a fling (no touch starts), each take their entry.
 #[derive(Debug)]
 pub struct DownStamps {
-    /// The stamps of downs queued and not yet handled, oldest first.
+    /// Downs queued and not yet handled whose stamps were dropped to keep
+    /// the bound: the oldest of all, so they come first and take NO_STAMP.
+    dropped: usize,
+    /// The stamps of the other downs queued and not yet handled, oldest first.
     queue: std::collections::VecDeque<u64>,
     /// The stamp of the down GPUI handled last: the touch in progress.
     current: u64,
@@ -185,13 +188,16 @@ impl DownStamps {
     pub const CAPACITY: usize = 64;
 
     pub const fn new() -> Self {
-        Self { queue: std::collections::VecDeque::new(), current: NO_STAMP }
+        Self { dropped: 0, queue: std::collections::VecDeque::new(), current: NO_STAMP }
     }
 
-    /// A down went into GPUI's queue with `stamp`.
+    /// A down went into GPUI's queue with `stamp`. Past the bound the oldest
+    /// stamp is dropped, but its down still holds its place: it is handled
+    /// with NO_STAMP, so no later down's stamp shifts onto it.
     pub fn queued(&mut self, stamp: u64) {
         if self.queue.len() == Self::CAPACITY {
             self.queue.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
         }
         self.queue.push_back(stamp);
     }
@@ -204,7 +210,12 @@ impl DownStamps {
     /// GPUI handled the next queued down: its stamp is the touch in progress
     /// now, and is returned. [`NO_STAMP`] when none was queued.
     pub fn handled(&mut self) -> u64 {
-        self.current = self.queue.pop_front().unwrap_or(NO_STAMP);
+        self.current = if self.dropped > 0 {
+            self.dropped -= 1;
+            NO_STAMP
+        } else {
+            self.queue.pop_front().unwrap_or(NO_STAMP)
+        };
         self.current
     }
 
@@ -418,13 +429,48 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_is_bounded() {
+    fn past_the_bound_the_oldest_downs_keep_their_place_without_a_stamp() {
+        let mut downs = DownStamps::default();
+        // Pane A's down, then CAPACITY downs on pane B: A's stamp is dropped.
+        downs.queued(1);
+        for _ in 0..DownStamps::CAPACITY {
+            downs.queued(2);
+        }
+        // GPUI handles A's down first: it gets no stamp, never B's.
+        assert_eq!(downs.handled(), NO_STAMP);
+        for _ in 0..DownStamps::CAPACITY {
+            assert_eq!(downs.handled(), 2);
+        }
+        assert_eq!(downs.handled(), NO_STAMP);
+    }
+
+    #[test]
+    fn overflow_counts_every_dropped_down_in_order() {
         let mut downs = DownStamps::default();
         for i in 0..(DownStamps::CAPACITY as u64 + 5) {
             downs.queued(i);
         }
-        // The first five were dropped to keep the bound.
+        // The five oldest downs lost their stamps; each is still handled, first.
+        for _ in 0..5 {
+            assert_eq!(downs.handled(), NO_STAMP);
+        }
         assert_eq!(downs.handled(), 5);
+    }
+
+    #[test]
+    fn a_withdrawn_down_after_an_overflow_leaves_the_order_intact() {
+        let mut downs = DownStamps::default();
+        for i in 0..(DownStamps::CAPACITY as u64 + 1) {
+            downs.queued(i);
+        }
+        // The newest down never reached GPUI: only it leaves.
+        downs.withdrawn();
+        assert_eq!(downs.handled(), NO_STAMP); // down 0, its stamp dropped
+        assert_eq!(downs.handled(), 1);
+        for i in 2..(DownStamps::CAPACITY as u64) {
+            assert_eq!(downs.handled(), i);
+        }
+        assert_eq!(downs.handled(), NO_STAMP);
     }
 
     #[test]
