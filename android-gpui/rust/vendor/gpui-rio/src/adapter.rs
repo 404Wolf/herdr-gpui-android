@@ -532,10 +532,19 @@ macro_rules! __bind_gpui {
                         .flatten();
                     let kind = self.ghost.as_ref().map_or(self.prompt_kind, |ghost| ghost.kind);
                     let anchor = $crate::ghost::locate(&screen, caret, kind);
+                    // Without a caret the controls keep the row they last had.
+                    let previous = self
+                        .last_hint
+                        .as_ref()
+                        .and_then(|hint| hint.controls.first())
+                        .map(|control| $crate::ghost::Previous {
+                            row: control.row,
+                            scrolled: offset != 0,
+                        });
                     let layout = self
                         .ghost
                         .as_ref()
-                        .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen))
+                        .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen, previous))
                         .unwrap_or_default();
                     let placed = &layout.placed;
                     if let Some(ghost) = self.ghost.clone() {
