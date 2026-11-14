@@ -39,8 +39,9 @@ macro_rules! __bind_gpui {
                 bounds: Bounds<Pixels>,
                 /// The grid cell (row, column) drawn at the pane's top-left.
                 view_origin: (i32, usize),
-                /// The pane's and the grid's rows when `view_origin` was drawn.
-                view_rows: (u16, u16),
+                /// The rows the last paint drew with (the controls' last row is
+                /// carried from them to the next paint's).
+                drawn_rows: $crate::ghost::DrawnRows,
                 cell: Size<Pixels>,
                 selecting: bool,
                 scroll_delta: f32,
@@ -102,7 +103,7 @@ macro_rules! __bind_gpui {
                             visible: true,
                             bounds: Bounds::default(),
                             view_origin: (0, 0),
-                            view_rows: (0, 0),
+                            drawn_rows: $crate::ghost::DrawnRows::default(),
                             cell: size(px(8.), px(18.)),
                             selecting: false,
                             scroll_delta: 0.,
@@ -403,20 +404,18 @@ macro_rules! __bind_gpui {
                     // Rows drawn: the pane's when a short grid sits at its bottom
                     // (row_off < 0, the rows above the grid's first stay empty).
                     let rows = usize::from(if row_off < 0 { pane.1 } else { pane.1.min(grid_rows) });
-                    // The rows drawn moved under the pane's top since the last paint
-                    // when the pane or the grid changed height (a keyboard hidden with
-                    // the link down puts a short grid at the new bottom): the controls'
-                    // last row is rebased by as much, so a frame without a caret keeps
-                    // them on the same grid row instead of a pane row that may now be
-                    // empty above the grid. Scrolling changes neither height, so the
-                    // controls stay pinned to their pane row while scrolled, as before.
-                    let moved_by = if self.view_rows == (pane.1, grid_rows) {
-                        None
-                    } else {
-                        Some((self.view_origin.0, row_off))
+                    // For a frame without a caret, the controls' last row is carried
+                    // from the last paint's rows to these: kept, rebased onto the same
+                    // grid row when only the pane's height changed (a keyboard hidden
+                    // with the link down puts the short grid at the new bottom), or
+                    // dropped when the host's grid changed height.
+                    let drawn_rows = $crate::ghost::DrawnRows {
+                        pane: pane.1,
+                        grid: grid_rows,
+                        origin: row_off,
                     };
+                    let last_rows = std::mem::replace(&mut self.drawn_rows, drawn_rows);
                     self.view_origin = (row_off, col_off);
-                    self.view_rows = (pane.1, grid_rows);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
                     // The rows as drawn, for finding the program's prompt.
@@ -566,10 +565,7 @@ macro_rules! __bind_gpui {
                             row: control.row,
                             scrolled: offset != 0,
                         })
-                        .and_then(|previous| match moved_by {
-                            Some((from, to)) => previous.rebased(from, to),
-                            None => Some(previous),
-                        });
+                        .and_then(|previous| previous.carried(last_rows, drawn_rows));
                     let layout = self
                         .ghost
                         .as_ref()
