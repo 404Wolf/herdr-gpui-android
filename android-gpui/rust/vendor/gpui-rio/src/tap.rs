@@ -64,7 +64,12 @@ pub enum Lifted {
 /// is sent to a program cannot be taken back. An owned tap is offered to the
 /// program as a click on `cell` (the session sends one only when the program
 /// asked for mouse events).
-pub fn lift_on(session: &crate::Session, press: Press, owned: bool, cell: Option<(usize, usize)>) -> Lifted {
+pub fn lift_on(
+    session: &crate::Session,
+    press: Press,
+    owned: bool,
+    cell: Option<(usize, usize)>,
+) -> Lifted {
     if !owned {
         return Lifted::Ignored;
     }
@@ -144,7 +149,10 @@ pub struct Gesture {
 
 impl Gesture {
     /// Before any down: matches no touch a view saw begin.
-    pub const NONE: Self = Self { id: 0, stamp: NO_STAMP };
+    pub const NONE: Self = Self {
+        id: 0,
+        stamp: NO_STAMP,
+    };
 }
 
 /// Whether a view owns a lifted press, and so may act on it (send a click,
@@ -166,9 +174,10 @@ pub fn owns(touch_presses: bool, lifted: Option<(bool, Gesture)>, now: Gesture) 
 /// [`owns`]); no tap for a held finger, or a press that is not its own.
 pub fn plain_view_tap(lifted: Option<(bool, Gesture)>, now: Gesture) -> (Tapped, u64) {
     match lifted {
-        Some((held, began)) if owns(true, lifted, now) => {
-            (if held { Tapped::Ignored } else { Tapped::Plain }, began.stamp)
-        }
+        Some((held, began)) if owns(true, lifted, now) => (
+            if held { Tapped::Ignored } else { Tapped::Plain },
+            began.stamp,
+        ),
         _ => (Tapped::Ignored, NO_STAMP),
     }
 }
@@ -203,7 +212,11 @@ impl DownStamps {
     pub const CAPACITY: usize = 64;
 
     pub const fn new() -> Self {
-        Self { dropped: 0, queue: std::collections::VecDeque::new(), current: Gesture::NONE }
+        Self {
+            dropped: 0,
+            queue: std::collections::VecDeque::new(),
+            current: Gesture::NONE,
+        }
     }
 
     /// A down went into GPUI's queue with `stamp`. Past the bound the oldest
@@ -231,7 +244,10 @@ impl DownStamps {
         } else {
             self.queue.pop_front().unwrap_or(NO_STAMP)
         };
-        self.current = Gesture { id: self.current.id + 1, stamp };
+        self.current = Gesture {
+            id: self.current.id + 1,
+            stamp,
+        };
         stamp
     }
 
@@ -390,9 +406,18 @@ mod tests {
     #[test]
     fn zoom_and_font_scale_change_only_the_cell_size() {
         // Pinch zoom or a larger font: the same point is an earlier cell.
-        assert_eq!(cell_at((105., 105.), (10., 20.), (0, 0), GRID), Some((10, 5)));
-        assert_eq!(cell_at((105., 105.), (15., 30.), (0, 0), GRID), Some((7, 3)));
-        assert_eq!(cell_at((105., 105.), (7.5, 15.), (0, 0), GRID), Some((14, 7)));
+        assert_eq!(
+            cell_at((105., 105.), (10., 20.), (0, 0), GRID),
+            Some((10, 5))
+        );
+        assert_eq!(
+            cell_at((105., 105.), (15., 30.), (0, 0), GRID),
+            Some((7, 3))
+        );
+        assert_eq!(
+            cell_at((105., 105.), (7.5, 15.), (0, 0), GRID),
+            Some((14, 7))
+        );
     }
 
     #[test]
@@ -400,7 +425,10 @@ mod tests {
         // A 24-row grid at the bottom of a 52-row pane: drawn from pane row 28.
         let origin = (-28, 0);
         assert_eq!(cell_at((5., 28. * 20.), CELL, origin, GRID), Some((0, 0)));
-        assert_eq!(cell_at((5., 51. * 20. + 1.), CELL, origin, GRID), Some((0, 23)));
+        assert_eq!(
+            cell_at((5., 51. * 20. + 1.), CELL, origin, GRID),
+            Some((0, 23))
+        );
         // The empty rows above it are no cell.
         assert_eq!(cell_at((5., 27. * 20.), CELL, origin, GRID), None);
         assert_eq!(cell_at((5., 0.), CELL, origin, GRID), None);
@@ -409,7 +437,10 @@ mod tests {
     #[test]
     fn a_window_into_a_larger_grid_is_offset_by_its_origin() {
         assert_eq!(cell_at((5., 5.), CELL, (16, 40), (120, 40)), Some((40, 16)));
-        assert_eq!(cell_at((795., 465.), CELL, (16, 40), (120, 40)), Some((119, 39)));
+        assert_eq!(
+            cell_at((795., 465.), CELL, (16, 40), (120, 40)),
+            Some((119, 39))
+        );
     }
 
     #[test]
@@ -527,17 +558,26 @@ mod tests {
         assert_eq!(plain_view_tap(touch.lifted(), g(1, 4)), (Tapped::Plain, 4));
         touch.began(g(2, 4));
         touch.held();
-        assert_eq!(plain_view_tap(touch.lifted(), g(2, 4)), (Tapped::Ignored, 4));
+        assert_eq!(
+            plain_view_tap(touch.lifted(), g(2, 4)),
+            (Tapped::Ignored, 4)
+        );
     }
 
     #[test]
     fn a_view_replaced_mid_tap_acts_on_nothing() {
         // The touch began on the other view; this one saw no start.
-        assert_eq!(plain_view_tap(Touch::default().lifted(), g(1, 4)), (Tapped::Ignored, NO_STAMP));
+        assert_eq!(
+            plain_view_tap(Touch::default().lifted(), g(1, 4)),
+            (Tapped::Ignored, NO_STAMP)
+        );
         let mut touch = Touch::default();
         touch.began(g(1, NO_STAMP));
         assert!(!touch.owned_now(g(1, NO_STAMP)));
-        assert_eq!(plain_view_tap(touch.lifted(), g(1, NO_STAMP)), (Tapped::Ignored, NO_STAMP));
+        assert_eq!(
+            plain_view_tap(touch.lifted(), g(1, NO_STAMP)),
+            (Tapped::Ignored, NO_STAMP)
+        );
         touch.began(g(2, 3));
         assert!(touch.owned_now(g(2, 3)));
     }
@@ -555,7 +595,10 @@ mod tests {
         downs.queued(1);
         downs.handled(); // off the view: no began
         assert!(!touch.owned_now(downs.now()));
-        assert_eq!(plain_view_tap(touch.lifted(), downs.now()), (Tapped::Ignored, NO_STAMP));
+        assert_eq!(
+            plain_view_tap(touch.lifted(), downs.now()),
+            (Tapped::Ignored, NO_STAMP)
+        );
     }
 
     #[test]

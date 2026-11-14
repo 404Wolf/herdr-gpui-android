@@ -230,7 +230,8 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
     if let Some(downs) = downs.as_mut() {
         downs.queued(stamp.max(0) as u64);
     }
-    let posted = gpui_mobile::android::host::motion_event(action as u32, action_index as usize, &pointers);
+    let posted =
+        gpui_mobile::android::host::motion_event(action as u32, action_index as usize, &pointers);
     if !posted && let Some(downs) = downs.as_mut() {
         // A platform view took it: GPUI never handles this down.
         downs.withdrawn();
@@ -244,7 +245,9 @@ static DOWNS: std::sync::Mutex<gpui_rio::tap::DownStamps> =
     std::sync::Mutex::new(gpui_rio::tap::DownStamps::new());
 
 fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
-    DOWNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    DOWNS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// GPUI handled the next queued touch-down (see `ui::down_watch`).

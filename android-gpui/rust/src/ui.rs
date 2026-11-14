@@ -312,7 +312,10 @@ fn down_watch() -> impl IntoElement {
                     ScrollDelta::Pixels(delta) => delta == Point::default(),
                     ScrollDelta::Lines(delta) => delta == Point::default(),
                 };
-                if phase == DispatchPhase::Capture && event.touch_phase == TouchPhase::Started && still {
+                if phase == DispatchPhase::Capture
+                    && event.touch_phase == TouchPhase::Started
+                    && still
+                {
                     crate::android::touch_handled();
                 }
             });
@@ -394,7 +397,10 @@ struct DrawnCell {
 
 /// The finger on the pane's own view, where presses come from touch: a link
 /// opens only for a press whose touch began on this view.
-type PressOwner = Option<(Rc<std::cell::Cell<gpui_rio::tap::Touch>>, fn() -> gpui_rio::tap::Gesture)>;
+type PressOwner = Option<(
+    Rc<std::cell::Cell<gpui_rio::tap::Touch>>,
+    fn() -> gpui_rio::tap::Gesture,
+)>;
 
 /// The layout a linked row painted, kept so a tap resolves against it.
 type PaintedLine = Rc<RefCell<Option<(Point<Pixels>, ShapedLine)>>>;
@@ -499,7 +505,10 @@ impl GridRow {
             .child(line)
             .on_click(move |event, _, _cx| {
                 // A touch begun on another view (one this replaced mid-tap) opens nothing.
-                if owner.as_ref().is_some_and(|(touch, now)| !touch.get().owned_now(now())) {
+                if owner
+                    .as_ref()
+                    .is_some_and(|(touch, now)| !touch.get().owned_now(now()))
+                {
                     return;
                 }
                 let url = painted.borrow().as_ref().and_then(|(origin, line)| {
@@ -929,12 +938,18 @@ impl Render for TerminalView {
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseUpEvent, _, _| {
                                 let mut touch = this.tap_touch.get();
-                                let (tapped, stamp) =
-                                    gpui_rio::tap::plain_view_tap(touch.lifted(), crate::android::touch_stamp());
+                                let (tapped, stamp) = gpui_rio::tap::plain_view_tap(
+                                    touch.lifted(),
+                                    crate::android::touch_stamp(),
+                                );
                                 this.tap_touch.set(touch);
                                 crate::android::terminal_tapped(
                                     generation,
-                                    gpui_rio::tap::Report { id: gpui_rio::tap::next_id(), stamp, tapped },
+                                    gpui_rio::tap::Report {
+                                        id: gpui_rio::tap::next_id(),
+                                        stamp,
+                                        tapped,
+                                    },
                                 );
                             }),
                         )

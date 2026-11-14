@@ -414,7 +414,11 @@ impl Session {
         };
         let count = lines.unsigned_abs().min(30) as usize;
         let up = lines > 0;
-        let gesture = if up { Gesture::WheelUp } else { Gesture::WheelDown };
+        let gesture = if up {
+            Gesture::WheelUp
+        } else {
+            Gesture::WheelDown
+        };
         // Reported at the middle of the screen: the pane under the finger is
         // the whole terminal here.
         let report = mouse::report(mode, gesture, columns / 2 + 1, rows / 2 + 1);
@@ -734,18 +738,28 @@ mod tests {
 
     /// Nothing more reaches the program within a moment.
     fn silent(remote: &mut UnixStream) {
-        remote.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        remote
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let mut byte = [0; 1];
         let read = remote.read(&mut byte);
         assert!(read.is_err(), "the program was sent {read:?}");
-        remote.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
     }
 
     fn with_mouse_reporting() -> (Arc<Session>, UnixStream) {
         use rio_vt::crosswords::Mode;
         let (session, mut remote, _) = session();
         remote.write_all(b"\x1b[?1000h\x1b[?1006h").unwrap();
-        until(|| session.grid().lock().mode().contains(Mode::MOUSE_REPORT_CLICK | Mode::SGR_MOUSE));
+        until(|| {
+            session
+                .grid()
+                .lock()
+                .mode()
+                .contains(Mode::MOUSE_REPORT_CLICK | Mode::SGR_MOUSE)
+        });
         (session, remote)
     }
 
@@ -764,7 +778,10 @@ mod tests {
         let mut touch = Touch::default();
         touch.began(handled(&mut downs, 7));
         let owned = owns(true, touch.lifted(), downs.now());
-        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Clicked);
+        assert_eq!(
+            lift_on(&session, Press::default(), owned, Some((2, 1))),
+            Lifted::Clicked
+        );
         reply(&mut remote, b"\x1b[<0;3;2M\x1b[<0;3;2m");
     }
 
@@ -781,7 +798,10 @@ mod tests {
         let mut replacing = Touch::default();
         let owned = owns(true, replacing.lifted(), downs.now());
         assert!(!owned);
-        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        assert_eq!(
+            lift_on(&session, Press::default(), owned, Some((2, 1))),
+            Lifted::Ignored
+        );
         silent(&mut remote);
     }
 
@@ -795,16 +815,28 @@ mod tests {
         a.began(handled(&mut downs, 7));
         let mut b = Touch::default();
         let owned = owns(true, b.lifted(), downs.now());
-        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        assert_eq!(
+            lift_on(&session, Press::default(), owned, Some((2, 1))),
+            Lifted::Ignored
+        );
         // Nor does a link open: lift_on says Ignored for a press on one too.
-        let on_link = Press { on_link: true, ..Press::default() };
-        assert_eq!(lift_on(&session, on_link, owned, Some((2, 1))), Lifted::Ignored);
+        let on_link = Press {
+            on_link: true,
+            ..Press::default()
+        };
+        assert_eq!(
+            lift_on(&session, on_link, owned, Some((2, 1))),
+            Lifted::Ignored
+        );
         silent(&mut remote);
         // A touch the host had no stamp for is no view's either.
         let mut stampless = Touch::default();
         stampless.began(handled(&mut downs, NO_STAMP));
         let owned = owns(true, stampless.lifted(), downs.now());
-        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        assert_eq!(
+            lift_on(&session, Press::default(), owned, Some((2, 1))),
+            Lifted::Ignored
+        );
         silent(&mut remote);
     }
 
@@ -821,9 +853,18 @@ mod tests {
         view.began(handled(&mut downs, 7));
         handled(&mut downs, 7); // off the view: it sees no start
         let owned = owns(true, view.lifted(), downs.now());
-        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
-        let on_link = Press { on_link: true, ..Press::default() };
-        assert_eq!(lift_on(&session, on_link, owned, Some((2, 1))), Lifted::Ignored);
+        assert_eq!(
+            lift_on(&session, Press::default(), owned, Some((2, 1))),
+            Lifted::Ignored
+        );
+        let on_link = Press {
+            on_link: true,
+            ..Press::default()
+        };
+        assert_eq!(
+            lift_on(&session, on_link, owned, Some((2, 1))),
+            Lifted::Ignored
+        );
         silent(&mut remote);
     }
 
@@ -838,7 +879,10 @@ mod tests {
         view.began(handled(&mut downs, 7));
         handled(&mut downs, 8); // the swap's taps, on another view
         let owned = owns(true, view.lifted(), downs.now());
-        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        assert_eq!(
+            lift_on(&session, Press::default(), owned, Some((2, 1))),
+            Lifted::Ignored
+        );
         silent(&mut remote);
         // A swap also clears the touch outright.
         view.began(handled(&mut downs, 9));
