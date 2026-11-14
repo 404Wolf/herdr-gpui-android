@@ -187,4 +187,46 @@ public final class ComposerBarTest {
         assertEquals("● rec 0:05 · tap to stop",
                 ComposerBar.controls(false, RECORDING, queued, 43, true).get(1).spans[0]);
     }
+
+    @Test public void whereHerdrDrawsTalkTheKeyboardIsAskedToDropItsMicrophone() {
+        String options = ComposerBar.privateImeOptions(true);
+        // HeliBoard splits on "," exactly: no spaces, and its own key present
+        // (InputAttributes.inPrivateImeOptions: package name + ".noMicrophoneKey").
+        java.util.List<String> keys = java.util.Arrays.asList(options.split(","));
+        assertFalse(options.contains(" "));
+        assertTrue(keys.contains("helium314.keyboard.noMicrophoneKey"));
+        assertTrue(keys.contains("helium314.keyboard.debug.noMicrophoneKey"));
+        assertTrue(keys.contains("noMicrophoneKey"));
+        assertTrue(keys.contains("nm"));
+        assertTrue(keys.contains("com.google.android.inputmethod.latin.noMicrophoneKey"));
+        // No Herdr talk (no dictation, a shell): the keyboard keeps its own.
+        assertEquals(null, ComposerBar.privateImeOptions(false));
+    }
+
+    @Test public void theKeyboardsFieldSendsAndNeverOpensAFullScreenBox() {
+        int ime = ComposerBar.FIELD_IME_OPTIONS;
+        assertEquals(android.view.inputmethod.EditorInfo.IME_ACTION_SEND,
+                ime & android.view.inputmethod.EditorInfo.IME_MASK_ACTION);
+        assertTrue((ime & android.view.inputmethod.EditorInfo.IME_FLAG_NO_FULLSCREEN) != 0);
+        assertTrue((ime & android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI) != 0);
+        int type = ComposerBar.FIELD_INPUT_TYPE;
+        assertEquals(android.text.InputType.TYPE_CLASS_TEXT, type & android.text.InputType.TYPE_MASK_CLASS);
+        // Single-line, so the action key is "send", not a new line.
+        assertEquals(0, type & android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        // Not a password or email field: those hide the mic for other reasons
+        // and would also turn off suggestions.
+        assertEquals(0, type & android.text.InputType.TYPE_MASK_VARIATION);
+    }
+
+    @Test public void switchingBetweenAgentAndShellRestartsTheKeyboardOnlyWhenItsMicChanges() {
+        String agent = ComposerBar.privateImeOptions(true);
+        String shell = ComposerBar.privateImeOptions(false);
+        // Agent to shell: the keyboard gets its mic back (no Herdr talk there).
+        assertTrue(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(agent, shell));
+        // Shell to agent: the keyboard drops its mic (Herdr's talk is drawn).
+        assertTrue(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(shell, agent));
+        // Agent to agent, shell to shell: no restart, no flicker.
+        assertFalse(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(agent, ComposerBar.privateImeOptions(true)));
+        assertFalse(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(shell, ComposerBar.privateImeOptions(false)));
+    }
 }

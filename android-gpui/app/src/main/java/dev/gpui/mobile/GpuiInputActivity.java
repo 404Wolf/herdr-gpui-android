@@ -92,6 +92,32 @@ public class GpuiInputActivity extends Activity {
         });
     }
 
+    /**
+     * Private options for the keyboard while it types straight into the
+     * terminal ({@code EditorInfo.privateImeOptions}), read each time it
+     * connects; null leaves them unset.
+     */
+    protected String terminalImeOptions() {
+        return null;
+    }
+
+    /**
+     * {@link #terminalImeOptions()} may have changed (another pane): hands the
+     * keyboard the new ones at once if it is typing into the terminal, by
+     * restarting its input, but only when they differ, so it never flickers
+     * for nothing. Unfocused, the next connection reads them anyway.
+     */
+    protected final void refreshTerminalImeOptions() {
+        if (input == null || !input.hasFocus()) return;
+        if (!imeOptionsChanged(input.appliedOptions, terminalImeOptions())) return;
+        ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).restartInput(input);
+    }
+
+    /** Whether the keyboard, given {@code applied}, must be told {@code wanted}. */
+    public static boolean imeOptionsChanged(String applied, String wanted) {
+        return !java.util.Objects.equals(applied, wanted);
+    }
+
     private final class InputProxy extends EditText {
         private long session;
         private long epoch;
@@ -100,6 +126,8 @@ public class GpuiInputActivity extends Activity {
         private int depth;
         private boolean marked;
         private boolean keyboardVisible;
+        /** The private IME options the newest connection handed over (null for none). */
+        private String appliedOptions;
 
         InputProxy() {
             super(GpuiInputActivity.this);
@@ -173,6 +201,9 @@ public class GpuiInputActivity extends Activity {
         @Override public InputConnection onCreateInputConnection(EditorInfo info) {
             InputConnection connection = super.onCreateInputConnection(info);
             if (connection == null) return null;
+            String options = terminalImeOptions();
+            if (options != null) info.privateImeOptions = options;
+            appliedOptions = options;
             final long connectionSession = session;
             final long connectionEpoch = epoch;
             // Android can create the next connection (restartInput after

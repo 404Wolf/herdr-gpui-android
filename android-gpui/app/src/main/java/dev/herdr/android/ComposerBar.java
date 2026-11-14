@@ -401,6 +401,8 @@ final class ComposerBar {
 
     private void startTyping() {
         if (!agent) return;
+        // Read when the keyboard connects, on the focus below.
+        field.setPrivateImeOptions(privateImeOptions(drawsTalk()));
         if (!typing) {
             typing = true;
             imeShown = false;
@@ -825,6 +827,48 @@ final class ComposerBar {
         return start >= 0 && (start != length || end != length);
     }
 
+    /**
+     * The field's input type: single-line, so the keyboard's action key sends;
+     * the text still keeps line breaks from Shift+Enter on a hardware keyboard
+     * and from pasted text.
+     */
+    static final int FIELD_INPUT_TYPE = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            | InputType.TYPE_TEXT_FLAG_AUTO_CORRECT;
+
+    /** Send, and no full-screen extract box in landscape: that would be a typing box again. */
+    static final int FIELD_IME_OPTIONS = EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+
+    /**
+     * Asks the keyboard to leave out its microphone key
+     * ({@code EditorInfo.privateImeOptions}, comma-separated, no spaces):
+     * HeliBoard looks for its own package name plus ".noMicrophoneKey"
+     * (release and debug builds), AOSP LatinIME for "noMicrophoneKey" and the
+     * older "nm", Gboard for its package's. Keyboards that know none of them
+     * ignore them.
+     */
+    static final String NO_MICROPHONE_KEY = String.join(",",
+            "helium314.keyboard.noMicrophoneKey",
+            "helium314.keyboard.debug.noMicrophoneKey",
+            "noMicrophoneKey",
+            "nm",
+            "com.google.android.inputmethod.latin.noMicrophoneKey");
+
+    /**
+     * The keyboard's private options for a field on a pane where Herdr draws
+     * its own "talk": no microphone key there, so there is one talk control,
+     * Herdr's, in every fold state. Elsewhere (no dictation set up, a shell)
+     * the keyboard keeps its own.
+     */
+    static String privateImeOptions(boolean drawsTalk) {
+        return drawsTalk ? NO_MICROPHONE_KEY : null;
+    }
+
+    /** Herdr draws "talk" on this pane: an agent's, with dictation set up. */
+    boolean drawsTalk() {
+        return agent && dictation.isAvailable();
+    }
+
     /** Keys that would move the hidden cursor; while typing they do nothing. */
     static boolean movesCursor(int keyCode) {
         switch (keyCode) {
@@ -864,16 +908,10 @@ final class ComposerBar {
         edit.setLongClickable(false);
         edit.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         edit.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        // Single-line input type so the keyboard's action key sends; the text
-        // still keeps line breaks from Shift+Enter on a hardware keyboard and
-        // from pasted text.
-        edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-                | InputType.TYPE_TEXT_FLAG_AUTO_CORRECT);
+        edit.setInputType(FIELD_INPUT_TYPE);
         edit.setHorizontallyScrolling(false);
         edit.setMaxLines(MAX_LINES);
-        // No full-screen extract box in landscape either: that would be a typing box again.
-        edit.setImeOptions(EditorInfo.IME_ACTION_SEND | EditorInfo.IME_FLAG_NO_EXTRACT_UI
-                | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        edit.setImeOptions(FIELD_IME_OPTIONS);
         // Every way a keyboard says "send" ends in enter(), the app's own send
         // (EnterPaths): its action key, an Enter key event, a typed newline.
         edit.setOnEditorActionListener((view, action, event) -> {
