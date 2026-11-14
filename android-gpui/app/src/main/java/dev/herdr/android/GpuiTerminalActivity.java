@@ -399,16 +399,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         FrameLayout column = new FrameLayout(this);
         terminalColumn = column;
         column.addView(content, new FrameLayout.LayoutParams(-1, -1));
-        // On an agent's pane: the keys above its prompt, the chip of keyboard,
-        // mic and Enter clear of its caret, and the typing box on the keyboard.
+        // On an agent's pane: the keys above its prompt, the touch targets over
+        // the controls drawn in its prompt box, and the typing box on the keyboard.
         // The composer places each from the renderer's layout hints.
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
         column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
-        // Bottom right until the renderer's first hint places it.
-        FrameLayout.LayoutParams chipAt = new FrameLayout.LayoutParams(-2, -2,
-                android.view.Gravity.BOTTOM | android.view.Gravity.END);
-        chipAt.setMargins(0, 0, dp(4), dp(4));
-        column.addView(composer.cluster(), chipAt);
         filePager.setOnShownChanged(() -> composer.setCovered(filePager.showingFile()));
         column.addView(composer.field(), new FrameLayout.LayoutParams(-1, -2, android.view.Gravity.BOTTOM));
         // The sidebar rail mirrors the desktop's list of workspaces and agents.

@@ -31,13 +31,14 @@ import java.util.List;
  * Input for the pane on screen.
  *
  * <p>On an agent's pane there is no bottom bar: the terminal takes the whole
- * height, and a small chip floats over its bottom right ({@link FloatingCluster}:
- * keyboard, mic, Enter), clear of the caret and of dialogs. What is spoken or
- * typed is drawn as ghost text at the agent's own prompt caret by the renderer
- * ({@link GhostText}), and reaches the agent only on Enter, as one bracketed
- * paste plus Enter (through the outbox when the link is down). A typing box
- * exists only while the keyboard is up. The terminal keys open over the
- * terminal, above the prompt, on a swipe up or a long press on Enter.
+ * height, and the renderer draws the controls as words in the agent's own
+ * prompt box ("type ─ talk ─ send"), with invisible touch targets over them.
+ * What is spoken or typed is drawn as ghost text at the agent's own prompt
+ * caret by the renderer ({@link GhostText}), and reaches the agent only on
+ * Enter, as one bracketed paste plus Enter (through the outbox when the link
+ * is down). A typing box exists only while the keyboard is up. The terminal
+ * keys open over the terminal, above the prompt, on a swipe up or a long press
+ * on "send".
  *
  * <p>A plain shell keeps a bar: its pinned controls, its keys and Enter, and
  * raw typing.
@@ -82,8 +83,8 @@ final class ComposerBar {
     private static final String DRAFTS = "composer_drafts";
     private static final long SAVE_DRAFTS_MS = 400;
     private static final int MAX_LINES = 6;
-    /** Gap between the chip and the grid's right edge and the row under it, in dp. */
-    private static final int INSET = 4;
+    /** The mic's height in the typing box, in dp. */
+    private static final int MIC_SIZE = 36;
     private static final java.util.Set<String> SHELLS = new java.util.HashSet<>(java.util.Arrays.asList(
             "shell", "sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh", "csh"));
 
@@ -102,7 +103,6 @@ final class ComposerBar {
     private final android.widget.TextView hide;
     private final ImageView send;
     private final MicButton mic;
-    private final FloatingCluster cluster;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
     /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
@@ -114,8 +114,8 @@ final class ComposerBar {
     /** In the keys' overlay: the keyboard typing straight into the program. */
     private final ImageView raw;
     /**
-     * The draft, above the chip, when the renderer finds no prompt to draw it
-     * at (a dialog, an unknown program): ghost text never covers the program.
+     * The draft, above the controls, when the renderer finds no prompt to draw
+     * it at (a dialog, an unknown program): ghost text never covers the program.
      */
     private final android.widget.TextView fallback;
     /** Recording lengths of clips dictated this run, for their chips. */
@@ -139,7 +139,6 @@ final class ComposerBar {
     private boolean covered;
     private List<Outbox.Message> queuedMessages = Collections.emptyList();
     private ClusterPlacement.Hint layout;
-    private ClusterPlacement.Spot spot;
     /** The ghost JSON last handed over, so an unchanged one is not sent again. */
     private String lastGhost = "";
     private DictationEngine.State dictationState = DictationEngine.State.IDLE;
@@ -156,18 +155,7 @@ final class ComposerBar {
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         drafts.restore(preferences.getString(DRAFTS, ""));
-        mic = new MicButton(context, chrome, v -> toggleDictation(), FloatingCluster.SIZE, host::notice);
-        cluster = new FloatingCluster(context, chrome, mic.view(), new FloatingCluster.Actions() {
-            @Override public void keyboard() { startTyping(); }
-            @Override public void enter() { ComposerBar.this.enter(); }
-            @Override public void keys() { setKeysOpen(!keysOpen); }
-            @Override public void queue() { if (!queuedMessages.isEmpty()) host.showQueue(queuedMessages); }
-            @Override public void pane(int step) { host.switchPane(step); }
-        });
-        cluster.view().setVisibility(View.GONE);
-        cluster.view().addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
-            if (r - l != or - ol || b - t != ob - ot) v.post(this::place);
-        });
+        mic = new MicButton(context, chrome, v -> toggleDictation(), MIC_SIZE, host::notice);
         field = createField();
         send = new ImageView(context);
         send.setImageResource(R.drawable.ic_bar_enter);
@@ -224,9 +212,6 @@ final class ComposerBar {
     /** The typing box, floated at the bottom of the terminal's frame (over the keyboard). */
     View field() { return stack; }
 
-    /** The floating chip; the activity adds it to the frame over the terminal. */
-    View cluster() { return cluster.view(); }
-
     /** The terminal keys' overlay; the activity adds it to the frame over the terminal. */
     View keysOverlay() { return keysOverlay; }
 
@@ -281,7 +266,6 @@ final class ComposerBar {
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
     void showQueued(List<Outbox.Message> messages) {
         queuedMessages = messages;
-        cluster.setQueued(messages);
         pushGhost();
     }
 
@@ -353,7 +337,6 @@ final class ComposerBar {
         String text = drafts.switchTo(paneId);
         if (switched) {
             keysOpen = false;
-            spot = null;
             showText(text);
         }
         String next = paneKind == null ? "" : paneKind;
@@ -430,7 +413,6 @@ final class ComposerBar {
 
     private void style(GpuiChrome next) {
         chrome = next;
-        cluster.style(chrome);
         mic.style(chrome);
         field.setTextColor(chrome.onSurface);
         field.setHintTextColor(chrome.onSurfaceVariant);
@@ -577,22 +559,19 @@ final class ComposerBar {
                 stack.addView(mic.view(), 1, params);
             }
         } else {
-            cluster.takeMic(mic.view());
+            detach(mic.view());
         }
         stack.setVisibility(agent && typing ? View.VISIBLE : View.GONE);
-        if (!agent || typing || covered) {
-            cluster.view().setVisibility(View.GONE);
-            targets.setVisibility(View.GONE);
-        }
+        if (!agent || covered) targets.setVisibility(View.GONE);
         place();
         pushGhost();
     }
 
     /**
      * Puts the touch targets on the words the renderer drew in the program's
-     * frame ("type ─ talk ─ send"), from its last layout hint. When it had no
-     * room for them (a full screen), the floating chip stands in, on the lowest
-     * free cells. The keys float just above the prompt (or a dialog).
+     * frame ("type ─ talk ─ send"), from its last layout hint; it always draws
+     * them somewhere (see gpui-rio ghost.rs, {@code place_all}). The keys float
+     * just above the prompt (or a dialog).
      */
     private void place() {
         View surface = host.surface();
@@ -608,28 +587,9 @@ final class ComposerBar {
         boolean showing = agent && !covered;
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
-        View chip = cluster.view();
-        chip.setVisibility(showing && !drawn ? View.VISIBLE : View.GONE);
         FrameLayout.LayoutParams anchorAt = null;
         int anchorWidth = 0;
-        if (chip.getVisibility() == View.VISIBLE) {
-            chip.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
-            float width = (chip.getMeasuredWidth() + dp(INSET)) / density;
-            float height = (chip.getMeasuredHeight() + dp(INSET)) / density;
-            ClusterPlacement.Spot next = ClusterPlacement.place(layout, width, height, spot);
-            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
-            params.leftMargin = Math.round(left + next.right * density - chip.getMeasuredWidth() - dp(INSET));
-            params.topMargin = Math.round(top + next.bottom * density - chip.getMeasuredHeight() - dp(INSET) / 2f);
-            FrameLayout.LayoutParams old = (FrameLayout.LayoutParams) chip.getLayoutParams();
-            if (old == null || old.leftMargin != params.leftMargin || old.topMargin != params.topMargin
-                    || old.gravity != params.gravity) {
-                chip.setLayoutParams(params);
-            }
-            cluster.setCrowded(next.crowded);
-            spot = next;
-            anchorAt = params;
-            anchorWidth = chip.getMeasuredWidth();
-        } else if (drawn) {
+        if (drawn && targets.getVisibility() == View.VISIBLE) {
             FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) targets.getLayoutParams();
             anchorAt = t;
             anchorWidth = t.width;
