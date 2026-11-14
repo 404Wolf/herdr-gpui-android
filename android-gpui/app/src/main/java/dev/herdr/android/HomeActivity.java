@@ -89,6 +89,8 @@ public final class HomeActivity extends Activity {
         String deaconPending = "";
         long deaconPendingAt;
         String deaconError = "", projectError = "";
+        /** The navigation intent and session that requested this Deacon, including its polling stage. */
+        long deaconNavigation, deaconHandle;
         final Set<String> opening = new HashSet<>();
         /** Bumped whenever any of the above changes, so the tree redraws. */
         int ui;
@@ -107,6 +109,7 @@ public final class HomeActivity extends Activity {
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final HomeNavigation navigation = new HomeNavigation();
     private final ExecutorService worker = Executors.newFixedThreadPool(4);
     private final Map<String, Machine> machines = new LinkedHashMap<>();
     /** Folded rows (and "open:" rows that start folded), kept across launches. */
@@ -224,6 +227,7 @@ public final class HomeActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        beginNavigation();
         resumed = false;
         main.removeCallbacks(poll);
         super.onPause();
@@ -728,6 +732,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void openHosts() {
+        beginNavigation();
         startActivity(new Intent(this, RemoteHostsActivity.class).putExtra("skip_reopen", true));
     }
 
@@ -878,6 +883,7 @@ public final class HomeActivity extends Activity {
      * exact terminal). With none, its card offers Start Deacon; nothing starts.
      */
     private void pickMachine(Machine machine) {
+        beginNavigation();
         selectedHost = machine.host.id;
         try {
             getSharedPreferences("home", MODE_PRIVATE).edit().putString("machine", selectedHost).apply();
@@ -902,6 +908,7 @@ public final class HomeActivity extends Activity {
 
     /** Every computer, with how many agents it runs and how many wait on Wolf. */
     private void showMachinePicker() {
+        beginNavigation();
         ActionSheet sheet = new ActionSheet(this, chrome, "Computer");
         for (Machine machine : machines.values()) {
             int[] n = agentCounts(machine);
@@ -985,12 +992,13 @@ public final class HomeActivity extends Activity {
             row.addView(plus);
         }
         row.setOnClickListener(v -> {
-            if (machines.size() > 1) showMachinePicker();
             if ("closed".equals(machine.state) && machine.handle <= 0 && !machine.connecting) connect(machine);
+            showMachinePicker();
         });
         row.setContentDescription("Computer " + machine.host.name + ", " + detail
-                + (machines.size() > 1 ? ", tap to pick another" : ""));
+                + ", tap to pick a computer");
         row.setOnLongClickListener(v -> {
+            beginNavigation();
             ActionSheet sheet = new ActionSheet(this, chrome, machine.host.name);
             if (fleet.deacon != null) sheet.add("Open the Deacon", () -> openAgent((Agent) fleet.deacon));
             else if (ready) sheet.add("Start Deacon", () -> startDeacon(machine));
@@ -1084,6 +1092,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void toggleFold(String key, boolean foldedByDefault) {
+        beginNavigation();
         String stored = foldedByDefault ? "open:" + key : key;
         if (!collapsed.remove(stored)) collapsed.add(stored);
         try {
@@ -1103,17 +1112,25 @@ public final class HomeActivity extends Activity {
         for (int i = 0; i < row.kids.size(); i++) emit(into, row.kids.get(i), next, i == row.kids.size() - 1, depth + 1);
     }
 
-    /** One row per PM (by project name), then Other terminals; no repo, worktree or space rows. */
+    /** Repository headings with their PMs, then Other terminals; workers stay behind each PM. */
     private List<Row> bodyRows(Machine machine, FleetTree.PmTree tree, boolean ready) {
         String m = machine.host.id;
         List<Row> rows = new ArrayList<>();
-        for (FleetTree.PmRow pm : tree.pms) rows.add(pmRow(machine, pm));
-        if (!tree.others.isEmpty()) {
+        for (FleetTree.RepoRow repo : tree.repos) {
+            String count = (repo.blocked() ? "! " : "") + repo.countLabel();
+            Row group = new Row((guide, self) -> groupLine(guide, self, repo.name, count));
+            group.fold = m + "/repo/" + repo.key;
+            group.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.REPO);
+            for (FleetTree.PmRow pm : repo.projects) group.kids.add(pmRow(machine, pm));
+            rows.add(group);
+        }
+        if (!tree.others.isEmpty() || !tree.otherCatalogs.isEmpty()) {
             String count = (tree.othersBlocked() ? "! " : "") + tree.otherMembers.size();
             Row others = new Row((guide, self) -> {
                 View line = groupLine(guide, self, "Other terminals", count);
                 if (!tree.otherCatalogs.isEmpty()) {
                     line.setOnLongClickListener(v -> {
+                        beginNavigation();
                         new ActionSheet(this, chrome, "Other terminals")
                                 .add("Worktrees…", () -> showCatalogs(machine, tree.otherCatalogs)).show();
                         return true;
@@ -1127,6 +1144,7 @@ public final class HomeActivity extends Activity {
                 String tag = "deacon".equals(node.member.role) ? "another deacon" : null;
                 others.kids.add(agentTree(m, node, tag));
             }
+            addCatalogRows(others, machine, tree.otherCatalogs);
             rows.add(others);
         }
         return rows;
@@ -1153,8 +1171,14 @@ public final class HomeActivity extends Activity {
             row = new Row((guide, self) -> {
                 View line = actionLine(guide, self, "●", pm.name() + " · no PM"
                         + (tally.isEmpty() ? "" : "  " + tally), pm.blocked() ? chrome.danger : chrome.onSurfaceVariant,
-                        () -> askForManager(machine, pm.project));
+                        () -> {
+                            FleetTree.Member target = FleetTree.projectTarget(pm);
+                            if (target != null) openAgent((Agent) target);
+                            else if (!self.kids.isEmpty()) toggleFold(self.fold, self.foldedByDefault);
+                            else askForManager(machine, pm.project);
+                        });
                 line.setOnLongClickListener(v -> {
+                    beginNavigation();
                     ActionSheet sheet = new ActionSheet(this, chrome, pm.name())
                             .add("Ask for a manager", () -> askForManager(machine, pm.project));
                     if (!pm.catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, pm.catalogs));
@@ -1168,11 +1192,22 @@ public final class HomeActivity extends Activity {
         // PM rows start folded, as on the desktop; Home reveals nothing on its own.
         row.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.PROJECT);
         for (FleetTree.AgentNode node : pm.workers) row.kids.add(agentTree(machine.host.id, node, null));
+        addCatalogRows(row, machine, pm.catalogs);
         return row;
+    }
+
+    /** Catalogs are reachable by tap as well as from the row's long-press menu. */
+    private void addCatalogRows(Row parent, Machine machine, List<FleetTree.Project> catalogs) {
+        for (FleetTree.Project project : catalogs) {
+            parent.kids.add(new Row((guide, self) -> actionLine(guide, null, "○",
+                    FleetTree.repoName(project.repo) + " · " + FleetTree.unopenedLabel(project), chrome.primary,
+                    () -> showWorktrees(machine, project, 0))));
+        }
     }
 
     /** A row's "Worktrees…": straight to the one repo's catalog, else a choice of repo first. */
     private void showCatalogs(Machine machine, List<FleetTree.Project> catalogs) {
+        beginNavigation();
         if (catalogs.size() == 1) { showWorktrees(machine, catalogs.get(0), 0); return; }
         ActionSheet sheet = new ActionSheet(this, chrome, "Worktrees with no space");
         for (FleetTree.Project project : catalogs) {
@@ -1184,6 +1219,7 @@ public final class HomeActivity extends Activity {
 
     /** "Worktrees…" for one repo: its worktrees no terminal has open, a page at a time. */
     private void showWorktrees(Machine machine, FleetTree.Project project, int pages) {
+        beginNavigation();
         int total = project.closed.size();
         ActionSheet sheet = new ActionSheet(this, chrome, project.name + " · " + total
                 + (total == 1 ? " worktree" : " worktrees") + " with no space"
@@ -1193,9 +1229,7 @@ public final class HomeActivity extends Activity {
             FleetTree.GitWorktree wt = project.closed.get(i);
             String name = wt.branch.isEmpty() ? FleetTree.lastSegment(wt.path) + " (detached)" : wt.branch;
             boolean busy = machine.opening.contains(wt.path);
-            sheet.add("○ " + name + (busy ? " · opening…" : ""), () -> {
-                if (!busy && live(machine)) closedWorktreeActions(machine, wt, name);
-            });
+            sheet.add("○ " + name + (busy ? " · opening…" : ""), () -> openWorktree(machine, wt.path));
         }
         if (total > shown) sheet.add("+" + (total - shown) + " more", () -> showWorktrees(machine, project, pages + 1));
         sheet.show();
@@ -1235,6 +1269,8 @@ public final class HomeActivity extends Activity {
             boolean folded = folded(fold);
             TextView toggle = chevronSlot(folded ? "▸" : "▾");
             toggle.setContentDescription((folded ? "Show " : "Hide ") + fold.kids.size() + " rows under it");
+            toggle.setBackground(ripple());
+            toggle.setFocusable(true);
             toggle.setOnClickListener(v -> toggleFold(fold.fold, fold.foldedByDefault));
             row.addView(toggle);
         } else if (fold != null && fold.fold != null) {
@@ -1352,7 +1388,7 @@ public final class HomeActivity extends Activity {
         return line;
     }
 
-    /** "Spaces", "Other agents": the whole row folds. */
+    /** A repository or Other terminals heading: the whole row folds. */
     private View groupLine(String guide, Row fold, String words, String count) {
         LinearLayout line = treeLine(guide, fold);
         TextView name = single(text(words, 12, chrome.primary));
@@ -1373,8 +1409,10 @@ public final class HomeActivity extends Activity {
         GradientDrawable border = new GradientDrawable();
         border.setCornerRadius(dp(10));
         border.setStroke(Math.max(1, dp(1)), enabled ? chrome.primary : chrome.outline);
-        chip.setBackground(border);
+        chip.setBackground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(chrome.selected), border, new ColorDrawable(0xffffffff)));
         chip.setEnabled(enabled);
+        chip.setFocusable(enabled);
         if (enabled) chip.setOnClickListener(v -> action.run());
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
         params.setMarginStart(dp(6));
@@ -1444,6 +1482,7 @@ public final class HomeActivity extends Activity {
 
     /** A PM's menu also offers the unopened-worktree catalogs its row holds. */
     private void agentActions(Agent agent, Machine machine, List<FleetTree.Project> catalogs) {
+        beginNavigation();
         ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent)).add("Open", () -> openAgent(agent));
         if (machine != null && !catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, catalogs));
         if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
@@ -1520,6 +1559,7 @@ public final class HomeActivity extends Activity {
     private void startDeacon(Machine machine) {
         long handle = machine.handle;
         if (machine.deaconBusy || deaconGuard(machine) > 0) return;
+        long intent = beginNavigation();
         if (handle <= 0 || !"ready".equals(machine.state)) {
             machine.deaconError = machine.host.name + " is offline";
             machine.ui++;
@@ -1527,6 +1567,8 @@ public final class HomeActivity extends Activity {
             return;
         }
         machine.deaconBusy = true;
+        machine.deaconNavigation = intent;
+        machine.deaconHandle = handle;
         machine.deaconError = "";
         machine.ui++;
         try {
@@ -1588,7 +1630,7 @@ public final class HomeActivity extends Activity {
                 }
                 machine.ui++;
                 render(true);
-                if (machine.handle == handle) openTerminal(machine, address, "Deacon");
+                openTerminal(machine, address, "Deacon", handle, intent);
             });
         });
     }
@@ -1633,7 +1675,7 @@ public final class HomeActivity extends Activity {
         }
         machine.ui++;
         render(true);
-        if (launched != null) openTerminal(machine, address, "Deacon");
+        if (launched != null) openTerminal(machine, address, "Deacon", machine.deaconHandle, machine.deaconNavigation);
     }
 
     /**
@@ -1644,6 +1686,7 @@ public final class HomeActivity extends Activity {
     private void newProject(Machine machine, Agent deacon) {
         long handle = machine.handle;
         if (machine.projectBusy) return;
+        beginNavigation();
         if (handle <= 0 || !"ready".equals(machine.state)) {
             machine.projectError = machine.host.name + " is offline";
             machine.ui++;
@@ -1655,6 +1698,7 @@ public final class HomeActivity extends Activity {
 
     /** A project with no manager: ask that machine's Deacon to set one up. */
     private void askForManager(Machine machine, FleetTree.Project project) {
+        beginNavigation();
         FleetTree.Member found = FleetTree.canonicalDeacon(members(machine));
         if (found == null) {
             note = "Start the Deacon on " + machine.host.name + " first; it sets up project managers.";
@@ -1671,6 +1715,7 @@ public final class HomeActivity extends Activity {
 
     private void sendToDeacon(Machine machine, Agent deacon, String text) {
         if (machine.projectBusy) return; // one send per tap
+        long intent = beginNavigation();
         long handle = machine.handle;
         String action;
         try {
@@ -1697,44 +1742,37 @@ public final class HomeActivity extends Activity {
                 machine.projectError = reason == null ? "" : reason;
                 machine.ui++;
                 render(true);
-                if (reason == null) openAgent(deacon);
+                if (reason == null) completeNavigation(machine, handle, intent, () -> openAgent(deacon, intent));
             });
         });
-    }
-
-    /**
-     * An unopened worktree: work there goes through the Deacon (it starts a
-     * labelled worker); a bare shell is only the secondary choice.
-     */
-    private void closedWorktreeActions(Machine machine, FleetTree.GitWorktree wt, String name) {
-        // The git cache can lag: a terminal already there (a slow first open) is opened instead.
-        FleetTree.Member there = FleetTree.memberAt(members(machine), wt.path);
-        if (there != null) { openAgent((Agent) there); return; }
-        FleetTree.Member deacon = FleetTree.canonicalDeacon(members(machine));
-        ActionSheet sheet = new ActionSheet(this, chrome, name);
-        if (deacon != null) {
-            sheet.add("Ask the Deacon to start work here", () -> sendToDeacon(machine, (Agent) deacon,
-                    "I want to work in the " + name.replaceAll("\\p{Cntrl}", "") + " worktree ("
-                            + wt.path.replaceAll("\\p{Cntrl}", "") + ") on " + machine.host.name
-                            + ". Help me set up a worker there."));
-        } else {
-            sheet.add("Start the Deacon first", () -> startDeacon(machine));
-        }
-        sheet.add("Open a plain shell there", () -> openWorktree(machine, wt.path));
-        sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", wt.path));
-        sheet.show();
     }
 
     /** A closed worktree: a shell space there (no agent), then that shell. */
     private void openWorktree(Machine machine, String path) {
         long handle = machine.handle;
-        if (handle <= 0 || !"ready".equals(machine.state) || !machine.opening.add(path)) return;
+        if (!live(machine)) {
+            beginNavigation();
+            note = machine.host.name + " is offline. Connect it before opening a worktree.";
+            render(true);
+            return;
+        }
+        // The git catalog can lag a live poll: reuse any terminal already there.
+        FleetTree.Member there = FleetTree.memberAt(members(machine), path);
+        if (there != null) { openAgent((Agent) there); return; }
+        if (!machine.opening.add(path)) {
+            note = "Opening " + FleetTree.lastSegment(path) + "…";
+            render(true);
+            return;
+        }
+        long intent = beginNavigation();
+        note = "Opening " + FleetTree.lastSegment(path) + "…";
         machine.ui++;
         render(true);
         String action;
         try {
             action = new JSONObject().put("op", "space.open").put("folder", path).toString();
         } catch (org.json.JSONException impossible) {
+            machine.opening.remove(path);
             return;
         }
         worker.execute(() -> {
@@ -1751,20 +1789,25 @@ public final class HomeActivity extends Activity {
                 if (destroyed) return;
                 machine.opening.remove(path);
                 machine.ui++;
-                note = reason == null ? null : "Could not open " + FleetTree.lastSegment(path) + ": " + reason;
-                render(true);
-                if (!address.isEmpty() && machine.handle == handle) openTerminal(machine, address, FleetTree.lastSegment(path));
+                completeNavigation(machine, handle, intent, () -> {
+                    note = reason != null ? "Could not open " + FleetTree.lastSegment(path) + ": " + reason
+                            : address.isEmpty() ? "The computer did not return a terminal for " + FleetTree.lastSegment(path) : null;
+                    render(true);
+                    if (reason == null && !address.isEmpty()) {
+                        openTerminal(machine, address, FleetTree.lastSegment(path), handle, intent);
+                    }
+                });
             });
         });
     }
 
     /** Opens a terminal the core just made or found, by address on this machine. */
-    private void openTerminal(Machine machine, String address, String title) {
+    private void openTerminal(Machine machine, String address, String title, long handle, long intent) {
         Agent agent = new Agent();
         agent.machine = machine;
         agent.id = address;
         agent.title = title;
-        openAgent(agent);
+        completeNavigation(machine, handle, intent, () -> openAgent(agent, intent));
     }
 
     /**
@@ -1874,14 +1917,32 @@ public final class HomeActivity extends Activity {
             line.setSingleLine(true);
             line.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(line, new LinearLayout.LayoutParams(0, -2, 1));
+            row.setContentDescription("Open " + machine.host.name + ", " + detail);
+            row.setOnClickListener(v -> pickMachine(machine));
             fleet.addView(row);
         }
     }
 
     // ── Actions ─────────────────────────────────────────────────────────────
 
+    private long beginNavigation() {
+        opening = false;
+        reopenPane = "";
+        return navigation.begin();
+    }
+
+    /** The only completion gate for asynchronous actions that can open a terminal. */
+    private void completeNavigation(Machine machine, long handle, long intent, Runnable action) {
+        if (!destroyed) navigation.complete(intent, handle, machine.handle, action);
+    }
+
     /** Hands this machine's session to the terminal, attached to the agent. */
     private void openAgent(Agent agent) {
+        openAgent(agent, beginNavigation());
+    }
+
+    /** Carries the original intent through a worktree/Deacon action and this asynchronous focus. */
+    private void openAgent(Agent agent, long intent) {
         Machine machine = agent.machine;
         long handle = machine.handle;
         if (GpuiLaunch.terminalOpen()) {
@@ -1920,8 +1981,7 @@ public final class HomeActivity extends Activity {
                 failure = "Not available";
             }
             final String reason = failure;
-            main.post(() -> {
-                if (destroyed || machine.handle != handle) { opening = false; return; }
+            main.post(() -> completeNavigation(machine, handle, intent, () -> {
                 if (reason != null) {
                     opening = false;
                     note = agent.title + ": " + reason;
@@ -1939,12 +1999,13 @@ public final class HomeActivity extends Activity {
                     note = "The terminal could not be opened";
                     render(true);
                 }
-            });
+            }));
         });
     }
 
     /** Fuzzy search over machines, spaces and agents, keyboard up at once. */
     private void openPicker() {
+        beginNavigation();
         AlertDialog.Builder builder = new AlertDialog.Builder(this, chrome.dialogTheme());
         LinearLayout body = column();
         body.setPadding(dp(8), dp(8), dp(8), 0);
