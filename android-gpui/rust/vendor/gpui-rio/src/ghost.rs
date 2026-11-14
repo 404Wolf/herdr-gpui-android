@@ -493,8 +493,16 @@ pub fn place_all(
                     run.text = clip(&run.text, room);
                     Some(run)
                 });
+            let draft: Vec<Placed> = draft.collect();
+            // Shown only if some of its words were placed: with no free cells
+            // at the caret (the controls fill its row) nothing is, and the host
+            // shows the draft itself instead of losing it.
+            layout.draft_shown = has_draft
+                && draft.iter().any(|p| {
+                    matches!(p.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip)
+                        && !p.text.trim_matches(|c: char| c == '…' || c.is_whitespace()).is_empty()
+                });
             layout.placed.extend(draft);
-            layout.draft_shown = has_draft;
         }
         None => {
             // One line on the row above the controls, only on its blank end.
@@ -1228,6 +1236,31 @@ mod tests {
             "{:?}",
             layout.placed
         );
+    }
+
+    #[test]
+    fn with_no_free_cells_at_the_caret_the_host_shows_the_draft() {
+        // Codex at 22 cols with the full offline controls on its caret row and
+        // its hint right below: no cell is free for the draft, so none is
+        // placed and draft_shown is false, and the host's own draft view shows.
+        let cols = 22;
+        let rows = screen(&["", "", "› ", "  ? for shortcuts", "", ""], cols);
+        let anchor = locate(&rows, Some((2, 2)), PromptKind::Codex);
+        let mut g = full_line(OFFLINE);
+        g.kind = PromptKind::Codex;
+        g.draft = vec![text(&format!("{} END", "z".repeat(99)))];
+        let layout = place_all(&g, anchor, &rows, None);
+        assert!(layout.controls.iter().any(|c| c.id == "talk"));
+        assert!(layout.placed.iter().all(|p| p.row != 3), "{:?}", layout.placed);
+        let placed = layout
+            .placed
+            .iter()
+            .any(|p| matches!(p.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip));
+        assert!(!placed && !layout.draft_shown, "{layout:?}");
+        // With room, the same draft is placed and reported shown.
+        let (rows, anchor) = claude_status_screen(40);
+        let layout = place_all(&g, anchor, &rows, None);
+        assert!(layout.draft_shown);
     }
 
     #[test]
