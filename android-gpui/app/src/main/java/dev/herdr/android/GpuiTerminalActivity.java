@@ -2051,6 +2051,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
             composer.setPane(current == null ? "" : current.paneId, kind);
+            // Agent and shell panes differ in whether the keyboard keeps its mic.
+            refreshTerminalImeOptions();
             refreshQueued();
         }
         boolean show = current != null && !shellMode() && current.tabs != null;
@@ -4642,6 +4644,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Off unless turned on in View options: Herdr posts no notifications by default. */
     static final String AGENT_ALERTS = "agent_alerts";
+
+    /**
+     * Typing straight into an agent's terminal: the keyboard leaves out its
+     * microphone key, as in the composer, since Herdr draws its own "talk".
+     */
+    @Override protected String terminalImeOptions() {
+        return ComposerBar.privateImeOptions(composer != null && composer.drawsTalk());
+    }
 
     private boolean agentAlertsOn() {
         return getSharedPreferences("terminal-display", MODE_PRIVATE).getBoolean(AGENT_ALERTS, false);
