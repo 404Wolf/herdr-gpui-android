@@ -14,7 +14,10 @@ use rio_vt::{
         square::Wide,
     },
     event::{EventListener, RioEvent, WindowId, WindowSize, sync::FairMutex},
-    performer::handler::Processor,
+    performer::{
+        handler::Processor,
+        parser::{Params, Parser, Perform},
+    },
 };
 use std::{
     io::{ErrorKind, Read, Write},
@@ -459,9 +462,23 @@ struct Reader {
     alive: Arc<AtomicBool>,
 }
 
+/// Observe actual ED2 dispatches, including across reads, rather than matching
+/// escape-looking bytes in titles or other terminal strings.
+struct RepaintErase(bool);
+
+impl Perform for RepaintErase {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.0 = !ignore
+            && intermediates.is_empty()
+            && action == 'J'
+            && params.iter().next() == Some(&[2][..]);
+    }
+}
+
 impl Reader {
     fn run(self, mut output: impl Read) {
         let mut processor = Processor::default();
+        let mut repaint_erase: Option<(Parser, RepaintErase)> = None;
         let mut buffer = vec![0; READ_BUFFER];
         loop {
             let read = match output.read(&mut buffer) {
@@ -488,7 +505,9 @@ impl Reader {
                 }
                 drop(grid);
                 *lock(&self.shared.negotiated) = Some((columns, lines));
-                apply_grid(&self.grid, &self.shared, (columns, lines), None);
+                if apply_grid(&self.grid, &self.shared, (columns, lines), None) {
+                    repaint_erase = Some((Parser::new(), RepaintErase(false)));
+                }
                 self.dirty.store(true, Ordering::Release);
             }
             let flush = processor
@@ -499,7 +518,29 @@ impl Reader {
                 continue;
             }
             let mut grid = self.grid.lock();
-            processor.advance(&mut *grid, &buffer[..read]);
+            let erase_at = repaint_erase.as_mut().and_then(|(parser, erase)| {
+                buffer[..read].iter().position(|byte| {
+                    parser.advance(erase, std::slice::from_ref(byte));
+                    erase.0
+                })
+            });
+            let remaining = if let Some(index) = erase_at {
+                processor.advance(&mut *grid, &buffer[..index]);
+                if !grid.mode().contains(Mode::ALT_SCREEN) {
+                    // Erase this repaint in place, then cancel its ED2: even
+                    // an empty viewport can add a blank row to empty history.
+                    grid.grid.sync_template_style();
+                    grid.grid.reset_region(..);
+                    grid.selection = None;
+                    grid.mark_fully_damaged();
+                    buffer[index] = 0x18;
+                }
+                repaint_erase = None;
+                &buffer[index..read]
+            } else {
+                &buffer[..read]
+            };
+            processor.advance(&mut *grid, remaining);
             self.answer(&grid);
             drop(grid);
             self.dirty.store(true, Ordering::Release);
@@ -703,6 +744,59 @@ mod tests {
         until(|| text_at(&session, 0, 60) == line);
         // Nothing spilled onto the next row.
         assert!(text_at(&session, 1, 1).trim_matches(['\0', ' ']).is_empty());
+    }
+
+    #[test]
+    fn a_core_repaint_erases_in_place_and_later_clears_keep_their_history() {
+        let (session, mut remote, _) = session();
+        remote
+            .write_all(b"history\r\nold one\r\nold two\r\nold three\r\nold four")
+            .unwrap();
+        until(|| text_at(&session, 3, 8) == "old four");
+        let history = session.grid().lock().history_size();
+        assert_eq!(history, 1);
+        assert_eq!(text_at(&session, -1, 7), "history");
+
+        assert!(session.queue_grid(40, 4));
+        until(|| session.grid_size() == (40, 4));
+        // A grid notification alone must preserve output parsed at the old size.
+        assert_eq!(text_at(&session, 0, 7), "old one");
+        // An ED2-looking title must not consume the one-shot erase.
+        remote
+            .write_all(b"\x18\x1b]2;[2J\x07\x1b[!p\x1b[H\x1b[2")
+            .unwrap();
+        until(|| session.title().as_deref() == Some("[2J"));
+        assert_eq!(text_at(&session, 0, 7), "old one");
+        remote.write_all(b"J\x1b[6n").unwrap();
+        reply(&mut remote, b"\x1b[1;1R");
+        // ED2 must add neither the stale screen nor blank replacement rows.
+        assert_eq!(session.screen_text(), "");
+        assert_eq!(session.grid().lock().history_size(), history);
+        assert_eq!(text_at(&session, -1, 7), "history");
+
+        remote.write_all(b"new one\r\nnew two\x1b[6n").unwrap();
+        reply(&mut remote, b"\x1b[2;8R");
+        assert_eq!(session.screen_text(), "new one\nnew two");
+        assert_eq!(session.grid().lock().history_size(), history);
+        remote.write_all(b"\x1b[H\x1b[2J\x1b[6n").unwrap();
+        reply(&mut remote, b"\x1b[1;1R");
+        assert_eq!(session.grid().lock().history_size(), history + 2);
+        assert_eq!(text_at(&session, -3, 7), "history");
+        assert_eq!(text_at(&session, -2, 7), "new one");
+        assert_eq!(text_at(&session, -1, 7), "new two");
+    }
+
+    #[test]
+    fn a_core_repaint_does_not_push_styled_blank_rows_into_history() {
+        let (session, mut remote, _) = session();
+        remote.write_all(b"\x1b[41mold\x1b[6n").unwrap();
+        reply(&mut remote, b"\x1b[1;4R");
+        assert!(session.queue_grid(40, 4));
+        until(|| session.grid_size() == (40, 4));
+        remote.write_all(b"\x18\x1b[H\x1b[2J\x1b[6n").unwrap();
+        reply(&mut remote, b"\x1b[1;1R");
+        assert_eq!(session.screen_text(), "");
+        assert_eq!(session.grid().lock().history_size(), 0);
     }
 
     #[test]
