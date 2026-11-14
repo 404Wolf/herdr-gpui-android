@@ -95,8 +95,8 @@ public final class FleetSidebarTest {
 
     @Test public void aNoPmProjectWithoutAnInferredLeadCountsEveryWorker() {
         FleetTree.Member a = member(1, "worker", "repo", "/repo", "working");
-        FleetTree.Member b = member(2, "worker", "repo", "/repo", "working");
-        b.parent = a.id;
+        FleetTree.Member b = member(2, "", "repo", "/repo", "working");
+        b.parent = a.id; // An unlabelled sub-agent cannot be the inferred lead.
         FleetTree.GitLook git = new FleetTree.GitLook();
         place(git, a.cwd, "/repo/.git", "/repo");
         FleetTree.PmRow row = project(FleetTree.pmTree(FleetTree.build(Arrays.asList(a, b), git)), "repo");

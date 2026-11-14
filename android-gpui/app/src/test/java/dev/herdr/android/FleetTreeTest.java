@@ -249,7 +249,15 @@ public final class FleetTreeTest {
         FleetTree.Member second = m("t8", "s2", "zulip", 1, 1, "/w/zulip", "working");
         FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(worker, other, second, lead), null);
         FleetTree.Project billing = project(fleet, "billing");
-        assertNull(billing.pm);
+        // Desktop sidebar inference considers unlabelled roots even after an explicit worker.
+        assertSame(other, billing.pm);
+        assertTrue(billing.pmInferred);
+        assertEquals(Arrays.asList("t2"), agentIds(billing.entries.get(0)));
+        FleetTree.PmRow row = FleetTree.pmTree(fleet).allProjects.get(0);
+        assertSame(billing, row.project);
+        assertFalse(row.labelledPm());
+        assertEquals(1, row.subAgents);
+        assertEquals(Arrays.asList("t2"), ids(FleetTree.flatten(row.workers)));
         FleetTree.Project zulip = project(fleet, "zulip");
         assertSame(lead, zulip.pm);
         assertTrue(zulip.pmInferred);

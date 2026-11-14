@@ -1881,24 +1881,75 @@ mod tests {
         let lane = dir.join("custom place/lane 1");
         let l = lane.to_string_lossy().into_owned();
         assert!(run(&["-C", &m, "worktree", "add", "-q", "-b", "lane-1", &l]));
-        assert!(run(&["-C", &l, "branch", "--set-upstream-to=upstream", "lane-1"]));
-        assert!(run(&["-C", &l, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "ahead"]));
-        assert!(run(&["-C", &m, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "behind"]));
+        assert!(run(&[
+            "-C",
+            &l,
+            "branch",
+            "--set-upstream-to=upstream",
+            "lane-1"
+        ]));
+        assert!(run(&[
+            "-C",
+            &l,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "ahead"
+        ]));
+        assert!(run(&[
+            "-C",
+            &m,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "behind"
+        ]));
         assert!(run(&["-C", &m, "branch", "-f", "upstream", "main"]));
         let sub = lane.join("src");
         assert!(std::fs::create_dir_all(&sub).is_ok());
         let sub = sub.to_string_lossy().into_owned();
         let out = std::process::Command::new("sh")
-            .args(["-c", GIT_LOOK, "sh", &m, &l, &format!("{l}/"), &sub, "/nonexistent"])
+            .args([
+                "-c",
+                GIT_LOOK,
+                "sh",
+                &m,
+                &l,
+                &format!("{l}/"),
+                &sub,
+                "/nonexistent",
+            ])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
         let common = format!("{m}/.git");
-        assert!(out.contains(&format!("P\t{m}\t{common}\t{m}\tmain\t0\t0\n")), "{out}");
-        assert!(out.contains(&format!("P\t{l}\t{common}\t{l}\tlane-1\t1\t1\n")), "{out}");
-        assert!(out.contains(&format!("P\t{l}/\t{common}\t{l}\tlane-1\t1\t1\n")), "{out}");
-        assert!(out.contains(&format!("P\t{sub}\t{common}\t{l}\tlane-1\t1\t1\n")), "{out}");
+        assert!(
+            out.contains(&format!("P\t{m}\t{common}\t{m}\tmain\t0\t0\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("P\t{l}\t{common}\t{l}\tlane-1\t1\t1\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("P\t{l}/\t{common}\t{l}\tlane-1\t1\t1\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("P\t{sub}\t{common}\t{l}\tlane-1\t1\t1\n")),
+            "{out}"
+        );
         assert!(out.contains("P\t/nonexistent\n"), "{out}");
         assert_eq!(out.matches("\nR\t").count() + usize::from(out.starts_with("R\t")), 1, "{out}");
         assert!(out.contains(&format!("worktree {l}\n")) && out.contains("branch refs/heads/lane-1\n"), "{out}");
