@@ -180,6 +180,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
     ids: jni::objects::JIntArray<'_>,
     xs: jni::objects::JFloatArray<'_>,
     ys: jni::objects::JFloatArray<'_>,
+    stamp: jlong,
 ) -> jboolean {
     if !matches!(action, 0 | 1 | 2 | 3 | 5 | 6) || ids.is_null() || xs.is_null() || ys.is_null() {
         return 0;
@@ -222,11 +223,40 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
             y: y[i],
         });
     }
-    u8::from(gpui_mobile::android::host::motion_event(
-        action as u32,
-        action_index as usize,
-        &pointers,
-    ))
+    // The pane this press begins on goes into the queue with its down, in the
+    // order GPUI gets the downs (the lock is held across the post), so the
+    // renderer stamps the tap with it however late it handles it.
+    let mut downs = (action == 0).then(lock_downs);
+    if let Some(downs) = downs.as_mut() {
+        downs.queued(stamp.max(0) as u64);
+    }
+    let posted = gpui_mobile::android::host::motion_event(action as u32, action_index as usize, &pointers);
+    if !posted && let Some(downs) = downs.as_mut() {
+        // A platform view took it: GPUI never handles this down.
+        downs.withdrawn();
+    }
+    u8::from(posted)
+}
+
+/// The stamps queued with touch-downs, for the renderer to take back when it
+/// starts each touch (`touch_stamp`).
+static DOWNS: std::sync::Mutex<gpui_rio::tap::DownStamps> =
+    std::sync::Mutex::new(gpui_rio::tap::DownStamps::new());
+
+fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
+    DOWNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// GPUI handled the next queued touch-down (see `ui::down_watch`).
+pub(crate) fn touch_handled() {
+    lock_downs().handled();
+}
+
+/// The gesture GPUI is handling: the down it handled last, with the stamp
+/// Java sent with it (the pane it began on). Its stamp is `tap::NO_STAMP`,
+/// which Java never hands out, when none was queued, so nothing acts on it.
+pub(crate) fn touch_stamp() -> gpui_rio::tap::Gesture {
+    lock_downs().now()
 }
 
 #[allow(unsafe_code)]
@@ -335,6 +365,37 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
             &[
                 jni_mobile::objects::JValue::Long(generation),
                 jni_mobile::objects::JValue::Object(&value),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .is_ok()
+}
+
+/// Tells Java what the renderer did with a press on the terminal, once it has:
+/// its report id, the stamp it began under, and whether the program took it
+/// as a click (0), it was a tap the program did not take (1), or no tap (2).
+pub(crate) fn terminal_tapped(generation: i64, report: gpui_rio::tap::Report) -> bool {
+    let outcome = match report.tapped {
+        gpui_rio::tap::Tapped::Clicked => 0,
+        gpui_rio::tap::Tapped::Plain => 1,
+        gpui_rio::tap::Tapped::Ignored => 2,
+    };
+    gpui_mobile::android::jni::with_env(|env| {
+        let activity = gpui_mobile::android::jni::activity(env)?;
+        let name = jni_mobile::strings::JNIString::from("gpuiTerminalTapped");
+        let signature = jni_mobile::signature::RuntimeMethodSignature::from_str("(JJJI)V")
+            .map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            name,
+            signature.method_signature(),
+            &[
+                jni_mobile::objects::JValue::Long(generation),
+                jni_mobile::objects::JValue::Long(i64::try_from(report.stamp).unwrap_or(i64::MAX)),
+                jni_mobile::objects::JValue::Long(i64::try_from(report.id).unwrap_or(i64::MAX)),
+                jni_mobile::objects::JValue::Int(outcome),
             ],
         )
         .map_err(|e| e.to_string())?;

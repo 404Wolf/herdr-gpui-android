@@ -27,6 +27,14 @@ pub struct TerminalView {
     /// The ghost text last given to the shell, so it is handed over once.
     #[cfg(unix)]
     shell_ghost: Option<Arc<gpui_rio::ghost::Ghost>>,
+    /// The finger on the pane's own view (no shell drawn): its tap report,
+    /// and whether a link it lifts on is this view's to open.
+    #[cfg(target_os = "android")]
+    tap_touch: Rc<std::cell::Cell<gpui_rio::tap::Touch>>,
+    /// The generation this view draws, for the reports of its taps (the
+    /// shell's view reports through it too, so they never name an older one).
+    #[cfg(target_os = "android")]
+    tap_generation: Rc<std::cell::Cell<i64>>,
     _updates: Task<()>,
 }
 
@@ -65,8 +73,14 @@ impl TerminalView {
             shell_style: None,
             #[cfg(unix)]
             shell_ghost: None,
+            #[cfg(target_os = "android")]
+            tap_touch: Rc::default(),
+            #[cfg(target_os = "android")]
+            tap_generation: Rc::new(std::cell::Cell::new(0)),
             _updates: updates,
         };
+        #[cfg(target_os = "android")]
+        view.tap_generation.set(view.state.generation);
         // The window can open after a shell was attached, with no later change
         // to wake the view: show what the mailbox already names.
         #[cfg(unix)]
@@ -108,6 +122,8 @@ impl TerminalView {
         if self.marked != *state.preedit {
             self.marked = state.preedit.to_string();
         }
+        #[cfg(target_os = "android")]
+        self.tap_generation.set(state.generation);
         self.state = state;
         true
     }
@@ -121,6 +137,13 @@ impl TerminalView {
         }
         self.shell_style = None;
         self.shell_ghost = None;
+        // The pane's own view is swapped out or back: it holds no touch now.
+        #[cfg(target_os = "android")]
+        self.tap_touch.set(gpui_rio::tap::Touch::default());
+        // Read when a tap is reported, not now: refresh_snapshot attaches the
+        // incoming state's shell before it takes that state's generation.
+        #[cfg(target_os = "android")]
+        let generation = self.tap_generation.clone();
         self.shell = crate::shell::session(handle)
             .or_else(|| crate::remote::renderer(handle))
             .map(|session| {
@@ -137,6 +160,17 @@ impl TerminalView {
                             &crate::ghost_bridge::hint_json(hint),
                         );
                     });
+                    // Every tap goes back to Java from the view that handled it,
+                    // which opens typing only for one the program did not take as
+                    // a click. Stamped with the pane Java showed at the touch-down.
+                    #[cfg(target_os = "android")]
+                    terminal.set_tap_listener(crate::android::touch_stamp, move |report| {
+                        crate::android::terminal_tapped(generation.get(), report);
+                    });
+                    // Every press here is a touch: one begun on a view this one
+                    // replaced mid-tap is never this view's to click.
+                    #[cfg(target_os = "android")]
+                    terminal.set_touch_presses(true);
                     #[cfg(target_os = "android")]
                     terminal.set_link_handler(|link| {
                         let generation = model::mailbox().state().generation;
@@ -257,6 +291,89 @@ fn button(
         .child(div().min_w_0().truncate().child(label.into()))
 }
 
+/// Takes the stamp Java queued with each touch-down, in the order GPUI
+/// handles the downs, before any view sees the touch (capture phase). Every
+/// down GPUI handles shows as one of two events: a touch drag offered as the
+/// touch starts, or (a down that stops a fling, starting no touch) a touch
+/// scroll that starts with no movement. Both take their down's entry, so
+/// entries are matched one to one in order, never by position.
+#[cfg(target_os = "android")]
+fn down_watch() -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            window.on_mouse_event(|event: &TouchDragEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture && event.phase == TouchPhase::Started {
+                    crate::android::touch_handled();
+                }
+            });
+            window.on_mouse_event(|event: &ScrollWheelEvent, phase, _, _| {
+                let still = match event.delta {
+                    ScrollDelta::Pixels(delta) => delta == Point::default(),
+                    ScrollDelta::Lines(delta) => delta == Point::default(),
+                };
+                if phase == DispatchPhase::Capture && event.touch_phase == TouchPhase::Started && still {
+                    crate::android::touch_handled();
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+#[cfg(target_os = "android")]
+fn down_watch_child() -> Option<AnyElement> {
+    Some(down_watch().into_any_element())
+}
+
+#[cfg(not(target_os = "android"))]
+fn down_watch_child() -> Option<AnyElement> {
+    None
+}
+
+/// Watches, without claiming them, the gestures GPUI offers every touch: its
+/// start (to take back the stamp Java queued with its down) and a long press.
+/// The pane's own view reports its taps from them, as the shell's view does.
+#[cfg(target_os = "android")]
+fn tap_watch(view: Entity<TerminalView>) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            window.on_mouse_event({
+                let view = view.clone();
+                move |event: &TouchDragEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && event.phase == TouchPhase::Started
+                        && bounds.contains(&event.start_position)
+                    {
+                        let stamp = crate::android::touch_stamp();
+                        view.update(cx, |view, _| {
+                            let mut touch = view.tap_touch.get();
+                            touch.began(stamp);
+                            view.tap_touch.set(touch);
+                        });
+                    }
+                }
+            });
+            window.on_mouse_event({
+                let view = view.clone();
+                move |event: &LongPressEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && event.phase == TouchPhase::Started {
+                        view.update(cx, |view, _| {
+                            let mut touch = view.tap_touch.get();
+                            touch.held();
+                            view.tap_touch.set(touch);
+                        });
+                    }
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// Text, style runs, tappable byte ranges and drawn cells for one painted row.
 struct GridRow {
     text: SharedString,
@@ -274,6 +391,10 @@ struct DrawnCell {
     /// The colour its glyph would have been painted in.
     color: Hsla,
 }
+
+/// The finger on the pane's own view, where presses come from touch: a link
+/// opens only for a press whose touch began on this view.
+type PressOwner = Option<(Rc<std::cell::Cell<gpui_rio::tap::Touch>>, fn() -> gpui_rio::tap::Gesture)>;
 
 /// The layout a linked row painted, kept so a tap resolves against it.
 type PaintedLine = Rc<RefCell<Option<(Point<Pixels>, ShapedLine)>>>;
@@ -337,6 +458,7 @@ impl GridRow {
         row_index: usize,
         font_size: Pixels,
         cell_width: Pixels,
+        owner: PressOwner,
     ) -> AnyElement {
         if self.text.is_empty() {
             return div().into_any_element();
@@ -376,6 +498,10 @@ impl GridRow {
             .cursor_pointer()
             .child(line)
             .on_click(move |event, _, _cx| {
+                // A touch begun on another view (one this replaced mid-tap) opens nothing.
+                if owner.as_ref().is_some_and(|(touch, now)| !touch.get().owned_now(now())) {
+                    return;
+                }
                 let url = painted.borrow().as_ref().and_then(|(origin, line)| {
                     link_at(line, &links, event.position().x - origin.x).map(str::to_owned)
                 });
@@ -629,6 +755,10 @@ impl Render for TerminalView {
         let snapshot = self.state.snapshot.clone();
         let rows = snapshot.clone();
         let entity = cx.entity();
+        #[cfg(target_os = "android")]
+        let press_owner: PressOwner = Some((self.tap_touch.clone(), crate::android::touch_stamp));
+        #[cfg(not(target_os = "android"))]
+        let press_owner: PressOwner = None;
         let active = self.state.active;
         let held = self.state.held;
         let generation = self.state.generation;
@@ -727,6 +857,9 @@ impl Render for TerminalView {
             .when(false, |root| root)
             .font_family(crate::fonts::SANS_FAMILY)
             .track_focus(&self.focus)
+            // Whichever view draws the pane, every touch-down GPUI handles takes
+            // the stamp Java queued with it, in order.
+            .children(down_watch_child())
             // A shell has no pane title or agent state to show: its rows take
             // the header's height, and its exit or failure shows in the banner.
             .when(!shell_mode, |root| {
@@ -786,6 +919,27 @@ impl Render for TerminalView {
                     .bg(rgb(fill))
                     .flex()
                     .flex_col();
+                // Without a shell, this view handles a tap: it reports it as a
+                // tap no program took (or none, for a held finger), as the
+                // shell's view reports its own, so Java never decides alone.
+                #[cfg(target_os = "android")]
+                if !shell_mode {
+                    body = body
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseUpEvent, _, _| {
+                                let mut touch = this.tap_touch.get();
+                                let (tapped, stamp) =
+                                    gpui_rio::tap::plain_view_tap(touch.lifted(), crate::android::touch_stamp());
+                                this.tap_touch.set(touch);
+                                crate::android::terminal_tapped(
+                                    generation,
+                                    gpui_rio::tap::Report { id: gpui_rio::tap::next_id(), stamp, tapped },
+                                );
+                            }),
+                        )
+                        .child(tap_watch(entity.clone()));
+                }
                 // A horizontal drag pans the pane; vertical deltas stay with the
                 // list so scrolling keeps working exactly as before.
                 // A shell fits its own width and scrolls its own history.
@@ -865,7 +1019,11 @@ impl Render for TerminalView {
                                                         ),
                                                     };
                                                     line.child(row.into_element(
-                                                        generation, index, font_size, cell_width,
+                                                        generation,
+                                                        index,
+                                                        font_size,
+                                                        cell_width,
+                                                        press_owner.clone(),
                                                     ))
                                                 })
                                                 .collect::<Vec<_>>()

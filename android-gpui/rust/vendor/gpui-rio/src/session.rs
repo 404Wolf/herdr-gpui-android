@@ -3,7 +3,10 @@
 //! owes the program (device and cursor reports, colour and size queries) are
 //! answered as they are parsed and leave through the same input queue.
 
-use crate::{Error, KeyPress, Result, TerminalTheme, key_bytes};
+use crate::{
+    Error, KeyPress, Result, TerminalTheme, key_bytes,
+    mouse::{self, Gesture},
+};
 use rio_vt::{
     ansi::CursorShape,
     config::colors::{AnsiColor, ColorRgb},
@@ -411,17 +414,11 @@ impl Session {
         };
         let count = lines.unsigned_abs().min(30) as usize;
         let up = lines > 0;
-        let bytes = if mode.intersects(Mode::MOUSE_MODE) {
-            // Report at the middle of the screen: the pane under the finger is
-            // the whole terminal here.
-            let (column, row) = (columns / 2 + 1, rows / 2 + 1);
-            let button = if up { 64 } else { 65 };
-            let one = if mode.contains(Mode::SGR_MOUSE) {
-                format!("\x1b[<{button};{column};{row}M").into_bytes()
-            } else {
-                let encode = |value: usize| u8::try_from(32 + value.min(223)).unwrap_or(255);
-                vec![0x1b, b'[', b'M', 32 + button, encode(column), encode(row)]
-            };
+        let gesture = if up { Gesture::WheelUp } else { Gesture::WheelDown };
+        // Reported at the middle of the screen: the pane under the finger is
+        // the whole terminal here.
+        let report = mouse::report(mode, gesture, columns / 2 + 1, rows / 2 + 1);
+        let bytes = if let Some(one) = report {
             one.repeat(count)
         } else if mode.contains(Mode::ALT_SCREEN) {
             let one: &[u8] = match (up, mode.contains(Mode::APP_CURSOR)) {
@@ -435,6 +432,23 @@ impl Session {
             return false;
         };
         self.write(bytes)
+    }
+
+    /// A tap or click on the screen cell (`column`, `row`), counted from 0 at
+    /// the screen's top-left, reported to the program as a left-button press
+    /// and release when it asked for mouse events. Returns false, sending
+    /// nothing, when it asked for none, or the cell is off the screen.
+    /// Like the wheel, it leaves the view where it is.
+    pub fn click(&self, column: usize, row: usize) -> bool {
+        let (mode, columns, rows) = {
+            let grid = self.grid.lock();
+            (grid.mode(), grid.columns(), grid.screen_lines())
+        };
+        if column >= columns || row >= rows {
+            return false;
+        }
+        mouse::report(mode, Gesture::Click, column + 1, row + 1)
+            .is_some_and(|bytes| self.write(bytes))
     }
 
     fn follow_input(&self) -> Mode {
@@ -690,6 +704,146 @@ mod tests {
             key: "a".into(),
             ..KeyPress::default()
         }));
+    }
+
+    #[test]
+    fn a_click_reaches_only_a_program_that_asked_for_mouse_events() {
+        use rio_vt::crosswords::Mode;
+        let (session, mut remote, _) = session();
+        let mode = |session: &Session| session.grid().lock().mode();
+        // No mouse reporting: nothing is sent, and the caller is told so.
+        assert!(!session.click(4, 2));
+        // 1000 then 1006: clicks are reported, as SGR, at 1-based cells.
+        remote.write_all(b"\x1b[?1000h\x1b[?1006h").unwrap();
+        until(|| mode(&session).contains(Mode::MOUSE_REPORT_CLICK | Mode::SGR_MOUSE));
+        assert!(session.click(4, 2));
+        reply(&mut remote, b"\x1b[<0;5;3M\x1b[<0;5;3m");
+        // Off the 20x4 screen: nothing.
+        assert!(!session.click(20, 0));
+        assert!(!session.click(0, 4));
+        // The program turned reporting off again: taps are its own no more.
+        remote.write_all(b"\x1b[?1000l").unwrap();
+        until(|| !mode(&session).intersects(Mode::MOUSE_MODE));
+        assert!(!session.click(4, 2));
+        // The wheel, sharing the encoder, still scrolls by reports when asked.
+        remote.write_all(b"\x1b[?1002h").unwrap();
+        until(|| mode(&session).contains(Mode::MOUSE_DRAG));
+        assert!(session.wheel(2));
+        reply(&mut remote, b"\x1b[<64;11;3M\x1b[<64;11;3M");
+    }
+
+    /// Nothing more reaches the program within a moment.
+    fn silent(remote: &mut UnixStream) {
+        remote.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut byte = [0; 1];
+        let read = remote.read(&mut byte);
+        assert!(read.is_err(), "the program was sent {read:?}");
+        remote.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    }
+
+    fn with_mouse_reporting() -> (Arc<Session>, UnixStream) {
+        use rio_vt::crosswords::Mode;
+        let (session, mut remote, _) = session();
+        remote.write_all(b"\x1b[?1000h\x1b[?1006h").unwrap();
+        until(|| session.grid().lock().mode().contains(Mode::MOUSE_REPORT_CLICK | Mode::SGR_MOUSE));
+        (session, remote)
+    }
+
+    /// The host's side: each down queued with its pane's stamp, then handled.
+    fn handled(downs: &mut crate::tap::DownStamps, stamp: u64) -> crate::tap::Gesture {
+        downs.queued(stamp);
+        downs.handled();
+        downs.now()
+    }
+
+    #[test]
+    fn an_owned_tap_reaches_the_program_as_a_click() {
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut touch = Touch::default();
+        touch.began(handled(&mut downs, 7));
+        let owned = owns(true, touch.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Clicked);
+        reply(&mut remote, b"\x1b[<0;3;2M\x1b[<0;3;2m");
+    }
+
+    #[test]
+    fn a_shell_view_that_replaced_the_panes_own_view_mid_touch_sends_nothing() {
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
+        // The touch began on the pane's own view (it took the down's stamp);
+        // the shell's view replaced it before the lift. GPUI's tap lands on the
+        // new view, which saw no touch begin: no click reaches the program.
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut own_view = Touch::default();
+        own_view.began(handled(&mut downs, 7));
+        let mut replacing = Touch::default();
+        let owned = owns(true, replacing.lifted(), downs.now());
+        assert!(!owned);
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+    }
+
+    #[test]
+    fn a_shell_view_that_replaced_another_mid_touch_sends_nothing() {
+        use crate::tap::{DownStamps, Lifted, NO_STAMP, Press, Touch, lift_on, owns};
+        // Shell view A saw the touch begin; B replaced A before the lift.
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut a = Touch::default();
+        a.began(handled(&mut downs, 7));
+        let mut b = Touch::default();
+        let owned = owns(true, b.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        // Nor does a link open: lift_on says Ignored for a press on one too.
+        let on_link = Press { on_link: true, ..Press::default() };
+        assert_eq!(lift_on(&session, on_link, owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+        // A touch the host had no stamp for is no view's either.
+        let mut stampless = Touch::default();
+        stampless.began(handled(&mut downs, NO_STAMP));
+        let owned = owns(true, stampless.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+    }
+
+    #[test]
+    fn a_cancelled_touch_then_a_tap_begun_off_the_view_sends_nothing() {
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
+        // A down on the terminal, then the host's CANCEL (a pinch, a scroll):
+        // the view still holds that touch. The next down starts off the view
+        // (the header) and lifts just inside it, within GPUI's slop, so GPUI's
+        // tap lands on the view, which saw no new start.
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut view = Touch::default();
+        view.began(handled(&mut downs, 7));
+        handled(&mut downs, 7); // off the view: it sees no start
+        let owned = owns(true, view.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        let on_link = Press { on_link: true, ..Press::default() };
+        assert_eq!(lift_on(&session, on_link, owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+    }
+
+    #[test]
+    fn a_view_shown_again_after_a_swap_sends_nothing_for_its_old_touch() {
+        use crate::tap::{DownStamps, Lifted, Press, Touch, lift_on, owns};
+        // The view saw a touch begin, was swapped out (shell <-> pane) before
+        // the lift, and is shown again; the next tap begins elsewhere.
+        let (session, mut remote) = with_mouse_reporting();
+        let mut downs = DownStamps::default();
+        let mut view = Touch::default();
+        view.began(handled(&mut downs, 7));
+        handled(&mut downs, 8); // the swap's taps, on another view
+        let owned = owns(true, view.lifted(), downs.now());
+        assert_eq!(lift_on(&session, Press::default(), owned, Some((2, 1))), Lifted::Ignored);
+        silent(&mut remote);
+        // A swap also clears the touch outright.
+        view.began(handled(&mut downs, 9));
+        view.clear();
+        assert_eq!(view.lifted(), None);
     }
 
     #[test]
