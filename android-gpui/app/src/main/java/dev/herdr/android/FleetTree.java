@@ -132,7 +132,7 @@ final class FleetTree {
         final List<Project> projects = new ArrayList<>();
         /** Spaces with no project: shown under "Spaces", never dropped. */
         final List<SpaceNode> loose = new ArrayList<>();
-        /** Extra deacon candidates and agents with no space: "Other agents". */
+        /** Extra deacon candidates and terminals (agents or bare shells) with no space. */
         final List<Member> others = new ArrayList<>();
         /** Every terminal of this computer, in space/tab order. */
         final List<Member> all = new ArrayList<>();
@@ -226,14 +226,15 @@ final class FleetTree {
             }
             if (!m.hasSpace() && up != null && up.hasSpace()) adopted.put(m.id, up.space);
         }
-        // Spaces in order, with their members; agents without a space go to Other agents.
+        // Spaces in order, with their members; terminals without a space go to Other terminals.
         Map<String, List<Member>> spaces = new LinkedHashMap<>();
         for (Member m : sorted) {
             if (m == fleet.deacon) continue;
             if ("deacon".equals(m.role)) { fleet.others.add(m); continue; }
             String space = m.hasSpace() ? m.space : adopted.get(m.id);
+            // No space (nor a parent's to adopt): kept, shells too, so every terminal is listed once.
             if (space == null) {
-                if (m.isAgent()) fleet.others.add(m);
+                fleet.others.add(m);
                 continue;
             }
             if (m.project.isEmpty() && m.role.isEmpty() && deaconSpace(m) && m.isAgent()) {
@@ -729,6 +730,8 @@ final class FleetTree {
         String where = "";
         /** Every other terminal of the project, across its checkouts, nested by parent. */
         final List<AgentNode> workers = new ArrayList<>();
+        /** Projects whose unopened-worktree catalog this row's menu offers ("Worktrees…"). */
+        final List<Project> catalogs = new ArrayList<>();
         PmRow(Project project) {
             this.project = project;
             this.pm = project.pm;
@@ -756,6 +759,8 @@ final class FleetTree {
         final List<AgentNode> others = new ArrayList<>();
         /** The same terminals flat, in place order. */
         final List<Member> otherMembers = new ArrayList<>();
+        /** Catalogs of unopened worktrees no PM row can offer: on Other terminals' menu. */
+        final List<Project> otherCatalogs = new ArrayList<>();
 
         /** Anything under Other terminals is blocked. */
         boolean othersBlocked() {
@@ -847,10 +852,28 @@ final class FleetTree {
             int c = a.name().compareToIgnoreCase(b.name());
             return c != 0 ? c : a.name().compareTo(b.name());
         });
+        // Each repo's unopened worktrees stay reachable from exactly one menu.
+        for (Project project : fleet.projects) {
+            if (project.closed.isEmpty()) continue;
+            PmRow home = catalogRow(tree.pms, project);
+            (home == null ? tree.otherCatalogs : home.catalogs).add(project);
+        }
         Collections.sort(rest, PLACE);
         tree.otherMembers.addAll(rest);
         tree.others.addAll(nestAll(rest, null, where));
         return tree;
+    }
+
+    /**
+     * The PM row whose menu offers {@code owner}'s catalog: its own row when
+     * it has one; else (an owner inferred from folders) the first PM row, by
+     * name, working in the same repo; else null (Other terminals' menu).
+     */
+    private static PmRow catalogRow(List<PmRow> pms, Project owner) {
+        for (PmRow row : pms) if (row.project == owner) return row;
+        if (owner.repo.isEmpty()) return null;
+        for (PmRow row : pms) if (owner.repo.equals(row.project.repo)) return row;
+        return null;
     }
 
     /** Every terminal under {@code nodes}, depth first. */

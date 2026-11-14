@@ -694,14 +694,17 @@ public final class FleetTreeTest {
         FleetTree.Member shell = m("t31", "c", "notes", 3, 1, "/w/notes", "");
         FleetTree.Member another = label(m("t40", "e", "misc", 4, 0, "/h", "idle"), "deacon", "");
         FleetTree.Member stray = m("t50", "", "", 9, 0, "/x", "working");
-        List<FleetTree.Member> all = Arrays.asList(stray, another, shell, unlabelled, orphan, worker, pm, helper, deacon);
+        // A bare shell with no space, role or status is a terminal too.
+        FleetTree.Member bare = m("t60", "", "", 9, 1, "/x", "");
+        List<FleetTree.Member> all = Arrays.asList(bare, stray, another, shell, unlabelled, orphan, worker, pm, helper,
+                deacon);
         FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(all, null));
         // Case-insensitive by name: alpha before Zeta.
         assertEquals(Arrays.asList("alpha", "Zeta"), pmNames(tree));
         assertNull(tree.pms.get(0).pm);
         assertEquals(Arrays.asList("t20"), ids(FleetTree.flatten(tree.pms.get(0).workers)));
         assertSame(pm, tree.pms.get(1).pm);
-        assertEquals(Arrays.asList("t30", "t31", "t40", "t50"), ids(tree.otherMembers));
+        assertEquals(Arrays.asList("t30", "t31", "t40", "t50", "t60"), ids(tree.otherMembers));
         List<String> shown = new ArrayList<>();
         shown.add(tree.deacon.id);
         shown.addAll(ids(tree.helpers));
@@ -716,6 +719,49 @@ public final class FleetTreeTest {
         assertEquals(every, shown);
         // At rest: the Deacon and the PMs only.
         assertEquals(Arrays.asList("t1", "t10"), ids(FleetTree.shownByDefault(FleetTree.build(all, null))));
+    }
+
+    private static final FleetTree.GitLook REPO = FleetTree.parseGitLook(look(new String[][] {
+            {"/w/repo", "/w/repo/.git", "/w/repo", "main"}}, "/w/repo/.git", "/w/repo=main", "/w/fix=fix"), 200);
+
+    private static List<String> catalogPaths(List<FleetTree.Project> catalogs) {
+        List<String> out = new ArrayList<>();
+        for (FleetTree.Project p : catalogs) out.addAll(closedPaths(p));
+        return out;
+    }
+
+    @Test public void aPmOffersItsRepoWorktreesEvenWhenAnInferredProjectOwnsTheCatalog() {
+        FleetTree.Member pm = label(m("t1", "s1", "feature", 0, 0, "/w/repo", "idle"), "pm", "feature");
+        FleetTree.PmTree alone = FleetTree.pmTree(FleetTree.build(Collections.singletonList(pm), REPO));
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(alone.pms.get(0).catalogs));
+        // An unlabelled agent in a space named after the repo becomes the catalog's owner
+        // (repoOwner), but its project has no row: the PM working in that repo offers it.
+        FleetTree.Member inferred = m("t2", "s2", "repo", 1, 0, "/w/repo", "working");
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(pm, inferred), REPO);
+        assertEquals(Arrays.asList("/w/fix"), closedPaths(project(fleet, "repo")));
+        FleetTree.PmTree tree = FleetTree.pmTree(fleet);
+        assertEquals(Arrays.asList("feature"), pmNames(tree));
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.pms.get(0).catalogs));
+        assertTrue(tree.otherCatalogs.isEmpty());
+        assertEquals(Arrays.asList("t2"), ids(tree.otherMembers));
+    }
+
+    @Test public void aProjectWithWorkersButNoPmOffersItsCatalogOnItsOwnRow() {
+        FleetTree.Member worker = label(m("t1", "s1", "repo", 0, 0, "/w/repo", "working"), "worker", "repo");
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Collections.singletonList(worker), REPO));
+        assertEquals(1, tree.pms.size());
+        assertNull(tree.pms.get(0).pm);
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.pms.get(0).catalogs));
+        assertTrue(tree.otherCatalogs.isEmpty());
+    }
+
+    @Test public void aCatalogNoPmRowCanOfferGoesOnOtherTerminals() {
+        FleetTree.Member inferred = m("t2", "s2", "repo", 0, 0, "/w/repo", "working");
+        FleetTree.Member elsewhere = label(m("t1", "s1", "web", 1, 0, "/w/web", "idle"), "pm", "web");
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(inferred, elsewhere), REPO));
+        assertEquals(Arrays.asList("web"), pmNames(tree));
+        assertTrue(tree.pms.get(0).catalogs.isEmpty());
+        assertEquals(Arrays.asList("/w/fix"), catalogPaths(tree.otherCatalogs));
     }
 
     @Test public void aCheckoutIsOneShortLine() {

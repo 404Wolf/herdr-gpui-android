@@ -1110,7 +1110,17 @@ public final class HomeActivity extends Activity {
         for (FleetTree.PmRow pm : tree.pms) rows.add(pmRow(machine, pm));
         if (!tree.others.isEmpty()) {
             String count = (tree.othersBlocked() ? "! " : "") + tree.otherMembers.size();
-            Row others = new Row((guide, self) -> groupLine(guide, self, "Other terminals", count));
+            Row others = new Row((guide, self) -> {
+                View line = groupLine(guide, self, "Other terminals", count);
+                if (!tree.otherCatalogs.isEmpty()) {
+                    line.setOnLongClickListener(v -> {
+                        new ActionSheet(this, chrome, "Other terminals")
+                                .add("Worktrees…", () -> showCatalogs(machine, tree.otherCatalogs)).show();
+                        return true;
+                    });
+                }
+                return line;
+            });
             others.fold = m + "/others";
             others.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.OTHERS);
             for (FleetTree.AgentNode node : tree.others) {
@@ -1136,13 +1146,23 @@ public final class HomeActivity extends Activity {
             String tag = "pm" + (tally.isEmpty() ? "" : "  " + tally);
             row = new Row((guide, self) -> {
                 View line = agentLine(guide, lead, tag, self, pm.name(), pm.where);
-                line.setOnLongClickListener(v -> { agentActions(lead, machine, pm.project); return true; });
+                line.setOnLongClickListener(v -> { agentActions(lead, machine, pm.catalogs); return true; });
                 return line;
             });
         } else {
-            row = new Row((guide, self) -> actionLine(guide, self, "●", pm.name() + " · no PM"
-                    + (tally.isEmpty() ? "" : "  " + tally), pm.blocked() ? chrome.danger : chrome.onSurfaceVariant,
-                    () -> askForManager(machine, pm.project)));
+            row = new Row((guide, self) -> {
+                View line = actionLine(guide, self, "●", pm.name() + " · no PM"
+                        + (tally.isEmpty() ? "" : "  " + tally), pm.blocked() ? chrome.danger : chrome.onSurfaceVariant,
+                        () -> askForManager(machine, pm.project));
+                line.setOnLongClickListener(v -> {
+                    ActionSheet sheet = new ActionSheet(this, chrome, pm.name())
+                            .add("Ask for a manager", () -> askForManager(machine, pm.project));
+                    if (!pm.catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, pm.catalogs));
+                    sheet.show();
+                    return true;
+                });
+                return line;
+            });
         }
         row.fold = key;
         // PM rows start folded, as on the desktop; Home reveals nothing on its own.
@@ -1151,7 +1171,18 @@ public final class HomeActivity extends Activity {
         return row;
     }
 
-    /** A PM's "Worktrees…": its repo's worktrees no terminal has open, a page at a time. */
+    /** A row's "Worktrees…": straight to the one repo's catalog, else a choice of repo first. */
+    private void showCatalogs(Machine machine, List<FleetTree.Project> catalogs) {
+        if (catalogs.size() == 1) { showWorktrees(machine, catalogs.get(0), 0); return; }
+        ActionSheet sheet = new ActionSheet(this, chrome, "Worktrees with no space");
+        for (FleetTree.Project project : catalogs) {
+            sheet.add(FleetTree.repoName(project.repo) + " · " + project.closed.size() + "…",
+                    () -> showWorktrees(machine, project, 0));
+        }
+        sheet.show();
+    }
+
+    /** "Worktrees…" for one repo: its worktrees no terminal has open, a page at a time. */
     private void showWorktrees(Machine machine, FleetTree.Project project, int pages) {
         int total = project.closed.size();
         ActionSheet sheet = new ActionSheet(this, chrome, project.name + " · " + total
@@ -1408,15 +1439,13 @@ public final class HomeActivity extends Activity {
     }
 
     private void agentActions(Agent agent) {
-        agentActions(agent, null, null);
+        agentActions(agent, null, java.util.Collections.emptyList());
     }
 
-    /** A PM's menu also offers its repo's worktrees with no space ({@code project} may be null). */
-    private void agentActions(Agent agent, Machine machine, FleetTree.Project project) {
+    /** A PM's menu also offers the unopened-worktree catalogs its row holds. */
+    private void agentActions(Agent agent, Machine machine, List<FleetTree.Project> catalogs) {
         ActionSheet sheet = new ActionSheet(this, chrome, breadcrumb(agent)).add("Open", () -> openAgent(agent));
-        if (machine != null && project != null && !project.closed.isEmpty()) {
-            sheet.add("Worktrees…", () -> showWorktrees(machine, project, 0));
-        }
+        if (machine != null && !catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, catalogs));
         if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
         if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
         sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
