@@ -10,13 +10,19 @@ import java.util.List;
  * They reach down to the bottom of the terminal and up only to the row above
  * the prompt's caret (the prompt's own rule), never into the program's text
  * above it, which stays free to scroll and select. Neighbours never overlap:
- * "talk" keeps its width and the others give way. Pure: no views.
+ * "talk" keeps its width and the others give way. While recording, "talk" is
+ * the stop and takes the whole bottom-right block, from its words to the
+ * grid's right edge and at least {@link #STOP_MIN_WIDTH_DP} ×
+ * {@link #STOP_MIN_HEIGHT_DP}, reaching above the prompt if need be: the one
+ * thing to tap then should be impossible to miss. Pure: no views.
  */
 final class ControlTargets {
     static final int MIN_DP = 44;
     /** Extra width each side of a control's words, in dp; "talk" gets more. */
     static final int PAD_DP = 8, TALK_PAD_DP = 20;
     static final int TALK_MIN_DP = 88;
+    /** The stop's least size while recording, in dp. */
+    static final int STOP_MIN_WIDTH_DP = 120, STOP_MIN_HEIGHT_DP = 96;
 
     /** A control as the renderer drew it: cells {@code start..end} on {@code row}. */
     static final class Cells {
@@ -55,10 +61,10 @@ final class ControlTargets {
      * The targets for {@code controls} on a grid at ({@code left}, {@code top})
      * with cells {@code cellWidth}×{@code cellHeight}, the surface ending at
      * {@code surfaceBottom}; none reaches above row {@code topRow - 1} or past
-     * {@code maxRight}.
+     * {@code maxRight}, except "talk" while {@code recording}.
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
-            int topRow, float surfaceBottom, float maxRight) {
+            int topRow, float surfaceBottom, float maxRight, boolean recording) {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
@@ -89,6 +95,24 @@ final class ControlTargets {
                 b.left = middle;
             }
         }
+        if (recording) growStop(out, left, top, maxRight);
         return out;
+    }
+
+    /** "talk" takes the bottom-right block; what lies under it gives way, or goes. */
+    private static void growStop(List<Rect> rects, float left, float top, float maxRight) {
+        Rect stop = null;
+        for (Rect r : rects) if ("talk".equals(r.id)) stop = r;
+        if (stop == null) return;
+        stop.right = maxRight;
+        stop.left = Math.max(left, Math.min(stop.left, maxRight - STOP_MIN_WIDTH_DP));
+        stop.top = Math.max(top, Math.min(stop.top, stop.bottom - STOP_MIN_HEIGHT_DP));
+        java.util.Iterator<Rect> each = rects.iterator();
+        while (each.hasNext()) {
+            Rect r = each.next();
+            if (r == stop) continue;
+            r.right = Math.min(r.right, stop.left);
+            if (r.width() <= 0) each.remove();
+        }
     }
 }

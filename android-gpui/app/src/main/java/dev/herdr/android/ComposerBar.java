@@ -555,7 +555,8 @@ final class ComposerBar {
         }
         float right = layout.left + layout.cols * layout.cellWidth;
         java.util.List<ControlTargets.Rect> rects = ControlTargets.layout(layout.controls, layout.left,
-                layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right);
+                layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
+                recording(dictationState));
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
             return;
@@ -662,7 +663,8 @@ final class ComposerBar {
         java.util.List<GhostText.Control> talks = dictates
                 ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
                 : java.util.Collections.emptyList();
-        java.util.List<GhostText.Control> out = controls(typing, talks, queuedMessages, cols);
+        java.util.List<GhostText.Control> out = controls(typing, talks, queuedMessages, cols,
+                recording(dictationState));
         sendCount = 0;
         for (GhostText.Control control : out) {
             if ("send".equals(control.id) && control.spans.length > 2) sendCount = control.spans[2].length();
@@ -689,6 +691,16 @@ final class ComposerBar {
      */
     static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
             List<Outbox.Message> queued, int cols) {
+        return controls(typing, talks, queued, cols, false);
+    }
+
+    /**
+     * The controls while {@code recording}: no "send", so the stop can take the
+     * bottom-right corner ({@link ControlTargets}) and no tap meant for it
+     * sends. Enter on the keyboard still stops and sends.
+     */
+    static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
+            List<Outbox.Message> queued, int cols, boolean recording) {
         GhostText.Control type = new GhostText.Control("type", typing ? "hide" : "type", "dim");
         String count = queued.isEmpty() ? "" : "·" + QueuedMessages.badge(queued.size());
         String countStyle;
@@ -697,8 +709,9 @@ final class ComposerBar {
             case WAITING: countStyle = "warn"; break;
             default: countStyle = "info";
         }
-        GhostText.Control send = new GhostText.Control("send", "send", "bright", count, countStyle);
-        GhostText.Control bareSend = new GhostText.Control("send", "send", "bright");
+        GhostText.Control send = recording ? null
+                : new GhostText.Control("send", "send", "bright", count, countStyle);
+        GhostText.Control bareSend = recording ? null : new GhostText.Control("send", "send", "bright");
         GhostText.Control talk = talks.isEmpty() ? null : talks.get(0);
         GhostText.Control shorter = talks.isEmpty() ? null : talks.get(Math.min(1, talks.size() - 1));
         GhostText.Control shortest = talks.isEmpty() ? null : talks.get(talks.size() - 1);

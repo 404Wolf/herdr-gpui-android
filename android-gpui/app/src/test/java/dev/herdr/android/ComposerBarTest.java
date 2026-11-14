@@ -172,4 +172,19 @@ public final class ComposerBarTest {
         assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_DEL));
         assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_A));
     }
+
+    @Test public void whileRecordingSendIsNotDrawnSoTheStopOwnsTheCorner() {
+        java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED);
+        for (int cols : new int[] {22, 50, 100}) {
+            java.util.List<GhostText.Control> line = ComposerBar.controls(false, RECORDING, queued, cols, true);
+            assertFalse("send at " + cols, ids(line).contains("send"));
+            assertTrue("talk at " + cols, ids(line).contains("talk"));
+            // The stop is last: the right end of the line, the bottom-right corner.
+            assertEquals("talk", line.get(line.size() - 1).id);
+        }
+        // With send gone the full words fit sooner: 35 cells plus the margin of 8.
+        assertEquals("type talk", ids(ComposerBar.controls(false, RECORDING, queued, 43, true)));
+        assertEquals("● rec 0:05 · tap to stop",
+                ComposerBar.controls(false, RECORDING, queued, 43, true).get(1).spans[0]);
+    }
 }
