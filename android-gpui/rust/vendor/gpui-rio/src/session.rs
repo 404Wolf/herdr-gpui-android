@@ -554,6 +554,30 @@ pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize))
     (row, col)
 }
 
+#[doc(hidden)]
+/// The grid cell (column, row) painted under the point `(x, y)` in the pane,
+/// with `cell` the cell's width and height and `origin` the grid cell drawn
+/// at the pane's top-left (see [`viewport_origin`]). The row counts the
+/// grid's screen rows from 0, as drawn: a view scrolled into history shifts
+/// them, which the caller applies. `None` where no grid cell is painted: the
+/// empty rows above a grid drawn against the pane's bottom and the empty
+/// columns right of a narrower grid, so a touch there reaches nothing (no
+/// link, no selection, no click) instead of the nearest edge cell.
+pub fn cell_at(
+    (x, y): (f32, f32),
+    (width, height): (f32, f32),
+    (row_off, col_off): (i32, usize),
+    (columns, rows): (usize, usize),
+) -> Option<(usize, usize)> {
+    if !(x >= 0. && y >= 0. && width > 0. && height > 0.) {
+        return None;
+    }
+    let row = (y / height).floor() as i64 + i64::from(row_off);
+    let col = (x / width).floor() as i64 + i64::try_from(col_off).ok()?;
+    let (row, col) = (usize::try_from(row).ok()?, usize::try_from(col).ok()?);
+    (row < rows && col < columns).then_some((col, row))
+}
+
 pub fn resolve_index(grid: &Crosswords<Listener>, theme: TerminalTheme, index: usize) -> ColorRgb {
     if index < 269
         && let Some(color) = grid.colors()[index]
@@ -755,6 +779,39 @@ mod tests {
         assert_eq!(viewport_origin((40, 10), (80, 24), (9, 39)), (-14, 0));
         // One row short: one empty row on top.
         assert_eq!(viewport_origin((80, 23), (80, 24), (22, 2)), (-1, 0));
+    }
+
+    #[test]
+    fn a_touch_above_a_bottom_anchored_grid_reaches_no_cell() {
+        use super::{cell_at, viewport_origin};
+        // The cover screen offline: a 50x24 grid at the bottom of a 52-row pane.
+        let origin = viewport_origin((50, 24), (50, 52), (22, 2));
+        assert_eq!(origin, (-28, 0));
+        let at = |x, y| cell_at((x, y), (10., 20.), origin, (50, 24));
+        // The grid's first row is drawn on pane row 28, its last on row 51.
+        assert_eq!(at(5., 28. * 20.), Some((0, 0)));
+        assert_eq!(at(495., 51. * 20. + 19.), Some((49, 23)));
+        // The empty rows above it: nothing, not row 0 (where a link could be).
+        assert_eq!(at(5., 27. * 20. + 19.), None);
+        assert_eq!(at(5., 0.), None);
+    }
+
+    #[test]
+    fn a_touch_outside_the_drawn_grid_reaches_no_cell() {
+        use super::cell_at;
+        let at = |x, y, origin, grid| cell_at((x, y), (10., 20.), origin, grid);
+        // A grid that fills the pane: every cell is its own.
+        assert_eq!(at(0., 0., (0, 0), (80, 24)), Some((0, 0)));
+        assert_eq!(at(799.9, 479.9, (0, 0), (80, 24)), Some((79, 23)));
+        // Right of a narrower grid, and below or left of the pane: nothing.
+        assert_eq!(at(400., 5., (0, 0), (40, 24)), None);
+        assert_eq!(at(5., 480., (0, 0), (80, 24)), None);
+        assert_eq!(at(-0.5, 5., (0, 0), (80, 24)), None);
+        // A window into a larger grid that follows the caret is offset by it.
+        assert_eq!(at(5., 5., (16, 40), (120, 40)), Some((40, 16)));
+        assert_eq!(at(795., 465., (16, 40), (120, 40)), Some((119, 39)));
+        // A degenerate cell size maps nothing.
+        assert_eq!(cell_at((5., 5.), (0., 20.), (0, 0), (80, 24)), None);
     }
 
     #[test]

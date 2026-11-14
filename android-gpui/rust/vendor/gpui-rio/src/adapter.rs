@@ -247,18 +247,22 @@ macro_rules! __bind_gpui {
                     }
                 }
 
-                fn position(&self, point: Point<Pixels>) -> Pos {
+                /// The grid cell painted under `point`, through the origin the last
+                /// paint drew with (a window following the caret on a larger grid,
+                /// or a short grid's place at the pane's bottom). `None` over the
+                /// pane's empty area, so a touch there selects and opens nothing.
+                fn position(&self, point: Point<Pixels>) -> Option<Pos> {
                     let grid = self.session.grid().lock();
-                    let row =
-                        (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor() as i32;
-                    let col =
-                        (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor() as usize;
-                    // Through the window drawn (it may follow the caret on a larger grid).
-                    let (row_off, col_off) = self.view_origin;
-                    Pos::new(
-                        Line((row + row_off).clamp(0, grid.screen_lines() as i32 - 1) - grid.display_offset() as i32),
-                        Column((col + col_off).min(grid.columns() - 1)),
-                    )
+                    let (col, row) = $crate::cell_at(
+                        (
+                            f32::from(point.x - self.bounds.left()),
+                            f32::from(point.y - self.bounds.top()),
+                        ),
+                        (f32::from(self.cell.width), f32::from(self.cell.height)),
+                        self.view_origin,
+                        (grid.columns(), grid.screen_lines()),
+                    )?;
+                    Some(Pos::new(Line(row as i32 - grid.display_offset() as i32), Column(col)))
                 }
 
                 /// Paints placed ghost runs over the grid on the program's background,
@@ -660,16 +664,16 @@ macro_rules! __bind_gpui {
                                 if !this.host_input {
                                     this.focus(window, cx);
                                 }
+                                // Over the pane's empty area there is no cell: no link,
+                                // no selection, before either is looked for.
                                 let pos = this.position(event.position);
                                 this.press = Some(event.position);
-                                this.pressed_link = if this.link_handler.is_some() {
-                                    this.link_at(pos)
-                                } else {
-                                    None
-                                };
+                                this.pressed_link = pos
+                                    .filter(|_| this.link_handler.is_some())
+                                    .and_then(|pos| this.link_at(pos));
                                 this.session.grid().lock().selection =
-                                    Some(Selection::new(SelectionType::Simple, pos, Side::Left));
-                                this.selecting = true;
+                                    pos.map(|pos| Selection::new(SelectionType::Simple, pos, Side::Left));
+                                this.selecting = pos.is_some();
                                 cx.notify();
                             }),
                         )
@@ -685,8 +689,10 @@ macro_rules! __bind_gpui {
                                 }
                             }
                             if this.selecting && event.pressed_button == Some(MouseButton::Left) {
-                                let pos = this.position(event.position);
-                                if let Some(selection) = &mut this.session.grid().lock().selection {
+                                // Dragged over the empty area, the selection keeps its end.
+                                if let Some(pos) = this.position(event.position)
+                                    && let Some(selection) = &mut this.session.grid().lock().selection
+                                {
                                     selection.update(pos, Side::Right);
                                 }
                                 cx.notify();
