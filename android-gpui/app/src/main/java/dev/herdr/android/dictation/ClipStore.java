@@ -21,6 +21,9 @@ import org.json.JSONObject;
  * PCM16 16 kHz mono file per clip, and an index written atomically. A clip is first pending
  * (audio, no text), then transcribed (text, audio deleted) until the composer has taken its text.
  *
+ * <p>A session the phone transcribed itself keeps its audio too, as a kept clip: never sent and
+ * never offered, deleted after {@link #KEEP_MS}, or earlier when a recording needs the room.
+ *
  * <p>Bounded: a clip holds at most {@link #MAX_CLIP_BYTES} (the server's session limit) and all
  * clips together at most {@link #MAX_TOTAL_BYTES}; recording stops at either. Thread-safe.
  */
@@ -30,27 +33,46 @@ final class ClipStore {
     static final long MAX_TOTAL_BYTES = 30L * 60 * BYTES_PER_SECOND;
     static final int MAX_CLIPS = 64;
     static final String INDEX = "index-v1.json";
+    /** How long a recording the phone transcribed itself is kept: 48 h. */
+    static final long KEEP_MS = 48L * 60 * 60 * 1000;
 
     /** One saved clip; {@code text} is null until transcribed. */
     static final class Entry {
         final PendingClip clip;
         final long bytes;
         final String text;
+        /** Non-zero for a kept clip (the phone transcribed it): deleted after this epoch time. */
+        final long keptUntil;
 
         Entry(PendingClip clip, long bytes, String text) {
+            this(clip, bytes, text, 0);
+        }
+
+        Entry(PendingClip clip, long bytes, String text, long keptUntil) {
             this.clip = clip;
             this.bytes = bytes;
             this.text = text;
+            this.keptUntil = keptUntil;
+        }
+
+        boolean kept() {
+            return keptUntil != 0;
         }
     }
 
     private final File dir;
+    private final java.util.function.LongSupplier clock;
     private final List<Entry> entries = new ArrayList<>();
     /** Bytes held by recordings not yet kept or discarded. */
     private long recording;
 
     ClipStore(File dir) {
+        this(dir, System::currentTimeMillis);
+    }
+
+    ClipStore(File dir, java.util.function.LongSupplier clock) {
         this.dir = dir;
+        this.clock = clock;
         load();
     }
 
@@ -108,6 +130,18 @@ final class ClipStore {
 
         /** Saves the audio as a pending clip; null when nothing was saved. */
         PendingClip keep() {
+            return keep(0);
+        }
+
+        /**
+         * Saves the audio of a session the phone transcribed itself, for {@link #KEEP_MS}: never
+         * sent, never offered. Null when nothing was saved.
+         */
+        PendingClip keepTranscribedOnPhone() {
+            return keep(clock.getAsLong() + KEEP_MS);
+        }
+
+        private PendingClip keep(long keptUntil) {
             synchronized (this) {
                 boolean ok = out != null;
                 try {
@@ -121,7 +155,7 @@ final class ClipStore {
                     return null;
                 }
             }
-            return ClipStore.this.keep(this);
+            return ClipStore.this.keep(this, keptUntil);
         }
 
         void discard() {
@@ -143,22 +177,57 @@ final class ClipStore {
         }
     }
 
+    /** Starts a session's recording; kept clips past their 48 h go first. */
     Recording record(String target, long now) {
+        dropExpired();
         return new Recording(target, now);
     }
 
     private synchronized boolean reserve(long n) {
+        // Kept clips give way to a recording, oldest first.
+        while (held() + recording + n > MAX_TOTAL_BYTES && dropOldestKept()) { }
         if (held() + recording + n > MAX_TOTAL_BYTES) return false;
         recording += n;
         return true;
+    }
+
+    /** Deletes the oldest kept clip; false when there is none. */
+    private synchronized boolean dropOldestKept() {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.kept()) continue;
+            entries.remove(i);
+            save();
+            //noinspection ResultOfMethodCallIgnored
+            audio(e.clip.id).delete();
+            return true;
+        }
+        return false;
+    }
+
+    /** Deletes kept clips past their time: on load, at each session start and courier pass. */
+    synchronized void dropExpired() {
+        long now = clock.getAsLong();
+        boolean changed = false;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            Entry e = entries.get(i);
+            if (!e.kept() || e.keptUntil > now) continue;
+            entries.remove(i);
+            //noinspection ResultOfMethodCallIgnored
+            audio(e.clip.id).delete();
+            changed = true;
+        }
+        if (changed) save();
     }
 
     private synchronized void release(long n) {
         recording = Math.max(0, recording - n);
     }
 
-    private synchronized PendingClip keep(Recording r) {
+    private synchronized PendingClip keep(Recording r, long keptUntil) {
         release(r.bytes);
+        dropExpired();
+        if (entries.size() >= MAX_CLIPS) dropOldestKept();
         if (entries.size() >= MAX_CLIPS) {
             //noinspection ResultOfMethodCallIgnored
             r.file.delete();
@@ -171,7 +240,7 @@ final class ClipStore {
             return null;
         }
         PendingClip clip = new PendingClip(r.id, r.target, r.createdAt, r.durationMs());
-        entries.add(new Entry(clip, r.bytes, null));
+        entries.add(new Entry(clip, r.bytes, null, keptUntil));
         if (!save()) {
             entries.remove(entries.size() - 1);
             //noinspection ResultOfMethodCallIgnored
@@ -181,7 +250,7 @@ final class ClipStore {
         return clip;
     }
 
-    /** Audio bytes of kept clips not yet transcribed. */
+    /** Audio bytes of saved clips not yet transcribed, kept ones included. */
     private long held() {
         long total = 0;
         for (Entry e : entries) if (e.text == null) total += e.bytes;
@@ -195,7 +264,17 @@ final class ClipStore {
     /** The clips still waiting for the desktop, oldest first. */
     synchronized List<PendingClip> untranscribed() {
         List<PendingClip> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text == null) out.add(e.clip);
+        for (Entry e : entries) if (e.text == null && !e.kept()) out.add(e.clip);
+        return out;
+    }
+
+    /**
+     * Recordings the phone transcribed itself, kept for a while, oldest first. Expired ones go on
+     * load, at each session start ({@link #record}) and at each courier pass.
+     */
+    synchronized List<PendingClip> keptClips() {
+        List<PendingClip> out = new ArrayList<>();
+        for (Entry e : entries) if (e.kept()) out.add(e.clip);
         return out;
     }
 
@@ -206,15 +285,18 @@ final class ClipStore {
         return out;
     }
 
+    /** Clips waiting or not yet placed; kept clips do not count. */
     synchronized int size() {
-        return entries.size();
+        int n = 0;
+        for (Entry e : entries) if (!e.kept()) n++;
+        return n;
     }
 
     /** Records the text and deletes the audio; false if the clip is gone (e.g. dropped). */
     synchronized boolean transcribed(String id, String text) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
-            if (!e.clip.id.equals(id) || e.text != null) continue;
+            if (!e.clip.id.equals(id) || e.text != null || e.kept()) continue;
             entries.set(i, new Entry(e.clip, e.bytes, text == null ? "" : text));
             if (!save()) {
                 entries.set(i, e);
@@ -246,10 +328,12 @@ final class ClipStore {
                     String id = o.getString("id");
                     String clipText = o.isNull("text") ? null : o.optString("text", null);
                     long bytes = o.getLong("bytes");
+                    long keptUntil = o.optLong("keptUntil", 0);
                     if (clipText == null && audio(id).length() != bytes) continue;
+                    if (keptUntil != 0 && keptUntil <= clock.getAsLong()) continue;
                     PendingClip clip = new PendingClip(id, PendingClip.cutTarget(o.optString("target")),
                             o.getLong("created"), o.getLong("duration"));
-                    entries.add(new Entry(clip, bytes, clipText));
+                    entries.add(new Entry(clip, bytes, clipText, keptUntil));
                 }
             } catch (JSONException damaged) {
                 entries.clear();
@@ -279,6 +363,7 @@ final class ClipStore {
                 o.put("duration", e.clip.durationMs);
                 o.put("bytes", e.bytes);
                 o.put("text", e.text == null ? JSONObject.NULL : e.text);
+                if (e.kept()) o.put("keptUntil", e.keptUntil);
                 list.put(o);
             }
             write(new File(dir, INDEX), list.toString());

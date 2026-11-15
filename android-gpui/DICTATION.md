@@ -6,8 +6,10 @@ or `● 0:05 stop` on a narrow screen) to stop. While the keyboard is up, `↓ h
 (in place of `type`) puts it away. While recording, the whole bottom-right
 corner of the terminal is the stop, and **send** is hidden so a tap meant for
 stop never sends; Enter on the keyboard still stops and sends. Silence never
-ends a session. Speech is always transcribed on the desktop's Whisper; the phone
-never guesses at it with a weaker model.
+ends a session. Speech is transcribed on the desktop's Whisper when it answers
+in time; otherwise the phone's own speech recognizer gives the text, marked
+**offline**, so there is never no dictation (see "When the desktop is away or
+slow" below).
 
 ## How it works
 
@@ -30,6 +32,8 @@ tap → ServerDictationEngine ── ws:// over the tailnet ──▶ dictation 
   `Dictation.create(context)` picks the engine. A session goes CONNECTING,
   LISTENING, TRANSCRIBING, then the final and IDLE; or OFFLINE_RECORDING, then
   onPending and PENDING. IDLE and PENDING both end a session.
+- The same audio goes from the first chunk to the phone's own recognizer too
+  (`OnDeviceRecognizer`, below), which listens alongside the desktop.
 - The server URL is provisioned, never built in: put `"dictationUrl":
   "ws://<desktop tailnet address>:8770/v1/dictate"` in
   `remote-for-herdr-settings.json` (see `ProvisionedSettings`). Without it
@@ -52,6 +56,69 @@ tap → ServerDictationEngine ── ws:// over the tailnet ──▶ dictation 
   websocket only on the tailnet address. Its protocol is documented at the top
   of `server.py`; a waiting clip uses the same protocol, sent as fast as the
   link allows.
+
+## When the desktop is away or slow
+
+On 15 November 2026 the desktop's Whisper silently ran on its CPU: a 2.6 s
+dictation took 34 s, and the phone showed nothing for a minute. Since then the
+phone falls back to its own recognizer, so there is always text:
+
+```text
+mic ──▶ recording (app storage, always)
+    ──▶ desktop (ws, as above)
+    ──▶ phone's recognizer (SpeechRecognizer fed the same PCM through a pipe,
+        EXTRA_AUDIO_SOURCE, Android 13+; never a second microphone)
+```
+
+- The phone's text is used when the desktop cannot be reached, is not ready in
+  4 s, drops, sends an `error` (any `code`: `backend_slow`,
+  `backend_unavailable`, `bad_start`, `session_too_long`), says its backend is
+  not the GPU (`{"type":"ready","backend":"cpu"}` or `"down"`; an old server
+  without the field counts as the GPU), or has no final within
+  `dictationFinalTimeoutMs` of stop (provisioned, default 5000, 1000..60000).
+- While the phone transcribes, `talk` reads `● offline · rec 0:05 · tap to stop`
+  (`● offline 0:05 stop` when narrow). Its final goes into the draft like the
+  desktop's; `talk` then reads `talk offline` until the next dictation, a send
+  or a pane switch, and a notice says so once.
+- The recording of such a session is kept for 48 h (`ClipStore.KEEP_MS`): never
+  sent to the desktop, never replacing the text (which may be edited or sent by
+  then), and the first to go when a new recording needs the room. Expired
+  ones are deleted when the app starts, at each session start and at each
+  courier pass.
+- The recognizer: only one trusted to read the piped audio, because Android
+  documents that a service without `EXTRA_AUDIO_SOURCE` support silently opens
+  the microphone itself. That is the phone's on-device service when it has one
+  (`SpeechRecognizer.createOnDeviceSpeechRecognizer`), else the first installed
+  service listed in the provisioned `"dictationRecognizers": ["package/class"]`
+  (empty by default: add one only after checking it on the phone), asked to
+  prefer offline. It starts only once our own microphone is open, and if a new
+  recording appears after it starts (the service opened the microphone after
+  all), it is given up on. A segmented session keeps it listening through
+  pauses; a service that ends on a pause anyway is restarted and the pieces
+  joined. A pane switch while the phone transcribes (or a final is on its way)
+  stops the session rather than cancelling it: the text joins the end of the
+  draft of the pane it was spoken for. Enter pressed while a session finishes
+  waits for it and is settled exactly once at its end (final, queued clip,
+  error, cancel), in the pane it was pressed in: it sends that pane's draft if
+  that pane is on screen, else it is dropped; it never carries over to a later
+  dictation (`DictationRouting`). The manifest's `<queries>` for `android.speech.RecognitionService`
+  makes the services visible (Android 11+ package visibility). Audio reaches
+  it through `PcmFeeder`: every chunk in order, or a failure (it falls behind,
+  or its pipe breaks and no restart comes within 2 s), never a silent drop.
+  If the phone has none (or it fails, falls behind, or hears nothing)
+  the session records and queues as before, and `talk` reads
+  `offline · queued · rec 0:05 · tap to stop`. Without the phone's recognizer the
+  desktop's final is waited for 20 s, as before.
+- Tests: `ServerDictationEngineTest` runs the engine against a fake dictation
+  server speaking the real protocol (the server's exact JSON: ready with each
+  backend, every error code, a slow final, a drop, never ready, unreachable)
+  and a scripted recognizer; `ClipStoreKeptTest` covers the 48 h clips and
+  `PcmFeederTest` the recognizer's audio (no drop at the end, falling behind,
+  a broken pipe, a restart).
+- Not yet checked on the Fold: which recognizer its build has, and whether that
+  service honours `EXTRA_AUDIO_SOURCE` and segmented sessions. Logcat tag
+  `HerdrDictation` says which path each session took (reasons and timings,
+  never text).
 
 ## Why this design: measurements (11 November 2026)
 
@@ -85,8 +152,8 @@ engines (lower case, no punctuation).
   its cores may have been held back; even 3× faster, base.en stays well behind.
 - On-device Whisper would need a model in the APK (60–190 MB) and is 10× slower
   than the server even with the small model; Vosk streams and finishes at once
-  but makes about four times the server's errors. Neither is used: while the
-  desktop is away the phone records, and the desktop transcribes later.
+  but makes about four times the server's errors. Neither is bundled: the
+  fallback uses the recognizer the phone already has (see above).
 
 Raw outputs and scripts for these runs were kept outside the repository; the
 numbers above are copied from them.

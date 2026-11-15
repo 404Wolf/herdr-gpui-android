@@ -22,7 +22,6 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import dev.herdr.android.dictation.DictationEngine;
-import dev.herdr.android.dictation.DictationException;
 import dev.herdr.android.dictation.PendingClip;
 import java.util.Collections;
 import java.util.List;
@@ -139,8 +138,44 @@ final class ComposerBar {
     /** The ghost JSON last handed over, so an unchanged one is not sent again. */
     private String lastGhost = "";
     private DictationEngine.State dictationState = DictationEngine.State.IDLE;
-    /** Enter was pressed while listening: send the utterance once it is final. */
-    private boolean sendWhenFinal;
+    /**
+     * The last dictation was transcribed on the phone (the desktop was away or slow): "talk"
+     * reads "talk offline" until the next dictation, a send or a pane switch.
+     */
+    private boolean transcribedOnPhone;
+    /**
+     * Each session's text, and an Enter pressed while it finishes: kept with the pane it was
+     * pressed in and settled at that session's end, never left for a later dictation.
+     */
+    private final DictationRouting routing = new DictationRouting(drafts, new DictationRouting.Bar() {
+        @Override public void showText(String text) {
+            ComposerBar.this.showText(text);
+        }
+
+        @Override public void setDictationState(DictationEngine.State state) {
+            ComposerBar.this.setDictationState(state);
+        }
+
+        @Override public void enter() {
+            ComposerBar.this.enter();
+        }
+
+        @Override public void notice(String text) {
+            host.notice(text);
+        }
+
+        @Override public void appendDictation(String pane, String text) {
+            ComposerBar.this.appendDictation(pane, text);
+        }
+
+        @Override public void clipLength(String clipId, long durationMs) {
+            clipLengths.put(clipId, durationMs);
+        }
+
+        @Override public void transcribedOnPhone() {
+            transcribedOnPhone = true;
+        }
+    });
     /** Our own setText calls, which must not count as user edits. */
     private boolean updatingField;
 
@@ -296,20 +331,22 @@ final class ComposerBar {
      */
     void setPane(String paneId, String paneKind) {
         boolean switched = !drafts.pane().equals(paneId == null ? "" : paneId);
-        if (switched && dictationState == DictationEngine.State.OFFLINE_RECORDING) {
-            // Keep the recording: its text finds its pane's draft later, by target.
-            sendWhenFinal = false;
-            dictation.stop();
+        if (switched && keepsAcrossPaneSwitch(dictationState)) {
+            // Keep the recording and its text: offline it finds its pane's draft later, by
+            // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
+            // pressed in the old pane is settled with it (sent only if that pane is back).
+            if (recording(dictationState)) dictation.stop();
             drafts.dictationEnded();
         } else if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
             dictation.cancel();
             setDictationState(DictationEngine.State.IDLE);
-            sendWhenFinal = false;
+            routing.forget();
             drafts.dictationEnded();
         }
         String text = drafts.switchTo(paneId);
         if (switched) {
+            transcribedOnPhone = false;
             keysOpen = false;
             showText(text);
         }
@@ -363,6 +400,7 @@ final class ComposerBar {
 
     void destroy() {
         dictation.cancel();
+        routing.forget();
         persist();
         host.setGhost("");
     }
@@ -787,18 +825,29 @@ final class ComposerBar {
             }
             case TRANSCRIBING:
                 return new GhostText.Control("talk", words == Words.TINY ? "…" : "transcribing…", "info");
-            case OFFLINE_RECORDING: {
-                // The warning colour still says offline when the words cannot.
+            case ON_DEVICE: {
+                // The phone transcribes: the warning colour says offline when the words cannot.
                 String text;
                 switch (words) {
-                    case FULL: text = "desktop offline · rec " + clock + " · tap to stop"; break;
+                    case FULL: text = "● offline · rec " + clock + " · tap to stop"; break;
                     case SHORT: text = "● offline " + clock + " stop"; break;
                     default: text = "● stop";
                 }
                 return new GhostText.Control("talk", text, "warn");
             }
+            case OFFLINE_RECORDING: {
+                // No recognizer on the phone: the recording waits for the desktop.
+                String text;
+                switch (words) {
+                    case FULL: text = "offline · queued · rec " + clock + " · tap to stop"; break;
+                    case SHORT: text = "● queued " + clock + " stop"; break;
+                    default: text = "● stop";
+                }
+                return new GhostText.Control("talk", text, "warn");
+            }
             default:
-                return new GhostText.Control("talk", "talk", "dim", waiting > 0 ? "·" + waiting : "", "warn");
+                return new GhostText.Control("talk", "talk", "dim",
+                        (transcribedOnPhone ? " offline" : "") + (waiting > 0 ? "·" + waiting : ""), "warn");
         }
     }
 
@@ -977,10 +1026,20 @@ final class ComposerBar {
         return edit;
     }
 
+    /**
+     * A session that a pane switch stops rather than cancels: its text is the phone's or is on
+     * its way, and is placed in the pane it was spoken for. A desktop session still listening
+     * is cancelled (the utterance belongs to its pane, and nothing was transcribed yet).
+     */
+    static boolean keepsAcrossPaneSwitch(DictationEngine.State s) {
+        return s == DictationEngine.State.OFFLINE_RECORDING || s == DictationEngine.State.ON_DEVICE
+                || s == DictationEngine.State.TRANSCRIBING;
+    }
+
     /** The microphone is open: the clock runs, and "talk" stops it. */
     static boolean recording(DictationEngine.State s) {
         return s == DictationEngine.State.CONNECTING || s == DictationEngine.State.LISTENING
-                || s == DictationEngine.State.OFFLINE_RECORDING;
+                || s == DictationEngine.State.ON_DEVICE || s == DictationEngine.State.OFFLINE_RECORDING;
     }
 
     /** A session runs: IDLE and PENDING both mean none does. */
@@ -1019,46 +1078,10 @@ final class ComposerBar {
         if (!agent || dictating()) return;
         if (typing) drafts.edit(field.getText().toString());
         drafts.dictationStarted();
+        transcribedOnPhone = false;
         final String pane = drafts.pane();
-        dictation.start(pane, new DictationEngine.Listener() {
-            @Override public void onPartial(String text) {
-                if (pane.equals(drafts.pane())) showText(drafts.dictationPartial(text));
-            }
-
-            @Override public void onFinal(String text) {
-                if (!pane.equals(drafts.pane())) return;
-                showText(drafts.dictationFinal(text));
-                if (sendWhenFinal) {
-                    sendWhenFinal = false;
-                    // The session is over (IDLE follows): Enter must send, not wait again.
-                    setDictationState(DictationEngine.State.IDLE);
-                    enter();
-                }
-            }
-
-            @Override public void onPending(PendingClip clip) {
-                clipLengths.put(clip.id, clip.durationMs);
-                if (!pane.equals(drafts.pane())) return;
-                showText(drafts.dictationPending(clip.id));
-                if (sendWhenFinal) {
-                    // The message waits in the outbox until the desktop fills the dictation in.
-                    sendWhenFinal = false;
-                    setDictationState(DictationEngine.State.PENDING);
-                    enter();
-                }
-            }
-
-            @Override public void onState(DictationEngine.State state) {
-                setDictationState(state);
-            }
-
-            @Override public void onError(DictationException error) {
-                setDictationState(DictationEngine.State.IDLE);
-                sendWhenFinal = false;
-                if (pane.equals(drafts.pane())) showText(drafts.dictationEnded());
-                host.notice(error.getMessage() == null ? "Dictation stopped" : error.getMessage());
-            }
-        });
+        routing.forget();
+        dictation.start(pane, routing.listener(pane));
     }
 
     /**
@@ -1067,12 +1090,12 @@ final class ComposerBar {
      */
     private void enter() {
         if (recording(dictationState)) {
-            sendWhenFinal = true;
+            routing.sendWhenDone();
             dictation.stop();
             return;
         }
         if (dictationState == DictationEngine.State.TRANSCRIBING) {
-            sendWhenFinal = true;
+            routing.sendWhenDone();
             return;
         }
         if (typing) {
@@ -1090,6 +1113,7 @@ final class ComposerBar {
         // The draft stays until the message is queued or kept, so nothing is lost.
         if (!host.send(outgoing)) return;
         drafts.sent();
+        transcribedOnPhone = false;
         showText("");
     }
 

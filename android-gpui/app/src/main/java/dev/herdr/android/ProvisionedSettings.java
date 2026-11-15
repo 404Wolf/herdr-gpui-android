@@ -24,6 +24,10 @@ import org.json.JSONObject;
  *  "capturable": true,    allow screenshots and screen mirroring (no FLAG_SECURE)
  *  "scrollSpeed": 1.4,    lines scrolled per row of finger travel, 0.5..3
  *  "dictationUrl": "ws://100.x.y.z:8770/v1/dictate",  the tailnet Whisper server
+ *  "dictationFinalTimeoutMs": 5000,  after stop, how long the desktop's text is waited
+ *                         for before the phone's own is used, 1000..60000
+ *  "dictationRecognizers": ["package/class", ...],  speech services trusted to
+ *                         read piped audio, besides the on-device recognizer
  *  "palette": {...}}      replaces Default: see model::set_default_palette_json
  * </pre>
  *
@@ -49,10 +53,17 @@ final class ProvisionedSettings {
     final float scrollSpeed;
     /** Null when unset or not a ws:// or wss:// URL: dictation is then not available. */
     final URI dictationUrl;
+    /** After stop, the desktop's final is waited for this long before the phone's text is used. */
+    final long dictationFinalTimeoutMs;
+    /** Speech service components ("package/class") trusted with piped audio; may be empty. */
+    final java.util.List<String> dictationRecognizers;
 
     private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson,
-            float scrollSpeed, URI dictationUrl) {
+            float scrollSpeed, URI dictationUrl, long dictationFinalTimeoutMs,
+            java.util.List<String> dictationRecognizers) {
         this.dictationUrl = dictationUrl;
+        this.dictationRecognizers = dictationRecognizers;
+        this.dictationFinalTimeoutMs = dictationFinalTimeoutMs;
         this.scrollSpeed = scrollSpeed;
         this.fontSize = fontSize;
         this.uiScale = uiScale;
@@ -68,7 +79,8 @@ final class ProvisionedSettings {
     }
 
     private static ProvisionedSettings read(Context context) {
-        ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED, null);
+        ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED, null,
+                ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS, java.util.Collections.emptyList());
         File dir = context.getExternalFilesDir(null);
         File file = dir == null ? null : new File(dir, FILE_NAME);
         if (file == null || !file.isFile() || file.length() > MAX_BYTES) return none;
@@ -86,16 +98,30 @@ final class ProvisionedSettings {
             double scale = root.optDouble("uiScale", 1);
             JSONObject palette = root.optJSONObject("palette");
             double speed = root.optDouble("scrollSpeed", DEFAULT_SCROLL_SPEED);
+            long budget = root.optLong("dictationFinalTimeoutMs", ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS);
             return new ProvisionedSettings(
                     font >= 9 && font <= 24 ? (float) font : 0,
                     scale >= 0.7 && scale <= 1.3 ? (float) scale : 1,
                     root.has("capturable") ? root.optBoolean("capturable") : null,
                     palette == null ? null : palette.toString(),
                     speed >= 0.5 && speed <= 3 ? (float) speed : DEFAULT_SCROLL_SPEED,
-                    ServerDictationEngine.parseUrl(root.optString("dictationUrl", null)));
+                    ServerDictationEngine.parseUrl(root.optString("dictationUrl", null)),
+                    budget >= 1000 && budget <= 60000 ? budget : ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS,
+                    components(root.optJSONArray("dictationRecognizers")));
         } catch (IOException | JSONException | RuntimeException unreadable) {
             return none;
         }
+    }
+
+    /** At most 8 non-empty strings of at most 256 characters each; others are left out. */
+    static java.util.List<String> components(org.json.JSONArray list) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (list == null) return out;
+        for (int i = 0; i < list.length() && out.size() < 8; i++) {
+            String c = list.optString(i, "").trim();
+            if (!c.isEmpty() && c.length() <= 256 && c.indexOf('/') > 0) out.add(c);
+        }
+        return out;
     }
 
     /** Whether windows may be captured: the provisioned choice, else upstream's debug-only rule. */

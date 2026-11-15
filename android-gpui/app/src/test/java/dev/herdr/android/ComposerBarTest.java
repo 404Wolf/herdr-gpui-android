@@ -128,13 +128,26 @@ public final class ComposerBarTest {
         assertEquals("● offline 0:05 stop", folded.get(1).spans[0]);
     }
 
-    @Test public void theMicrophoneIsOpenWhileConnectingListeningOrRecordingOffline() {
+    @Test public void theMicrophoneIsOpenWhileConnectingListeningOnDeviceOrRecordingOffline() {
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.CONNECTING));
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.LISTENING));
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.OFFLINE_RECORDING));
+        assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.ON_DEVICE));
         assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.TRANSCRIBING));
         assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.PENDING));
         assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.IDLE));
+    }
+
+    @Test public void aPaneSwitchKeepsTheSessionsWhoseTextIsThePhonesOrOnItsWay() {
+        // Kept: the phone transcribing, a queued recording, a final on its way.
+        assertTrue(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.ON_DEVICE));
+        assertTrue(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.OFFLINE_RECORDING));
+        assertTrue(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.TRANSCRIBING));
+        // Cancelled: a desktop utterance still being spoken belongs to its pane.
+        assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.LISTENING));
+        assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.CONNECTING));
+        assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.IDLE));
+        assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.PENDING));
     }
 
     @Test public void theKeyboardsUnderlinedWordIsTheRevisableTailOnlyAtTheEnd() {
