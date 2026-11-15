@@ -82,19 +82,26 @@ mic ──▶ recording (app storage, always)
   or a pane switch, and a notice says so once.
 - The recording of such a session is kept for 48 h (`ClipStore.KEEP_MS`): never
   sent to the desktop, never replacing the text (which may be edited or sent by
-  then), and the first to go when a new recording needs the room.
+  then), and the first to go when a new recording needs the room. Expired
+  ones are deleted at each session start and when the app starts.
 - The recognizer: the phone's on-device service when it has one
   (`SpeechRecognizer.createOnDeviceSpeechRecognizer`), else the default service
   asked to prefer offline. A segmented session keeps it listening through
   pauses; a service that ends on a pause anyway is restarted and the pieces
-  joined. If the phone has none (or it fails, falls behind, or hears nothing)
+  joined. The manifest's `<queries>` for `android.speech.RecognitionService`
+  makes the services visible (Android 11+ package visibility). Audio reaches
+  it through `PcmFeeder`: every chunk in order, or a failure (it falls behind,
+  or its pipe breaks and no restart comes within 2 s), never a silent drop.
+  If the phone has none (or it fails, falls behind, or hears nothing)
   the session records and queues as before, and `talk` reads
   `offline · queued · rec 0:05 · tap to stop`. Without the phone's recognizer the
   desktop's final is waited for 20 s, as before.
 - Tests: `ServerDictationEngineTest` runs the engine against a fake dictation
   server speaking the real protocol (the server's exact JSON: ready with each
   backend, every error code, a slow final, a drop, never ready, unreachable)
-  and a scripted recognizer; `ClipStoreKeptTest` covers the 48 h clips.
+  and a scripted recognizer; `ClipStoreKeptTest` covers the 48 h clips and
+  `PcmFeederTest` the recognizer's audio (no drop at the end, falling behind,
+  a broken pipe, a restart).
 - Not yet checked on the Fold: which recognizer its build has, and whether that
   service honours `EXTRA_AUDIO_SOURCE` and segmented sessions. Logcat tag
   `HerdrDictation` says which path each session took (reasons and timings,

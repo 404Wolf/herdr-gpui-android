@@ -42,15 +42,28 @@ public final class ClipStoreKeptTest {
         assertTrue(again.untranscribed().isEmpty());
     }
 
-    @Test public void aKeptClipIsDeletedAfter48Hours() {
+    @Test public void aKeptClipIsDeletedAt48HoursByTheNextSessionStartInARunningApp() {
         ClipStore store = store();
         PendingClip kept = recording(store, 1).keepTranscribedOnPhone();
         now.addAndGet(ClipStore.KEEP_MS - 1);
-        assertEquals(1, store.keptClips().size());
+        store.record("host/pane", now.get()).discard();
+        assertEquals("not yet", 1, store.keptClips().size());
         now.addAndGet(2);
+        // No restart: the same store, as in an app that stays running for days.
+        assertEquals(1, store.keptClips().size());
+        assertTrue(store.audio(kept.id).exists());
+        store.record("host/pane", now.get()).discard();
         assertTrue(store.keptClips().isEmpty());
         assertFalse(store.audio(kept.id).exists());
         assertTrue("gone after a restart too", store().keptClips().isEmpty());
+    }
+
+    @Test public void anExpiredKeptClipIsDeletedOnLoad() {
+        PendingClip kept = recording(store(), 1).keepTranscribedOnPhone();
+        now.addAndGet(ClipStore.KEEP_MS + 1);
+        ClipStore again = store();
+        assertTrue(again.keptClips().isEmpty());
+        assertFalse(again.audio(kept.id).exists());
     }
 
     @Test public void keptClipsGiveWayToANewRecording() {

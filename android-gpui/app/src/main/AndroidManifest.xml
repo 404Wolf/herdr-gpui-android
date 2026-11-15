@@ -7,6 +7,14 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Dictation in the composer; asked for on the first tap of the microphone. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Android 11+ package visibility: without this the phone's speech
+         recognition services are invisible, so the dictation fallback to the
+         phone's own recognizer would find none. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="false" />
     <!-- Back reaches each screen through OnBackInvokedCallback (BackOwner) on

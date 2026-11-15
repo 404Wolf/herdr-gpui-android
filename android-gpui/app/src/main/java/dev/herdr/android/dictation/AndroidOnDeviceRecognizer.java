@@ -13,10 +13,7 @@ import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.util.ArrayList;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 
 /**
  * The phone's own {@link SpeechRecognizer}, fed the session's audio through a pipe
@@ -26,15 +23,18 @@ import java.util.concurrent.BlockingQueue;
  * audio ends; a service that ends a session on a pause anyway is restarted on a fresh pipe, and
  * its pieces are joined.
  *
- * <p>All SpeechRecognizer calls happen on the main thread. Audio goes through a bounded queue
- * to a writer thread, so the microphone thread never blocks on the recognizer.
+ * <p>All SpeechRecognizer calls happen on the main thread. Audio goes through a {@link PcmFeeder},
+ * so the microphone thread never blocks on the recognizer and no audio is dropped silently: a
+ * recognizer that falls behind or whose pipe breaks fails, and the engine falls back to the
+ * session's recording.
  */
 @android.annotation.TargetApi(33)
 final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
     private static final String TAG = "HerdrDictation";
     /** 10 s of 100 ms chunks: past that the recognizer is not keeping up and is given up on. */
     private static final int QUEUE_CHUNKS = 100;
-    private static final byte[] END = new byte[0];
+    /** How long a failed pipe write waits for the recognizer's restart on a fresh pipe. */
+    private static final long SWAP_GRACE_MS = 2000;
 
     /** A factory for {@code context}, or null when this Android cannot feed a recognizer audio. */
     static OnDeviceRecognizer.Factory factory(Context context) {
@@ -62,27 +62,40 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
     private final SpeechRecognizer recognizer;
     private final Callback callback;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final BlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(QUEUE_CHUNKS);
-    private final Thread writer;
-    /** Where the writer puts audio: the current pipe's write end. */
-    private volatile OutputStream sink;
+    /** Carries audio into the current pipe; never drops it silently. */
+    private final PcmFeeder feeder;
+    private boolean feederStarted;
     /** Main thread: the current pipe's read end, handed to the recognizer. */
     private ParcelFileDescriptor source;
     /** Main thread: text of the finished pieces (segments, or sessions ended on a pause). */
     private final StringBuilder done = new StringBuilder();
-    /** Main thread: the writer has sent the last audio and closed the pipe. */
+    /** Main thread: the feeder has written the last audio and closed the pipe. */
     private boolean audioEnded;
     /** No more callbacks: finished, failed or cancelled. */
     private volatile boolean over;
-    /** The queue overflowed: the failure is on its way to the main thread. */
-    private volatile boolean overflowed;
 
     private AndroidOnDeviceRecognizer(SpeechRecognizer recognizer, Callback callback) {
         this.recognizer = recognizer;
         this.callback = callback;
         recognizer.setRecognitionListener(new Listener());
-        writer = new Thread(this::writeAll, "dictation-on-device");
-        writer.setDaemon(true);
+        feeder = new PcmFeeder(QUEUE_CHUNKS, SWAP_GRACE_MS, new PcmFeeder.Listener() {
+            @Override public void onDrained() {
+                main.post(() -> {
+                    audioEnded = true;
+                    if (over) return;
+                    try {
+                        recognizer.stopListening();
+                    } catch (RuntimeException ignored) {
+                        // The session already ended; its results come or came through the listener.
+                    }
+                });
+            }
+
+            @Override public void onFailed(String why) {
+                Log.w(TAG, "dictation: feeding the phone's recognizer failed: " + why);
+                main.post(() -> fail(why));
+            }
+        });
     }
 
     /** Main thread: opens a pipe and starts a recognition session reading it. */
@@ -96,9 +109,7 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
         }
         ParcelFileDescriptor old = source;
         source = pipe[0];
-        OutputStream previous = sink;
-        sink = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]);
-        closeQuietly(previous);
+        feeder.setSink(new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]));
         closeQuietly(old);
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -121,72 +132,42 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
             Log.w(TAG, "dictation: the phone's recognizer refused to start", e);
             return false;
         }
-        if (writer.getState() == Thread.State.NEW) writer.start();
+        if (!feederStarted) {
+            feederStarted = true;
+            feeder.start();
+        }
         return true;
     }
 
     @Override
     public void write(byte[] chunk, int length) {
-        if (over || overflowed) return;
-        if (!queue.offer(java.util.Arrays.copyOf(chunk, length))) {
-            overflowed = true;
-            main.post(() -> fail("not keeping up"));
-        }
+        // A full queue is a failure the feeder reports (onFailed), never a silent drop.
+        if (!over) feeder.write(chunk, length);
     }
 
     @Override
     public void endOfAudio() {
-        if (over || overflowed) return;
-        // The writer closes the pipe after the last chunk; the recognizer then finishes.
-        while (!queue.offer(END)) queue.poll();
+        // Everything queued is written first; then the pipe closes and the recognizer finishes.
+        feeder.end();
     }
 
     @Override
     public void cancel() {
         over = true;
-        queue.clear();
-        queue.offer(END);
+        feeder.cancel();
         main.post(this::tearDown);
     }
 
-    /** Main thread: releases the service and both pipe ends; safe to repeat. */
+    /** Main thread: releases the service, the feeder and the pipe; safe to repeat. */
     private void tearDown() {
+        feeder.cancel();
         try {
             recognizer.cancel();
             recognizer.destroy();
         } catch (RuntimeException ignored) {
             // Already gone.
         }
-        closeQuietly(sink);
         closeQuietly(source);
-    }
-
-    /** Writer thread: copies queued audio into the current pipe until the end. */
-    private void writeAll() {
-        try {
-            while (true) {
-                byte[] chunk = queue.take();
-                if (chunk == END) break;
-                OutputStream out = sink;
-                try {
-                    if (out != null) out.write(chunk);
-                } catch (IOException e) {
-                    // A pipe closed by a restart: this chunk misses the recognizer, not the recording.
-                }
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        closeQuietly(sink);
-        main.post(() -> {
-            audioEnded = true;
-            if (over) return;
-            try {
-                recognizer.stopListening();
-            } catch (RuntimeException ignored) {
-                // The session already ended; its results come or came through the listener.
-            }
-        });
     }
 
     /** Main thread. */
@@ -201,8 +182,6 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
     private void fail(String why) {
         if (over) return;
         over = true;
-        queue.clear();
-        queue.offer(END);
         callback.onError(why);
         tearDown();
     }

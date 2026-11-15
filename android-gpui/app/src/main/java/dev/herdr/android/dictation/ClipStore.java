@@ -177,7 +177,9 @@ final class ClipStore {
         }
     }
 
+    /** Starts a session's recording; kept clips past their 48 h go first. */
     Recording record(String target, long now) {
+        dropExpired();
         return new Recording(target, now);
     }
 
@@ -266,9 +268,11 @@ final class ClipStore {
         return out;
     }
 
-    /** Recordings the phone transcribed itself, kept for a while, oldest first. */
+    /**
+     * Recordings the phone transcribed itself, kept for a while, oldest first. Expired ones go on
+     * load and at each session start ({@link #record}).
+     */
     synchronized List<PendingClip> keptClips() {
-        dropExpired();
         List<PendingClip> out = new ArrayList<>();
         for (Entry e : entries) if (e.kept()) out.add(e.clip);
         return out;
