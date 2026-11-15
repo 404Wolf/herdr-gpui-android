@@ -97,7 +97,11 @@ mic ──▶ recording (app storage, always)
   pauses; a service that ends on a pause anyway is restarted and the pieces
   joined. A pane switch while the phone transcribes (or a final is on its way)
   stops the session rather than cancelling it: the text joins the end of the
-  draft of the pane it was spoken for. The manifest's `<queries>` for `android.speech.RecognitionService`
+  draft of the pane it was spoken for. Enter pressed while a session finishes
+  waits for it and is settled exactly once at its end (final, queued clip,
+  error, cancel), in the pane it was pressed in: it sends that pane's draft if
+  that pane is on screen, else it is dropped; it never carries over to a later
+  dictation (`DictationRouting`). The manifest's `<queries>` for `android.speech.RecognitionService`
   makes the services visible (Android 11+ package visibility). Audio reaches
   it through `PcmFeeder`: every chunk in order, or a failure (it falls behind,
   or its pipe breaks and no restart comes within 2 s), never a silent drop.
