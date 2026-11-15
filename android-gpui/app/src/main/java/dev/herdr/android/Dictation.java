@@ -23,7 +23,8 @@ public final class Dictation {
         URI url = settings.dictationUrl;
         if (url == null) return new NoopDictationEngine();
         return new ServerDictationEngine(context, url, pending(context),
-                OnDeviceRecognizers.factory(context), settings.dictationFinalTimeoutMs);
+                OnDeviceRecognizers.factory(context, settings.dictationRecognizers),
+                settings.dictationFinalTimeoutMs);
     }
 
     /** The process's recordings waiting for the desktop (none ever without a server). */

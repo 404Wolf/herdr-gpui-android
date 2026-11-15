@@ -66,6 +66,25 @@ public final class ClipStoreKeptTest {
         assertFalse(again.audio(kept.id).exists());
     }
 
+    @Test public void aCourierPassDeletesExpiredKeptClipsInARunningApp() throws Exception {
+        ClipStore store = store();
+        PendingClip kept = recording(store, 1).keepTranscribedOnPhone();
+        java.util.concurrent.ScheduledExecutorService worker =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+        try {
+            PendingDictations pending = new PendingDictations(store, (c, f) -> {
+                throw new java.io.IOException("not under test");
+            }, worker, Runnable::run);
+            now.addAndGet(ClipStore.KEEP_MS + 1);
+            assertTrue(store.audio(kept.id).exists());
+            pending.pass();
+            assertFalse(store.audio(kept.id).exists());
+            assertTrue(store.keptClips().isEmpty());
+        } finally {
+            worker.shutdownNow();
+        }
+    }
+
     @Test public void keptClipsGiveWayToANewRecording() {
         ClipStore store = store();
         // Fill the whole budget with kept clips of 10 minutes each.

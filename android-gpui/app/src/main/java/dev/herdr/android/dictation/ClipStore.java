@@ -205,8 +205,8 @@ final class ClipStore {
         return false;
     }
 
-    /** Deletes kept clips past their time. */
-    private synchronized void dropExpired() {
+    /** Deletes kept clips past their time: on load, at each session start and courier pass. */
+    synchronized void dropExpired() {
         long now = clock.getAsLong();
         boolean changed = false;
         for (int i = entries.size() - 1; i >= 0; i--) {
@@ -270,7 +270,7 @@ final class ClipStore {
 
     /**
      * Recordings the phone transcribed itself, kept for a while, oldest first. Expired ones go on
-     * load and at each session start ({@link #record}).
+     * load, at each session start ({@link #record}) and at each courier pass.
      */
     synchronized List<PendingClip> keptClips() {
         List<PendingClip> out = new ArrayList<>();

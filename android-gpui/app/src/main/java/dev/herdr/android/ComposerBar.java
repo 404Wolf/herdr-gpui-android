@@ -301,10 +301,11 @@ final class ComposerBar {
      */
     void setPane(String paneId, String paneKind) {
         boolean switched = !drafts.pane().equals(paneId == null ? "" : paneId);
-        if (switched && dictationState == DictationEngine.State.OFFLINE_RECORDING) {
-            // Keep the recording: its text finds its pane's draft later, by target.
+        if (switched && keepsAcrossPaneSwitch(dictationState)) {
+            // Keep the recording and its text: offline it finds its pane's draft later, by
+            // target; the phone's (or a late desktop) final joins its own pane's draft.
             sendWhenFinal = false;
-            dictation.stop();
+            if (recording(dictationState)) dictation.stop();
             drafts.dictationEnded();
         } else if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
@@ -994,6 +995,16 @@ final class ComposerBar {
         return edit;
     }
 
+    /**
+     * A session that a pane switch stops rather than cancels: its text is the phone's or is on
+     * its way, and is placed in the pane it was spoken for. A desktop session still listening
+     * is cancelled (the utterance belongs to its pane, and nothing was transcribed yet).
+     */
+    static boolean keepsAcrossPaneSwitch(DictationEngine.State s) {
+        return s == DictationEngine.State.OFFLINE_RECORDING || s == DictationEngine.State.ON_DEVICE
+                || s == DictationEngine.State.TRANSCRIBING;
+    }
+
     /** The microphone is open: the clock runs, and "talk" stops it. */
     static boolean recording(DictationEngine.State s) {
         return s == DictationEngine.State.CONNECTING || s == DictationEngine.State.LISTENING
@@ -1048,11 +1059,21 @@ final class ComposerBar {
             }
 
             @Override public void onFinal(String text, boolean onDevice) {
-                if (!pane.equals(drafts.pane())) return;
                 if (onDevice) {
-                    transcribedOnPhone = true;
                     host.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
                 }
+                if (!pane.equals(drafts.pane())) {
+                    // Switched away while it finished: it joins the end of its own pane's draft.
+                    if (!text.isEmpty()) appendDictation(pane, text);
+                    if (sendWhenFinal) {
+                        // Enter was pressed in this pane while it finished: send this pane's draft.
+                        sendWhenFinal = false;
+                        setDictationState(DictationEngine.State.IDLE);
+                        enter();
+                    }
+                    return;
+                }
+                if (onDevice) transcribedOnPhone = true;
                 showText(drafts.dictationFinal(text));
                 if (sendWhenFinal) {
                     sendWhenFinal = false;

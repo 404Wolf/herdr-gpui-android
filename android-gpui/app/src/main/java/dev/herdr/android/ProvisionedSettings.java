@@ -26,6 +26,8 @@ import org.json.JSONObject;
  *  "dictationUrl": "ws://100.x.y.z:8770/v1/dictate",  the tailnet Whisper server
  *  "dictationFinalTimeoutMs": 5000,  after stop, how long the desktop's text is waited
  *                         for before the phone's own is used, 1000..60000
+ *  "dictationRecognizers": ["package/class", ...],  speech services trusted to
+ *                         read piped audio, besides the on-device recognizer
  *  "palette": {...}}      replaces Default: see model::set_default_palette_json
  * </pre>
  *
@@ -53,10 +55,14 @@ final class ProvisionedSettings {
     final URI dictationUrl;
     /** After stop, the desktop's final is waited for this long before the phone's text is used. */
     final long dictationFinalTimeoutMs;
+    /** Speech service components ("package/class") trusted with piped audio; may be empty. */
+    final java.util.List<String> dictationRecognizers;
 
     private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson,
-            float scrollSpeed, URI dictationUrl, long dictationFinalTimeoutMs) {
+            float scrollSpeed, URI dictationUrl, long dictationFinalTimeoutMs,
+            java.util.List<String> dictationRecognizers) {
         this.dictationUrl = dictationUrl;
+        this.dictationRecognizers = dictationRecognizers;
         this.dictationFinalTimeoutMs = dictationFinalTimeoutMs;
         this.scrollSpeed = scrollSpeed;
         this.fontSize = fontSize;
@@ -74,7 +80,7 @@ final class ProvisionedSettings {
 
     private static ProvisionedSettings read(Context context) {
         ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED, null,
-                ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS);
+                ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS, java.util.Collections.emptyList());
         File dir = context.getExternalFilesDir(null);
         File file = dir == null ? null : new File(dir, FILE_NAME);
         if (file == null || !file.isFile() || file.length() > MAX_BYTES) return none;
@@ -100,10 +106,22 @@ final class ProvisionedSettings {
                     palette == null ? null : palette.toString(),
                     speed >= 0.5 && speed <= 3 ? (float) speed : DEFAULT_SCROLL_SPEED,
                     ServerDictationEngine.parseUrl(root.optString("dictationUrl", null)),
-                    budget >= 1000 && budget <= 60000 ? budget : ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS);
+                    budget >= 1000 && budget <= 60000 ? budget : ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS,
+                    components(root.optJSONArray("dictationRecognizers")));
         } catch (IOException | JSONException | RuntimeException unreadable) {
             return none;
         }
+    }
+
+    /** At most 8 non-empty strings of at most 256 characters each; others are left out. */
+    static java.util.List<String> components(org.json.JSONArray list) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (list == null) return out;
+        for (int i = 0; i < list.length() && out.size() < 8; i++) {
+            String c = list.optString(i, "").trim();
+            if (!c.isEmpty() && c.length() <= 256 && c.indexOf('/') > 0) out.add(c);
+        }
+        return out;
     }
 
     /** Whether windows may be captured: the provisioned choice, else upstream's debug-only rule. */

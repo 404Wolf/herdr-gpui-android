@@ -201,6 +201,27 @@ public final class ServerDictationEngineTest {
         assertTrue(phone.ended);
     }
 
+    @Test public void theRecognizerStartsOnlyOnceOurMicrophoneIsOpen() throws Exception {
+        FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 50);
+        Run run = dictate(closedPort(), phone, 300);
+        run.awaitEnd();
+        assertTrue(phone.started);
+        assertFalse("started before our microphone was open", phone.startedBeforeTheMic);
+    }
+
+    @Test public void aMicrophoneThatDoesNotOpenStartsNoRecognizer() throws Exception {
+        FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 50);
+        Run run = new Run();
+        run.mic.failToOpen = true;
+        dictate(closedPort(), phone, 100, run);
+        run.awaitEnd();
+        assertFalse(phone.started);
+        assertTrue(run.listener.states.contains(null)); // onError
+        assertEquals(DictationEngine.State.IDLE, last(run.listener.states));
+        assertTrue(store.untranscribed().isEmpty());
+        assertTrue(store.keptClips().isEmpty());
+    }
+
     // ---- nothing on the phone: today's record-and-queue ------------------------------------
 
     @Test public void withoutARecognizerAnUnreachableDesktopQueuesTheRecording() throws Exception {
@@ -287,7 +308,11 @@ public final class ServerDictationEngineTest {
 
     /** One session: start, talk for {@code talkMs}, stop. */
     private Run dictate(URI uri, FakeRecognizer phone, long talkMs) throws Exception {
-        Run run = new Run();
+        return dictate(uri, phone, talkMs, new Run());
+    }
+
+    private Run dictate(URI uri, FakeRecognizer phone, long talkMs, Run run) throws Exception {
+        if (phone != null) phone.mic = run.mic;
         ServerDictationEngine engine = new ServerDictationEngine(uri, pending, new TestMain(mainThread),
                 run.mic, () -> true, phone == null ? null : cb -> phone.start(cb), TIMEOUTS, log::add);
         mainThread.submit(() -> engine.start("host/pane", run.listener)).get();
@@ -335,8 +360,12 @@ public final class ServerDictationEngineTest {
     private static final class ScriptedMic implements AudioInput.Opener, AudioInput {
         private final ByteArrayOutputStream given = new ByteArrayOutputStream();
         private int index;
+        volatile boolean opened;
+        volatile boolean failToOpen;
 
-        @Override public AudioInput open() {
+        @Override public AudioInput open() throws Microphone.Failure {
+            if (failToOpen) throw new Microphone.Failure("The microphone could not be opened");
+            opened = true;
             return this;
         }
 
@@ -375,6 +404,10 @@ public final class ServerDictationEngineTest {
         final ByteArrayOutputStream heard = new ByteArrayOutputStream();
         String partial;
         boolean failOnFirstAudio;
+        /** The microphone it was started with; it must be open already. */
+        ScriptedMic mic;
+        volatile boolean startedBeforeTheMic;
+        volatile boolean started;
         volatile boolean cancelled;
         volatile boolean ended;
         private Callback callback;
@@ -385,6 +418,8 @@ public final class ServerDictationEngineTest {
         }
 
         OnDeviceRecognizer start(Callback cb) {
+            started = true;
+            if (mic != null && !mic.opened) startedBeforeTheMic = true;
             callback = cb;
             return this;
         }

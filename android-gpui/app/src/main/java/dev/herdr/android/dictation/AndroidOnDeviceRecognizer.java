@@ -1,19 +1,27 @@
 package dev.herdr.android.dictation;
 
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ResolveInfo;
 import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioRecordingConfiguration;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.speech.RecognitionListener;
+import android.speech.RecognitionService;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
  * The phone's own {@link SpeechRecognizer}, fed the session's audio through a pipe
@@ -36,21 +44,42 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
     /** How long a failed pipe write waits for the recognizer's restart on a fresh pipe. */
     private static final long SWAP_GRACE_MS = 2000;
 
-    /** A factory for {@code context}, or null when this Android cannot feed a recognizer audio. */
-    static OnDeviceRecognizer.Factory factory(Context context) {
+    /**
+     * A factory for {@code context}, or null when this Android cannot feed a recognizer audio.
+     * {@code allowed}: service components ("package/class") trusted to read the piped audio,
+     * besides the system's on-device recognizer (see {@link RecognizerChoice}).
+     */
+    static OnDeviceRecognizer.Factory factory(Context context, List<String> allowed) {
         if (Build.VERSION.SDK_INT < 33) return null;
         Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        List<String> trusted = new ArrayList<>();
+        if (allowed != null) {
+            for (String a : allowed) {
+                ComponentName c = a == null ? null : ComponentName.unflattenFromString(a.trim());
+                if (c != null) trusted.add(c.flattenToString());
+            }
+        }
         return callback -> {
-            SpeechRecognizer r;
-            if (SpeechRecognizer.isOnDeviceRecognitionAvailable(app)) {
-                r = SpeechRecognizer.createOnDeviceSpeechRecognizer(app);
-            } else if (SpeechRecognizer.isRecognitionAvailable(app)) {
-                r = SpeechRecognizer.createSpeechRecognizer(app);
-            } else {
-                Log.i(TAG, "dictation: no speech recognizer on this phone");
+            Set<String> installed = new HashSet<>();
+            for (ResolveInfo ri : app.getPackageManager().queryIntentServices(
+                    new Intent(RecognitionService.SERVICE_INTERFACE), 0)) {
+                if (ri.serviceInfo != null) {
+                    installed.add(new ComponentName(ri.serviceInfo.packageName, ri.serviceInfo.name).flattenToString());
+                }
+            }
+            String choice = RecognizerChoice.choose(
+                    SpeechRecognizer.isOnDeviceRecognitionAvailable(app), installed, trusted);
+            if (choice == null) {
+                Log.i(TAG, "dictation: no trusted speech recognizer on this phone (" + installed.size()
+                        + " installed, none on-device or allowed): recording for later only");
                 return null;
             }
+            SpeechRecognizer r = choice.equals(RecognizerChoice.ON_DEVICE)
+                    ? SpeechRecognizer.createOnDeviceSpeechRecognizer(app)
+                    : SpeechRecognizer.createSpeechRecognizer(app, ComponentName.unflattenFromString(choice));
+            Log.i(TAG, "dictation: the phone's recognizer is " + choice);
             AndroidOnDeviceRecognizer rec = new AndroidOnDeviceRecognizer(r, callback);
+            rec.watchMicrophone(app.getSystemService(AudioManager.class));
             if (!rec.listen()) {
                 rec.cancel();
                 return null;
@@ -73,6 +102,9 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
     private boolean audioEnded;
     /** No more callbacks: finished, failed or cancelled. */
     private volatile boolean over;
+    /** Main thread: watches for a recording other than ours, i.e. the service's own mic. */
+    private AudioManager audio;
+    private AudioManager.AudioRecordingCallback micWatch;
 
     private AndroidOnDeviceRecognizer(SpeechRecognizer recognizer, Callback callback) {
         this.recognizer = recognizer;
@@ -158,16 +190,49 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
         main.post(this::tearDown);
     }
 
+    /**
+     * Main thread, before {@link #listen}, with the session's own microphone already open: a
+     * recording that starts after this one is the service ignoring the piped audio and opening
+     * the microphone itself, which would compete with ours. Then the recognizer is given up on.
+     */
+    private void watchMicrophone(AudioManager am) {
+        if (am == null) return;
+        audio = am;
+        int baseline = am.getActiveRecordingConfigurations().size();
+        micWatch = new AudioManager.AudioRecordingCallback() {
+            @Override public void onRecordingConfigChanged(List<AudioRecordingConfiguration> configs) {
+                if (!over && RecognizerChoice.foreignCapture(baseline, configs.size())) {
+                    Log.w(TAG, "dictation: the phone's recognizer opened its own microphone");
+                    fail("opened its own microphone");
+                }
+            }
+        };
+        am.registerAudioRecordingCallback(micWatch, main);
+    }
+
     /** Main thread: releases the service, the feeder and the pipe; safe to repeat. */
     private void tearDown() {
         feeder.cancel();
+        if (audio != null && micWatch != null) {
+            try {
+                audio.unregisterAudioRecordingCallback(micWatch);
+            } catch (RuntimeException ignored) {
+                // Not registered any more.
+            }
+            micWatch = null;
+        }
         try {
             recognizer.cancel();
-            recognizer.destroy();
         } catch (RuntimeException ignored) {
-            // Already gone.
+            // The service is gone already: destroy still unbinds it.
+        } finally {
+            try {
+                recognizer.destroy();
+            } catch (RuntimeException ignored) {
+                // Already destroyed.
+            }
+            closeQuietly(source);
         }
-        closeQuietly(source);
     }
 
     /** Main thread. */

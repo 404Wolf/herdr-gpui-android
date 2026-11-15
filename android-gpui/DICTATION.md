@@ -83,12 +83,21 @@ mic ──▶ recording (app storage, always)
 - The recording of such a session is kept for 48 h (`ClipStore.KEEP_MS`): never
   sent to the desktop, never replacing the text (which may be edited or sent by
   then), and the first to go when a new recording needs the room. Expired
-  ones are deleted at each session start and when the app starts.
-- The recognizer: the phone's on-device service when it has one
-  (`SpeechRecognizer.createOnDeviceSpeechRecognizer`), else the default service
-  asked to prefer offline. A segmented session keeps it listening through
+  ones are deleted when the app starts, at each session start and at each
+  courier pass.
+- The recognizer: only one trusted to read the piped audio, because Android
+  documents that a service without `EXTRA_AUDIO_SOURCE` support silently opens
+  the microphone itself. That is the phone's on-device service when it has one
+  (`SpeechRecognizer.createOnDeviceSpeechRecognizer`), else the first installed
+  service listed in the provisioned `"dictationRecognizers": ["package/class"]`
+  (empty by default: add one only after checking it on the phone), asked to
+  prefer offline. It starts only once our own microphone is open, and if a new
+  recording appears after it starts (the service opened the microphone after
+  all), it is given up on. A segmented session keeps it listening through
   pauses; a service that ends on a pause anyway is restarted and the pieces
-  joined. The manifest's `<queries>` for `android.speech.RecognitionService`
+  joined. A pane switch while the phone transcribes (or a final is on its way)
+  stops the session rather than cancelling it: the text joins the end of the
+  draft of the pane it was spoken for. The manifest's `<queries>` for `android.speech.RecognitionService`
   makes the services visible (Android 11+ package visibility). Audio reaches
   it through `PcmFeeder`: every chunk in order, or a failure (it falls behind,
   or its pipe breaks and no restart comes within 2 s), never a silent drop.

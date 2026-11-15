@@ -231,13 +231,26 @@ public final class ServerDictationEngine implements DictationEngine {
 
         void begin() {
             listener.onState(State.CONNECTING);
+            // Our microphone first: the phone's recognizer then reads our audio, and one that
+            // would open the microphone itself is caught against it (AndroidOnDeviceRecognizer).
+            AudioInput mic;
+            try {
+                mic = microphone.open();
+            } catch (Microphone.Failure e) {
+                micDone = true;
+                fail(new DictationException(DictationException.Reason.AUDIO, e.getMessage(), e));
+                return;
+            }
             startOnDevice();
             main.postDelayed(readyTimeout, timeouts.readyMs);
-            new Thread(this::record, "dictation-mic").start();
+            new Thread(() -> record(mic), "dictation-mic").start();
             new Thread(this::converse, "dictation-socket").start();
         }
 
-        /** Main thread: the phone's recognizer listens alongside the desktop from the start. */
+        /**
+         * Main thread, with our microphone open: the phone's recognizer listens alongside the
+         * desktop from the first chunk.
+         */
         private void startOnDevice() {
             if (onDevice == null) return;
             try {
@@ -445,11 +458,9 @@ public final class ServerDictationEngine implements DictationEngine {
         }
 
         /** Mic thread: records until stop, saving everything and sending while the server is ready. */
-        private void record() {
+        private void record(AudioInput opened) {
             ArrayDeque<byte[]> unsent = new ArrayDeque<>();
-            boolean opened = false;
-            try (AudioInput mic = microphone.open()) {
-                opened = true;
+            try (AudioInput mic = opened) {
                 while (!stopping) {
                     byte[] chunk = new byte[CHUNK_BYTES];
                     int n = mic.read(chunk, () -> stopping);
@@ -465,12 +476,6 @@ public final class ServerDictationEngine implements DictationEngine {
                     send(unsent);
                 }
             } catch (Microphone.Failure e) {
-                if (!opened) {
-                    micFinished();
-                    if (!cancelled) post(() -> fail(new DictationException(
-                            DictationException.Reason.AUDIO, e.getMessage(), e)));
-                    return;
-                }
                 // The mic failed partway: keep what was heard, as if the user tapped stop.
                 post(this::finish);
             }

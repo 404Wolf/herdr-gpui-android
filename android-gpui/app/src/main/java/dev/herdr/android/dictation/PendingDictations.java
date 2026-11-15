@@ -172,6 +172,8 @@ public final class PendingDictations {
     /** Worker thread: transcribes waiting clips, oldest first, until one fails. */
     void pass() {
         scheduled = null;
+        // Cheap (an index scan): recordings the phone transcribed go once their 48 h are up.
+        store.dropExpired();
         List<PendingClip> waiting = store.untranscribed();
         if (waiting.isEmpty()) return;
         int sent = 0;
