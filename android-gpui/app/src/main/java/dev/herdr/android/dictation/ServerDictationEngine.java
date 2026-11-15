@@ -11,6 +11,8 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -20,31 +22,124 @@ import org.json.JSONObject;
  * final after {@link #stop}. Recording starts at once and is buffered while the socket connects,
  * so the first words are not lost.
  *
- * <p>Every session's audio is also written to app storage as it is recorded. If the desktop
- * cannot be reached, stops answering, or drops mid-session, the session carries on in
- * {@link State#OFFLINE_RECORDING} and, on stop, keeps that file as a {@link PendingClip} for
- * {@link PendingDictations}; a finished live session deletes it.
+ * <p>The same audio also goes, from the first chunk, to the phone's own recognizer
+ * ({@link OnDeviceRecognizer}), which listens alongside. Its text is used instead of the
+ * desktop's when the desktop cannot be reached, is not ready in {@link #READY_TIMEOUT_MS}, drops,
+ * sends an error, says its transcription runs on the CPU ({@code ready.backend} other than
+ * "gpu"), or has no final within the final budget after stop (provisioned, default
+ * {@link #DEFAULT_FINAL_BUDGET_MS}). That text is delivered as {@code onFinal(text, true)}.
+ *
+ * <p>Every session's audio is also written to app storage as it is recorded. A finished desktop
+ * session deletes it; a session the phone transcribed keeps it for {@link ClipStore#KEEP_MS}.
+ * When the phone has no recognizer (or it fails) and the desktop is out, the session carries on
+ * in {@link State#OFFLINE_RECORDING} and, on stop, keeps that file as a {@link PendingClip} for
+ * {@link PendingDictations}.
  */
 public final class ServerDictationEngine implements DictationEngine {
     static final int CHUNK_BYTES = Microphone.CHUNK_BYTES;
     /** Audio kept in memory while connecting: 10 s (it is on disk as well). */
     static final int MAX_PENDING_CHUNKS = 100;
     static final int CONNECT_TIMEOUT_MS = 2500;
-    /** From the tap until the server says ready, else the session records offline. */
+    /** From the tap until the server says ready, else the desktop is out of the session. */
     static final int READY_TIMEOUT_MS = 4000;
+    /** From stop to the desktop's final, when the phone's own text is there to fall back on. */
+    public static final int DEFAULT_FINAL_BUDGET_MS = 5000;
+    /** From stop to the desktop's final with nothing on the phone to fall back on. */
     static final int FINAL_TIMEOUT_MS = 20000;
+    /** From the moment the phone's recognizer is the one in use to its final, else the clip waits. */
+    static final int ON_DEVICE_FINAL_TIMEOUT_MS = 10000;
 
-    private final Context context;
+    /** The main thread: runs callbacks in order, one at a time. */
+    interface Main {
+        void post(Runnable r);
+
+        void postDelayed(Runnable r, long delayMs);
+
+        void remove(Runnable r);
+    }
+
+    /** How long each wait may take, in milliseconds. */
+    static final class Timeouts {
+        final long readyMs;
+        final long finalBudgetMs;
+        final long finalMs;
+        final long onDeviceFinalMs;
+
+        Timeouts(long readyMs, long finalBudgetMs, long finalMs, long onDeviceFinalMs) {
+            this.readyMs = readyMs;
+            this.finalBudgetMs = finalBudgetMs;
+            this.finalMs = finalMs;
+            this.onDeviceFinalMs = onDeviceFinalMs;
+        }
+
+        static Timeouts withFinalBudget(long finalBudgetMs) {
+            return new Timeouts(READY_TIMEOUT_MS, finalBudgetMs, FINAL_TIMEOUT_MS, ON_DEVICE_FINAL_TIMEOUT_MS);
+        }
+    }
+
     private final URI uri;
     private final PendingDictations pending;
-    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Main main;
+    private final AudioInput.Opener microphone;
+    private final BooleanSupplier permitted;
+    /** Null when the phone has no recognizer of its own. */
+    private final OnDeviceRecognizer.Factory onDevice;
+    private final Timeouts timeouts;
+    /** One line per fallback, reasons and timings only (never audio or text). */
+    private final Consumer<String> log;
     /** Main thread only. */
     private Session session;
 
+    /** Without the phone's recognizer: the desktop or a queued clip, as before. */
     public ServerDictationEngine(Context context, URI uri, PendingDictations pending) {
-        this.context = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        this(context, uri, pending, null, DEFAULT_FINAL_BUDGET_MS);
+    }
+
+    /**
+     * {@code onDevice} null when the phone has no recognizer; {@code finalBudgetMs} is how long
+     * after stop the desktop's final is waited for before the phone's text is used.
+     */
+    public ServerDictationEngine(Context context, URI uri, PendingDictations pending,
+            OnDeviceRecognizer.Factory onDevice, long finalBudgetMs) {
+        this(uri, pending, androidMain(), Microphone::open, permission(context), onDevice,
+                Timeouts.withFinalBudget(finalBudgetMs),
+                line -> android.util.Log.i(PendingDictations.TAG, line));
+    }
+
+    ServerDictationEngine(URI uri, PendingDictations pending, Main main, AudioInput.Opener microphone,
+            BooleanSupplier permitted, OnDeviceRecognizer.Factory onDevice, Timeouts timeouts,
+            Consumer<String> log) {
         this.uri = uri;
         this.pending = pending;
+        this.main = main;
+        this.microphone = microphone;
+        this.permitted = permitted;
+        this.onDevice = onDevice;
+        this.timeouts = timeouts;
+        this.log = log;
+    }
+
+    private static Main androidMain() {
+        Handler h = new Handler(Looper.getMainLooper());
+        return new Main() {
+            @Override public void post(Runnable r) {
+                h.post(r);
+            }
+
+            @Override public void postDelayed(Runnable r, long delayMs) {
+                h.postDelayed(r, delayMs);
+            }
+
+            @Override public void remove(Runnable r) {
+                h.removeCallbacks(r);
+            }
+        };
+    }
+
+    private static BooleanSupplier permission(Context context) {
+        Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        return () -> app.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     /**
@@ -66,8 +161,7 @@ public final class ServerDictationEngine implements DictationEngine {
     @Override
     public void start(String target, Listener listener) {
         if (session != null) return;
-        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
+        if (!permitted.getAsBoolean()) {
             listener.onError(new DictationException(
                     DictationException.Reason.PERMISSION, "Microphone permission is not granted"));
             listener.onState(State.IDLE);
@@ -94,24 +188,41 @@ public final class ServerDictationEngine implements DictationEngine {
         return true;
     }
 
+    /** The desktop's {@code ready.backend}: anything but "gpu" means its text will be late. */
+    static boolean fastBackend(JSONObject ready) {
+        return ready.optString("backend", "gpu").equals("gpu");
+    }
+
     private final class Session {
         private final Listener listener;
         private final ClipStore.Recording recording;
-        private final Runnable readyTimeout = () -> goOffline(null);
-        private final Runnable finishTimeout = () -> goOffline(null);
+        private final long startedAt = System.nanoTime();
+        private final Runnable readyTimeout = () -> goOffline("not ready in time", null);
+        private final Runnable finishTimeout = () -> goOffline("no final in time", null);
+        private final Runnable onDeviceTimeout = () -> onDeviceFailed("no final in time");
         /** Counted down once the server is ready or given up on, for a stop that came first. */
         private final CountDownLatch settled = new CountDownLatch(1);
-        /** Main thread: the desktop is out of this session; its audio goes to the clip. */
+        /** Main thread: the desktop is out of this session; the phone or the clip has its audio. */
         private boolean offline;
         /** Main thread: the mic thread has written its last audio. */
         private boolean micDone;
         /** Main thread: a partial is on screen. */
         private boolean shownPartial;
+        /** Main thread: when stop was tapped, for the log. */
+        private long stoppedAt;
+        /** Main thread: the phone's recognizer, null when there is none or it failed. */
+        private OnDeviceRecognizer local;
+        /** Main thread: the phone's latest partial, shown once the desktop is out. */
+        private String localPartial = "";
+        /** Main thread: the phone's final, once it has one. */
+        private String localFinal;
         private volatile boolean stopping;
         private volatile boolean cancelled;
         private volatile DictationSocket socket;
         /** Set once the server is ready and cleared when it is given up on: where audio goes. */
         private volatile DictationSocket ready;
+        /** What the mic thread feeds besides the clip and the desktop; null when none. */
+        private volatile OnDeviceRecognizer localFeed;
 
         Session(Listener listener, ClipStore.Recording recording) {
             this.listener = listener;
@@ -120,21 +231,53 @@ public final class ServerDictationEngine implements DictationEngine {
 
         void begin() {
             listener.onState(State.CONNECTING);
-            main.postDelayed(readyTimeout, READY_TIMEOUT_MS);
+            startOnDevice();
+            main.postDelayed(readyTimeout, timeouts.readyMs);
             new Thread(this::record, "dictation-mic").start();
             new Thread(this::converse, "dictation-socket").start();
+        }
+
+        /** Main thread: the phone's recognizer listens alongside the desktop from the start. */
+        private void startOnDevice() {
+            if (onDevice == null) return;
+            try {
+                local = onDevice.start(new OnDeviceRecognizer.Callback() {
+                    @Override public void onPartial(String text) {
+                        post(() -> localPartial(text));
+                    }
+
+                    @Override public void onFinal(String text) {
+                        post(() -> localFinal(text));
+                    }
+
+                    @Override public void onError(String why) {
+                        post(() -> onDeviceFailed(why));
+                    }
+                });
+            } catch (RuntimeException e) {
+                log.accept("dictation: the phone's recognizer did not start (" + e.getClass().getSimpleName() + ")");
+                local = null;
+            }
+            localFeed = local;
         }
 
         /** Main thread: stop recording; then the final, or the clip once the mic is done. */
         void finish() {
             if (stopping) return;
             stopping = true;
+            stoppedAt = System.nanoTime();
             if (offline) {
-                keepIfDone();
+                if (local != null) {
+                    listener.onState(State.TRANSCRIBING);
+                    main.postDelayed(onDeviceTimeout, timeouts.onDeviceFinalMs);
+                    deliverLocalIfDone();
+                } else {
+                    keepIfDone();
+                }
                 return;
             }
             listener.onState(State.TRANSCRIBING);
-            main.postDelayed(finishTimeout, FINAL_TIMEOUT_MS);
+            main.postDelayed(finishTimeout, local != null ? timeouts.finalBudgetMs : timeouts.finalMs);
         }
 
         /** Main thread, after {@link #cancel}: release everything, no more callbacks. */
@@ -146,12 +289,21 @@ public final class ServerDictationEngine implements DictationEngine {
 
         private void release() {
             stopping = true;
-            main.removeCallbacks(readyTimeout);
-            main.removeCallbacks(finishTimeout);
+            main.remove(readyTimeout);
+            main.remove(finishTimeout);
+            main.remove(onDeviceTimeout);
             ready = null;
             settled.countDown();
             DictationSocket s = socket;
             if (s != null) s.close();
+            stopOnDevice();
+        }
+
+        private void stopOnDevice() {
+            OnDeviceRecognizer l = local;
+            local = null;
+            localFeed = null;
+            if (l != null) l.cancel();
         }
 
         /** Main thread: the session is over; later callbacks for it are dropped. */
@@ -161,19 +313,39 @@ public final class ServerDictationEngine implements DictationEngine {
         }
 
         /**
-         * Main thread: the desktop is out of this session, from the start or partway. The audio
-         * so far is in the recording, so nothing heard is lost; if it is not being saved, the
-         * session fails instead.
+         * Main thread: the desktop is out of this session, from the start or partway. The phone's
+         * recognizer carries on if there is one; otherwise the audio so far is in the recording,
+         * so nothing heard is lost; if it is not being saved either, the session fails instead.
          */
-        private void goOffline(Exception cause) {
+        private void goOffline(String why, Exception cause) {
             if (session != this || offline) return;
             offline = true;
-            main.removeCallbacks(readyTimeout);
-            main.removeCallbacks(finishTimeout);
+            main.remove(readyTimeout);
+            main.remove(finishTimeout);
             ready = null;
             settled.countDown();
             DictationSocket s = socket;
             if (s != null) s.close();
+            log.accept("dictation: desktop out (" + why
+                    + (cause == null ? "" : ", " + cause.getClass().getSimpleName() + ": " + cause.getMessage())
+                    + ") " + sinceStart() + (local != null ? ", the phone transcribes" : ", recording for later"));
+            if (local != null) {
+                // The phone's own words replace the desktop's on screen.
+                shownPartial = !localPartial.isEmpty();
+                listener.onPartial(localPartial);
+                if (stopping) {
+                    main.postDelayed(onDeviceTimeout, timeouts.onDeviceFinalMs);
+                    deliverLocalIfDone();
+                } else {
+                    listener.onState(State.ON_DEVICE);
+                }
+                return;
+            }
+            toOfflineRecording(cause);
+        }
+
+        /** Main thread: no transcription now; the recording waits for the desktop. */
+        private void toOfflineRecording(Exception cause) {
             if (!recording.saved()) {
                 fail(new DictationException(DictationException.Reason.UNREACHABLE,
                         "The desktop is offline and the phone could not save the recording", cause));
@@ -187,9 +359,59 @@ public final class ServerDictationEngine implements DictationEngine {
             else listener.onState(State.OFFLINE_RECORDING);
         }
 
+        private void localPartial(String text) {
+            if (local == null) return;
+            localPartial = text == null ? "" : text;
+            if (!offline || stopping) return;
+            shownPartial = !localPartial.isEmpty();
+            listener.onPartial(localPartial);
+        }
+
+        private void localFinal(String text) {
+            if (local == null) return;
+            localFinal = text == null ? "" : text;
+            deliverLocalIfDone();
+        }
+
+        /** Main thread: the phone's recognizer stopped working. */
+        private void onDeviceFailed(String why) {
+            if (session != this || local == null) return;
+            log.accept("dictation: the phone's recognizer failed (" + why + ") " + sinceStart());
+            main.remove(onDeviceTimeout);
+            stopOnDevice();
+            localFinal = null;
+            if (offline) {
+                toOfflineRecording(null);
+            } else if (stopping) {
+                // Back to the long wait for the desktop: the phone has nothing to offer.
+                main.remove(finishTimeout);
+                main.postDelayed(finishTimeout, timeouts.finalMs);
+            }
+        }
+
+        /**
+         * Main thread: the phone's text is the session's once the desktop is out, stop was tapped,
+         * the mic has finished and the phone has its final. No speech heard by the phone leaves
+         * the recording for the desktop instead.
+         */
+        private void deliverLocalIfDone() {
+            if (session != this || !offline || !stopping || !micDone || local == null || localFinal == null) return;
+            String text = localFinal.trim();
+            if (text.isEmpty()) {
+                onDeviceFailed("heard no speech");
+                return;
+            }
+            end();
+            PendingClip kept = recording.keepTranscribedOnPhone();
+            log.accept("dictation: the phone's final " + (System.nanoTime() - stoppedAt) / 1_000_000
+                    + " ms after stop, recording " + (kept != null ? "kept" : "not saved"));
+            listener.onFinal(text, true);
+            listener.onState(State.IDLE);
+        }
+
         /** Main thread: once stopped, offline and the mic has finished, keeps the clip. */
         private void keepIfDone() {
-            if (session != this || !offline || !stopping || !micDone) return;
+            if (session != this || !offline || !stopping || !micDone || local != null) return;
             end();
             PendingClip clip = recording.keep();
             if (clip == null) {
@@ -211,6 +433,10 @@ public final class ServerDictationEngine implements DictationEngine {
             listener.onState(State.IDLE);
         }
 
+        private String sinceStart() {
+            return (System.nanoTime() - startedAt) / 1_000_000 + " ms into the session";
+        }
+
         /** Runs {@code r} on the main thread while this is still the live session. */
         private void post(Runnable r) {
             main.post(() -> {
@@ -222,7 +448,7 @@ public final class ServerDictationEngine implements DictationEngine {
         private void record() {
             ArrayDeque<byte[]> unsent = new ArrayDeque<>();
             boolean opened = false;
-            try (Microphone mic = Microphone.open()) {
+            try (AudioInput mic = microphone.open()) {
                 opened = true;
                 while (!stopping) {
                     byte[] chunk = new byte[CHUNK_BYTES];
@@ -233,6 +459,8 @@ public final class ServerDictationEngine implements DictationEngine {
                         post(this::finish);
                         break;
                     }
+                    OnDeviceRecognizer l = localFeed;
+                    if (l != null) l.write(chunk, n);
                     enqueue(unsent, n == chunk.length ? chunk : Arrays.copyOf(chunk, n));
                     send(unsent);
                 }
@@ -246,11 +474,13 @@ public final class ServerDictationEngine implements DictationEngine {
                 // The mic failed partway: keep what was heard, as if the user tapped stop.
                 post(this::finish);
             }
+            OnDeviceRecognizer l = localFeed;
+            if (l != null) l.endOfAudio();
             micFinished();
             if (cancelled) return;
             try {
                 // A stop before the server was ready waits for it, or for the session to go offline.
-                if (ready == null) settled.await(READY_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                if (ready == null) settled.await(timeouts.readyMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -261,7 +491,7 @@ public final class ServerDictationEngine implements DictationEngine {
                 send(unsent);
                 s.sendText("{\"type\":\"stop\"}");
             } catch (IOException e) {
-                post(() -> goOffline(e));
+                post(() -> goOffline("send failed", e));
             }
         }
 
@@ -270,12 +500,13 @@ public final class ServerDictationEngine implements DictationEngine {
             main.post(() -> {
                 micDone = true;
                 if (cancelled || session != this) {
-                    // Over (final, failure or cancel) before the mic finished: only keepIfDone,
-                    // which needs micDone, keeps a recording, so nothing will.
+                    // Over (final, failure or cancel) before the mic finished: only keepIfDone or
+                    // deliverLocalIfDone, which need micDone, keep a recording, so nothing will.
                     recording.discard();
                     return;
                 }
                 keepIfDone();
+                deliverLocalIfDone();
             });
         }
 
@@ -287,7 +518,7 @@ public final class ServerDictationEngine implements DictationEngine {
                 drain(unsent, s);
             } catch (IOException e) {
                 ready = null;
-                post(() -> goOffline(e));
+                post(() -> goOffline("send failed", e));
             }
         }
 
@@ -297,7 +528,7 @@ public final class ServerDictationEngine implements DictationEngine {
             try {
                 s = DictationSocket.connect(uri, CONNECT_TIMEOUT_MS);
             } catch (IOException e) {
-                post(() -> goOffline(e));
+                post(() -> goOffline("unreachable", e));
                 return;
             }
             socket = s;
@@ -312,9 +543,16 @@ public final class ServerDictationEngine implements DictationEngine {
                     String type = e.optString("type");
                     String text = e.optString("text");
                     if (type.equals("ready")) {
+                        boolean fast = fastBackend(e);
+                        String backend = e.optString("backend", "gpu");
                         post(() -> {
                             if (offline) return;
-                            main.removeCallbacks(readyTimeout);
+                            if (!fast && local != null) {
+                                // Its text would be late: the phone's is used from the start.
+                                goOffline("backend " + backend, null);
+                                return;
+                            }
+                            main.remove(readyTimeout);
                             ready = s;
                             settled.countDown();
                             listener.onState(stopping ? State.TRANSCRIBING : State.LISTENING);
@@ -329,19 +567,22 @@ public final class ServerDictationEngine implements DictationEngine {
                     } else if (type.equals("final")) {
                         post(() -> {
                             if (offline) return;
+                            log.accept("dictation: desktop final " + (System.nanoTime() - stoppedAt) / 1_000_000
+                                    + " ms after stop");
                             end();
                             if (micDone) recording.discard();
-                            listener.onFinal(text);
+                            listener.onFinal(text, false);
                             listener.onState(State.IDLE);
                         });
                         return;
                     } else if (type.equals("error")) {
-                        // e.g. the desktop's Whisper is down: the recording is still good.
-                        throw new IOException("server: " + e.optString("message"));
+                        // e.g. the desktop's Whisper is slow or down: the recording is still good.
+                        String code = e.optString("code", "unknown");
+                        throw new IOException("server error " + code + ": " + e.optString("message"));
                     }
                 }
             } catch (IOException | JSONException e) {
-                post(() -> goOffline(e));
+                post(() -> goOffline("dropped", e));
             } finally {
                 s.close();
             }

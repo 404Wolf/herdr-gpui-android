@@ -139,6 +139,11 @@ final class ComposerBar {
     /** The ghost JSON last handed over, so an unchanged one is not sent again. */
     private String lastGhost = "";
     private DictationEngine.State dictationState = DictationEngine.State.IDLE;
+    /**
+     * The last dictation was transcribed on the phone (the desktop was away or slow): "talk"
+     * reads "talk offline" until the next dictation, a send or a pane switch.
+     */
+    private boolean transcribedOnPhone;
     /** Enter was pressed while listening: send the utterance once it is final. */
     private boolean sendWhenFinal;
     /** Our own setText calls, which must not count as user edits. */
@@ -310,6 +315,7 @@ final class ComposerBar {
         }
         String text = drafts.switchTo(paneId);
         if (switched) {
+            transcribedOnPhone = false;
             keysOpen = false;
             showText(text);
         }
@@ -787,18 +793,29 @@ final class ComposerBar {
             }
             case TRANSCRIBING:
                 return new GhostText.Control("talk", words == Words.TINY ? "…" : "transcribing…", "info");
-            case OFFLINE_RECORDING: {
-                // The warning colour still says offline when the words cannot.
+            case ON_DEVICE: {
+                // The phone transcribes: the warning colour says offline when the words cannot.
                 String text;
                 switch (words) {
-                    case FULL: text = "desktop offline · rec " + clock + " · tap to stop"; break;
+                    case FULL: text = "● offline · rec " + clock + " · tap to stop"; break;
                     case SHORT: text = "● offline " + clock + " stop"; break;
                     default: text = "● stop";
                 }
                 return new GhostText.Control("talk", text, "warn");
             }
+            case OFFLINE_RECORDING: {
+                // No recognizer on the phone: the recording waits for the desktop.
+                String text;
+                switch (words) {
+                    case FULL: text = "offline · queued · rec " + clock + " · tap to stop"; break;
+                    case SHORT: text = "● queued " + clock + " stop"; break;
+                    default: text = "● stop";
+                }
+                return new GhostText.Control("talk", text, "warn");
+            }
             default:
-                return new GhostText.Control("talk", "talk", "dim", waiting > 0 ? "·" + waiting : "", "warn");
+                return new GhostText.Control("talk", "talk", "dim",
+                        (transcribedOnPhone ? " offline" : "") + (waiting > 0 ? "·" + waiting : ""), "warn");
         }
     }
 
@@ -980,7 +997,7 @@ final class ComposerBar {
     /** The microphone is open: the clock runs, and "talk" stops it. */
     static boolean recording(DictationEngine.State s) {
         return s == DictationEngine.State.CONNECTING || s == DictationEngine.State.LISTENING
-                || s == DictationEngine.State.OFFLINE_RECORDING;
+                || s == DictationEngine.State.ON_DEVICE || s == DictationEngine.State.OFFLINE_RECORDING;
     }
 
     /** A session runs: IDLE and PENDING both mean none does. */
@@ -1019,6 +1036,7 @@ final class ComposerBar {
         if (!agent || dictating()) return;
         if (typing) drafts.edit(field.getText().toString());
         drafts.dictationStarted();
+        transcribedOnPhone = false;
         final String pane = drafts.pane();
         dictation.start(pane, new DictationEngine.Listener() {
             @Override public void onPartial(String text) {
@@ -1026,7 +1044,15 @@ final class ComposerBar {
             }
 
             @Override public void onFinal(String text) {
+                onFinal(text, false);
+            }
+
+            @Override public void onFinal(String text, boolean onDevice) {
                 if (!pane.equals(drafts.pane())) return;
+                if (onDevice) {
+                    transcribedOnPhone = true;
+                    host.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
+                }
                 showText(drafts.dictationFinal(text));
                 if (sendWhenFinal) {
                     sendWhenFinal = false;
@@ -1090,6 +1116,7 @@ final class ComposerBar {
         // The draft stays until the message is queued or kept, so nothing is lost.
         if (!host.send(outgoing)) return;
         drafts.sent();
+        transcribedOnPhone = false;
         showText("");
     }
 

@@ -128,10 +128,11 @@ public final class ComposerBarTest {
         assertEquals("● offline 0:05 stop", folded.get(1).spans[0]);
     }
 
-    @Test public void theMicrophoneIsOpenWhileConnectingListeningOrRecordingOffline() {
+    @Test public void theMicrophoneIsOpenWhileConnectingListeningOnDeviceOrRecordingOffline() {
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.CONNECTING));
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.LISTENING));
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.OFFLINE_RECORDING));
+        assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.ON_DEVICE));
         assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.TRANSCRIBING));
         assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.PENDING));
         assertFalse(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.IDLE));

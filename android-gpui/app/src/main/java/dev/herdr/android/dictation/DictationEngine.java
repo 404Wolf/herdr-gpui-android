@@ -1,16 +1,21 @@
 package dev.herdr.android.dictation;
 
 /**
- * Speech-to-text for the composer, always on the desktop's Whisper. Tap to {@link #start}, tap
- * again to {@link #stop}: an engine never stops itself on silence.
+ * Speech-to-text for the composer, on the desktop's Whisper when it answers in time, else on the
+ * phone. Tap to {@link #start}, tap again to {@link #stop}: an engine never stops itself on
+ * silence.
  *
  * <p>A session goes CONNECTING, LISTENING (partials), TRANSCRIBING, then onFinal and
- * {@link State#IDLE}. When the desktop cannot be reached, or drops mid-session, it goes
+ * {@link State#IDLE}. When the desktop cannot be reached, drops mid-session, says its
+ * transcription is slow or on its CPU, or has no final soon enough after {@link #stop}, the
+ * phone's own recognizer takes over ({@link State#ON_DEVICE}): its text comes back through
+ * {@code onFinal(text, true)}, marked offline. Without a recognizer on the phone the session goes
  * {@link State#OFFLINE_RECORDING} instead: the microphone keeps going and the whole session's
  * audio is saved in app storage; on {@link #stop} the session ends with onPending and
  * {@link State#PENDING}, and {@link PendingDictations} transcribes the recording once the desktop
  * is back. Every session ends in exactly one of IDLE or PENDING; after either, {@link #start}
- * begins a new one.
+ * begins a new one. Audio is never lost: a session the phone transcribed keeps its recording
+ * for {@link ClipStore#KEEP_MS} (not sent anywhere, never replacing the text).
  *
  * <p>All methods are called on the main thread, and every {@link Listener} callback is delivered
  * on the main thread. One session at a time: {@link #start} during one is ignored.
@@ -33,6 +38,12 @@ public interface DictationEngine {
          */
         OFFLINE_RECORDING,
         /**
+         * Recording, with the phone's own recognizer giving the partials and the final: the
+         * desktop is out of this session (unreachable, slow, or on its CPU). Any desktop partial
+         * shown was replaced by the phone's.
+         */
+        ON_DEVICE,
+        /**
          * The session is over and its recording waits for the desktop (see onPending). Like
          * {@link #IDLE}, {@link #start} begins a new session.
          */
@@ -49,6 +60,14 @@ public interface DictationEngine {
 
         /** The finished utterance after {@link #stop}; {@link State#IDLE} follows. */
         void onFinal(String text);
+
+        /**
+         * The finished utterance, {@code onDevice} when the phone transcribed it (show it as
+         * offline). Engines call this one; by default it forwards to {@link #onFinal(String)}.
+         */
+        default void onFinal(String text, boolean onDevice) {
+            onFinal(text);
+        }
 
         void onState(State state);
 
@@ -70,7 +89,7 @@ public interface DictationEngine {
      */
     void start(String target, Listener listener);
 
-    /** Ends recording; then onFinal, or onPending when the desktop is away. */
+    /** Ends recording; then onFinal, or onPending when neither the desktop nor the phone can transcribe. */
     void stop();
 
     /** Ends the session at once, discarding its audio and text; no further callbacks for it. */

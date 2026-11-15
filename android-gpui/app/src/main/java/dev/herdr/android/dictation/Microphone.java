@@ -3,10 +3,9 @@ package dev.herdr.android.dictation;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
-import java.io.Closeable;
 
 /** The microphone as 16 kHz mono PCM16, read in 100 ms chunks on the caller's thread. */
-final class Microphone implements Closeable {
+final class Microphone implements AudioInput {
     static final int RATE = 16000;
     static final int CHUNK_BYTES = RATE * 2 / 10;
 
@@ -58,7 +57,8 @@ final class Microphone implements Closeable {
      * Fills {@code chunk} unless {@code stop} turns true first; returns the bytes read, which is
      * less than a chunk only when stopping.
      */
-    int read(byte[] chunk, java.util.function.BooleanSupplier stop) throws Failure {
+    @Override
+    public int read(byte[] chunk, java.util.function.BooleanSupplier stop) throws Failure {
         int n = 0;
         while (n < chunk.length && !stop.getAsBoolean()) {
             int r = record.read(chunk, n, chunk.length - n);
