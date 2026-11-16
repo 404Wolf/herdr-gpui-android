@@ -36,6 +36,10 @@ pub enum Error {
     Rpc { kind: String, message: String },
     #[error("Saved pane is unreadable")]
     Snapshot,
+    /// A project's new window started and is shown, but its tab is not in
+    /// herdr-app's layout, so the phone cannot rename or move it.
+    #[error("The window started, but its tab could not be saved in the layout ({0}); rename or move it on the desktop")]
+    WindowNotPlaced(#[source] Box<Error>),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
