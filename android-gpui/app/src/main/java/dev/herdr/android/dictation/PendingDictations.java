@@ -268,6 +268,15 @@ public final class PendingDictations {
         for (PendingClip clip : waiting) {
             String text;
             long t = System.nanoTime();
+            // Counted before it is sent, on disk: a crash or a lost index write never lets a long
+            // clip be re-sent without end. No count written, no send.
+            if (store.charge(clip.id) < 0) {
+                log.accept(line(sent, sentMs, waiting.size() - sent, started)
+                        + ", cannot record the attempt (storage), retry in " + retryMs / 1000 + " s");
+                schedule(retryMs);
+                retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
+                return;
+            }
             try {
                 text = transcriber.transcribe(clip, store.audio(clip.id));
             } catch (IOException e) {
@@ -298,12 +307,16 @@ public final class PendingDictations {
                 : new UploadFailure(UploadFailure.Kind.UNREACHABLE, false, e.getMessage(), e);
         String what = f.kind.name().toLowerCase(java.util.Locale.ROOT);
         if (f.attempted) {
-            int n = store.attempted(clip.id);
+            int n = store.attempts(clip.id);
             what += ", attempt " + n + " of " + ClipStore.MAX_ATTEMPTS;
             if (n >= ClipStore.MAX_ATTEMPTS) {
+                store.park(clip.id);
                 what += ", parked";
                 main.execute(this::changed);
             }
+        } else {
+            // Charged before sending, but the desktop never decoded it.
+            store.refund(clip.id);
         }
         if (f.kind == UploadFailure.Kind.DEGRADED) {
             degraded = false; // a fresh spell: its wait starts now
@@ -367,9 +380,11 @@ public final class PendingDictations {
             if (ready == null || !"ready".equals(ready.optString("type"))) {
                 throw failure(ready, false);
             }
-            if (!ServerDictationEngine.fastBackend(ready)) {
+            // Only a desktop that says it is on its GPU gets the clip: a missing backend (an old
+            // server, without resume or an upload mode) is not taken on trust here.
+            if (!"gpu".equals(ready.optString("backend", ""))) {
                 throw new UploadFailure(UploadFailure.Kind.DEGRADED, false,
-                        "backend " + ready.optString("backend") + ": not sent");
+                        "backend " + ready.optString("backend", "not given") + ": not sent");
             }
             byte[] frame = new byte[UPLOAD_FRAME_BYTES];
             for (int n; (n = in.read(frame)) > 0; ) socket.sendBinary(frame, 0, n);

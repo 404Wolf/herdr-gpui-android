@@ -296,15 +296,58 @@ final class ClipStore {
      * and at {@link #MAX_ATTEMPTS} the clip is parked. The attempts so far, -1 if unknown.
      */
     synchronized int attempted(String id) {
+        int n = charge(id);
+        if (n >= MAX_ATTEMPTS) park(id);
+        return n;
+    }
+
+    /**
+     * Counts an upload of {@code id} before it is sent, durably: the attempts after it, or -1
+     * when the count could not be written (then the clip must not be sent: an upload the index
+     * does not know of could be repeated without end across restarts).
+     */
+    synchronized int charge(String id) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
             if (!e.clip.id.equals(id) || e.text != null) continue;
             int n = e.attempts + 1;
-            entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, n >= MAX_ATTEMPTS));
-            save();
+            entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, e.parked));
+            if (!save()) {
+                entries.set(i, e);
+                return -1;
+            }
             return n;
         }
         return -1;
+    }
+
+    /** The charged upload never reached the desktop's decoder: it does not count. */
+    synchronized void refund(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.attempts == 0) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts - 1, e.parked));
+            // A refund that is not written leaves the count high: the safe side.
+            save();
+            return;
+        }
+    }
+
+    /** After {@link #MAX_ATTEMPTS} counted uploads: parked, sent again only by hand. */
+    synchronized void park(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.parked) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts, true));
+            save();
+            return;
+        }
+    }
+
+    /** The counted uploads of {@code id} so far. */
+    synchronized int attempts(String id) {
+        for (Entry e : entries) if (e.clip.id.equals(id)) return e.attempts;
+        return 0;
     }
 
     /** The user's retry of a parked clip: it waits for the desktop again, its count reset. */

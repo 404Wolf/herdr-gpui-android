@@ -255,6 +255,69 @@ public final class CourierDegradedTest {
         }
     }
 
+    @Test public void aReadyWithoutABackendGetsNoAudioFromTheCourier() throws Exception {
+        // An old server says nothing of its backend: no resume, no upload mode. Not trusted.
+        try (FakeDesktop desktop = new FakeDesktop("{\"type\":\"ready\"}")) {
+            File audio = dir.newFile("a.pcm");
+            java.nio.file.Files.write(audio.toPath(), new byte[ClipStore.BYTES_PER_SECOND / 5]);
+            try {
+                PendingDictations.upload(desktop.uri(), "clip-old", audio);
+                fail("not sent");
+            } catch (UploadFailure f) {
+                assertEquals(UploadFailure.Kind.DEGRADED, f.kind);
+                assertFalse(f.attempted);
+            }
+            assertEquals("no PCM sent", 0, desktop.audioBytes());
+        }
+    }
+
+    @Test public void theAttemptIsCountedOnDiskBeforeTheSendAndRefundedIfNothingWasDecoded() {
+        ClipStore store = store();
+        PendingClip clip = record(store, "pane", 10);
+        int[] seenAttempts = {-1};
+        PendingDictations crashing = new PendingDictations(store, (c, file) -> {
+            // What a fresh process would read now, mid-upload.
+            seenAttempts[0] = store().attempts(c.id);
+            throw new IllegalStateException("killed mid-upload");
+        }, worker, Runnable::run, line -> { }, now::get);
+        try {
+            crashing.pass();
+            fail("crashed");
+        } catch (IllegalStateException expected) {
+            // the process died
+        }
+        assertEquals("charged on disk before the send", 1, seenAttempts[0]);
+        assertEquals("a restart remembers it", 1, store().attempts(clip.id));
+        // A desktop on its CPU never decodes it: the charge comes back.
+        ClipStore again = store();
+        PendingDictations refusing = new PendingDictations(again, (c, file) -> {
+            throw new UploadFailure(UploadFailure.Kind.DEGRADED, false, "backend cpu: not sent");
+        }, worker, Runnable::run, line -> { }, now::get);
+        refusing.pass();
+        assertEquals(1, again.attempts(clip.id));
+        assertEquals(1, store().attempts(clip.id));
+    }
+
+    @Test public void noSendWhenTheAttemptCannotBeWritten() throws Exception {
+        ClipStore store = store();
+        record(store, "pane", 10);
+        File blocker = new File(new File(dir.getRoot(), "pending"), ClipStore.INDEX + ".tmp");
+        assertTrue(blocker.mkdirs());
+        assertTrue(new File(blocker, "x").createNewFile());
+        int[] sends = {0};
+        PendingDictations pending = new PendingDictations(store, (c, file) -> {
+            sends[0]++;
+            return "text";
+        }, worker, Runnable::run, line -> { }, now::get);
+        pending.pass();
+        assertEquals("an uncounted upload could repeat without end", 0, sends[0]);
+        // Room again: it goes.
+        new File(blocker, "x").delete();
+        assertTrue(blocker.delete());
+        worker.advance(PendingDictations.FIRST_RETRY_MS);
+        assertEquals(1, sends[0]);
+    }
+
     @Test public void backendSlowAfterTheClipIsADegradedAttempt() throws Exception {
         try (FakeDesktop desktop = new FakeDesktop("{\"type\":\"ready\",\"backend\":\"gpu\"}",
                 "{\"type\":\"error\",\"code\":\"backend_slow\",\"message\":\"transcription backend slow\","
