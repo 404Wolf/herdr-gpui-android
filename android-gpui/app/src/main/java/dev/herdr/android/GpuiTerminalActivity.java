@@ -4233,10 +4233,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             new dev.herdr.android.dictation.PendingDictations.Listener() {
                 @Override public void onTranscribed(dev.herdr.android.dictation.PendingClip clip, String text) {
                     if (composer == null) return;
-                    if (!composer.placeDictation(clip.id, text) && !outbox.fillDictation(clip.id, text)) {
-                        composer.appendDictation(clip.target, text);
+                    // The recording goes only once its text is durably stored: in a draft, a queued
+                    // message, or the end of its pane's draft. A failed write leaves all as it was,
+                    // and the text is offered again shortly.
+                    int placed = composer.placeDictation(clip.id, text);
+                    if (placed == 0) placed = outbox.fillDictation(clip.id, text);
+                    if (placed == 0) placed = composer.appendDictation(clip.target, text) ? 1 : -1;
+                    dev.herdr.android.dictation.PendingDictations pending = Dictation.pending(GpuiTerminalActivity.this);
+                    if (placed > 0) {
+                        pending.delivered(clip.id);
+                    } else {
+                        main.postDelayed(() -> pending.offerAgain(clip.id), 5_000);
                     }
-                    Dictation.pending(GpuiTerminalActivity.this).delivered(clip.id);
                 }
 
                 @Override public void onChanged() {

@@ -225,6 +225,104 @@ public final class ServerDictationEngineTest {
         assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(run.listener.pendingClip.id).toPath()));
     }
 
+    @Test public void theLiveStartCarriesTheRecordingsIdThatAQueuedClipKeeps() throws Exception {
+        // Never ready, no recognizer: the session records for later, under the id it started with.
+        server = new FakeServer(Behaviour.silent());
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertNotNull(run.listener.pendingClip);
+        JSONObject start = server.starts.get(0);
+        assertEquals("live", start.getString("mode"));
+        assertEquals(16000, start.getInt("sample_rate"));
+        assertEquals("the courier resends it under the same id", run.listener.pendingClip.id, start.getString("id"));
+    }
+
+    @Test public void theRecordingIsDeletedOnlyAfterTheFinalWasStored() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        File dirFile = new File(dir.getRoot(), "pending");
+        boolean[] audioAtFinal = {false};
+        run.listener.atFinal = () -> {
+            File[] parts = dirFile.listFiles((d, n) -> n.endsWith(".part"));
+            audioAtFinal[0] = parts != null && parts.length == 1 && parts[0].length() > 0;
+        };
+        dictate(server.uri(), null, 300, run);
+        run.awaitEnd();
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertTrue("the audio was still there when the final was handed over", audioAtFinal[0]);
+        Thread.sleep(200);
+        File[] left = dirFile.listFiles((d, n) -> n.endsWith(".part") || n.endsWith(".pcm"));
+        assertEquals("deleted once stored", 0, left == null ? 0 : left.length);
+    }
+
+    @Test public void aFinalWhoseTextCouldNotBeStoredKeepsItsRecording() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.listener.stores = false;
+        dictate(server.uri(), null, 300, run);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        // A durable parked clip, "not transcribed yet · retry": no 48 h expiry, never sent on its own.
+        assertTrue("not rescue audio that expires", store.keptClips().isEmpty());
+        assertEquals(1, store.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.parked().get(0).id).toPath()));
+        assertTrue(store.untranscribed().isEmpty());
+        // Still there after a restart, however long after.
+        ClipStore later = new ClipStore(new File(dir.getRoot(), "pending"), () -> System.currentTimeMillis() + 3 * ClipStore.KEEP_MS);
+        assertEquals(1, later.parked().size());
+    }
+
+    @Test public void aPhoneFinalWhoseTextCouldNotBeStoredIsParkedNeverExpiring() throws Exception {
+        // The desktop is on its CPU: the phone transcribes; its text cannot be saved.
+        server = new FakeServer(Behaviour.fast(READY_CPU));
+        Run run = new Run();
+        run.listener.stores = false;
+        dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300, run);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(PHONE_WORDS, run.listener.finalText);
+        assertTrue(run.listener.onDevice);
+        assertTrue("not rescue audio that expires", store.keptClips().isEmpty());
+        assertEquals(1, store.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.parked().get(0).id).toPath()));
+        ClipStore later = new ClipStore(new File(dir.getRoot(), "pending"),
+                () -> System.currentTimeMillis() + 3 * ClipStore.KEEP_MS);
+        assertEquals("still there 3 x 48 h later", 1, later.parked().size());
+    }
+
+    @Test public void aStoredPhoneFinalKeepsItsRecordingAsRescueAudio() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_CPU));
+        Run run = dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(1, store.keptClips().size());
+        assertTrue(store.parked().isEmpty());
+    }
+
+    @Test public void aCrashWhileStoringTheFinalKeepsTheAudioForTheNextStart() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.listener.atFinal = () -> {
+            throw new IllegalStateException("killed while storing the text");
+        };
+        dictate(server.uri(), null, 300, run);
+        Thread.sleep(1500);
+        // The next start finds the audio and offers it as "not transcribed yet".
+        ClipStore restarted = new ClipStore(new File(dir.getRoot(), "pending"));
+        assertEquals(1, restarted.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(restarted.audio(restarted.parked().get(0).id).toPath()));
+    }
+
+    @Test public void finishingIsShownAndTheFinalStillLands() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU).finishing().finalAfter(300));
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertEquals(1, run.listener.finishing);
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertFalse(run.listener.onDevice);
+    }
+
     @Test public void withoutARecognizerASlowDesktopIsWaitedForLonger() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU).finalAfter(1200));
         Run run = dictate(server.uri(), null, 300);
@@ -351,11 +449,28 @@ public final class ServerDictationEngineTest {
             partials.add(text);
         }
 
+        volatile int finishing;
+
+        @Override public void onFinishing(double tailSeconds) {
+            finishing++;
+        }
+
         @Override public void onFinal(String text) {
             throw new AssertionError("engines call onFinal(text, onDevice)");
         }
 
+        /** Run when the final arrives, before anything else (a check, or a simulated crash). */
+        volatile Runnable atFinal;
+        /** What finalStored() answers: false as when the draft's write failed. */
+        volatile boolean stores = true;
+
+        @Override public boolean finalStored() {
+            return stores;
+        }
+
         @Override public void onFinal(String text, boolean onDevice) {
+            Runnable r = atFinal;
+            if (r != null) r.run();
             finalText = text;
             this.onDevice = onDevice;
             finals++;

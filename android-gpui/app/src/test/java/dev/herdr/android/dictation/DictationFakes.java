@@ -202,6 +202,14 @@ public final class DictationFakes {
             dropOnAudio = true;
             return this;
         }
+
+        boolean finishing;
+
+        /** After stop: {"type":"status","state":"finishing"} before the final. */
+        public Behaviour finishing() {
+            finishing = true;
+            return this;
+        }
     }
 
     /** The desktop's dictation server, speaking server.py's protocol on a local port. */
@@ -210,6 +218,8 @@ public final class DictationFakes {
         private final Behaviour behaviour;
         private final ByteArrayOutputStream audio = new ByteArrayOutputStream();
         private final List<Socket> open = Collections.synchronizedList(new ArrayList<>());
+        /** Every session's start message, in order. */
+        public final List<JSONObject> starts = Collections.synchronizedList(new ArrayList<>());
 
         public FakeServer(Behaviour behaviour) throws IOException {
             this.behaviour = behaviour;
@@ -250,6 +260,7 @@ public final class DictationFakes {
                 WebSocketFrames.Reader reader = new WebSocketFrames.Reader(in, 1 << 20);
                 WebSocketFrames.Message start = reader.next();
                 assertEquals("start", new JSONObject(start.text()).getString("type"));
+                starts.add(new JSONObject(start.text()));
                 if (behaviour.ready == null) {
                     while (true) reader.next(); // never ready: read until the phone gives up
                 }
@@ -276,6 +287,9 @@ public final class DictationFakes {
                         }
                     } else if (m.opcode == WebSocketFrames.TEXT
                             && new JSONObject(m.text()).getString("type").equals("stop")) {
+                        if (behaviour.finishing) {
+                            send(out, "{\"type\":\"status\",\"state\":\"finishing\",\"tail_s\":12.3}");
+                        }
                         Thread.sleep(behaviour.finalDelayMs);
                         send(out, "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
                         s.close();

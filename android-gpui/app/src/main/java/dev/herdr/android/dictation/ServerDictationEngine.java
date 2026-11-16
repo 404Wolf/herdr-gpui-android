@@ -415,10 +415,21 @@ public final class ServerDictationEngine implements DictationEngine {
                 return;
             }
             end();
-            PendingClip kept = recording.keepTranscribedOnPhone();
-            log.accept("dictation: the phone's final " + (System.nanoTime() - stoppedAt) / 1_000_000
-                    + " ms after stop, recording " + (kept != null ? "kept" : "not saved"));
+            // The text is handed over first; only once it is stored is the recording kept as
+            // rescue audio (48 h). Not stored, the recording stays a parked clip with no expiry
+            // ("not transcribed yet · retry"), as on the desktop path.
             listener.onFinal(text, true);
+            boolean stored = listener.finalStored();
+            PendingClip kept;
+            if (stored) {
+                kept = recording.keepTranscribedOnPhone();
+            } else {
+                kept = recording.keepParked();
+                pending.saved();
+            }
+            log.accept("dictation: the phone's final " + (System.nanoTime() - stoppedAt) / 1_000_000
+                    + " ms after stop, " + (stored ? "stored" : "text not stored")
+                    + ", recording " + (kept == null ? "not saved" : stored ? "kept 48 h" : "parked"));
             listener.onState(State.IDLE);
         }
 
@@ -501,13 +512,33 @@ public final class ServerDictationEngine implements DictationEngine {
         }
 
         /** Mic thread: tells the main thread the recording is complete. */
+        /** Main thread: a final's text was not stored: its recording is kept as rescue audio. */
+        private boolean keepAfterFinal;
+
+        /** Main thread, after a desktop final: delete the recording, or keep it if the text is not stored. */
+        private void settleRecording() {
+            if (keepAfterFinal) keepUnstored();
+            else recording.discard();
+        }
+
+        /**
+         * The final's text could not be stored: the recording stays as a durable parked clip
+         * ("not transcribed yet · retry"), never rescue audio that expires.
+         */
+        private void keepUnstored() {
+            recording.keepParked();
+            pending.saved();
+        }
+
         private void micFinished() {
             main.post(() -> {
                 micDone = true;
                 if (cancelled || session != this) {
                     // Over (final, failure or cancel) before the mic finished: only keepIfDone or
-                    // deliverLocalIfDone, which need micDone, keep a recording, so nothing will.
-                    recording.discard();
+                    // deliverLocalIfDone, which need micDone, keep a recording; a final whose text
+                    // could not be stored keeps it too.
+                    if (keepAfterFinal && !cancelled) keepUnstored();
+                    else recording.discard();
                     return;
                 }
                 keepIfDone();
@@ -539,7 +570,9 @@ public final class ServerDictationEngine implements DictationEngine {
             socket = s;
             try {
                 if (cancelled) return;
-                s.sendText("{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}");
+                // The recording's id: the courier resends a kept clip under the same id, so the
+                // desktop resumes from what it decoded or answers from its cache.
+                s.sendText(PendingDictations.startMessage(recording.id, "live"));
                 while (true) {
                     WebSocketFrames.Message m = s.read();
                     if (m == null) throw new IOException("the server closed the session");
@@ -550,6 +583,8 @@ public final class ServerDictationEngine implements DictationEngine {
                     if (type.equals("ready")) {
                         boolean fast = fastBackend(e);
                         String backend = e.optString("backend", "gpu");
+                        // The courier learns the desktop's state from every live session.
+                        pending.desktopReady(fast);
                         post(() -> {
                             if (offline) return;
                             if (!fast && local != null) {
@@ -561,8 +596,15 @@ public final class ServerDictationEngine implements DictationEngine {
                             ready = s;
                             settled.countDown();
                             listener.onState(stopping ? State.TRANSCRIBING : State.LISTENING);
-                            pending.kick(0);
                         });
+                    } else if (type.equals("status")) {
+                        // "finishing": the final waits for a decode; it follows, not an error.
+                        if ("finishing".equals(e.optString("state"))) {
+                            double tail = e.optDouble("tail_s", 0);
+                            post(() -> {
+                                if (!offline) listener.onFinishing(tail);
+                            });
+                        }
                     } else if (type.equals("partial")) {
                         post(() -> {
                             if (offline) return;
@@ -575,14 +617,19 @@ public final class ServerDictationEngine implements DictationEngine {
                             log.accept("dictation: desktop final " + (System.nanoTime() - stoppedAt) / 1_000_000
                                     + " ms after stop");
                             end();
-                            if (micDone) recording.discard();
+                            // The text is stored first (the composer saves its draft at once);
+                            // only then is the recording deleted: a crash in between keeps the
+                            // audio, recovered at the next start.
                             listener.onFinal(text, false);
+                            keepAfterFinal = !listener.finalStored();
+                            if (micDone) settleRecording();
                             listener.onState(State.IDLE);
                         });
                         return;
                     } else if (type.equals("error")) {
                         // e.g. the desktop's Whisper is slow or down: the recording is still good.
                         String code = e.optString("code", "unknown");
+                        if (UploadFailure.degradedCode(code)) pending.desktopDegraded();
                         throw new IOException("server error " + code + ": " + e.optString("message"));
                     }
                 }

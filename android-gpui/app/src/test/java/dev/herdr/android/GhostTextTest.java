@@ -68,4 +68,13 @@ public final class GhostTextTest {
         assertEquals("other", GhostText.kind("aider"));
         assertEquals("other", GhostText.kind(null));
     }
+
+    @Test public void aParkedRecordingsChipReadsNotTranscribedYet() throws Exception {
+        String token = DictationToken.of("c-2");
+        Map<String, Long> lengths = new HashMap<>();
+        lengths.put("c-2", 124_600L);
+        JSONObject o = new JSONObject(GhostText.json("claude", "see " + token, -1, lengths,
+                Collections.singleton("c-2"), Collections.emptyList(), "t1", NONE, COLORS));
+        assertEquals("[2:04 not transcribed yet · retry]", o.getJSONArray("draft").getJSONObject(1).getString("t"));
+    }
 }

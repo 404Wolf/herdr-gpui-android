@@ -33,6 +33,17 @@ final class DictationRouting {
 
         /** The text just placed on screen is the phone's: say so ("talk offline"). */
         void transcribedOnPhone();
+
+        /** The desktop's final waits for a decode: "finishing…" instead of "transcribing…". */
+        default void finishing() { }
+
+        /**
+         * Saves the drafts to disk now, before the recording a final came from is deleted; false
+         * when the write failed (the engine then keeps the recording).
+         */
+        default boolean persistNow() {
+            return true;
+        }
     }
 
     /** What the composer's Enter does in a dictation state ({@link #onEnter}). */
@@ -94,6 +105,13 @@ final class DictationRouting {
                 onFinal(text, false);
             }
 
+            /** Whether the last final's text reached the disk. */
+            private boolean stored = true;
+
+            @Override public boolean finalStored() {
+                return stored;
+            }
+
             @Override public void onFinal(String text, boolean onDevice) {
                 if (onDevice) {
                     bar.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
@@ -105,6 +123,8 @@ final class DictationRouting {
                     // Switched away while it finished: it joins the end of its own pane's draft.
                     bar.appendDictation(pane, text);
                 }
+                // Saved before the engine deletes the recording; not saved, it keeps it.
+                stored = bar.persistNow();
                 // The session is over (IDLE follows): Enter must send, not wait again.
                 settle(DictationEngine.State.IDLE);
             }
@@ -115,6 +135,10 @@ final class DictationRouting {
                 if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPending(clip.id));
                 // A message sent with the chip waits in the outbox until the desktop fills it in.
                 settle(DictationEngine.State.PENDING);
+            }
+
+            @Override public void onFinishing(double tailSeconds) {
+                bar.finishing();
             }
 
             @Override public void onState(DictationEngine.State state) {

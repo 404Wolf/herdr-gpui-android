@@ -52,6 +52,12 @@ public final class PendingDictations {
     static final String TAG = "HerdrDictation";
     static final long FIRST_RETRY_MS = 10_000;
     static final long MAX_RETRY_MS = 5 * 60_000;
+    /**
+     * While the desktop is degraded (on its CPU, slow, its backend down) clips wait this long,
+     * doubling to {@link #MAX_DEGRADED_RETRY_MS}; only the desktop seen ready on its GPU ends it.
+     */
+    static final long FIRST_DEGRADED_RETRY_MS = 2 * 60_000;
+    static final long MAX_DEGRADED_RETRY_MS = 30 * 60_000;
     /** After the network comes back, give the tailnet a moment before trying. */
     static final long NETWORK_SETTLE_MS = 3_000;
 
@@ -71,6 +77,13 @@ public final class PendingDictations {
     /** Worker thread only. */
     private ScheduledFuture<?> scheduled;
     private long retryMs = FIRST_RETRY_MS;
+    /** Worker thread only: the desktop is degraded; {@link #kick} does not cut the wait short. */
+    private boolean degraded;
+    private long degradedRetryMs = FIRST_DEGRADED_RETRY_MS;
+    /** Worker thread only: the clock for {@link #degradedUntil} (milliseconds). */
+    private final java.util.function.LongSupplier clock;
+    /** Worker thread only: no pass before this while degraded. */
+    private long degradedUntil;
 
     /** The process's instance. Call on the main thread; {@code uri} null means no server. */
     public static synchronized PendingDictations shared(Context context, URI uri) {
@@ -79,7 +92,7 @@ public final class PendingDictations {
         File dir = new File(app.getNoBackupFilesDir(), "dictation-pending");
         Transcriber transcriber = uri == null ? (clip, audio) -> {
             throw new IOException("no dictation server");
-        } : (clip, audio) -> upload(uri, audio);
+        } : (clip, audio) -> upload(uri, clip.id, audio);
         shared = new PendingDictations(new ClipStore(dir), transcriber,
                 Executors.newSingleThreadScheduledExecutor(r -> {
                     Thread t = new Thread(r, "dictation-pending");
@@ -104,6 +117,12 @@ public final class PendingDictations {
 
     PendingDictations(ClipStore store, Transcriber transcriber, ScheduledExecutorService worker, Executor main,
             java.util.function.Consumer<String> log) {
+        this(store, transcriber, worker, main, log, System::currentTimeMillis);
+    }
+
+    PendingDictations(ClipStore store, Transcriber transcriber, ScheduledExecutorService worker, Executor main,
+            java.util.function.Consumer<String> log, java.util.function.LongSupplier clock) {
+        this.clock = clock;
         this.store = store;
         this.transcriber = transcriber;
         this.worker = worker;
@@ -142,6 +161,12 @@ public final class PendingDictations {
         changed();
     }
 
+    /** Its text could not be stored where it goes: offer it again (the recording is kept). Main thread. */
+    public void offerAgain(String id) {
+        offered.remove(id);
+        offer();
+    }
+
     /** The user threw the recording away. Main thread. */
     public void drop(String id) {
         delivered(id);
@@ -153,11 +178,65 @@ public final class PendingDictations {
         worker.execute(() -> schedule(retryMs));
     }
 
-    /** Try the waiting clips after {@code delayMs}, e.g. the desktop was just seen up. */
+    /**
+     * Try the waiting clips after {@code delayMs}, e.g. the network came back. While the desktop
+     * is degraded this does not cut its wait short: only {@link #desktopReady} on its GPU does.
+     */
     void kick(long delayMs) {
         worker.execute(() -> {
+            if (degraded) return;
             retryMs = FIRST_RETRY_MS;
             schedule(delayMs);
+        });
+    }
+
+    /**
+     * A live session found the desktop ready: on its GPU ({@code fast}) the waiting clips go now
+     * and a degraded spell ends; otherwise the desktop is degraded and the clips keep waiting.
+     */
+    void desktopReady(boolean fast) {
+        worker.execute(() -> {
+            if (fast) {
+                degraded = false;
+                degradedRetryMs = FIRST_DEGRADED_RETRY_MS;
+                retryMs = FIRST_RETRY_MS;
+                schedule(0);
+            } else {
+                markDegraded();
+            }
+        });
+    }
+
+    /** A live session heard backend_slow / backend_unavailable: the clips wait too. */
+    void desktopDegraded() {
+        worker.execute(this::markDegraded);
+    }
+
+    /** Worker thread: starts (or keeps) a degraded spell, with its long wait. */
+    private void markDegraded() {
+        long now = clock.getAsLong();
+        if (degraded && now < degradedUntil) return;
+        degraded = true;
+        degradedUntil = now + degradedRetryMs;
+        reschedule(degradedRetryMs);
+        degradedRetryMs = Math.min(MAX_DEGRADED_RETRY_MS, degradedRetryMs * 2);
+    }
+
+    /** Recordings given up on after {@link ClipStore#MAX_ATTEMPTS} uploads, for a manual retry. */
+    public List<PendingClip> parked() {
+        return store.parked();
+    }
+
+    /** The user's retry of a parked recording: it waits for the desktop again. Main thread. */
+    public void retry(String id) {
+        if (!store.unpark(id)) return;
+        changed();
+        // The user's word: it goes now, whatever the desktop was last seen doing.
+        worker.execute(() -> {
+            degraded = false;
+            degradedUntil = 0;
+            retryMs = FIRST_RETRY_MS;
+            reschedule(0);
         });
     }
 
@@ -165,6 +244,11 @@ public final class PendingDictations {
     private void schedule(long delayMs) {
         if (scheduled != null && !scheduled.isDone()
                 && scheduled.getDelay(TimeUnit.MILLISECONDS) <= delayMs) return;
+        reschedule(delayMs);
+    }
+
+    /** Worker thread. The next pass in {@code delayMs}, earlier or later than one already set. */
+    private void reschedule(long delayMs) {
         if (scheduled != null) scheduled.cancel(false);
         scheduled = worker.schedule(this::pass, delayMs, TimeUnit.MILLISECONDS);
     }
@@ -172,6 +256,14 @@ public final class PendingDictations {
     /** Worker thread: transcribes waiting clips, oldest first, until one fails. */
     void pass() {
         scheduled = null;
+        // An index write that failed earlier (a full disk): try again first.
+        store.flush();
+        long now = clock.getAsLong();
+        if (degraded && now < degradedUntil) {
+            // Something asked early (a new clip, a retry): the degraded wait still holds.
+            reschedule(degradedUntil - now);
+            return;
+        }
         // Cheap (an index scan): recordings the phone transcribed go once their 48 h are up.
         store.dropExpired();
         List<PendingClip> waiting = store.untranscribed();
@@ -182,14 +274,19 @@ public final class PendingDictations {
         for (PendingClip clip : waiting) {
             String text;
             long t = System.nanoTime();
+            // Counted before it is sent, on disk: a crash or a lost index write never lets a long
+            // clip be re-sent without end. No count written, no send.
+            if (store.charge(clip.id) < 0) {
+                log.accept(line(sent, sentMs, waiting.size() - sent, started)
+                        + ", cannot record the attempt (storage), retry in " + retryMs / 1000 + " s");
+                schedule(retryMs);
+                retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
+                return;
+            }
             try {
                 text = transcriber.transcribe(clip, store.audio(clip.id));
             } catch (IOException e) {
-                log.accept(line(sent, sentMs, waiting.size() - sent, started)
-                        + ", desktop unreachable (" + e.getClass().getSimpleName() + "), retry in "
-                        + retryMs / 1000 + " s");
-                schedule(retryMs);
-                retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
+                failed(clip, e, line(sent, sentMs, waiting.size() - sent, started));
                 return;
             }
             sent++;
@@ -200,6 +297,43 @@ public final class PendingDictations {
         }
         log.accept(line(sent, sentMs, 0, started) + ", all sent");
         retryMs = FIRST_RETRY_MS;
+        // The desktop took them all: whatever was degraded is over.
+        degraded = false;
+        degradedRetryMs = FIRST_DEGRADED_RETRY_MS;
+    }
+
+    /**
+     * Worker thread: one upload failed. An attempt the desktop took (it got the whole clip) is
+     * counted, and the clip is parked at {@link ClipStore#MAX_ATTEMPTS}, so a long clip is never
+     * re-decoded without end. A degraded desktop starts the long wait; anything else, the usual
+     * backoff.
+     */
+    private void failed(PendingClip clip, IOException e, String sofar) {
+        UploadFailure f = e instanceof UploadFailure ? (UploadFailure) e
+                : new UploadFailure(UploadFailure.Kind.UNREACHABLE, false, e.getMessage(), e);
+        String what = f.kind.name().toLowerCase(java.util.Locale.ROOT);
+        if (f.attempted) {
+            int n = store.attempts(clip.id);
+            what += ", attempt " + n + " of " + ClipStore.MAX_ATTEMPTS;
+            if (n >= ClipStore.MAX_ATTEMPTS) {
+                store.park(clip.id);
+                what += ", parked";
+                main.execute(this::changed);
+            }
+        } else {
+            // Charged before sending, but the desktop never decoded it.
+            store.refund(clip.id);
+        }
+        if (f.kind == UploadFailure.Kind.DEGRADED) {
+            degraded = false; // a fresh spell: its wait starts now
+            markDegraded();
+            log.accept(sofar + ", desktop " + what + ", retry in " + (degradedUntil - clock.getAsLong()) / 1000 + " s");
+            return;
+        }
+        log.accept(sofar + ", desktop " + what + " (" + e.getClass().getSimpleName() + "), retry in "
+                + retryMs / 1000 + " s");
+        schedule(retryMs);
+        retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
     }
 
     private static String line(int sent, long sentMs, int left, long started) {
@@ -226,28 +360,92 @@ public final class PendingDictations {
 
     static final int UPLOAD_FRAME_BYTES = 64 * 1024;
 
-    /** Sends a whole clip through the dictation protocol and returns the server's final text. */
-    static String upload(URI uri, File audio) throws IOException {
-        try (DictationSocket s = DictationSocket.connect(uri, ServerDictationEngine.CONNECT_TIMEOUT_MS);
+    /** How long an upload waits for the desktop to say ready before giving up (nothing sent). */
+    static final int UPLOAD_READY_MS = 4000;
+
+    /**
+     * Sends a whole clip through the dictation protocol and returns the server's final text. The
+     * start carries the clip's id (the recording's, the same the live session sent) and
+     * {@code "mode":"upload"}, so the desktop resumes from what it already decoded or answers a
+     * resend from its cache, and holds an upload to no realtime budget. Nothing is sent unless
+     * the desktop is ready on its GPU.
+     */
+    static String upload(URI uri, String id, File audio) throws IOException {
+        DictationSocket s;
+        try {
+            s = DictationSocket.connect(uri, ServerDictationEngine.CONNECT_TIMEOUT_MS);
+        } catch (IOException e) {
+            throw new UploadFailure(UploadFailure.Kind.UNREACHABLE, false, "not reached", e);
+        }
+        boolean attempted = false;
+        try (DictationSocket socket = s;
              InputStream in = new BufferedInputStream(new FileInputStream(audio))) {
-            s.sendText("{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}");
+            socket.sendText(startMessage(id, "upload"));
+            socket.readTimeout(UPLOAD_READY_MS);
+            JSONObject ready = read(socket);
+            if (ready == null || !"ready".equals(ready.optString("type"))) {
+                throw failure(ready, false);
+            }
+            // Only a desktop that says it is on its GPU gets the clip: a missing backend (an old
+            // server, without resume or an upload mode) is not taken on trust here.
+            if (!"gpu".equals(ready.optString("backend", ""))) {
+                throw new UploadFailure(UploadFailure.Kind.DEGRADED, false,
+                        "backend " + ready.optString("backend", "not given") + ": not sent");
+            }
             byte[] frame = new byte[UPLOAD_FRAME_BYTES];
-            for (int n; (n = in.read(frame)) > 0; ) s.sendBinary(frame, 0, n);
-            s.sendText("{\"type\":\"stop\"}");
+            for (int n; (n = in.read(frame)) > 0; ) socket.sendBinary(frame, 0, n);
+            socket.sendText("{\"type\":\"stop\"}");
+            attempted = true;
             // Decoding runs at ~30x real time on the desktop; allow a wide margin.
             long seconds = audio.length() / ClipStore.BYTES_PER_SECOND;
-            s.readTimeout((int) Math.min(10 * 60_000, 60_000 + seconds * 500));
+            socket.readTimeout((int) Math.min(10 * 60_000, 60_000 + seconds * 500));
             while (true) {
-                WebSocketFrames.Message m = s.read();
-                if (m == null) throw new IOException("the server closed before the final");
-                if (m.opcode != WebSocketFrames.TEXT) continue;
-                JSONObject e = new JSONObject(m.text());
+                JSONObject e = read(socket);
+                if (e == null) throw new UploadFailure(UploadFailure.Kind.FAILED, true, "closed before the final");
                 String type = e.optString("type");
                 if (type.equals("final")) return e.optString("text");
-                if (type.equals("error")) throw new IOException("server: " + e.optString("message"));
+                if (type.equals("error")) throw failure(e, true);
+                // "partial", "status" (finishing…): the final follows.
             }
+        } catch (UploadFailure f) {
+            throw f;
         } catch (JSONException e) {
-            throw new IOException("bad message from the dictation server", e);
+            throw new UploadFailure(UploadFailure.Kind.FAILED, attempted, "bad message from the dictation server", e);
+        } catch (IOException e) {
+            throw new UploadFailure(attempted ? UploadFailure.Kind.FAILED : UploadFailure.Kind.UNREACHABLE,
+                    attempted, e.getMessage(), e);
         }
+    }
+
+    /** The start message: the recording's id, and whether it is live or an upload. */
+    static String startMessage(String id, String mode) {
+        try {
+            return new JSONObject().put("type", "start").put("sample_rate", Microphone.RATE)
+                    .put("id", id).put("mode", mode).toString();
+        } catch (JSONException impossible) {
+            return "{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}";
+        }
+    }
+
+    /** The next text message as JSON, or null when the server closed. */
+    private static JSONObject read(DictationSocket s) throws IOException, JSONException {
+        while (true) {
+            WebSocketFrames.Message m = s.read();
+            if (m == null) return null;
+            if (m.opcode == WebSocketFrames.TEXT) return new JSONObject(m.text());
+        }
+    }
+
+    /** What an error (or an unexpected message) means for the courier. */
+    private static UploadFailure failure(JSONObject e, boolean attempted) {
+        if (e == null) {
+            return new UploadFailure(attempted ? UploadFailure.Kind.FAILED : UploadFailure.Kind.UNREACHABLE,
+                    attempted, "closed");
+        }
+        String code = e.optString("code", "");
+        UploadFailure.Kind kind = UploadFailure.degradedCode(code) ? UploadFailure.Kind.DEGRADED
+                : attempted ? UploadFailure.Kind.FAILED : UploadFailure.Kind.UNREACHABLE;
+        return new UploadFailure(kind, attempted, "server " + e.optString("type") + " " + code + ": "
+                + e.optString("message"));
     }
 }
