@@ -120,7 +120,7 @@ struct Connection<'a> {
 struct Focus {
     /// The first hop's hello offered `viewer_focus` and `focus_by_use`.
     offered: bool,
-    /// The current attach confirmed `focus_updates`.
+    /// The current attach confirmed `focus_updates` and `focus_by_use`.
     frames: bool,
     /// The core was last told this viewer is focused (by the attach or a 1).
     on: bool,
@@ -1065,7 +1065,10 @@ impl Connection<'_> {
             self.history_on_resize = false;
         }
         // Uses before this attach are in its idle_ms, not a WINDOW_FOCUS of their own.
-        self.focus.frames = self.focus.offered && reply["focus_updates"] == true;
+        // Frames only where the pane's owner applies the rule through every hop:
+        // the reply says focus_by_use as well as focus_updates.
+        self.focus.frames =
+            self.focus.offered && reply["focus_updates"] == true && reply["focus_by_use"] == true;
         self.focus.on = self.focus.frames && focus.is_some_and(|(focused, _)| focused);
         self.focus.sent_at = None;
         self.focus.uses = uses;
@@ -3999,6 +4002,8 @@ mod claim_tests {
             let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
             let (tx, seen) = mpsc::channel();
             let (push, pushed) = mpsc::channel::<(u32, u8, Vec<u8>)>();
+            // The owner applies the focus rule (attach replies say focus_by_use).
+            let rule = !features.as_array().is_some_and(|f| f.iter().any(|f| f == "no_rule"));
             let peer = std::thread::spawn(move || {
                 let mut attaches = 0;
                 let mut killed = false;
@@ -4057,6 +4062,9 @@ mod claim_tests {
                                 let mut result = json!({"channel":next_channel - 1,"resize_notifications":script.resizes,"terminal":{"cols":90,"rows":40},
                                        "visibility_updates": asked && confirm,
                                        "focus_updates": focus && confirm});
+                                if focus && confirm && rule {
+                                    result["focus_by_use"] = json!(true);
+                                }
                                 if script.echo && script.echo_until.is_none_or(|n| attaches <= n) && request["params"].get("resize_history").is_some() {
                                     result["resize_history"] = request["params"]["resize_history"].clone();
                                 }
@@ -4317,6 +4325,24 @@ mod claim_tests {
         crate::remote::used();
         core.quiet(Duration::from_millis(1300));
         assert!(core.close().iter().all(|seen| !matches!(seen, Seen::Frame(_, WINDOW_FOCUS, _))));
+    }
+
+    #[test]
+    fn an_owner_that_does_not_apply_the_rule_gets_no_focus_frames() {
+        let _serial = focus_test_lock();
+        // focus_updates confirmed, focus_by_use absent from the reply (an owner
+        // or hop without the rule; "no_rule" makes the mock leave it out).
+        let core = Mock::start(json!(["viewer_visibility", "viewer_focus", "focus_by_use", "no_rule"]), true, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["focus_updates"], true);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        crate::remote::used();
+        core.quiet(Duration::from_millis(300));
+        assert_eq!(
+            core.close(),
+            vec![Seen::Frame(2, VISIBILITY, vec![0]), Seen::Frame(2, DETACH, Vec::new())]
+        );
     }
 
     #[test]
