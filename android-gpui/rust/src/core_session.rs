@@ -760,11 +760,7 @@ impl Connection<'_> {
                 self.attach(&terminal, cols, rows)?;
                 // Started, and shown; but say so when its tab is not in the
                 // layout, rather than offer a menu that cannot work.
-                placed.map_err(|error| {
-                    Error::Protocol(format!(
-                        "the window started, but its tab could not be saved in the layout ({error}); rename or move it on the desktop"
-                    ))
-                })
+                placed.map_err(|error| Error::WindowNotPlaced(Box::new(error)))
             }
             TabEdit::WindowsMove {
                 project,
@@ -1196,14 +1192,6 @@ fn add_window_tab(doc: &mut Value, space: &str, name: &str, folder: &Value, entr
             Ok(())
         }
     }
-}
-/// Appends `entry` to `space`'s tabs in herdr-app's layout.
-fn add_tab(doc: &mut Value, space: &str, entry: &Value) -> Result<()> {
-    let tabs = tabs_mut(doc, space)?;
-    if !tabs.iter().any(|t| t["id"] == entry["id"]) {
-        tabs.push(entry.clone());
-    }
-    Ok(())
 }
 /// A rename names the tab for good: `named`, so its window goes by this name
 /// and no longer by its agent's task.
@@ -2321,8 +2309,8 @@ b"}"#), None);
     fn a_new_project_window_is_a_layout_tab_that_renames_for_good() {
         let mut doc = json!({"spaces":[{"id":"s1","name":"monopoly","tabs":[]}]});
         let tab = window_tab("mobile-1-9", "t44", "p9", "claude");
-        add_tab(&mut doc, "s1", &tab).unwrap();
-        add_tab(&mut doc, "s1", &tab).unwrap();
+        add_window_tab(&mut doc, "s1", "monopoly", &Value::Null, &tab).unwrap();
+        add_window_tab(&mut doc, "s1", "monopoly", &Value::Null, &tab).unwrap();
         assert_eq!(doc["spaces"][0]["tabs"].as_array().unwrap().len(), 1, "added once");
         let terminals = json!([{"address":"t44","state":"live","labels":{"herdr.space":"s1","herdr.tab":"mobile-1-9","parent":"t5"},"title":"Fix tests","status":{}}]);
         let mut view = json!({"pane_id":"t44"});
@@ -2332,8 +2320,18 @@ b"}"#), None);
         rename_tab(&mut doc, "s1", "mobile-1-9", "review").unwrap();
         project(&mut view, &terminals, &doc).unwrap();
         assert_eq!((view["tabs"][0]["label"].clone(), view["tabs"][0]["named"].clone()), (json!("review"), json!(true)));
-        // add_tab alone needs the space; add_window_tab adds it (next test).
-        assert!(add_tab(&mut doc, "nowhere", &tab).is_err());
+    }
+
+    #[test]
+    fn a_window_whose_tab_was_not_saved_keeps_the_layout_failure_as_its_source() {
+        use std::error::Error as _;
+        let error = Error::WindowNotPlaced(Box::new(Error::Rpc { kind: "denied".into(), message: "read-only".into() }));
+        // The layout write's own error, typed, as the source (boxed: Error holds itself).
+        let source = error.source().and_then(|s| s.downcast_ref::<Box<Error>>()).map(|b| &**b);
+        assert!(matches!(source, Some(Error::Rpc { kind, .. }) if kind == "denied"));
+        assert!(matches!(&error, Error::WindowNotPlaced(cause) if matches!(**cause, Error::Rpc { .. })));
+        assert!(error.to_string().starts_with("The window started, but its tab could not be saved in the layout"));
+        assert!(error.to_string().contains("read-only"));
     }
 
     #[test]

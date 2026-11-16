@@ -87,6 +87,11 @@ final class ProjectBar {
         return Math.max(0, to);
     }
 
+    /** Whether a window chip of this status carries a status dot after its name. */
+    static boolean dotted(String status) {
+        return "working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status);
+    }
+
     /** The project chip: "[name]"; the waiting count is drawn beside it. */
     static String projectText(ProjectModel.Project p) {
         return "[" + (p == null ? "-" : p.name) + "]";

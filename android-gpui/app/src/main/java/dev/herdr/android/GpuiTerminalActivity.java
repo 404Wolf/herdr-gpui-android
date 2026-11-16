@@ -2204,7 +2204,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.text)
                     .append('\t').append(c.window.status).append('\t').append(c.active).append('\t')
                     .append(ProjectModel.ownsTab(projects, project, c.window)).append('\n');
-            if (i <= shown) before.append(c.text).append('\n');
+            // What the chip shows, its status dot too (ProjectBar.dotted): either widens it.
+            if (i <= shown) before.append(c.text).append(ProjectBar.dotted(c.window.status) ? " ●" : "").append('\n');
         }
         String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
         if (signature.toString().equals(tabSignature)) return;
@@ -2387,7 +2388,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private TextView windowChip(String label, boolean active, String status, boolean idle) {
         TextView chip = new TextView(this);
         android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(label);
-        if ("working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status)) {
+        if (ProjectBar.dotted(status)) {
             int color = "error".equals(status) ? chrome.danger : chrome.status(status);
             text.append(" ●", new android.text.style.ForegroundColorSpan(color), 0);
         }
