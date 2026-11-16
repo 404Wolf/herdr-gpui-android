@@ -109,6 +109,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private ScrollView sidebarScroll;
     private ImageButton sidebarButton;
+    /**
+     * Wolf's item 83: the docked rail open, minimized to a strip or closed,
+     * this device's choice (RailPanel). The strip is shown while the rail is
+     * closed and {@code railMinimized}; it and the toolbar's rail button keep
+     * the needs-you badge, the bar's count ({@code barNeedYou}).
+     */
+    private RailPanel railPanel = RailPanel.DEFAULT;
+    private boolean railMinimized;
+    private int barNeedYou;
+    private LinearLayout railBody, railControls, railStrip;
+    private TextView railStripBadge, sidebarBadge;
     /** Rail parent when it sits beside the terminal; compact windows float it instead. */
     private LinearLayout railColumns;
     private View railScrim, railEdge, railFade;
@@ -431,11 +442,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         sidebarScroll.addView(sidebarRows, new android.widget.FrameLayout.LayoutParams(-1, -2));
         // Hosts and workspaces exceed one screen; the fade says the list keeps going.
         android.widget.FrameLayout railFrame = new android.widget.FrameLayout(this);
-        railFrame.addView(sidebarScroll, new android.widget.FrameLayout.LayoutParams(-1, -1));
+        // Docked, the rail's own header minimizes or closes it (item 83); the
+        // list scrolls under it.
+        railBody = new LinearLayout(this);
+        railBody.setOrientation(LinearLayout.VERTICAL);
+        railControls = createRailControls();
+        railBody.addView(railControls, new LinearLayout.LayoutParams(-1, dp(32)));
+        railBody.addView(sidebarScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        railFrame.addView(railBody, new android.widget.FrameLayout.LayoutParams(-1, -1));
         railFade = new View(this);
         railFade.setLayoutParams(new android.widget.FrameLayout.LayoutParams(
                 -1, dp(24), android.view.Gravity.BOTTOM));
         railFrame.addView(railFade);
+        railStrip = createRailStrip();
+        railFrame.addView(railStrip, new android.widget.FrameLayout.LayoutParams(-1, -1));
         sidebar.addView(railFrame, new LinearLayout.LayoutParams(0, -1, 1));
         railEdge = new View(this);
         sidebar.addView(railEdge, new LinearLayout.LayoutParams(dp(1), -1));
@@ -536,6 +556,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railFade.setBackground(new android.graphics.drawable.GradientDrawable(
                 android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[] {GpuiChrome.withAlpha(chrome.surface, 0), chrome.surface}));
+        for (android.view.ViewGroup group : new android.view.ViewGroup[] {railControls, railStrip}) {
+            for (int i = 0; group != null && i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child instanceof TextView && child != railStripBadge) {
+                    ((TextView) child).setTextColor(chrome.onSurfaceVariant);
+                }
+            }
+        }
+        updateRailBadge();
     }
 
     /** Moves the rail between the drawer layer and the column beside the terminal. */
@@ -907,7 +936,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!shellMode()) {
             sidebarButton = iconButton(R.drawable.ic_bar_hosts, "Hosts",
                     "Show the host and workspace sidebar", view -> toggleSidebar());
-            pinned.addView(sidebarButton);
+            // While the rail is not open, its button keeps the needs-you badge (item 83).
+            FrameLayout railButton = new FrameLayout(this);
+            sidebarButton.setLayoutParams(new FrameLayout.LayoutParams(dp(48), dp(48)));
+            railButton.addView(sidebarButton);
+            sidebarBadge = needYouBadge(10);
+            railButton.addView(sidebarBadge, new FrameLayout.LayoutParams(-2, -2,
+                    android.view.Gravity.TOP | android.view.Gravity.END));
+            pinned.addView(railButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
             pinned.addView(iconButton(R.drawable.ic_bar_panes, "Panes",
                     "Workspaces, tabs and panes for this host", view -> showPanes()));
         }
@@ -1970,11 +2006,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // The stored value is the preference for a panel with room. Folding to the
         // cover must not keep half the terminal covered by the rail, and unfolding
         // restores what the user asked for.
+        // Item 83: the stored choice is open, minimized to a strip, or closed.
         int widthDp = getResources().getConfiguration().screenWidthDp;
-        boolean wantsRail = getSharedPreferences("terminal-display", MODE_PRIVATE)
-                .getBoolean("list", true);
-        boolean fits = widthDp >= 600;
-        boolean open = wantsRail && fits && !shellMode();
+        railPanel = storedRailPanel();
+        RailPanel.Mode shown = railPanel.shown(widthDp >= 600, shellMode());
+        boolean open = shown == RailPanel.Mode.OPEN;
+        railMinimized = shown == RailPanel.Mode.MINIMIZED;
         boolean opening = open && !sidebarOpen;
         if (sidebarOpen != open) sidebarSignature = null;
         sidebarOpen = open;
@@ -2056,8 +2093,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean transientDrawer = railAsDrawer();
         if (!open) railOverlay = false;
         if (!transientDrawer) {
-            getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                    .putBoolean("list", sidebarOpen).apply();
+            // Pinned open or closed beside the terminal: the strip is gone either way.
+            railMinimized = false;
+            storeRailPanel(railPanel.with(open ? RailPanel.Mode.OPEN : RailPanel.Mode.CLOSED));
         }
         applySidebarWidth();
         updateHostSampling();
@@ -2067,14 +2105,149 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /** This device's choice for the docked rail (item 83); the older open/closed flag before it. */
+    private RailPanel storedRailPanel() {
+        SharedPreferences preferences = getSharedPreferences("terminal-display", MODE_PRIVATE);
+        return RailPanel.read(preferences.getString(RailPanel.MODE_KEY, null),
+                preferences.getString(RailPanel.LAST_KEY, null),
+                preferences.contains(RailPanel.LEGACY_KEY) ? preferences.getBoolean(RailPanel.LEGACY_KEY, true) : null);
+    }
+
+    private void storeRailPanel(RailPanel next) {
+        railPanel = next;
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                .putString(RailPanel.MODE_KEY, RailPanel.name(next.mode))
+                .putString(RailPanel.LAST_KEY, RailPanel.name(next.last))
+                .putBoolean(RailPanel.LEGACY_KEY, next.mode == RailPanel.Mode.OPEN).apply();
+    }
+
+    /**
+     * The docked rail to {@code next} (item 83): open beside the terminal, a
+     * strip with the needs-you badge, or closed. The terminal takes the width
+     * it frees, as the toolbar's toggle has always made it. On the cover there
+     * is nothing docked: the rail stays the drawer its button opens.
+     */
+    private void setRailPanel(RailPanel next) {
+        if (shellMode()) return;
+        if (compactWindow()) {
+            note("Unfold the phone to dock, minimize or close the rail");
+            return;
+        }
+        storeRailPanel(next);
+        railOverlay = false;
+        boolean open = next.mode == RailPanel.Mode.OPEN;
+        boolean opening = open && !sidebarOpen;
+        if (sidebarOpen != open) sidebarSignature = null;
+        sidebarOpen = open;
+        railMinimized = next.mode == RailPanel.Mode.MINIMIZED;
+        applySidebarWidth();
+        updateHostSampling();
+        if (opening) {
+            revealedPane = "";
+            refreshSidebar(true);
+        }
+    }
+
+    /** ctrl-alt-w closes the rail and brings back what was there; ctrl-alt-b minimizes it and back. */
+    private void railKey(boolean close) {
+        if (compactWindow()) {
+            toggleSidebar();
+            return;
+        }
+        // What the rail shows now, an open drawer over the terminal included, is what the key acts on.
+        RailPanel now = sidebarOpen && railAsDrawer() ? railPanel.with(RailPanel.Mode.OPEN) : railPanel;
+        setRailPanel(close ? now.toggle() : now.minimize());
+    }
+
+    /** The docked rail's header: minimize to the strip, close (item 83). */
+    private LinearLayout createRailControls() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL | android.view.Gravity.END);
+        row.setPadding(0, 0, dp(4), 0);
+        row.addView(railControl("–", "Minimize the rail to a strip (ctrl-alt-b)",
+                () -> setRailPanel(railPanel.with(RailPanel.Mode.MINIMIZED))));
+        row.addView(railControl("×", "Close the rail (ctrl-alt-w brings it back)",
+                () -> setRailPanel(railPanel.with(RailPanel.Mode.CLOSED))));
+        return row;
+    }
+
+    private TextView railControl(String glyph, String description, Runnable action) {
+        TextView button = new TextView(this);
+        button.setText(glyph);
+        button.setTextSize(16);
+        button.setGravity(android.view.Gravity.CENTER);
+        button.setContentDescription(description);
+        button.setTooltipText(description);
+        button.setOnClickListener(view -> action.run());
+        button.setLayoutParams(new LinearLayout.LayoutParams(dp(40), dp(32)));
+        return button;
+    }
+
+    /** The minimized rail: a strip that opens it again and keeps the needs-you badge. */
+    private LinearLayout createRailStrip() {
+        LinearLayout strip = new LinearLayout(this);
+        strip.setOrientation(LinearLayout.VERTICAL);
+        strip.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+        strip.setPadding(0, dp(6), 0, 0);
+        strip.setVisibility(View.GONE);
+        strip.setContentDescription("Open the rail");
+        strip.setOnClickListener(view -> setRailPanel(railPanel.with(RailPanel.Mode.OPEN)));
+        TextView open = new TextView(this);
+        open.setText("»");
+        open.setTextSize(18);
+        open.setGravity(android.view.Gravity.CENTER);
+        open.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        strip.addView(open, new LinearLayout.LayoutParams(-1, dp(40)));
+        railStripBadge = needYouBadge(12);
+        strip.addView(railStripBadge, new LinearLayout.LayoutParams(-2, -2));
+        return strip;
+    }
+
+    /** The needs-you count as a small filled badge; hidden while nobody waits. */
+    private TextView needYouBadge(int textSp) {
+        TextView badge = new TextView(this);
+        badge.setTextSize(textSp);
+        badge.setGravity(android.view.Gravity.CENTER);
+        badge.setSingleLine(true);
+        badge.setMinWidth(dp(16));
+        badge.setPadding(dp(4), 0, dp(4), 0);
+        badge.setVisibility(View.GONE);
+        badge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        return badge;
+    }
+
+    /** The strip's and the toolbar button's badge follow the bar's count of agents waiting on Wolf. */
+    private void updateRailBadge() {
+        String text = RailPanel.badge(barNeedYou);
+        String waiting = text.isEmpty() ? "" : ", " + barNeedYou + (barNeedYou == 1 ? " agent needs" : " agents need") + " you";
+        for (TextView badge : new TextView[] {railStripBadge, sidebarBadge}) {
+            if (badge == null) continue;
+            if (!text.contentEquals(badge.getText())) badge.setText(text);
+            android.graphics.drawable.GradientDrawable fill = new android.graphics.drawable.GradientDrawable();
+            fill.setColor(chrome.status("blocked"));
+            fill.setCornerRadius(dp(8));
+            badge.setBackground(fill);
+            badge.setTextColor(chrome.surface);
+            // The toolbar's copy only while the rail is not open: open, the rail's header says it.
+            boolean wanted = !text.isEmpty() && (badge == railStripBadge || !sidebarOpen);
+            badge.setVisibility(wanted ? View.VISIBLE : View.GONE);
+        }
+        if (railStrip != null) railStrip.setContentDescription("Open the rail" + waiting);
+        if (sidebarButton != null && !sidebarOpen) {
+            sidebarButton.setContentDescription("Show the host and workspace sidebar" + waiting);
+        }
+    }
+
     private void applySidebarWidth() {
         if (sidebar == null) return;
         placeRail();
         int available = terminalRoot == null ? 0
                 : terminalRoot.getWidth() - terminalRoot.getPaddingLeft() - terminalRoot.getPaddingRight();
         int width;
+        boolean strip = !sidebarOpen && railMinimized && !railAsDrawer();
         if (!sidebarOpen) {
-            width = 0;
+            width = strip ? dp(RailPanel.STRIP_DP) : 0;
         } else if (railAsDrawer()) {
             // Modal drawer: wide enough to read titles, never the whole window.
             width = available > 0 ? Math.min(dp(320), Math.round(available * 0.86f)) : dp(300);
@@ -2087,7 +2260,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             layout.width = width;
             sidebar.setLayoutParams(layout);
         }
+        if (railStrip != null) {
+            railStrip.setVisibility(strip ? View.VISIBLE : View.GONE);
+            railBody.setVisibility(strip ? View.GONE : View.VISIBLE);
+            railFade.setVisibility(strip ? View.GONE : View.VISIBLE);
+            // A drawer closes by Back or a tap outside; only the docked rail has the header.
+            railControls.setVisibility(sidebarOpen && !railAsDrawer() ? View.VISIBLE : View.GONE);
+        }
         updateRailToggle();
+        updateRailBadge();
     }
 
     /** The toggle shows its state as a selected container, not a changing word. */
@@ -2168,7 +2349,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
         // The menu stays wherever the bar is gone, tabs or not.
         if (tabRow != null) tabRow.setVisibility(current != null && !shellMode() ? View.VISIBLE : View.GONE);
-        if (!show) return;
+        if (!show) {
+            if (barNeedYou != 0) {
+                barNeedYou = 0;
+                updateRailBadge();
+            }
+            return;
+        }
         String space = "", paneTab = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -2188,6 +2375,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean compact = compactWindow();
         java.util.List<ProjectBar.Chip> chips = ProjectBar.chips(project, shown, compact);
         int needYou = ProjectBar.needYou(projects);
+        if (needYou != barNeedYou) {
+            barNeedYou = needYou;
+            updateRailBadge();
+        }
         String repo = compact || project == null || project.deacon ? null
                 : ProjectModel.repoOf(project, gitNames(), ProjectModel.repoLabels(current.panes));
         // Rebuild only when what the bar shows changes. Agents retitle their
@@ -5356,6 +5547,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /** ctrl-alt-w or ctrl-alt-b, nothing else held: the rail's keys (item 83). */
+    static boolean railKeyCode(KeyEvent event) {
+        int code = event.getKeyCode();
+        return (code == KeyEvent.KEYCODE_W || code == KeyEvent.KEYCODE_B)
+                && event.isCtrlPressed() && event.isAltPressed()
+                && !event.isShiftPressed() && !event.isMetaPressed();
+    }
+
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
         // Enter while typing into the composer is its send, whichever view has
@@ -5373,6 +5572,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (event.getAction() == KeyEvent.ACTION_UP) {
             capturedKeys.remove(code);
             if (oneShotKey == code) oneShotKey = KeyEvent.KEYCODE_UNKNOWN;
+            return true;
+        }
+        // Item 83's keys, as the desktop's Work panel has them: ctrl-alt-w closes the
+        // rail and brings it back, ctrl-alt-b minimizes it to its strip and back.
+        // Ctrl with Alt reaches no terminal here (refused below), so nothing is taken from it.
+        if (railKeyCode(event) && !shellMode()) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                railKey(code == KeyEvent.KEYCODE_W);
+            }
+            capturedKeys.add(code);
             return true;
         }
         // A one-shot Ctrl press must not turn into plain text when the same key repeats.
