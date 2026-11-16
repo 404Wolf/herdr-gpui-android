@@ -3423,6 +3423,32 @@ mod connection_tests {
         }
     }
 
+    /// The core's policy (#88 v3): a RESIZE is followed by ESC[3J and the
+    /// history only when the whole confirmed N fits; otherwise by a
+    /// screen-only paint with no ESC[3J. That paint must keep every row the
+    /// phone held, whichever side moved more rows, even when it arrives cut
+    /// into 3-byte pieces (escape sequences split across frames).
+    #[test]
+    fn a_screen_only_paint_after_a_resize_keeps_the_old_history() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let pieces = |bytes: Vec<u8>| bytes.chunks(3).map(|piece| Chunk::Data(piece.to_vec())).collect::<Vec<_>>();
+        for (rows, shown) in [(8u16, 5usize), (8, 8), (6, 6), (12, 10)] {
+            let mut chunks = pieces(core_paint(&all[..40], &all[40..], 10));
+            chunks.push(Chunk::Grid(20, rows));
+            // Screen-only: no ESC[3J, no history, just the core's screen.
+            let screen_only = core_paint(&[], &all[all.len() - shown..], usize::from(rows));
+            assert!(!screen_only.windows(4).any(|w| w == b"\x1b[3J"));
+            chunks.extend(pieces(screen_only));
+            let pane = streamed(20, 10, chunks);
+            let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+            for line in &all {
+                assert!(rows_seen.contains(line), "{line} lost at 10 -> {rows}: {rows_seen:?}");
+            }
+            let firsts: Vec<usize> = all.iter().map(|l| rows_seen.iter().position(|r| r == l).unwrap()).collect();
+            assert!(firsts.windows(2).all(|w| w[0] < w[1]), "out of order at 10 -> {rows}: {rows_seen:?}");
+        }
+    }
+
     /// A saved copy read back (a switch, a close or a checkpoint wrote it).
     fn restored(session: &gpui_rio::Session, max_bytes: usize) -> Arc<gpui_rio::Session> {
         let bytes = crate::snapshot::encode(&session.grid().lock(), max_bytes);
