@@ -1158,6 +1158,17 @@ impl<U: EventListener> Crosswords<U> {
             .saturating_sub(self.grid.screen_lines())
     }
 
+    /// The main screen's grid (with its scrollback), also while the
+    /// alternate screen is shown (Herdr GPUI Android: a pane's main history
+    /// is carried to a new stream after its old one ended on the alt screen).
+    pub fn main_grid(&self) -> &Grid<Square> {
+        if self.mode.contains(Mode::ALT_SCREEN) {
+            &self.inactive_grid
+        } else {
+            &self.grid
+        }
+    }
+
     /// Damage the entire line at the cursor position
     #[inline]
     pub fn damage_cursor_line(&mut self) {

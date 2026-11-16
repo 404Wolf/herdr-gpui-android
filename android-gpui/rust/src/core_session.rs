@@ -96,6 +96,14 @@ struct Connection<'a> {
     /// that keeps closing is reattached at most that often. Only a refused
     /// attach leaves it ended.
     reattached_at: Option<Instant>,
+    /// The main screen (history and screen) of the pane whose stream the
+    /// core ended, as VT bytes: the reattach of that pane starts its new grid
+    /// from it, so history the core does not send again (an attach on the
+    /// alternate screen carries none) is not lost.
+    carried: Option<(String, Vec<u8>)>,
+    /// Set for one `attach`: start the new grid from these bytes and attach
+    /// as `resumed` (the owner then owes a whole history replacement).
+    resume_with: Option<Vec<u8>>,
 }
 
 /// History rows asked for in the repaint after a RESIZE: the attach's own
@@ -329,6 +337,13 @@ impl Connection<'_> {
                     self.output = None;
                     let mut state = lock(&self.owner.state);
                     let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+                    // Its main screen, for the reattach (read only: the grid
+                    // may still be on screen as the pane's last frame).
+                    self.carried = state
+                        .terminal
+                        .as_ref()
+                        .filter(|_| !pane.is_empty())
+                        .map(|terminal| (pane.clone(), crate::snapshot::encode_main(&terminal.grid().lock(), crate::snapshot::MAX_BYTES)));
                     state.view["state"] = json!("connecting");
                     state.view["status"] =
                         json!("Terminal stream ended; select a terminal to attach again");
@@ -929,6 +944,8 @@ impl Connection<'_> {
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
         // This attach replaces any reattach still waiting for its turn.
         self.reattach = None;
+        let resume = self.resume_with.take();
+        self.carried = None;
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
@@ -948,6 +965,17 @@ impl Connection<'_> {
         let mut params = attach_params(terminal, cols, rows, self.claim.offered);
         if self.history_on_resize {
             params["resize_history"] = json!(RESIZE_HISTORY);
+        }
+        if resume.is_some() {
+            // The same pane again after the core ended its stream: the grid
+            // starts from what the phone held. `resumed` makes the owner owe
+            // a whole history replacement (sent at once, or on the return to
+            // the main screen); without `resize_history` the path cannot
+            // send one, so ask no history that would repeat what is held.
+            params["resumed"] = json!(true);
+            if !self.history_on_resize {
+                params["history"] = json!(0);
+            }
         }
         let reply = self.call("terminal.attach", params)?;
         // Only the owner's echo confirms it (relays pass on only that): no
@@ -975,9 +1003,11 @@ impl Connection<'_> {
             channel,
         };
         let session_slot = Arc::new(Mutex::new(Weak::new()));
+        let uncredited = resume.as_ref().map_or(0, Vec::len);
         let output = StreamRead {
             rx,
-            chunks: VecDeque::new(),
+            chunks: resume.map(VecDeque::from).unwrap_or_default(),
+            uncredited,
             commands: commands.clone(),
             channel,
             session: session_slot.clone(),
@@ -1566,6 +1596,9 @@ enum Chunk {
 struct StreamRead {
     rx: mpsc::Receiver<Chunk>,
     chunks: VecDeque<u8>,
+    /// Bytes at the front of `chunks` that came from the phone itself (a
+    /// carried main screen), not from the core: no CREDIT for them.
+    uncredited: usize,
     commands: mpsc::SyncSender<Operation>,
     channel: u32,
     /// The session this stream feeds, for in-order grid changes.
@@ -1602,13 +1635,17 @@ impl Read for StreamRead {
                 .pop_front()
                 .ok_or(io::ErrorKind::UnexpectedEof)?;
         }
-        self.commands
-            .try_send(Operation::Frame(
-                self.channel,
-                1,
-                (n as u32).to_le_bytes().to_vec(),
-            ))
-            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        let local = n.min(self.uncredited);
+        self.uncredited -= local;
+        if n > local {
+            self.commands
+                .try_send(Operation::Frame(
+                    self.channel,
+                    1,
+                    ((n - local) as u32).to_le_bytes().to_vec(),
+                ))
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        }
         Ok(n)
     }
 }
@@ -1704,6 +1741,8 @@ pub(crate) fn run(
         history_on_resize: offers(&hello, "resize_history"),
         reattach: None,
         reattached_at: None,
+        carried: None,
+        resume_with: None,
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -1786,6 +1825,11 @@ fn serve(
         if !connection.may_attach() {
             // Hidden without VISIBILITY frames: remember the pick, claim nothing.
             if let Some((terminal, _)) = switch.take() {
+                // A person's pick: an owed reattach of another pane is off.
+                if connection.reattach.as_ref().is_some_and(|owed| *owed != terminal) {
+                    connection.reattach = None;
+                    connection.carried = None;
+                }
                 connection.claim.parked = Some(terminal);
             }
         }
@@ -1826,6 +1870,9 @@ fn serve(
         }
         if connection.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY)
             && let Some(pane) = connection.reattach.take()
+            // A newer pick (also one parked while hidden) wins over the old pane.
+            && connection.claim.parked.as_ref().is_none_or(|parked| *parked == pane)
+            && lock(&owner.state).view["pane_id"] == pane.as_str()
         {
             if !connection.may_attach() {
                 // Hidden by now on a path that cannot say so: parked like any
@@ -1834,6 +1881,7 @@ fn serve(
                 connection.claim.parked = Some(pane);
             } else {
                 connection.reattached_at = Some(Instant::now());
+                connection.resume_with = connection.carried.take().filter(|(of, _)| *of == pane).map(|(_, bytes)| bytes);
                 match connection.attach(&pane, cols, rows) {
                     Ok(()) => {}
                     // Refused (the program ended, the pane is gone): it stays ended.
@@ -3142,7 +3190,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3189,7 +3237,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3211,7 +3259,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3277,7 +3325,7 @@ mod connection_tests {
     /// All rows from the oldest history row to the last screen row, read the
     /// way the renderer reads them: what scrolling all the way back shows,
     /// then the screen.
-    fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
+    pub(super) fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
         let history = session.grid().lock().history_size();
         let mut out: Vec<String> = Vec::new();
         for offset in (0..=history).rev() {
@@ -3317,7 +3365,7 @@ mod connection_tests {
     /// `Terminal::paint`): a reset ending in ESC[H ESC[2J, then (on a first
     /// paint) the history pushed up with newlines and erased, then the scroll
     /// region and the screen rows from the top.
-    fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+    pub(super) fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
         let mut out = String::from("\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J");
         if !history.is_empty() {
             out.push_str(&history.join("\r\n"));
@@ -3335,7 +3383,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3393,7 +3441,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(64);
         let (commands, _credits) = mpsc::sync_channel(4096);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&pane);
@@ -3679,7 +3727,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
@@ -3708,7 +3756,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
@@ -3733,6 +3781,46 @@ mod connection_tests {
         assert_eq!(cell(0, 19), 'A', "{}", session.screen_text());
         assert_eq!(cell(0, 29), ' ', "{}", session.screen_text());
     }
+
+    // t21s's probes from the #27 review (gpui-pr27-artifacts), kept as regression tests.
+    fn reviewer_rows(chunks: Vec<Chunk>) -> Vec<String> {
+        all_rows(&streamed(20, 10, chunks)).into_iter().filter(|s| !s.is_empty()).collect()
+    }
+
+    #[test]
+    fn reviewer_interrupted_paint_then_two_resizes_and_repair() {
+        let all: Vec<String> = (0..70).map(|n| format!("row {n:03}")).collect();
+        let first = core_paint(&all[..60], &all[60..], 10);
+        let paint8 = core_resize_paint(&all[..62], &all[62..], 8);
+        let paint6 = core_resize_paint(&all[..64], &all[64..], 6);
+        let paint12 = core_resize_paint(&all[..58], &all[58..], 12);
+        // Interrupt inside CAN/reset, ED3, history, the history/screen separator,
+        // and final screen, then resize again. Final repair is unfragmented in
+        // stream meaning only: DATA splits every escape into three-byte pieces.
+        for cut in [0, 1, 2, 5, 20, 35, 45, 80, paint8.len()/2, paint8.len()-2, paint8.len()] {
+            for (final_rows, final_paint) in [(6, &paint6), (12, &paint12)] {
+                let mut chunks = vec![Chunk::Data(first.clone()), Chunk::Grid(20, 8)];
+                chunks.extend(paint8[..cut].chunks(3).map(|b| Chunk::Data(b.to_vec())));
+                chunks.push(Chunk::Grid(20, final_rows));
+                chunks.extend(final_paint.chunks(3).map(|b| Chunk::Data(b.to_vec())));
+                assert_eq!(reviewer_rows(chunks), all, "cut {cut}, final rows {final_rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_alt_resize_and_main_repair_keep_history() {
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        let enter = b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec();
+        let alt = b"\x18\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J\x1b[?1049h\x1b[H\x1b[2JALT resized".to_vec();
+        let repair = core_resize_paint(&all[..42], &all[42..], 8);
+        let mut chunks = vec![Chunk::Data(first), Chunk::Data(enter), Chunk::Grid(20, 8)];
+        chunks.extend(alt.chunks(3).map(|b| Chunk::Data(b.to_vec())));
+        chunks.extend(repair.chunks(3).map(|b| Chunk::Data(b.to_vec())));
+        assert_eq!(reviewer_rows(chunks), all);
+    }
+
 }
 
 /// A scripted herdr-core on the far end of the socket: it answers every RPC
@@ -3758,6 +3846,10 @@ mod claim_tests {
     #[derive(Default)]
     struct Script {
         echo: bool,
+        /// Echo `resize_history` only on attaches up to this one (counting from 1).
+        echo_until: Option<usize>,
+        /// The attach reply confirms RESIZE frames (and gives a 90x40 grid).
+        resizes: bool,
         refuse_from: Option<usize>,
     }
 
@@ -3800,6 +3892,7 @@ mod claim_tests {
             let (push, pushed) = mpsc::channel::<(u32, u8, Vec<u8>)>();
             let peer = std::thread::spawn(move || {
                 let mut attaches = 0;
+                let mut killed = false;
                 let mut hello = String::new();
                 read_hello(&core, &mut hello);
                 let reply = json!({"jsonrpc":"2.0","id":0,"result":{"generation":1,"core":{"id":"fixture"},"framed":true,"features":features}});
@@ -3828,6 +3921,8 @@ mod claim_tests {
                         let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
                         let result = match request["method"].as_str().unwrap() {
                             "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                            "terminal.kill" => { killed = true; json!({}) },
+                            "terminal.list" if killed => json!({"terminals": [{"address":"t2","state":"live","labels":{},"cwd":"/tmp"}]}),
                             "terminal.list" => json!({"terminals":[
                                 {"address":"t1","state":"live","labels":{},"cwd":"/tmp"},
                                 {"address":"t2","state":"live","labels":{},"cwd":"/tmp"}]}),
@@ -3836,16 +3931,16 @@ mod claim_tests {
                                 let asked = request["params"]["visibility_updates"] == true;
                                 let _ = tx.send(Seen::Attach(request["params"].clone()));
                                 attaches += 1;
-                                if script.refuse_from.is_some_and(|from| attaches >= from) {
+                                if killed || script.refuse_from.is_some_and(|from| attaches >= from) {
                                     let error = json!({"jsonrpc":"2.0","id":request["id"],
                                         "error":{"code":1,"message":"t1 has finished","data":{"kind":"finished"}}});
                                     if write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).is_err() { return; }
                                     continue;
                                 }
                                 next_channel += 1;
-                                let mut result = json!({"channel":next_channel - 1,"resize_notifications":false,
+                                let mut result = json!({"channel":next_channel - 1,"resize_notifications":script.resizes,"terminal":{"cols":90,"rows":40},
                                        "visibility_updates": asked && confirm});
-                                if script.echo && request["params"].get("resize_history").is_some() {
+                                if script.echo && script.echo_until.is_none_or(|n| attaches <= n) && request["params"].get("resize_history").is_some() {
                                     result["resize_history"] = request["params"]["resize_history"].clone();
                                 }
                                 result
@@ -4053,7 +4148,7 @@ mod claim_tests {
     #[test]
     fn a_stream_closed_again_soon_is_attached_again_when_the_wait_ends() {
         let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
-            Script { echo: true, refuse_from: Some(3) });
+            Script { echo: true, refuse_from: Some(3), ..Script::default() });
         let Seen::Attach(first) = core.next() else { panic!("attach first") };
         assert_eq!(first["terminal"], "t1");
         // The core ends the stream: the phone attaches t1 again by itself.
@@ -4155,5 +4250,151 @@ mod claim_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(core.close().iter().any(|seen| *seen == Seen::Frame(2, DETACH, Vec::new())));
+    }
+
+    // t21s's probes from the #27 review (gpui-pr27-artifacts), kept as regression tests.
+    fn reviewer_wait(mut done: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < until, "fixture condition timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn reviewer_attach(core: &Mock) -> Value {
+        loop {
+            if let Seen::Attach(params) = core.next() { return params; }
+        }
+    }
+
+    #[test]
+    fn reviewer_downgrade_echo_is_sticky_across_close_and_switch() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, echo_until: Some(1), ..Script::default() });
+        assert_eq!(reviewer_attach(&core)["resize_history"], 1000);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((2, 2, br#"{"reason":"relay_overflow"}"#.to_vec())).unwrap();
+        assert_eq!(reviewer_attach(&core)["resize_history"], 1000);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        let third = reviewer_attach(&core);
+        assert_eq!(third["terminal"], "t2");
+        assert!(third.get("resize_history").is_none(), "downgrade must disable later requests");
+        reviewer_wait(|| lock(&core.owner.state).view["pane_id"] == "t2");
+        core.close();
+    }
+
+    #[test]
+    fn reviewer_a_user_switch_cancels_the_owed_reattach() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        reviewer_attach(&core);
+        core.push.send((2, 2, Vec::new())).unwrap();
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        assert_eq!(reviewer_attach(&core)["terminal"], "t2");
+        reviewer_wait(|| lock(&core.owner.state).view["pane_id"] == "t2");
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "unexpected old-pane reattach: {seen:?}");
+            }
+        }
+        core.close();
+    }
+
+    #[test]
+    fn reviewer_hidden_user_pick_wins_over_the_owed_reattach() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::start(json!([]), false, true, true);
+        reviewer_attach(&core);
+        core.push.send((2, 2, Vec::new())).unwrap();
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        core.set_visible(false);
+        loop {
+            if core.next() == Seen::Frame(3, DETACH, Vec::new()) { break; }
+        }
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        reviewer_wait(|| lock(&core.owner.focus).is_none());
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "attached while hidden");
+            }
+        }
+        core.set_visible(true);
+        let shown = reviewer_attach(&core);
+        core.close();
+        assert_eq!(shown["terminal"], "t2", "the user's newer parked pick must win");
+    }
+
+    #[test]
+    fn reviewer_close_on_alt_screen_retains_main_history() {
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, resizes: true, ..Script::default() });
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        let first = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        let paint = connection_tests::core_paint(&all[..40], &all[40..], 40);
+        core.push.send((2, 0, paint)).unwrap();
+        reviewer_wait(|| first.screen_text().contains("row 049"));
+        let rows = |p: &gpui_rio::Session| connection_tests::all_rows(p)
+            .into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+        assert_eq!(rows(&first), all, "fixture starts with all main rows");
+        core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT before close".to_vec())).unwrap();
+        reviewer_wait(|| first.screen_text().contains("ALT before close"));
+        core.push.send((2, 2, br#"{"reason":"relay_overflow"}"#.to_vec())).unwrap();
+        let reattach = reviewer_attach(&core);
+        eprintln!("automatic reattach parameters: {reattach}");
+        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
+        let second = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        // A fresh attach on the alternate screen has no history in its
+        // first paint. No `resumed` loss is recorded by the owner, so exit
+        // from alt has only the program's screen, not a history repair.
+        let mut alt = connection_tests::core_paint(&[], &[], 40);
+        alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT after reattach");
+        core.push.send((3, 0, alt)).unwrap();
+        reviewer_wait(|| second.screen_text().contains("ALT after reattach"));
+        let main = connection_tests::core_paint(&[], &all[40..], 40);
+        core.push.send((3, 0, main)).unwrap();
+        reviewer_wait(|| second.screen_text().contains("row 049"));
+        let got = rows(&second);
+        core.close();
+        assert_eq!(got, all, "main history held before a stream CLOSE must survive reattach on alt");
+    }
+
+    #[test]
+    fn reviewer_user_closed_pane_is_never_revived_or_started() {
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        reviewer_attach(&core);
+        core.push.send((2, 2, Vec::new())).unwrap();
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        let (tx, rx) = mpsc::sync_channel(1);
+        core.owner.commands.send(Operation::Action("pane.close".into(), tx)).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+        // Current code still attempts the pending attach, but the owner's
+        // finished/missing rejection must leave the pane ended. No run/start
+        // RPC is supported by this mock: either would panic the test.
+        assert_eq!(reviewer_attach(&core)["terminal"], "t1");
+        reviewer_wait(|| lock(&core.owner.state).view["status"] == "Terminal stream ended; select a terminal to attach again");
+        assert!(lock(&core.owner.state).terminal.is_none());
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "reattempt after closed-pane refusal");
+            }
+        }
+        core.close();
     }
 }

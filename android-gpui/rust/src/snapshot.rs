@@ -12,6 +12,8 @@
 //! then the bytes. Written to a temporary file and renamed over the old one.
 use crate::remote::{Error, Result};
 use rio_vt::crosswords::Crosswords;
+use rio_vt::crosswords::grid::{Dimensions, Grid};
+use rio_vt::crosswords::square::Square;
 use rio_vt::crosswords::formatter::write_sgr;
 use rio_vt::crosswords::pos::{Column, Line};
 use rio_vt::crosswords::style::Style;
@@ -34,18 +36,30 @@ const VERSION: u64 = 1;
 /// oldest rows are dropped to fit). Every screen row is written, blank or
 /// not, so replayed rows land on the same screen lines.
 pub(crate) fn encode<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -> Vec<u8> {
+    let shown = grid.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+    encode_grid(&grid.grid, shown, max_bytes)
+}
+
+/// The main screen's history and screen as VT bytes (see [`encode`]), also
+/// while the alternate screen is shown: what a new stream of the same pane
+/// starts from after its old one ended (`Connection::carried`).
+pub(crate) fn encode_main<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -> Vec<u8> {
+    encode_grid(grid.main_grid(), true, max_bytes)
+}
+
+fn encode_grid(grid: &Grid<Square>, cursor_shown: bool, max_bytes: usize) -> Vec<u8> {
     let (rows, cols) = (grid.screen_lines(), grid.columns());
     if rows == 0 || cols == 0 {
         return Vec::new();
     }
-    let history = grid.history_size() as i32;
+    let history = grid.total_lines().saturating_sub(rows) as i32;
     let mut lines: Vec<String> = (-history..rows as i32).map(|line| row(grid, line, cols)).collect();
     let mut tail = String::from("\x1b[0m");
-    let cursor = grid.grid.cursor.pos;
+    let cursor = grid.cursor.pos;
     let _ = write!(tail, "\x1b[{};{}H", cursor.row.0.max(0) + 1, cursor.col.0 + 1);
     // A hidden cursor stays hidden: the composer reads a visible one as the
     // program's input caret, so a cached dialog must not offer one.
-    if !grid.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR) {
+    if !cursor_shown {
         tail.push_str("\x1b[?25l");
     }
     // \r\n between rows, a reset and the cursor at the end.
@@ -73,12 +87,12 @@ pub(crate) fn encode<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -
 
 /// One row, self-contained: it starts and ends in the default style, so any
 /// prefix of history can be dropped. Trailing blanks that draw nothing are left out.
-fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize) -> String {
-    let cells = &grid.grid[Line(line)];
+fn row(grid: &Grid<Square>, line: i32, cols: usize) -> String {
+    let cells = &grid[Line(line)];
     let last = (0..cols).rev().find(|&col| {
         let square = &cells[Column(col)];
         let c = square.c();
-        (c != ' ' && c != '\0') || grid.grid.style_of(square).renders_on_blank()
+        (c != ' ' && c != '\0') || grid.style_of(square).renders_on_blank()
     });
     let mut out = String::new();
     let Some(last) = last else {
@@ -92,7 +106,7 @@ fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize) -> String
             col += 1;
             continue;
         }
-        let style = grid.grid.style_of(square);
+        let style = grid.style_of(square);
         if style != current {
             write_sgr(&mut out, &style);
             current = style;
