@@ -748,6 +748,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (host == null) {
                 runOnUiThread(() -> {
                     reconnectRunning = false;
+                    if (destroyed || !hostResumed) return;
+                    // A lookup for a computer no longer picked must not stop the
+                    // monitor, label or banner of the one picked since.
+                    if (hostEpoch.stale(epoch)) {
+                        retryCurrentHost();
+                        return;
+                    }
                     if (monitor != null) monitor.succeeded();
                     showLinkUp();
                     showReconnectBanner("Open the host list to reconnect");
