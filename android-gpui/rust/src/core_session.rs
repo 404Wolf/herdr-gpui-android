@@ -2693,9 +2693,9 @@ mod connection_tests {
         // Saved for its own pane only, then read back as the held frame.
         let path = std::env::temp_dir().join(format!("herdr-held-{}.snap", std::process::id()));
         let path = path.to_str().unwrap();
-        assert!(!crate::remote::save_pane(0, "t1", path).unwrap());
+        assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
         crate::remote::closed_for_test(session.clone(), "t9");
-        assert!(!crate::remote::save_pane(0, "t1", path).unwrap());
+        assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
         assert!(crate::remote::save_pane(0, "t9", path).unwrap());
         let id = crate::remote::open_saved(path).unwrap();
         let restored = crate::remote::renderer(id).unwrap();
