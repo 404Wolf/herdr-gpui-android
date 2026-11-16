@@ -473,6 +473,11 @@ where
     /// via [`set_grapheme_clustering`](Self::set_grapheme_clustering).
     grapheme_clustering_default: bool,
 
+    /// Whether erasing the whole display (ED 2) on the main screen scrolls
+    /// the rows into history first, as Rio and Alacritty do, or only erases
+    /// them, as xterm does. See [`set_erase_scrolls_into_history`](Self::set_erase_scrolls_into_history).
+    erase_scrolls_into_history: bool,
+
     // The stack for the keyboard modes.
     modify_other_keys: u8,
     keyboard_mode_stack: [u8; KEYBOARD_MODE_STACK_MAX_DEPTH],
@@ -520,6 +525,7 @@ impl<U: EventListener> Crosswords<U> {
                 | Mode::URGENCY_HINTS
                 | Mode::GRAPHEME_CLUSTER,
             grapheme_clustering_default: true,
+            erase_scrolls_into_history: true,
             damage: TermDamageState::new(rows),
             graphics: Graphics::new(&dimensions),
             #[cfg(feature = "graphics")]
@@ -549,6 +555,15 @@ impl<U: EventListener> Crosswords<U> {
     pub fn set_grapheme_clustering(&mut self, enabled: bool) {
         self.grapheme_clustering_default = enabled;
         self.mode.set(Mode::GRAPHEME_CLUSTER, enabled);
+    }
+
+    /// Whether ED 2 (erase the whole display) on the main screen first
+    /// scrolls the rows into history (Rio's default) or only erases them
+    /// (xterm). A viewer that mirrors another terminal, which repaints it
+    /// with ED 2 and replays its history itself, turns it off: otherwise
+    /// every repaint copies the screen into this viewer's scrollback again.
+    pub fn set_erase_scrolls_into_history(&mut self, scrolls: bool) {
+        self.erase_scrolls_into_history = scrolls;
     }
 
     pub fn mark_fully_damaged(&mut self) {
@@ -4125,7 +4140,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 );
             }
             ClearMode::All => {
-                if self.mode.contains(Mode::ALT_SCREEN) {
+                if self.mode.contains(Mode::ALT_SCREEN) || !self.erase_scrolls_into_history {
                     self.grid.reset_region(..);
                     let columns = self.grid.columns();
                     self.clip_atlas_placements(0, screen_lines as i32, 0, columns);
@@ -8336,6 +8351,24 @@ mod tests {
         cw.erase_chars(Column(1)); // blank the lead; sweep repairs the spacer
         assert_eq!(cw.grid[Line(0)][Column(3)].wide(), Wide::Narrow);
         assert!(cw.grid[Line(0)][Column(3)].wrapline());
+    }
+
+    /// ED 2 scrolls the main screen into history by default; an embedder
+    /// mirroring another terminal turns that off (xterm's plain erase).
+    #[test]
+    fn erase_display_scrolls_into_history_unless_the_embedder_turns_it_off() {
+        use crate::performer::handler::Handler;
+        for scrolls in [true, false] {
+            let mut cw = new_term(6, 3);
+            cw.set_erase_scrolls_into_history(scrolls);
+            for c in "ab".chars() {
+                cw.input(c);
+            }
+            cw.goto(Line(0), Column(0));
+            cw.clear_screen(ClearMode::All);
+            assert_eq!(cw.history_size(), usize::from(scrolls), "scrolls={scrolls}");
+            assert!(matches!(cw.grid[Line(0)][Column(0)].c(), ' ' | '\0'), "the screen is erased either way");
+        }
     }
 
     /// ED partial-row clears split pairs at the cursor boundary too.

@@ -126,14 +126,20 @@ impl Session {
             dirty: dirty.clone(),
             events,
         };
-        let grid = Arc::new(FairMutex::new(Crosswords::new(
+        let mut crosswords = Crosswords::new(
             CrosswordsSize::new(usize::from(columns), usize::from(lines)),
             CursorShape::Block,
             listener,
             WindowId::from(0),
             0,
             SCROLLBACK,
-        )));
+        );
+        // Every repaint of a herdr-core pane starts with ESC[H ESC[2J, and the
+        // core replays the pane's history itself: an erase must not copy the
+        // screen into this scrollback each time (it showed up as the screen
+        // repeated when scrolling back). xterm's plain erase.
+        crosswords.set_erase_scrolls_into_history(false);
+        let grid = Arc::new(FairMutex::new(crosswords));
         let shared = Arc::new(Shared {
             theme: Mutex::new(theme),
             size: Mutex::new(WindowSize {
