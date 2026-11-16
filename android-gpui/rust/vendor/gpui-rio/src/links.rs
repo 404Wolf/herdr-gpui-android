@@ -122,6 +122,22 @@ pub struct Found {
     pub spans: Vec<(usize, Range<usize>)>,
 }
 
+/// Whether the cell drawn at `screen_col` of row `line` lies in a pressed
+/// link's `spans`. Spans count grid columns; a window panned or following the
+/// caret starts `origin_col` columns into the grid, so screen and grid columns
+/// differ by that much.
+pub fn pressed<L: PartialEq>(
+    spans: &[(L, Range<usize>)],
+    line: &L,
+    screen_col: usize,
+    origin_col: usize,
+) -> bool {
+    let col = screen_col + origin_col;
+    spans
+        .iter()
+        .any(|(at, columns)| at == line && columns.contains(&col))
+}
+
 /// The link covering column `col` of `rows[row]`. A link continues onto the
 /// next row when the terminal wrapped it there, or when the program broke it
 /// itself (as Claude Code and other TUIs do): the row's text runs to its right
@@ -601,5 +617,21 @@ mod tests {
         assert_eq!(Link::from_uri("mailto:a@b"), None);
         assert_eq!(Link::from_uri("file:///a%0a"), None);
         assert_eq!(Link::from_uri("https://a.io/\n"), None);
+    }
+
+    #[test]
+    fn a_pressed_link_is_washed_where_it_is_drawn_in_a_panned_window() {
+        // A link at grid columns 40..50 of row 3, with the window 30 columns in:
+        // it is drawn at screen columns 10..20.
+        let spans = vec![(3, 40..50)];
+        assert!(pressed(&spans, &3, 10, 30));
+        assert!(pressed(&spans, &3, 19, 30));
+        assert!(!pressed(&spans, &3, 20, 30));
+        assert!(!pressed(&spans, &3, 9, 30));
+        // Screen columns are not grid columns: 40..50 on screen is past it.
+        assert!(!pressed(&spans, &3, 40, 30));
+        // Other rows, and the unpanned window, as before.
+        assert!(!pressed(&spans, &4, 10, 30));
+        assert!(pressed(&spans, &3, 45, 0));
     }
 }

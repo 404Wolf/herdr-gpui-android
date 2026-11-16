@@ -95,6 +95,8 @@ impl TerminalView {
         }
         #[cfg(unix)]
         self.attach_shell(state.shell, cx);
+        #[cfg(unix)]
+        self.pan_shell(state.generation, cx);
         #[cfg(not(unix))]
         let _ = cx;
         let new_generation = self.state.generation != state.generation;
@@ -186,6 +188,26 @@ impl TerminalView {
                 });
                 (handle, terminal)
             });
+    }
+
+    /// Hands queued pan steps (the pan buttons) to the shell's view, which
+    /// owns the column offset of a grid wider than the pane.
+    #[cfg(unix)]
+    fn pan_shell(&mut self, generation: i64, cx: &mut Context<Self>) {
+        let Some((handle, terminal)) = &self.shell else {
+            return;
+        };
+        // Only steps queued for the pane drawn here: ones queued for another
+        // pane (a switch raced this take) are dropped by the mailbox.
+        let dx = model::mailbox().take_shell_pan(generation, *handle);
+        if dx == 0. {
+            return;
+        }
+        terminal.update(cx, |terminal, cx| {
+            if terminal.pan(px(dx)) {
+                cx.notify();
+            }
+        });
     }
 
     #[cfg(unix)]

@@ -435,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn a_panned_window_maps_taps_to_the_grid_columns_drawn() {
+        use crate::view_origin;
+        // A 200-column grid on a 50-column pane, panned 120 columns in.
+        let grid = (200, 24);
+        let origin = view_origin((200, 24), (50, 24), (23, 2), false, Some(120));
+        assert_eq!(origin, (0, 120));
+        assert_eq!(cell_at((5., 5.), CELL, origin, grid), Some((120, 0)));
+        assert_eq!(cell_at((499., 5.), CELL, origin, grid), Some((169, 0)));
+        // Panned to the end: the last screen column is the grid's last.
+        let origin = view_origin((200, 24), (50, 24), (23, 2), false, Some(500));
+        assert_eq!(cell_at((499., 479.), CELL, origin, grid), Some((199, 23)));
+    }
+
+    #[test]
     fn a_window_into_a_larger_grid_is_offset_by_its_origin() {
         assert_eq!(cell_at((5., 5.), CELL, (16, 40), (120, 40)), Some((40, 16)));
         assert_eq!(
