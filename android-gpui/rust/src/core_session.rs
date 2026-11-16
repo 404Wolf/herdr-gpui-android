@@ -96,49 +96,11 @@ struct Connection<'a> {
     /// that keeps closing is reattached at most that often. Only a refused
     /// attach leaves it ended.
     reattached_at: Option<Instant>,
-    /// The grid of the pane whose stream the core ended: the next attach of
-    /// that pane (the automatic reattach, also parked and shown later, or a
-    /// person picking it again) starts its new grid from its main screen, so
-    /// history the core does not send again (an attach on the alternate
-    /// screen carries none) is not lost. Read only once its reader has parsed
-    /// every byte the stream delivered (see [`Carried::copy`]).
-    carried: Option<Carried>,
-}
-
-/// The grid of a pane whose stream the core ended (`Connection::carried`).
-struct Carried {
-    pane: String,
-    grid: Arc<gpui_rio::Session>,
-    closed: Instant,
-}
-
-/// How long a carried grid's reader may take to parse what its stream
-/// delivered. Past it the carry is given up, never copied half parsed.
-const CARRY_DRAIN: Duration = Duration::from_secs(2);
-
-impl Carried {
-    /// Its reader has parsed every byte the ended stream delivered (it stops
-    /// at the stream's end), or the wait for that is over.
-    fn settled(&self) -> bool {
-        !self.grid.is_alive() || self.closed.elapsed() >= CARRY_DRAIN
-    }
-
-    /// Its main screen and scrollback as VT bytes, with the grid they were
-    /// copied at, once its reader has parsed everything the ended stream
-    /// delivered. Waits (on the session loop, never the UI) at most
-    /// [`CARRY_DRAIN`] after the end; a reader still busy then gives None:
-    /// the attach asks the core for history as usual instead.
-    fn copy(self) -> Option<((u16, u16), Vec<u8>)> {
-        while self.grid.is_alive() && self.closed.elapsed() < CARRY_DRAIN {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if self.grid.is_alive() {
-            return None;
-        }
-        let grid = self.grid.grid().lock();
-        let size = (grid.columns() as u16, grid.screen_lines() as u16);
-        Some((size, crate::snapshot::encode_main(&grid, crate::snapshot::MAX_BYTES)))
-    }
+    /// The pane whose stream the core ended: the next attach of it (the
+    /// automatic reattach, also one parked while hidden and made when shown,
+    /// or a person picking it again) is `resumed` where the path confirmed
+    /// `resize_history`, so the owner owes one whole history replacement.
+    ended: Option<String>,
 }
 
 /// History rows asked for in the repaint after a RESIZE: the attach's own
@@ -372,14 +334,9 @@ impl Connection<'_> {
                     self.output = None;
                     let mut state = lock(&self.owner.state);
                     let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-                    // Kept for the next attach of this pane, which copies its
-                    // main screen once its reader has parsed what the ended
-                    // stream delivered (read only: it may still be on screen).
-                    self.carried = state
-                        .terminal
-                        .clone()
-                        .filter(|_| !pane.is_empty())
-                        .map(|grid| Carried { pane: pane.clone(), grid, closed: Instant::now() });
+                    if !pane.is_empty() {
+                        self.ended = Some(pane.clone());
+                    }
                     state.view["state"] = json!("connecting");
                     state.view["status"] =
                         json!("Terminal stream ended; select a terminal to attach again");
@@ -980,8 +937,7 @@ impl Connection<'_> {
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
         // This attach replaces any reattach still waiting for its turn.
         self.reattach = None;
-        // The same pane again after its stream ended: start from what it held.
-        let resume = self.carried.take().filter(|carried| carried.pane == terminal).and_then(Carried::copy);
+        let resumed = self.ended.take().is_some_and(|ended| ended == terminal);
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
@@ -1002,16 +958,15 @@ impl Connection<'_> {
         if self.history_on_resize {
             params["resize_history"] = json!(RESIZE_HISTORY);
         }
-        if resume.is_some() {
-            // The same pane again after the core ended its stream: the grid
-            // starts from what the phone held. `resumed` makes the owner owe
-            // a whole history replacement (sent at once, or on the return to
-            // the main screen); without `resize_history` the path cannot
-            // send one, so ask no history that would repeat what is held.
+        if resumed && self.history_on_resize {
+            // The same pane again after the core ended its stream, on a path
+            // that confirmed `resize_history`: the owner then owes one whole
+            // history replacement (at once on the main screen, or on the
+            // return to it), which replaces this grid's history; the phone
+            // replays nothing itself. Elsewhere an ordinary attach (its
+            // history, maybe some rows twice; on the alternate screen an old
+            // owner sends none, so the main history is not brought back).
             params["resumed"] = json!(true);
-            if !self.history_on_resize {
-                params["history"] = json!(0);
-            }
         }
         let reply = self.call("terminal.attach", params)?;
         // Only the owner's echo confirms it (relays pass on only that): no
@@ -1042,7 +997,6 @@ impl Connection<'_> {
         let output = StreamRead {
             rx,
             chunks: VecDeque::new(),
-            uncredited: 0,
             commands: commands.clone(),
             channel,
             session: session_slot.clone(),
@@ -1066,24 +1020,6 @@ impl Connection<'_> {
             terminal_session.set_grid(cols, rows);
         }
         *lock(&session_slot) = Arc::downgrade(&terminal_session);
-        // The carried main screen, through the ordered reader: at the grid it
-        // was copied at, then back to this stream's grid, all before a byte
-        // of this stream (the output opens just below).
-        if let Some((carried_grid, bytes)) = resume {
-            if let Some(grid) = initial_grid(&reply) {
-                let _ = tx.try_send(Chunk::Grid(carried_grid.0, carried_grid.1));
-                let _ = tx.try_send(Chunk::Local(bytes));
-                let _ = tx.try_send(Chunk::Grid(grid.0, grid.1));
-            } else {
-                // A path that does not confirm the grid: the copy still goes
-                // in at the grid it was taken at, then the grid is the pane's
-                // own again (and follows it), its next erase keeping the
-                // screen in history so the change loses no row.
-                let _ = tx.try_send(Chunk::Grid(carried_grid.0, carried_grid.1));
-                let _ = tx.try_send(Chunk::Local(bytes));
-                let _ = tx.try_send(Chunk::Release);
-            }
-        }
         crate::remote::release_held();
         self.channel = channel;
         self.output = Some(tx);
@@ -1643,21 +1579,12 @@ fn tab_mut<'a>(doc: &'a mut Value, space: &str, tab: &str) -> Result<&'a mut Val
 /// One item of an attached stream, in the core's order.
 enum Chunk {
     Data(Vec<u8>),
-    /// Bytes from the phone itself (a carried main screen), parsed in order
-    /// like DATA but never credited to the core.
-    Local(Vec<u8>),
-    /// In order: the grid is the pane's own again (a path that does not
-    /// confirm the grid, after a carried screen went in at its own grid).
-    Release,
     /// The PTY's authoritative grid (a RESIZE frame).
     Grid(u16, u16),
 }
 struct StreamRead {
     rx: mpsc::Receiver<Chunk>,
     chunks: VecDeque<u8>,
-    /// Bytes at the front of `chunks` that came from the phone itself (a
-    /// carried main screen), not from the core: no CREDIT for them.
-    uncredited: usize,
     commands: mpsc::SyncSender<Operation>,
     channel: u32,
     /// The session this stream feeds, for in-order grid changes.
@@ -1677,21 +1604,6 @@ impl Read for StreamRead {
         while self.chunks.is_empty() {
             match self.rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(Chunk::Data(bytes)) => self.chunks.extend(bytes),
-                Ok(Chunk::Release) => {
-                    if let Some(session) = lock(&self.session).upgrade() {
-                        let before = session.grid_size();
-                        session.clear_grid();
-                        if session.grid_size() != before {
-                            session.grid().lock().scroll_next_erase_into_history();
-                        }
-                    }
-                    return Err(io::ErrorKind::TimedOut.into());
-                }
-                Ok(Chunk::Local(bytes)) => {
-                    // Only reached with nothing else queued: these bytes lead.
-                    self.uncredited += bytes.len();
-                    self.chunks.extend(bytes);
-                }
                 Ok(Chunk::Grid(cols, rows)) => {
                     if let Some(session) = lock(&self.session).upgrade() {
                         session.queue_grid(cols, rows);
@@ -1709,17 +1621,13 @@ impl Read for StreamRead {
                 .pop_front()
                 .ok_or(io::ErrorKind::UnexpectedEof)?;
         }
-        let local = n.min(self.uncredited);
-        self.uncredited -= local;
-        if n > local {
-            self.commands
-                .try_send(Operation::Frame(
-                    self.channel,
-                    1,
-                    ((n - local) as u32).to_le_bytes().to_vec(),
-                ))
-                .map_err(|_| io::ErrorKind::BrokenPipe)?;
-        }
+        self.commands
+            .try_send(Operation::Frame(
+                self.channel,
+                1,
+                (n as u32).to_le_bytes().to_vec(),
+            ))
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
         Ok(n)
     }
 }
@@ -1815,7 +1723,7 @@ pub(crate) fn run(
         history_on_resize: offers(&hello, "resize_history"),
         reattach: None,
         reattached_at: None,
-        carried: None,
+        ended: None,
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -1901,7 +1809,7 @@ fn serve(
                 // A person's pick: an owed reattach of another pane is off.
                 if connection.reattach.as_ref().is_some_and(|owed| *owed != terminal) {
                     connection.reattach = None;
-                    connection.carried = None;
+                    connection.ended = None;
                 }
                 connection.claim.parked = Some(terminal);
             }
@@ -1942,9 +1850,6 @@ fn serve(
             connection.deliver(frame)?;
         }
         if connection.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY)
-            // Its carried grid first finishes what the ended stream delivered
-            // (the loop goes on meanwhile).
-            && connection.carried.as_ref().is_none_or(Carried::settled)
             && let Some(pane) = connection.reattach.take()
             // A newer pick (also one parked while hidden) wins over the old pane.
             && connection.claim.parked.as_ref().is_none_or(|parked| *parked == pane)
@@ -3265,7 +3170,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3312,7 +3217,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3334,7 +3239,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3458,7 +3363,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3505,7 +3410,7 @@ mod connection_tests {
     /// What herdr-core sends after a RESIZE to a viewer that asked for
     /// `resize_history` (home-manager-conf #88): CAN, the paint's reset
     /// (ending ESC[H ESC[2J), ESC[3J, then the history and the screen.
-    fn core_resize_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+    pub(super) fn core_resize_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
         let paint = core_paint(history, screen, rows);
         let reset = b"\x1b[H\x1b[2J";
         let at = paint.windows(reset.len()).position(|w| w == reset).unwrap() + reset.len();
@@ -3516,7 +3421,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(64);
         let (commands, _credits) = mpsc::sync_channel(4096);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&pane);
@@ -3802,7 +3707,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
@@ -3831,7 +3736,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), uncredited: 0, commands: commands.clone(), channel: 9, session: slot.clone() };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
@@ -3923,11 +3828,8 @@ mod claim_tests {
         echo: bool,
         /// Echo `resize_history` only on attaches up to this one (counting from 1).
         echo_until: Option<usize>,
-        /// The attach reply confirms RESIZE frames (and gives `grid`, else 90x40).
+        /// The attach reply confirms RESIZE frames (and gives a 90x40 grid).
         resizes: bool,
-        /// Confirm RESIZE only on attaches up to this one (counting from 1).
-        resizes_until: Option<usize>,
-        grid: Option<(u16, u16)>,
         refuse_from: Option<usize>,
     }
 
@@ -4016,7 +3918,7 @@ mod claim_tests {
                                     continue;
                                 }
                                 next_channel += 1;
-                                let mut result = json!({"channel":next_channel - 1,"resize_notifications":script.resizes && script.resizes_until.is_none_or(|n| attaches <= n),"terminal":{"cols":script.grid.map_or(90, |g| g.0),"rows":script.grid.map_or(40, |g| g.1)},
+                                let mut result = json!({"channel":next_channel - 1,"resize_notifications":script.resizes,"terminal":{"cols":90,"rows":40},
                                        "visibility_updates": asked && confirm});
                                 if script.echo && script.echo_until.is_none_or(|n| attaches <= n) && request["params"].get("resize_history").is_some() {
                                     result["resize_history"] = request["params"]["resize_history"].clone();
@@ -4441,7 +4343,9 @@ mod claim_tests {
         alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT after reattach");
         core.push.send((3, 0, alt)).unwrap();
         reviewer_wait(|| second.screen_text().contains("ALT after reattach"));
-        let main = connection_tests::core_paint(&[], &all[40..], 40);
+        // The owner contract (#88): this resumed, opted-in stream owes a
+        // whole history replacement on its return to the main screen.
+        let main = owner_main_paint(&reattach, &all[..40], &all[40..], 40);
         core.push.send((3, 0, main)).unwrap();
         reviewer_wait(|| second.screen_text().contains("row 049"));
         let got = rows(&second);
@@ -4476,11 +4380,25 @@ mod claim_tests {
         core.close();
     }
 
-    /// #27 re-review (t21s) (a): the carried main screen survives a
-    /// reattach put off while hidden on a path without visibility frames
-    /// (parked) and made when shown; that attach is `resumed`.
+    /// What a #88 owner sends a stream when its program is (back) on the main
+    /// screen: to a `resumed` attach that asked `resize_history`, the one
+    /// whole history replacement it owes (CAN, reset, ESC[3J, history,
+    /// screen); otherwise the screen only.
+    fn owner_main_paint(request: &Value, history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+        if request["resumed"] == true && request["resize_history"].as_u64().unwrap_or(0) > 0 {
+            connection_tests::core_resize_paint(history, screen, rows)
+        } else {
+            connection_tests::core_paint(&[], screen, rows)
+        }
+    }
+
+    /// #27 (t21s's reviews, t1jf's decision): the reattach of a pane whose
+    /// stream the core ended is `resumed` with `resize_history`, also when it
+    /// was put off while hidden on a path without visibility frames (parked)
+    /// and made when shown; the owner's replacement on the return to the main
+    /// screen then gives back every row.
     #[test]
-    fn a_parked_reattach_shown_later_keeps_the_main_history() {
+    fn a_parked_reattach_shown_later_is_resumed_and_gets_the_history_back() {
         let core = Mock::scripted(json!(["resize_history"]), false, true, true,
             Script { echo: true, resizes: true, ..Script::default() });
         reviewer_attach(&core);
@@ -4491,9 +4409,10 @@ mod claim_tests {
         reviewer_wait(|| first.screen_text().contains("row 049"));
         core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
         reviewer_wait(|| first.screen_text().contains("ALT"));
-        // Ended, reattached at once (carrying it), then ended again within 5 s.
+        // Ended, reattached at once, then ended again within 5 s.
         core.push.send((2, 2, Vec::new())).unwrap();
-        assert_eq!(reviewer_attach(&core)["resumed"], true);
+        let again = reviewer_attach(&core);
+        assert_eq!((again["resumed"].clone(), again["resize_history"].clone()), (json!(true), json!(1000)));
         reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
         core.push.send((3, 2, Vec::new())).unwrap();
         reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
@@ -4507,145 +4426,65 @@ mod claim_tests {
         core.set_visible(true);
         let shown = reviewer_attach(&core);
         assert_eq!(shown["terminal"], "t1");
-        assert_eq!(shown["resumed"], true, "the carried screen went through park and show");
+        assert_eq!(shown["resumed"], true, "still the reattach after park and show");
         reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
         let third = lock(&core.owner.state).terminal.clone().unwrap();
         let mut alt = connection_tests::core_paint(&[], &[], 40);
         alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT again");
         core.push.send((4, 0, alt)).unwrap();
         reviewer_wait(|| third.screen_text().contains("ALT again"));
-        core.push.send((4, 0, connection_tests::core_paint(&[], &all[40..], 40))).unwrap();
+        core.push.send((4, 0, owner_main_paint(&shown, &all[..40], &all[40..], 40))).unwrap();
         reviewer_wait(|| third.screen_text().contains("row 049"));
         let rows: Vec<String> = connection_tests::all_rows(&third).into_iter().filter(|s| !s.is_empty()).collect();
         core.close();
         assert_eq!(rows, all);
     }
 
-    /// (b): the CLOSE comes while the old grid's reader is still parsing
-    /// what the stream delivered before it (held here by its grid lock).
-    /// The carried copy waits for that, so on a path without
-    /// `resize_history` (no history asked, nothing to repair) every row the
-    /// stream delivered survives.
+    /// (B), documented: where the path does not confirm `resize_history` (an
+    /// old owner or relay, a downgrade), the reattach is an ordinary attach
+    /// asking the attach's history. On the main screen that history comes
+    /// back (some rows maybe twice, none lost). On the alternate screen an
+    /// old owner sends none, so on the return to main the old main history is
+    /// gone: the same as before #27 on such paths.
     #[test]
-    fn a_close_behind_unparsed_output_carries_every_row_delivered() {
-        let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
-            Script { resizes: true, ..Script::default() });
-        reviewer_attach(&core);
-        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
-        let first = lock(&core.owner.state).terminal.clone().unwrap();
-        let all: Vec<String> = (0..300).map(|n| format!("row {n:03}")).collect();
-        let held = first.grid().lock();
-        for piece in connection_tests::core_paint(&all[..260], &all[260..], 40).chunks(512) {
-            core.push.send((2, 0, piece.to_vec())).unwrap();
-        }
-        core.push.send((2, 2, Vec::new())).unwrap();
-        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
-        drop(held);
-        let again = reviewer_attach(&core);
-        assert_eq!(again["resumed"], true);
-        assert_eq!(again["history"], 0, "no resize_history: no history asked, none repeated");
-        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
-        let second = lock(&core.owner.state).terminal.clone().unwrap();
-        core.push.send((3, 0, connection_tests::core_paint(&[], &all[260..], 40))).unwrap();
-        reviewer_wait(|| second.screen_text().contains("row 299"));
-        let rows: Vec<String> = connection_tests::all_rows(&second).into_iter().filter(|s| !s.is_empty()).collect();
-        core.close();
-        assert_eq!(rows, all);
-    }
-
-    /// (c): the carried screen is replayed at the grid it was copied at,
-    /// before this stream's grid, whatever the phone offers: rows as wide as
-    /// that grid (wider than the phone's 90 columns) come back unwrapped.
-    #[test]
-    fn a_carried_screen_is_replayed_at_its_own_grid() {
-        let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
-            Script { resizes: true, grid: Some((100, 20)), ..Script::default() });
-        reviewer_attach(&core);
-        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| p.grid_size() == (100, 20)));
-        let first = lock(&core.owner.state).terminal.clone().unwrap();
-        let all: Vec<String> = (0..30).map(|n| format!("{n:03} {}", "x".repeat(95))).collect();
-        core.push.send((2, 0, connection_tests::core_paint(&all[..10], &all[10..], 20))).unwrap();
-        reviewer_wait(|| first.screen_text().contains("029 "));
-        core.push.send((2, 2, Vec::new())).unwrap();
-        reviewer_attach(&core);
-        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
-        let second = lock(&core.owner.state).terminal.clone().unwrap();
-        reviewer_wait(|| second.screen_text().contains("029 "));
-        let rows: Vec<String> = connection_tests::all_rows(&second).into_iter().filter(|s| !s.is_empty()).collect();
-        core.close();
-        assert_eq!(second.grid_size(), (100, 20));
-        assert_eq!(rows, all, "replayed at 100x20, not at the phone's 90 columns");
-    }
-
-    /// #27 third review (t21s) P1: a carried grid whose reader is still
-    /// busy when the wait for it is over (held here on its grid lock past
-    /// CARRY_DRAIN) is never copied half parsed: the reattach is an ordinary
-    /// attach that asks the core for history, with no local replay.
-    #[test]
-    fn a_reader_still_busy_after_the_drain_wait_gives_up_the_carry() {
-        let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
-            Script { resizes: true, ..Script::default() });
-        reviewer_attach(&core);
-        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
-        let first = lock(&core.owner.state).terminal.clone().unwrap();
+    fn without_resize_history_the_reattach_is_ordinary() {
         let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
-        core.push.send((2, 0, connection_tests::core_paint(&all[..40], &all[40..], 40))).unwrap();
-        reviewer_wait(|| first.screen_text().contains("row 049"));
-        let held = first.grid().lock();
-        core.push.send((2, 0, b"more output\r\n".to_vec())).unwrap();
-        core.push.send((2, 2, Vec::new())).unwrap();
-        let started = Instant::now();
-        let again = loop {
-            if let Seen::Attach(params) = core.next() { break params; }
-        };
-        assert!(started.elapsed() >= CARRY_DRAIN - Duration::from_millis(100), "it waited for the reader first");
-        assert!(again.get("resumed").is_none(), "no half-parsed copy: an ordinary attach");
-        assert_eq!(again["history"], 1000, "it asks the core for history instead");
-        drop(held);
-        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
-        let second = lock(&core.owner.state).terminal.clone().unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!second.screen_text().contains("row "), "nothing replayed locally");
-        core.close();
-    }
-
-    /// Third review P2: on a path that stops confirming the grid (a
-    /// downgrade), the carried screen still goes in at the grid it was taken
-    /// at (100x20 here, the phone offering 90x40), then the grid is the
-    /// pane's own again with no row lost: the old history survives an
-    /// alternate screen and the return to main.
-    #[test]
-    fn a_carried_screen_on_a_path_that_stops_confirming_the_grid_keeps_its_history() {
-        let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
-            Script { resizes: true, resizes_until: Some(1), grid: Some((100, 20)), ..Script::default() });
-        reviewer_attach(&core);
-        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| p.grid_size() == (100, 20)));
-        let first = lock(&core.owner.state).terminal.clone().unwrap();
-        let all: Vec<String> = (0..30).map(|n| format!("row {n:03}")).collect();
-        core.push.send((2, 0, connection_tests::core_paint(&all[..10], &all[10..], 20))).unwrap();
-        reviewer_wait(|| first.screen_text().contains("row 029"));
-        core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
-        reviewer_wait(|| first.screen_text().contains("ALT"));
-        core.push.send((2, 2, Vec::new())).unwrap();
-        let again = reviewer_attach(&core);
-        assert_eq!(again["resumed"], true);
-        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
-        let second = lock(&core.owner.state).terminal.clone().unwrap();
-        reviewer_wait(|| second.screen_text().contains("row 029") && !second.negotiated());
-        // The program is still on the alternate screen, then returns to main
-        // (screen-only paints: this path asks no history).
-        let mut alt = connection_tests::core_paint(&[], &[], 40);
-        alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT again");
-        core.push.send((3, 0, alt)).unwrap();
-        reviewer_wait(|| second.screen_text().contains("ALT again"));
-        core.push.send((3, 0, connection_tests::core_paint(&[], &all[10..], 40))).unwrap();
-        reviewer_wait(|| second.screen_text().contains("row 029"));
-        let rows: Vec<String> = connection_tests::all_rows(&second).into_iter().filter(|s| !s.is_empty()).collect();
-        core.close();
-        for line in &all {
-            assert!(rows.contains(line), "{line} lost: {rows:?}");
+        for on_alt in [false, true] {
+            let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
+                Script { resizes: true, ..Script::default() });
+            reviewer_attach(&core);
+            reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+            let first = lock(&core.owner.state).terminal.clone().unwrap();
+            core.push.send((2, 0, connection_tests::core_paint(&all[..40], &all[40..], 40))).unwrap();
+            reviewer_wait(|| first.screen_text().contains("row 049"));
+            if on_alt {
+                core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
+                reviewer_wait(|| first.screen_text().contains("ALT"));
+            }
+            core.push.send((2, 2, Vec::new())).unwrap();
+            let again = reviewer_attach(&core);
+            assert!(again.get("resumed").is_none() && again.get("resize_history").is_none());
+            assert_eq!(again["history"], 1000, "never history 0: the core sends what it has");
+            reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
+            let second = lock(&core.owner.state).terminal.clone().unwrap();
+            if on_alt {
+                // The old owner's attach paint on the alternate screen: no history.
+                let mut alt = connection_tests::core_paint(&[], &[], 40);
+                alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT again");
+                core.push.send((3, 0, alt)).unwrap();
+                reviewer_wait(|| second.screen_text().contains("ALT again"));
+                core.push.send((3, 0, owner_main_paint(&again, &all[..40], &all[40..], 40))).unwrap();
+            } else {
+                core.push.send((3, 0, connection_tests::core_paint(&all[..40], &all[40..], 40))).unwrap();
+            }
+            reviewer_wait(|| second.screen_text().contains("row 049"));
+            let rows: Vec<String> = connection_tests::all_rows(&second).into_iter().filter(|s| !s.is_empty()).collect();
+            core.close();
+            if on_alt {
+                assert_eq!(rows, all[40..].to_vec(), "documented: the old main history is not brought back");
+            } else {
+                assert_eq!(rows, all, "the attach's own history brings every row back");
+            }
         }
-        let firsts: Vec<usize> = all.iter().map(|l| rows.iter().position(|r| r == l).unwrap()).collect();
-        assert!(firsts.windows(2).all(|w| w[0] < w[1]), "in order: {rows:?}");
     }
 }

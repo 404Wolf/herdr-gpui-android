@@ -1,7 +1,7 @@
 # rio-vt
 
 > **Modified copy** of rio-vt 0.5.28 for Herdr GPUI Android (MIT, see
-> `LICENSE`). Three changes:
+> `LICENSE`). Two changes:
 >
 > - Kitty graphics transmissions that name a file, temporary file or
 >   shared-memory object are refused with `EINVAL: unsupported medium` instead
@@ -15,8 +15,6 @@
 >   `Crosswords::scroll_next_erase_into_history()` keeps Rio's behaviour for
 >   one ED 2: the repaint right after the core resizes the pane, so rows the
 >   core and the phone moved differently are never lost.
-> - `Crosswords::main_grid()` reads the main screen's grid and scrollback,
->   also while the alternate screen is shown (read only).
 >
 > The examples and benchmark are not copied (so `ansi::sixel::tests::load_sixel_files`,
 > which reads them, fails when this crate is tested on its own).
