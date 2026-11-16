@@ -35,6 +35,29 @@ final class DictationRouting {
         void transcribedOnPhone();
     }
 
+    /** What the composer's Enter does in a dictation state ({@link #onEnter}). */
+    enum Enter {
+        /** Recording: stop, and send once the session ends. */
+        STOP_THEN_SEND,
+        /** Transcribing: send once the session ends, never the partial now. */
+        SEND_WHEN_DONE,
+        /** No session finishing: send the draft now. */
+        SEND
+    }
+
+    /** The microphone is open: the clock runs, "talk" stops it, and Enter stops first. */
+    static boolean recording(DictationEngine.State s) {
+        return s == DictationEngine.State.CONNECTING || s == DictationEngine.State.LISTENING
+                || s == DictationEngine.State.ON_DEVICE || s == DictationEngine.State.OFFLINE_RECORDING;
+    }
+
+    /** ComposerBar.enter's decision: a session still finishing makes Enter wait for its end. */
+    static Enter onEnter(DictationEngine.State s) {
+        if (recording(s)) return Enter.STOP_THEN_SEND;
+        if (s == DictationEngine.State.TRANSCRIBING) return Enter.SEND_WHEN_DONE;
+        return Enter.SEND;
+    }
+
     private final ComposerDrafts drafts;
     private final Bar bar;
     /** The pane an Enter was pressed in while a session was finishing; null for none. */
