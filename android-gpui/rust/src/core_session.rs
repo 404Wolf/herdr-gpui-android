@@ -2811,7 +2811,6 @@ mod connection_tests {
     /// then the screen.
     fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
         let history = session.grid().lock().history_size();
-        let rows = usize::from(session.grid_size().1);
         let mut out: Vec<String> = Vec::new();
         for offset in (0..=history).rev() {
             let shown = rows_back(session, offset as i32);
