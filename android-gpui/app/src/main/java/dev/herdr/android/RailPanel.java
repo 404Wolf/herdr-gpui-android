@@ -83,6 +83,68 @@ final class RailPanel {
     }
 
     /**
+     * What the window's rail is now: open (rows built), floating as a drawer
+     * over the terminal ({@code overlay}: opened by a gesture on a wide
+     * window, transient), and whether a closed docked rail shows the strip.
+     * Every change of the activity's rail goes through one of these, so a
+     * transient drawer never decides what the docked rail is.
+     */
+    static final class Shown {
+        final boolean open, overlay, minimized;
+
+        Shown(boolean open, boolean overlay, boolean minimized) {
+            this.open = open;
+            this.overlay = overlay;
+            this.minimized = minimized;
+        }
+
+        /**
+         * The window's configuration applied (start, fold, unfold): the
+         * stored choice as this panel shows it. A drawer open across the fold
+         * is gone: it was never the docked choice.
+         */
+        static Shown configured(RailPanel stored, boolean docks, boolean shell) {
+            Mode m = stored.shown(docks, shell);
+            return new Shown(m == Mode.OPEN, false, m == Mode.MINIMIZED);
+        }
+
+        /** The buttons and keys: the docked rail as {@code next} is (it is also stored). */
+        static Shown docked(RailPanel next) {
+            return new Shown(next.mode == Mode.OPEN, false, next.mode == Mode.MINIMIZED);
+        }
+
+        /** Floats over the terminal (narrow window, or a gesture's drawer): nothing docked changes. */
+        boolean drawer(boolean compact) {
+            return compact || overlay;
+        }
+
+        /**
+         * The toolbar's toggle, a drawer's Back or tap outside: open or shut.
+         * A drawer shuts to what was docked (the strip stays); pinned open
+         * or closed beside the terminal, the strip is gone.
+         */
+        Shown toggled(boolean open, boolean compact) {
+            boolean transientDrawer = drawer(compact);
+            return new Shown(open, open && overlay, transientDrawer && minimized);
+        }
+
+        /** A gesture opens the rail as a drawer over a wide window's terminal. */
+        Shown floated(boolean compact) {
+            return new Shown(true, !compact, minimized);
+        }
+
+        /** The docked strip shows: closed, minimized, and not a drawer. */
+        boolean strip(boolean compact) {
+            return !open && minimized && !drawer(compact);
+        }
+
+        /** The rail's width in dp: 0 closed, the strip's, or open ({@code openDp}). */
+        int widthDp(boolean compact, int openDp) {
+            return open ? openDp : strip(compact) ? STRIP_DP : 0;
+        }
+    }
+
+    /**
      * The badge's text, from how many agents on the machine shown wait on Wolf
      * (the bar's "! N need you", ProjectBar.needYou): empty when nobody waits.
      */

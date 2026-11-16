@@ -447,7 +447,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railBody = new LinearLayout(this);
         railBody.setOrientation(LinearLayout.VERTICAL);
         railControls = createRailControls();
-        railBody.addView(railControls, new LinearLayout.LayoutParams(-1, dp(32)));
+        railBody.addView(railControls, new LinearLayout.LayoutParams(-1, dp(48)));
         railBody.addView(sidebarScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         railFrame.addView(railBody, new android.widget.FrameLayout.LayoutParams(-1, -1));
         railFade = new View(this);
@@ -522,14 +522,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean railOverlay;
 
     private boolean railAsDrawer() {
-        return compactWindow() || railOverlay;
+        return railShown().drawer(compactWindow());
     }
 
     /** Opens the rail as a drawer over the terminal, never narrowing it. */
     private void showRailOverlay() {
         if (sidebarOpen) return;
-        railOverlay = !compactWindow();
-        setSidebarOpen(true);
+        // Transient: nothing docked (the stored choice, the strip) changes.
+        setRailShown(railShown().floated(compactWindow()));
+        applySidebarWidth();
+        updateHostSampling();
+        revealedPane = "";
+        refreshSidebar(true);
+    }
+
+    /** The rail as it is now (item 83's transitions are RailPanel.Shown's). */
+    private RailPanel.Shown railShown() {
+        return new RailPanel.Shown(sidebarOpen, railOverlay, railMinimized);
+    }
+
+    private void setRailShown(RailPanel.Shown next) {
+        if (sidebarOpen != next.open) sidebarSignature = null;
+        sidebarOpen = next.open;
+        railOverlay = next.overlay;
+        railMinimized = next.minimized;
     }
 
     private void styleRail() {
@@ -1007,6 +1023,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         View bar = composer.bar(chrome, pinned, scrolling);
         updateControlButton();
         updateRailToggle();
+        // A rebuilt toolbar (theme, posture) gets the badge now, not at the count's next change.
+        updateRailBadge();
         return bar;
     }
 
@@ -2008,13 +2026,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // restores what the user asked for.
         // Item 83: the stored choice is open, minimized to a strip, or closed.
         int widthDp = getResources().getConfiguration().screenWidthDp;
+        // A drawer open across the fold ends here: it never decides the docked choice.
         railPanel = storedRailPanel();
-        RailPanel.Mode shown = railPanel.shown(widthDp >= 600, shellMode());
-        boolean open = shown == RailPanel.Mode.OPEN;
-        railMinimized = shown == RailPanel.Mode.MINIMIZED;
-        boolean opening = open && !sidebarOpen;
-        if (sidebarOpen != open) sidebarSignature = null;
-        sidebarOpen = open;
+        RailPanel.Shown next = RailPanel.Shown.configured(railPanel, widthDp >= 600, shellMode());
+        boolean opening = next.open && !sidebarOpen;
+        setRailShown(next);
         applySidebarWidth();
         updateHostSampling();
         // A closed rail builds no rows (refreshSidebar), so one docked by
@@ -2087,16 +2103,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void setSidebarOpen(boolean open) {
-        sidebarOpen = open;
         // The stored choice is for a pinned panel with room; a drawer (the
-        // cover's, or one opened by a gesture) is transient.
-        boolean transientDrawer = railAsDrawer();
-        if (!open) railOverlay = false;
-        if (!transientDrawer) {
-            // Pinned open or closed beside the terminal: the strip is gone either way.
-            railMinimized = false;
-            storeRailPanel(railPanel.with(open ? RailPanel.Mode.OPEN : RailPanel.Mode.CLOSED));
-        }
+        // cover's, or one opened by a gesture) is transient: it shuts to what
+        // was docked, the strip included.
+        if (!railAsDrawer()) storeRailPanel(railPanel.with(open ? RailPanel.Mode.OPEN : RailPanel.Mode.CLOSED));
+        setRailShown(railShown().toggled(open, compactWindow()));
         applySidebarWidth();
         updateHostSampling();
         if (sidebarOpen) {
@@ -2134,12 +2145,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         storeRailPanel(next);
-        railOverlay = false;
-        boolean open = next.mode == RailPanel.Mode.OPEN;
-        boolean opening = open && !sidebarOpen;
-        if (sidebarOpen != open) sidebarSignature = null;
-        sidebarOpen = open;
-        railMinimized = next.mode == RailPanel.Mode.MINIMIZED;
+        RailPanel.Shown shown = RailPanel.Shown.docked(next);
+        boolean opening = shown.open && !sidebarOpen;
+        setRailShown(shown);
         applySidebarWidth();
         updateHostSampling();
         if (opening) {
@@ -2180,7 +2188,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         button.setContentDescription(description);
         button.setTooltipText(description);
         button.setOnClickListener(view -> action.run());
-        button.setLayoutParams(new LinearLayout.LayoutParams(dp(40), dp(32)));
+        // A 48 dp touch target, as every control here; the glyph stays small.
+        button.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
         return button;
     }
 
@@ -2245,7 +2254,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int available = terminalRoot == null ? 0
                 : terminalRoot.getWidth() - terminalRoot.getPaddingLeft() - terminalRoot.getPaddingRight();
         int width;
-        boolean strip = !sidebarOpen && railMinimized && !railAsDrawer();
+        boolean strip = railShown().strip(compactWindow());
         if (!sidebarOpen) {
             width = strip ? dp(RailPanel.STRIP_DP) : 0;
         } else if (railAsDrawer()) {
