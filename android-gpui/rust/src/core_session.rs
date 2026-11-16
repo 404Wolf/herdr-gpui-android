@@ -101,6 +101,10 @@ struct Connection<'a> {
     /// or a person picking it again) is `resumed` where the path confirmed
     /// `resize_history`, so the owner owes one whole history replacement.
     ended: Option<String>,
+    /// The core's hello advertised `automatic_input`: the terminal's own
+    /// answers to the program's queries go as AUTOMATIC_INPUT, which the
+    /// core never counts as someone using the pane (item 71).
+    automatic_input: bool,
 }
 
 /// History rows asked for in the repaint after a RESIZE: the attach's own
@@ -111,9 +115,12 @@ const RESIZE_HISTORY: usize = 1000;
 /// At most one automatic reattach of an ended stream this often.
 const REATTACH_EVERY: Duration = Duration::from_secs(5);
 
-/// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
+/// Frame kinds this viewer sends besides CREDIT (1).
+const DATA: u8 = 0;
 const DETACH: u8 = 2;
 const RESIZE: u8 = 3;
+/// Bytes for the program that nobody typed: the terminal's answers.
+const AUTOMATIC_INPUT: u8 = 6;
 /// herdr-core's viewer VISIBILITY frame: one byte, 0 hidden or 1 visible.
 const VISIBILITY: u8 = 7;
 /// How long a fresh attach waits for the terminal's own measured RESIZE
@@ -997,6 +1004,18 @@ impl Connection<'_> {
         let input = StreamWrite {
             commands: commands.clone(),
             channel,
+            kind: DATA,
+        };
+        // Answers the core left to this viewer (a cursor report, device
+        // attributes): AUTOMATIC_INPUT where the core knows it, else DATA as before.
+        let answers = StreamWrite {
+            commands: commands.clone(),
+            channel,
+            kind: if self.automatic_input {
+                AUTOMATIC_INPUT
+            } else {
+                DATA
+            },
         };
         let session_slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead {
@@ -1006,9 +1025,10 @@ impl Connection<'_> {
             channel,
             session: session_slot.clone(),
         };
-        let terminal_session = gpui_rio::Session::start(
+        let terminal_session = gpui_rio::Session::start_with_replies(
             output,
             input,
+            answers,
             move |cols, rows| {
                 let mut bytes = Vec::from(cols.to_le_bytes());
                 bytes.extend(rows.to_le_bytes());
@@ -1639,11 +1659,13 @@ impl Read for StreamRead {
 struct StreamWrite {
     commands: mpsc::SyncSender<Operation>,
     channel: u32,
+    /// DATA, or AUTOMATIC_INPUT for the terminal's own answers.
+    kind: u8,
 }
 impl Write for StreamWrite {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.commands
-            .try_send(Operation::Frame(self.channel, 0, bytes.to_vec()))
+            .try_send(Operation::Frame(self.channel, self.kind, bytes.to_vec()))
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         Ok(bytes.len())
     }
@@ -1729,6 +1751,7 @@ pub(crate) fn run(
         reattach: None,
         reattached_at: None,
         ended: None,
+        automatic_input: offers(&hello, "automatic_input"),
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -3175,7 +3198,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         let lines: String = (0..30).map(|n| format!("line {n}\r\n")).collect();
@@ -3222,7 +3245,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         tx.send(Chunk::Data(text.as_bytes().to_vec())).unwrap();
@@ -3244,7 +3267,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         session.set_grid(grid.0, grid.1);
@@ -3368,7 +3391,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         for chunk in chunks {
@@ -3426,7 +3449,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(4096);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&pane);
         pane.set_grid(cols, rows);
@@ -3712,7 +3735,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
         *lock(&slot) = Arc::downgrade(&session);
@@ -3741,7 +3764,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
         // As attach does: the slot is set before the stream's first item.
@@ -3897,7 +3920,7 @@ mod claim_tests {
                     }
                     while let Some(frame) = decoder.next().unwrap() {
                         if frame.channel != 0 {
-                            if matches!(frame.kind, DETACH | RESIZE | VISIBILITY) {
+                            if matches!(frame.kind, DATA | AUTOMATIC_INPUT | DETACH | RESIZE | VISIBILITY) {
                                 let _ = tx.send(Seen::Frame(frame.channel, frame.kind, frame.bytes));
                             }
                             continue;
@@ -3958,6 +3981,18 @@ mod claim_tests {
 
         fn set_visible(&self, visible: bool) {
             self.owner.visible.store(visible, Ordering::Relaxed);
+        }
+
+        /// The attached terminal, as the phone's view types into it.
+        fn terminal(&self) -> Arc<gpui_rio::Session> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(terminal) = lock(&self.owner.state).terminal.clone() {
+                    return terminal;
+                }
+                assert!(Instant::now() < deadline, "no terminal attached");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         /// What the phone's terminal does when its view is laid out.
@@ -4038,6 +4073,41 @@ mod claim_tests {
         assert_eq!(params["terminal"], "t1", "the same pane comes back");
         assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(100, 30)));
         assert_eq!(core.close(), vec![Seen::Frame(3, DETACH, Vec::new())]);
+    }
+
+    /// The program asks for a cursor report (DSR 6) and device attributes (DA)
+    /// and the phone types: what core sees as the terminal's answers and as typing.
+    fn answers_and_typing(features: Value) -> Vec<Seen> {
+        let core = Mock::start(features, true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        let terminal = core.terminal();
+        core.push.send((2, DATA, b"\x1b[6n".to_vec())).unwrap();
+        let mut seen = vec![core.next()];
+        core.push.send((2, DATA, b"\x1b[c".to_vec())).unwrap();
+        seen.push(core.next());
+        assert!(terminal.type_text("ls"));
+        seen.push(core.next());
+        core.close();
+        seen
+    }
+
+    #[test]
+    fn a_query_from_the_program_is_answered_as_automatic_input_not_typing() {
+        let seen = answers_and_typing(json!(["viewer_visibility", "automatic_input"]));
+        assert_eq!(seen[0], Seen::Frame(2, AUTOMATIC_INPUT, b"\x1b[1;1R".to_vec()));
+        let Seen::Frame(2, AUTOMATIC_INPUT, ref attributes) = seen[1] else { panic!("DA: {:?}", seen[1]) };
+        assert!(attributes.starts_with(b"\x1b[?"));
+        assert_eq!(seen[2], Seen::Frame(2, DATA, b"ls".to_vec()), "typing stays DATA");
+    }
+
+    #[test]
+    fn an_older_core_gets_the_answers_as_data_as_before() {
+        let seen = answers_and_typing(json!(["viewer_visibility"]));
+        assert_eq!(seen[0], Seen::Frame(2, DATA, b"\x1b[1;1R".to_vec()));
+        assert!(matches!(seen[1], Seen::Frame(2, DATA, _)));
+        assert_eq!(seen[2], Seen::Frame(2, DATA, b"ls".to_vec()));
     }
 
     #[test]

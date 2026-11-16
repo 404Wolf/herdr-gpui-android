@@ -90,7 +90,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// controls by closing its transport.
 pub struct Session {
     grid: Arc<FairMutex<Crosswords<Listener>>>,
-    input: mpsc::SyncSender<Vec<u8>>,
+    input: mpsc::SyncSender<Input>,
     dirty: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
@@ -99,6 +99,13 @@ pub struct Session {
     inputs: AtomicU64,
     // Type-erased so one session type serves every transport.
     resize: Box<dyn Fn(u16, u16) + Send + Sync>,
+}
+
+/// One write to the program, in order: what the user sent, or the
+/// terminal's own answer to a query the program made.
+enum Input {
+    Typed(Vec<u8>),
+    Reply(Vec<u8>),
 }
 
 impl Session {
@@ -117,6 +124,52 @@ impl Session {
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
+        F: Fn(u16, u16) + Send + Sync + 'static,
+    {
+        Self::start_inner(output, Box::new(input), None, resize, theme, columns, lines)
+    }
+
+    /// As [`Session::start`], but the terminal's own answers to the program's
+    /// queries (cursor and device reports, colour and size answers) go to
+    /// `replies` instead of `input`, in the same order with everything else
+    /// written: a transport can then tell them from what the user sent.
+    pub fn start_with_replies<R, W, A, F>(
+        output: R,
+        input: W,
+        replies: A,
+        resize: F,
+        theme: TerminalTheme,
+        columns: u16,
+        lines: u16,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+        A: Write + Send + 'static,
+        F: Fn(u16, u16) + Send + Sync + 'static,
+    {
+        Self::start_inner(
+            output,
+            Box::new(input),
+            Some(Box::new(replies)),
+            resize,
+            theme,
+            columns,
+            lines,
+        )
+    }
+
+    fn start_inner<R, F>(
+        output: R,
+        input: Box<dyn Write + Send>,
+        answers: Option<Box<dyn Write + Send>>,
+        resize: F,
+        theme: TerminalTheme,
+        columns: u16,
+        lines: u16,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Send + 'static,
         F: Fn(u16, u16) + Send + Sync + 'static,
     {
         let (columns, lines) = (columns.max(2), lines.max(1));
@@ -153,17 +206,18 @@ impl Session {
             negotiated: Mutex::new(None),
             grid_controls: Mutex::new(std::collections::VecDeque::new()),
         });
-        let (input_queue, queued) = mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
+        let (input_queue, queued) = mpsc::sync_channel::<Input>(INPUT_QUEUE);
         thread::Builder::new()
             .name("rio-input".into())
             .spawn(move || {
                 let mut input = input;
-                for bytes in queued {
-                    if input
-                        .write_all(&bytes)
-                        .and_then(|()| input.flush())
-                        .is_err()
-                    {
+                let mut answers = answers;
+                for write in queued {
+                    let (to, bytes): (&mut Box<dyn Write + Send>, Vec<u8>) = match write {
+                        Input::Typed(bytes) => (&mut input, bytes),
+                        Input::Reply(bytes) => (answers.as_mut().unwrap_or(&mut input), bytes),
+                    };
+                    if to.write_all(&bytes).and_then(|()| to.flush()).is_err() {
                         break;
                     }
                 }
@@ -479,7 +533,7 @@ impl Session {
     }
 
     fn write(&self, bytes: Vec<u8>) -> bool {
-        bytes.is_empty() || self.input.try_send(bytes).is_ok()
+        bytes.is_empty() || self.input.try_send(Input::Typed(bytes)).is_ok()
     }
 }
 
@@ -487,7 +541,7 @@ struct Reader {
     grid: Arc<FairMutex<Crosswords<Listener>>>,
     replies: mpsc::Receiver<RioEvent>,
     shared: Arc<Shared>,
-    input: mpsc::SyncSender<Vec<u8>>,
+    input: mpsc::SyncSender<Input>,
     dirty: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
 }
@@ -562,7 +616,7 @@ impl Reader {
                 _ => continue,
             };
             // A program that floods queries cannot grow memory without bound.
-            let _ = self.input.try_send(reply.into_bytes());
+            let _ = self.input.try_send(Input::Reply(reply.into_bytes()));
         }
     }
 }
@@ -828,6 +882,69 @@ mod tests {
         reply(&mut remote, b"\x1b[2;6R");
         remote.write_all(b"\x1b]2;build log\x07").unwrap();
         until(|| session.title().as_deref() == Some("build log"));
+    }
+
+    /// Every write, in order, with the end it reached.
+    type Log = Arc<Mutex<Vec<(&'static str, Vec<u8>)>>>;
+
+    /// One end of the session's writes, logging each as its own entry.
+    struct Writes(Log, &'static str);
+
+    impl Write for Writes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push((self.1, bytes.to_vec()));
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_terminals_own_answers_go_apart_from_what_the_user_sent_in_order() {
+        // herdr-core counts a viewer's DATA as the user using the pane (item 71);
+        // a cursor report or device attributes the program asked for is not.
+        let (local, mut remote) = UnixStream::pair().unwrap();
+        local
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::start_with_replies(
+            local,
+            Writes(log.clone(), "typed"),
+            Writes(log.clone(), "reply"),
+            |_, _| {},
+            theme(),
+            20,
+            4,
+        )
+        .unwrap();
+        assert!(session.type_text("ls"));
+        until(|| log.lock().unwrap().len() == 1);
+        // DSR 6 (cursor position) and DA (primary device attributes).
+        remote.write_all(b"ab\x1b[6n\x1b[c").unwrap();
+        until(|| log.lock().unwrap().len() == 3);
+        assert!(session.type_text("x"));
+        until(|| log.lock().unwrap().len() == 4);
+        let writes = log.lock().unwrap().clone();
+        assert_eq!(writes[0], ("typed", b"ls".to_vec()));
+        assert_eq!(writes[1], ("reply", b"\x1b[1;3R".to_vec()));
+        assert_eq!(writes[2].0, "reply");
+        assert!(
+            writes[2].1.starts_with(b"\x1b[?"),
+            "device attributes: {:?}",
+            writes[2].1
+        );
+        assert_eq!(writes[3], ("typed", b"x".to_vec()));
+    }
+
+    #[test]
+    fn without_a_replies_writer_answers_go_with_the_input_as_before() {
+        let (session, mut remote, _) = session();
+        remote.write_all(b"\x1b[6n").unwrap();
+        reply(&mut remote, b"\x1b[1;1R");
+        assert!(session.type_text("y"));
+        reply(&mut remote, b"y");
     }
 
     #[test]
