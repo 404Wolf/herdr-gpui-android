@@ -365,8 +365,8 @@ pub fn close(id: u64) {
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
         // This grid is newer than any copy of the same pane kept on a switch.
         lock(departed()).retain(|kept| !kept.from(id, &pane));
-        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane: pane.clone() });
-        hold(terminal, pane);
+        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane });
+        hold(terminal);
     }
 }
 /// Most grids of switched-away panes kept at once, each until the phone saves
@@ -434,13 +434,12 @@ impl Kept {
         self.session == session && self.pane == pane
     }
 }
-pub(crate) fn hold(terminal: Arc<gpui_rio::Session>, pane: String) {
-    *lock(held()) = Some(Held { terminal, pane });
+pub(crate) fn hold(terminal: Arc<gpui_rio::Session>) {
+    *lock(held()) = Some(Held { terminal });
 }
-/// The grid the held frame draws, and the pane it showed.
+/// The grid the held frame draws.
 struct Held {
     terminal: Arc<gpui_rio::Session>,
-    pane: String,
 }
 /// The terminal of the last closed session (or a saved pane read back), which
 /// the held frame draws.
@@ -498,11 +497,10 @@ pub fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
 /// held frame. Disk work: never on the UI thread.
 pub fn open_saved(path: &str) -> Result<u64> {
     let saved = crate::snapshot::load(std::path::Path::new(path))?;
-    let pane = saved.pane.clone();
     let terminal = crate::snapshot::restore(saved)?;
     let id = crate::core_session::next_render_id();
     *lock(cached()) = Some((id, terminal.clone()));
-    hold(terminal, pane);
+    hold(terminal);
     Ok(id)
 }
 /// Makes `pane`'s stand-in the held frame when it has no saved copy: `title`
@@ -517,7 +515,7 @@ pub fn hold_note(pane: &str, title: &str, note: &str, cols: u16, rows: u16) -> R
     })?;
     let id = crate::core_session::next_render_id();
     *lock(cached()) = Some((id, terminal.clone()));
-    hold(terminal, pane.into());
+    hold(terminal);
     Ok(id)
 }
 /// Scrolls the held frame's own history, with no link: `delta` rows back

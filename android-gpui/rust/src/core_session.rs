@@ -2687,7 +2687,7 @@ mod connection_tests {
         }
         // The link is gone: the stream ends, the grid stays.
         drop(tx);
-        crate::remote::hold(session.clone(), "t9".into());
+        crate::remote::hold(session.clone());
         let offset = |reply: String| serde_json::from_str::<Value>(&reply).unwrap()["local_offset"].as_u64().unwrap();
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 5);
         assert_eq!(offset(crate::remote::scroll_held(-2, false)), 3);
@@ -2843,7 +2843,7 @@ mod connection_tests {
         assert!(grid.grid().try_lock_unfair().is_some(), "the grid is locked during disk I/O");
         // Release the writer: read the FIFO to its end.
         let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut std::fs::File::open(&fifo).unwrap(), &mut bytes).unwrap();
+        std::fs::File::open(&fifo).unwrap().read_to_end(&mut bytes).unwrap();
         // (A FIFO cannot be synced, so this save then fails; a file would not.)
         let _ = saver.join().unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("painted"));
