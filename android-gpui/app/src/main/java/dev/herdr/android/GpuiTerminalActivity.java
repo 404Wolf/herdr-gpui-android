@@ -1892,10 +1892,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 .getBoolean("list", true);
         boolean fits = widthDp >= 600;
         boolean open = wantsRail && fits && !shellMode();
+        boolean opening = open && !sidebarOpen;
         if (sidebarOpen != open) sidebarSignature = null;
         sidebarOpen = open;
         applySidebarWidth();
         updateHostSampling();
+        // A closed rail builds no rows (refreshSidebar), so one docked by
+        // unfolding would stay empty until the tree next changed: fill it now.
+        if (opening) refreshSidebar(true);
     }
 
     private static SurfaceView findSurface(View view) {

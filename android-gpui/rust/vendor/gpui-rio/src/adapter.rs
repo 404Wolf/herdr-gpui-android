@@ -417,49 +417,60 @@ macro_rules! __bind_gpui {
 
                 fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
                     self.bounds = bounds;
-                    let font_size = px(if self.style.font_size.is_finite() {
+                    let base_size = if self.style.font_size.is_finite() {
                         self.style.font_size.clamp(1., 256.)
-                    } else { 13. });
+                    } else { 13. };
                     let font = font(terminal_font_family(self.style.font_family.clone().into(), cx));
-                    let run = TextRun {
-                        len: 1,
-                        font: font.clone(),
-                        color: rgb_color(self.style.theme.foreground),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let measure = window
-                        .text_system()
-                        .shape_line("M".into(), font_size, &[run], None);
                     // The font's own line spacing, as other terminals use: tall
                     // glyphs and box drawing meet row to row, and no added leading
                     // takes rows from a small screen.
-                    self.cell = size(
-                        measure.width.max(px(1.)),
-                        (measure.ascent + measure.descent).ceil().max(px(1.)),
+                    let measure = |font_size: f32, window: &mut Window| {
+                        let run = TextRun {
+                            len: 1,
+                            font: font.clone(),
+                            color: rgb_color(self.style.theme.foreground),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let m = window.text_system().shape_line("M".into(), px(font_size), &[run], None);
+                        size(m.width.max(px(1.)), (m.ascent + m.descent).ceil().max(px(1.)))
+                    };
+                    let base_cell = measure(base_size, window);
+                    let pixels = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                    // The pane is measured, and offered, at the style's own size
+                    // only: what the type grows to below never reaches the remote
+                    // side, so it can never feed back into the grid.
+                    let (cols, rows) = $crate::pane_cells(
+                        pixels,
+                        (f32::from(base_cell.width), f32::from(base_cell.height)),
                     );
-                    let cols = (f32::from(bounds.size.width) / f32::from(self.cell.width))
-                        .floor()
-                        .clamp(2., 1000.) as u16;
-                    let rows = (f32::from(bounds.size.height) / f32::from(self.cell.height))
-                        .floor()
-                        .clamp(1., 1000.) as u16;
                     // Resize before locking: the session locks the grid itself.
-                    self.session.resize(
-                        cols,
-                        rows,
-                        f32::from(bounds.size.width) as u16,
-                        f32::from(bounds.size.height) as u16,
-                    );
-                    // The grid may be the remote side's negotiated one. Smaller than
-                    // the pane: drawn whole, the rest left empty (letterboxed).
+                    self.session.resize(cols, rows, pixels.0 as u16, pixels.1 as u16);
+                    // The grid may be the remote side's negotiated one. Fewer
+                    // columns than the pane: drawn with type grown to fill it
+                    // (when the host asks), the rest left empty (letterboxed).
                     // Larger: a pane-sized window into it that follows the caret.
                     let (grid_cols, grid_rows) = self.session.grid_size();
-                    let pane = (cols, rows);
+                    let drawn_size = self.style.grow_to_grid.map_or(base_size, |max| {
+                        $crate::fitted_font_size(
+                            base_size,
+                            (f32::from(base_cell.width), f32::from(base_cell.height)),
+                            pixels,
+                            (grid_cols, grid_rows),
+                            max,
+                        )
+                    });
+                    self.cell = if drawn_size == base_size { base_cell } else { measure(drawn_size, window) };
+                    let font_size = px(drawn_size);
+                    let pane = if drawn_size == base_size {
+                        (cols, rows)
+                    } else {
+                        $crate::pane_cells(pixels, (f32::from(self.cell.width), f32::from(self.cell.height)))
+                    };
                     let (cols, rows) = (
-                        usize::from(cols.min(grid_cols)),
-                        usize::from(rows.min(grid_rows)),
+                        usize::from(pane.0.min(grid_cols)),
+                        usize::from(pane.1.min(grid_rows)),
                     );
                     let theme = self.style.theme;
                     let mut grid = self.session.grid().lock();

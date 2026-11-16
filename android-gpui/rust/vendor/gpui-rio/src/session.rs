@@ -580,6 +580,42 @@ pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize))
 }
 
 #[doc(hidden)]
+/// The cells (columns, rows) a pane of `size` pixels holds at `cell` pixels
+/// a cell.
+pub fn pane_cells(size: (f32, f32), cell: (f32, f32)) -> (u16, u16) {
+    let fit = |length: f32, cell: f32, least: f32| {
+        (length / cell.max(1.)).floor().clamp(least, 1000.) as u16
+    };
+    (fit(size.0, cell.0, 2.), fit(size.1, cell.1, 1.))
+}
+
+#[doc(hidden)]
+/// The type size to draw `grid` with in a pane of `size` pixels whose type
+/// size is `base` (a cell of `cell` pixels there). A grid with fewer columns
+/// than the pane holds at `base` (another viewer sized it) grows the type
+/// until it fills the pane's width, but never past its height, nor `max`.
+/// Any other grid is drawn at `base`: type is never shrunk here, and a pane
+/// the grid follows (its columns are the pane's own) is left as it is.
+pub fn fitted_font_size(
+    base: f32,
+    cell: (f32, f32),
+    size: (f32, f32),
+    grid: (u16, u16),
+    max: f32,
+) -> f32 {
+    let (columns, _) = pane_cells(size, cell);
+    if !(base > 0.) || grid.0 == 0 || grid.0 >= columns {
+        return base;
+    }
+    // Cells widen in proportion to the type. Rows round up to whole pixels:
+    // leave each a pixel, so every grid row still fits.
+    let width = size.0 / (f32::from(grid.0) * cell.0) * 0.999;
+    let rows = f32::from(grid.1.max(1));
+    let height = (size.1 / rows - 1.) / cell.1;
+    (base * width.min(height)).clamp(base, max.max(base))
+}
+
+#[doc(hidden)]
 /// The window actually drawn: [`viewport_origin`], except that a column the
 /// reader panned to (`pan`) wins over following the caret, and a view scrolled
 /// back into history starts at the top row and, unpanned, the left column.
@@ -1019,6 +1055,67 @@ mod tests {
         session.resize(30, 8, 310, 170);
         assert_eq!(*resizes.lock().unwrap(), vec![(30, 8)]);
         assert_eq!(session.grid_size(), (90, 25));
+    }
+
+    /// The emulator's unfolded pane at 11 px type: 707 x 571 dp, a 6.6 x 13 cell.
+    const PANE: (f32, f32) = (707., 571.);
+    const CELL: (f32, f32) = (6.601, 13.);
+
+    #[test]
+    fn a_narrower_grid_grows_the_type_within_the_pane() {
+        use super::{fitted_font_size, pane_cells};
+        assert_eq!(pane_cells(PANE, CELL), (107, 43));
+        // Another viewer holds 60 x 30: the type grows until the grid fills
+        // the pane's width, or its height, whichever comes first.
+        let size = fitted_font_size(11., CELL, PANE, (60, 20), 36.);
+        let scale = size / 11.;
+        let drawn = pane_cells(PANE, (CELL.0 * scale, (CELL.1 * scale).ceil()));
+        assert_eq!(drawn.0, 60, "{size}");
+        assert!(drawn.1 >= 20);
+        let tall = fitted_font_size(11., CELL, PANE, (60, 40), 36.);
+        let scale = tall / 11.;
+        let drawn = pane_cells(PANE, (CELL.0 * scale, (CELL.1 * scale).ceil()));
+        assert!(drawn.0 >= 60 && drawn.1 >= 40, "{tall}: {drawn:?}");
+        assert!(tall > 11. && tall < size);
+        // Never past the cap, never below the pane's own size.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (10, 5), 36.), 36.);
+        assert_eq!(fitted_font_size(11., CELL, PANE, (60, 400), 36.), 11.);
+        assert_eq!(fitted_font_size(16., CELL, PANE, (60, 30), 12.), 16.);
+    }
+
+    #[test]
+    fn a_grid_as_wide_as_the_pane_or_wider_keeps_the_pane_s_type() {
+        use super::{fitted_font_size, pane_cells};
+        let (columns, rows) = pane_cells(PANE, CELL);
+        // The phone leads: the grid is its own offer. Nothing changes.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (columns, rows), 36.), 11.);
+        // Fewer rows but the same columns: no growth either.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (columns, 10), 36.), 11.);
+        // Wider (item 72's held 200 columns): panned, never shrunk.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (200, 120), 36.), 11.);
+        assert!(fitted_font_size(f32::NAN, CELL, PANE, (60, 30), 36.).is_nan());
+    }
+
+    #[test]
+    fn the_offer_never_follows_the_grown_type() {
+        use super::{fitted_font_size, pane_cells};
+        // The pane is offered at its own size, whatever the grid makes the
+        // type: no offer, no resize, no loop.
+        let offer = pane_cells(PANE, CELL);
+        // The phone leads, another viewer narrows the grid, the phone leads
+        // again, a desktop holds it wider, the phone leads again.
+        for grid in [offer, (60, 30), (80, 43), offer, (200, 120), offer] {
+            let size = fitted_font_size(11., CELL, PANE, grid, 36.);
+            assert_eq!(
+                pane_cells(PANE, CELL),
+                offer,
+                "offer moved with {grid:?} at {size}"
+            );
+            // The grid back at the pane's own size restores its own type.
+            if grid == offer {
+                assert_eq!(size, 11.);
+            }
+        }
     }
 
     #[test]

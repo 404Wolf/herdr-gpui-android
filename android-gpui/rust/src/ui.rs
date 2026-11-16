@@ -216,6 +216,10 @@ impl TerminalView {
             theme: crate::shell::theme(&model::palette()),
             font_family: crate::fonts::MONO_FAMILY.into(),
             font_size: model::shell_font_size(self.state.display_preferences, width.into()),
+            // A grid another viewer sized narrower than this pane fills it
+            // instead of leaving its right part empty; the pane is still
+            // offered at the size above, chosen or auto.
+            grow_to_grid: Some(model::MAX_FONT),
         }
     }
 
