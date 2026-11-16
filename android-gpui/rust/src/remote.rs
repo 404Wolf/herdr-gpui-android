@@ -199,6 +199,9 @@ pub(crate) struct State {
     pub(crate) render_id: u64,
 }
 pub(crate) struct Session {
+    /// This session's handle (the phone's id for it): a kept grid remembers
+    /// which session showed it, since every core numbers its panes t1, t2…
+    pub(crate) id: u64,
     pub(crate) state: Mutex<State>,
     pub(crate) cancel: CancellationToken,
     pub(crate) commands: mpsc::SyncSender<Operation>,
@@ -309,6 +312,7 @@ pub fn connect_credentials_grid(
     // pane overran 256 while a slow refresh held the session thread.
     let (tx, rx) = mpsc::sync_channel(4096);
     let owner = Arc::new(Session {
+        id,
         state: Mutex::new(State {
             view: json!({"state":"connecting","status":"Connecting to herdr-core over SSH","boot_id":"","pane_id":"","focused_pane":"","panes":[],"workspaces":[],"tabs":[],"title":"Herdr Core","token":1,"chrome_token":1,"revision":1,"fetch":null,"scroll":{"offset":0,"max":0,"rows":0}}),
             terminal: None,
@@ -360,8 +364,8 @@ pub fn close(id: u64) {
     if let Some(terminal) = state.terminal.take() {
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
         // This grid is newer than any copy of the same pane kept on a switch.
-        lock(departed()).retain(|held| held.pane != pane);
-        *lock(closed()) = Some(Held { terminal: terminal.clone(), pane: pane.clone() });
+        lock(departed()).retain(|kept| !kept.from(id, &pane));
+        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane: pane.clone() });
         hold(terminal, pane);
     }
 }
@@ -372,33 +376,34 @@ pub(crate) const DEPARTED_MAX: usize = 2;
 /// Grids of panes a session just switched away from, oldest first: an attach
 /// drops its outgoing grid, and the phone saves it from here on its own thread
 /// (maybe after the next attach), so a pane looked at online can be read offline.
-fn departed() -> &'static Mutex<std::collections::VecDeque<Held>> {
-    static DEPARTED: OnceLock<Mutex<std::collections::VecDeque<Held>>> = OnceLock::new();
+fn departed() -> &'static Mutex<std::collections::VecDeque<Kept>> {
+    static DEPARTED: OnceLock<Mutex<std::collections::VecDeque<Kept>>> = OnceLock::new();
     DEPARTED.get_or_init(Mutex::default)
 }
-/// An attach is replacing `pane`'s grid with another pane's: keep it for saving.
-/// Only the grid object moves here; nothing is sent and no size changes.
-pub(crate) fn depart(terminal: Arc<gpui_rio::Session>, pane: String) {
+/// Session `session` is replacing `pane`'s grid with another pane's: keep it
+/// for saving. Only the grid object moves here; nothing is sent and no size
+/// changes.
+pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: String) {
     if pane.is_empty() {
         return;
     }
     {
-        // A copy kept from an earlier close of the same pane is older.
+        // A copy kept from an earlier close of the same session's pane is older.
         let mut closed = lock(closed());
-        if closed.as_ref().is_some_and(|held| held.pane == pane) {
+        if closed.as_ref().is_some_and(|kept| kept.from(session, &pane)) {
             closed.take();
         }
     }
     let mut kept = lock(departed());
-    kept.retain(|held| held.pane != pane);
-    kept.push_back(Held { terminal, pane });
+    kept.retain(|other| !other.from(session, &pane));
+    kept.push_back(Kept { session, terminal, pane });
     while kept.len() > DEPARTED_MAX {
         kept.pop_front();
     }
 }
 #[cfg(test)]
 pub(crate) fn departed_holds(terminal: &Arc<gpui_rio::Session>) -> bool {
-    lock(departed()).iter().any(|held| Arc::ptr_eq(&held.terminal, terminal))
+    lock(departed()).iter().any(|kept| Arc::ptr_eq(&kept.terminal, terminal))
 }
 /// Serializes the tests that count what the shared departed slot holds.
 #[cfg(test)]
@@ -409,12 +414,25 @@ pub(crate) fn departed_test_lock() -> MutexGuard<'static, ()> {
 /// The last closed session's grid, kept for saving even after a new pane
 /// attaches (the save runs on a worker, maybe after that attach).
 #[cfg(test)]
-pub(crate) fn closed_for_test(terminal: Arc<gpui_rio::Session>, pane: &str) {
-    *lock(closed()) = Some(Held { terminal, pane: pane.into() });
+pub(crate) fn closed_for_test(session: u64, terminal: Arc<gpui_rio::Session>, pane: &str) {
+    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into() });
 }
-fn closed() -> &'static Mutex<Option<Held>> {
-    static CLOSED: OnceLock<Mutex<Option<Held>>> = OnceLock::new();
+fn closed() -> &'static Mutex<Option<Kept>> {
+    static CLOSED: OnceLock<Mutex<Option<Kept>>> = OnceLock::new();
     CLOSED.get_or_init(Mutex::default)
+}
+/// A grid kept for saving after its session stopped showing it, with the
+/// session that showed it: pane ids repeat across computers (each core has
+/// its own t1), so a save names the session too.
+struct Kept {
+    session: u64,
+    terminal: Arc<gpui_rio::Session>,
+    pane: String,
+}
+impl Kept {
+    fn from(&self, session: u64, pane: &str) -> bool {
+        self.session == session && self.pane == pane
+    }
 }
 pub(crate) fn hold(terminal: Arc<gpui_rio::Session>, pane: String) {
     *lock(held()) = Some(Held { terminal, pane });
@@ -441,11 +459,14 @@ pub(crate) fn release_held() {
     lock(held()).take();
     lock(cached()).take();
 }
-/// Saves `pane`'s grid to `path`: the phone's copy of that conversation, for
-/// reading it later with no link. The grid is the newest the phone holds: the
-/// live one when session `id` (0: none) shows `pane`, else the one kept when a
-/// switch left it (freed once saved), else the last closed session's. False
-/// when none of them is `pane`'s. Disk work: never on the UI thread.
+/// Saves `pane`'s grid, as session `id` last showed it, to `path`: the
+/// phone's copy of that conversation, for reading it later with no link. The
+/// grid is the newest that session left: its live one while it shows `pane`,
+/// else the one kept when a switch left it (freed once saved), else the one
+/// kept when it closed. Grids of other sessions never count, even for the
+/// same pane id. False when there is none. The grid is copied under its lock
+/// and written after it is released, so a slow disk never holds up painting.
+/// Disk work: never on the UI thread.
 pub fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
     if pane.is_empty() {
         return Ok(false);
@@ -456,20 +477,20 @@ pub fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
     });
     let switched = || {
         let mut kept = lock(departed());
-        let at = kept.iter().position(|held| held.pane == pane)?;
-        kept.remove(at).map(|held| held.terminal)
+        let at = kept.iter().position(|kept| kept.from(id, pane))?;
+        kept.remove(at).map(|kept| kept.terminal)
     };
     let last_closed = || {
         lock(closed())
             .as_ref()
-            .filter(|held| held.pane == pane)
-            .map(|held| held.terminal.clone())
+            .filter(|kept| kept.from(id, pane))
+            .map(|kept| kept.terminal.clone())
     };
     let Some(terminal) = live.or_else(switched).or_else(last_closed) else {
         return Ok(false);
     };
-    let grid = terminal.grid().lock();
-    crate::snapshot::save(&grid, pane, std::path::Path::new(path))?;
+    let copy = crate::snapshot::copy(&terminal.grid().lock(), pane)?;
+    crate::snapshot::write(&copy, std::path::Path::new(path))?;
     Ok(true)
 }
 /// Reads a saved pane from `path` and makes it the held frame, drawn under a

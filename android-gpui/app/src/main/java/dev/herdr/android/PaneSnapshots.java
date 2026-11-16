@@ -64,17 +64,13 @@ final class PaneSnapshots {
         this.thread = thread;
     }
 
-    /** The session that showed {@code pane} on {@code host} just closed: keep its grid. */
-    void saveClosed(String host, String pane) {
-        save(host, pane, 0);
-    }
-
     /**
-     * Keeps {@code pane}'s grid on disk: the live grid of session {@code handle}
-     * (0: none) while it shows the pane, else the copy kept when a switch or a
-     * close left it. Called before a switch (the attach then drops the grid),
-     * on close, and as a checkpoint of the pane on screen. A failed save never
-     * truncates the previous copy.
+     * Keeps {@code pane}'s grid on disk as session {@code handle} showed it:
+     * its live grid while it shows the pane, else the copy kept when a switch
+     * or a close left it. The handle names the computer too: every core has
+     * its own t1, so a save never takes another session's grid. Called when a
+     * switch is confirmed, on close, and as a checkpoint of the pane on
+     * screen. A failed save never truncates the previous copy.
      */
     void save(String host, String pane, long handle) {
         if (host == null || pane == null || pane.isEmpty()) return;

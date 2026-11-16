@@ -120,20 +120,32 @@ pub(crate) fn header(cols: u16, rows: u16, pane: &str) -> String {
     format!("{}\n", json!({"v":VERSION,"cols":cols,"rows":rows,"pane":pane}))
 }
 
-/// Writes `pane`'s grid to `path`, atomically.
-pub(crate) fn save<U: EventListener>(grid: &Crosswords<U>, pane: &str, path: &Path) -> Result<()> {
+/// A saved pane's whole file, built from the grid: copied while the grid is
+/// locked, written by [`write`] after the lock is released.
+pub(crate) fn copy<U: EventListener>(grid: &Crosswords<U>, pane: &str) -> Result<Vec<u8>> {
     let cols = u16::try_from(grid.columns()).map_err(|_| Error::Capacity)?;
     let rows = u16::try_from(grid.screen_lines()).map_err(|_| Error::Capacity)?;
     let mut file = header(cols, rows, pane).into_bytes();
     file.extend(encode(grid, MAX_BYTES));
+    Ok(file)
+}
+
+/// Writes a [`copy`] to `path`, atomically: a temporary file, synced, then renamed.
+pub(crate) fn write(file: &[u8], path: &Path) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut out = fs::File::create(&tmp)?;
-        io::Write::write_all(&mut out, &file)?;
+        io::Write::write_all(&mut out, file)?;
         out.sync_all()?;
     }
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Writes `pane`'s grid to `path`, atomically.
+#[cfg(test)]
+pub(crate) fn save<U: EventListener>(grid: &Crosswords<U>, pane: &str, path: &Path) -> Result<()> {
+    write(&copy(grid, pane)?, path)
 }
 
 /// Reads a saved pane, refusing anything malformed or larger than a save makes.

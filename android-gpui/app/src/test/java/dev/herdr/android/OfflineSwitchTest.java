@@ -2,6 +2,8 @@ package dev.herdr.android;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import java.util.Calendar;
 import java.util.Locale;
@@ -59,5 +61,41 @@ public final class OfflineSwitchTest {
         assertArrayEquals(new int[] {52, 30}, OfflineSwitch.gridSize("52,30,8,16"));
         assertArrayEquals(new int[] {80, 24}, OfflineSwitch.gridSize("x,30"));
         assertArrayEquals(new int[] {80, 24}, OfflineSwitch.gridSize(null));
+    }
+
+    /** Review #22 finding 3: a raw key with no link is refused, never queued for later. */
+    @Test public void rawKeysNeedTheLink() {
+        // The offline stand-in (opened or switched to with no link).
+        assertTrue(OfflineSwitch.refusesKeys(true, true, 0));
+        // A dropped link: the session ended, a reconnect is pending.
+        assertTrue(OfflineSwitch.refusesKeys(false, true, 7));
+        // A live session, or one still attaching its pane, takes them.
+        assertFalse(OfflineSwitch.refusesKeys(false, false, 7));
+        // A companion or shell connection is not this rule's business.
+        assertFalse(OfflineSwitch.refusesKeys(false, true, 0));
+        assertEquals("keys need the link · not queued", OfflineSwitch.KEYS_REFUSED);
+    }
+
+    /** Review #22 finding 5: the machine on screen never reads "live" from the cache. */
+    @Test public void theMachineOnScreenSaysWhatItsLinkIsNotThatItIsSelected() {
+        OfflineSwitch.Link standIn = OfflineSwitch.link(false, true, true, false);
+        assertEquals(OfflineSwitch.Link.DOWN, standIn);
+        assertEquals("offline", OfflineSwitch.railStatus(true, standIn, false, false));
+        assertEquals("offline", OfflineSwitch.railWord("offline", true));
+        // A dropped link, and no connection at all.
+        assertEquals(OfflineSwitch.Link.DOWN, OfflineSwitch.link(false, false, true, false));
+        assertEquals(OfflineSwitch.Link.DOWN, OfflineSwitch.link(true, false, false, false));
+        // Attaching, then live.
+        OfflineSwitch.Link attaching = OfflineSwitch.link(false, false, false, false);
+        assertEquals("connecting", OfflineSwitch.railStatus(true, attaching, false, false));
+        assertEquals("dialling", OfflineSwitch.railWord("connecting", true));
+        OfflineSwitch.Link up = OfflineSwitch.link(false, false, false, true);
+        assertEquals("connected", OfflineSwitch.railStatus(true, up, false, false));
+        assertEquals("live", OfflineSwitch.railWord("connected", true));
+        // Other machines go by their background sample, as before.
+        assertEquals("connected", OfflineSwitch.railStatus(false, standIn, true, true));
+        assertEquals("connecting", OfflineSwitch.railStatus(false, standIn, true, false));
+        assertEquals("offline", OfflineSwitch.railStatus(false, up, false, false));
+        assertEquals("", OfflineSwitch.railWord("offline", false));
     }
 }

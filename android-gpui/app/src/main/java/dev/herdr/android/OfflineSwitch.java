@@ -36,6 +36,50 @@ final class OfflineSwitch {
         return closed ? Route.OFFLINE : Route.LIVE;
     }
 
+    /**
+     * Whether a raw key (Enter, Esc, an arrow, Ctrl-C) is refused rather than
+     * sent or queued: with no link. What a key means depends on the screen at
+     * that moment, so it is never replayed later; messages go to the Outbox.
+     */
+    static boolean refusesKeys(boolean offline, boolean closed, long handle) {
+        return offline || handle > 0 && closed;
+    }
+
+    /** The note a refused key shows, in the crumb's slot. */
+    static final String KEYS_REFUSED = "keys need the link · not queued";
+
+    /** The link of the machine on screen. */
+    enum Link { UP, CONNECTING, DOWN }
+
+    /**
+     * {@code none}: no connection at all; {@code offline}: a cached stand-in;
+     * {@code closed}: the session ended (the link dropped); {@code ready}: its pane is live.
+     */
+    static Link link(boolean none, boolean offline, boolean closed, boolean ready) {
+        if (none || offline || closed) return Link.DOWN;
+        return ready ? Link.UP : Link.CONNECTING;
+    }
+
+    /**
+     * A rail machine row's status: "connected", "connecting" or "offline".
+     * The machine on screen ({@code selected}) goes by its own link, so a
+     * cached stand-in or a dropped link reads offline; another machine by its
+     * background sample.
+     */
+    static String railStatus(boolean selected, Link link, boolean sampled, boolean sampleConnected) {
+        if (selected) {
+            return link == Link.UP ? "connected" : link == Link.CONNECTING ? "connecting" : "offline";
+        }
+        return sampleConnected ? "connected" : sampled ? "connecting" : "offline";
+    }
+
+    /** The word beside a machine row's dot; the machine on screen says "offline" outright. */
+    static String railWord(String status, boolean selected) {
+        if ("connected".equals(status)) return "live";
+        if ("connecting".equals(status)) return "dialling";
+        return selected ? "offline" : "";
+    }
+
     /** The one dim line under the title of a pane with no saved copy. */
     static final String NOT_CACHED = "not cached · opens when the link is back";
 
