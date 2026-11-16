@@ -186,12 +186,13 @@ macro_rules! __bind_gpui {
                 }
                 /// Pans a grid wider than the pane `dx` to the right (negative:
                 /// left), as the host's pan buttons do. Client-local: the program
-                /// sees nothing. True when the window moved; the host then
-                /// notifies this view.
+                /// sees nothing. Holds until the grid's width changes or the user
+                /// types (see `ColumnPan`). True when the window moved; the host
+                /// then notifies this view.
                 pub fn pan(&mut self, dx: Pixels) -> bool {
                     let columns = f32::from(dx) / f32::from(self.cell.width);
                     let (grid_cols, _) = self.session.grid_size();
-                    self.pan.pan(columns, self.view_origin.1, grid_cols, self.pane.0)
+                    self.pan.pan(columns, self.view_origin.1, (grid_cols, self.pane.0), self.session.inputs())
                 }
                 fn tap_stamp(&self) -> $crate::tap::Gesture {
                     self.tap_listener.as_ref().map_or($crate::tap::Gesture::NONE, |(stamp, _)| stamp())
@@ -476,7 +477,7 @@ macro_rules! __bind_gpui {
                         pane,
                         (cursor.pos.row.0, cursor.pos.col.0),
                         offset != 0,
-                        self.pan.column(grid_cols, pane.0),
+                        self.pan.column((grid_cols, pane.0), self.session.inputs()),
                     );
                     self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);

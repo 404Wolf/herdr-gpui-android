@@ -23,7 +23,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -94,6 +94,9 @@ pub struct Session {
     dirty: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
+    /// Input sent so far (keys, typed and pasted text), counted so a view
+    /// can tell that the user typed since it last looked.
+    inputs: AtomicU64,
     // Type-erased so one session type serves every transport.
     resize: Box<dyn Fn(u16, u16) + Send + Sync>,
 }
@@ -185,6 +188,7 @@ impl Session {
             dirty,
             alive,
             shared,
+            inputs: AtomicU64::new(0),
             resize: Box::new(resize),
         }))
     }
@@ -454,7 +458,13 @@ impl Session {
             .is_some_and(|bytes| self.write(bytes))
     }
 
+    /// How many inputs (keys, typed or pasted text) were sent so far.
+    pub fn inputs(&self) -> u64 {
+        self.inputs.load(Ordering::Acquire)
+    }
+
     fn follow_input(&self) -> Mode {
+        self.inputs.fetch_add(1, Ordering::AcqRel);
         let mut grid = self.grid.lock();
         grid.scroll_display(Scroll::Bottom);
         grid.selection = None;
@@ -592,23 +602,33 @@ pub fn view_origin(
 #[doc(hidden)]
 /// A column offset the reader chose by panning a grid wider than the pane
 /// (one the remote side drew wider than this screen). Client-local: nothing
-/// is sent. Kept only for the grid width it was chosen on.
+/// is sent. Once panned, every column is a real position, the left edge too;
+/// the window follows the caret again only after the grid's width changes
+/// (its rows were drawn again) or the user types (their input is at the
+/// caret). A pane switch shows another session's view with its own offset.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ColumnPan {
     /// The grid column drawn at the pane's left; `None` follows the caret.
     col: Option<usize>,
     /// Columns of drag not yet a whole one, so slow drags still move.
     rest: f32,
-    grid_cols: u16,
+    /// The grid width and the session's input count it was chosen at.
+    basis: (u16, u64),
 }
 
 impl ColumnPan {
     /// Moves the window `columns` to the right (negative: left) from `drawn`,
-    /// the column the last frame started at, stopping at either edge. Back at
-    /// the left edge, the window follows the caret again. True when the column
-    /// to draw from changed.
-    pub fn pan(&mut self, columns: f32, drawn: usize, grid_cols: u16, pane_cols: u16) -> bool {
-        self.forget_other_grid(grid_cols);
+    /// the column the last frame started at, stopping at either edge.
+    /// `inputs` is the session's input count ([`Session::inputs`]). True when
+    /// the column to draw from changed.
+    pub fn pan(
+        &mut self,
+        columns: f32,
+        drawn: usize,
+        (grid_cols, pane_cols): (u16, u16),
+        inputs: u64,
+    ) -> bool {
+        self.rebase(grid_cols, inputs);
         let last = usize::from(grid_cols).saturating_sub(usize::from(pane_cols.max(1)));
         if last == 0 || !columns.is_finite() {
             self.rest = 0.;
@@ -621,27 +641,28 @@ impl ColumnPan {
         self.rest += columns;
         let whole = self.rest.trunc();
         self.rest -= whole;
+        if whole == 0. {
+            return false;
+        }
         let from = self.col.unwrap_or(drawn).min(last);
         let next = (from as f32 + whole).clamp(0., last as f32) as usize;
-        let col = (next > 0).then_some(next);
-        let moved = next != from || col != self.col;
-        self.col = col;
+        let moved = self.col != Some(next);
+        self.col = Some(next);
         moved
     }
 
     /// The column to draw from (within the grid), or `None` to follow the
-    /// caret. A grid of another width (a resize) drops the offset: its rows
-    /// were drawn again at that width.
-    pub fn column(&mut self, grid_cols: u16, pane_cols: u16) -> Option<usize> {
-        self.forget_other_grid(grid_cols);
+    /// caret: never panned, or dropped by a new grid width or new input.
+    pub fn column(&mut self, (grid_cols, pane_cols): (u16, u16), inputs: u64) -> Option<usize> {
+        self.rebase(grid_cols, inputs);
         let last = usize::from(grid_cols).saturating_sub(usize::from(pane_cols.max(1)));
         self.col.map(|col| col.min(last))
     }
 
-    fn forget_other_grid(&mut self, grid_cols: u16) {
-        if self.grid_cols != grid_cols {
+    fn rebase(&mut self, grid_cols: u16, inputs: u64) {
+        if self.basis != (grid_cols, inputs) {
             *self = Self {
-                grid_cols,
+                basis: (grid_cols, inputs),
                 ..Self::default()
             };
         }
@@ -1049,30 +1070,47 @@ mod tests {
     #[test]
     fn a_column_pan_moves_by_whole_columns_within_the_grid() {
         use super::ColumnPan;
+        const WIDE: (u16, u16) = (200, 50);
         let mut pan = ColumnPan::default();
         // Nothing to pan when the grid fits the pane.
-        assert!(!pan.pan(10., 0, 40, 80));
-        assert_eq!(pan.column(40, 80), None);
+        assert!(!pan.pan(10., 0, (40, 80), 0));
+        assert_eq!(pan.column((40, 80), 0), None);
         // A wider grid: 200 columns on a 50-column pane, 150 to pan.
-        assert!(pan.pan(12., 0, 200, 50));
-        assert_eq!(pan.column(200, 50), Some(12));
+        assert!(pan.pan(12., 0, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(12));
         // Fractions add up, so a slow drag still moves.
-        assert!(!pan.pan(0.6, 12, 200, 50));
-        assert!(pan.pan(0.6, 12, 200, 50));
-        assert_eq!(pan.column(200, 50), Some(13));
+        assert!(!pan.pan(0.6, 12, WIDE, 0));
+        assert!(pan.pan(0.6, 12, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(13));
         // Clamped at the right edge; the next step left moves at once.
-        pan.pan(1000., 13, 200, 50);
-        assert_eq!(pan.column(200, 50), Some(150));
-        assert!(!pan.pan(5., 150, 200, 50));
-        assert!(pan.pan(-1., 150, 200, 50));
-        assert_eq!(pan.column(200, 50), Some(149));
+        pan.pan(1000., 13, WIDE, 0);
+        assert_eq!(pan.column(WIDE, 0), Some(150));
+        assert!(!pan.pan(5., 150, WIDE, 0));
+        assert!(pan.pan(-1., 150, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(149));
         // A wider pane (unfolded, smaller type) clamps without forgetting.
-        assert_eq!(pan.column(200, 120), Some(80));
-        assert_eq!(pan.column(200, 50), Some(149));
-        // Back at the left edge it follows the caret again.
-        pan.pan(-1000., 149, 200, 50);
-        assert_eq!(pan.column(200, 50), None);
-        assert!(!pan.pan(f32::NAN, 0, 200, 50));
+        assert_eq!(pan.column((200, 120), 0), Some(80));
+        assert_eq!(pan.column(WIDE, 0), Some(149));
+        assert!(!pan.pan(f32::NAN, 149, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(149));
+    }
+
+    #[test]
+    fn the_left_edge_is_a_real_position_once_panned() {
+        use super::ColumnPan;
+        const WIDE: (u16, u16) = (200, 50);
+        let mut pan = ColumnPan::default();
+        pan.pan(-1000., 120, WIDE, 0);
+        // Panned to column 0 with the caret out at column 120: it stays at 0,
+        // never snapping back to the caret.
+        assert_eq!(pan.column(WIDE, 0), Some(0));
+        let caret = (49, 170);
+        let origin = super::view_origin((200, 50), (50, 50), caret, false, pan.column(WIDE, 0));
+        assert_eq!(origin, (0, 0));
+        // Further left changes nothing; right moves from there.
+        assert!(!pan.pan(-3., 0, WIDE, 0));
+        assert!(pan.pan(2., 0, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(2));
     }
 
     #[test]
@@ -1080,23 +1118,49 @@ mod tests {
         use super::ColumnPan;
         let mut pan = ColumnPan::default();
         // The caret had the window at column 30: a pan moves from there.
-        assert!(pan.pan(-4., 30, 200, 50));
-        assert_eq!(pan.column(200, 50), Some(26));
+        assert!(pan.pan(-4., 30, (200, 50), 0));
+        assert_eq!(pan.column((200, 50), 0), Some(26));
+        // A drag under a whole column does not pin the window yet.
+        let mut pan = ColumnPan::default();
+        assert!(!pan.pan(0.4, 30, (200, 50), 0));
+        assert_eq!(pan.column((200, 50), 0), None);
     }
 
     #[test]
-    fn a_new_grid_width_drops_the_pan_but_new_rows_keep_it() {
+    fn a_new_grid_width_or_typing_drops_the_pan_but_new_rows_keep_it() {
         use super::ColumnPan;
         let mut pan = ColumnPan::default();
-        pan.pan(20., 0, 200, 50);
-        pan.pan(0.5, 20, 200, 50);
+        pan.pan(20., 0, (200, 50), 3);
+        pan.pan(0.5, 20, (200, 50), 3);
         // Rows are not part of it: a keyboard opening never moves the window.
-        assert_eq!(pan.column(200, 50), Some(20));
+        assert_eq!(pan.column((200, 50), 3), Some(20));
         // Another width: the program drew its rows again; follow the caret.
-        assert_eq!(pan.column(118, 50), None);
+        assert_eq!(pan.column((118, 50), 3), None);
         // The dropped half column does not come back either.
-        assert!(!pan.pan(0.6, 0, 118, 50));
-        assert_eq!(pan.column(200, 50), None);
+        assert!(!pan.pan(0.6, 0, (118, 50), 3));
+        assert_eq!(pan.column((200, 50), 3), None);
+        // Typing (the session counted another input): back to the caret.
+        pan.pan(20., 0, (200, 50), 3);
+        assert_eq!(pan.column((200, 50), 3), Some(20));
+        assert_eq!(pan.column((200, 50), 4), None);
+    }
+
+    #[test]
+    fn keys_typed_and_pasted_text_count_as_input_and_wheel_does_not() {
+        let (session, _remote, _) = session();
+        assert_eq!(session.inputs(), 0);
+        assert!(session.type_text("a"));
+        assert!(session.paste("b"));
+        assert!(session.key(&KeyPress {
+            key: "enter".into(),
+            control: false,
+            alt: false,
+            shift: false,
+            text: None,
+        }));
+        assert_eq!(session.inputs(), 3);
+        session.wheel(3);
+        assert_eq!(session.inputs(), 3);
     }
 
     #[test]

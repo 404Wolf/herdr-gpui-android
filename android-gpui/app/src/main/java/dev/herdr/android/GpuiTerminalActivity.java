@@ -198,6 +198,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         flingRemainder = 0f;
     }
     private boolean scrolling;
+    /** The current drag left the slop sideways: the renderer pans it to its end. */
+    private boolean panning;
     /** Locally accumulated scrollback target; polls only resync it while idle. */
     private long desiredScroll, lastSentScroll = -1;
     /** A fetch whose frame never arrived is asked for again after this long. */
@@ -4358,6 +4360,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             lastMoveAt = SystemClock.uptimeMillis();
             scrollVelocity = 0f;
             scrolling = false;
+            panning = false;
             scrollFraction = 0f;
         } else if (masked == MotionEvent.ACTION_MOVE && count == 1 && !shellMode()) {
             // A shell has no rail, and GPUI turns its pans into Rio's own scrollback.
@@ -4378,7 +4381,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
             }
             if (edgeClaimed) return true;
-            if (!scrolling && Math.abs(event.getY() - touchDownY) > dp(RendererTouch.SLOP_DP)) {
+            // The axis is decided once, where GPUI decides it: a drag it locked
+            // sideways stays the renderer's pan however it drifts after.
+            int axis = scrolling || panning ? RendererTouch.AXIS_NONE : RendererTouch.axis(
+                    event.getX() - touchDownX, event.getY() - touchDownY, dp(RendererTouch.SLOP_DP));
+            if (axis == RendererTouch.AXIS_X) panning = true;
+            if (axis == RendererTouch.AXIS_Y) {
                 scrolling = true;
                 // Dragging the conversation down while typing puts the keyboard away.
                 if (event.getY() > touchDownY && composer != null) composer.hideKeyboard();
