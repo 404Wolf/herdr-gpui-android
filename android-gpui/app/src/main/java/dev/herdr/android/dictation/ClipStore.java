@@ -417,7 +417,9 @@ final class ClipStore {
         if (text != null) {
             try {
                 JSONArray list = new JSONArray(text);
-                for (int i = 0; i < list.length() && entries.size() < MAX_CLIPS; i++) {
+                // Every entry, whatever the bound: keep() may file more than MAX_CLIPS rather than
+                // delete audio, so a load that stopped short would drop stored finals.
+                for (int i = 0; i < list.length(); i++) {
                     JSONObject o = list.getJSONObject(i);
                     String id = o.getString("id");
                     String clipText = o.isNull("text") ? null : o.optString("text", null);

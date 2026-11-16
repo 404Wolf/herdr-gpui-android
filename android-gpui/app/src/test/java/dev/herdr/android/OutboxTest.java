@@ -229,4 +229,48 @@ public final class OutboxTest {
         assertEquals(Outbox.Outcome.SENT, Outbox.Outcome.parse("sent"));
         assertEquals(Outbox.Outcome.RETRY, Outbox.Outcome.parse("retry"));
     }
+
+    @Test public void aFilledDictationCanBeUndoneWhenItsSaveFails() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        String token = DictationToken.of("c1");
+        Outbox.Message m = outbox.add("h", "t1", "see " + token, 1);
+        Runnable undo = outbox.fillDictationUndoably("c1", "the words");
+        assertNotNull(undo);
+        assertEquals("see the words", outbox.shown("h", "t1", 2).get(0).text);
+        undo.run();
+        assertEquals("see " + token, outbox.shown("h", "t1", 2).get(0).text);
+        // A message left blank by an empty dictation is dropped; the undo brings it back.
+        Outbox.Message only = outbox.add("h", "t1", DictationToken.of("c2"), 3);
+        Runnable undo2 = outbox.fillDictationUndoably("c2", "");
+        assertEquals(1, outbox.shown("h", "t1", 4).size());
+        undo2.run();
+        assertEquals(Arrays.asList(m.id, only.id), ids(outbox.shown("h", "t1", 5)));
+        assertNull(outbox.fillDictationUndoably("nobody", "x"));
+    }
+
+    @Test public void theCourierSaysWhenAFilledDictationCouldNotBeSaved() throws Exception {
+        File file = new File(dir.getRoot(), "courier-" + Outbox.FILE_NAME);
+        OutboxCourier courier = new OutboxCourier(file, Runnable::run, (handle, pane, text) -> "sent");
+        courier.outbox().ready("h", "b1", panes("t1"));
+        String token = DictationToken.of("c1");
+        courier.add("h", "t1", "see " + token);
+        assertEquals(0, courier.fillDictation("nobody", "x"));
+        // The file cannot be written: its temporary's place is taken.
+        File tmp = new File(file.getPath() + ".tmp");
+        assertTrue(tmp.mkdirs());
+        assertTrue(new File(tmp, "x").createNewFile());
+        assertEquals(-1, courier.fillDictation("c1", "the words"));
+        assertEquals("as it was", "see " + token, courier.outbox().shown("h", "t1", 1).get(0).text);
+        new File(tmp, "x").delete();
+        assertTrue(tmp.delete());
+        assertEquals(1, courier.fillDictation("c1", "the words"));
+        assertEquals("see the words", courier.outbox().shown("h", "t1", 1).get(0).text);
+    }
+
+    private static List<String> ids(List<Outbox.Message> messages) {
+        List<String> out = new ArrayList<>();
+        for (Outbox.Message m : messages) out.add(m.id);
+        return out;
+    }
 }

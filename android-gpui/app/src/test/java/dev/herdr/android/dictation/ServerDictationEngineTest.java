@@ -255,6 +255,20 @@ public final class ServerDictationEngineTest {
         assertEquals("deleted once stored", 0, left == null ? 0 : left.length);
     }
 
+    @Test public void aFinalWhoseTextCouldNotBeStoredKeepsItsRecording() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.listener.stores = false;
+        dictate(server.uri(), null, 300, run);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        // Kept as rescue audio: never sent, never offered, but there.
+        assertEquals(1, store.keptClips().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.keptClips().get(0).id).toPath()));
+        assertTrue(store.untranscribed().isEmpty());
+    }
+
     @Test public void aCrashWhileStoringTheFinalKeepsTheAudioForTheNextStart() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU));
         Run run = new Run();
@@ -416,6 +430,12 @@ public final class ServerDictationEngineTest {
 
         /** Run when the final arrives, before anything else (a check, or a simulated crash). */
         volatile Runnable atFinal;
+        /** What finalStored() answers: false as when the draft's write failed. */
+        volatile boolean stores = true;
+
+        @Override public boolean finalStored() {
+            return stores;
+        }
 
         @Override public void onFinal(String text, boolean onDevice) {
             Runnable r = atFinal;

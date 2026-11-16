@@ -86,12 +86,20 @@ final class OutboxCourier {
     }
 
     /** A transcribed dictation for a queued message; true when one held its token. */
-    boolean fillDictation(String clipId, String spoken) {
-        if (!outbox.fillDictation(clipId, spoken)) return false;
-        // Saved before returning: the caller deletes the recording next.
-        if (!outbox.save()) thread.execute(outbox::save);
+    /**
+     * A transcribed dictation for a queued message: 1 when a message held its token and the text
+     * is saved; 0 when none held it; -1 when the save failed, and the message is as it was (the
+     * caller keeps the recording, which is offered again).
+     */
+    int fillDictation(String clipId, String spoken) {
+        Runnable undo = outbox.fillDictationUndoably(clipId, spoken);
+        if (undo == null) return 0;
+        if (!outbox.save()) {
+            undo.run();
+            return -1;
+        }
         changed();
-        return true;
+        return 1;
     }
 
     /** Send again, or drop/take back, by the user's hand. */

@@ -126,4 +126,18 @@ public final class NoLostAudioTest {
         assertTrue(store.audio(clip.id).isFile());
         assertEquals(clip.id, store().untranscribed().get(0).id);
     }
+
+    @Test public void everyEntryIsReadBackHoweverManyThereAre() throws Exception {
+        ClipStore store = store();
+        int n = ClipStore.MAX_CLIPS + 6;
+        for (int i = 0; i < n; i++) {
+            PendingClip c = recording(store, 0 == i % 2 ? 1 : 1).keep();
+            assertNotNull(c);
+            if (i % 2 == 0) assertTrue(store.transcribed(c.id, "final " + i));
+        }
+        ClipStore again = store();
+        assertEquals("nothing dropped on reload", n, again.size());
+        assertEquals(n / 2, again.transcribed().size());
+        assertEquals(n - n / 2, again.untranscribed().size());
+    }
 }

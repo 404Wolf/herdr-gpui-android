@@ -219,4 +219,25 @@ public final class PendingDictationsTest {
         assertEquals(0, pending.count());
         assertFalse(store.audio(a.id).exists());
     }
+
+    @Test public void textThatCouldNotBeStoredIsOfferedAgainAndTheRecordingKept() {
+        ClipStore store = store();
+        PendingClip a = record(store, "1", 10);
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> "words", worker, Runnable::run);
+        java.util.List<String> got = new java.util.ArrayList<>();
+        pending.setListener(new PendingDictations.Listener() {
+            @Override public void onTranscribed(PendingClip clip, String text) {
+                got.add(text); // not stored: no delivered()
+            }
+
+            @Override public void onChanged() { }
+        });
+        pending.pass();
+        assertEquals(1, got.size());
+        assertEquals("still held until delivered", 1, pending.count());
+        pending.offerAgain(a.id);
+        assertEquals(2, got.size());
+        pending.delivered(a.id);
+        assertEquals(0, pending.count());
+    }
 }

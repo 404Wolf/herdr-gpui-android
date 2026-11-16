@@ -54,6 +54,12 @@ public final class DictationRoutingTest {
 
         @Override public void clipLength(String clipId, long durationMs) { }
 
+        boolean saves = true;
+
+        @Override public boolean persistNow() {
+            return saves;
+        }
+
         @Override public void transcribedOnPhone() {
             offlineTag = true;
         }
@@ -187,5 +193,20 @@ public final class DictationRoutingTest {
         a.onError(new DictationException(DictationException.Reason.AUDIO, "The recording could not be saved"));
         assertEquals(Collections.emptyList(), c.sent);
         assertFalse(c.routing.sendPending());
+    }
+
+    @Test public void aFinalWhoseDraftCouldNotBeSavedTellsTheEngineToKeepTheRecording() {
+        Composer c = new Composer();
+        c.drafts.switchTo("A");
+        c.drafts.dictationStarted();
+        DictationEngine.Listener a = c.routing.listener("A");
+        a.onFinal("words", false);
+        assertTrue(a.finalStored());
+        c.saves = false;
+        c.drafts.dictationStarted();
+        DictationEngine.Listener b = c.routing.listener("A");
+        b.onFinal("more words", false);
+        assertFalse("not saved: the engine keeps the recording", b.finalStored());
+        assertTrue("the words stay on screen", c.drafts.text().contains("more words"));
     }
 }

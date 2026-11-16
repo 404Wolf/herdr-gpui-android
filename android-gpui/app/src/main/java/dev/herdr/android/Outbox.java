@@ -309,10 +309,22 @@ final class Outbox {
      * grew past what a send can carry is gone (offered back as a draft).
      */
     synchronized boolean fillDictation(String clipId, String spoken) {
-        for (Entry entry : entries) {
+        return fillDictationUndoably(clipId, spoken) != null;
+    }
+
+    /**
+     * {@link #fillDictation}, with a way back: null when no message held the token, else what
+     * puts the message as it was (for a fill that could not be saved).
+     */
+    synchronized Runnable fillDictationUndoably(String clipId, String spoken) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry entry = entries.get(i);
             if (entry.state == State.SENDING) continue;
             String filled = DictationToken.fill(entry.text, clipId, spoken);
             if (filled == null) continue;
+            String oldText = entry.text;
+            State oldState = entry.state;
+            int at = i;
             if (filled.trim().isEmpty()) {
                 remove(entry);
             } else {
@@ -321,9 +333,21 @@ final class Outbox {
                 if (!sendable(filled)) entry.state = State.GONE;
             }
             version++;
-            return true;
+            return () -> {
+                synchronized (Outbox.this) {
+                    if (!entries.contains(entry)) {
+                        entries.add(Math.min(at, entries.size()), entry);
+                        chars += oldText.length();
+                    } else {
+                        chars += oldText.length() - entry.text.length();
+                    }
+                    entry.text = oldText;
+                    entry.state = oldState;
+                    version++;
+                }
+            };
         }
-        return false;
+        return null;
     }
 
     /** The user's "send again" on an unsure message: back in line where it was. */

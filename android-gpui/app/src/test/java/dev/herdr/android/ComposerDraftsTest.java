@@ -118,4 +118,17 @@ public final class ComposerDraftsTest {
         damaged.switchTo("a");
         assertEquals("", damaged.text());
     }
+
+    @Test
+    public void aRollbackPutsEveryDraftBackAsItWas() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("a");
+        drafts.edit("before " + DictationToken.of("c1"));
+        Object snap = drafts.snapshot();
+        assertEquals("a", drafts.placeDictation("c1", "spoken"));
+        drafts.append("b", "elsewhere");
+        drafts.rollback(snap);
+        assertEquals("before " + DictationToken.of("c1"), drafts.text());
+        assertEquals("", drafts.switchTo("b"));
+    }
 }

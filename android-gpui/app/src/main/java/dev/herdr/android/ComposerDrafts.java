@@ -160,6 +160,19 @@ final class ComposerDrafts {
     }
 
     /** Restores what {@link #encode} saved, under drafts already typed since; a damaged value restores nothing. */
+    /** Every draft as it is now, to {@link #rollback} a change that could not be saved. */
+    Object snapshot() {
+        return new Object[] {new LinkedHashMap<>(drafts), dictationBase};
+    }
+
+    @SuppressWarnings("unchecked")
+    void rollback(Object snapshot) {
+        Object[] s = (Object[]) snapshot;
+        drafts.clear();
+        drafts.putAll((Map<String, String>) s[0]);
+        dictationBase = (String) s[1];
+    }
+
     void restore(String saved) {
         if (saved == null || saved.isEmpty()) return;
         Map<String, String> typed = new LinkedHashMap<>(drafts);

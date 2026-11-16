@@ -165,7 +165,10 @@ final class ComposerBar {
         }
 
         @Override public void appendDictation(String pane, String text) {
-            ComposerBar.this.appendDictation(pane, text);
+            // A live final for another pane: it stays in memory either way; persistNow follows.
+            if (pane == null || pane.isEmpty()) pane = drafts.pane();
+            String draft = drafts.append(pane, text);
+            if (pane.equals(drafts.pane())) showText(draft);
         }
 
         @Override public void clipLength(String clipId, long durationMs) {
@@ -181,8 +184,8 @@ final class ComposerBar {
             pushGhost();
         }
 
-        @Override public void persistNow() {
-            ComposerBar.this.persistNow();
+        @Override public boolean persistNow() {
+            return ComposerBar.this.persistNow();
         }
     });
     /** The desktop said its final waits for a decode ("finishing…"), until the session ends. */
@@ -255,35 +258,48 @@ final class ComposerBar {
 
     /**
      * A recording made offline came back as text: it replaces its chip in
-     * whichever pane's draft holds it, saved at once. False when no draft does.
+     * whichever pane's draft holds it, saved at once. 1 when placed and saved,
+     * 0 when no draft holds it, -1 when it could not be saved (left as it was).
      */
-    boolean placeDictation(String clipId, String text) {
+    int placeDictation(String clipId, String text) {
+        Object before = drafts.snapshot();
         String pane = drafts.placeDictation(clipId, text);
-        if (pane == null) return false;
+        if (pane == null) return 0;
+        if (!persistNow()) {
+            // Not saved: as it was, and the recording stays to be offered again.
+            drafts.rollback(before);
+            showText(drafts.text());
+            return -1;
+        }
         clipLengths.remove(clipId);
         if (pane.equals(drafts.pane())) showText(drafts.text());
-        persistNow();
-        return true;
+        return 1;
     }
 
     /**
      * A dictation whose chip is gone from everywhere: it joins the end of its pane's draft (a
      * recovered recording, whose pane is not known, joins the pane on screen).
      */
-    void appendDictation(String pane, String text) {
+    boolean appendDictation(String pane, String text) {
         if (pane == null || pane.isEmpty()) pane = drafts.pane();
+        Object before = drafts.snapshot();
         String draft = drafts.append(pane, text);
+        if (!persistNow()) {
+            drafts.rollback(before);
+            showText(drafts.text());
+            return false;
+        }
         if (pane.equals(drafts.pane())) showText(draft);
-        persistNow();
+        return true;
     }
 
     /**
      * Saves the drafts to disk before returning: a dictation's text is stored before its
      * recording is deleted (the courier's {@code delivered}, the live engine's discard).
      */
-    void persistNow() {
+    boolean persistNow() {
         field.removeCallbacks(saveDrafts);
-        preferences.edit().putString(DRAFTS, drafts.encode()).commit();
+        return preferences.edit().putString(DRAFTS, drafts.encode()).commit();
     }
 
     /** Where the drawn screen is busy, from the renderer after a paint that changed it. */

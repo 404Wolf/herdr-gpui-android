@@ -37,8 +37,13 @@ final class DictationRouting {
         /** The desktop's final waits for a decode: "finishing…" instead of "transcribing…". */
         default void finishing() { }
 
-        /** Saves the drafts to disk now, before the recording a final came from is deleted. */
-        default void persistNow() { }
+        /**
+         * Saves the drafts to disk now, before the recording a final came from is deleted; false
+         * when the write failed (the engine then keeps the recording).
+         */
+        default boolean persistNow() {
+            return true;
+        }
     }
 
     /** What the composer's Enter does in a dictation state ({@link #onEnter}). */
@@ -100,6 +105,13 @@ final class DictationRouting {
                 onFinal(text, false);
             }
 
+            /** Whether the last final's text reached the disk. */
+            private boolean stored = true;
+
+            @Override public boolean finalStored() {
+                return stored;
+            }
+
             @Override public void onFinal(String text, boolean onDevice) {
                 if (onDevice) {
                     bar.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
@@ -111,8 +123,8 @@ final class DictationRouting {
                     // Switched away while it finished: it joins the end of its own pane's draft.
                     bar.appendDictation(pane, text);
                 }
-                // Saved before the engine deletes the recording.
-                bar.persistNow();
+                // Saved before the engine deletes the recording; not saved, it keeps it.
+                stored = bar.persistNow();
                 // The session is over (IDLE follows): Enter must send, not wait again.
                 settle(DictationEngine.State.IDLE);
             }

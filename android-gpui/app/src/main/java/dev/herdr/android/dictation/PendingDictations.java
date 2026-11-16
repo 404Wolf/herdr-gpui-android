@@ -161,6 +161,12 @@ public final class PendingDictations {
         changed();
     }
 
+    /** Its text could not be stored where it goes: offer it again (the recording is kept). Main thread. */
+    public void offerAgain(String id) {
+        offered.remove(id);
+        offer();
+    }
+
     /** The user threw the recording away. Main thread. */
     public void drop(String id) {
         delivered(id);

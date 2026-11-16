@@ -75,6 +75,14 @@ public interface DictationEngine {
          */
         default void onFinishing(double tailSeconds) { }
 
+        /**
+         * Asked right after onFinal: whether its text is durably stored. Only then is the
+         * recording deleted; otherwise it is kept as rescue audio ({@link ClipStore#KEEP_MS}).
+         */
+        default boolean finalStored() {
+            return true;
+        }
+
         void onState(State state);
 
         /** The session failed; {@link State#IDLE} follows and no onFinal. */
