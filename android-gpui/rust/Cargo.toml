@@ -11,7 +11,11 @@ base64 = "0.22.1"
 async-channel = "2"
 thiserror = "2"
 gpui = { package = "gpui-pre", version = "=0.3.7", default-features = false }
-gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/longbridge/gpui-mobile", rev = "9075e3aa3eea812127f2c60ed66f0cd5798ff245", default-features = false }
+# Fork of longbridge/gpui-mobile at 9075e3a plus one commit: the touch observer
+# (host::set_touch_observer) the tap stamps rely on (see tap::DownStamps).
+# Owner: herdr-android (PM t1jf). Removal: repin to upstream once an equivalent
+# hook is released there, then delete the fork's herdr/touch-observer branch.
+gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/404Wolf/gpui-mobile", rev = "cf8eabe1391da50055ca7f3609c6eb82216c90aa", default-features = false }
 gpui-wgpu = { package = "gpui-pre-wgpu", version = "=0.3.7", default-features = false }
 jni = "0.21"
 jni-mobile = { package = "jni", version = "0.22" }

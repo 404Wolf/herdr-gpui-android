@@ -187,9 +187,13 @@ pub fn plain_view_tap(lifted: Option<(bool, Gesture)>, now: Gesture) -> (Tapped,
 /// changes at once, while a touch waits in GPUI's queue, so the stamp
 /// travels with the down instead, in a queue kept in the same order.
 ///
-/// Every down GPUI handles is matched: by identity, one entry per down in
-/// dispatch order, never by position. A down that starts a touch, and one
-/// GPUI takes to stop a fling (no touch starts), each take their entry.
+/// Every down is matched by identity, one entry per down in order, never by
+/// position: the host's render thread reports each touch it posted as it hands
+/// it to GPUI ([`DownStamps::observed`], from gpui-mobile's touch observer).
+/// Contacts the platform layer adds never reach that report: the fling guard
+/// relays a synthetic contact before a down that may land on a fling, which
+/// GPUI reports as a start of its own, so counting GPUI's starts instead
+/// took the synthetic contact for the down and left the real one without.
 #[derive(Debug)]
 pub struct DownStamps {
     /// Downs queued and not yet handled whose stamps were dropped to keep
@@ -233,6 +237,16 @@ impl DownStamps {
     /// The down queued last never reached GPUI (the platform kept it).
     pub fn withdrawn(&mut self) {
         self.queue.pop_back();
+    }
+
+    /// The render thread is handing GPUI a touch the host posted, with this
+    /// single-pointer action (`0` down, `1` up, `2` move, `3` cancel): a down
+    /// takes its entry ([`Self::handled`]); the rest take nothing.
+    pub fn observed(&mut self, action: u32) {
+        const DOWN: u32 = 0;
+        if action == DOWN {
+            self.handled();
+        }
     }
 
     /// GPUI handled the next queued down: its stamp is the touch in progress
@@ -547,6 +561,37 @@ mod tests {
             assert_eq!(downs.handled(), i);
         }
         assert_eq!(downs.handled(), NO_STAMP);
+    }
+
+    // Touch actions as the observer reports them.
+    const DOWN: u32 = 0;
+    const UP: u32 = 1;
+    const MOVE: u32 = 2;
+    const CANCEL: u32 = 3;
+
+    /// One posted touch gesture as the render thread reports it: a down, its
+    /// moves, and its end. The platform's synthetic contacts never appear.
+    fn gesture(downs: &mut DownStamps, end: u32) -> Gesture {
+        downs.observed(DOWN);
+        let now = downs.now();
+        downs.observed(MOVE);
+        downs.observed(end);
+        now
+    }
+
+    #[test]
+    fn only_observed_downs_take_entries_one_to_one_in_order() {
+        let mut downs = DownStamps::default();
+        downs.queued(1);
+        downs.queued(2);
+        downs.queued(3);
+        // A pan, a tap after it (the fling guard's synthetic contact before
+        // it is never observed), a cancelled scroll: one entry each, in order.
+        assert_eq!(gesture(&mut downs, UP).stamp, 1);
+        assert_eq!(gesture(&mut downs, UP).stamp, 2);
+        assert_eq!(gesture(&mut downs, CANCEL).stamp, 3);
+        assert_eq!(gesture(&mut downs, UP).stamp, NO_STAMP);
+        assert_eq!(downs.now().id, 4, "one gesture per observed down");
     }
 
     #[test]
