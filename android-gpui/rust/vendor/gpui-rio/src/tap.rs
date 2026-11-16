@@ -190,6 +190,16 @@ pub fn plain_view_tap(lifted: Option<(bool, Gesture)>, now: Gesture) -> (Tapped,
 /// Every down GPUI handles is matched: by identity, one entry per down in
 /// dispatch order, never by position. A down that starts a touch, and one
 /// GPUI takes to stop a fling (no touch starts), each take their entry.
+///
+/// One down can reach GPUI as two contacts. Within a few seconds of a pan,
+/// the Android platform layer (gpui-mobile's `FlingGuard`) relays a
+/// synthetic contact, begun and cancelled where the real one begins, before
+/// the real one: it stops any fling still coasting. GPUI reports that
+/// contact's start as well (a still scroll start while a fling coasts, else
+/// a touch-drag offer), right before the real contact's touch-drag offer, at
+/// the same point. Both are the one down Java queued, so the second start
+/// takes no entry of its own ([`DownStamps::started`]); otherwise the real
+/// down found the queue empty and its tap was dropped.
 #[derive(Debug)]
 pub struct DownStamps {
     /// Downs queued and not yet handled whose stamps were dropped to keep
@@ -199,6 +209,8 @@ pub struct DownStamps {
     queue: std::collections::VecDeque<u64>,
     /// The down GPUI handled last: the touch in progress.
     current: Gesture,
+    /// Where and when GPUI last reported a down starting.
+    last_start: Option<((f32, f32), std::time::Instant)>,
 }
 
 impl Default for DownStamps {
@@ -216,7 +228,30 @@ impl DownStamps {
             dropped: 0,
             queue: std::collections::VecDeque::new(),
             current: Gesture::NONE,
+            last_start: None,
         }
+    }
+
+    /// Longest gap between the two starts one down can produce (see the
+    /// type's notes). They are relayed in one platform callback, so they are
+    /// microseconds apart; a person cannot put a second finger down on the
+    /// very same point that fast.
+    pub const ONE_DOWN: std::time::Duration = std::time::Duration::from_millis(16);
+
+    /// GPUI reported a down starting at `position` (logical pixels) at `at`:
+    /// a touch-drag offer, or a still scroll start (a down that stopped a
+    /// fling). Its stamp, as [`Self::handled`] takes it; a start at the same
+    /// point within [`Self::ONE_DOWN`] of the last is the same down and keeps
+    /// the gesture in progress.
+    pub fn started(&mut self, position: (f32, f32), at: std::time::Instant) -> u64 {
+        let same_down = self.last_start.is_some_and(|(last, then)| {
+            last == position && at.saturating_duration_since(then) <= Self::ONE_DOWN
+        });
+        self.last_start = Some((position, at));
+        if same_down {
+            return self.current.stamp;
+        }
+        self.handled()
     }
 
     /// A down went into GPUI's queue with `stamp`. Past the bound the oldest
@@ -547,6 +582,106 @@ mod tests {
             assert_eq!(downs.handled(), i);
         }
         assert_eq!(downs.handled(), NO_STAMP);
+    }
+
+    /// The two starts GPUI reports for one down that came right after a pan:
+    /// the platform's synthetic contact, then the real one, at one point and
+    /// microseconds apart (see `DownStamps`).
+    fn after_a_pan(downs: &mut DownStamps, at: (f32, f32), t: std::time::Instant) -> u64 {
+        let synthetic = downs.started(at, t);
+        let real = downs.started(at, t + std::time::Duration::from_micros(40));
+        assert_eq!(synthetic, real, "one down, one stamp");
+        real
+    }
+
+    #[test]
+    fn a_tap_right_after_a_fling_keeps_its_stamp() {
+        let t = std::time::Instant::now();
+        // The emulator case (4 of 4 taps dropped): a sideways fling, then a
+        // tap 0.7 s later while it still coasts. The synthetic contact stops
+        // the fling (a still scroll start), then the real tap is offered.
+        let mut downs = DownStamps::default();
+        downs.queued(3);
+        assert_eq!(downs.started((500., 300.), t), 3); // the fling
+        downs.queued(3);
+        let tap = after_a_pan(
+            &mut downs,
+            (10., 150.),
+            t + std::time::Duration::from_millis(700),
+        );
+        assert_eq!(tap, 3);
+        assert_eq!(downs.now().stamp, 3);
+        // Counting each start as a down, as before, left the real tap none.
+        let mut old = DownStamps::default();
+        old.queued(3);
+        old.handled();
+        assert_eq!(old.handled(), NO_STAMP);
+    }
+
+    #[test]
+    fn a_tap_after_a_slow_pan_keeps_its_stamp() {
+        // A pan released without a fling, then a tap within 4 s: the
+        // platform still relays its synthetic contact, which GPUI offers as a
+        // touch drag of its own. Same down, same stamp, same gesture.
+        let t = std::time::Instant::now();
+        let mut downs = DownStamps::default();
+        downs.queued(1);
+        assert_eq!(downs.started((300., 300.), t), 1); // the pan
+        downs.queued(1);
+        let before = downs.now();
+        let tap_at = t + std::time::Duration::from_secs(2);
+        assert_eq!(downs.started((40., 80.), tap_at), 1);
+        let gesture = downs.now();
+        assert_ne!(gesture, before);
+        assert_eq!(
+            downs.started((40., 80.), tap_at + std::time::Duration::from_micros(30)),
+            1
+        );
+        assert_eq!(
+            downs.now(),
+            gesture,
+            "the real contact is the gesture the synthetic one began"
+        );
+    }
+
+    #[test]
+    fn plain_taps_and_long_presses_take_one_entry_each() {
+        let t = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut downs = DownStamps::default();
+        // Two plain taps on the very same point, on two panes: two downs.
+        downs.queued(1);
+        assert_eq!(downs.started((10., 10.), t), 1);
+        downs.queued(2);
+        assert_eq!(downs.started((10., 10.), t + ms(250)), 2);
+        // A long press is one start, then a hold: the next tap is its own.
+        downs.queued(3);
+        assert_eq!(downs.started((20., 20.), t + ms(600)), 3);
+        downs.queued(4);
+        assert_eq!(downs.started((20., 20.), t + ms(1400)), 4);
+        assert_eq!(downs.started((30., 30.), t + ms(1500)), NO_STAMP);
+    }
+
+    #[test]
+    fn a_scroll_then_taps_stay_in_step() {
+        let t = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut downs = DownStamps::default();
+        // A scroll (pane 1), a tap within the platform's window (pane 1),
+        // then the host switches to pane 2 and the next tap is pane 2's: no
+        // stamp is left over or borrowed after the double start.
+        downs.queued(1);
+        assert_eq!(downs.started((200., 900.), t), 1);
+        downs.queued(1);
+        assert_eq!(after_a_pan(&mut downs, (200., 400.), t + ms(900)), 1);
+        downs.queued(2);
+        assert_eq!(downs.started((200., 400.), t + ms(1300)), 2);
+        downs.queued(2);
+        assert_eq!(downs.started((60., 400.), t + ms(1700)), 2);
+        assert_eq!(
+            downs.started((60., 400.), t + ms(1700) + DownStamps::ONE_DOWN * 2),
+            NO_STAMP
+        );
     }
 
     #[test]

@@ -250,9 +250,11 @@ fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// GPUI handled the next queued touch-down (see `ui::down_watch`).
-pub(crate) fn touch_handled() {
-    lock_downs().handled();
+/// GPUI reported a touch-down starting at `position` (see `ui::down_watch`):
+/// it takes the next queued stamp, unless it is the second start of one down.
+pub(crate) fn touch_started(position: gpui::Point<gpui::Pixels>) {
+    let at = (f32::from(position.x), f32::from(position.y));
+    lock_downs().started(at, std::time::Instant::now());
 }
 
 /// The gesture GPUI is handling: the down it handled last, with the stamp

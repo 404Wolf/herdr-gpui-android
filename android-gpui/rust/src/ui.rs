@@ -318,7 +318,10 @@ fn button(
 /// down GPUI handles shows as one of two events: a touch drag offered as the
 /// touch starts, or (a down that stops a fling, starting no touch) a touch
 /// scroll that starts with no movement. Both take their down's entry, so
-/// entries are matched one to one in order, never by position.
+/// entries are matched one to one in order, never by position. One down that
+/// lands right after a pan shows as two starts at one point (the platform's
+/// fling-stopping synthetic contact, then the real one): they take one entry
+/// (`DownStamps::started`).
 #[cfg(target_os = "android")]
 fn down_watch() -> impl IntoElement {
     canvas(
@@ -326,7 +329,7 @@ fn down_watch() -> impl IntoElement {
         move |_, _, window, _| {
             window.on_mouse_event(|event: &TouchDragEvent, phase, _, _| {
                 if phase == DispatchPhase::Capture && event.phase == TouchPhase::Started {
-                    crate::android::touch_handled();
+                    crate::android::touch_started(event.start_position);
                 }
             });
             window.on_mouse_event(|event: &ScrollWheelEvent, phase, _, _| {
@@ -338,7 +341,7 @@ fn down_watch() -> impl IntoElement {
                     && event.touch_phase == TouchPhase::Started
                     && still
                 {
-                    crate::android::touch_handled();
+                    crate::android::touch_started(event.position);
                 }
             });
         },
