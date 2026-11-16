@@ -2060,6 +2060,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean linkStatusDim;
     /** When to checkpoint the pane on screen. Under stateLock. */
     private final PaneCheckpoint checkpoint = new PaneCheckpoint();
+    /** Each computer's lists as this terminal last saw them live: newer than Home's cache. */
+    private final java.util.Map<String, JSONArray[]> seenLists = new java.util.concurrent.ConcurrentHashMap<>();
     /** Home's last view of each computer, for switching with no link; read once per resume. */
     private volatile java.util.Map<String, HomeCache.Entry> fleetCache = java.util.Collections.emptyMap();
     /** The terminal has been on screen before (later resumes reopen the pane last shown). */
@@ -2604,12 +2606,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     : sample == null ? null : sample.panes;
             JSONArray tabs = live && current != null ? current.tabs
                     : sample == null ? null : sample.tabs;
-            HomeCache.Entry cached = live || panes != null ? null : fleetCache.get(host.id);
-            if (cached != null) {
-                // Not reachable yet: Home's last view, read only (item 77).
-                workspaces = cached.view.optJSONArray("workspaces");
-                tabs = cached.view.optJSONArray("tabs");
-                panes = cached.view.optJSONArray("panes");
+            JSONArray[] last = live || panes != null ? null : lastLists(host.id);
+            if (last != null) {
+                // Not reachable yet: its last lists, read only (item 77).
+                workspaces = last[0];
+                tabs = last[1];
+                panes = last[2];
             }
             addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
@@ -3539,11 +3541,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 workspaces = sample == null ? null : sample.workspaces;
                 tabs = sample == null ? null : sample.tabs;
                 connected = sample != null && sample.connected;
-                HomeCache.Entry cached = panes != null ? null : fleetCache.get(host.id);
-                if (cached != null) {
-                    panes = cached.view.optJSONArray("panes");
-                    workspaces = cached.view.optJSONArray("workspaces");
-                    tabs = cached.view.optJSONArray("tabs");
+                JSONArray[] last = panes != null ? null : lastLists(host.id);
+                if (last != null) {
+                    workspaces = last[0];
+                    tabs = last[1];
+                    panes = last[2];
                 }
             }
             // A pick focuses that computer's canonical live Deacon, in its exact
@@ -5557,6 +5559,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.tabs = state.optJSONArray("tabs");
                     current.panes = state.optJSONArray("panes");
                     current.title = state.optString("title", current.hostName);
+                    if (current.hostId != null && current.panes != null && current.workspaces != null) {
+                        seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
+                    }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
                 // a title update on the pane the user is already reading.
@@ -5718,6 +5723,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             savedShownHost = host;
             savedShownAt = savedAt;
         }
+        // A copy just drawn starts at its newest line.
+        showLatest(false);
         showLinkDown();
     }
 
@@ -5769,14 +5776,28 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    /** A stand-in with no lists takes Home's cached ones for its computer. Under stateLock. */
+    /**
+     * A stand-in with no lists takes the ones this terminal last saw live for
+     * its computer, else Home's cached ones. Under stateLock.
+     */
     private void fillFromCache(Connection offline) {
         if (!offline.offline || offline.panes != null) return;
-        HomeCache.Entry cached = fleetCache.get(offline.hostId);
-        if (cached == null) return;
-        offline.workspaces = cached.view.optJSONArray("workspaces");
-        offline.tabs = cached.view.optJSONArray("tabs");
-        offline.panes = cached.view.optJSONArray("panes");
+        JSONArray[] last = lastLists(offline.hostId);
+        if (last == null) return;
+        offline.workspaces = last[0];
+        offline.tabs = last[1];
+        offline.panes = last[2];
+    }
+
+    /** {workspaces, tabs, panes} of a computer with no live list: as last seen here, else Home's cache; null if neither. */
+    private JSONArray[] lastLists(String hostId) {
+        if (hostId == null) return null;
+        JSONArray[] seen = seenLists.get(hostId);
+        if (seen != null) return seen;
+        HomeCache.Entry cached = fleetCache.get(hostId);
+        if (cached == null) return null;
+        return new JSONArray[] {cached.view.optJSONArray("workspaces"), cached.view.optJSONArray("tabs"),
+                cached.view.optJSONArray("panes")};
     }
 
     /** Reads Home's cached Fleet view off the UI thread; the rail and strip redraw with it. */
@@ -5806,8 +5827,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void switchHostOffline(SavedRemoteHost host, String pane) {
         String shown = pane != null && !pane.isEmpty() ? pane : rememberedHostPane(host.id);
         if (shown.isEmpty()) {
-            HomeCache.Entry cached = fleetCache.get(host.id);
-            if (cached != null) shown = FleetPanes.switchLanding(cached.view, "");
+            JSONArray[] last = lastLists(host.id);
+            if (last != null) {
+                try {
+                    shown = FleetPanes.switchLanding(new JSONObject().put("workspaces", last[0])
+                            .put("tabs", last[1]).put("panes", last[2]), "");
+                } catch (JSONException unexpected) {
+                    shown = "";
+                }
+            }
         }
         stopConnection();
         synchronized (stateLock) { pendingInput.discardAll(); }
