@@ -86,11 +86,19 @@ struct Connection<'a> {
 /// the core's own history (item 77). Both sides move rows between screen and
 /// history on a resize, but Ghostty (the core) and Rio (the phone) do not
 /// always move the same ones (a fold changes columns and rows together), and
-/// the core's resize repaint carries only the screen. So once the RESIZE
-/// frames settle, an observer attach (observers never size the grid) reads
-/// the core's first paint, history included, and that paint is put into this
-/// stream after an ESC[3J, exactly where it arrived: the scrollback then is
-/// the core's, as on a fresh attach, and later output follows it in order.
+/// the core's resize repaint carries only the screen.
+///
+/// So once the RESIZE frames settle, an observer attach (observers never size
+/// the grid) streams the core's paint, history included, and then the same
+/// live output as this viewer, into a terminal of its own. The pane's screen
+/// and live output stay this viewer's alone: nothing from the observer is
+/// ever replayed into it. When both streams have gone quiet and both
+/// terminals show the same screen (so the observer has its whole paint and
+/// both are at the same point of the output; the core may split a paint into
+/// 16 KiB frames interleaved with other channels), the observer's history
+/// replaces this pane's, rows and styles, keeping the screen and the
+/// reader's scroll position. A newer resize, another pane or leaving drops
+/// a rebuild in flight before anything of it is used.
 #[derive(Default)]
 struct Rebuild {
     /// The pane's grid as the core last announced it.
@@ -98,28 +106,47 @@ struct Rebuild {
     /// When to start: the last grid change plus REBUILD_SETTLE, so a burst
     /// (a keyboard sliding, a fold) costs one rebuild.
     due: Option<Instant>,
-    /// The observer reading the core's paint, while one is open.
+    /// When this viewer's stream last brought pane output.
+    main_heard: Option<Instant>,
+    /// Rebuilds given up for this grid change (busy panes), bounded by REBUILD_TRIES.
+    tries: u8,
+    /// The observer streaming the core's history, while one is open.
     reading: Option<Reading>,
-    /// The last rebuild's paint size and how long it took, for the log and tests.
-    last: Option<(usize, Duration)>,
 }
 struct Reading {
     channel: u32,
     pane: String,
-    paint: Vec<u8>,
+    /// The observer's own terminal: the core's paint, then the same live output.
+    terminal: Arc<gpui_rio::Session>,
+    feed: mpsc::SyncSender<Chunk>,
+    bytes: usize,
     started: Instant,
     heard: Option<Instant>,
+}
+impl Reading {
+    /// The observer's own terminal at the core's grid; it credits the core
+    /// (through the session's command queue) as it parses.
+    fn open(commands: &mpsc::SyncSender<Operation>, channel: u32, pane: String, cols: u16, rows: u16) -> Result<Self> {
+        let (feed, rx) = mpsc::sync_channel(256);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel, session: slot.clone() };
+        let terminal = gpui_rio::Session::start(output, io::sink(), |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows)?;
+        terminal.set_grid(cols, rows);
+        *lock(&slot) = Arc::downgrade(&terminal);
+        Ok(Self { channel, pane, terminal, feed, bytes: 0, started: Instant::now(), heard: None })
+    }
 }
 /// History rows an attach (and a scrollback rebuild) asks the core for.
 const ATTACH_HISTORY: usize = 1000;
 /// How long the core's grid must stay put before the scrollback is rebuilt.
 const REBUILD_SETTLE: Duration = Duration::from_millis(300);
-/// The paint is one burst: this long without more of it ends it.
+/// Both streams this long without pane output: the observer has caught up.
 const REBUILD_QUIET: Duration = Duration::from_millis(250);
-/// An observer that sends nothing for this long is given up.
-const REBUILD_GIVE_UP: Duration = Duration::from_secs(5);
-/// The most of a paint kept (the core bounds its history by bytes too).
-const REBUILD_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// A rebuild that cannot finish (a pane that never goes quiet) is dropped
+/// after this long and tried again later, at most REBUILD_TRIES times.
+const REBUILD_GIVE_UP: Duration = Duration::from_secs(15);
+const REBUILD_RETRY: Duration = Duration::from_secs(5);
+const REBUILD_TRIES: u8 = 3;
 
 /// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
 const DETACH: u8 = 2;
@@ -173,13 +200,17 @@ impl Connection<'_> {
     }
     /// Starts or ends the scrollback rebuild when due. Called every turn of the session loop.
     fn tick_rebuild(&mut self, cols: u16, rows: u16) -> Result<()> {
-        if let Some(reading) = &self.rebuild.reading {
-            let quiet = reading.heard.is_some_and(|at| at.elapsed() >= REBUILD_QUIET);
-            if quiet {
-                return self.finish_rebuild();
+        if let Some((heard, started)) = self.rebuild.reading.as_ref().map(|r| (r.heard, r.started)) {
+            let quiet = |at: Option<Instant>| at.is_none_or(|at| at.elapsed() >= REBUILD_QUIET);
+            if heard.is_some() && quiet(heard) && quiet(self.rebuild.main_heard) && self.try_finish_rebuild()? {
+                return Ok(());
             }
-            if reading.heard.is_none() && reading.started.elapsed() >= REBUILD_GIVE_UP {
-                return self.abort_rebuild();
+            if started.elapsed() >= REBUILD_GIVE_UP {
+                self.abort_rebuild()?;
+                if self.rebuild.tries < REBUILD_TRIES {
+                    self.rebuild.tries += 1;
+                    self.rebuild.due = Some(Instant::now() + REBUILD_RETRY);
+                }
             }
             return Ok(());
         }
@@ -202,66 +233,68 @@ impl Connection<'_> {
         let (cols, rows) = self.rebuild.grid.unwrap_or((cols, rows));
         let params = json!({"terminal": pane, "observe": true, "history": ATTACH_HISTORY,
                             "cols": cols, "rows": rows, "display": display()});
-        match self.call("terminal.attach", params) {
-            Ok(reply) => {
-                let Some(channel) = reply["channel"].as_u64().filter(|c| *c > 0 && *c <= u64::from(u32::MAX)) else {
-                    return Ok(());
-                };
-                self.rebuild.reading = Some(Reading {
-                    channel: channel as u32,
-                    pane,
-                    paint: Vec::new(),
-                    started: Instant::now(),
-                    heard: None,
-                });
-                Ok(())
-            }
+        let reply = match self.call("terminal.attach", params) {
+            Ok(reply) => reply,
             // Refused (the pane ended, an older core): the scrollback stays as it is.
-            Err(Error::Protocol(_) | Error::Rpc { .. }) => Ok(()),
-            Err(error) => Err(error),
-        }
+            Err(Error::Protocol(_) | Error::Rpc { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(channel) = reply["channel"].as_u64().and_then(|c| u32::try_from(c).ok()).filter(|c| *c > 0) else {
+            return Ok(());
+        };
+        self.rebuild.reading = Some(Reading::open(&self.owner.commands, channel, pane, cols, rows)?);
+        Ok(())
     }
-    /// A frame on the rebuild's observer channel.
+    /// A frame on the rebuild's observer channel: into the observer's terminal only.
     fn read_rebuild(&mut self, frame: Frame) -> Result<()> {
         match frame.kind {
             0 => {
                 let Some(reading) = self.rebuild.reading.as_mut() else { return Ok(()) };
-                let channel = reading.channel;
-                let count = frame.bytes.len();
-                if reading.paint.len() + count > REBUILD_MAX_BYTES {
+                reading.bytes += frame.bytes.len();
+                reading.heard = Some(Instant::now());
+                if reading.feed.try_send(Chunk::Data(frame.bytes)).is_err() {
                     return self.abort_rebuild();
                 }
-                reading.paint.extend_from_slice(&frame.bytes);
-                reading.heard = Some(Instant::now());
-                // Taken at once: credit it so the core never waits on this channel.
-                write_frame(&mut self.socket, channel, 1, &(count as u32).to_le_bytes())?;
                 Ok(())
             }
-            2 => self.finish_rebuild(),
+            // The observer's stream ended: nothing to rebuild from.
+            2 => self.abort_rebuild(),
             _ => Ok(()),
         }
     }
-    /// The paint is complete: detach the observer and put the paint into the
-    /// stream, after an ESC[3J, if the same pane is still shown.
-    fn finish_rebuild(&mut self) -> Result<()> {
-        let Some(reading) = self.rebuild.reading.take() else { return Ok(()) };
-        write_frame(&mut self.socket, reading.channel, DETACH, &[])?;
-        let shown = lock(&self.owner.state).view["pane_id"] == reading.pane.as_str();
-        if reading.paint.is_empty() || !shown {
-            return Ok(());
+    /// Uses the observer's history if both terminals show the same screen
+    /// (the whole paint arrived, and both are at the same point of the
+    /// output); true when the rebuild is over.
+    fn try_finish_rebuild(&mut self) -> Result<bool> {
+        let Some(reading) = &self.rebuild.reading else { return Ok(true) };
+        let terminal = {
+            let state = lock(&self.owner.state);
+            if state.view["pane_id"] != reading.pane.as_str() {
+                None
+            } else {
+                state.terminal.clone()
+            }
+        };
+        let Some(terminal) = terminal else {
+            self.abort_rebuild()?;
+            return Ok(true);
+        };
+        if !terminal.same_screen(&reading.terminal) {
+            return Ok(false);
         }
-        let bytes = reading.paint.len();
-        let mut local = b"\x1b[3J".to_vec();
-        local.extend(reading.paint);
-        if let Some(output) = &self.output {
-            output.try_send(Chunk::Local(local)).map_err(|_| Error::Capacity)?;
-        }
-        self.rebuild.last = Some((bytes, reading.started.elapsed()));
+        let replaced = terminal.replace_history_from(&reading.terminal);
+        let (bytes, took) = (reading.bytes, reading.started.elapsed());
+        self.abort_rebuild()?;
+        self.rebuild.tries = 0;
         #[cfg(feature = "android-ui")]
-        log::warn!("scrollback rebuilt from the core: {bytes} bytes in {:?}", reading.started.elapsed());
-        Ok(())
+        if replaced {
+            log::warn!("scrollback rebuilt from the core: {bytes} bytes in {took:?}");
+        }
+        #[cfg(not(feature = "android-ui"))]
+        let _ = (replaced, bytes, took);
+        Ok(true)
     }
-    /// Drops a rebuild in progress (a newer resize, or nothing came).
+    /// Ends a rebuild: its observer is detached and its terminal dropped.
     fn abort_rebuild(&mut self) -> Result<()> {
         if let Some(reading) = self.rebuild.reading.take() {
             write_frame(&mut self.socket, reading.channel, DETACH, &[])?;
@@ -323,6 +356,8 @@ impl Connection<'_> {
     /// Best effort as the session ends: the core forgets this viewer now
     /// rather than when the transport finally times out.
     fn release(&mut self) {
+        // An observer reading history goes too.
+        let _ = self.abort_rebuild();
         if self.channel == 0 {
             return;
         }
@@ -395,15 +430,8 @@ impl Connection<'_> {
         Err(Error::Protocol(format!("{method} timed out")))
     }
     fn deliver(&mut self, frame: Frame) -> Result<()> {
-        if let Some(channel) = self.rebuild.reading.as_ref().map(|r| r.channel) {
-            if frame.channel == channel {
-                return self.read_rebuild(frame);
-            }
-            // The paint is written in one piece: anything else after it ends it,
-            // and it goes into the stream before this frame.
-            if self.rebuild.reading.as_ref().is_some_and(|r| r.heard.is_some()) {
-                self.finish_rebuild()?;
-            }
+        if self.rebuild.reading.as_ref().is_some_and(|r| r.channel == frame.channel) {
+            return self.read_rebuild(frame);
         }
         if frame.channel == self.events && frame.kind == 0 {
             self.event_carry.extend_from_slice(&frame.bytes);
@@ -432,6 +460,7 @@ impl Connection<'_> {
             match frame.kind {
                 0 => {
                     self.owner.heard.printed(frame.bytes.len());
+                    self.rebuild.main_heard = Some(Instant::now());
                     if let Some(output) = &self.output {
                         // 256 KiB starting credit bounds this queue. Credit is returned
                         // only as Rio consumes bytes, never when the network receives them.
@@ -446,9 +475,10 @@ impl Connection<'_> {
                     if let (Some(output), Some((cols, rows))) = (&self.output, resize_frame(&frame.bytes)) {
                         output.try_send(Chunk::Grid(cols, rows)).map_err(|_| Error::Capacity)?;
                         if self.rebuild.grid.replace((cols, rows)).is_some_and(|old| old != (cols, rows)) {
-                            self.rebuild.due = Some(Instant::now() + REBUILD_SETTLE);
-                            // A paint read before this resize is stale now.
+                            // A rebuild read before this resize is stale: dropped first, unused.
                             self.abort_rebuild()?;
+                            self.rebuild.due = Some(Instant::now() + REBUILD_SETTLE);
+                            self.rebuild.tries = 0;
                         }
                     }
                 }
@@ -1014,7 +1044,6 @@ impl Connection<'_> {
             commands: commands.clone(),
             channel,
             session: session_slot.clone(),
-            uncredited: 0,
         };
         let terminal_session = gpui_rio::Session::start(
             output,
@@ -1424,10 +1453,6 @@ enum Chunk {
     Data(Vec<u8>),
     /// The PTY's authoritative grid (a RESIZE frame).
     Grid(u16, u16),
-    /// Bytes the phone itself puts in the stream, in order with the core's
-    /// (a scrollback rebuilt from the core): parsed like DATA, but no credit
-    /// goes back to the core for them, since it never sent them on this channel.
-    Local(Vec<u8>),
 }
 struct StreamRead {
     rx: mpsc::Receiver<Chunk>,
@@ -1436,8 +1461,6 @@ struct StreamRead {
     channel: u32,
     /// The session this stream feeds, for in-order grid changes.
     session: Arc<Mutex<Weak<gpui_rio::Session>>>,
-    /// Bytes of a `Chunk::Local` still to hand out: credited to nobody.
-    uncredited: usize,
 }
 impl Read for StreamRead {
     /// A Grid item is reached only once every earlier byte was handed out
@@ -1453,10 +1476,6 @@ impl Read for StreamRead {
         while self.chunks.is_empty() {
             match self.rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(Chunk::Data(bytes)) => self.chunks.extend(bytes),
-                Ok(Chunk::Local(bytes)) => {
-                    self.uncredited = bytes.len();
-                    self.chunks.extend(bytes);
-                }
                 Ok(Chunk::Grid(cols, rows)) => {
                     if let Some(session) = lock(&self.session).upgrade() {
                         session.queue_grid(cols, rows);
@@ -1474,19 +1493,13 @@ impl Read for StreamRead {
                 .pop_front()
                 .ok_or(io::ErrorKind::UnexpectedEof)?;
         }
-        // The queue refills only when empty, so its bytes are all from one
-        // chunk: a Local one is handed out without crediting the core.
-        let local = n.min(self.uncredited);
-        self.uncredited -= local;
-        if n > local {
-            self.commands
-                .try_send(Operation::Frame(
-                    self.channel,
-                    1,
-                    ((n - local) as u32).to_le_bytes().to_vec(),
-                ))
-                .map_err(|_| io::ErrorKind::BrokenPipe)?;
-        }
+        self.commands
+            .try_send(Operation::Frame(
+                self.channel,
+                1,
+                (n as u32).to_le_bytes().to_vec(),
+            ))
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
         Ok(n)
     }
 }
@@ -1585,7 +1598,12 @@ pub(crate) fn run(
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
-    result
+    match result {
+        // Cancelled while waiting on the socket: the phone closed the session,
+        // which is how it ends normally, not a failure.
+        Err(Error::Closed) if owner.cancel.is_cancelled() => Ok(()),
+        result => result,
+    }
 }
 
 fn serve(
@@ -1632,6 +1650,12 @@ fn serve(
                 }
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
+                }
+                // Credit from the rebuild's observer terminal, as it parses.
+                Ok(Operation::Frame(channel, 1, bytes))
+                    if connection.rebuild.reading.as_ref().is_some_and(|r| r.channel == channel) =>
+                {
+                    write_frame(&mut connection.socket, channel, 1, &bytes)?
                 }
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
@@ -2850,7 +2874,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -2897,7 +2921,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -2919,7 +2943,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3039,11 +3063,11 @@ mod connection_tests {
     }
 
     /// A pane fed `chunks` in order, as one attach would deliver them.
-    fn painted(cols: u16, rows: u16, chunks: Vec<Vec<u8>>) -> Arc<gpui_rio::Session> {
+    pub(super) fn painted(cols: u16, rows: u16, chunks: Vec<Vec<u8>>) -> Arc<gpui_rio::Session> {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
@@ -3102,7 +3126,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(64);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 10).unwrap();
         *lock(&slot) = Arc::downgrade(&pane);
@@ -3120,35 +3144,171 @@ mod connection_tests {
         assert_eq!(shown, all);
     }
 
-    /// Bytes the phone puts in the stream itself (a rebuilt scrollback) are
-    /// parsed in order but never credited to the core, which did not send them.
+    /// A connection to a scripted peer whose pane `t1` shows `main` (fed as
+    /// this viewer's stream would be) and whose rebuild observer (channel 3)
+    /// is open at `main`'s grid. The peer's end of the socket is returned too.
+    fn rebuilding(owner: &Arc<Session>, main: &Arc<gpui_rio::Session>) -> (Connection<'static>, UnixStream) {
+        let (phone, peer) = UnixStream::pair().unwrap();
+        lock(&owner.state).terminal = Some(main.clone());
+        let (cols, rows) = main.grid_size();
+        // Leaked for the test's lifetime: Connection borrows its owner.
+        let owner: &'static Arc<Session> = Box::leak(Box::new(owner.clone()));
+        let reading = Reading::open(&owner.commands, 3, "t1".into(), cols, rows).unwrap();
+        let connection = Connection {
+            socket: phone, decoder: Decoder::default(), owner, serial: 0, channel: 2, output: None, events: 1,
+            event_carry: Vec::new(), dirty: false, negotiated: true, claim: Claim::default(),
+            rebuild: Rebuild { grid: Some((cols, rows)), reading: Some(reading), ..Rebuild::default() },
+        };
+        (connection, peer)
+    }
+
+    fn owner() -> Arc<Session> {
+        let (commands, operations) = mpsc::sync_channel(4096);
+        // The observer's credits land here; nobody needs them in these tests.
+        std::mem::forget(operations);
+        Arc::new(Session {
+            id: 999,
+            state: Mutex::new(State { view: json!({"pane_id":"t1"}), terminal: None, render_id: 0 }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// Lets the observer's terminal parse what it was fed, then finishes the
+    /// rebuild as the session loop would once both streams are quiet.
+    fn finish(connection: &mut Connection<'_>, main: &gpui_rio::Session) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !connection.rebuild.reading.as_ref().is_some_and(|r| main.same_screen(&r.terminal)) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        connection.try_finish_rebuild().unwrap()
+    }
+
+    fn numbered(from: usize, to: usize, width: usize) -> Vec<String> {
+        (from..to).map(|i| format!("line {i:03} {}", "x".repeat(width)).trim_end().to_owned()).collect()
+    }
+
+    /// Review #24 (t1yq) 1: the core splits a paint into 16 KiB frames sent
+    /// in turn with other channels; a heartbeat between two of them must not
+    /// end the paint early. The rebuild ends only once the observer shows the
+    /// same screen (its whole paint arrived).
     #[test]
-    fn local_bytes_are_read_in_order_but_never_credited() {
-        let (tx, rx) = mpsc::sync_channel(8);
-        let (commands, credits) = mpsc::sync_channel(64);
-        let mut stream = StreamRead { rx, chunks: VecDeque::new(), commands, channel: 9, session: Arc::new(Mutex::new(Weak::new())), uncredited: 0 };
-        tx.send(Chunk::Data(b"core-1".to_vec())).unwrap();
-        tx.send(Chunk::Local(b"phone".to_vec())).unwrap();
-        tx.send(Chunk::Data(b"core-22".to_vec())).unwrap();
-        drop(tx);
-        let mut read = Vec::new();
-        let mut buffer = [0u8; 4];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => read.extend_from_slice(&buffer[..n]),
-                Err(_) => {}
+    fn a_heartbeat_between_paint_fragments_keeps_all_rows() {
+        let history = numbered(0, 300, 70);
+        let screen = numbered(300, 304, 0);
+        let main = painted(100, 4, vec![core_paint(&[], &screen, 4)]);
+        let owner = owner();
+        let (mut connection, _peer) = rebuilding(&owner, &main);
+        let paint = core_paint(&history, &screen, 4);
+        assert!(paint.len() > 16 * 1024);
+        connection.deliver(Frame { channel: 3, kind: 0, bytes: paint[..16 * 1024].to_vec() }).unwrap();
+        connection.deliver(Frame { channel: 1, kind: 0, bytes: b"{\"method\":\"heartbeat\"}\n".to_vec() }).unwrap();
+        // Half a paint: the screens differ, so nothing is taken yet.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!connection.try_finish_rebuild().unwrap());
+        connection.deliver(Frame { channel: 3, kind: 0, bytes: paint[16 * 1024..].to_vec() }).unwrap();
+        assert!(finish(&mut connection, &main));
+        let shown: Vec<String> = all_rows(&main).into_iter().filter(|r| !r.is_empty()).collect();
+        assert_eq!(shown, history.iter().chain(&screen).cloned().collect::<Vec<_>>());
+    }
+
+    /// Review #24 2: live output reaches both the observer and this viewer;
+    /// the pane takes it from this viewer only, never replayed from the observer.
+    #[test]
+    fn live_output_on_both_channels_is_shown_once() {
+        let screen: Vec<String> = ["a", "b", "c", "d"].map(str::to_owned).into();
+        let main = painted(20, 4, vec![core_paint(&[], &screen, 4), b"\r\nnew".to_vec()]);
+        let owner = owner();
+        let (mut connection, _peer) = rebuilding(&owner, &main);
+        connection.deliver(Frame { channel: 3, kind: 0, bytes: core_paint(&[], &screen, 4) }).unwrap();
+        connection.deliver(Frame { channel: 3, kind: 0, bytes: b"\r\nnew".to_vec() }).unwrap();
+        assert!(finish(&mut connection, &main));
+        let shown = all_rows(&main);
+        assert_eq!(shown.iter().filter(|row| row.as_str() == "new").count(), 1, "{shown:?}");
+    }
+
+    /// Review #24 4: a RESIZE during a rebuild drops it first; nothing of the
+    /// stale observer is ever used, and its channel is detached.
+    #[test]
+    fn a_resize_drops_a_rebuild_in_flight_unused() {
+        let screen = numbered(30, 34, 0);
+        let main = painted(100, 4, vec![core_paint(&numbered(0, 30, 0), &screen, 4)]);
+        let before = all_rows(&main);
+        let owner = owner();
+        let (mut connection, mut peer) = rebuilding(&owner, &main);
+        let (tx, _rx) = mpsc::sync_channel(16);
+        connection.output = Some(tx);
+        connection.deliver(Frame { channel: 3, kind: 0, bytes: core_paint(&numbered(0, 50, 0), &screen, 4) }).unwrap();
+        connection.deliver(Frame { channel: 2, kind: RESIZE, bytes: size_bytes(100, 6) }).unwrap();
+        assert!(connection.rebuild.reading.is_none(), "dropped at the resize");
+        assert!(connection.rebuild.due.is_some(), "and due again once the new grid settles");
+        assert_eq!(all_rows(&main), before, "nothing of the stale observer was used");
+        assert!(detached(&mut peer).contains(&3));
+    }
+
+    /// Review #24 3: taking the core's history keeps a reader who scrolled
+    /// back where they were, not at the live output.
+    #[test]
+    fn a_rebuild_keeps_a_scrolled_back_view() {
+        let screen = numbered(30, 34, 0);
+        let main = painted(100, 4, vec![core_paint(&numbered(0, 30, 0), &screen, 4)]);
+        main.grid().lock().scroll_display(rio_vt::crosswords::grid::Scroll::Delta(10));
+        let shown_before = rows_at_offset(&main);
+        let owner = owner();
+        let (mut connection, _peer) = rebuilding(&owner, &main);
+        connection.deliver(Frame { channel: 3, kind: 0, bytes: core_paint(&numbered(0, 30, 0), &screen, 4) }).unwrap();
+        assert!(finish(&mut connection, &main));
+        assert_eq!(main.grid().lock().display_offset(), 10);
+        assert_eq!(rows_at_offset(&main), shown_before, "the same rows, not the live screen");
+    }
+
+    /// Review #24 5: leaving detaches the rebuild's observer as well as this viewer.
+    #[test]
+    fn release_detaches_the_observer_too() {
+        let main = painted(20, 4, vec![core_paint(&[], &numbered(0, 4, 0), 4)]);
+        let owner = owner();
+        let (mut connection, mut peer) = rebuilding(&owner, &main);
+        connection.release();
+        let channels = detached(&mut peer);
+        assert!(channels.contains(&3) && channels.contains(&2), "{channels:?}");
+        assert!(connection.rebuild.reading.is_none());
+    }
+
+    fn size_bytes(cols: u16, rows: u16) -> Vec<u8> {
+        let mut bytes = Vec::from(cols.to_le_bytes());
+        bytes.extend(rows.to_le_bytes());
+        bytes
+    }
+
+    /// The channels the peer has seen a DETACH for so far.
+    fn detached(peer: &mut UnixStream) -> Vec<u32> {
+        peer.set_nonblocking(true).unwrap();
+        let mut decoder = Decoder::default();
+        let mut bytes = [0; 4096];
+        while let Ok(n) = peer.read(&mut bytes) {
+            if n == 0 {
+                break;
+            }
+            decoder.bytes.extend_from_slice(&bytes[..n]);
+        }
+        let mut channels = Vec::new();
+        while let Some(frame) = decoder.next().unwrap() {
+            if frame.kind == DETACH {
+                channels.push(frame.channel);
             }
         }
-        assert_eq!(read, b"core-1phonecore-22");
-        let credited: u32 = credits
-            .try_iter()
-            .map(|op| match op {
-                Operation::Frame(9, 1, bytes) => u32::from_le_bytes(bytes.try_into().unwrap()),
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(credited, 13, "6 + 7 core bytes, none of the phone's 5");
+        channels
+    }
+
+    /// The rows on screen at the current scroll position, as drawn.
+    fn rows_at_offset(session: &gpui_rio::Session) -> Vec<String> {
+        session.screen_text().lines().map(str::to_owned).collect()
     }
 
     /// A saved copy read back (a switch, a close or a checkpoint wrote it).
@@ -3319,7 +3479,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
@@ -3348,7 +3508,7 @@ mod connection_tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
-        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone(), uncredited: 0 };
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
@@ -3493,9 +3653,13 @@ mod claim_tests {
                         };
                         let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
                         write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
-                        // An observer's first paint follows its reply, in one piece.
+                        // An observer's first paint follows its reply, cut as the core's
+                        // wire cuts it (16 KiB DATA frames), other channels in between.
                         if let Some(channel) = observer.take() {
-                            write_frame(&mut core, channel, 0, &script.observer_paint).unwrap();
+                            for piece in script.observer_paint.chunks(16 * 1024) {
+                                write_frame(&mut core, channel, 0, piece).unwrap();
+                                write_frame(&mut core, 1, 0, b"{\"method\":\"heartbeat\"}\n").unwrap();
+                            }
                         }
                     }
                 }
@@ -3657,25 +3821,28 @@ mod claim_tests {
     #[test]
     fn a_core_resize_rebuilds_the_scrollback_from_the_cores_history_once_per_burst() {
         use super::connection_tests::{all_rows, core_paint};
-        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
-        // The core's state after the burst settles at 20x8: the last 8 lines on
+        let all: Vec<String> = (0..350).map(|n| format!("line {n:03} {}", "x".repeat(70))).collect();
+        // The core's state after the burst settles at 100x8: the last 8 lines on
         // screen, and a history the phone's own bookkeeping cannot have made
-        // (its oldest row only the core still holds).
+        // (its oldest row only the core still holds). Over 16 KiB, so the mock
+        // core sends it in pieces with heartbeats in between.
         let mut core_history = vec!["only the core".to_owned()];
-        core_history.extend_from_slice(&all[..42]);
-        let script = Script { negotiate: Some((20, 10)), observer_paint: core_paint(&core_history, &all[42..], 8) };
+        core_history.extend_from_slice(&all[..342]);
+        let observer_paint = core_paint(&core_history, &all[342..], 8);
+        assert!(observer_paint.len() > 16 * 1024);
+        let script = Script { negotiate: Some((100, 10)), observer_paint };
         let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true, script);
         let Seen::Attach(first) = core.next() else { panic!("attach first") };
         assert!(first.get("observe").is_none());
-        core.measured(2, 20, 10);
-        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(20, 10)));
+        core.measured(2, 100, 10);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 10)));
         assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
-        // The first paint: 40 lines of history, 10 on screen.
-        core.push.send((2, 0, core_paint(&all[..40], &all[40..], 10))).unwrap();
+        // The first paint: 340 lines of history, 10 on screen.
+        core.push.send((2, 0, core_paint(&all[..340], &all[340..], 10))).unwrap();
         // A burst of resizes, each with the core's screen-only repaint. The
         // phone's own row bookkeeping need not match the core's.
         for rows in [6u16, 10, 8] {
-            core.push.send((2, RESIZE, size(20, rows))).unwrap();
+            core.push.send((2, RESIZE, size(100, rows))).unwrap();
             let at = all.len() - usize::from(rows);
             core.push.send((2, 0, core_paint(&[], &all[at..], usize::from(rows)))).unwrap();
             std::thread::sleep(Duration::from_millis(50));
@@ -3683,19 +3850,12 @@ mod claim_tests {
         // One observer attach for the burst, asking for the attach's history, then its DETACH.
         let Seen::Attach(observer) = core.next() else { panic!("observer attach") };
         assert_eq!((observer["observe"].as_bool(), observer["history"].as_u64()), (Some(true), Some(1000)));
-        assert_eq!((observer["cols"].as_u64(), observer["rows"].as_u64()), (Some(20), Some(8)));
+        assert_eq!((observer["cols"].as_u64(), observer["rows"].as_u64()), (Some(100), Some(8)));
         assert_eq!(core.next(), Seen::Frame(3, DETACH, Vec::new()));
         core.quiet(Duration::from_millis(700));
         let terminal = lock(&core.owner.state).terminal.clone().unwrap();
-        let expected: Vec<String> = core_history.iter().chain(&all[42..]).cloned().collect();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let shown = loop {
-            let shown: Vec<String> = all_rows(&terminal).into_iter().filter(|r| !r.is_empty()).collect();
-            if shown == expected || Instant::now() > deadline {
-                break shown;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let expected: Vec<String> = core_history.iter().chain(&all[342..]).cloned().collect();
+        let shown: Vec<String> = all_rows(&terminal).into_iter().filter(|r| !r.is_empty()).collect();
         assert_eq!(shown, expected, "the scrollback is the core's: every line once, in order");
         core.close();
     }

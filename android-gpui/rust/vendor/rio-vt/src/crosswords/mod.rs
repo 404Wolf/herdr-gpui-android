@@ -566,6 +566,22 @@ impl<U: EventListener> Crosswords<U> {
         self.erase_scrolls_into_history = scrolls;
     }
 
+    /// Takes `from`'s main-screen scrollback as this terminal's, keeping this
+    /// screen, its cursor, modes and scroll position (see
+    /// [`Grid::replace_history_from`]). False, with nothing changed, while
+    /// either is on the alternate screen or their widths differ.
+    pub fn replace_history_from<V: EventListener>(&mut self, from: &Crosswords<V>) -> bool {
+        if self.mode.contains(Mode::ALT_SCREEN) || from.mode.contains(Mode::ALT_SCREEN) {
+            return false;
+        }
+        if !self.grid.replace_history_from(&from.grid) {
+            return false;
+        }
+        self.selection = None;
+        self.mark_fully_damaged();
+        true
+    }
+
     pub fn mark_fully_damaged(&mut self) {
         // Only emit event if we weren't already fully damaged
         let was_damaged = self.damage.full;
@@ -8351,6 +8367,43 @@ mod tests {
         cw.erase_chars(Column(1)); // blank the lead; sweep repairs the spacer
         assert_eq!(cw.grid[Line(0)][Column(3)].wide(), Wide::Narrow);
         assert!(cw.grid[Line(0)][Column(3)].wrapline());
+    }
+
+    /// Taking another terminal's history keeps this screen and the reader's
+    /// scroll position, and history cells keep their look: styles (and
+    /// extras) are interned again into this terminal's own tables.
+    #[test]
+    fn replace_history_from_takes_rows_and_styles_and_keeps_screen_and_offset() {
+        use crate::performer::handler::Processor;
+        let mut source = new_term(10, 2);
+        let mut target = new_term(10, 2);
+        let mut parser = Processor::default();
+        // The target has its own styles first, so the ids differ between the two.
+        parser.advance(&mut target, b"\x1b[32mmine0\r\n\x1b[0mmine1\r\nmine2\r\nscreenA\r\nscreenB");
+        parser.advance(&mut source, b"\x1b[31;1mred0\x1b[0m\r\n\x1b[4mund1\x1b[0m\r\nplain2\r\nscreenA\r\nscreenB");
+        target.scroll_display(Scroll::Delta(1));
+        assert!(target.replace_history_from(&source));
+        assert_eq!(target.history_size(), source.history_size());
+        assert_eq!(target.display_offset(), 1, "the reader stays where they were");
+        let text = |cw: &Crosswords<VoidListener>, line: i32| -> String {
+            (0..cw.columns()).map(|c| cw.grid[Line(line)][Column(c)].c()).filter(|c| *c != '\0' && *c != ' ').collect()
+        };
+        let history = source.history_size() as i32;
+        for line in -history..2 {
+            assert_eq!(text(&target, line), text(&source, line), "row {line}");
+        }
+        for line in -history..0 {
+            for col in 0..4 {
+                let a = target.grid.style_of(&target.grid[Line(line)][Column(col)]);
+                let b = source.grid.style_of(&source.grid[Line(line)][Column(col)]);
+                assert_eq!(a, b, "style at row {line} col {col}");
+            }
+        }
+        // Not across widths, nor on the alternate screen.
+        let mut wide = new_term(12, 2);
+        assert!(!wide.replace_history_from(&source));
+        parser.advance(&mut target, b"\x1b[?1049h");
+        assert!(!target.replace_history_from(&source));
     }
 
     /// ED 2 scrolls the main screen into history by default; an embedder

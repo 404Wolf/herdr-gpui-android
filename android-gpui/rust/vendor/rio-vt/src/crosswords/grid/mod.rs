@@ -603,6 +603,49 @@ use crate::crosswords::square::Square;
 use crate::crosswords::style::{Style, StyleId};
 
 impl Grid<Square> {
+    /// Replaces this grid's scrollback with `from`'s, keeping this grid's
+    /// screen, cursor and scroll position. `from` must have as many columns.
+    /// Cells keep their look: their styles and extras (zero-width characters,
+    /// hyperlinks) are interned again into this grid's own tables, since ids
+    /// are per grid. An embedder mirroring another terminal uses it to take
+    /// that terminal's history as authoritative. False (nothing changed)
+    /// when the column counts differ.
+    pub fn replace_history_from(&mut self, from: &Grid<Square>) -> bool {
+        if from.columns != self.columns {
+            return false;
+        }
+        let keep = std::cmp::min(from.history_size(), self.max_scroll_limit);
+        let mut styles: rustc_hash::FxHashMap<StyleId, StyleId> = rustc_hash::FxHashMap::default();
+        let mut rows = Vec::with_capacity(self.lines + keep);
+        // Storage order: the bottom screen row first, then up through history.
+        for line in (0..self.lines as i32).rev() {
+            rows.push(self.raw[Line(line)].clone());
+        }
+        for back in 1..=keep as i32 {
+            let mut row = from.raw[Line(-back)].clone();
+            for cell in row.inner.iter_mut() {
+                if let Some(id) = cell.style_id_checked() {
+                    if id != 0 {
+                        // Interned without the sweep: ids handed out here are
+                        // not referenced by any row yet, so a sweep would free them.
+                        let ours = *styles
+                            .entry(id)
+                            .or_insert_with(|| self.style_set.intern(from.style_set.get(id)));
+                        cell.set_style_id(ours);
+                    }
+                }
+                if let Some(id) = cell.extras_id_checked() {
+                    let ours = from.extras_table.get(id).cloned().map_or(0, |extras| self.extras_table.alloc(extras));
+                    cell.set_extras_id((ours != 0).then_some(ours));
+                }
+            }
+            rows.push(row);
+        }
+        self.raw.replace_inner(rows);
+        self.display_offset = std::cmp::min(self.display_offset, self.history_size());
+        true
+    }
+
     /// The full text of the cell at `pos`: its base character followed by any
     /// zero-width marks (combining accents, ZWJ joiners, variation selectors).
     ///
