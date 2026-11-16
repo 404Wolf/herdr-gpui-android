@@ -52,8 +52,8 @@ final class ClipStore {
 
         /** Uploads the desktop took and then failed to finish (slow, unavailable, cut off). */
         final int attempts;
-        /** Given up on after {@link #MAX_ATTEMPTS}: kept and shown, sent again only by hand. */
-        final boolean parked;
+        /** Parked by the courier (an explicit mark; {@link #parked()} is what counts). */
+        final boolean parkedFlag;
 
         Entry(PendingClip clip, long bytes, String text, long keptUntil) {
             this(clip, bytes, text, keptUntil, 0, false);
@@ -65,11 +65,19 @@ final class ClipStore {
             this.text = text;
             this.keptUntil = keptUntil;
             this.attempts = attempts;
-            this.parked = parked;
+            this.parkedFlag = parked;
         }
 
         boolean kept() {
             return keptUntil != 0;
+        }
+
+        /**
+         * Given up on: kept and shown, sent again only by hand. Derived from the durable count, so
+         * a kill right after the last charge (before the mark was written) still stops a send.
+         */
+        boolean parked() {
+            return parkedFlag || attempts >= MAX_ATTEMPTS;
         }
     }
 
@@ -280,14 +288,14 @@ final class ClipStore {
     /** The clips still waiting for the desktop, oldest first (parked and kept ones not). */
     synchronized List<PendingClip> untranscribed() {
         List<PendingClip> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text == null && !e.kept() && !e.parked) out.add(e.clip);
+        for (Entry e : entries) if (e.text == null && !e.kept() && !e.parked()) out.add(e.clip);
         return out;
     }
 
     /** Clips given up on after {@link #MAX_ATTEMPTS} uploads, oldest first: sent again only by hand. */
     synchronized List<PendingClip> parked() {
         List<PendingClip> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text == null && !e.kept() && e.parked) out.add(e.clip);
+        for (Entry e : entries) if (e.text == null && !e.kept() && e.parked()) out.add(e.clip);
         return out;
     }
 
@@ -311,7 +319,8 @@ final class ClipStore {
             Entry e = entries.get(i);
             if (!e.clip.id.equals(id) || e.text != null) continue;
             int n = e.attempts + 1;
-            entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, e.parked));
+            if (e.parked()) return -1; // the cap: never a send past it
+            entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, e.parkedFlag));
             if (!save()) {
                 entries.set(i, e);
                 return -1;
@@ -326,7 +335,7 @@ final class ClipStore {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
             if (!e.clip.id.equals(id) || e.attempts == 0) continue;
-            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts - 1, e.parked));
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts - 1, e.parkedFlag));
             // A refund that is not written leaves the count high: the safe side.
             save();
             return;
@@ -337,7 +346,7 @@ final class ClipStore {
     synchronized void park(String id) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
-            if (!e.clip.id.equals(id) || e.parked) continue;
+            if (!e.clip.id.equals(id) || e.parkedFlag) continue;
             entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts, true));
             save();
             return;
@@ -354,7 +363,7 @@ final class ClipStore {
     synchronized boolean unpark(String id) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
-            if (!e.clip.id.equals(id) || !e.parked) continue;
+            if (!e.clip.id.equals(id) || !e.parked()) continue;
             entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, 0, false));
             return save();
         }
@@ -484,7 +493,7 @@ final class ClipStore {
                 o.put("text", e.text == null ? JSONObject.NULL : e.text);
                 if (e.kept()) o.put("keptUntil", e.keptUntil);
                 if (e.attempts > 0) o.put("attempts", e.attempts);
-                if (e.parked) o.put("parked", true);
+                if (e.parkedFlag) o.put("parked", true);
                 list.put(o);
             }
             write(new File(dir, INDEX), list.toString());

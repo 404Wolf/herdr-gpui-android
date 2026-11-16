@@ -201,6 +201,44 @@ public final class CourierDegradedTest {
         assertTrue(store.untranscribed().isEmpty());
     }
 
+    @Test public void aKillRightAfterTheThirdChargeStillStopsAFourthUpload() {
+        ClipStore store = store();
+        PendingClip clip = record(store, "pane", LONG_CLIP_BYTES);
+        int[] sends = {0};
+        PendingDictations first = new PendingDictations(store, (c, file) -> {
+            sends[0]++;
+            if (sends[0] < 3) throw slow();
+            // The third upload is charged on disk; the app is killed before its answer.
+            throw new IllegalStateException("killed");
+        }, worker, Runnable::run, line -> { }, now::get);
+        first.saved();
+        try {
+            worker.advance(2 * 60 * 60 * 1000);
+        } catch (IllegalStateException killed) {
+            // the process died
+        }
+        assertEquals(3, sends[0]);
+        // A new process: the count on disk is 3, with no parked mark written. That is the cap.
+        ClipStore restarted = store();
+        assertEquals(ClipStore.MAX_ATTEMPTS, restarted.attempts(clip.id));
+        assertEquals(1, restarted.parked().size());
+        assertTrue(restarted.untranscribed().isEmpty());
+        assertEquals("no charge past the cap", -1, restarted.charge(clip.id));
+        PendingDictations second = new PendingDictations(restarted, (c, file) -> {
+            sends[0]++;
+            return "a fourth upload";
+        }, worker, Runnable::run, line -> { }, now::get);
+        second.desktopReady(true);
+        second.kick(0);
+        worker.advance(60 * 60 * 1000);
+        assertEquals("never a fourth upload on its own", 3, sends[0]);
+        assertTrue(restarted.audio(clip.id).isFile());
+        // By hand it goes.
+        second.retry(clip.id);
+        worker.advance(0);
+        assertEquals(4, sends[0]);
+    }
+
     @Test public void aParkedClipIsSentAgainOnlyByHand() {
         ClipStore store = store();
         PendingClip clip = record(store, "pane", 10);
