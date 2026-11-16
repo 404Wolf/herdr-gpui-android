@@ -415,10 +415,21 @@ public final class ServerDictationEngine implements DictationEngine {
                 return;
             }
             end();
-            PendingClip kept = recording.keepTranscribedOnPhone();
-            log.accept("dictation: the phone's final " + (System.nanoTime() - stoppedAt) / 1_000_000
-                    + " ms after stop, recording " + (kept != null ? "kept" : "not saved"));
+            // The text is handed over first; only once it is stored is the recording kept as
+            // rescue audio (48 h). Not stored, the recording stays a parked clip with no expiry
+            // ("not transcribed yet · retry"), as on the desktop path.
             listener.onFinal(text, true);
+            boolean stored = listener.finalStored();
+            PendingClip kept;
+            if (stored) {
+                kept = recording.keepTranscribedOnPhone();
+            } else {
+                kept = recording.keepParked();
+                pending.saved();
+            }
+            log.accept("dictation: the phone's final " + (System.nanoTime() - stoppedAt) / 1_000_000
+                    + " ms after stop, " + (stored ? "stored" : "text not stored")
+                    + ", recording " + (kept == null ? "not saved" : stored ? "kept 48 h" : "parked"));
             listener.onState(State.IDLE);
         }
 
@@ -610,9 +621,9 @@ public final class ServerDictationEngine implements DictationEngine {
                             // only then is the recording deleted: a crash in between keeps the
                             // audio, recovered at the next start.
                             listener.onFinal(text, false);
-                            listener.onState(State.IDLE);
                             keepAfterFinal = !listener.finalStored();
                             if (micDone) settleRecording();
+                            listener.onState(State.IDLE);
                         });
                         return;
                     } else if (type.equals("error")) {

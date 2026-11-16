@@ -273,6 +273,33 @@ public final class ServerDictationEngineTest {
         assertEquals(1, later.parked().size());
     }
 
+    @Test public void aPhoneFinalWhoseTextCouldNotBeStoredIsParkedNeverExpiring() throws Exception {
+        // The desktop is on its CPU: the phone transcribes; its text cannot be saved.
+        server = new FakeServer(Behaviour.fast(READY_CPU));
+        Run run = new Run();
+        run.listener.stores = false;
+        dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300, run);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(PHONE_WORDS, run.listener.finalText);
+        assertTrue(run.listener.onDevice);
+        assertTrue("not rescue audio that expires", store.keptClips().isEmpty());
+        assertEquals(1, store.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.parked().get(0).id).toPath()));
+        ClipStore later = new ClipStore(new File(dir.getRoot(), "pending"),
+                () -> System.currentTimeMillis() + 3 * ClipStore.KEEP_MS);
+        assertEquals("still there 3 x 48 h later", 1, later.parked().size());
+    }
+
+    @Test public void aStoredPhoneFinalKeepsItsRecordingAsRescueAudio() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_CPU));
+        Run run = dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(1, store.keptClips().size());
+        assertTrue(store.parked().isEmpty());
+    }
+
     @Test public void aCrashWhileStoringTheFinalKeepsTheAudioForTheNextStart() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU));
         Run run = new Run();
