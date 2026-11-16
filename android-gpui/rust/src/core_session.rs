@@ -126,7 +126,7 @@ struct Focus {
     on: bool,
     /// When the last WINDOW_FOCUS 1 went.
     sent_at: Option<Instant>,
-    /// The phone's use count (`remote::USE`) last looked at.
+    /// The phone's use count (`Session::uses`) last looked at.
     uses: u64,
     /// The attached terminal's typed inputs last looked at: typing (a key,
     /// the raw keyboard, a paste) is a use too.
@@ -214,15 +214,19 @@ impl Connection<'_> {
     /// and sent once it is; a use while hidden is not Wolf using this pane.
     /// Hidden before ever being shown, a focused attach is unfocused.
     fn sync_focus(&mut self) -> Result<()> {
+        // Only a session with a core that has the rule reports or records uses.
+        if !self.focus.offered {
+            return Ok(());
+        }
         let typed = lock(&self.owner.state).terminal.as_ref().map(|t| t.inputs());
         if let Some(typed) = typed.filter(|typed| *typed != self.focus.typed) {
             self.focus.typed = typed;
-            crate::remote::USE.mark();
+            self.owner.uses.mark();
         }
         if !self.focus.frames || self.channel == 0 {
             return Ok(());
         }
-        let uses = crate::remote::USE.count();
+        let uses = self.owner.uses.count();
         if !self.wants_visible() {
             self.focus.uses = uses;
             // VISIBILITY 0 unfocuses a shown pane (sync_claim); this one never was.
@@ -1047,8 +1051,8 @@ impl Connection<'_> {
         let focus = self
             .focus
             .offered
-            .then(|| (self.wants_visible(), crate::remote::USE.idle_ms()));
-        let uses = crate::remote::USE.count();
+            .then(|| (self.wants_visible(), self.owner.uses.idle_ms()));
+        let uses = self.owner.uses.count();
         let mut params = attach_params(terminal, cols, rows, self.claim.offered, focus);
         if self.history_on_resize {
             params["resize_history"] = json!(RESIZE_HISTORY);
@@ -2876,7 +2880,6 @@ mod connection_tests {
     use crate::remote::State;
     use herdr_remote_transport::CancellationToken;
     use std::collections::HashMap;
-    use std::io::BufRead;
     use std::sync::Mutex;
 
     fn frame(socket: &mut UnixStream, decoder: &mut Decoder) -> Frame {
@@ -2917,15 +2920,14 @@ mod connection_tests {
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
         let (observed, events) = mpsc::sync_channel(2);
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
-            io::BufReader::new(core.try_clone().unwrap())
-                .read_line(&mut hello)
-                .unwrap();
+            read_hello(&core, &mut hello);
             let hello: Value = serde_json::from_str(&hello).unwrap();
             assert_eq!(hello["method"], "hello");
             assert_eq!(hello["params"], json!({"framed":true,"generation":1}));
@@ -3019,6 +3021,7 @@ mod connection_tests {
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -3123,6 +3126,7 @@ mod connection_tests {
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -3986,10 +3990,24 @@ mod claim_tests {
         /// `features` is what hello advertises; `confirm` is whether the
         /// attach reply confirms VISIBILITY frames when asked for them.
         fn start(features: Value, confirm: bool, visible: bool, active: bool) -> Self {
-            Self::scripted(features, confirm, visible, active, Script::default())
+            Self::start_with(features, confirm, visible, active, false)
+        }
+
+        /// As `start`; `used`: Wolf used the phone just before the session began.
+        fn start_with(features: Value, confirm: bool, visible: bool, active: bool, used: bool) -> Self {
+            Self::begin(features, confirm, visible, active, Script::default(), used)
         }
 
         fn scripted(features: Value, confirm: bool, visible: bool, active: bool, script: Script) -> Self {
+            Self::begin(features, confirm, visible, active, script, false)
+        }
+
+        /// Each mock session reads its own record of use, so no test sees another's typing.
+        fn begin(features: Value, confirm: bool, visible: bool, active: bool, script: Script, used: bool) -> Self {
+            let uses: &'static crate::remote::LastUse = Box::leak(Box::new(crate::remote::LastUse::new()));
+            if used {
+                uses.mark();
+            }
             let (phone, mut core) = UnixStream::pair().unwrap();
             core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             let (commands, rx) = mpsc::sync_channel(256);
@@ -4005,6 +4023,7 @@ mod claim_tests {
                 focus: Mutex::new(None),
                 heard: crate::remote::Heard::default(),
                 visible: AtomicBool::new(visible),
+                uses,
             });
             let worker = owner.clone();
             let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
@@ -4209,6 +4228,9 @@ mod claim_tests {
         seen.push(core.next());
         assert!(terminal.type_text("ls"));
         seen.push(core.next());
+        // A core without the focus rule: typing is no use this session records.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(core.owner.uses.count(), 0, "uses recorded without focus_by_use");
         core.close();
         seen
     }
@@ -4230,19 +4252,12 @@ mod claim_tests {
         assert_eq!(seen[2], Seen::Frame(2, DATA, b"ls".to_vec()));
     }
 
-    /// The phone's uses are process-wide: tests that count them run one at a time.
-    pub(super) fn focus_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        lock(&LOCK)
-    }
-
     const FOCUS_CORE: [&str; 3] = ["viewer_visibility", "viewer_focus", "focus_by_use"];
 
     #[test]
     fn a_focus_core_hears_each_use_at_most_once_a_second_and_a_zero_before_hiding() {
-        let _serial = focus_test_lock();
-        crate::remote::used();
-        let core = Mock::start(json!(FOCUS_CORE), true, true, true);
+        // Wolf used the phone just before the attach.
+        let core = Mock::start_with(json!(FOCUS_CORE), true, true, true, true);
         let Seen::Attach(params) = core.next() else { panic!("attach first") };
         assert_eq!(params["focus_updates"], true);
         assert_eq!(params["focused"], true, "Herdr in front, showing the pane");
@@ -4253,21 +4268,21 @@ mod claim_tests {
         // The attach said it all: no WINDOW_FOCUS until Wolf does something.
         core.quiet(Duration::from_millis(300));
 
-        crate::remote::used();
+        core.owner.uses.mark();
         assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
         // Leading edge: more uses within the second add nothing.
-        crate::remote::used();
-        crate::remote::used();
+        core.owner.uses.mark();
+        core.owner.uses.mark();
         core.quiet(Duration::from_millis(400));
         std::thread::sleep(FOCUS_EVERY);
-        crate::remote::used();
+        core.owner.uses.mark();
         assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
 
         // Hidden: 0 first, then VISIBILITY 0; uses while hidden say nothing.
         core.set_visible(false);
         assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![0]));
         assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![0]));
-        crate::remote::used();
+        core.owner.uses.mark();
         core.quiet(Duration::from_millis(300));
 
         // Shown again (a resume): sized, visible, then focused.
@@ -4287,8 +4302,37 @@ mod claim_tests {
     }
 
     #[test]
+    fn an_unfocused_attach_still_says_how_long_ago_the_phone_was_used() {
+        // t1x1 (core #94): idle_ms dates an unfocused attach's history too.
+        let core = Mock::start_with(json!(FOCUS_CORE), true, false, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["focus_updates"], true);
+        assert_eq!(params["focused"], false, "Herdr is not showing it");
+        assert!(params["idle_ms"].as_u64().unwrap() < 5_000);
+        core.owner.uses.mark();
+        core.quiet(Duration::from_millis(300));
+        core.close();
+    }
+
+    #[test]
+    fn typing_on_a_focus_core_is_a_use_and_says_so() {
+        let core = Mock::start(json!(FOCUS_CORE), true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        assert!(core.terminal().type_text("ls"));
+        let mut seen = vec![core.next(), core.next()];
+        seen.sort_by_key(|seen| matches!(seen, Seen::Frame(_, WINDOW_FOCUS, _)));
+        assert_eq!(
+            seen,
+            vec![Seen::Frame(2, DATA, b"ls".to_vec()), Seen::Frame(2, WINDOW_FOCUS, vec![1])]
+        );
+        assert_eq!(core.owner.uses.count(), 1);
+        core.close();
+    }
+
+    #[test]
     fn leaving_a_pane_for_another_unfocuses_it_first() {
-        let _serial = focus_test_lock();
         let _departed = crate::remote::departed_test_lock();
         let core = Mock::start(json!(FOCUS_CORE), true, true, true);
         assert!(matches!(core.next(), Seen::Attach(_)));
@@ -4305,7 +4349,6 @@ mod claim_tests {
 
     #[test]
     fn a_core_without_focus_by_use_is_never_asked_or_told() {
-        let _serial = focus_test_lock();
         for features in [json!(["viewer_visibility", "viewer_focus"]), json!(["viewer_visibility"])] {
             let core = Mock::start(features, true, true, true);
             let Seen::Attach(params) = core.next() else { panic!("attach first") };
@@ -4314,7 +4357,7 @@ mod claim_tests {
             }
             assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
             assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
-            crate::remote::used();
+            core.owner.uses.mark();
             core.quiet(Duration::from_millis(300));
             assert_eq!(
                 core.close(),
@@ -4325,19 +4368,17 @@ mod claim_tests {
 
     #[test]
     fn a_path_that_does_not_confirm_focus_gets_no_focus_frames() {
-        let _serial = focus_test_lock();
         // Asked, not confirmed (an older relay on the way): nothing is sent.
         let core = Mock::start(json!(FOCUS_CORE), false, true, true);
         let Seen::Attach(params) = core.next() else { panic!("attach first") };
         assert_eq!(params["focus_updates"], true);
-        crate::remote::used();
+        core.owner.uses.mark();
         core.quiet(Duration::from_millis(1300));
         assert!(core.close().iter().all(|seen| !matches!(seen, Seen::Frame(_, WINDOW_FOCUS, _))));
     }
 
     #[test]
     fn an_owner_that_does_not_apply_the_rule_gets_no_focus_frames() {
-        let _serial = focus_test_lock();
         // focus_updates confirmed, focus_by_use absent from the reply (an owner
         // or hop without the rule; "no_rule" makes the mock leave it out).
         let core = Mock::start(json!(["viewer_visibility", "viewer_focus", "focus_by_use", "no_rule"]), true, true, true);
@@ -4345,7 +4386,7 @@ mod claim_tests {
         assert_eq!(params["focus_updates"], true);
         assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
         assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
-        crate::remote::used();
+        core.owner.uses.mark();
         core.quiet(Duration::from_millis(300));
         assert_eq!(
             core.close(),
@@ -4890,6 +4931,7 @@ mod focus_review_tests {
             focus: Mutex::new(None),
             heard: Heard::default(),
             visible: AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         })
     }
 
@@ -4924,7 +4966,7 @@ mod focus_review_tests {
                 offered: true,
                 frames: true,
                 on: true,
-                uses: crate::remote::USE.count(),
+                uses: owner.uses.count(),
                 ..Focus::default()
             },
         };
@@ -4945,10 +4987,9 @@ mod focus_review_tests {
 
     #[test]
     fn a_touch_while_waiting_for_size_is_reported_when_the_pane_is_shown() {
-        let _serial = claim_tests::focus_test_lock();
         let owner = owner();
         let (mut connection, mut peer) = awaiting_measurement(&owner);
-        crate::remote::used();
+        owner.uses.mark();
         connection.sync_focus().unwrap();
         assert!(frames(&mut peer).is_empty());
         connection.resize(90, 40).unwrap();
@@ -4964,7 +5005,6 @@ mod focus_review_tests {
 
     #[test]
     fn an_untouched_reconnect_is_shown_without_a_focus_frame() {
-        let _serial = claim_tests::focus_test_lock();
         let owner = owner();
         let (mut connection, mut peer) = awaiting_measurement(&owner);
         connection.resize(90, 40).unwrap();
@@ -4976,7 +5016,6 @@ mod focus_review_tests {
 
     #[test]
     fn hiding_before_first_measurement_unfocuses_the_focused_attach() {
-        let _serial = claim_tests::focus_test_lock();
         let owner = owner();
         let (mut connection, mut peer) = awaiting_measurement(&owner);
         owner.visible.store(false, Ordering::Relaxed);
@@ -4991,7 +5030,6 @@ mod focus_review_tests {
 
     #[test]
     fn first_use_after_hide_bypasses_the_existing_rate_limit() {
-        let _serial = claim_tests::focus_test_lock();
         let owner = owner();
         let (mut connection, mut peer) = awaiting_measurement(&owner);
         connection.claim.shown = true;
@@ -5005,7 +5043,7 @@ mod focus_review_tests {
         owner.visible.store(true, Ordering::Relaxed);
         connection.resize(90, 40).unwrap();
         connection.sync_claim(90, 40).unwrap();
-        crate::remote::used();
+        owner.uses.mark();
         connection.sync_focus().unwrap();
         let frames = frames(&mut peer);
         assert_eq!(frames.last(), Some(&(2, WINDOW_FOCUS, vec![1])));

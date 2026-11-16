@@ -218,6 +218,11 @@ pub(crate) struct Session {
     /// Whether the phone shows this session: only a visible viewer may size
     /// the pane's grid (core_session's `Claim`).
     pub(crate) visible: std::sync::atomic::AtomicBool,
+    /// Wolf's uses of the phone this session reports (item 71): the phone's
+    /// own [`USE`], which every session shares, since one person holds one
+    /// phone (a host switched to just now was just used). Tests give each
+    /// session its own.
+    pub(crate) uses: &'static LastUse,
 }
 
 /// The last time bytes arrived, lock-free: the socket loop marks it on every
@@ -329,6 +334,7 @@ pub fn connect_credentials_grid(
         focus: Mutex::new(None),
         heard: Heard::default(),
         visible: std::sync::atomic::AtomicBool::new(true),
+        uses: &USE,
     });
     let worker = owner.clone();
     std::thread::Builder::new()
