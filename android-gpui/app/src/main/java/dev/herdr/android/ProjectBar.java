@@ -53,6 +53,24 @@ final class ProjectBar {
         return out;
     }
 
+    /**
+     * Window {@code from} let go with its centre at {@code centre}, the
+     * window chips' centres being {@code centres} (bar coordinates): it lands
+     * before or after the nearest other window, never before the lead.
+     * null: nowhere to go, or where it already is.
+     */
+    static ProjectModel.WindowMove dropMove(ProjectModel.Project p, int from, float centre, float[] centres) {
+        if (p == null || centres == null || centres.length != p.windows.size()) return null;
+        int first = !p.windows.isEmpty() && p.windows.get(0) == p.lead ? 1 : 0;
+        int to = -1;
+        for (int i = first; i < centres.length; i++) {
+            if (i == from) continue;
+            if (to < 0 || Math.abs(centres[i] - centre) < Math.abs(centres[to] - centre)) to = i;
+        }
+        if (to < 0) return null;
+        return ProjectModel.windowMove(p, from, to, centre > centres[to]);
+    }
+
     /** The project chip: "[name]"; the waiting count is drawn beside it. */
     static String projectText(ProjectModel.Project p) {
         return "[" + (p == null ? "-" : p.name) + "]";

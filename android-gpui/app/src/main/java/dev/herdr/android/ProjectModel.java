@@ -447,6 +447,7 @@ final class ProjectModel {
      * that is gone is skipped.
      */
     static Groups groups(List<Project> all, Map<String, GitName> git, Map<String, String> repoLabels, JSONObject order) {
+        ordered(all, order);
         List<Project> list = new ArrayList<>(all);
         Collections.sort(list, (a, b) -> {
             int ra = a.deacon ? 0 : a.key.startsWith("pm:") ? 1 : 2, rb = b.deacon ? 0 : b.key.startsWith("pm:") ? 1 : 2;
@@ -471,9 +472,6 @@ final class ProjectModel {
         });
         repos = orderBy(repos, order == null ? null : strings(order.optJSONArray("repos")), g -> g.name, null);
         if (!none.projects.isEmpty()) repos.add(none);
-        Map<String, Integer> sameName = new HashMap<>();
-        for (Project p : list) sameName.merge(p.name, 1, Integer::sum);
-        for (Project p : list) p.orderId = orderId(p.name, sameName.get(p.name) > 1 ? localId(p) : null);
         JSONObject byRepo = order == null ? null : order.optJSONObject("projects");
         for (Repo g : repos) {
             List<Project> ordered = new ArrayList<>(orderBy(g.projects,
@@ -482,6 +480,120 @@ final class ProjectModel {
             g.projects.clear();
             g.projects.addAll(ordered);
             out.repos.add(g);
+        }
+        return out;
+    }
+
+    /**
+     * Wolf's own orders applied to {@code all} (model.js repoGroups' part that
+     * every surface reads): each project's id in projects.order (its name,
+     * "name#lead" when two leads share it), and its windows in the order kept
+     * under it (item 79; the plain name's list when the id has none), the lead
+     * first. Returns {@code all}.
+     */
+    static List<Project> ordered(List<Project> all, JSONObject order) {
+        Map<String, Integer> sameName = new HashMap<>();
+        for (Project p : all) sameName.merge(p.name, 1, Integer::sum);
+        JSONObject windows = order == null ? null : order.optJSONObject("windows");
+        for (Project p : all) {
+            p.orderId = orderId(p.name, sameName.get(p.name) > 1 ? localId(p) : null);
+            JSONArray ids = windows == null ? null : windows.optJSONArray(p.orderId);
+            if (ids == null && windows != null) ids = windows.optJSONArray(orderId(p.name, null));
+            orderWindows(p, strings(ids));
+        }
+        return all;
+    }
+
+    /**
+     * A window's id in the order (model.js windowId, one computer): its
+     * terminal's address, or "tab:<id>" for a tab with nothing running.
+     */
+    static String windowId(Window w) {
+        if (w == null) return null;
+        if (w.terminal != null) return w.terminal;
+        return w.tab != null && !w.tab.isEmpty() ? "tab:" + w.tab : null;
+    }
+
+    /**
+     * A project's windows in Wolf's order (model.js orderWindows, item 79):
+     * window 1 stays the lead; the others as listed, then the ones not listed
+     * (new windows) in their own order. Renumbers. Never by focus or clicks.
+     */
+    static Project orderWindows(Project p, List<String> ids) {
+        if (ids == null || ids.isEmpty() || p.windows.isEmpty()) return p;
+        boolean leadFirst = p.windows.get(0) == p.lead;
+        List<Window> rest = new ArrayList<>(p.windows.subList(leadFirst ? 1 : 0, p.windows.size()));
+        List<Window> sorted = orderBy(rest, ids, ProjectModel::windowId, null);
+        p.windows.subList(leadFirst ? 1 : 0, p.windows.size()).clear();
+        p.windows.addAll(sorted);
+        for (int i = 0; i < p.windows.size(); i++) p.windows.get(i).n = i + 1;
+        return p;
+    }
+
+    /** A window move for projects.order (item 79): ids, and the project's windows after its lead as shown. */
+    static final class WindowMove {
+        final String project, id, target;
+        final boolean after;
+        final List<String> shown;
+        WindowMove(String project, String id, String target, boolean after, List<String> shown) {
+            this.project = project;
+            this.id = id;
+            this.target = target;
+            this.after = after;
+            this.shown = shown;
+        }
+    }
+
+    /**
+     * Window {@code from} dropped just before (or {@code after}) window
+     * {@code to} of {@code p}: the move to store, or null when nothing moves.
+     * The lead neither moves nor is passed: window 1 stays the lead.
+     */
+    static WindowMove windowMove(Project p, int from, int to, boolean after) {
+        if (p == null || from == to) return null;
+        int first = !p.windows.isEmpty() && p.windows.get(0) == p.lead ? 1 : 0;
+        if (from < first || to < first || from >= p.windows.size() || to >= p.windows.size()) return null;
+        // The place it lands on: no move when that is where it already is.
+        int landing = to + (after ? 1 : 0) - (from < to ? 1 : 0);
+        if (landing == from) return null;
+        List<String> shown = new ArrayList<>();
+        for (int i = first; i < p.windows.size(); i++) shown.add(windowId(p.windows.get(i)));
+        String id = windowId(p.windows.get(from)), target = windowId(p.windows.get(to));
+        if (id == null || target == null) return null;
+        return new WindowMove(p.orderId, id, target, after, shown);
+    }
+
+    /**
+     * Whether {@code w}'s tab holds only {@code p}'s windows: only then is the
+     * tab's own menu (close, split, move: every terminal in it) offered on the
+     * window; a tab shared with another project offers the window's own
+     * terminal only (the desktop's ownsTab rule).
+     */
+    static boolean ownsTab(List<Project> all, Project p, Window w) {
+        if (w == null || w.tab == null) return false;
+        for (Project q : all) {
+            if (q == p) continue;
+            for (Window o : q.windows) {
+                if (w.tab.equals(o.tab) && w.space.equals(o.space)) return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * What git said of a computer's folders, as the desktop names repos (item
+     * 61): by the remote's name (origin's, else the first), whatever the
+     * clone's folder is called; a repo with no remote by its folder.
+     */
+    static Map<String, GitName> gitNames(FleetTree.GitLook look) {
+        Map<String, GitName> out = new HashMap<>();
+        if (look == null) return out;
+        for (Map.Entry<String, FleetTree.Place> e : look.places.entrySet()) {
+            FleetTree.Place place = e.getValue();
+            if (place == null || place.common.isEmpty()) continue;
+            String remote = remoteName(look.remotes.get(place.common));
+            boolean linked = !place.common.equals(place.top + "/.git");
+            out.put(e.getKey(), new GitName(remote != null ? remote : FleetTree.repoName(place.common), linked));
         }
         return out;
     }

@@ -75,6 +75,8 @@ final class FleetTree {
     static final class GitLook {
         final Map<String, Place> places = new HashMap<>();
         final Map<String, List<GitWorktree>> repos = new HashMap<>();
+        /** Each repo's remote URL (origin's, else the first), by common dir; absent: none, or an older core. */
+        final Map<String, String> remotes = new HashMap<>();
         final Set<String> outside = new HashSet<>();
         /** Repos whose worktree list was cut short; all of them when the whole answer was. */
         final Set<String> truncated = new HashSet<>();
@@ -618,6 +620,8 @@ final class FleetTree {
             } else if (at + 1 < lines.length && f.length == 2 && f[0].equals("P")) {
                 look.outside.add(trimSlash(f[1]));
                 look.places.remove(trimSlash(f[1]));
+            } else if (f.length >= 3 && f[0].equals("U")) {
+                if (!f[2].isEmpty()) look.remotes.put(trimSlash(f[1]), f[2]);
             } else if (f.length >= 2 && f[0].equals("R")) {
                 repo = trimSlash(f[1]);
                 porcelain.setLength(0);

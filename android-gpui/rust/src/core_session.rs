@@ -619,10 +619,7 @@ impl Connection<'_> {
     }
     fn edit_tab(&mut self, edit: TabEdit, cols: u16, rows: u16) -> Result<()> {
         match edit {
-            TabEdit::Rename { space, tab, name } => self.edit_doc(|doc| {
-                tab_mut(doc, &space, &tab)?["name"] = json!(name);
-                Ok(())
-            }),
+            TabEdit::Rename { space, tab, name } => self.edit_doc(|doc| rename_tab(doc, &space, &tab, &name)),
             TabEdit::Move { space, tab, index } => self.edit_doc(|doc| {
                 let tabs = tabs_mut(doc, &space)?;
                 let at = tabs
@@ -732,12 +729,23 @@ impl Connection<'_> {
                         .map(|p| p["cwd"].clone())
                         .unwrap_or(Value::Null)
                 });
-                let run = window_run(&space, &lead, cwd, kind, cols, rows);
+                let tab = format!(
+                    "mobile-{}-{}",
+                    std::process::id(),
+                    NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
+                );
+                let run = window_run(&space, &tab, &lead, cwd, kind, cols, rows);
                 let result = self.call("terminal.run", run)?;
                 let terminal = result["address"]
                     .as_str()
                     .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
                     .to_owned();
+                // Its tab in herdr-app's layout, so it can be renamed, moved or
+                // closed from here and the desktop places it without a repair.
+                // A space the layout lacks (one only labels name) keeps it label-only.
+                let block = format!("p{:x}", NEXT_RENDER.fetch_add(1, Ordering::Relaxed));
+                let entry = window_tab(&tab, &terminal, &block, kind);
+                let _ = self.edit_doc(|doc| add_tab(doc, &space, &entry));
                 // Labelled at birth; set again for a core that drops run labels.
                 // A failure leaves the run's own label, which a current core keeps.
                 let _ = self.call(
@@ -746,6 +754,31 @@ impl Connection<'_> {
                 );
                 self.refresh()?;
                 self.attach(&terminal, cols, rows)
+            }
+            TabEdit::WindowsMove {
+                project,
+                id,
+                target,
+                after,
+                shown,
+            } => {
+                // One compare-and-set per try, from the doc as it is now: a drop
+                // never writes back another window's stale order.
+                for _ in 0..5 {
+                    let doc = self.call("doc.get", json!({"name":"projects.order"}))?;
+                    let Some(value) = order_move(&doc["value"], &project, &id, &target, after, &shown) else {
+                        return Ok(());
+                    };
+                    match self.call(
+                        "doc.set",
+                        json!({"name":"projects.order","value":value,"version":doc["version"]}),
+                    ) {
+                        Ok(_) => return self.refresh(),
+                        Err(Error::Rpc { kind, .. }) if kind == "conflict" => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(Error::Protocol("the window order kept changing; try again".into()))
             }
             TabEdit::Interrupt { terminal } => {
                 self.call("terminal.interrupt", json!({"terminal":terminal}))?;
@@ -952,6 +985,11 @@ pub(crate) enum TabEdit {
     /// in `folder` (else the lead's), its terminal labelled parent=<lead>
     /// so it is that project's window wherever its tab goes.
     WindowNew { space: String, lead: String, folder: Option<String>, kind: &'static str },
+    /// Wolf's drag of a project's window (item 79): `id` just before or after
+    /// `target` in the core doc projects.order's `windows[<project>]`, the
+    /// list the desktop's status line keeps; `shown`: the project's windows
+    /// after its lead as drawn (the lead never moves).
+    WindowsMove { project: String, id: String, target: String, after: bool, shown: Vec<String> },
     Interrupt { terminal: String },
     Kill { terminal: String },
     DeaconStart { machine: String },
@@ -1022,6 +1060,25 @@ impl TabEdit {
                     _ => return None,
                 },
             },
+            "windows.move" => {
+                // As herdr-projects-order bounds them: 1 to 200 characters, at most 1000 names.
+                let name = |v: &Value| {
+                    v.as_str()
+                        .filter(|x| !x.is_empty() && x.len() <= 200 && !x.chars().any(char::is_control))
+                        .map(str::to_owned)
+                };
+                let shown = value["shown"].as_array()?;
+                if shown.len() > 1000 {
+                    return None;
+                }
+                Self::WindowsMove {
+                    project: name(&value["project"])?,
+                    id: name(&value["id"])?,
+                    target: name(&value["target"])?,
+                    after: value["after"].as_bool()?,
+                    shown: shown.iter().map(name).collect::<Option<Vec<_>>>()?,
+                }
+            }
             "pane.interrupt" => Self::Interrupt { terminal: id("terminal")? },
             "pane.kill" => Self::Kill { terminal: id("terminal")? },
             "deacon.start" => Self::DeaconStart { machine: name().unwrap_or_default() },
@@ -1067,18 +1124,83 @@ impl TabEdit {
 /// The terminal.run of a project's new window (`WindowNew`): a tab of its own
 /// in `space`, in `cwd`, working for `lead` (parent=<lead>), as the desktop's
 /// C-a c adopts it; an agent through the login shell, as `space.new` starts one.
-fn window_run(space: &str, lead: &str, cwd: Value, kind: &str, cols: u16, rows: u16) -> Value {
-    let tab = format!(
-        "mobile-{}-{}",
-        std::process::id(),
-        NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
-    );
+fn window_run(space: &str, tab: &str, lead: &str, cwd: Value, kind: &str, cols: u16, rows: u16) -> Value {
     let mut run = json!({"cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":tab,"parent":lead},"size":{"cols":cols,"rows":rows},"display":display()});
     if kind != "shell" {
         run["line"] = json!(format!("exec \"${{SHELL:-/bin/sh}}\" -lic {kind}"));
         run["labels"]["agent.kind"] = json!(kind);
     }
     run
+}
+/// The herdr-app tab of a project's new window: unnamed, so it goes by its
+/// agent's task, as a tab the desktop makes does.
+fn window_tab(tab: &str, terminal: &str, block: &str, kind: &str) -> Value {
+    let root = json!({"children":[{"content":{"terminal":terminal},"id":block,"type":"block"}],"id":tab,"type":"row"});
+    json!({"id":tab,"name":kind,"named":false,"root":root})
+}
+/// Appends `entry` to `space`'s tabs in herdr-app's layout.
+fn add_tab(doc: &mut Value, space: &str, entry: &Value) -> Result<()> {
+    let tabs = tabs_mut(doc, space)?;
+    if !tabs.iter().any(|t| t["id"] == entry["id"]) {
+        tabs.push(entry.clone());
+    }
+    Ok(())
+}
+/// A rename names the tab for good: `named`, so its window goes by this name
+/// and no longer by its agent's task.
+fn rename_tab(doc: &mut Value, space: &str, tab: &str, name: &str) -> Result<()> {
+    let item = tab_mut(doc, space, tab)?;
+    item["name"] = json!(name);
+    item["named"] = json!(true);
+    Ok(())
+}
+/// herdr-projects-order's reading of the projects.order doc: lists of names
+/// only, `windows` only once something is stored there.
+fn order_clean(value: &Value) -> Value {
+    let names = |v: &Value| -> Vec<Value> {
+        v.as_array()
+            .map(|a| a.iter().filter(|x| x.is_string()).cloned().collect())
+            .unwrap_or_default()
+    };
+    let lists = |v: &Value| -> serde_json::Map<String, Value> {
+        v.as_object()
+            .map(|o| o.iter().filter(|(_, ids)| ids.is_array()).map(|(k, ids)| (k.clone(), Value::from(names(ids)))).collect())
+            .unwrap_or_default()
+    };
+    let mut out = json!({"repos": names(&value["repos"]), "projects": lists(&value["projects"])});
+    let windows = lists(&value["windows"]);
+    if !windows.is_empty() {
+        out["windows"] = Value::from(windows);
+    }
+    out
+}
+/// One window move in projects.order (item 79), as herdr-projects-order makes
+/// it: the stored list for `project` less the windows no longer shown (they
+/// ended), then those `shown` adds, with `id` just before or after `target`.
+/// None: nothing moves (either is missing, or it is already there).
+fn order_move(value: &Value, project: &str, id: &str, target: &str, after: bool, shown: &[String]) -> Option<Value> {
+    let mut v = order_clean(value);
+    let stored: Vec<String> = v["windows"][project]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let stored: Vec<String> = if shown.is_empty() { stored } else { stored.into_iter().filter(|x| shown.contains(x)).collect() };
+    let mut ids = stored.clone();
+    ids.extend(shown.iter().filter(|x| !stored.contains(x)).cloned());
+    if id == target || !ids.iter().any(|x| x == id) || !ids.iter().any(|x| x == target) {
+        return None;
+    }
+    let mut rest: Vec<String> = ids.iter().filter(|x| *x != id).cloned().collect();
+    let at = rest.iter().position(|x| x == target)? + usize::from(after);
+    rest.insert(at, id.to_owned());
+    if rest == ids || rest.len() > 1000 {
+        return None;
+    }
+    if !v["windows"].is_object() {
+        v["windows"] = json!({});
+    }
+    v["windows"][project] = json!(rest);
+    Some(v)
 }
 /// Appends one space to herdr-app's document, keeping every space and tab
 /// already there (edit_doc hands it the freshest version on each try).
@@ -1160,6 +1282,8 @@ $c
 "*) continue;; esac
   seen="$seen$c
 "
+  u=$(git -C "$p" remote get-url origin 2>/dev/null) || u=$(git -C "$p" remote -v 2>/dev/null | sed -n '1s/^[^	]*	\([^ ]*\).*/\1/p')
+  printf 'U\t%s\t%s\n' "$c" "$u"
   printf 'R\t%s\n' "$c"
   w=$(git -C "$p" worktree list --porcelain 2>/dev/null)
   if [ "${#w}" -gt 2000000 ]; then
@@ -2135,14 +2259,54 @@ mod tests {
 b"}"#), None);
     }
     #[test]
+    fn a_new_project_window_is_a_layout_tab_that_renames_for_good() {
+        let mut doc = json!({"spaces":[{"id":"s1","name":"monopoly","tabs":[]}]});
+        let tab = window_tab("mobile-1-9", "t44", "p9", "claude");
+        add_tab(&mut doc, "s1", &tab).unwrap();
+        add_tab(&mut doc, "s1", &tab).unwrap();
+        assert_eq!(doc["spaces"][0]["tabs"].as_array().unwrap().len(), 1, "added once");
+        let terminals = json!([{"address":"t44","state":"live","labels":{"herdr.space":"s1","herdr.tab":"mobile-1-9","parent":"t5"},"title":"Fix tests","status":{}}]);
+        let mut view = json!({"pane_id":"t44"});
+        project(&mut view, &terminals, &doc).unwrap();
+        assert_eq!(view["tabs"][0]["named"], false, "goes by its task until renamed");
+        // A rename finds it in the layout and names it for good.
+        rename_tab(&mut doc, "s1", "mobile-1-9", "review").unwrap();
+        project(&mut view, &terminals, &doc).unwrap();
+        assert_eq!((view["tabs"][0]["label"].clone(), view["tabs"][0]["named"].clone()), (json!("review"), json!(true)));
+        // A space the layout lacks keeps the window label-only.
+        assert!(add_tab(&mut doc, "nowhere", &tab).is_err());
+    }
+
+    #[test]
+    fn window_moves_keep_their_own_list_in_projects_order() {
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // As herdr-projects-order's test_item_79: its own list beside the others.
+        let got = order_move(&json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]}}), "research-ui", "t1s7", "t1s6", false,
+            &ids(&["t1s6", "t1s7", "tab:s3/4"])).unwrap();
+        assert_eq!(got, json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]},"windows":{"research-ui":["t1s7","t1s6","tab:s3/4"]}}));
+        // Windows that ended leave the list at the next move; a new one joins.
+        let again = order_move(&got, "research-ui", "t1new", "t1s6", false, &ids(&["t1s6", "t1new"])).unwrap();
+        assert_eq!(again["windows"]["research-ui"], json!(["t1new", "t1s6"]));
+        // Nothing moves: the same place, a name not shown (the lead), or onto itself.
+        assert!(order_move(&again, "research-ui", "t1new", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, "research-ui", "t9r", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, "research-ui", "t1s6", "t1s6", true, &ids(&["t1new", "t1s6"])).is_none());
+        // After, and a doc that was never written.
+        let fresh = order_move(&Value::Null, "x#t1", "a", "c", true, &ids(&["a", "b", "c"])).unwrap();
+        assert_eq!(fresh, json!({"repos":[],"projects":{},"windows":{"x#t1":["b","c","a"]}}));
+        // A doc with no windows yet reads without the key, as the tool keeps it.
+        assert_eq!(order_clean(&json!({"repos":["a"],"projects":{},"windows":{}})), json!({"repos":["a"],"projects":{}}));
+    }
+
+    #[test]
     fn a_project_window_works_for_its_lead_like_c_a_c() {
-        let run = window_run("s1", "t5", json!("/w/x"), "codex", 80, 24);
+        let run = window_run("s1", "mobile-1-2", "t5", json!("/w/x"), "codex", 80, 24);
         assert_eq!(run["labels"]["parent"], "t5");
         assert_eq!(run["labels"]["herdr.space"], "s1");
         assert_eq!(run["labels"]["agent.kind"], "codex");
         assert_eq!(run["cwd"], "/w/x");
         assert!(run["labels"]["herdr.tab"].as_str().is_some_and(|t| t.starts_with("mobile-")));
-        let shell = window_run("s1", "t5", Value::Null, "shell", 80, 24);
+        let shell = window_run("s1", "mobile-1-3", "t5", Value::Null, "shell", 80, 24);
         assert!(shell["line"].is_null() && shell["labels"]["agent.kind"].is_null());
         assert_eq!(shell["labels"]["parent"], "t5");
     }
@@ -2189,6 +2353,12 @@ b"}"#), None);
             Some(TabEdit::WindowNew { space: "s1".into(), lead: "t5".into(), folder: None, kind: "shell" })
         );
         assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"laptop/t5","kind":"shell"}"#), None);
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"windows.move","project":"same#t31","id":"t1c","target":"tab:s1/4","after":true,"shown":["t1c","tab:s1/4"]}"#),
+            Some(TabEdit::WindowsMove { project: "same#t31".into(), id: "t1c".into(), target: "tab:s1/4".into(), after: true, shown: vec!["t1c".into(), "tab:s1/4".into()] })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"windows.move","project":"p","id":"a","target":"b","shown":[]}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"windows.move","project":"p","id":"a\nb","target":"b","after":false,"shown":[]}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"vim"}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"shell","folder":"rel"}"#), None);
         assert_eq!(

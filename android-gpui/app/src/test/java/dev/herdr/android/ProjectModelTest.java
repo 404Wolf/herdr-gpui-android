@@ -57,6 +57,7 @@ public final class ProjectModelTest {
             JSONObject view = c.getJSONObject("view");
             List<ProjectModel.Project> all = ProjectModel.projects(view.optJSONArray("workspaces"),
                     view.optJSONArray("tabs"), view.optJSONArray("panes"));
+            if (c.has("order")) ProjectModel.ordered(all, c.getJSONObject("order"));
             JSONObject expect = c.getJSONObject("expect");
             JSONObject projects = expect.optJSONObject("projects");
             if (projects != null) {
@@ -84,6 +85,38 @@ public final class ProjectModelTest {
                 assertEquals(name + " current " + focus, cur.getString("project"), p.key);
                 assertEquals(name + " shown " + focus, cur.getInt("shown"), ProjectModel.shownIndex(p,
                         focus.optString("terminal", null), focus.optString("tab", null)));
+            }
+            Map<String, ProjectModel.Project> keyed = new HashMap<>();
+            for (ProjectModel.Project p : all) keyed.put(p.key, p);
+            JSONArray moves = expect.optJSONArray("moves");
+            for (int k = 0; moves != null && k < moves.length(); k++) {
+                JSONObject m = moves.getJSONObject(k);
+                ProjectModel.WindowMove got = ProjectModel.windowMove(keyed.get(m.getString("project")),
+                        m.getInt("from"), m.getInt("to"), m.getBoolean("after"));
+                String what = name + " move " + m.getInt("from") + (m.getBoolean("after") ? " after " : " before ") + m.getInt("to");
+                if (m.isNull("expect")) {
+                    org.junit.Assert.assertNull(what, got);
+                    continue;
+                }
+                JSONObject want = m.getJSONObject("expect");
+                assertNotNull(what, got);
+                assertEquals(what, want.getString("project"), got.project);
+                assertEquals(what, want.getString("id"), got.id);
+                assertEquals(what, want.getString("target"), got.target);
+                assertEquals(what, want.getBoolean("after"), got.after);
+                assertEquals(what, strings(want.getJSONArray("shown")), got.shown);
+            }
+            JSONObject owns = expect.optJSONObject("owns_tab");
+            if (owns != null) {
+                for (String key : owns.keySet()) {
+                    ProjectModel.Project p = keyed.get(key);
+                    for (String terminal : owns.getJSONObject(key).keySet()) {
+                        ProjectModel.Window w = null;
+                        for (ProjectModel.Window x : p.windows) if (terminal.equals(x.terminal)) w = x;
+                        assertEquals(name + " " + key + " owns " + terminal + "'s tab",
+                                owns.getJSONObject(key).getBoolean(terminal), ProjectModel.ownsTab(all, p, w));
+                    }
+                }
             }
             JSONObject groups = expect.optJSONObject("groups");
             if (groups != null || expect.has("order_ids")) {
@@ -184,6 +217,66 @@ public final class ProjectModelTest {
         ProjectModel.Window w = new ProjectModel.Window("t1", "a", "s", "", name, "", 0, 0);
         w.n = n;
         return w;
+    }
+
+    @Test
+    public void aDraggedChipLandsBesideTheNearestWindowNeverBeforeTheLead() throws Exception {
+        JSONObject c = null;
+        JSONArray cases = fixture().getJSONArray("cases");
+        for (int i = 0; i < cases.length(); i++) if ("window-order-79".equals(cases.getJSONObject(i).getString("name"))) c = cases.getJSONObject(i);
+        JSONObject view = c.getJSONObject("view");
+        List<ProjectModel.Project> all = ProjectModel.ordered(ProjectModel.projects(view.optJSONArray("workspaces"),
+                view.optJSONArray("tabs"), view.optJSONArray("panes")), c.getJSONObject("order"));
+        ProjectModel.Project p = all.get(0);
+        // Six chips 100 px apart: lead, t1c, notes, t1a, t1b, t1new.
+        float[] centres = {50, 150, 250, 350, 450, 550};
+        // t1b (4) let go just left of t1c's centre: before it.
+        ProjectModel.WindowMove m = ProjectBar.dropMove(p, 4, 140, centres);
+        assertEquals("t1b before t1c", m.id + (m.after ? " after " : " before ") + m.target, "t1b before t1c");
+        // Over the lead: beside window 2 at most, never before the lead.
+        m = ProjectBar.dropMove(p, 4, 20, centres);
+        assertEquals("t1b before t1c", m.id + (m.after ? " after " : " before ") + m.target);
+        // Let go where it already is: nothing to store.
+        org.junit.Assert.assertNull(ProjectBar.dropMove(p, 4, 452, centres));
+        // Past the end: after the last.
+        m = ProjectBar.dropMove(p, 1, 900, centres);
+        assertEquals("t1c after t1new", m.id + (m.after ? " after " : " before ") + m.target);
+    }
+
+    @Test
+    public void aCloneIsNamedByItsRemoteAsTheDesktopNamesIt() {
+        // git.look's answer: a clone in /w/clone whose origin is org/monopoly, and a repo with no remote.
+        FleetTree.GitLook look = FleetTree.parseGitLook(
+                "P\t/w/clone\t/w/clone/.git\t/w/clone\tmain\t0\t0\n"
+                        + "U\t/w/clone/.git\tgit@github.com:org/monopoly.git\n"
+                        + "R\t/w/clone/.git\nworktree /w/clone\nbranch refs/heads/main\n\nE\n"
+                        + "P\t/w/lane\t/w/clone/.git\t/w/lane\tlane\t0\t0\n"
+                        + "P\t/w/solo\t/w/solo/.git\t/w/solo\tmain\t0\t0\n"
+                        + "U\t/w/solo/.git\t\n"
+                        + "R\t/w/solo/.git\nworktree /w/solo\n\nE\n", 32);
+        Map<String, ProjectModel.GitName> names = ProjectModel.gitNames(look);
+        assertEquals("monopoly", names.get("/w/clone").name);
+        assertEquals(false, names.get("/w/clone").linked);
+        assertEquals("monopoly", names.get("/w/lane").name);
+        assertEquals(true, names.get("/w/lane").linked);
+        assertEquals("solo", names.get("/w/solo").name);
+        // The switcher then follows the desktop's saved order for that repo.
+        JSONArray workspaces = new JSONArray().put(new JSONObject().put("id", "s1").put("label", "w"));
+        JSONArray tabs = new JSONArray()
+                .put(new JSONObject().put("id", "a").put("workspace_id", "s1").put("label", "a"))
+                .put(new JSONObject().put("id", "b").put("workspace_id", "s1").put("label", "b"));
+        JSONArray panes = new JSONArray()
+                .put(new JSONObject().put("id", "t10").put("workspace_id", "s1").put("tab_id", "a").put("role", "pm")
+                        .put("project", "research-ui").put("cwd", "/w/clone").put("created_ms", 1))
+                .put(new JSONObject().put("id", "t20").put("workspace_id", "s1").put("tab_id", "b").put("role", "pm")
+                        .put("project", "incident-fixes").put("cwd", "/w/lane").put("created_ms", 2));
+        JSONObject order = new JSONObject().put("projects", new JSONObject().put("monopoly",
+                new JSONArray().put("incident-fixes").put("research-ui")));
+        ProjectModel.Groups g = ProjectModel.groups(ProjectModel.projects(workspaces, tabs, panes), names,
+                new HashMap<>(), order);
+        assertEquals("monopoly", g.repos.get(0).name);
+        assertEquals("pm:t20", g.repos.get(0).projects.get(0).key);
+        assertEquals("pm:t10", g.repos.get(0).projects.get(1).key);
     }
 
     private static List<String> strings(JSONArray a) {

@@ -1,6 +1,6 @@
 {
- "source": "Desktop model: home-manager-conf 10ad20b users/wolf/programs/herdr-core/app/mods/projects/model.js (projects, summary, currentOf, shownIndex, repoOf, repoGroups, orderBy, orderId); cases ported from home-manager-conf 10ad20b users/wolf/programs/herdr-core/app/test_wolf_requirements.mjs and test_projects.mjs (each case's desktop_test). Read by ProjectModelTest (phone). A change to either model is diffed against this file.",
- "format": "view: the phone's view of one core (workspaces, tabs, panes = one per live terminal with its labels). expect.projects: every project by key -> name, windows ('<terminal> <name>' or 'tab:<id> <name>', in order), waiting. current: focus -> project key and shown index. groups: the switcher's order (deacons, then repos with their projects; name null = no repo). order_ids: a project's id in projects.order.",
+ "source": "Desktop model: home-manager-conf 10ad20b (item 79: 88e7bf7) users/wolf/programs/herdr-core/app/mods/projects/model.js (projects, summary, currentOf, shownIndex, repoOf, repoGroups, orderBy, orderId, windowId, orderWindows); cases ported from home-manager-conf 10ad20b (item 79: 88e7bf7) users/wolf/programs/herdr-core/app/test_wolf_requirements.mjs and test_projects.mjs (each case's desktop_test). Read by ProjectModelTest (phone). A change to either model is diffed against this file.",
+ "format": "view: the phone's view of one core (workspaces, tabs, panes = one per live terminal with its labels). expect.projects: every project by key -> name, windows ('<terminal> <name>' or 'tab:<id> <name>', in order), waiting. current: focus -> project key and shown index. groups: the switcher's order (deacons, then repos with their projects; name null = no repo). order_ids: a project's id in projects.order. order (when given) is applied to the projects first (ordered: windows[<project id>]). moves: a window chip dragged from index to index (before, or after) -> the projects.order move, or null. owns_tab: project -> window -> whether its tab holds only that project's windows.",
  "phone_differences": "The phone lists every live terminal of its core as a window (it can open any); the desktop lists paneless leads only. A phone tab named by a terminal address counts as unnamed.",
  "cases": [
   {
@@ -192,7 +192,7 @@
   },
   {
    "name": "pm-split-beside-another-pms-worker",
-   "desktop_test": "projects/model.js currentOf ('its own lead first: a PM split beside another's worker is still its own'); test_projects.mjs '2026-11-15: the sidebar lights the project focus is in'",
+   "desktop_test": "projects/model.js currentOf ('its own lead first: a PM split beside another's worker is still its own'); test_projects.mjs '2026-11-15: the sidebar lights the project focus is in'; ownsTab: test_projects.mjs 'right-click with two PMs split in one tab: each gets only its own pane's menu (Close pane), never the tab's whose Close kills both'",
    "view": {
     "workspaces": [
      {
@@ -301,7 +301,16 @@
       "project": "pm:t10",
       "shown": 0
      }
-    ]
+    ],
+    "owns_tab": {
+     "pm:t10": {
+      "t10": false
+     },
+     "pm:t20": {
+      "t20": true,
+      "t21": false
+     }
+    }
    }
   },
   {
@@ -979,6 +988,362 @@
        ]
       }
      ]
+    }
+   }
+  },
+  {
+   "name": "window-order-79",
+   "desktop_test": "test_projects.mjs '79: a window moved before another keeps the lead first, renumbers, is saved in the core's projects.order (windows:<project>)', '79: nothing goes before the lead; a click never reorders', '79: a window new since the order was saved comes after the ordered ones'; test_wolf_requirements.mjs '79-reorder-windows'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "mono",
+      "label": "monopoly"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "mono/1",
+      "workspace_id": "mono",
+      "label": "research ui",
+      "named": true
+     },
+     {
+      "id": "mono/2",
+      "workspace_id": "mono",
+      "label": "a",
+      "named": true
+     },
+     {
+      "id": "mono/3",
+      "workspace_id": "mono",
+      "label": "b",
+      "named": true
+     },
+     {
+      "id": "mono/4",
+      "workspace_id": "mono",
+      "label": "c",
+      "named": true
+     },
+     {
+      "id": "mono/5",
+      "workspace_id": "mono",
+      "label": "new",
+      "named": true
+     },
+     {
+      "id": "mono/6",
+      "workspace_id": "mono",
+      "label": "notes",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t9r",
+      "workspace_id": "mono",
+      "tab_id": "mono/1",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "research-ui",
+      "repo": "",
+      "created_ms": 1,
+      "program": ""
+     },
+     {
+      "id": "t1a",
+      "workspace_id": "mono",
+      "tab_id": "mono/2",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t9r",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t1b",
+      "workspace_id": "mono",
+      "tab_id": "mono/3",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t9r",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t1c",
+      "workspace_id": "mono",
+      "tab_id": "mono/4",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t9r",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t1new",
+      "workspace_id": "mono",
+      "tab_id": "mono/5",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t9r",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     }
+    ]
+   },
+   "order": {
+    "repos": [],
+    "projects": {},
+    "windows": {
+     "research-ui": [
+      "t1c",
+      "tab:mono/6",
+      "t1a",
+      "t1b",
+      "t1gone"
+     ]
+    }
+   },
+   "expect": {
+    "projects": {
+     "pm:t9r": {
+      "name": "research-ui",
+      "windows": [
+       "t9r lead",
+       "t1c c",
+       "tab:mono/6 notes",
+       "t1a a",
+       "t1b b",
+       "t1new new"
+      ],
+      "waiting": 0
+     }
+    },
+    "moves": [
+     {
+      "project": "pm:t9r",
+      "from": 4,
+      "to": 1,
+      "after": false,
+      "expect": {
+       "project": "research-ui",
+       "id": "t1b",
+       "target": "t1c",
+       "after": false,
+       "shown": [
+        "t1c",
+        "tab:mono/6",
+        "t1a",
+        "t1b",
+        "t1new"
+       ]
+      }
+     },
+     {
+      "project": "pm:t9r",
+      "from": 1,
+      "to": 5,
+      "after": true,
+      "expect": {
+       "project": "research-ui",
+       "id": "t1c",
+       "target": "t1new",
+       "after": true,
+       "shown": [
+        "t1c",
+        "tab:mono/6",
+        "t1a",
+        "t1b",
+        "t1new"
+       ]
+      }
+     },
+     {
+      "project": "pm:t9r",
+      "from": 0,
+      "to": 1,
+      "after": false,
+      "expect": null
+     },
+     {
+      "project": "pm:t9r",
+      "from": 1,
+      "to": 0,
+      "after": false,
+      "expect": null
+     },
+     {
+      "project": "pm:t9r",
+      "from": 2,
+      "to": 2,
+      "after": false,
+      "expect": null
+     },
+     {
+      "project": "pm:t9r",
+      "from": 2,
+      "to": 1,
+      "after": true,
+      "expect": null
+     },
+     {
+      "project": "pm:t9r",
+      "from": 2,
+      "to": 3,
+      "after": false,
+      "expect": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "window-order-plain-name",
+   "desktop_test": "test_projects.mjs '79 (#87 review): a window's id takes off only its project's computer ...; an order kept under the plain name still applies'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "work"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "a",
+      "workspace_id": "s1",
+      "label": "a",
+      "named": true
+     },
+     {
+      "id": "b",
+      "workspace_id": "s1",
+      "label": "b",
+      "named": true
+     },
+     {
+      "id": "c",
+      "workspace_id": "s1",
+      "label": "c",
+      "named": true
+     },
+     {
+      "id": "d",
+      "workspace_id": "s1",
+      "label": "d",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t1",
+      "workspace_id": "s1",
+      "tab_id": "a",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "x",
+      "repo": "",
+      "created_ms": 1,
+      "program": ""
+     },
+     {
+      "id": "t2",
+      "workspace_id": "s1",
+      "tab_id": "b",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t1",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t3",
+      "workspace_id": "s1",
+      "tab_id": "c",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t1",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t9",
+      "workspace_id": "s1",
+      "tab_id": "d",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "x",
+      "repo": "",
+      "created_ms": 2,
+      "program": ""
+     }
+    ]
+   },
+   "order": {
+    "repos": [],
+    "projects": {},
+    "windows": {
+     "x": [
+      "t3",
+      "t2"
+     ]
+    }
+   },
+   "expect": {
+    "projects": {
+     "pm:t1": {
+      "name": "x",
+      "windows": [
+       "t1 lead",
+       "t3 c",
+       "t2 b"
+      ],
+      "waiting": 0
+     },
+     "pm:t9": {
+      "name": "x",
+      "windows": [
+       "t9 lead"
+      ],
+      "waiting": 0
+     }
+    },
+    "order_ids": {
+     "pm:t1": "x#t1",
+     "pm:t9": "x#t9"
     }
    }
   }

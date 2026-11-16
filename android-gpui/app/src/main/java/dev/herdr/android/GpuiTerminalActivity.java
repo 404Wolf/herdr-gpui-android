@@ -360,6 +360,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabStrip.setGravity(android.view.Gravity.CENTER_VERTICAL);
         tabStrip.setPadding(dp(6), 0, dp(6), 0);
         tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
+        // The shown window stays whole when the bar is rebuilt (its chips laid
+        // out only then) and when its width changes (a fold, a rotation).
+        tabStrip.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (revealPending) revealActiveChip();
+        });
+        tabScroll.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (r - l != or - ol) v.post(this::revealActiveChip);
+        });
         // An agent's pane has no bottom bar: the strip's end holds what the bar's
         // buttons did (panes, hosts, view, session, close).
         tabRow = new PullDownRow(this);
@@ -2173,7 +2181,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         updateCrumb(current, space);
         // The project focus is in and its windows only (Wolf's items 60, 70, 78; the desktop's
         // status line): window 1 its lead, the shown one filled. Nothing toggles it.
-        java.util.List<ProjectModel.Project> projects = ProjectModel.projects(current.workspaces, current.tabs, current.panes);
+        java.util.List<ProjectModel.Project> projects = ProjectModel.ordered(
+                ProjectModel.projects(current.workspaces, current.tabs, current.panes), current.projectsOrder);
         ProjectModel.Project project = ProjectModel.currentOf(projects, current.paneId, paneTab, space);
         int shown = ProjectModel.shownIndex(project, current.paneId, paneTab);
         boolean compact = compactWindow();
@@ -2191,9 +2200,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.text)
                     .append('\t').append(c.window.status).append('\t').append(c.active).append('\n');
         }
-        String activeId = shown >= 0 ? project.key + "#" + shown : "";
+        String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
         if (signature.toString().equals(tabSignature)) return;
-        boolean activeMoved = !activeId.equals(tabActive);
+        // A fold (the cover cuts names) or renamed windows move the shown chip too.
+        boolean activeMoved = !activeId.equals(tabActive) || compact != tabCompact;
+        tabCompact = compact;
         tabSignature = signature.toString();
         tabActive = activeId;
         tabStrip.removeAllViews();
@@ -2209,9 +2220,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             crumbText.setPadding(0, 0, dp(6), 0);
             tabStrip.addView(crumbText, new LinearLayout.LayoutParams(-2, dp(24)));
         }
-        View active = null;
-        for (ProjectBar.Chip c : chips) {
+        java.util.List<View> windowChips = new java.util.ArrayList<>();
+        for (int i = 0; i < chips.size(); i++) {
+            ProjectBar.Chip c = chips.get(i);
             ProjectModel.Window w = c.window;
+            final int index = i;
             TextView chip = windowChip(c.text, c.active, w.status, w.terminal == null);
             chip.setTag(c.active ? PANE_PILL_ACTIVE : PANE_PILL);
             chip.setOnClickListener(v -> {
@@ -2219,21 +2232,34 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (w.terminal != null) focusRemotePane(target, w.terminal);
                 else note("Nothing runs in " + w.name + ": open it on the desktop");
             });
-            final String windowName = w.name;
-            chip.setOnLongClickListener(v -> {
-                if (w.tab != null && !w.tab.isEmpty()) showTabActions(target, w.space, w.tab, windowName);
-                return true;
-            });
+            boolean owns = ProjectModel.ownsTab(projects, project, w);
+            Runnable menu = () -> showWindowActions(target, w, owns);
+            if (w == project.lead) {
+                // Window 1 stays the lead: it is never dragged (item 79).
+                chip.setOnLongClickListener(v -> { menu.run(); return true; });
+            } else {
+                // Held, then dragged: Wolf's order of the project's windows (item 79), kept in this
+                // core's projects.order as the desktop keeps it. Held and let go: the menu.
+                chip.setOnTouchListener(new WindowDrag(chip, menu, centre -> {
+                    float[] centres = new float[windowChips.size()];
+                    for (int k = 0; k < centres.length; k++) {
+                        View other = windowChips.get(k);
+                        centres[k] = other.getLeft() + other.getWidth() / 2f;
+                    }
+                    ProjectModel.WindowMove move = ProjectBar.dropMove(project, index, (float) centre, centres);
+                    if (move != null) moveWindow(target, move);
+                }));
+            }
             chip.setContentDescription("Window " + w.n + ", " + w.name + (w.status.isEmpty() ? "" : ", " + w.status)
-                    + (c.active ? ", current" : ""));
+                    + (c.active ? ", current" : "") + (w == project.lead ? "" : ". Hold and drag to reorder"));
             tabStrip.addView(chip);
-            if (c.active) active = chip;
+            windowChips.add(chip);
         }
         TextView add = windowChip("+", false, "", false);
         add.setContentDescription(project != null && project.led()
                 ? "New Claude, Codex or terminal window of " + project.name
                 : "New Claude, Codex or terminal tab in this space");
-        add.setOnClickListener(v -> showNewMenu(v, project, shown));
+        add.setOnClickListener(this::showNewMenu);
         tabStrip.addView(add);
         if (!compact && needYou > 0) {
             TextView waiting = new TextView(this);
@@ -2247,10 +2273,58 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             waiting.setOnClickListener(v -> focusNextWaiting(target, projects));
             tabStrip.addView(waiting, new LinearLayout.LayoutParams(-2, dp(24)));
         }
-        if (active != null && activeMoved) {
-            final View activePill = active;
-            tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
+        if (activeMoved) {
+            revealPending = true;
+            tabScroll.post(this::revealActiveChip);
         }
+    }
+
+    private boolean tabCompact;
+    /** The shown chip is to be revealed once the rebuilt bar is laid out. */
+    private boolean revealPending;
+
+    /**
+     * Scrolls the bar so the shown window's chip is whole, by its measured
+     * bounds after layout, and only when it is not: a scroll Wolf made himself
+     * stays where he left it.
+     */
+    private void revealActiveChip() {
+        if (tabStrip == null || tabScroll == null) return;
+        View active = tabStrip.findViewWithTag(PANE_PILL_ACTIVE);
+        if (active == null || active.getWidth() == 0 || tabScroll.getWidth() == 0) return;
+        revealPending = false;
+        int left = active.getLeft(), right = active.getRight();
+        int from = tabScroll.getScrollX(), width = tabScroll.getWidth();
+        if (left >= from && right <= from + width) return;
+        int to = right > from + width && right - left < width ? right - width + dp(24) : left - dp(24);
+        tabScroll.smoothScrollTo(Math.max(0, to), 0);
+    }
+
+    /**
+     * A window's menu. Its tab holds only this project's windows: the tab's
+     * own menu (rename, split, move, close: every terminal in it). A tab it
+     * shares with another project's terminal: this window's terminal only,
+     * so nothing of the other project is ever ended or moved with it.
+     */
+    private void showWindowActions(Connection target, ProjectModel.Window w, boolean ownsTab) {
+        if (ownsTab && w.tab != null && !w.tab.isEmpty()) {
+            showTabActions(target, w.space, w.tab, w.name);
+            return;
+        }
+        if (w.terminal == null) {
+            note(w.name + " shares its tab with another project; change it on the desktop");
+            return;
+        }
+        new ActionSheet(this, chrome, w.name + " · shares its tab with another project")
+                .danger("Close this window (" + w.terminal + " only)", () ->
+                        runEdit(target, "Close " + w.name, "op", "pane.kill", "terminal", w.terminal))
+                .show();
+    }
+
+    /** Saves a dragged window's place in this core's projects.order; the bar follows when it is read back. */
+    private void moveWindow(Connection target, ProjectModel.WindowMove move) {
+        runEdit(target, "Move window", "op", "windows.move", "project", move.project, "id", move.id,
+                "target", move.target, "after", move.after, "shown", new JSONArray(move.shown));
     }
 
     /**
@@ -2315,16 +2389,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** What git said of this computer's folders: folder -> its repo's name and whether it is a linked worktree. */
     private java.util.Map<String, ProjectModel.GitName> gitNames() {
-        java.util.Map<String, ProjectModel.GitName> out = new java.util.HashMap<>();
-        FleetTree.GitLook look = currentHostId == null ? null : FleetPanes.LOOKS.get(currentHostId);
-        if (look == null) return out;
-        for (java.util.Map.Entry<String, FleetTree.Place> e : look.places.entrySet()) {
-            FleetTree.Place place = e.getValue();
-            if (place == null || place.common.isEmpty()) continue;
-            boolean linked = !place.common.equals(place.top + "/.git");
-            out.put(e.getKey(), new ProjectModel.GitName(FleetTree.repoName(place.common), linked));
-        }
-        return out;
+        return ProjectModel.gitNames(currentHostId == null ? null : FleetPanes.LOOKS.get(currentHostId));
     }
 
     /**
@@ -2530,27 +2595,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * scrolls the strip, a hold opens the actions, and a hold then drag lifts
      * the pill and drops it at a new position.
      */
-    private final class TabDrag implements View.OnTouchListener {
-        private final View pill;
+    /**
+     * Hold, then drag a window chip along the bar (item 79): it follows the
+     * finger and, let go, reports where its centre is (bar coordinates). Held
+     * and let go without moving: its menu. A plain tap stays the chip's click.
+     */
+    private final class WindowDrag implements View.OnTouchListener {
+        private final View chip;
         private final Runnable menu;
-        private final java.util.function.IntConsumer moved;
+        private final java.util.function.DoubleConsumer dropped;
         private final int slop = android.view.ViewConfiguration.get(GpuiTerminalActivity.this).getScaledTouchSlop();
         private float downX, downY;
-        private boolean held, dragging, cancelled;
+        private boolean held, dragging;
         private final Runnable hold = new Runnable() {
             @Override public void run() {
                 held = true;
-                pill.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
-                pill.animate().scaleX(1.08f).scaleY(1.08f).setDuration(90).start();
-                pill.setElevation(dp(6));
-                pill.getParent().requestDisallowInterceptTouchEvent(true);
+                chip.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+                chip.animate().scaleX(1.08f).scaleY(1.08f).setDuration(90).start();
+                chip.setElevation(dp(6));
+                chip.getParent().requestDisallowInterceptTouchEvent(true);
             }
         };
 
-        TabDrag(View pill, Runnable menu, java.util.function.IntConsumer moved) {
-            this.pill = pill;
+        WindowDrag(View chip, Runnable menu, java.util.function.DoubleConsumer dropped) {
+            this.chip = chip;
             this.menu = menu;
-            this.moved = moved;
+            this.dropped = dropped;
         }
 
         @Override public boolean onTouch(View view, MotionEvent event) {
@@ -2558,43 +2628,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 case MotionEvent.ACTION_DOWN:
                     downX = event.getRawX();
                     downY = event.getRawY();
-                    held = dragging = cancelled = false;
-                    pill.postDelayed(hold, android.view.ViewConfiguration.getLongPressTimeout());
+                    held = dragging = false;
+                    chip.postDelayed(hold, android.view.ViewConfiguration.getLongPressTimeout());
                     return false; // the pressed state and click stay the view's own
                 case MotionEvent.ACTION_MOVE: {
                     float dx = event.getRawX() - downX;
                     if (!held) {
-                        if (Math.abs(dx) > slop || Math.abs(event.getRawY() - downY) > slop) {
-                            pill.removeCallbacks(hold);
-                            cancelled = true;
-                        }
+                        if (Math.abs(dx) > slop || Math.abs(event.getRawY() - downY) > slop) chip.removeCallbacks(hold);
                         return false;
                     }
                     if (!dragging && Math.abs(dx) > slop) dragging = true;
-                    if (dragging) pill.setTranslationX(dx);
+                    if (dragging) chip.setTranslationX(dx);
                     return true;
                 }
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL: {
-                    pill.removeCallbacks(hold);
+                    chip.removeCallbacks(hold);
                     if (!held) return false;
                     boolean up = event.getActionMasked() == MotionEvent.ACTION_UP;
-                    int target = dropIndex();
-                    pill.animate().scaleX(1f).scaleY(1f).translationX(0).setDuration(120).start();
-                    pill.setElevation(0);
-                    pill.setPressed(false);
-                    if (up && dragging) {
-                        int from = tabStrip.indexOfChild(pill);
-                        if (target != from && target >= 0) {
-                            // Show the new order at once; herdr-core's answer confirms it.
-                            tabStrip.removeView(pill);
-                            tabStrip.addView(pill, target);
-                            tabSignature = "";
-                            moved.accept(target);
-                        }
-                    } else if (up) {
-                        menu.run();
-                    }
+                    float centre = chip.getLeft() + chip.getTranslationX() + chip.getWidth() / 2f;
+                    chip.animate().scaleX(1f).scaleY(1f).translationX(0).setDuration(120).start();
+                    chip.setElevation(0);
+                    chip.setPressed(false);
+                    if (up && dragging) dropped.accept(centre);
+                    else if (up) menu.run();
                     held = dragging = false;
                     return true;
                 }
@@ -2602,22 +2659,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     return false;
             }
         }
-
-        /** Where the lifted pill's centre now falls among the other tabs ("+" excluded). */
-        private int dropIndex() {
-            float centre = pill.getLeft() + pill.getTranslationX() + pill.getWidth() / 2f;
-            int tabs = tabStrip.getChildCount() - 1;
-            int index = 0;
-            for (int i = 0; i < tabs; i++) {
-                View other = tabStrip.getChildAt(i);
-                if (other == pill) continue;
-                if (centre > other.getLeft() + other.getWidth() / 2f) index++;
-            }
-            return Math.min(index, Math.max(0, tabs - 1));
-        }
     }
 
-    /** "+": what a new tab in this space should run. */
+    /** Where "+" puts a project's new window now (ProjectBar.newWindowPlace), or null: a plain new tab. */
+    private String[] newWindowPlace(Connection target) {
+        String space = "", tab = "";
+        JSONArray panes = target.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane != null && pane.optString("id").equals(target.paneId)) {
+                space = pane.optString("workspace_id");
+                tab = pane.optString("tab_id");
+            }
+        }
+        java.util.List<ProjectModel.Project> all = ProjectModel.ordered(
+                ProjectModel.projects(target.workspaces, target.tabs, target.panes), target.projectsOrder);
+        ProjectModel.Project p = ProjectModel.currentOf(all, target.paneId, tab, space);
+        return ProjectBar.newWindowPlace(p, ProjectModel.shownIndex(p, target.paneId, tab));
+    }
+
     /**
      * "+": a new Claude, Codex or shell window. Of a project with a lead, it
      * is that project's window, as the desktop's C-a c makes one: a tab in the
@@ -2625,11 +2685,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * parent=<lead> on this core (window.new). Elsewhere a plain new tab in the
      * space shown.
      */
-    private void showNewMenu(View anchor, ProjectModel.Project project, int shown) {
+    private void showNewMenu(View anchor) {
         Connection target;
         synchronized (stateLock) { target = connection; }
         if (target == null) return;
-        String[] place = ProjectBar.newWindowPlace(project, shown);
+        // Placed from the view as it is now, not as the bar was last drawn: a
+        // window that changed folder since makes the new one there.
+        String[] place = newWindowPlace(target);
         android.widget.PopupMenu menu = new android.widget.PopupMenu(
                 new android.view.ContextThemeWrapper(this, chrome.popupTheme()), anchor);
         menu.getMenu().add(0, 1, 0, "Claude");
