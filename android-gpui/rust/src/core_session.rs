@@ -78,14 +78,20 @@ struct Connection<'a> {
     negotiated: bool,
     /// How this viewer claims the attached pane's grid.
     claim: Claim,
-    /// The core's hello offered `resize_history`: asked for on every attach,
-    /// the repaint after a RESIZE then carries the pane's history (after an
-    /// ESC[3J), so the phone's scrollback after a resize is exactly the core's.
+    /// The core's hello offered `resize_history`: asked for on every attach.
+    /// Then the repaint after a RESIZE may carry the pane's history after an
+    /// ESC[3J, which makes the phone's scrollback after a resize exactly the
+    /// core's. Nothing depends on it arriving: the phone's own no-loss
+    /// handling of a resize (the old screen kept on the paint's first ED 2)
+    /// is erased by that ESC[3J when the history comes, and stands when only
+    /// the screen comes (an older relay, or a paint the core had to cut).
     history_on_resize: bool,
 }
 
-/// History rows the repaint after a RESIZE carries, when the core offers it
-/// (the same as an attach's first paint).
+/// History rows asked for in the repaint after a RESIZE: the attach's own
+/// (`attach_params`). That ESC[3J replaces the whole scrollback, so fewer
+/// would cut the phone's history shorter than the attach gave it, and more
+/// buys nothing the phone ever had. Bounding the bytes is the core's cap.
 const RESIZE_HISTORY: usize = 1000;
 
 /// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
@@ -966,9 +972,6 @@ impl Connection<'_> {
         if let Some((cols, rows)) = initial_grid(&reply) {
             terminal_session.set_grid(cols, rows);
         }
-        // Before any byte of the stream: a core that repaints its history
-        // after a RESIZE makes the phone's own old-screen copy unneeded.
-        terminal_session.set_history_on_resize(self.history_on_resize);
         *lock(&session_slot) = Arc::downgrade(&terminal_session);
         crate::remote::release_held();
         self.channel = channel;
@@ -3301,20 +3304,23 @@ mod connection_tests {
     }
 
     /// A pane fed `chunks` (DATA and the core's RESIZE) in stream order.
-    fn streamed(cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
-        streamed_as(false, cols, rows, chunks)
+    /// What herdr-core sends after a RESIZE to a viewer that asked for
+    /// `resize_history` (home-manager-conf #88): CAN, the paint's reset
+    /// (ending ESC[H ESC[2J), ESC[3J, then the history and the screen.
+    fn core_resize_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+        let paint = core_paint(history, screen, rows);
+        let reset = b"\x1b[H\x1b[2J";
+        let at = paint.windows(reset.len()).position(|w| w == reset).unwrap() + reset.len();
+        [b"\x18".as_slice(), &paint[..at], b"\x1b[3J", &paint[at..]].concat()
     }
 
-    /// As [`streamed`], for a core that does (`history_on_resize`) or does
-    /// not repaint its history after a RESIZE.
-    fn streamed_as(history_on_resize: bool, cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
+    fn streamed(cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
         let (tx, rx) = mpsc::sync_channel(64);
         let (commands, _credits) = mpsc::sync_channel(4096);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
-        pane.set_history_on_resize(history_on_resize);
         *lock(&slot) = Arc::downgrade(&pane);
         pane.set_grid(cols, rows);
         for chunk in chunks {
@@ -3358,12 +3364,12 @@ mod connection_tests {
         assert_eq!(rows_seen, all);
     }
 
-    /// With a core that offers `resize_history`, the repaint after a RESIZE
-    /// is CAN, the reset, ESC[3J, the history and the screen: the phone's
-    /// scrollback becomes exactly the core's, whichever side moved more rows,
-    /// with no row lost and none shown twice.
+    /// With a core that sends its history after a RESIZE, the scrollback
+    /// becomes exactly the core's, whichever side moved more rows: the old
+    /// screen the phone keeps on the paint's first erase is cleared by the
+    /// ESC[3J that follows. No row is lost and none shows twice.
     #[test]
-    fn a_core_that_repaints_its_history_on_resize_leaves_exactly_its_scrollback() {
+    fn a_history_repaint_after_a_resize_leaves_exactly_the_cores_scrollback() {
         let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
         let first = core_paint(&all[..40], &all[40..], 10);
         for (rows, shown) in [(8u16, 6usize), (8, 8), (6, 6), (12, 10)] {
@@ -3371,8 +3377,8 @@ mod connection_tests {
             let at = all.len() - shown;
             let mut history = vec!["only the core".to_owned()];
             history.extend_from_slice(&all[..at]);
-            let repaint = [b"\x18\x1b[3J".to_vec(), core_paint(&history, &all[at..], usize::from(rows))].concat();
-            let pane = streamed_as(true, 20, 10, vec![Chunk::Data(first.clone()), Chunk::Grid(20, rows), Chunk::Data(repaint)]);
+            let repaint = core_resize_paint(&history, &all[at..], usize::from(rows));
+            let pane = streamed(20, 10, vec![Chunk::Data(first.clone()), Chunk::Grid(20, rows), Chunk::Data(repaint)]);
             let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
             let expected: Vec<String> = history.iter().chain(&all[at..]).cloned().collect();
             assert_eq!(rows_seen, expected, "10 -> {rows} rows");
@@ -3845,7 +3851,7 @@ mod claim_tests {
         );
     }
 
-    /// The phone asks for the history repaint only from a core that offers
+    /// The history repaint is asked for only from a core whose hello offers
     /// it; an older core gets exactly the attach it always got.
     #[test]
     fn resize_history_is_asked_for_only_when_the_core_offers_it() {
