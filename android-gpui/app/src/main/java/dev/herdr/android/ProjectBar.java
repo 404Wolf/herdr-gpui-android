@@ -92,6 +92,35 @@ final class ProjectBar {
         return "working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status);
     }
 
+    /** The project chip as drawn: "[name]", then " !N" when N of its agents wait on Wolf. */
+    static String projectChipText(ProjectModel.Project p) {
+        return projectText(p) + (p != null && p.waiting > 0 ? " !" + p.waiting : "");
+    }
+
+    /** The repo crumb as drawn after the project chip, or null: none. */
+    static String crumbText(String repo) {
+        return repo == null ? null : repo + " ›";
+    }
+
+    /** A window chip as drawn: its text, and its status dot. */
+    static String chipText(Chip c) {
+        return c.text + (dotted(c.window.status) ? " ●" : "");
+    }
+
+    /**
+     * The bar's text as drawn, from the start up to chip {@code upTo}
+     * (inclusive; chips.size() - 1 for all): the project chip, the repo
+     * crumb, the window chips. Whatever changes in it can move the shown chip
+     * (the activity reveals it again) or change the bar (it is rebuilt).
+     */
+    static String drawn(ProjectModel.Project p, String repo, List<Chip> chips, int upTo) {
+        StringBuilder out = new StringBuilder(projectChipText(p)).append('\n');
+        if (repo != null) out.append(crumbText(repo));
+        out.append('\n');
+        for (int i = 0; i <= upTo && i < chips.size(); i++) out.append(chipText(chips.get(i))).append('\n');
+        return out.toString();
+    }
+
     /** The project chip: "[name]"; the waiting count is drawn beside it. */
     static String projectText(ProjectModel.Project p) {
         return "[" + (p == null ? "-" : p.name) + "]";

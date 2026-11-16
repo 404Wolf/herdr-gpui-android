@@ -303,6 +303,38 @@ public final class ProjectModelTest {
     }
 
     @Test
+    public void theBarsHeaderIsPartOfWhatItDrawsAndOfWhatMovesTheShownChip() throws Exception {
+        JSONArray workspaces = new JSONArray().put(new JSONObject().put("id", "s1").put("label", "w"));
+        JSONArray tabs = new JSONArray()
+                .put(new JSONObject().put("id", "a").put("workspace_id", "s1").put("label", "lead"))
+                .put(new JSONObject().put("id", "b").put("workspace_id", "s1").put("label", "traces"));
+        JSONObject lead = new JSONObject().put("id", "t10").put("workspace_id", "s1").put("tab_id", "a").put("role", "pm")
+                .put("project", "research-ui").put("created_ms", 1);
+        JSONObject worker = new JSONObject().put("id", "t11").put("workspace_id", "s1").put("tab_id", "b").put("parent", "t10");
+        JSONArray panes = new JSONArray().put(lead).put(worker);
+        ProjectModel.Project p = ProjectModel.projects(workspaces, tabs, panes).get(0);
+        List<ProjectBar.Chip> chips = ProjectBar.chips(p, 1, false);
+        String all = ProjectBar.drawn(p, "monopoly", chips, chips.size() - 1);
+        String before = ProjectBar.drawn(p, "monopoly", chips, 1);
+        assertEquals("[research-ui]\nmonopoly ›\n1 lead\n2 traces\n", all);
+        // The project renamed: what the bar draws changes, so it is rebuilt.
+        lead.put("project", "research-bar");
+        p = ProjectModel.projects(workspaces, tabs, panes).get(0);
+        chips = ProjectBar.chips(p, 1, false);
+        org.junit.Assert.assertNotEquals(all, ProjectBar.drawn(p, "monopoly", chips, chips.size() - 1));
+        // A window starts waiting on Wolf: "!1" before the shown chip moves it, so it is revealed.
+        lead.put("project", "research-ui");
+        worker.put("status", "blocked");
+        p = ProjectModel.projects(workspaces, tabs, panes).get(0);
+        chips = ProjectBar.chips(p, 1, false);
+        assertEquals("[research-ui] !1", ProjectBar.projectChipText(p));
+        org.junit.Assert.assertNotEquals(before, ProjectBar.drawn(p, "monopoly", chips, 1));
+        // The crumb too.
+        org.junit.Assert.assertNotEquals(ProjectBar.drawn(p, "monopoly", chips, 1), ProjectBar.drawn(p, "other", chips, 1));
+        org.junit.Assert.assertNotEquals(ProjectBar.drawn(p, "monopoly", chips, 1), ProjectBar.drawn(p, null, chips, 1));
+    }
+
+    @Test
     public void aCloneIsNamedByItsRemoteAsTheDesktopNamesIt() {
         // git.look's answer: a clone in /w/clone whose origin is org/monopoly, and a repo with no remote.
         FleetTree.GitLook look = FleetTree.parseGitLook(

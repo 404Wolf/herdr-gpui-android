@@ -2193,28 +2193,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Rebuild only when what the bar shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
+        // The exact text drawn (project chip, crumb, chips), and what is not
+        // drawn but acted on: which terminal and tab each chip is, and whether
+        // its tab is its project's alone (its menu's scope).
         StringBuilder signature = new StringBuilder(project == null ? "" : project.key).append('\t')
-                .append(project == null ? 0 : project.waiting).append('\t').append(needYou).append('\t')
-                .append(compact).append('\t').append(repo).append('\n');
-        // Whether each window's tab is its project's alone is drawn too (its
-        // menu's scope): another project's terminal joining the tab rebuilds.
-        StringBuilder before = new StringBuilder();
-        for (int i = 0; i < chips.size(); i++) {
-            ProjectBar.Chip c = chips.get(i);
-            signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.text)
-                    .append('\t').append(c.window.status).append('\t').append(c.active).append('\t')
-                    .append(ProjectModel.ownsTab(projects, project, c.window)).append('\n');
-            // What the chip shows, its status dot too (ProjectBar.dotted): either widens it.
-            if (i <= shown) before.append(c.text).append(ProjectBar.dotted(c.window.status) ? " ●" : "").append('\n');
+                .append(needYou).append('\t').append(compact).append('\n')
+                .append(ProjectBar.drawn(project, repo, chips, chips.size() - 1));
+        for (ProjectBar.Chip c : chips) {
+            signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.active)
+                    .append('\t').append(ProjectModel.ownsTab(projects, project, c.window)).append('\n');
         }
+        // Everything drawn before the shown chip, and it: a change there moves it.
+        String before = ProjectBar.drawn(project, repo, chips, shown);
         String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
         if (signature.toString().equals(tabSignature)) return;
         // A fold (the cover cuts names), or windows before it (or it) renamed,
         // move the shown chip too.
         boolean activeMoved = !activeId.equals(tabActive) || compact != tabCompact
-                || !before.toString().equals(tabBefore);
+                || !before.equals(tabBefore);
         tabCompact = compact;
-        tabBefore = before.toString();
+        tabBefore = before;
         tabSignature = signature.toString();
         tabActive = activeId;
         tabStrip.removeAllViews();
@@ -2222,7 +2220,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabStrip.addView(projectChip(project, target));
         if (repo != null) {
             TextView crumbText = new TextView(this);
-            crumbText.setText(repo + " ›");
+            crumbText.setText(ProjectBar.crumbText(repo));
             crumbText.setTextSize(11);
             crumbText.setSingleLine(true);
             crumbText.setTextColor(chrome.onSurfaceVariant);
@@ -2358,12 +2356,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private TextView projectChip(ProjectModel.Project project, Connection target) {
         TextView chip = new TextView(this);
-        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(ProjectBar.projectText(project));
-        text.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, text.length(), 0);
-        if (project != null && project.waiting > 0) {
-            int from = text.length();
-            text.append(" !").append(String.valueOf(project.waiting));
-            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.status("blocked")), from, text.length(), 0);
+        // ProjectBar.projectChipText, styled: the name bold, the waiting count in blocked's colour.
+        String drawn = ProjectBar.projectChipText(project);
+        int name = ProjectBar.projectText(project).length();
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(drawn);
+        text.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, name, 0);
+        if (drawn.length() > name) {
+            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.status("blocked")), name, drawn.length(), 0);
         }
         chip.setText(text);
         chip.setTextSize(12);
