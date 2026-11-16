@@ -480,6 +480,11 @@ pub(crate) const MONO_ADVANCE_EM: f32 = 1229. / 2048.;
 #[cfg(any(feature = "android-ui", test))]
 const DEFAULT_FONT: f32 = 13.;
 
+/// The largest terminal type size (logical pixels), also the most a grid
+/// narrower than the pane grows the type to (see `ui::shell_style`).
+#[cfg(any(feature = "android-ui", test))]
+pub(crate) const MAX_FONT: f32 = 36.;
+
 /// A classic terminal width, which a raw shell keeps on narrow panels.
 #[cfg(any(feature = "android-ui", test))]
 const SHELL_COLUMNS: f32 = 80.;
@@ -494,7 +499,7 @@ pub(crate) fn shell_font_size(preferences: DisplayPreferences, viewport_width: f
         return preferences.font_size;
     }
     let classic = viewport_width.max(0.) / (SHELL_COLUMNS * MONO_ADVANCE_EM);
-    (classic.min(DEFAULT_FONT) * preferences.scale).clamp(11., 36.)
+    (classic.min(DEFAULT_FONT) * preferences.scale).clamp(11., MAX_FONT)
 }
 
 /// Most a pane's row pitch may be spread. Past this, rows read as islands and

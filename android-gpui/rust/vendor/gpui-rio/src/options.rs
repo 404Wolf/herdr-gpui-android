@@ -49,5 +49,10 @@ pub struct TerminalStyle {
     pub theme: TerminalTheme,
     /// An installed monospace family, or "monospace" for platform fallback.
     pub font_family: String,
+    /// The type size the pane is measured, and offered to the remote side, at.
     pub font_size: f32,
+    /// Draw a grid narrower than the pane (another viewer sized it) with type
+    /// grown to fill the pane, up to this size; `None` letterboxes it. The
+    /// pane is still measured and offered at `font_size`.
+    pub grow_to_grid: Option<f32>,
 }
