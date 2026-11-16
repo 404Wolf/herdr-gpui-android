@@ -443,15 +443,35 @@ struct Held {
 }
 /// The terminal of the last closed session (or a saved pane read back), which
 /// the held frame draws.
+#[cfg(not(test))]
 fn held() -> &'static Mutex<Option<Held>> {
     static HELD: OnceLock<Mutex<Option<Held>>> = OnceLock::new();
     HELD.get_or_init(Mutex::default)
 }
+/// In tests the held frame is per thread: every test runs on its own
+/// thread, so another test's attach (on its own session thread) can never
+/// release this test's held frame.
+#[cfg(test)]
+fn held() -> &'static Mutex<Option<Held>> {
+    thread_local! {
+        static HELD: &'static Mutex<Option<Held>> = Box::leak(Box::default());
+    }
+    HELD.with(|held| *held)
+}
 /// A saved pane being drawn with no session: its render id and terminal.
 type Cached = Option<(u64, Arc<gpui_rio::Session>)>;
+#[cfg(not(test))]
 fn cached() -> &'static Mutex<Cached> {
     static CACHED: OnceLock<Mutex<Cached>> = OnceLock::new();
     CACHED.get_or_init(Mutex::default)
+}
+/// Per thread in tests, like [`held`].
+#[cfg(test)]
+fn cached() -> &'static Mutex<Cached> {
+    thread_local! {
+        static CACHED: &'static Mutex<Cached> = Box::leak(Box::default());
+    }
+    CACHED.with(|cached| *cached)
 }
 /// A new pane attached: its live grid is the one to scroll and draw now.
 pub(crate) fn release_held() {

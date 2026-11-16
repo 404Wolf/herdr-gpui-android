@@ -1410,7 +1410,12 @@ pub(crate) fn run(
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
-    result
+    match result {
+        // Cancelled while waiting on the socket: the phone closed the session,
+        // which is how it ends normally, not a failure.
+        Err(Error::Closed) if owner.cancel.is_cancelled() => Ok(()),
+        result => result,
+    }
 }
 
 fn serve(
@@ -2735,6 +2740,278 @@ mod connection_tests {
         session
     }
 
+    /// A grid started at `start` (the phone's own size), then given the
+    /// core's `grid` before any byte (as an attach does), with `lines`
+    /// numbered rows written into it: "row 0" first, the caret on a blank row
+    /// after the last.
+    fn written(start: (u16, u16), grid: (u16, u16), lines: usize) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        session.set_grid(grid.0, grid.1);
+        let text: String = (0..lines).map(|n| format!("row {n}\r\n")).collect();
+        tx.send(Chunk::Data(text.into_bytes())).unwrap();
+        drop(tx);
+        let last = format!("row {}", lines - 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen_text().contains(&last) || session.is_alive() {
+            assert!(Instant::now() < deadline, "the rows never reached the grid");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session
+    }
+
+    /// The rows drawn `offset` rows back, read the way the renderer reads
+    /// them (Line(row - offset) for each screen row), each trimmed; every
+    /// screen row is returned, blank ones too.
+    fn rows_back(session: &gpui_rio::Session, offset: i32) -> Vec<String> {
+        use rio_vt::crosswords::{grid::Scroll, pos::{Column, Line}};
+        let mut grid = session.grid().lock();
+        grid.scroll_display(Scroll::Bottom);
+        grid.scroll_display(Scroll::Delta(offset));
+        let shown = grid.display_offset() as i32;
+        let rows = (0..grid.screen_lines() as i32)
+            .map(|row| {
+                (0..grid.columns())
+                    .map(|col| match grid.grid[Line(row - shown)][Column(col)].c() {
+                        '\0' => ' ',
+                        c => c,
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        grid.scroll_display(Scroll::Bottom);
+        rows
+    }
+
+    /// What `offset` rows back must show on a `rows`-row screen after
+    /// `lines` numbered rows and a blank caret row: rows in order, newest last.
+    fn expected_back(lines: usize, rows: usize, offset: usize) -> Vec<String> {
+        // Screen rows are the last `rows` of: row 0 .. row lines-1, then "".
+        let all: Vec<String> = (0..lines).map(|n| format!("row {n}")).chain([String::new()]).collect();
+        let bottom = all.len() - offset;
+        all[bottom - rows..bottom].to_vec()
+    }
+
+    #[test]
+    fn scrolled_back_a_grid_shows_its_history_in_order_whatever_size_it_started_at() {
+        for (start, grid) in [((20, 4), (20, 4)), ((20, 6), (20, 4)), ((20, 3), (20, 4)), ((30, 5), (20, 4))] {
+            let session = written(start, grid, 30);
+            let history = session.grid().lock().history_size();
+            assert_eq!(history, 27, "{start:?} -> {grid:?}");
+            for offset in [1, 5, 21, 27] {
+                assert_eq!(rows_back(&session, offset as i32), expected_back(30, 4, offset), "{start:?} -> {grid:?} at {offset}");
+            }
+        }
+    }
+
+    /// All rows from the oldest history row to the last screen row, read the
+    /// way the renderer reads them: what scrolling all the way back shows,
+    /// then the screen.
+    fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
+        let history = session.grid().lock().history_size();
+        let mut out: Vec<String> = Vec::new();
+        for offset in (0..=history).rev() {
+            let shown = rows_back(session, offset as i32);
+            if offset == history {
+                out.extend(shown);
+            } else if let Some(last) = shown.last() {
+                out.push(last.clone());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_grid_made_smaller_then_larger_again_keeps_its_scrollback_in_order() {
+        // Each size the phone's pane goes through (keyboard up and down, a
+        // fold, the core's RESIZE): rows go into history and come back.
+        for (lines, small) in [(8usize, 5u16), (8, 3), (30, 5), (30, 8), (12, 9)] {
+            let session = written((20, 10), (20, 10), lines);
+            let before = all_rows(&session);
+            session.set_grid(20, small);
+            session.set_grid(20, 10);
+            let history = session.grid().lock().history_size();
+            let after = all_rows(&session);
+            assert_eq!(after.iter().filter(|r| !r.is_empty()).collect::<Vec<_>>(),
+                before.iter().filter(|r| !r.is_empty()).collect::<Vec<_>>(),
+                "{lines} rows, 10 -> {small} -> 10, history {history}");
+            // No row is shown twice: history never repeats the screen.
+            let mut seen = std::collections::HashSet::new();
+            for row in after.iter().filter(|r| !r.is_empty()) {
+                assert!(seen.insert(row.clone()), "{row} shown twice after 10 -> {small} -> 10: {after:?}");
+            }
+        }
+    }
+
+    /// What herdr-core sends a viewer to repaint a pane (ghostty-vt
+    /// `Terminal::paint`): a reset ending in ESC[H ESC[2J, then (on a first
+    /// paint) the history pushed up with newlines and erased, then the scroll
+    /// region and the screen rows from the top.
+    fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+        let mut out = String::from("\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J");
+        if !history.is_empty() {
+            out.push_str(&history.join("\r\n"));
+            out.push_str("\x1b[0m\r\n");
+            out.push_str(&"\n".repeat(rows));
+            out.push_str("\x1b[H\x1b[2J");
+        }
+        out.push_str(&format!("\x1b[1;{rows}r\x1b[H"));
+        out.push_str(&screen.join("\r\n"));
+        out.into_bytes()
+    }
+
+    /// A pane fed `chunks` in order, as one attach would deliver them.
+    fn painted(cols: u16, rows: u16, chunks: Vec<Vec<u8>>) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        for chunk in chunks {
+            tx.send(Chunk::Data(chunk)).unwrap();
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.is_alive() {
+            assert!(Instant::now() < deadline, "the paint was never parsed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session
+    }
+
+    /// Item 77 (A): scrolling back showed the screen again, as if the rows
+    /// had rotated. Each core repaint (first paint, a RESIZE, showing the
+    /// viewer again) starts with ESC[2J, which copied the screen into the
+    /// phone's scrollback. The scrollback is the pane's history, once.
+    #[test]
+    fn core_repaints_never_copy_the_screen_into_the_scrollback() {
+        let line = |name: &str, n: usize| format!("{name} {n}");
+        // A pane longer than the screen: 30 history rows, a 10-row screen.
+        let history: Vec<String> = (0..30).map(|n| line("old", n)).collect();
+        let screen: Vec<String> = (0..10).map(|n| line("now", n)).collect();
+        let first = core_paint(&history, &screen, 10);
+        let again = core_paint(&[], &screen, 10);
+        let pane = painted(20, 10, vec![first, again.clone(), again]);
+        let shown: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+        let expected: Vec<String> = history.iter().chain(&screen).cloned().collect();
+        assert_eq!(shown, expected);
+        // Every offset shows rows in order, newest at the bottom.
+        let history_rows = pane.grid().lock().history_size();
+        let top = rows_back(&pane, history_rows as i32);
+        assert_eq!(top.first().map(String::as_str), Some("old 0"));
+        // A pane that fits its screen has nothing to scroll back to, however often it is repainted.
+        let short: Vec<String> = (0..4).map(|n| line("note", n)).collect();
+        let fits = painted(20, 10, vec![core_paint(&[], &short, 10), core_paint(&[], &short, 10), core_paint(&[], &short, 10)]);
+        assert_eq!(fits.grid().lock().history_size(), 0);
+        assert_eq!(rows_back(&fits, 5), rows_back(&fits, 0), "nothing to scroll back to");
+    }
+
+    /// A pane fed `chunks` (DATA and the core's RESIZE) in stream order.
+    fn streamed(cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(64);
+        let (commands, _credits) = mpsc::sync_channel(4096);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
+        *lock(&slot) = Arc::downgrade(&pane);
+        pane.set_grid(cols, rows);
+        for chunk in chunks {
+            tx.send(chunk).unwrap();
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.is_alive() {
+            assert!(Instant::now() < deadline, "the stream was never parsed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pane
+    }
+
+    /// Item 77 / review of #24: after the core resizes a pane it repaints
+    /// only its screen, and it may have moved more (or fewer) rows into its
+    /// history than the phone did. The repaint right after a RESIZE keeps the
+    /// phone's old screen in history, so no row is ever lost; at worst a few
+    /// show twice. Repaints without a RESIZE still copy nothing.
+    #[test]
+    fn a_core_resize_never_loses_a_row_whichever_side_moved_more() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        // The core moved 4 rows into its history (the phone moves 2), and the
+        // core moved none on the way back (the phone pulls some back).
+        for (rows, shown) in [(8u16, 6usize), (8, 8), (6, 6), (12, 10)] {
+            let after = core_paint(&[], &all[all.len() - shown..], usize::from(rows));
+            let pane = streamed(20, 10, vec![Chunk::Data(first.clone()), Chunk::Grid(20, rows), Chunk::Data(after)]);
+            let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+            for line in &all {
+                assert!(rows_seen.contains(line), "{line} lost at 10 -> {rows} rows: {rows_seen:?}");
+            }
+            // In order: each line first appears after the one before it.
+            let firsts: Vec<usize> = all.iter().map(|l| rows_seen.iter().position(|r| r == l).unwrap()).collect();
+            assert!(firsts.windows(2).all(|w| w[0] < w[1]), "out of order at 10 -> {rows}: {rows_seen:?}");
+        }
+        // A repaint with no resize before it copies nothing.
+        let again = core_paint(&[], &all[40..], 10);
+        let pane = streamed(20, 10, vec![Chunk::Data(first), Chunk::Data(again.clone()), Chunk::Data(again)]);
+        let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+        assert_eq!(rows_seen, all);
+    }
+
+    /// A saved copy read back (a switch, a close or a checkpoint wrote it).
+    fn restored(session: &gpui_rio::Session, max_bytes: usize) -> Arc<gpui_rio::Session> {
+        let bytes = crate::snapshot::encode(&session.grid().lock(), max_bytes);
+        let (cols, rows) = session.grid_size();
+        let copy = crate::snapshot::restore(crate::snapshot::Saved { cols, rows, pane: "t1".into(), bytes }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while copy.is_alive() {
+            assert!(Instant::now() < deadline, "the copy was never parsed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        copy
+    }
+
+    #[test]
+    fn a_saved_copy_scrolls_back_through_the_same_history_in_order() {
+        let session = written((20, 6), (20, 4), 30);
+        let copy = restored(&session, crate::snapshot::MAX_BYTES);
+        assert_eq!(copy.grid().lock().history_size(), 27);
+        for offset in [1, 5, 21, 27] {
+            assert_eq!(rows_back(&copy, offset), expected_back(30, 4, offset as usize), "at {offset}");
+        }
+    }
+
+    #[test]
+    fn a_copy_cut_to_its_size_cap_keeps_the_newest_history_in_order() {
+        let session = written((20, 4), (20, 4), 300);
+        // Room for the screen and about 50 rows of history ("row NNN" + CRLF).
+        let copy = restored(&session, 60 * 9);
+        let history = copy.grid().lock().history_size();
+        assert!((40..60).contains(&history), "kept {history} rows");
+        for offset in [1, history / 2, history] {
+            assert_eq!(rows_back(&copy, offset as i32), expected_back(300, 4, offset), "at {offset}");
+        }
+    }
+
+    #[test]
+    fn a_grid_wider_than_the_pane_scrolls_back_in_order_and_keeps_its_pan() {
+        // The core holds a 40-column grid; the phone's pane is 20 wide (#15).
+        let session = written((20, 4), (40, 4), 30);
+        assert_eq!(session.grid_size(), (40, 4));
+        assert_eq!(rows_back(&session, 9), expected_back(30, 4, 9));
+        // Scrolled back, the drawn window starts at the top row and the panned column.
+        assert_eq!(gpui_rio::view_origin((40, 4), (20, 4), (3, 0), true, Some(12)), (0, 12));
+        assert_eq!(gpui_rio::view_origin((40, 4), (20, 4), (3, 0), true, None), (0, 0));
+    }
+
     #[test]
     fn a_pane_switched_away_from_is_saved_once_from_the_kept_grid_and_the_slot_stays_bounded() {
         let _serial = crate::remote::departed_test_lock();
@@ -3162,6 +3439,13 @@ mod claim_tests {
         *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
         let Seen::Attach(params) = core.next() else { panic!("attach the pick") };
         assert_eq!(params["terminal"], "t2");
+        // Closed only once the attach was answered: closing while it waits
+        // for its reply ends the session before there is a channel to detach.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&core.owner.state).view["pane_id"] != "t2" {
+            assert!(Instant::now() < deadline, "the attach was never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(core.close().iter().any(|seen| *seen == Seen::Frame(2, DETACH, Vec::new())));
     }
 }
