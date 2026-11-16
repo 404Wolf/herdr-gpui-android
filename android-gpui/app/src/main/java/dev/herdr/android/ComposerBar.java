@@ -175,7 +175,14 @@ final class ComposerBar {
         @Override public void transcribedOnPhone() {
             transcribedOnPhone = true;
         }
+
+        @Override public void finishing() {
+            finishing = true;
+            pushGhost();
+        }
     });
+    /** The desktop said its final waits for a decode ("finishing…"), until the session ends. */
+    private boolean finishing;
     /** Our own setText calls, which must not count as user edits. */
     private boolean updatingField;
 
@@ -652,6 +659,7 @@ final class ComposerBar {
             case "type": toggleTyping(); break;
             case "hide": hideKeyboard(); break;
             case "talk": toggleDictation(); break;
+            case "retry": retryParked(); break;
             case "send": {
                 // The count after "send" lists the queue; the word itself sends.
                 ControlTargets.Cells cells = null;
@@ -671,6 +679,7 @@ final class ComposerBar {
             case "type": return "Type a message";
             case "hide": return "Hide the keyboard";
             case "talk": return "Dictate; tap again to stop";
+            case "retry": return "Send the recordings not transcribed yet to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
             default: return id;
         }
@@ -706,10 +715,57 @@ final class ComposerBar {
     /** Characters of the queued count drawn after "send" ("·2"), 0 when none. */
     private int sendCount;
 
+    /** Recordings the desktop gave up on (after {@code ClipStore.MAX_ATTEMPTS} uploads). */
+    private java.util.Set<String> parkedIds() {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (PendingClip clip : Dictation.pending(context).parked()) ids.add(clip.id);
+        return ids;
+    }
+
+    /** The pane's parked recordings: in its draft, or recorded for it. */
+    private java.util.List<String> parkedHere() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        java.util.List<String> inDraft = DictationToken.ids(drafts.text());
+        for (PendingClip clip : Dictation.pending(context).parked()) {
+            if (inDraft.contains(clip.id) || drafts.pane().equals(clip.target)) out.add(clip.id);
+        }
+        return out;
+    }
+
+    /** "retry": the pane's parked recordings go back to waiting for the desktop. */
+    private void retryParked() {
+        java.util.List<String> ids = parkedHere();
+        for (String id : ids) Dictation.pending(context).retry(id);
+        if (!ids.isEmpty()) host.notice(ids.size() == 1 ? "Sending the recording to the desktop again"
+                : "Sending " + ids.size() + " recordings to the desktop again");
+        DraftChips.apply(field.getText(), chip());
+        pushGhost();
+    }
+
     /** The controls drawn in the program's frame, for the current state and the grid's width. */
     private java.util.List<GhostText.Control> controls() {
+        java.util.List<GhostText.Control> line = basicControls();
+        int parked = parkedHere().size();
+        return parked == 0 ? line : withRetry(line, parked);
+    }
+
+    /**
+     * {@code line} with "retry" after "talk" (or first): the parked recordings' chips say
+     * "not transcribed yet · retry", and this sends them again. Never left out while any is parked.
+     */
+    static java.util.List<GhostText.Control> withRetry(java.util.List<GhostText.Control> line, int parked) {
+        java.util.List<GhostText.Control> out = new java.util.ArrayList<>(line);
+        int at = 0;
+        for (int i = 0; i < out.size(); i++) if ("talk".equals(out.get(i).id)) at = i + 1;
+        out.add(at, new GhostText.Control("retry", parked == 1 ? "retry" : "retry " + parked, "warn"));
+        return out;
+    }
+
+    private java.util.List<GhostText.Control> basicControls() {
         boolean dictates = dictation.isAvailable();
         int cols = layout == null ? Integer.MAX_VALUE : layout.cols;
+        // Room for "retry" when a recording is parked, so the line still fits.
+        if (cols != Integer.MAX_VALUE && !parkedHere().isEmpty()) cols -= "retry 9".length() + 3;
         java.util.List<GhostText.Control> talks = dictates
                 ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
                 : java.util.Collections.emptyList();
@@ -824,7 +880,8 @@ final class ComposerBar {
                 return new GhostText.Control("talk", text, "danger");
             }
             case TRANSCRIBING:
-                return new GhostText.Control("talk", words == Words.TINY ? "…" : "transcribing…", "info");
+                return new GhostText.Control("talk", words == Words.TINY ? "…"
+                        : finishing ? "finishing…" : "transcribing…", "info");
             case ON_DEVICE: {
                 // The phone transcribes: the warning colour says offline when the words cannot.
                 String text;
@@ -864,7 +921,7 @@ final class ComposerBar {
                 partialFrom = composingFrom(drafts.text().length(), BaseInputConnection.getComposingSpanStart(typed),
                         BaseInputConnection.getComposingSpanEnd(typed));
             }
-            json = GhostText.json(GhostText.kind(kind), drafts.text(), partialFrom, clipLengths,
+            json = GhostText.json(GhostText.kind(kind), drafts.text(), partialFrom, clipLengths, parkedIds(),
                     queuedMessages, drafts.pane(), controls(), GhostText.Colors.of(chrome));
         }
         if (json.equals(lastGhost)) return;
@@ -1049,6 +1106,7 @@ final class ComposerBar {
     private void setDictationState(DictationEngine.State state) {
         boolean wasRecording = recording(dictationState);
         dictationState = state;
+        if (state != DictationEngine.State.TRANSCRIBING) finishing = false;
         boolean recording = recording(state);
         if (recording && !wasRecording) recordingSince = android.os.SystemClock.elapsedRealtime();
         if (!recording) recordingSince = 0;
@@ -1136,7 +1194,7 @@ final class ComposerBar {
 
     /** How a waiting dictation's token reads in the field and the fallback. */
     private DraftChips.Style chip() {
-        return new DraftChips.Style(chrome.warning, density, clipLengths,
+        return new DraftChips.Style(chrome.warning, density, clipLengths, parkedIds(),
                 context.getDrawable(R.drawable.ic_bar_schedule));
     }
 

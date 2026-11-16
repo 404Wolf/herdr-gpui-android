@@ -225,6 +225,27 @@ public final class ServerDictationEngineTest {
         assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(run.listener.pendingClip.id).toPath()));
     }
 
+    @Test public void theLiveStartCarriesTheRecordingsIdThatAQueuedClipKeeps() throws Exception {
+        // Never ready, no recognizer: the session records for later, under the id it started with.
+        server = new FakeServer(Behaviour.silent());
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertNotNull(run.listener.pendingClip);
+        JSONObject start = server.starts.get(0);
+        assertEquals("live", start.getString("mode"));
+        assertEquals(16000, start.getInt("sample_rate"));
+        assertEquals("the courier resends it under the same id", run.listener.pendingClip.id, start.getString("id"));
+    }
+
+    @Test public void finishingIsShownAndTheFinalStillLands() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU).finishing().finalAfter(300));
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertEquals(1, run.listener.finishing);
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertFalse(run.listener.onDevice);
+    }
+
     @Test public void withoutARecognizerASlowDesktopIsWaitedForLonger() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU).finalAfter(1200));
         Run run = dictate(server.uri(), null, 300);
@@ -349,6 +370,12 @@ public final class ServerDictationEngineTest {
 
         @Override public void onPartial(String text) {
             partials.add(text);
+        }
+
+        volatile int finishing;
+
+        @Override public void onFinishing(double tailSeconds) {
+            finishing++;
         }
 
         @Override public void onFinal(String text) {

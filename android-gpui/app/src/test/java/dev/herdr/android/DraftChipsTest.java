@@ -33,4 +33,10 @@ public final class DraftChipsTest {
         assertEquals("0:00", DraftChips.clock(-5));
         assertEquals("10:00", DraftChips.clock(600_000));
     }
+
+    @Test public void aParkedRecordingsChipSaysItIsNotTranscribedAndCanBeRetried() {
+        assertEquals("2:04 not transcribed yet · retry", DraftChips.label(124_600L, true));
+        assertEquals("not transcribed yet · retry", DraftChips.label(null, true));
+        assertEquals("2:04 waiting for desktop", DraftChips.label(124_600L, false));
+    }
 }

@@ -271,4 +271,16 @@ public final class ComposerBarTest {
         assertTrue(ComposerBar.stripKeeps(android.view.MotionEvent.ACTION_MOVE));
         assertTrue(ComposerBar.stripKeeps(android.view.MotionEvent.ACTION_UP));
     }
+
+    @Test public void aParkedRecordingAddsRetryAfterTalk() {
+        java.util.List<GhostText.Control> line = ComposerBar.withRetry(java.util.Arrays.asList(
+                new GhostText.Control("type", "type", "dim"), TALK, new GhostText.Control("send", "send", "bright")), 1);
+        assertEquals("type talk retry send", ids(line));
+        assertEquals("retry", line.get(2).spans[0]);
+        assertEquals("warn", line.get(2).spans[1]);
+        assertEquals("retry 2", ComposerBar.withRetry(java.util.Collections.singletonList(TALK), 2).get(1).spans[0]);
+        // Without dictation there is no talk: retry leads.
+        assertEquals("retry send", ids(ComposerBar.withRetry(java.util.Collections.singletonList(
+                new GhostText.Control("send", "send", "bright")), 1)));
+    }
 }

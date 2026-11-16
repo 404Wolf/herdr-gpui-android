@@ -33,6 +33,8 @@ final class ClipStore {
     static final long MAX_TOTAL_BYTES = 30L * 60 * BYTES_PER_SECOND;
     static final int MAX_CLIPS = 64;
     static final String INDEX = "index-v1.json";
+    /** Uploads a clip gets before it is parked: a long clip is never re-decoded without end. */
+    static final int MAX_ATTEMPTS = 3;
     /** How long a recording the phone transcribed itself is kept: 48 h. */
     static final long KEEP_MS = 48L * 60 * 60 * 1000;
 
@@ -48,11 +50,22 @@ final class ClipStore {
             this(clip, bytes, text, 0);
         }
 
+        /** Uploads the desktop took and then failed to finish (slow, unavailable, cut off). */
+        final int attempts;
+        /** Given up on after {@link #MAX_ATTEMPTS}: kept and shown, sent again only by hand. */
+        final boolean parked;
+
         Entry(PendingClip clip, long bytes, String text, long keptUntil) {
+            this(clip, bytes, text, keptUntil, 0, false);
+        }
+
+        Entry(PendingClip clip, long bytes, String text, long keptUntil, int attempts, boolean parked) {
             this.clip = clip;
             this.bytes = bytes;
             this.text = text;
             this.keptUntil = keptUntil;
+            this.attempts = attempts;
+            this.parked = parked;
         }
 
         boolean kept() {
@@ -261,11 +274,45 @@ final class ClipStore {
         return new File(dir, id + ".pcm");
     }
 
-    /** The clips still waiting for the desktop, oldest first. */
+    /** The clips still waiting for the desktop, oldest first (parked and kept ones not). */
     synchronized List<PendingClip> untranscribed() {
         List<PendingClip> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text == null && !e.kept()) out.add(e.clip);
+        for (Entry e : entries) if (e.text == null && !e.kept() && !e.parked) out.add(e.clip);
         return out;
+    }
+
+    /** Clips given up on after {@link #MAX_ATTEMPTS} uploads, oldest first: sent again only by hand. */
+    synchronized List<PendingClip> parked() {
+        List<PendingClip> out = new ArrayList<>();
+        for (Entry e : entries) if (e.text == null && !e.kept() && e.parked) out.add(e.clip);
+        return out;
+    }
+
+    /**
+     * An upload of {@code id} reached the desktop and did not come back with its text: counted,
+     * and at {@link #MAX_ATTEMPTS} the clip is parked. The attempts so far, -1 if unknown.
+     */
+    synchronized int attempted(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.text != null) continue;
+            int n = e.attempts + 1;
+            entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, n >= MAX_ATTEMPTS));
+            save();
+            return n;
+        }
+        return -1;
+    }
+
+    /** The user's retry of a parked clip: it waits for the desktop again, its count reset. */
+    synchronized boolean unpark(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || !e.parked) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, 0, false));
+            return save();
+        }
+        return false;
     }
 
     /**
@@ -333,7 +380,8 @@ final class ClipStore {
                     if (keptUntil != 0 && keptUntil <= clock.getAsLong()) continue;
                     PendingClip clip = new PendingClip(id, PendingClip.cutTarget(o.optString("target")),
                             o.getLong("created"), o.getLong("duration"));
-                    entries.add(new Entry(clip, bytes, clipText, keptUntil));
+                    entries.add(new Entry(clip, bytes, clipText, keptUntil, o.optInt("attempts", 0),
+                            o.optBoolean("parked", false)));
                 }
             } catch (JSONException damaged) {
                 entries.clear();
@@ -364,6 +412,8 @@ final class ClipStore {
                 o.put("bytes", e.bytes);
                 o.put("text", e.text == null ? JSONObject.NULL : e.text);
                 if (e.kept()) o.put("keptUntil", e.keptUntil);
+                if (e.attempts > 0) o.put("attempts", e.attempts);
+                if (e.parked) o.put("parked", true);
                 list.put(o);
             }
             write(new File(dir, INDEX), list.toString());

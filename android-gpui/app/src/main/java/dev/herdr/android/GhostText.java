@@ -68,6 +68,13 @@ final class GhostText {
      */
     static String json(String kind, String draft, int partialFrom, Map<String, Long> lengths,
             List<Outbox.Message> queued, String pane, List<Control> controls, Colors colors) {
+        return json(kind, draft, partialFrom, lengths, java.util.Collections.emptySet(), queued, pane, controls, colors);
+    }
+
+    /** @param parked recordings the desktop gave up on: their chips read "not transcribed yet · retry" */
+    static String json(String kind, String draft, int partialFrom, Map<String, Long> lengths,
+            java.util.Set<String> parked, List<Outbox.Message> queued, String pane, List<Control> controls,
+            Colors colors) {
         try {
             JSONObject o = new JSONObject();
             o.put("kind", kind);
@@ -88,17 +95,17 @@ final class GhostText {
             if (text.length() > MAX_CHARS) text = "…" + text.substring(text.length() - MAX_CHARS);
             JSONArray spans = new JSONArray();
             if (partialFrom >= 0 && partialFrom <= text.length()) {
-                spans(spans, text.substring(0, partialFrom), "text", lengths);
-                spans(spans, text.substring(partialFrom), "partial", lengths);
+                spans(spans, text.substring(0, partialFrom), "text", lengths, parked);
+                spans(spans, text.substring(partialFrom), "partial", lengths, parked);
             } else {
-                spans(spans, text, "text", lengths);
+                spans(spans, text, "text", lengths, parked);
             }
             o.put("draft", spans);
             JSONArray echoes = new JSONArray();
             int from = Math.max(0, queued.size() - MAX_ECHOES);
             for (Outbox.Message message : queued.subList(from, queued.size())) {
                 JSONArray echo = new JSONArray();
-                spans(echo, QueuedMessages.PROMPT + QueuedMessages.oneLine(message.text), "echo", lengths);
+                spans(echo, QueuedMessages.PROMPT + QueuedMessages.oneLine(message.text), "echo", lengths, parked);
                 boolean unsure = message.state == Outbox.State.UNSURE || message.state == Outbox.State.GONE;
                 echo.put(span("  " + QueuedMessages.label(message, pane), unsure ? "warn" : "tag"));
                 echoes.put(echo);
@@ -111,14 +118,14 @@ final class GhostText {
     }
 
     /** {@code text} as spans of {@code style}, each dictation token a chip. */
-    private static void spans(JSONArray out, String text, String style, Map<String, Long> lengths)
-            throws JSONException {
+    private static void spans(JSONArray out, String text, String style, Map<String, Long> lengths,
+            java.util.Set<String> parked) throws JSONException {
         Matcher m = DictationToken.PATTERN.matcher(text);
         int at = 0;
         while (m.find()) {
             if (m.start() > at) out.put(span(text.substring(at, m.start()), style));
             // Brackets, in the terminal's own font: it has no clock glyph.
-            out.put(span("[" + DraftChips.label(lengths.get(m.group(1))) + "]", "chip"));
+            out.put(span("[" + DraftChips.label(lengths.get(m.group(1)), parked.contains(m.group(1))) + "]", "chip"));
             at = m.end();
         }
         if (at < text.length()) out.put(span(text.substring(at), style));

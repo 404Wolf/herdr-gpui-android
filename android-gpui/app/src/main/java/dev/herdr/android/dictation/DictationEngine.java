@@ -69,6 +69,12 @@ public interface DictationEngine {
             onFinal(text);
         }
 
+        /**
+         * After stop, the desktop's final waits for a decode in flight or queued
+         * ({@code {"type":"status","state":"finishing"}}): show "finishing…"; the final follows.
+         */
+        default void onFinishing(double tailSeconds) { }
+
         void onState(State state);
 
         /** The session failed; {@link State#IDLE} follows and no onFinal. */

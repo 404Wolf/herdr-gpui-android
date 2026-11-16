@@ -539,7 +539,9 @@ public final class ServerDictationEngine implements DictationEngine {
             socket = s;
             try {
                 if (cancelled) return;
-                s.sendText("{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}");
+                // The recording's id: the courier resends a kept clip under the same id, so the
+                // desktop resumes from what it decoded or answers from its cache.
+                s.sendText(PendingDictations.startMessage(recording.id, "live"));
                 while (true) {
                     WebSocketFrames.Message m = s.read();
                     if (m == null) throw new IOException("the server closed the session");
@@ -550,6 +552,8 @@ public final class ServerDictationEngine implements DictationEngine {
                     if (type.equals("ready")) {
                         boolean fast = fastBackend(e);
                         String backend = e.optString("backend", "gpu");
+                        // The courier learns the desktop's state from every live session.
+                        pending.desktopReady(fast);
                         post(() -> {
                             if (offline) return;
                             if (!fast && local != null) {
@@ -561,8 +565,15 @@ public final class ServerDictationEngine implements DictationEngine {
                             ready = s;
                             settled.countDown();
                             listener.onState(stopping ? State.TRANSCRIBING : State.LISTENING);
-                            pending.kick(0);
                         });
+                    } else if (type.equals("status")) {
+                        // "finishing": the final waits for a decode; it follows, not an error.
+                        if ("finishing".equals(e.optString("state"))) {
+                            double tail = e.optDouble("tail_s", 0);
+                            post(() -> {
+                                if (!offline) listener.onFinishing(tail);
+                            });
+                        }
                     } else if (type.equals("partial")) {
                         post(() -> {
                             if (offline) return;
@@ -583,6 +594,7 @@ public final class ServerDictationEngine implements DictationEngine {
                     } else if (type.equals("error")) {
                         // e.g. the desktop's Whisper is slow or down: the recording is still good.
                         String code = e.optString("code", "unknown");
+                        if (UploadFailure.degradedCode(code)) pending.desktopDegraded();
                         throw new IOException("server error " + code + ": " + e.optString("message"));
                     }
                 }

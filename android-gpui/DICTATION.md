@@ -120,6 +120,19 @@ mic ──▶ recording (app storage, always)
   `HerdrDictation` says which path each session took (reasons and timings,
   never text).
 
+## Long dictations and a slow desktop: never resent without end
+
+On 15 November 2026 one 124.6 s clip was uploaded four times in two minutes. Each upload was cut off by `backend_slow`, and every new live session reset the courier's wait. Now:
+
+- **Every start carries the recording's id:**
+  `{"type":"start","sample_rate":16000,"id":"<recording uuid>","mode":"live"|"upload"}`.
+  The live session and every courier resend use the same id. The desktop resumes from what it already decoded, or answers from its cached final, and it holds an upload (`mode: upload`) to no realtime budget (agreed with server.py).
+- **The courier sends nothing to a desktop that is not on its GPU.** It reads `ready` first, and if the backend is not `gpu` it closes without sending audio, and that is not counted.
+- **A degraded desktop means a long wait.** That is `ready.backend` other than `gpu`, or `backend_slow` / `backend_unavailable`, on an upload or in a live session. The wait is 2 min, doubling to 30 min. New sessions, the network coming back and new clips do not cut it short. Only a live session finding the desktop on its GPU ends it.
+- **An upload the desktop took and did not finish is counted.** After 3 (`ClipStore.MAX_ATTEMPTS`, kept on disk) the clip is parked. Its audio is kept and its chip reads `[2:04 not transcribed yet · retry]`. The prompt line gets a `retry` control that sends the pane's parked clips again. A clip's audio is deleted only once its final has been received and stored.
+- **After stop the desktop may say** `{"type":"status","state":"finishing","tail_s":12.3}`. `talk` then reads `finishing…`, and the final follows; it is not an error.
+- Tests: `CourierDegradedTest` covers the 124.6 s replay (3 sends at most, growing gaps, one final, audio deleted only after it), sessions on the CPU never cutting the wait short, resuming on the GPU, a manual retry, and the upload protocol against a fake desktop.
+
 ## Why this design: measurements (11 November 2026)
 
 Clips: 73 LibriSpeech dev-clean utterances (8 min, 6.6 s mean); 3 of the same

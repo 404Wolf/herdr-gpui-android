@@ -33,6 +33,9 @@ final class DictationRouting {
 
         /** The text just placed on screen is the phone's: say so ("talk offline"). */
         void transcribedOnPhone();
+
+        /** The desktop's final waits for a decode: "finishing…" instead of "transcribing…". */
+        default void finishing() { }
     }
 
     /** What the composer's Enter does in a dictation state ({@link #onEnter}). */
@@ -115,6 +118,10 @@ final class DictationRouting {
                 if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPending(clip.id));
                 // A message sent with the chip waits in the outbox until the desktop fills it in.
                 settle(DictationEngine.State.PENDING);
+            }
+
+            @Override public void onFinishing(double tailSeconds) {
+                bar.finishing();
             }
 
             @Override public void onState(DictationEngine.State state) {
