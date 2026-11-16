@@ -79,6 +79,10 @@ struct Shared {
     /// Grid changes queued in stream order, for the reader to apply at its
     /// parser boundary (after flushing a pending synchronized update).
     grid_controls: Mutex<std::collections::VecDeque<(u16, u16)>>,
+    /// The remote side repaints its history after it changes the grid
+    /// (herdr-core's `resize_history`): that repaint clears and replaces this
+    /// scrollback, so no old screen is kept in history on a grid change.
+    history_on_resize: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -152,6 +156,7 @@ impl Session {
             offer: Mutex::new((columns, lines)),
             negotiated: Mutex::new(None),
             grid_controls: Mutex::new(std::collections::VecDeque::new()),
+            history_on_resize: AtomicBool::new(false),
         });
         let (input_queue, queued) = mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
         thread::Builder::new()
@@ -268,6 +273,14 @@ impl Session {
         if offered || regrid {
             self.dirty.store(true, Ordering::Release);
         }
+    }
+
+    /// Whether the remote side's repaint after a grid change carries its
+    /// history (and clears this scrollback first). Then the old screen is not
+    /// kept in history on a grid change: the repaint brings the remote's
+    /// exact history instead, so no row shows twice.
+    pub fn set_history_on_resize(&self, yes: bool) {
+        self.shared.history_on_resize.store(yes, Ordering::Release);
     }
 
     /// The remote side's authoritative grid (it sends one before repainting at
@@ -521,7 +534,9 @@ impl Reader {
                 }
                 drop(grid);
                 *lock(&self.shared.negotiated) = Some((columns, lines));
-                if apply_grid(&self.grid, &self.shared, (columns, lines), None) {
+                if apply_grid(&self.grid, &self.shared, (columns, lines), None)
+                    && !self.shared.history_on_resize.load(Ordering::Acquire)
+                {
                     // The remote side moved rows between screen and history
                     // its own way and repaints only its screen next: that
                     // repaint's erase keeps this screen in history, so no row

@@ -78,7 +78,15 @@ struct Connection<'a> {
     negotiated: bool,
     /// How this viewer claims the attached pane's grid.
     claim: Claim,
+    /// The core's hello offered `resize_history`: asked for on every attach,
+    /// the repaint after a RESIZE then carries the pane's history (after an
+    /// ESC[3J), so the phone's scrollback after a resize is exactly the core's.
+    history_on_resize: bool,
 }
+
+/// History rows the repaint after a RESIZE carries, when the core offers it
+/// (the same as an attach's first paint).
+const RESIZE_HISTORY: usize = 1000;
 
 /// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
 const DETACH: u8 = 2;
@@ -908,10 +916,11 @@ impl Connection<'_> {
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
         }
-        let reply = self.call(
-            "terminal.attach",
-            attach_params(terminal, cols, rows, self.claim.offered),
-        )?;
+        let mut params = attach_params(terminal, cols, rows, self.claim.offered);
+        if self.history_on_resize {
+            params["resize_history"] = json!(RESIZE_HISTORY);
+        }
+        let reply = self.call("terminal.attach", params)?;
         // A core (and path) that will send RESIZE before repainting says so;
         // an older one does not, and the phone's own size stays the grid.
         self.negotiated = reply["resize_notifications"] == true;
@@ -957,6 +966,9 @@ impl Connection<'_> {
         if let Some((cols, rows)) = initial_grid(&reply) {
             terminal_session.set_grid(cols, rows);
         }
+        // Before any byte of the stream: a core that repaints its history
+        // after a RESIZE makes the phone's own old-screen copy unneeded.
+        terminal_session.set_history_on_resize(self.history_on_resize);
         *lock(&session_slot) = Arc::downgrade(&terminal_session);
         crate::remote::release_held();
         self.channel = channel;
@@ -1352,6 +1364,12 @@ fn attach_params(terminal: &str, cols: u16, rows: u16, visibility: bool) -> Valu
     }
     params
 }
+/// Whether the core's hello lists `feature`.
+fn offers(hello: &Value, feature: &str) -> bool {
+    hello["result"]["features"]
+        .as_array()
+        .is_some_and(|features| features.iter().any(|f| f == feature))
+}
 /// The PTY's grid from an attach reply, when the path negotiated RESIZE.
 fn initial_grid(reply: &Value) -> Option<(u16, u16)> {
     if reply["resize_notifications"] != true {
@@ -1649,11 +1667,10 @@ pub(crate) fn run(
         dirty: false,
         negotiated: false,
         claim: Claim {
-            offered: hello["result"]["features"]
-                .as_array()
-                .is_some_and(|features| features.iter().any(|f| f == "viewer_visibility")),
+            offered: offers(&hello, "viewer_visibility"),
             ..Claim::default()
         },
+        history_on_resize: offers(&hello, "resize_history"),
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -3285,12 +3302,19 @@ mod connection_tests {
 
     /// A pane fed `chunks` (DATA and the core's RESIZE) in stream order.
     fn streamed(cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
+        streamed_as(false, cols, rows, chunks)
+    }
+
+    /// As [`streamed`], for a core that does (`history_on_resize`) or does
+    /// not repaint its history after a RESIZE.
+    fn streamed_as(history_on_resize: bool, cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
         let (tx, rx) = mpsc::sync_channel(64);
         let (commands, _credits) = mpsc::sync_channel(4096);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
         let input = StreamWrite { commands, channel: 9 };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
+        pane.set_history_on_resize(history_on_resize);
         *lock(&slot) = Arc::downgrade(&pane);
         pane.set_grid(cols, rows);
         for chunk in chunks {
@@ -3332,6 +3356,27 @@ mod connection_tests {
         let pane = streamed(20, 10, vec![Chunk::Data(first), Chunk::Data(again.clone()), Chunk::Data(again)]);
         let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
         assert_eq!(rows_seen, all);
+    }
+
+    /// With a core that offers `resize_history`, the repaint after a RESIZE
+    /// is CAN, the reset, ESC[3J, the history and the screen: the phone's
+    /// scrollback becomes exactly the core's, whichever side moved more rows,
+    /// with no row lost and none shown twice.
+    #[test]
+    fn a_core_that_repaints_its_history_on_resize_leaves_exactly_its_scrollback() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        for (rows, shown) in [(8u16, 6usize), (8, 8), (6, 6), (12, 10)] {
+            // The core's history after its own resize, with a row only it still holds.
+            let at = all.len() - shown;
+            let mut history = vec!["only the core".to_owned()];
+            history.extend_from_slice(&all[..at]);
+            let repaint = [b"\x18\x1b[3J".to_vec(), core_paint(&history, &all[at..], usize::from(rows))].concat();
+            let pane = streamed_as(true, 20, 10, vec![Chunk::Data(first.clone()), Chunk::Grid(20, rows), Chunk::Data(repaint)]);
+            let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+            let expected: Vec<String> = history.iter().chain(&all[at..]).cloned().collect();
+            assert_eq!(rows_seen, expected, "10 -> {rows} rows");
+        }
     }
 
     /// A saved copy read back (a switch, a close or a checkpoint wrote it).
@@ -3798,6 +3843,25 @@ mod claim_tests {
             core.close(),
             vec![Seen::Frame(3, VISIBILITY, vec![0]), Seen::Frame(3, DETACH, Vec::new())]
         );
+    }
+
+    /// The phone asks for the history repaint only from a core that offers
+    /// it; an older core gets exactly the attach it always got.
+    #[test]
+    fn resize_history_is_asked_for_only_when_the_core_offers_it() {
+        let core = Mock::start(json!(["viewer_visibility", "resize_history"]), true, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["resize_history"], 1000);
+        let mut without = params.clone();
+        without.as_object_mut().unwrap().remove("resize_history");
+        assert_eq!(without, attach_params("t1", 90, 40, true), "nothing else changes");
+        core.close();
+
+        let older = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        let Seen::Attach(params) = older.next() else { panic!("attach first") };
+        assert!(params.get("resize_history").is_none());
+        assert_eq!(params, attach_params("t1", 90, 40, true));
+        older.close();
     }
 
     #[test]
