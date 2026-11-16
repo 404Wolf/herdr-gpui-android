@@ -283,6 +283,7 @@ impl Connection<'_> {
         } else if frame.channel == self.channel && self.channel != 0 {
             match frame.kind {
                 0 => {
+                    self.owner.heard.printed(frame.bytes.len());
                     if let Some(output) = &self.output {
                         // 256 KiB starting credit bounds this queue. Credit is returned
                         // only as Rio consumes bytes, never when the network receives them.
@@ -813,7 +814,15 @@ impl Connection<'_> {
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
-            state.terminal = None;
+            // The outgoing pane's grid is kept for the phone to save (item 77:
+            // panes looked at online read offline). Only the grid object moves;
+            // what is sent to the core, and when, is unchanged.
+            if let Some(outgoing) = state.terminal.take() {
+                let pane = state.view["pane_id"].as_str().unwrap_or("");
+                if pane != terminal {
+                    crate::remote::depart(self.owner.id, outgoing, pane.to_owned());
+                }
+            }
             state.render_id = 0;
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
@@ -1742,6 +1751,11 @@ mod tests {
         assert!(before >= 40);
         heard.mark();
         assert!(heard.quiet_ms() < before);
+        // Pane output is counted apart from the link's own traffic.
+        assert_eq!(heard.output(), 0);
+        heard.printed(12);
+        heard.printed(3);
+        assert_eq!(heard.output(), 15);
     }
 
     #[test]
@@ -2259,6 +2273,7 @@ mod connection_tests {
             .unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
+            id: 0,
             state: Mutex::new(State {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
@@ -2358,6 +2373,7 @@ mod connection_tests {
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
+            id: 0,
             state: Mutex::new(State {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
@@ -2464,6 +2480,7 @@ mod connection_tests {
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
+            id: 0,
             state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0 }),
             cancel: CancellationToken::new(),
             commands: commands.clone(),
@@ -2652,6 +2669,8 @@ mod connection_tests {
 
     #[test]
     fn a_held_frame_scrolls_its_own_history_with_no_link_and_lets_go_on_attach() {
+        // The closed slot is shared with the departed-pane test.
+        let _serial = crate::remote::departed_test_lock();
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
@@ -2668,7 +2687,7 @@ mod connection_tests {
         }
         // The link is gone: the stream ends, the grid stays.
         drop(tx);
-        crate::remote::hold(session.clone(), "t9".into());
+        crate::remote::hold(session.clone());
         let offset = |reply: String| serde_json::from_str::<Value>(&reply).unwrap()["local_offset"].as_u64().unwrap();
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 5);
         assert_eq!(offset(crate::remote::scroll_held(-2, false)), 3);
@@ -2677,10 +2696,10 @@ mod connection_tests {
         // Saved for its own pane only, then read back as the held frame.
         let path = std::env::temp_dir().join(format!("herdr-held-{}.snap", std::process::id()));
         let path = path.to_str().unwrap();
-        assert!(!crate::remote::save_closed("t1", path).unwrap());
-        crate::remote::closed_for_test(session.clone(), "t9");
-        assert!(!crate::remote::save_closed("t1", path).unwrap());
-        assert!(crate::remote::save_closed("t9", path).unwrap());
+        assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
+        crate::remote::closed_for_test(0, session.clone(), "t9");
+        assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
+        assert!(crate::remote::save_pane(0, "t9", path).unwrap());
         let id = crate::remote::open_saved(path).unwrap();
         let restored = crate::remote::renderer(id).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2697,6 +2716,140 @@ mod connection_tests {
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 0);
         assert!(crate::remote::renderer(id).is_none());
     }
+    /// A grid for tests: 20x4, with `text` written into it.
+    fn grid_with(text: &str) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        tx.send(Chunk::Data(text.as_bytes().to_vec())).unwrap();
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen_text().contains(text) {
+            assert!(Instant::now() < deadline, "the text never reached the grid");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session
+    }
+
+    #[test]
+    fn a_pane_switched_away_from_is_saved_once_from_the_kept_grid_and_the_slot_stays_bounded() {
+        let _serial = crate::remote::departed_test_lock();
+        let dir = std::env::temp_dir().join(format!("herdr-departed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.snap");
+        let path = path.to_str().unwrap();
+        let read_back = |path: &str| {
+            let saved = crate::snapshot::load(std::path::Path::new(path)).unwrap();
+            let restored = crate::snapshot::restore(saved).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while restored.is_alive() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            restored.screen_text()
+        };
+        // Closed first, then looked at again and switched away from: the
+        // switch's grid is the newer one and wins.
+        crate::remote::closed_for_test(0, grid_with("old copy"), "dep-a");
+        let newer = grid_with("new copy");
+        crate::remote::depart(0, newer.clone(), "dep-a".into());
+        assert!(crate::remote::save_pane(0, "dep-a", path).unwrap());
+        assert!(read_back(path).contains("new copy"));
+        // Freed once saved, and the older closed copy went with the switch.
+        assert!(!crate::remote::departed_holds(&newer));
+        assert!(!crate::remote::save_pane(0, "dep-a", path).unwrap());
+        // Never more than DEPARTED_MAX grids: the oldest goes first.
+        let grids: Vec<_> = (0..=crate::remote::DEPARTED_MAX).map(|n| grid_with(&format!("pane {n}"))).collect();
+        for (n, grid) in grids.iter().enumerate() {
+            crate::remote::depart(0, grid.clone(), format!("dep-b{n}"));
+        }
+        assert!(!crate::remote::departed_holds(&grids[0]));
+        assert!(grids[1..].iter().all(crate::remote::departed_holds));
+        assert!(!crate::remote::save_pane(0, "dep-b0", path).unwrap());
+        // An empty pane id keeps nothing.
+        let nameless = grid_with("nameless");
+        crate::remote::depart(0, nameless.clone(), String::new());
+        assert!(!crate::remote::departed_holds(&nameless));
+        for n in 1..=crate::remote::DEPARTED_MAX {
+            assert!(crate::remote::save_pane(0, &format!("dep-b{n}"), path).unwrap());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// Review #22 finding 2: two computers both have a t1. A save queued for
+    /// one computer's t1 must write that computer's grid, even after the
+    /// other's t1 was switched away from (or closed) before the save ran.
+    #[test]
+    fn a_saved_pane_is_the_grid_its_own_session_showed_never_another_computers_same_pane_id() {
+        let _serial = crate::remote::departed_test_lock();
+        let dir = std::env::temp_dir().join(format!("herdr-origin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.snap");
+        let path = path.to_str().unwrap();
+        let text = |path: &str| {
+            let copy = crate::snapshot::restore(crate::snapshot::load(std::path::Path::new(path)).unwrap()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while copy.is_alive() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            copy.screen_text()
+        };
+        // Session 901 (computer A) leaves its t1; then session 902 (B) leaves its t1.
+        crate::remote::depart(901, grid_with("host A data"), "t1".into());
+        crate::remote::depart(902, grid_with("host B data"), "t1".into());
+        // A's queued save runs now: A's grid, not B's.
+        assert!(crate::remote::save_pane(901, "t1", path).unwrap());
+        assert!(text(path).contains("host A data"));
+        // B's is still kept for B, and a save for a session that kept nothing finds nothing.
+        assert!(!crate::remote::save_pane(903, "t1", path).unwrap());
+        assert!(crate::remote::save_pane(902, "t1", path).unwrap());
+        assert!(text(path).contains("host B data"));
+        // Closes are kept per session too: B's close does not drop A's switch copy, nor the reverse.
+        crate::remote::depart(901, grid_with("A again"), "t1".into());
+        crate::remote::closed_for_test(902, grid_with("B closed"), "t1");
+        crate::remote::depart(902, grid_with("B moved"), "t2".into());
+        assert!(crate::remote::save_pane(901, "t1", path).unwrap());
+        assert!(text(path).contains("A again"));
+        assert!(crate::remote::save_pane(902, "t1", path).unwrap());
+        assert!(text(path).contains("B closed"));
+        assert!(crate::remote::save_pane(902, "t2", path).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review #22 finding 4: the grid is copied under its lock and written
+    /// after it is released, so a save stuck on the disk never blocks the
+    /// painter (which takes the same lock).
+    #[test]
+    fn a_save_waiting_on_the_disk_does_not_hold_the_grid() {
+        let _serial = crate::remote::departed_test_lock();
+        let dir = std::env::temp_dir().join(format!("herdr-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.snap");
+        // The save writes p.tmp first: a FIFO there blocks it until a reader opens it.
+        let fifo = dir.join("p.tmp");
+        let _ = std::fs::remove_file(&fifo);
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let grid = grid_with("painted");
+        crate::remote::depart(904, grid.clone(), "t1".into());
+        let target = path.to_str().unwrap().to_owned();
+        let saver = std::thread::spawn(move || crate::remote::save_pane(904, "t1", &target));
+        // Wait until the save is blocked opening the FIFO, then the grid must be free.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!saver.is_finished(), "the save should be waiting on the FIFO");
+        assert!(grid.grid().try_lock_unfair().is_some(), "the grid is locked during disk I/O");
+        // Release the writer: read the FIFO to its end.
+        let mut bytes = Vec::new();
+        std::fs::File::open(&fifo).unwrap().read_to_end(&mut bytes).unwrap();
+        // (A FIFO cannot be synced, so this save then fails; a file would not.)
+        let _ = saver.join().unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("painted"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_resize_inside_a_synchronized_update_flushes_it_at_the_old_grid_first() {
         // BSU, then a move to column 30 on a 20-column grid plus "A" (buffered
@@ -2793,6 +2946,7 @@ mod claim_tests {
             core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             let (commands, rx) = mpsc::sync_channel(256);
             let owner = Arc::new(Session {
+                id: 0,
                 state: Mutex::new(State {
                     view: json!({"revision":0,"panes":[]}),
                     terminal: None,
@@ -2969,6 +3123,36 @@ mod claim_tests {
         assert_eq!(params["terminal"], "t1");
         assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
         core.close();
+    }
+
+    /// Item 77 keeps the outgoing pane's grid on a switch; what the core sees
+    /// (attach parameters, DETACH, RESIZE and VISIBILITY frames, in order, byte
+    /// for byte) is the same as before that change: this test passes unchanged
+    /// on phone-feedback 0ba5116.
+    #[test]
+    fn a_switch_sends_the_core_exactly_what_it_did_and_keeps_the_outgoing_grid() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        let Seen::Attach(first) = core.next() else { panic!("attach first") };
+        assert_eq!(first, attach_params("t1", 90, 40, true));
+        core.measured(2, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 30)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        let outgoing = lock(&core.owner.state).terminal.clone().unwrap();
+
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        assert_eq!(core.next(), Seen::Frame(2, DETACH, Vec::new()));
+        let Seen::Attach(second) = core.next() else { panic!("attach the pick") };
+        assert_eq!(second, attach_params("t2", 100, 30, true), "the attach starts at the measured size");
+        core.measured(3, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(100, 30)));
+        assert_eq!(core.next(), Seen::Frame(3, VISIBILITY, vec![1]));
+        core.quiet(Duration::from_millis(300));
+        assert!(crate::remote::departed_holds(&outgoing), "t1's grid is kept for the phone to save");
+        assert_eq!(
+            core.close(),
+            vec![Seen::Frame(3, VISIBILITY, vec![0]), Seen::Frame(3, DETACH, Vec::new())]
+        );
     }
 
     #[test]

@@ -702,6 +702,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (banner != null) banner.setVisibility(View.GONE);
     }
 
+    /**
+     * Another computer was picked: the attempt in flight (a reconnect or a
+     * switch) is for the old one. Its opening handle is closed so it fails
+     * fast, and whatever it returns later is ignored. Main thread.
+     */
+    private void pickedAnotherHost() {
+        hostEpoch.change();
+        long opening = reconnectHandle;
+        reconnectHandle = 0;
+        if (opening > 0) RemoteNative.close(opening);
+    }
+
+    /** After a stale attempt ends: try the computer picked now, if one is wanted. Main thread. */
+    private void retryCurrentHost() {
+        if (destroyed || !hostResumed || monitor == null || !monitor.reconnecting()) return;
+        reconnectCurrentHost();
+    }
+
     /** Reuses the saved host for this session; no credential is kept in memory. */
     private void reconnectCurrentHost() {
         if (shellMode()) {
@@ -714,6 +732,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (reconnectRunning) return;
         reconnectRunning = true;
         final String id = currentHostId;
+        final int epoch = hostEpoch.now();
         hideReconnectBanner();
         publishCurrent("Reconnecting…");
         worker.execute(() -> {
@@ -729,6 +748,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (host == null) {
                 runOnUiThread(() -> {
                     reconnectRunning = false;
+                    if (destroyed || !hostResumed) return;
+                    // A lookup for a computer no longer picked must not stop the
+                    // monitor, label or banner of the one picked since.
+                    if (hostEpoch.stale(epoch)) {
+                        retryCurrentHost();
+                        return;
+                    }
                     if (monitor != null) monitor.succeeded();
                     showLinkUp();
                     showReconnectBanner("Open the host list to reconnect");
@@ -749,6 +775,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 reconnectHandle = handle;
                 // Paused before the handle was published: attach nothing.
                 if (!hostResumed) throw new IllegalStateException("left the screen");
+                // Another computer was picked meanwhile (it closed the handle if it saw it).
+                if (hostEpoch.stale(epoch)) throw new IllegalStateException("another computer was picked");
                 // The same computer again: back to its remembered terminal, not its Deacon.
                 String chosen = awaitHostPane(handle, host.id, null, false);
                 reconnectHandle = 0;
@@ -762,8 +790,21 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         RemoteNative.close(readyHandle);
                         return;
                     }
+                    if (hostEpoch.stale(epoch) || !readyHost.id.equals(currentHostId)) {
+                        // Another computer was picked while this one connected: never adopt it.
+                        RemoteNative.close(readyHandle);
+                        retryCurrentHost();
+                        return;
+                    }
                     hideReconnectBanner();
                     adoptHost(readyHost, readyHandle, readyPane);
+                    // A pane picked offline after the session chose where to land.
+                    String picked = rememberedHostPane(readyHost.id);
+                    Connection now;
+                    synchronized (stateLock) { now = connection; }
+                    if (now != null && !picked.isEmpty() && !picked.equals(readyPane) && hasPane(now.panes, picked)) {
+                        focusRemotePane(now, picked);
+                    }
                 });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
@@ -774,6 +815,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     reconnectRunning = false;
                     // Left the screen meanwhile: onResume reconnects; say nothing.
                     if (!hostResumed) return;
+                    // A stale attempt for a computer no longer picked says nothing either.
+                    if (hostEpoch.stale(epoch)) {
+                        retryCurrentHost();
+                        return;
+                    }
                     if (monitor != null) {
                         // Keep trying, quickly, while the terminal is on screen.
                         monitor.failed();
@@ -1724,8 +1770,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             note("Trust " + host.name + " from Remote hosts first");
             return;
         }
+        if (monitor != null && monitor.offline()) {
+            // No network at all: no attempt to wait on, show it from the cache.
+            switchHostOffline(host, pane);
+            return;
+        }
         switchingHost = true;
         switchingTo = host.id;
+        pickedAnotherHost();
+        final int epoch = hostEpoch.now();
         // The mirror for this host is released before the real session opens;
         // two connections to one host would waste the handle budget.
         HostSample target = hostSamples.get(host.id);
@@ -1752,14 +1805,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 String chosen = awaitHostPane(handle, host.id, forcedPane, true);
                 final long readyHandle = handle;
                 final String readyPane = chosen;
-                runOnUiThread(() -> adoptHost(host, readyHandle, readyPane));
+                runOnUiThread(() -> {
+                    if (hostEpoch.stale(epoch)) {
+                        // Picked something else meanwhile.
+                        RemoteNative.close(readyHandle);
+                        switchingHost = false;
+                        switchingTo = null;
+                        return;
+                    }
+                    adoptHost(host, readyHandle, readyPane);
+                });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
                 if (handle != 0) RemoteNative.close(handle);
                 runOnUiThread(() -> {
                     switchingHost = false;
                     switchingTo = null;
-                    note("Could not switch to " + host.name);
+                    if (destroyed || !hostResumed || hostEpoch.stale(epoch)) return;
+                    // Unreachable: show it from the cache; the monitor keeps trying it.
+                    switchHostOffline(host, forcedPane);
                 });
             }
         });
@@ -1821,13 +1885,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (pane.isEmpty() || !hasPane(panes, pane)) pane = panes.getJSONObject(0).optString("id", "");
         rememberHostPane(hostId, pane);
         if (pane.isEmpty()) throw new IllegalStateException("no pane id");
-        RemoteNative.focus(handle, pane);
-        until = SystemClock.uptimeMillis() + 20_000;
-        while (SystemClock.uptimeMillis() < until) {
-            state = new JSONObject(RemoteNative.poll(handle, 0, false));
-            if (pane.equals(state.optString("pane_id"))
-                    && "ready".equals(state.optString("state"))) return pane;
-            Thread.sleep(150);
+        // A pane picked offline while this connected (item 77) is where it lands.
+        for (int pick = 0; pick < 3; pick++) {
+            RemoteNative.focus(handle, pane);
+            until = SystemClock.uptimeMillis() + 20_000;
+            boolean landed = false;
+            while (!landed && SystemClock.uptimeMillis() < until) {
+                state = new JSONObject(RemoteNative.poll(handle, 0, false));
+                landed = pane.equals(state.optString("pane_id")) && "ready".equals(state.optString("state"));
+                if (!landed) Thread.sleep(150);
+            }
+            if (!landed) break;
+            String picked = rememberedHostPane(hostId);
+            if (machineSwitch || picked.isEmpty() || picked.equals(pane) || !hasPane(panes, picked)) return pane;
+            pane = picked;
         }
         return pane;
     }
@@ -1844,7 +1915,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (previous != null) previous.close();
             // Resuming the same host keeps the last frame, the strip and the
             // keyboard until the new session paints; another host starts clean.
-            boolean resume = previous != null && previous.remoteHandle > 0 && host.id.equals(currentHostId);
+            boolean resume = previous != null && (previous.remoteHandle > 0 || previous.offline)
+                    && host.id.equals(currentHostId);
+            checkpoint.reset();
             if (!resume) pendingInput.discardAll();
             next = new Connection(GENERATIONS.incrementAndGet(), handle);
             if (resume) {
@@ -2031,13 +2104,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private OutboxCourier outbox;
     /** Each pane's last grid on disk, drawn when the terminal opens with no link. */
     private PaneSnapshots snapshots;
-    /** The computer whose saved pane is on screen (until its live pane attaches), and when it was saved. */
-    private String savedShownHost;
-    private long savedShownAt;
+    /**
+     * The computer whose saved pane is on screen (until its live pane attaches),
+     * and when it was saved: 0 for a pane with no copy (its title and a note).
+     */
+    private volatile String savedShownHost;
+    private volatile long savedShownAt;
+    /** The link status reads as a cached pane's label (dim), not a warning. Main thread. */
+    private boolean linkStatusDim;
+    /** When to checkpoint the pane on screen. Under stateLock. */
+    private final PaneCheckpoint checkpoint = new PaneCheckpoint();
+    /** Each computer's lists as this terminal last saw them live: newer than Home's cache. */
+    private final java.util.Map<String, JSONArray[]> seenLists = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Home's last view of each computer, for switching with no link; read once per resume. */
+    private volatile java.util.Map<String, HomeCache.Entry> fleetCache = java.util.Collections.emptyMap();
     /** The terminal has been on screen before (later resumes reopen the pane last shown). */
     private boolean openedOnce;
     /** One reconnect at a time. Main thread. */
     private boolean reconnectRunning;
+    /**
+     * Which computer was picked last: an attempt (reconnect or switch) that
+     * began before another pick is stale and must not adopt its host.
+     */
+    private final HostEpoch hostEpoch = new HostEpoch();
     /** The session a reconnect is opening; closed if the terminal leaves the screen first. */
     private volatile long reconnectHandle;
     /** The pane the rail last scrolled into view. */
@@ -2529,7 +2618,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             HostSample sample = hostSamples.get(host.id);
             signature.append(host.id).append(':');
             if (host.id.equals(currentHostId)) {
-                signature.append("live:").append(current == null ? 0 : current.chromeRevision);
+                signature.append("live:").append(current == null ? 0 : current.chromeRevision)
+                        .append(current != null && current.ready && !current.isClosed() ? "+" : "-");
             } else if (sample == null) {
                 signature.append("none");
             } else if (!sample.connected) {
@@ -2576,6 +2666,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     : sample == null ? null : sample.panes;
             JSONArray tabs = live && current != null ? current.tabs
                     : sample == null ? null : sample.tabs;
+            JSONArray[] last = live || panes != null ? null : lastLists(host.id);
+            if (last != null) {
+                // Not reachable yet: its last lists, read only (item 77).
+                workspaces = last[0];
+                tabs = last[1];
+                panes = last[2];
+            }
             addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
         }
@@ -3346,14 +3443,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.host = host;
         // Connection state is the thing a glance should answer, so it gets its
         // own dot shape: solid when connected, ring while dialling, hollow when down.
-        String status = live || (sample != null && sample.connected) ? "connected"
-                : sample != null ? "connecting" : "offline";
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        // The machine on screen says what its link really is: a cached
+        // stand-in or a dropped link is offline, never "live".
+        String status = OfflineSwitch.railStatus(live, OfflineSwitch.link(current == null, current != null && current.offline,
+                current != null && current.isClosed(), current != null && current.ready),
+                sample != null, sample != null && sample.connected);
         if (!status.equals(holder.status)) {
             boolean pulse = holder.status != null;
             holder.status = status;
             // Colour alone cannot say it, so the dot is paired with its word.
-            String word = "connected".equals(status) ? "live"
-                    : "connecting".equals(status) ? "dialling" : "";
+            String word = OfflineSwitch.railWord(status, live);
             holder.state.setText(word);
             holder.hostState = word;
             holder.row.setContentDescription(hostDescription(holder));
@@ -3504,6 +3605,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 workspaces = sample == null ? null : sample.workspaces;
                 tabs = sample == null ? null : sample.tabs;
                 connected = sample != null && sample.connected;
+                JSONArray[] last = panes != null ? null : lastLists(host.id);
+                if (last != null) {
+                    workspaces = last[0];
+                    tabs = last[1];
+                    panes = last[2];
+                }
             }
             // A pick focuses that computer's canonical live Deacon, in its exact
             // terminal; with none, the rail shows Start Deacon; offline (a cached
@@ -3987,9 +4094,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void focusRemotePane(Connection target, String paneId) {
         if (paneId.isEmpty() || paneId.length() > 128
                 || !paneId.matches("[A-Za-z0-9_./:-]+")) return;
-        if (target.remoteHandle <= 0) {
-            note("Switch panes from Remote hosts for this connection");
-            return;
+        switch (OfflineSwitch.route(target.offline, target.isClosed(), target.remoteHandle)) {
+            case REFUSE:
+                note("Switch panes from Remote hosts for this connection");
+                return;
+            case OFFLINE:
+                focusOffline(target, paneId);
+                return;
+            default:
+                break;
         }
         try {
             switchAskedAt = SystemClock.uptimeMillis();
@@ -4008,12 +4121,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             refreshSidebar(false);
         } catch (Exception | LinkageError failure) {
             // The only failure left is a session that has ended (the switch
-            // itself is a slot that cannot overflow): reconnect, landing on
-            // the asked-for window, instead of telling Wolf to reopen.
+            // itself is a slot that cannot overflow): show the pane's saved
+            // copy now; the reconnect lands on it.
             android.util.Log.w("herdr-switch", "switch to " + paneId + " failed: " + failure);
-            rememberHostPane(paneId);
-            reconnectCurrentHost();
+            focusOffline(target, paneId);
         }
+    }
+
+    /**
+     * A switch with no session (item 77): the pane is remembered, so the
+     * reconnect lands on it; the selection moves at once; its saved copy is
+     * drawn (or its title and a note when it has none). Nothing is asked of
+     * the core: the live grid replaces this one when the pane attaches.
+     */
+    private void focusOffline(Connection target, String paneId) {
+        String host = target.hostId != null ? target.hostId : currentHostId;
+        rememberHostPane(host, paneId);
+        synchronized (stateLock) {
+            if (connection != target) return;
+            target.paneId = paneId;
+            target.pendingPane = "";
+        }
+        nativeResetPan();
+        showSaved(host, paneId);
+        refreshSidebar(false);
+        // One attempt now unless one is running; the monitor keeps trying.
+        reconnectCurrentHost();
     }
 
     /** Tabs and workspaces use the daemon's own switch requests. */
@@ -4039,6 +4172,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (!pane.isEmpty()) {
             focusRemotePane(target, pane);
+            return;
+        }
+        if (target.offline || target.remoteHandle > 0 && target.isClosed()) {
+            note("That needs the link");
             return;
         }
         if (target.remoteHandle <= 0) {
@@ -4319,6 +4456,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         clearControl();
         synchronized (stateLock) {
             Connection target = connection;
+            if (target != null && OfflineSwitch.refusesKeys(target.offline, target.isClosed(), target.remoteHandle)) {
+                // What a key means depends on the screen at that moment: with
+                // no link it is refused, never queued (messages go to the Outbox).
+                main.post(() -> note(OfflineSwitch.KEYS_REFUSED));
+                return false;
+            }
             if (target != null && !target.ready && monitor != null && monitor.reconnecting()
                     && !target.paneId.isEmpty()) {
                 // Sent once, in order, when the same pane is back.
@@ -4483,7 +4626,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (hostId == null || pane == null || destroyed) return;
         Connection target;
         synchronized (stateLock) { target = connection; }
-        if (hostId.equals(currentHostId) && target != null && target.remoteHandle > 0) {
+        if (hostId.equals(currentHostId) && target != null && (target.remoteHandle > 0 || target.offline)) {
             focusRemotePane(target, pane);
             return;
         }
@@ -4505,6 +4648,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown);
         }
         if (monitor != null) monitor.start();
+        loadFleetCache();
         updateHostSampling();
         if (launch.shell) {
             synchronized (stateLock) {
@@ -4528,7 +4672,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         if (firstOpen && launch.paneId != null && !launch.paneId.isEmpty()) {
                             rememberHostPane(currentHostId, launch.paneId);
                         }
-                        showSaved(currentHostId, rememberedHostPane(currentHostId));
+                        String shown = rememberedHostPane(currentHostId);
+                        // The strip and the rail keep the last list seen, so
+                        // panes switch while the link is still down.
+                        installOffline(currentHostId, launch.name(), shown);
+                        showSaved(currentHostId, shown);
                         main.post(this::reconnectCurrentHost);
                         return;
                     }
@@ -5385,6 +5533,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     fail(current, "The host stopped answering");
                     return;
                 }
+                // A checkpoint of the pane on screen, so it reads offline as it
+                // was (item 77): at its turn's end, and every two minutes at most
+                // while it prints.
+                String onScreen = state.optString("pane_id", "");
+                if (current.ready && current.hostId != null && onScreen.equals(current.chromePane)
+                        && checkpoint.observe(onScreen, paneStatus(current.panes, onScreen),
+                                state.optLong("output", 0), SystemClock.uptimeMillis())) {
+                    snapshots.save(current.hostId, onScreen, current.remoteHandle);
+                }
                 if (state.optBoolean("unchanged", false)) {
                     String quietPhase = state.optString("state", "");
                     String quietPane = state.optString("pane_id", "");
@@ -5480,10 +5637,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.tabs = state.optJSONArray("tabs");
                     current.panes = state.optJSONArray("panes");
                     current.title = state.optString("title", current.hostName);
+                    if (current.hostId != null && current.panes != null && current.workspaces != null) {
+                        seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
+                    }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
                 // a title update on the pane the user is already reading.
                 if (selected && !pane.equals(current.chromePane)) {
+                    // The pane switched away from: its grid was kept natively
+                    // when the attach replaced it, and is saved (and freed) now.
+                    if (!current.chromePane.isEmpty() && current.hostId != null) {
+                        snapshots.save(current.hostId, current.chromePane, current.remoteHandle);
+                    }
                     if (switchAskedAt > 0) {
                         android.util.Log.w("herdr-switch", "pane " + pane + " shown "
                                 + (SystemClock.uptimeMillis() - switchAskedAt) + " ms after the tap");
@@ -5572,6 +5737,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 failed.ready = false;
                 holdUnsent(failed);
                 nativeHold(failed.generation);
+                // The frame held is the pane as of now; its copy is saved on close.
+                savedShownHost = failed.hostId;
+                savedShownAt = System.currentTimeMillis();
+                // A switch the core made but the poll never confirmed: the pane left is kept natively.
+                if (failed.hostId != null && !failed.chromePane.isEmpty() && !failed.chromePane.equals(failed.paneId)) {
+                    snapshots.save(failed.hostId, failed.chromePane, failed.remoteHandle);
+                }
                 publish(failed, message);
                 android.util.Log.i("herdr-reconnect", "link lost: " + message);
                 main.post(() -> {
@@ -5594,23 +5766,168 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /**
      * Draws {@code pane}'s saved grid, dimmed and scrollable, while there is no
-     * live pane: the terminal opened with no link, or came back to the screen
-     * before reconnecting. The live pane replaces it as soon as it attaches.
+     * live pane: the terminal opened with no link, came back to the screen
+     * before reconnecting, or switched panes or machines offline. A pane with
+     * no copy shows its title and one dim line instead. The live pane replaces
+     * either as soon as it attaches.
      */
     private void showSaved(String host, String pane) {
         if (snapshots == null || host == null || pane == null || pane.isEmpty()) return;
-        snapshots.open(host, pane, shown -> main.post(() -> {
-            synchronized (stateLock) {
-                Connection now = connection;
-                if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
-                long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
-                nativeHold(generation);
-                nativeAttachShell(generation, shown.renderId);
-                savedShownHost = host;
-                savedShownAt = shown.savedAt;
+        String title;
+        synchronized (stateLock) { title = paneTitle(connection, pane); }
+        int[] size = OfflineSwitch.gridSize(terminalGrid());
+        snapshots.open(host, pane, shown -> main.post(() -> drawSaved(host, pane, shown.renderId, shown.savedAt)),
+                () -> {
+                    long id;
+                    try {
+                        id = RemoteNative.holdNote(pane, title, OfflineSwitch.NOT_CACHED, size[0], size[1]);
+                    } catch (RuntimeException | LinkageError unavailable) {
+                        id = 0;
+                    }
+                    final long note = id;
+                    if (note > 0) main.post(() -> drawSaved(host, pane, note, 0));
+                });
+    }
+
+    /** Puts a saved pane (or an uncached pane's note) on screen, unless a later pick or the live pane won. Main thread. */
+    private void drawSaved(String host, String pane, long renderId, long savedAt) {
+        synchronized (stateLock) {
+            Connection now = connection;
+            if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
+            if (now != null && !pane.equals(now.paneId)) return;
+            long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
+            nativeHold(generation);
+            nativeAttachShell(generation, renderId);
+            savedShownHost = host;
+            savedShownAt = savedAt;
+        }
+        // A copy just drawn starts at its newest line.
+        showLatest(false);
+        showLinkDown();
+    }
+
+    /** The title a pane goes by in the strip, from the last list seen; its id when unlisted. */
+    private static String paneTitle(Connection source, String pane) {
+        JSONArray panes = source == null ? null : source.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject item = panes.optJSONObject(i);
+            if (item != null && pane.equals(item.optString("id"))) {
+                return RailTree.fallbackTitle(HomeActivity.cleanTitle(
+                        chromeTitle(item.optString("title", ""), pane), pane), item);
             }
-            showLinkDown();
-        }));
+        }
+        return pane;
+    }
+
+    /** The agent status of {@code pane} in {@code panes}, "" when unlisted. */
+    private static String paneStatus(JSONArray panes, String pane) {
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject item = panes.optJSONObject(i);
+            if (item != null && pane.equals(item.optString("id"))) return item.optString("status", "");
+        }
+        return "";
+    }
+
+    /**
+     * Makes the connection a stand-in for {@code hostId} with no session
+     * (unless one for that host is already here): its lists are Home's last
+     * view of that computer, so the strip and the rail switch panes offline.
+     * Under stateLock or on the main thread.
+     */
+    private void installOffline(String hostId, String hostName, String pane) {
+        synchronized (stateLock) {
+            Connection now = connection;
+            if (now != null && hostId.equals(now.hostId)) return;
+            Connection offline = new Connection(GENERATIONS.incrementAndGet(), 0L);
+            offline.offline = true;
+            offline.closed = true;
+            offline.hostId = hostId;
+            offline.hostName = hostName;
+            offline.title = hostName;
+            offline.paneId = pane == null ? "" : pane;
+            fillFromCache(offline);
+            connection = offline;
+            checkpoint.reset();
+            nativeHold(offline.generation);
+            if (imeSession > 0) nativeSetImeSession(offline.generation, imeSession);
+            publish(offline, "Offline");
+        }
+    }
+
+    /**
+     * A stand-in with no lists takes the ones this terminal last saw live for
+     * its computer, else Home's cached ones. Under stateLock.
+     */
+    private void fillFromCache(Connection offline) {
+        if (!offline.offline || offline.panes != null) return;
+        JSONArray[] last = lastLists(offline.hostId);
+        if (last == null) return;
+        offline.workspaces = last[0];
+        offline.tabs = last[1];
+        offline.panes = last[2];
+    }
+
+    /** {workspaces, tabs, panes} of a computer with no live list: as last seen here, else Home's cache; null if neither. */
+    private JSONArray[] lastLists(String hostId) {
+        if (hostId == null) return null;
+        JSONArray[] seen = seenLists.get(hostId);
+        if (seen != null) return seen;
+        HomeCache.Entry cached = fleetCache.get(hostId);
+        if (cached == null) return null;
+        return new JSONArray[] {cached.view.optJSONArray("workspaces"), cached.view.optJSONArray("tabs"),
+                cached.view.optJSONArray("panes")};
+    }
+
+    /** Reads Home's cached Fleet view off the UI thread; the rail and strip redraw with it. */
+    private void loadFleetCache() {
+        final java.io.File file = new java.io.File(getNoBackupFilesDir(), HomeCache.FILE_NAME);
+        worker.execute(() -> {
+            java.util.Map<String, HomeCache.Entry> read = HomeCache.read(file);
+            main.post(() -> {
+                if (destroyed) return;
+                fleetCache = java.util.Collections.unmodifiableMap(read);
+                synchronized (stateLock) {
+                    if (connection != null) fillFromCache(connection);
+                }
+                tabSignature = "";
+                sidebarSignature = "";
+                refreshSidebar(true);
+            });
+        });
+    }
+
+    /**
+     * Another computer picked while it cannot be reached (item 77): it
+     * becomes the one on screen anyway, as a terminal opened with no link
+     * does. Its picked (else last) pane is drawn from the cache and the
+     * monitor reconnects to it. Main thread.
+     */
+    private void switchHostOffline(SavedRemoteHost host, String pane) {
+        String shown = pane != null && !pane.isEmpty() ? pane : rememberedHostPane(host.id);
+        if (shown.isEmpty()) {
+            JSONArray[] last = lastLists(host.id);
+            if (last != null) {
+                try {
+                    shown = FleetPanes.switchLanding(new JSONObject().put("workspaces", last[0])
+                            .put("tabs", last[1]).put("panes", last[2]), "");
+                } catch (JSONException unexpected) {
+                    shown = "";
+                }
+            }
+        }
+        pickedAnotherHost();
+        stopConnection();
+        synchronized (stateLock) { pendingInput.discardAll(); }
+        currentHostId = host.id;
+        savedShownHost = null;
+        savedShownAt = 0;
+        if (!shown.isEmpty()) rememberHostPane(host.id, shown);
+        installOffline(host.id, host.name, shown);
+        showSaved(host.id, shown);
+        sidebarSignature = "";
+        refreshSidebar(true);
+        if (monitor != null) monitor.lost();
+        showLinkDown();
     }
 
     /** A Herdr session on a saved host: the pane outlives the link, so it can be resumed. */
@@ -5648,6 +5965,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** The status line while the link is down; dense, in the crumb's own slot. Main thread. */
     private void showLinkDown() {
         if (monitor == null || !monitor.reconnecting() || crumb == null) return;
+        // The rail's machine row says offline too.
+        refreshSidebar(false);
         String host;
         int held;
         synchronized (stateLock) {
@@ -5656,19 +5975,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String hostId = connection == null ? currentHostId : connection.hostId;
             if (hostId != null && outbox != null) held += outbox.outbox().waiting(hostId);
         }
-        StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
-        if (host != null && !host.isEmpty()) text.append(" to ").append(host);
-        text.append('…');
-        if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
-        if (savedShownAt > 0) {
-            text.append(" · showing ").append(android.text.format.DateFormat.getTimeFormat(this)
-                    .format(new java.util.Date(savedShownAt)));
+        long savedAt = savedShownAt;
+        if (savedShownHost != null) {
+            // A cached pane on screen: its age, the link, and what waits (item 77).
+            String when = savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
+                    java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
+                    java.util.Locale.getDefault()) : null;
+            linkStatus = OfflineSwitch.label(when, monitor.offline(), held);
+            linkStatusDim = true;
+        } else {
+            StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
+            if (host != null && !host.isEmpty()) text.append(" to ").append(host);
+            text.append('…');
+            if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
+            linkStatus = text.toString();
+            linkStatusDim = false;
         }
-        linkStatus = text.toString();
         // A note on screen keeps its moment; the link status follows it.
         if (crumbNote != null) return;
         crumb.setVisibility(View.VISIBLE);
-        crumb.setTextColor(chrome.warning);
+        crumb.setTextColor(linkStatusDim ? chrome.onSurfaceVariant : chrome.warning);
         crumb.setText(linkStatus);
         crumb.setContentDescription(linkStatus);
     }
@@ -5680,7 +6006,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumbText = null;
         if (crumb == null) return;
         if (linkStatus != null) {
-            crumb.setTextColor(chrome.warning);
+            crumb.setTextColor(linkStatusDim ? chrome.onSurfaceVariant : chrome.warning);
             crumb.setText(linkStatus);
             crumb.setContentDescription(linkStatus);
         } else refreshTabStrip();
@@ -5713,10 +6039,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         savedShownHost = null;
         savedShownAt = 0;
         if (monitor != null) monitor.succeeded();
-        if (linkStatus == null) return;
         linkStatus = null;
         crumbText = null;
-        refreshTabStrip();
+        // The strip and the rail's machine row (live again).
+        refreshSidebar(false);
     }
 
     /** A raw SSH shell instead of a Herdr pane: no rail, panes or session changes. */
@@ -5839,6 +6165,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private final class Connection {
+        /**
+         * A stand-in for a computer with no session (item 77): opened or
+         * switched to with no link. Its lists are the last ones seen; it is
+         * never polled, and the monitor's reconnect replaces it.
+         */
+        boolean offline;
         long degradedSince;
         /** Replaces a dropped session on the same host; its first ready ends the reconnect. */
         boolean resumed;
@@ -5917,7 +6249,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             RemoteNative.close(remoteHandle);
             // Its grid, for reading this conversation later with no link.
             if (remoteHandle > 0 && hostId != null && remoteClosed.compareAndSet(false, true)) {
-                snapshots.saveClosed(hostId, paneId);
+                snapshots.save(hostId, paneId, remoteHandle);
             }
         }
         /** Never blocks, so it is safe under stateLock on the UI thread. */
