@@ -244,6 +244,8 @@ impl Heard {
     pub(crate) fn printed(&self, bytes: usize) {
         self.output.fetch_add(bytes as u64, Ordering::Relaxed);
     }
+    /// Read by the UI's poll (and tests); a remote-only build has no reader.
+    #[cfg(any(feature = "android-ui", test))]
     pub(crate) fn output(&self) -> u64 {
         self.output.load(Ordering::Relaxed)
     }
