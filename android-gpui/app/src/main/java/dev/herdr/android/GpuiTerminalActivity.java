@@ -2171,82 +2171,81 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         updateCrumb(current, space);
-        java.util.List<FleetTree.Member> fleetMembers = FleetPanes.members(current.workspaces, current.tabs,
-                current.panes, FleetTree.Member::new);
-        FleetTree.Strip roleStrip = FleetTree.stripFor(fleetMembers, FleetPanes.LOOKS.get(currentHostId),
-                current.paneId, current.ready);
-        if (stripChoice().showsGroup(currentHostId, space, roleStrip)) {
-            showRoleStrip(current, roleStrip, space);
-            return;
-        }
-        // Rebuild only when what the strip shows changes. Agents retitle their
+        // The project focus is in and its windows only (Wolf's items 60, 70, 78; the desktop's
+        // status line): window 1 its lead, the shown one filled. Nothing toggles it.
+        java.util.List<ProjectModel.Project> projects = ProjectModel.projects(current.workspaces, current.tabs, current.panes);
+        ProjectModel.Project project = ProjectModel.currentOf(projects, current.paneId, paneTab, space);
+        int shown = ProjectModel.shownIndex(project, current.paneId, paneTab);
+        boolean compact = compactWindow();
+        java.util.List<ProjectBar.Chip> chips = ProjectBar.chips(project, shown, compact);
+        int needYou = ProjectBar.needYou(projects);
+        String repo = compact || project == null || project.deacon ? null
+                : ProjectModel.repoOf(project, gitNames(), ProjectModel.repoLabels(current.panes));
+        // Rebuild only when what the bar shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
-        JSONArray tabs = current.tabs;
-        java.util.List<String[]> shown = new java.util.ArrayList<>();
-        StringBuilder signature = new StringBuilder(space).append(roleStrip != null ? "\tgroup" : "").append('\n');
-        String activeId = "";
-        for (int i = 0; i < tabs.length(); i++) {
-            JSONObject tab = tabs.optJSONObject(i);
-            if (tab == null || !space.equals(tab.optString("workspace_id"))) continue;
-            String id = tab.optString("id");
-            String status = "";
-            JSONObject tabPane = null;
-            for (int j = 0; panes != null && j < panes.length(); j++) {
-                JSONObject pane = panes.optJSONObject(j);
-                if (pane != null && id.equals(pane.optString("tab_id"))
-                        && space.equals(pane.optString("workspace_id"))) {
-                    status = pane.optString("status");
-                    tabPane = pane;
-                }
-            }
-            // The pane being shown, which a tap moves at once, not the daemon's
-            // confirmation a round trip later.
-            boolean focused = id.equals(paneTab);
-            String label = HomeActivity.cleanTitle(tab.optString("label", id), id);
-            if (tabPane != null && RailTree.isTerminalId(label)) {
-                label = RailTree.fallbackTitle(HomeActivity.cleanTitle(
-                        chromeTitle(tabPane.optString("title", ""), id), id), tabPane);
-            }
-            shown.add(new String[] {id, label, status, focused ? "1" : ""});
-            signature.append(id).append('\t').append(label).append('\t').append(status)
-                    .append('\t').append(focused).append('\n');
-            if (focused) activeId = id;
+        StringBuilder signature = new StringBuilder(project == null ? "" : project.key).append('\t')
+                .append(project == null ? 0 : project.waiting).append('\t').append(needYou).append('\t')
+                .append(compact).append('\t').append(repo).append('\n');
+        for (ProjectBar.Chip c : chips) {
+            signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.text)
+                    .append('\t').append(c.window.status).append('\t').append(c.active).append('\n');
         }
+        String activeId = shown >= 0 ? project.key + "#" + shown : "";
         if (signature.toString().equals(tabSignature)) return;
         boolean activeMoved = !activeId.equals(tabActive);
         tabSignature = signature.toString();
         tabActive = activeId;
         tabStrip.removeAllViews();
-        View active = null;
-        for (String[] item : shown) {
-            String id = item[0], status = item[2];
-            boolean focused = !item[3].isEmpty();
-            TextView pill = tabPill(item[1], focused, status);
-            pill.setTag(focused ? PANE_PILL_ACTIVE : PANE_PILL);
-            final Connection target = current;
-            final String tabSpace = space, tabLabel = item[1];
-            pill.setOnClickListener(v -> { if (!focused) focusChrome(target, "tab", id); });
-            pill.setOnTouchListener(new TabDrag(pill, () -> showTabActions(target, tabSpace, id, tabLabel),
-                    to -> runEdit(target, "Move " + tabLabel, "op", "tab.move", "space", tabSpace,
-                            "tab", id, "index", to)));
-            pill.setContentDescription("Tab " + pill.getText() + (status.isEmpty() ? "" : ", " + status)
-                    + (focused ? ", current" : ""));
-            tabStrip.addView(pill);
-            if (focused) active = pill;
+        final Connection target = current;
+        tabStrip.addView(projectChip(project, target));
+        if (repo != null) {
+            TextView crumbText = new TextView(this);
+            crumbText.setText(repo + " ›");
+            crumbText.setTextSize(11);
+            crumbText.setSingleLine(true);
+            crumbText.setTextColor(chrome.onSurfaceVariant);
+            crumbText.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            crumbText.setPadding(0, 0, dp(6), 0);
+            tabStrip.addView(crumbText, new LinearLayout.LayoutParams(-2, dp(24)));
         }
-        TextView add = tabPill("+", false, "");
-        add.setContentDescription("New Claude, Codex or terminal tab in this space");
-        add.setOnClickListener(this::showNewMenu);
+        View active = null;
+        for (ProjectBar.Chip c : chips) {
+            ProjectModel.Window w = c.window;
+            TextView chip = windowChip(c.text, c.active, w.status, w.terminal == null);
+            chip.setTag(c.active ? PANE_PILL_ACTIVE : PANE_PILL);
+            chip.setOnClickListener(v -> {
+                if (c.active) return;
+                if (w.terminal != null) focusRemotePane(target, w.terminal);
+                else note("Nothing runs in " + w.name + ": open it on the desktop");
+            });
+            final String windowName = w.name;
+            chip.setOnLongClickListener(v -> {
+                if (w.tab != null && !w.tab.isEmpty()) showTabActions(target, w.space, w.tab, windowName);
+                return true;
+            });
+            chip.setContentDescription("Window " + w.n + ", " + w.name + (w.status.isEmpty() ? "" : ", " + w.status)
+                    + (c.active ? ", current" : ""));
+            tabStrip.addView(chip);
+            if (c.active) active = chip;
+        }
+        TextView add = windowChip("+", false, "", false);
+        add.setContentDescription(project != null && project.led()
+                ? "New Claude, Codex or terminal window of " + project.name
+                : "New Claude, Codex or terminal tab in this space");
+        add.setOnClickListener(v -> showNewMenu(v, project, shown));
         tabStrip.addView(add);
-        // Back to the role group (as the desktop's chip), when there is one.
-        if (roleStrip != null) {
-            final String chipSpace = space;
-            TextView group = tabPill(roleStrip.mode.equals("pm") ? "▤ " + roleStrip.name : "▤ Deacon", false, "");
-            group.setContentDescription("Show the " + (roleStrip.mode.equals("pm") ? roleStrip.name + " project" : "Deacon")
-                    + " group instead of this space's tabs");
-            group.setOnClickListener(v -> toggleStrip(chipSpace));
-            tabStrip.addView(group);
+        if (!compact && needYou > 0) {
+            TextView waiting = new TextView(this);
+            waiting.setText("! " + needYou + " need you");
+            waiting.setTextSize(12);
+            waiting.setSingleLine(true);
+            waiting.setTextColor(chrome.status("blocked"));
+            waiting.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            waiting.setPadding(dp(10), 0, dp(6), 0);
+            waiting.setContentDescription(needYou + " agents need you; go to the next one");
+            waiting.setOnClickListener(v -> focusNextWaiting(target, projects));
+            tabStrip.addView(waiting, new LinearLayout.LayoutParams(-2, dp(24)));
         }
         if (active != null && activeMoved) {
             final View activePill = active;
@@ -2255,67 +2254,120 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /**
-     * With a Deacon, a PM or a PM's worker focused, the strip shows that role
-     * context instead of the space's tabs (FleetTree.stripFor): each item is
-     * an exact terminal, possibly from another space, so a tap focuses that
-     * terminal and there is no close, move or rename. It is rebuilt from the
-     * live view on every refresh, so it never shows a stale group (what the
-     * desktop's projection handshake guards against). False: no role context.
+     * The project chip, `[name]` and how many of its own agents wait on Wolf:
+     * a tap lists this computer's projects (the desktop's switcher); it never
+     * changes which windows the bar lists (item 78).
      */
-    private void showRoleStrip(Connection current, FleetTree.Strip strip, String space) {
-        StringBuilder signature = new StringBuilder("role:").append(strip.mode).append('\t').append(space).append('\n');
-        for (FleetTree.StripItem item : strip.items) {
-            signature.append(item.id).append('\t').append(item.label).append('\t').append(item.status)
-                    .append('\t').append(item.id.equals(current.paneId)).append('\n');
+    private TextView projectChip(ProjectModel.Project project, Connection target) {
+        TextView chip = new TextView(this);
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(ProjectBar.projectText(project));
+        text.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, text.length(), 0);
+        if (project != null && project.waiting > 0) {
+            int from = text.length();
+            text.append(" !").append(String.valueOf(project.waiting));
+            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.status("blocked")), from, text.length(), 0);
         }
-        if (signature.toString().equals(tabSignature)) return;
-        boolean activeMoved = !current.paneId.equals(tabActive);
-        tabSignature = signature.toString();
-        tabActive = current.paneId;
-        tabStrip.removeAllViews();
-        View active = null;
-        for (FleetTree.StripItem item : strip.items) {
-            boolean focused = item.id.equals(current.paneId);
-            String label = ("worker".equals(item.role) ? "" : "pm".equals(item.role) ? "PM·" : "Deacon·") + item.label;
-            TextView pill = tabPill(label, focused, item.status);
-            pill.setTag(focused ? PANE_PILL_ACTIVE : PANE_PILL);
-            final Connection target = current;
-            pill.setOnClickListener(v -> { if (!focused) focusRemotePane(target, item.id); });
-            pill.setContentDescription((strip.mode.equals("pm") ? strip.name + ": " : "") + label
-                    + (item.status.isEmpty() ? "" : ", " + item.status) + (focused ? ", current" : ""));
-            tabStrip.addView(pill);
-            if (focused) active = pill;
-        }
-        // To this space's own tabs (where +, close, move and rename are).
-        TextView tabsChip = tabPill("⊞ Tabs", false, "");
-        tabsChip.setContentDescription("Show this space's own tabs");
-        tabsChip.setOnClickListener(v -> toggleStrip(space));
-        tabStrip.addView(tabsChip);
-        if (active != null && activeMoved) {
-            final View activePill = active;
-            tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
-        }
+        chip.setText(text);
+        chip.setTextSize(12);
+        chip.setSingleLine(true);
+        chip.setTextColor(chrome.onSurface);
+        chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        chip.setPadding(dp(4), 0, dp(8), 0);
+        chip.setContentDescription("Project " + (project == null ? "none" : project.name)
+                + (project != null && project.waiting > 0 ? ", " + project.waiting + " need you" : "") + ". Switch project");
+        chip.setOnClickListener(v -> showProjectSwitcher(target));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
+        params.setMarginEnd(dp(2));
+        chip.setLayoutParams(params);
+        return chip;
     }
 
-    private FleetTree.StripChoice stripChoiceState;
-
-    /** The group/tabs choice per physical space, kept across refreshes and launches. */
-    private FleetTree.StripChoice stripChoice() {
-        if (stripChoiceState == null) {
-            java.util.Set<String> saved = new java.util.HashSet<>(getSharedPreferences("terminal-display", MODE_PRIVATE)
-                    .getStringSet("strip_tabs", java.util.Collections.emptySet()));
-            stripChoiceState = new FleetTree.StripChoice(saved);
+    /**
+     * A window chip (item 60): a box with a border, the shown one filled; a
+     * status dot when an agent works, waits or is done there. {@code idle}:
+     * a tab with nothing running in it.
+     */
+    private TextView windowChip(String label, boolean active, String status, boolean idle) {
+        TextView chip = new TextView(this);
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(label);
+        if ("working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status)) {
+            int color = "error".equals(status) ? chrome.danger : chrome.status(status);
+            text.append(" ●", new android.text.style.ForegroundColorSpan(color), 0);
         }
-        return stripChoiceState;
+        chip.setText(text);
+        chip.setTextSize(12);
+        chip.setSingleLine(true);
+        chip.setTextColor(active ? chrome.background : idle ? chrome.onSurfaceVariant : chrome.onSurface);
+        chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        chip.setPadding(dp(7), 0, dp(7), 0);
+        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
+        shape.setCornerRadius(dp(3));
+        shape.setColor(active ? chrome.primary : chrome.background);
+        shape.setStroke(dp(1), active ? chrome.primary : chrome.outline);
+        chip.setBackground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(chrome.selected), shape,
+                new android.graphics.drawable.ColorDrawable(0xffffffff)));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
+        params.setMarginEnd(dp(3));
+        chip.setLayoutParams(params);
+        return chip;
     }
 
-    /** Switches this space's strip between the role group and its own tabs; focus is untouched. */
-    private void toggleStrip(String space) {
-        stripChoice().toggle(currentHostId, space);
-        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                .putStringSet("strip_tabs", new java.util.HashSet<>(stripChoice().physical)).apply();
-        tabSignature = "";
-        refreshTabStrip();
+    /** What git said of this computer's folders: folder -> its repo's name and whether it is a linked worktree. */
+    private java.util.Map<String, ProjectModel.GitName> gitNames() {
+        java.util.Map<String, ProjectModel.GitName> out = new java.util.HashMap<>();
+        FleetTree.GitLook look = currentHostId == null ? null : FleetPanes.LOOKS.get(currentHostId);
+        if (look == null) return out;
+        for (java.util.Map.Entry<String, FleetTree.Place> e : look.places.entrySet()) {
+            FleetTree.Place place = e.getValue();
+            if (place == null || place.common.isEmpty()) continue;
+            boolean linked = !place.common.equals(place.top + "/.git");
+            out.put(e.getKey(), new ProjectModel.GitName(FleetTree.repoName(place.common), linked));
+        }
+        return out;
+    }
+
+    /**
+     * The project switcher: this computer's projects as the desktop's sidebar
+     * orders them (the deacon, then each repo's projects by birth with Wolf's
+     * order from the core's projects.order over it, then those in no repo),
+     * each with how many of its agents wait on Wolf. A tap shows its lead.
+     */
+    private void showProjectSwitcher(Connection target) {
+        java.util.List<ProjectModel.Project> all = ProjectModel.projects(target.workspaces, target.tabs, target.panes);
+        ProjectModel.Groups groups = ProjectModel.groups(all, gitNames(), ProjectModel.repoLabels(target.panes),
+                target.projectsOrder);
+        ActionSheet sheet = new ActionSheet(this, chrome, "Projects on " + target.hostName);
+        java.util.List<ProjectModel.Project> listed = new java.util.ArrayList<>(groups.deacons);
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        for (ProjectModel.Project p : groups.deacons) labels.add("◆ deacon");
+        for (ProjectModel.Repo repo : groups.repos) {
+            for (ProjectModel.Project p : repo.projects) {
+                listed.add(p);
+                labels.add((repo.name == null ? "" : repo.name + " › ") + p.name);
+            }
+        }
+        for (int i = 0; i < listed.size(); i++) {
+            ProjectModel.Project p = listed.get(i);
+            String label = labels.get(i) + (p.waiting > 0 ? "   ! " + p.waiting + " need you" : "");
+            sheet.add(label, () -> {
+                ProjectModel.Window lead = p.lead;
+                if (lead != null && lead.terminal != null) focusRemotePane(target, lead.terminal);
+                else note(p.name + " has nothing running to show");
+            });
+        }
+        sheet.show();
+    }
+
+    /** "! N need you": the next waiting agent after the one shown, round all of them. */
+    private void focusNextWaiting(Connection target, java.util.List<ProjectModel.Project> projects) {
+        java.util.List<String> waiting = new java.util.ArrayList<>();
+        for (ProjectModel.Project p : projects) {
+            for (ProjectModel.Window w : p.windows) if ("blocked".equals(w.status) && w.terminal != null) waiting.add(w.terminal);
+        }
+        if (waiting.isEmpty()) return;
+        int at = waiting.indexOf(target.paneId);
+        focusRemotePane(target, waiting.get((at + 1) % waiting.size()));
     }
 
     private void updateCrumb(Connection current, String space) {
@@ -2446,33 +2498,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    private TextView tabPill(String label, boolean active, String status) {
-        TextView pill = new TextView(this);
-        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
-        if ("working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status)) {
-            int color = "error".equals(status) ? chrome.danger : chrome.status(status);
-            text.append("● ", new android.text.style.ForegroundColorSpan(color), 0);
-        }
-        text.append(label.length() > 28 ? label.substring(0, 27) + "…" : label);
-        pill.setText(text);
-        pill.setTextSize(12);
-        pill.setSingleLine(true);
-        pill.setTextColor(active ? chrome.onSurface : chrome.onSurfaceVariant);
-        pill.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        pill.setPadding(dp(9), 0, dp(9), 0);
-        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
-        shape.setCornerRadius(dp(6));
-        shape.setColor(active ? chrome.control : chrome.background);
-        if (active) shape.setStroke(dp(1), chrome.outline);
-        pill.setBackground(new android.graphics.drawable.RippleDrawable(
-                android.content.res.ColorStateList.valueOf(chrome.selected), shape,
-                new android.graphics.drawable.ColorDrawable(0xffffffff)));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
-        params.setMarginEnd(dp(3));
-        pill.setLayoutParams(params);
-        return pill;
-    }
-
     private void showTabActions(Connection target, String space, String tab, String label) {
         java.util.List<String[]> spaces = new java.util.ArrayList<>();
         JSONArray all = target.workspaces;
@@ -2593,16 +2618,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** "+": what a new tab in this space should run. */
-    private void showNewMenu(View anchor) {
+    /**
+     * "+": a new Claude, Codex or shell window. Of a project with a lead, it
+     * is that project's window, as the desktop's C-a c makes one: a tab in the
+     * lead's space, in the shown window's folder (else the lead's), labelled
+     * parent=<lead> on this core (window.new). Elsewhere a plain new tab in the
+     * space shown.
+     */
+    private void showNewMenu(View anchor, ProjectModel.Project project, int shown) {
         Connection target;
         synchronized (stateLock) { target = connection; }
         if (target == null) return;
+        String[] place = ProjectBar.newWindowPlace(project, shown);
         android.widget.PopupMenu menu = new android.widget.PopupMenu(
                 new android.view.ContextThemeWrapper(this, chrome.popupTheme()), anchor);
         menu.getMenu().add(0, 1, 0, "Claude");
         menu.getMenu().add(0, 2, 1, "Codex");
         menu.getMenu().add(0, 3, 2, "Shell");
         menu.setOnMenuItemClickListener(item -> {
+            if (place != null) {
+                String kind = item.getItemId() == 1 ? "claude" : item.getItemId() == 2 ? "codex" : "shell";
+                if (place[2] != null && place[2].startsWith("/")) {
+                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
+                            "folder", place[2], "kind", kind);
+                } else {
+                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
+                            "kind", kind);
+                }
+                return true;
+            }
             String action = item.getItemId() == 1 ? "agent.claude" : item.getItemId() == 2 ? "agent.codex" : "tab.new";
             runSessionAction(target, action, "New " + item.getTitle());
             return true;
@@ -5638,6 +5682,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.workspaces = state.optJSONArray("workspaces");
                     current.tabs = state.optJSONArray("tabs");
                     current.panes = state.optJSONArray("panes");
+                    current.projectsOrder = state.optJSONObject("projects_order");
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
@@ -6206,6 +6251,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String text = "";
         boolean remotePainted;
         JSONArray workspaces, tabs, panes;
+        /** The core's projects.order doc (Wolf's order of repos and projects), or null. */
+        JSONObject projectsOrder;
         volatile long clipboardSerial;
         volatile long scrollOffset, scrollMax, scrollRows;
         String chromePane = "";

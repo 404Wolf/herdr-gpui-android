@@ -1,0 +1,986 @@
+{
+ "source": "Desktop model: home-manager-conf 10ad20b users/wolf/programs/herdr-core/app/mods/projects/model.js (projects, summary, currentOf, shownIndex, repoOf, repoGroups, orderBy, orderId); cases ported from home-manager-conf 10ad20b users/wolf/programs/herdr-core/app/test_wolf_requirements.mjs and test_projects.mjs (each case's desktop_test). Read by ProjectModelTest (phone). A change to either model is diffed against this file.",
+ "format": "view: the phone's view of one core (workspaces, tabs, panes = one per live terminal with its labels). expect.projects: every project by key -> name, windows ('<terminal> <name>' or 'tab:<id> <name>', in order), waiting. current: focus -> project key and shown index. groups: the switcher's order (deacons, then repos with their projects; name null = no repo). order_ids: a project's id in projects.order.",
+ "phone_differences": "The phone lists every live terminal of its core as a window (it can open any); the desktop lists paneless leads only. A phone tab named by a terminal address counts as unnamed.",
+ "cases": [
+  {
+   "name": "windows-per-pm",
+   "desktop_test": "test_wolf_requirements.mjs '2026-11-15-windows-per-pm' and 'tmux-sidebar-windows-follow-parents'; test_projects.mjs '2026-11-15: the sidebar publishes its projects, each with only its own windows, wherever their tabs are'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "monopoly"
+     },
+     {
+      "id": "s2",
+      "label": "scratch"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "tA",
+      "workspace_id": "s1",
+      "label": "research",
+      "named": true
+     },
+     {
+      "id": "tB",
+      "workspace_id": "s1",
+      "label": "incident",
+      "named": true
+     },
+     {
+      "id": "tC",
+      "workspace_id": "s1",
+      "label": "traces",
+      "named": true
+     },
+     {
+      "id": "tD",
+      "workspace_id": "s1",
+      "label": "wsbox",
+      "named": true
+     },
+     {
+      "id": "tE",
+      "workspace_id": "s1",
+      "label": "tb5",
+      "named": false
+     },
+     {
+      "id": "tF",
+      "workspace_id": "s2",
+      "label": "review",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t10",
+      "workspace_id": "s1",
+      "tab_id": "tA",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "research-ui",
+      "repo": "",
+      "created_ms": 100,
+      "program": ""
+     },
+     {
+      "id": "t20",
+      "workspace_id": "s1",
+      "tab_id": "tB",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "incident-fixes",
+      "repo": "",
+      "created_ms": 200,
+      "program": ""
+     },
+     {
+      "id": "t11",
+      "workspace_id": "s1",
+      "tab_id": "tC",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t10",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t21",
+      "workspace_id": "s1",
+      "tab_id": "tD",
+      "status": "blocked",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t20",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t12",
+      "workspace_id": "s1",
+      "tab_id": "tE",
+      "status": "",
+      "title": "✳ Fix the limits",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t11",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": "claude"
+     },
+     {
+      "id": "t13",
+      "workspace_id": "s2",
+      "tab_id": "tF",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t10",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     }
+    ]
+   },
+   "expect": {
+    "projects": {
+     "pm:t10": {
+      "name": "research-ui",
+      "windows": [
+       "t10 lead",
+       "t11 traces",
+       "t12 Fix the limits",
+       "t13 review"
+      ],
+      "waiting": 0
+     },
+     "pm:t20": {
+      "name": "incident-fixes",
+      "windows": [
+       "t20 lead",
+       "t21 wsbox"
+      ],
+      "waiting": 1
+     }
+    },
+    "current": [
+     {
+      "focus": {
+       "terminal": "t21",
+       "tab": "tD"
+      },
+      "project": "pm:t20",
+      "shown": 1
+     },
+     {
+      "focus": {
+       "terminal": "t13",
+       "tab": "tF"
+      },
+      "project": "pm:t10",
+      "shown": 3
+     },
+     {
+      "focus": {
+       "tab": "tB"
+      },
+      "project": "pm:t20",
+      "shown": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "pm-split-beside-another-pms-worker",
+   "desktop_test": "projects/model.js currentOf ('its own lead first: a PM split beside another's worker is still its own'); test_projects.mjs '2026-11-15: the sidebar lights the project focus is in'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "monopoly"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "tA",
+      "workspace_id": "s1",
+      "label": "split",
+      "named": true
+     },
+     {
+      "id": "tB",
+      "workspace_id": "s1",
+      "label": "incident",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t10",
+      "workspace_id": "s1",
+      "tab_id": "tA",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "research-ui",
+      "repo": "",
+      "created_ms": 1,
+      "program": ""
+     },
+     {
+      "id": "t21",
+      "workspace_id": "s1",
+      "tab_id": "tA",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t20",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t20",
+      "workspace_id": "s1",
+      "tab_id": "tB",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "incident-fixes",
+      "repo": "",
+      "created_ms": 2,
+      "program": ""
+     }
+    ]
+   },
+   "expect": {
+    "projects": {
+     "pm:t10": {
+      "name": "research-ui",
+      "windows": [
+       "t10 lead"
+      ],
+      "waiting": 0
+     },
+     "pm:t20": {
+      "name": "incident-fixes",
+      "windows": [
+       "t20 lead",
+       "t21 split"
+      ],
+      "waiting": 0
+     }
+    },
+    "current": [
+     {
+      "focus": {
+       "terminal": "t21",
+       "tab": "tA"
+      },
+      "project": "pm:t20",
+      "shown": 1
+     },
+     {
+      "focus": {
+       "terminal": "t10",
+       "tab": "tA"
+      },
+      "project": "pm:t10",
+      "shown": 0
+     },
+     {
+      "focus": {
+       "tab": "tA"
+      },
+      "project": "pm:t10",
+      "shown": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "nothing-lost",
+   "desktop_test": "test_wolf_requirements.mjs 'tmux-sidebar-nothing-lost'; test_projects.mjs 'nothing live vanishes' and '2026-11-15 (deacon's must-have 1): a terminal nobody labelled ... is a window of its space's first lead, else of its space's own project'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "monopoly"
+     },
+     {
+      "id": "s3",
+      "label": "loose-space"
+     },
+     {
+      "id": "s4",
+      "label": "empty-space"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "tA",
+      "workspace_id": "s1",
+      "label": "research",
+      "named": true
+     },
+     {
+      "id": "tB",
+      "workspace_id": "s1",
+      "label": "shell",
+      "named": true
+     },
+     {
+      "id": "tC",
+      "workspace_id": "s1",
+      "label": "notes",
+      "named": true
+     },
+     {
+      "id": "tX",
+      "workspace_id": "s3",
+      "label": "tb2"
+     }
+    ],
+    "panes": [
+     {
+      "id": "t10",
+      "workspace_id": "s1",
+      "tab_id": "tA",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "research-ui",
+      "repo": "",
+      "created_ms": 1,
+      "program": ""
+     },
+     {
+      "id": "t30",
+      "workspace_id": "s1",
+      "tab_id": "tB",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t40",
+      "workspace_id": "s3",
+      "tab_id": "tX",
+      "status": "",
+      "title": "✳ Build docs",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": "claude"
+     }
+    ]
+   },
+   "expect": {
+    "projects": {
+     "pm:t10": {
+      "name": "research-ui",
+      "windows": [
+       "t10 lead",
+       "t30 shell",
+       "tab:tC notes"
+      ],
+      "waiting": 0
+     },
+     "space:s3": {
+      "name": "loose-space",
+      "windows": [
+       "t40 claude"
+      ],
+      "waiting": 0
+     },
+     "space:s4": {
+      "name": "empty-space",
+      "windows": [],
+      "waiting": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "deacon-and-census",
+   "desktop_test": "test_wolf_requirements.mjs 'tmux-sidebar-census-13-pms' (every PM its own project, none merged into the deacon) and 'tmux-sidebar-deacon-row'; 'tmux-window-1-lead'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s0",
+      "label": "deacon"
+     },
+     {
+      "id": "s1",
+      "label": "monopoly"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "t0",
+      "workspace_id": "s0",
+      "label": "deacon",
+      "named": true
+     },
+     {
+      "id": "t0b",
+      "workspace_id": "s0",
+      "label": "helper",
+      "named": true
+     },
+     {
+      "id": "tA",
+      "workspace_id": "s1",
+      "label": "public",
+      "named": true
+     },
+     {
+      "id": "tB",
+      "workspace_id": "s1",
+      "label": "health",
+      "named": true
+     },
+     {
+      "id": "tC",
+      "workspace_id": "s1",
+      "label": "qos",
+      "named": true
+     },
+     {
+      "id": "tD",
+      "workspace_id": "s1",
+      "label": "probe",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t1",
+      "workspace_id": "s0",
+      "tab_id": "t0",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "deacon",
+      "parent": "",
+      "project": "",
+      "repo": "",
+      "created_ms": 10,
+      "program": ""
+     },
+     {
+      "id": "t2",
+      "workspace_id": "s0",
+      "tab_id": "t0b",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t1",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "t5",
+      "workspace_id": "s1",
+      "tab_id": "tA",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "t1",
+      "project": "public",
+      "repo": "",
+      "created_ms": 50,
+      "program": ""
+     },
+     {
+      "id": "t6",
+      "workspace_id": "s1",
+      "tab_id": "tB",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "t1",
+      "project": "health",
+      "repo": "",
+      "created_ms": 40,
+      "program": ""
+     },
+     {
+      "id": "t7",
+      "workspace_id": "s1",
+      "tab_id": "tC",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "qos",
+      "repo": "",
+      "created_ms": 60,
+      "program": ""
+     },
+     {
+      "id": "t8",
+      "workspace_id": "s1",
+      "tab_id": "tD",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t6",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     }
+    ]
+   },
+   "expect": {
+    "projects": {
+     "deacon:t1": {
+      "name": "deacon",
+      "windows": [
+       "t1 deacon",
+       "t2 helper"
+      ],
+      "waiting": 0
+     },
+     "pm:t5": {
+      "name": "public",
+      "windows": [
+       "t5 lead"
+      ],
+      "waiting": 0
+     },
+     "pm:t6": {
+      "name": "health",
+      "windows": [
+       "t6 lead",
+       "t8 probe"
+      ],
+      "waiting": 0
+     },
+     "pm:t7": {
+      "name": "qos",
+      "windows": [
+       "t7 lead"
+      ],
+      "waiting": 0
+     }
+    },
+    "groups": {
+     "deacons": [
+      "deacon:t1"
+     ],
+     "repos": [
+      {
+       "name": null,
+       "projects": [
+        "pm:t6",
+        "pm:t5",
+        "pm:t7"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "never-across-computers",
+   "desktop_test": "test_projects.mjs '2026-11-15: a parent label names a terminal on the labelled one's computer; never across computers'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "monopoly"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "tA",
+      "workspace_id": "s1",
+      "label": "research",
+      "named": true
+     },
+     {
+      "id": "tR",
+      "workspace_id": "s1",
+      "label": "remote",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t10",
+      "workspace_id": "s1",
+      "tab_id": "tA",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "research-ui",
+      "repo": "",
+      "created_ms": 1,
+      "program": ""
+     },
+     {
+      "id": "laptop/t8",
+      "workspace_id": "s1",
+      "tab_id": "tR",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "",
+      "parent": "t10",
+      "project": "",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     },
+     {
+      "id": "laptop/t7",
+      "workspace_id": "s1",
+      "tab_id": "tR",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "laptop-pm",
+      "repo": "",
+      "created_ms": 0,
+      "program": ""
+     }
+    ]
+   },
+   "expect": {
+    "projects": {
+     "pm:t10": {
+      "name": "research-ui",
+      "windows": [
+       "t10 lead",
+       "tab:tR remote"
+      ],
+      "waiting": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "order-61-62-63",
+   "desktop_test": "test_projects.mjs '61, 63: the repos in order', '62: the stored order is read from this computer's core and applied; a project it doesn't list comes last in its repo; names it lists that are gone are skipped; \"no repo\" stays last', '63: projects and repos read by birth'; '61: which repo a project sits under'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "work"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "a",
+      "workspace_id": "s1",
+      "label": "a",
+      "named": true
+     },
+     {
+      "id": "b",
+      "workspace_id": "s1",
+      "label": "b",
+      "named": true
+     },
+     {
+      "id": "c",
+      "workspace_id": "s1",
+      "label": "c",
+      "named": true
+     },
+     {
+      "id": "d",
+      "workspace_id": "s1",
+      "label": "d",
+      "named": true
+     },
+     {
+      "id": "e",
+      "workspace_id": "s1",
+      "label": "e",
+      "named": true
+     },
+     {
+      "id": "f",
+      "workspace_id": "s1",
+      "label": "f",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t10",
+      "workspace_id": "s1",
+      "tab_id": "a",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "research-ui",
+      "repo": "git@github.com:org/monopoly.git",
+      "created_ms": 300,
+      "program": ""
+     },
+     {
+      "id": "t20",
+      "workspace_id": "s1",
+      "tab_id": "b",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "pm",
+      "parent": "",
+      "project": "incident-fixes",
+      "repo": "monopoly",
+      "created_ms": 100,
+      "program": ""
+     },
+     {
+      "id": "t30",
+      "workspace_id": "s1",
+      "tab_id": "c",
+      "status": "",
+      "title": "",
+      "cwd": "/home/w/.herdr/worktrees/home-manager-conf/wolf-x",
+      "role": "pm",
+      "parent": "",
+      "project": "zulip",
+      "repo": "",
+      "created_ms": 200,
+      "program": ""
+     },
+     {
+      "id": "t40",
+      "workspace_id": "s1",
+      "tab_id": "d",
+      "status": "",
+      "title": "",
+      "cwd": "/tmp",
+      "role": "pm",
+      "parent": "",
+      "project": "scratch",
+      "repo": "",
+      "created_ms": 50,
+      "program": ""
+     },
+     {
+      "id": "t1",
+      "workspace_id": "s1",
+      "tab_id": "e",
+      "status": "",
+      "title": "",
+      "cwd": "/w/monopoly",
+      "role": "deacon",
+      "parent": "",
+      "project": "",
+      "repo": "",
+      "created_ms": 400,
+      "program": ""
+     },
+     {
+      "id": "t50",
+      "workspace_id": "s1",
+      "tab_id": "f",
+      "status": "",
+      "title": "",
+      "cwd": "/w/kache",
+      "role": "pm",
+      "parent": "",
+      "project": "kache-pm",
+      "repo": "",
+      "created_ms": 500,
+      "program": ""
+     }
+    ]
+   },
+   "git": {
+    "/w/kache": {
+     "name": "kache",
+     "linked": false
+    }
+   },
+   "order": {
+    "repos": [
+     "home-manager-conf",
+     "monopoly",
+     "gone-repo"
+    ],
+    "projects": {
+     "monopoly": [
+      "research-ui",
+      "gone-project"
+     ]
+    }
+   },
+   "expect": {
+    "groups": {
+     "deacons": [
+      "deacon:t1"
+     ],
+     "repos": [
+      {
+       "name": "home-manager-conf",
+       "projects": [
+        "pm:t30"
+       ]
+      },
+      {
+       "name": "monopoly",
+       "projects": [
+        "pm:t10",
+        "pm:t20"
+       ]
+      },
+      {
+       "name": "kache",
+       "projects": [
+        "pm:t50"
+       ]
+      },
+      {
+       "name": null,
+       "projects": [
+        "pm:t40"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "order-ids",
+   "desktop_test": "test_projects.mjs '62: two leads with the same project name are told apart (name#lead) ... an entry by the plain name still places the first' and '62: ids are never ambiguous: a project named \"same#t9r\" is \"same##t9r\"'",
+   "view": {
+    "workspaces": [
+     {
+      "id": "s1",
+      "label": "work"
+     }
+    ],
+    "tabs": [
+     {
+      "id": "a",
+      "workspace_id": "s1",
+      "label": "a",
+      "named": true
+     },
+     {
+      "id": "b",
+      "workspace_id": "s1",
+      "label": "b",
+      "named": true
+     },
+     {
+      "id": "c",
+      "workspace_id": "s1",
+      "label": "c",
+      "named": true
+     }
+    ],
+    "panes": [
+     {
+      "id": "t31",
+      "workspace_id": "s1",
+      "tab_id": "a",
+      "status": "",
+      "title": "",
+      "cwd": "/tmp",
+      "role": "pm",
+      "parent": "",
+      "project": "same",
+      "repo": "",
+      "created_ms": 1,
+      "program": ""
+     },
+     {
+      "id": "t32",
+      "workspace_id": "s1",
+      "tab_id": "b",
+      "status": "",
+      "title": "",
+      "cwd": "/tmp",
+      "role": "pm",
+      "parent": "",
+      "project": "same",
+      "repo": "",
+      "created_ms": 2,
+      "program": ""
+     },
+     {
+      "id": "t33",
+      "workspace_id": "s1",
+      "tab_id": "c",
+      "status": "",
+      "title": "",
+      "cwd": "/tmp",
+      "role": "pm",
+      "parent": "",
+      "project": "a#b",
+      "repo": "",
+      "created_ms": 3,
+      "program": ""
+     }
+    ]
+   },
+   "order": {
+    "projects": {
+     "": [
+      "same",
+      "a##b"
+     ]
+    }
+   },
+   "expect": {
+    "order_ids": {
+     "pm:t31": "same#t31",
+     "pm:t32": "same#t32",
+     "pm:t33": "a##b"
+    },
+    "groups": {
+     "deacons": [],
+     "repos": [
+      {
+       "name": null,
+       "projects": [
+        "pm:t31",
+        "pm:t33",
+        "pm:t32"
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

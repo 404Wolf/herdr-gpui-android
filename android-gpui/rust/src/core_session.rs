@@ -718,6 +718,35 @@ impl Connection<'_> {
                 self.refresh()?;
                 self.attach(&terminal, cols, rows)
             }
+            TabEdit::WindowNew {
+                space,
+                lead,
+                folder,
+                kind,
+            } => {
+                let cwd = folder.map(Value::from).unwrap_or_else(|| {
+                    let state = lock(&self.owner.state);
+                    state.view["panes"]
+                        .as_array()
+                        .and_then(|p| p.iter().find(|p| p["id"] == lead.as_str()))
+                        .map(|p| p["cwd"].clone())
+                        .unwrap_or(Value::Null)
+                });
+                let run = window_run(&space, &lead, cwd, kind, cols, rows);
+                let result = self.call("terminal.run", run)?;
+                let terminal = result["address"]
+                    .as_str()
+                    .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
+                    .to_owned();
+                // Labelled at birth; set again for a core that drops run labels.
+                // A failure leaves the run's own label, which a current core keeps.
+                let _ = self.call(
+                    "terminal.label",
+                    json!({"terminal":terminal,"labels":{"parent":lead}}),
+                );
+                self.refresh()?;
+                self.attach(&terminal, cols, rows)
+            }
             TabEdit::Interrupt { terminal } => {
                 self.call("terminal.interrupt", json!({"terminal":terminal}))?;
                 Ok(())
@@ -806,8 +835,20 @@ impl Connection<'_> {
         self.dirty = false;
         let list = self.call("terminal.list", json!({}))?;
         let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+        // Wolf's order of the projects (item 62), kept in this core's doc
+        // projects.order by the desktop's sidebar; the phone's project
+        // switcher reads it. A core without it (older, or never dragged) has
+        // no order: birth order then.
+        let order = self
+            .call("doc.get", json!({"name":"projects.order"}))
+            .map(|o| o["value"].clone())
+            .unwrap_or(Value::Null);
         let mut state = lock(&self.owner.state);
         project(&mut state.view, &list["terminals"], &doc["value"])?;
+        if state.view["projects_order"] != order {
+            state.view["projects_order"] = order;
+            bump(&mut state.view);
+        }
         Ok(())
     }
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
@@ -907,6 +948,10 @@ pub(crate) enum TabEdit {
     SpaceRename { space: String, name: String },
     SpaceMove { space: String, index: usize },
     SpaceNew { space: String, kind: &'static str },
+    /// A new window of a project (the desktop's C-a c): a tab in `space`,
+    /// in `folder` (else the lead's), its terminal labelled parent=<lead>
+    /// so it is that project's window wherever its tab goes.
+    WindowNew { space: String, lead: String, folder: Option<String>, kind: &'static str },
     Interrupt { terminal: String },
     Kill { terminal: String },
     DeaconStart { machine: String },
@@ -962,6 +1007,21 @@ impl TabEdit {
                     _ => return None,
                 },
             },
+            "window.new" => Self::WindowNew {
+                space: id("space")?,
+                // A lead on this core only: a parent never names another computer's terminal.
+                lead: id("lead").filter(|l| !l.contains('/'))?,
+                folder: match &value["folder"] {
+                    Value::Null => None,
+                    v => Some(folder(v)?),
+                },
+                kind: match value["kind"].as_str()? {
+                    "shell" => "shell",
+                    "claude" => "claude",
+                    "codex" => "codex",
+                    _ => return None,
+                },
+            },
             "pane.interrupt" => Self::Interrupt { terminal: id("terminal")? },
             "pane.kill" => Self::Kill { terminal: id("terminal")? },
             "deacon.start" => Self::DeaconStart { machine: name().unwrap_or_default() },
@@ -1003,6 +1063,22 @@ impl TabEdit {
             _ => return None,
         })
     }
+}
+/// The terminal.run of a project's new window (`WindowNew`): a tab of its own
+/// in `space`, in `cwd`, working for `lead` (parent=<lead>), as the desktop's
+/// C-a c adopts it; an agent through the login shell, as `space.new` starts one.
+fn window_run(space: &str, lead: &str, cwd: Value, kind: &str, cols: u16, rows: u16) -> Value {
+    let tab = format!(
+        "mobile-{}-{}",
+        std::process::id(),
+        NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut run = json!({"cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":tab,"parent":lead},"size":{"cols":cols,"rows":rows},"display":display()});
+    if kind != "shell" {
+        run["line"] = json!(format!("exec \"${{SHELL:-/bin/sh}}\" -lic {kind}"));
+        run["labels"]["agent.kind"] = json!(kind);
+    }
+    run
 }
 /// Appends one space to herdr-app's document, keeping every space and tab
 /// already there (edit_doc hands it the freshest version on each try).
@@ -1574,7 +1650,9 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             if let Some(items) = space["tabs"].as_array() {
                 for tab in items {
                     if let Some(tab_id) = tab["id"].as_str() {
-                        tabs.push(json!({"id":tab_id,"workspace_id":id,"label":tab["name"].as_str().unwrap_or(tab_id),"focused":false,"zoomed":false,"status":""}));
+                        // `named`: whether someone named the tab (the desktop's
+                        // window names: an unnamed one goes by its task).
+                        tabs.push(json!({"id":tab_id,"workspace_id":id,"label":tab["name"].as_str().unwrap_or(tab_id),"named":tab["named"].as_bool(),"focused":false,"zoomed":false,"status":""}));
                     }
                 }
             }
@@ -1643,6 +1721,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "parent": label("parent").or(terminal["parent"].as_str()).unwrap_or(""),
             "role": label("role").unwrap_or(""),
             "project": label("project").unwrap_or(""),
+            // The repo a project sits under, when a label says so (item 61).
+            "repo": label("repo").unwrap_or(""),
             "kind": kind.unwrap_or(""),
             // What the deacon view shows under each agent: the program's own
             // status message, why it is blocked, and since when (core clock, ms).
@@ -2055,6 +2135,19 @@ mod tests {
 b"}"#), None);
     }
     #[test]
+    fn a_project_window_works_for_its_lead_like_c_a_c() {
+        let run = window_run("s1", "t5", json!("/w/x"), "codex", 80, 24);
+        assert_eq!(run["labels"]["parent"], "t5");
+        assert_eq!(run["labels"]["herdr.space"], "s1");
+        assert_eq!(run["labels"]["agent.kind"], "codex");
+        assert_eq!(run["cwd"], "/w/x");
+        assert!(run["labels"]["herdr.tab"].as_str().is_some_and(|t| t.starts_with("mobile-")));
+        let shell = window_run("s1", "t5", Value::Null, "shell", 80, 24);
+        assert!(shell["line"].is_null() && shell["labels"]["agent.kind"].is_null());
+        assert_eq!(shell["labels"]["parent"], "t5");
+    }
+
+    #[test]
     fn tab_edits_parse_only_bounded_known_operations() {
         use super::TabEdit;
         assert_eq!(
@@ -2086,6 +2179,18 @@ b"}"#), None);
             Some(TabEdit::SpaceOpen { folder: "/w/kache-wt".into() })
         );
         assert_eq!(TabEdit::parse(r#"{"op":"space.open","folder":"/w/a\nb"}"#), None);
+        // A project's new window (the desktop's C-a c): its lead on this core only.
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"claude","folder":"/w/x"}"#),
+            Some(TabEdit::WindowNew { space: "s1".into(), lead: "t5".into(), folder: Some("/w/x".into()), kind: "claude" })
+        );
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"shell"}"#),
+            Some(TabEdit::WindowNew { space: "s1".into(), lead: "t5".into(), folder: None, kind: "shell" })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"laptop/t5","kind":"shell"}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"vim"}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"shell","folder":"rel"}"#), None);
         assert_eq!(
             TabEdit::parse(r#"{"op":"pane.send","terminal":"t3","text":"I want to start a new project on server."}"#),
             Some(TabEdit::Send { terminal: "t3".into(), text: "I want to start a new project on server.".into() })
@@ -2303,9 +2408,11 @@ mod connection_tests {
             assert_eq!(hello["params"], json!({"framed":true,"generation":1}));
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
+            // The second doc.get is projects.order (the project switcher's order).
             for expected in [
                 "events.subscribe",
                 "terminal.list",
+                "doc.get",
                 "doc.get",
                 "terminal.attach",
             ] {
@@ -2398,7 +2505,8 @@ mod connection_tests {
             io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
-            for expected in ["events.subscribe", "terminal.list", "doc.get", "terminal.attach"] {
+            // The second doc.get is projects.order (the project switcher's order).
+            for expected in ["events.subscribe", "terminal.list", "doc.get", "doc.get", "terminal.attach"] {
                 let request: Value = serde_json::from_slice(&frame(&mut core, &mut decoder).bytes).unwrap();
                 assert_eq!(request["method"], expected);
                 let result = match expected {
