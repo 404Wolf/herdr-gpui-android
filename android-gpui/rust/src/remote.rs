@@ -395,18 +395,22 @@ impl LastUse {
     pub(crate) fn count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
     }
-    /// Milliseconds since the last use, at most [`IDLE_MAX_MS`] (also when
-    /// there was none): the attach's `idle_ms`.
+    /// Milliseconds since the last use, the true age however old (the core
+    /// orders devices by it); [`NEVER_USED_MS`] when there was none: the
+    /// attach's `idle_ms`.
     pub(crate) fn idle_ms(&self) -> u64 {
         let now = self.now_ms();
         match self.at_ms.load(Ordering::Relaxed) {
-            0 => IDLE_MAX_MS,
-            at => now.saturating_sub(at - 1).min(IDLE_MAX_MS),
+            0 => NEVER_USED_MS,
+            at => now.saturating_sub(at - 1),
         }
     }
 }
-/// An idle age past a day says nothing more; never used is that old.
-pub(crate) const IDLE_MAX_MS: u64 = 86_400_000;
+/// `idle_ms` for a phone never used since Herdr started: older than any
+/// core's uptime, so the core gives it no focus history (t1x1), and older
+/// than any real age, so it never sorts ahead of one. i64::MAX, so it reads
+/// the same as a signed or an unsigned number.
+pub(crate) const NEVER_USED_MS: u64 = i64::MAX as u64;
 pub(crate) static USE: LastUse = LastUse::new();
 pub fn close(id: u64) {
     let Some(owner) = lock(sessions()).remove(&id) else {
@@ -826,4 +830,32 @@ pub fn discover(id: u64) -> Result<String> {
         .map_err(|_| Error::Capacity)?;
     rx.recv_timeout(Duration::from_secs(120))
         .map_err(|_| Error::Closed)?
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod last_use_tests {
+    use super::*;
+
+    /// t217's probe on fc3d430: a one-day cap made a phone last used two days
+    /// ago look newer than a desktop idle for a day and a half.
+    #[test]
+    fn a_reconnect_after_two_days_keeps_two_days_of_idle_age() {
+        let uses = LastUse::new();
+        uses.born
+            .set(std::time::Instant::now().checked_sub(Duration::from_secs(172_800)).unwrap())
+            .unwrap();
+        uses.at_ms.store(1, Ordering::Relaxed);
+        uses.count.store(1, Ordering::Relaxed);
+        let age = uses.idle_ms();
+        assert!(age >= 172_800_000, "a two-day-old use must not become a one-day-old use on reconnect: {age}");
+        assert!(age < NEVER_USED_MS, "a real age always sorts ahead of never");
+    }
+
+    #[test]
+    fn never_used_is_older_than_any_real_age_and_reads_as_a_signed_number() {
+        let uses = LastUse::new();
+        assert_eq!(uses.idle_ms(), NEVER_USED_MS);
+        assert_eq!(json!(uses.idle_ms()).as_i64(), Some(i64::MAX));
+    }
 }

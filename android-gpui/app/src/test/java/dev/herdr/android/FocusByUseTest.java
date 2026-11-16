@@ -21,8 +21,8 @@ public final class FocusByUseTest {
     @Test public void aTouchAnywhereInHerdrIsAUseBeforeAnyViewSeesIt() throws IOException {
         String touch = section(source(UI), "@Override public boolean dispatchTouchEvent(", "@Override public boolean dispatchKeyEvent(");
         assertTrue(touch.contains("ACTION_DOWN) markUsed();"));
-        assertTrue("a use, then the touch as before",
-                touch.indexOf("markUsed()") < touch.indexOf("super.dispatchTouchEvent(event)"));
+        int used = touch.indexOf("markUsed()");
+        assertTrue("a use, then the touch as before", used >= 0 && used < touch.indexOf("super.dispatchTouchEvent(event)"));
     }
 
     @Test public void keysTypingTheKeyboardFoldsAndComingToTheFrontAreUsesToo() throws IOException {
@@ -33,11 +33,16 @@ public final class FocusByUseTest {
         assertTrue("the keyboard showing", ui.contains("if (ime && !imeShown) markUsed();"));
         String config = section(ui, "@Override public void onConfigurationChanged(", "terminalRoot.post(");
         assertTrue("a fold, an unfold or a turn", config.contains("markUsed();") && config.contains("screenWidthDp"));
+        // A posture change (tabletop) that keeps the window's size, from the watcher.
+        String watcher0 = section(ui, "FoldPosture.Uses folds = new FoldPosture.Uses();", "applyPosture();");
+        int fold = watcher0.indexOf("if (folds.isUse(posture, update)) markUsed();");
+        assertTrue("counted before the same-posture return", fold >= 0 && fold < watcher0.indexOf("if (update.equals(posture)) return;"));
         // Typing into the composer: the keyboard's window sends Herdr no touches.
         assertTrue(section(ui, "private ComposerBar.Host composerHost(", "@Override public void enterKey(")
                 .contains("public void typed() { markUsed(); }"));
         String watcher = section(source("ComposerBar"), "@Override public void afterTextChanged(", "EnterPaths.withoutTypedNewline(");
-        assertTrue("an edit the program made is not Wolf's", watcher.indexOf("if (updatingField) return;") < watcher.indexOf("host.typed();"));
+        int typed = watcher.indexOf("host.typed();");
+        assertTrue("an edit the program made is not Wolf's", typed > watcher.indexOf("if (updatingField) return;"));
     }
 
     @Test public void onlyAHerdrSessionOnScreenReportsUse() throws IOException {

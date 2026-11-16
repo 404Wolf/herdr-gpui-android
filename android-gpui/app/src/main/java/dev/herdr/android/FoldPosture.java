@@ -60,6 +60,21 @@ final class FoldPosture {
     }
 
     /** Fold updates for one activity, registered while it is started. */
+    /**
+     * Which deliveries are a physical fold, so Wolf using the phone (item 71):
+     * a change of posture, not the watcher's first delivery after it starts,
+     * which only says how the phone already was. One per watcher.
+     */
+    static final class Uses {
+        private boolean heard;
+
+        boolean isUse(FoldPosture before, FoldPosture after) {
+            boolean first = !heard;
+            heard = true;
+            return !first && !after.equals(before);
+        }
+    }
+
     static final class Watcher {
         private final Object component;
         private final Method remove;

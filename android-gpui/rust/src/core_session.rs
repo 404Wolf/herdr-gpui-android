@@ -210,6 +210,9 @@ impl Connection<'_> {
     }
     /// While the pane is shown: WINDOW_FOCUS 1 when it becomes shown without
     /// being focused, and for each new use, at most one a second (leading edge).
+    /// A use while the pane waits to be shown (its measured RESIZE) is kept
+    /// and sent once it is; a use while hidden is not Wolf using this pane.
+    /// Hidden before ever being shown, a focused attach is unfocused.
     fn sync_focus(&mut self) -> Result<()> {
         let typed = lock(&self.owner.state).terminal.as_ref().map(|t| t.inputs());
         if let Some(typed) = typed.filter(|typed| *typed != self.focus.typed) {
@@ -219,13 +222,18 @@ impl Connection<'_> {
         if !self.focus.frames || self.channel == 0 {
             return Ok(());
         }
-        let shown = self.wants_visible() && (!self.claim.frames || self.claim.shown);
         let uses = crate::remote::USE.count();
-        let used = uses != self.focus.uses;
-        self.focus.uses = uses;
-        if !shown {
+        if !self.wants_visible() {
+            self.focus.uses = uses;
+            // VISIBILITY 0 unfocuses a shown pane (sync_claim); this one never was.
+            return self.unfocus();
+        }
+        if self.claim.frames && !self.claim.shown {
+            // Measuring before showing: any use waits for the show.
             return Ok(());
         }
+        let used = uses != self.focus.uses;
+        self.focus.uses = uses;
         let due = self
             .focus
             .sent_at
@@ -4223,7 +4231,7 @@ mod claim_tests {
     }
 
     /// The phone's uses are process-wide: tests that count them run one at a time.
-    fn focus_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn focus_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         lock(&LOCK)
     }
@@ -4346,9 +4354,9 @@ mod claim_tests {
     }
 
     #[test]
-    fn idle_is_the_time_since_the_phones_last_use_capped_at_a_day() {
+    fn idle_is_the_time_since_the_phones_last_use() {
         let uses = crate::remote::LastUse::new();
-        assert_eq!(uses.idle_ms(), crate::remote::IDLE_MAX_MS, "never used");
+        assert_eq!(uses.idle_ms(), crate::remote::NEVER_USED_MS, "never used");
         assert_eq!(uses.count(), 0);
         uses.mark();
         assert!(uses.idle_ms() < 1_000);
@@ -4855,5 +4863,151 @@ mod claim_tests {
         let got: Vec<String> = connection_tests::all_rows(&pane).into_iter().filter(|s| !s.is_empty()).collect();
         core.close();
         assert_eq!(got, all, "path A fallback to the previous pane still owes its repair");
+    }
+}
+
+/// t217's review probes on fc3d430 (PR #29), kept: explicit state
+/// transitions, frames captured on a socket pair, no timing guesses.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod focus_review_tests {
+    use super::*;
+    use crate::remote::{Heard, State};
+    use herdr_remote_transport::CancellationToken;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    fn owner() -> Arc<Session> {
+        let (commands, _) = mpsc::sync_channel(256);
+        Arc::new(Session {
+            id: 0,
+            state: Mutex::new(State {
+                view: json!({"revision":0,"panes":[]}),
+                terminal: None,
+                render_id: 0,
+            }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(None),
+            heard: Heard::default(),
+            visible: AtomicBool::new(true),
+        })
+    }
+
+    /// After an automatic reconnect attached with an old idle_ms: focused,
+    /// not yet visible, waiting for the view's measured RESIZE.
+    fn awaiting_measurement(owner: &Arc<Session>) -> (Connection<'_>, UnixStream) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let connection = Connection {
+            socket,
+            decoder: Decoder::default(),
+            owner,
+            serial: 1,
+            channel: 2,
+            output: None,
+            events: 1,
+            event_carry: Vec::new(),
+            dirty: false,
+            negotiated: false,
+            claim: Claim {
+                offered: true,
+                frames: true,
+                attached_at: Some(Instant::now()),
+                ..Claim::default()
+            },
+            history_on_resize: false,
+            reattach: None,
+            reattached_at: None,
+            ended: None,
+            automatic_input: true,
+            focus: Focus {
+                offered: true,
+                frames: true,
+                on: true,
+                uses: crate::remote::USE.count(),
+                ..Focus::default()
+            },
+        };
+        (connection, peer)
+    }
+
+    fn frames(peer: &mut UnixStream) -> Vec<(u32, u8, Vec<u8>)> {
+        let mut bytes = Vec::new();
+        let result = peer.read_to_end(&mut bytes);
+        assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        let mut decoder = Decoder { bytes };
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.next().unwrap() {
+            frames.push((frame.channel, frame.kind, frame.bytes));
+        }
+        frames
+    }
+
+    #[test]
+    fn a_touch_while_waiting_for_size_is_reported_when_the_pane_is_shown() {
+        let _serial = claim_tests::focus_test_lock();
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        crate::remote::used();
+        connection.sync_focus().unwrap();
+        assert!(frames(&mut peer).is_empty());
+        connection.resize(90, 40).unwrap();
+        connection.sync_claim(90, 40).unwrap();
+        connection.sync_focus().unwrap();
+        let kinds: Vec<_> = frames(&mut peer).into_iter().map(|(_, kind, _)| kind).collect();
+        assert_eq!(
+            kinds,
+            [RESIZE, VISIBILITY, WINDOW_FOCUS],
+            "the touch after attach must refresh the old attach idle_ms when shown"
+        );
+    }
+
+    #[test]
+    fn an_untouched_reconnect_is_shown_without_a_focus_frame() {
+        let _serial = claim_tests::focus_test_lock();
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        connection.resize(90, 40).unwrap();
+        connection.sync_claim(90, 40).unwrap();
+        connection.sync_focus().unwrap();
+        let kinds: Vec<_> = frames(&mut peer).into_iter().map(|(_, kind, _)| kind).collect();
+        assert_eq!(kinds, [RESIZE, VISIBILITY], "its attach's idle_ms stands");
+    }
+
+    #[test]
+    fn hiding_before_first_measurement_unfocuses_the_focused_attach() {
+        let _serial = claim_tests::focus_test_lock();
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        owner.visible.store(false, Ordering::Relaxed);
+        connection.sync_claim(90, 40).unwrap();
+        connection.sync_focus().unwrap();
+        assert_eq!(
+            frames(&mut peer),
+            [(2, WINDOW_FOCUS, vec![0])],
+            "the focused attach must receive 0 even though VISIBILITY is already 0"
+        );
+    }
+
+    #[test]
+    fn first_use_after_hide_bypasses_the_existing_rate_limit() {
+        let _serial = claim_tests::focus_test_lock();
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        connection.claim.shown = true;
+        connection.focus.sent_at = Some(Instant::now());
+        owner.visible.store(false, Ordering::Relaxed);
+        connection.sync_claim(90, 40).unwrap();
+        assert_eq!(
+            frames(&mut peer),
+            [(2, WINDOW_FOCUS, vec![0]), (2, VISIBILITY, vec![0])]
+        );
+        owner.visible.store(true, Ordering::Relaxed);
+        connection.resize(90, 40).unwrap();
+        connection.sync_claim(90, 40).unwrap();
+        crate::remote::used();
+        connection.sync_focus().unwrap();
+        let frames = frames(&mut peer);
+        assert_eq!(frames.last(), Some(&(2, WINDOW_FOCUS, vec![1])));
     }
 }

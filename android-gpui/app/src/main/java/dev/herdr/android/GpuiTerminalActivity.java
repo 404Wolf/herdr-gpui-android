@@ -5113,7 +5113,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         super.onStart();
         // Postures arrive while the activity is visible, as Jetpack delivers them.
         if (foldWatcher == null) {
+            // A fold into or out of tabletop may keep the window's size: the
+            // posture change itself is the use (item 71), not its first report.
+            FoldPosture.Uses folds = new FoldPosture.Uses();
             foldWatcher = FoldPosture.Watcher.start(this, update -> main.post(() -> {
+                if (folds.isUse(posture, update)) markUsed();
                 if (update.equals(posture)) return;
                 posture = update;
                 applyPosture();
