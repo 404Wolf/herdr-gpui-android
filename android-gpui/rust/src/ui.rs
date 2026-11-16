@@ -318,30 +318,55 @@ fn button(
 /// down GPUI handles shows as one of two events: a touch drag offered as the
 /// touch starts, or (a down that stops a fling, starting no touch) a touch
 /// scroll that starts with no movement. Both take their down's entry, so
-/// entries are matched one to one in order, never by position. One down that
-/// lands right after a pan shows as two starts at one point (the platform's
-/// fling-stopping synthetic contact, then the real one): they take one entry
-/// (`DownStamps::started`).
+/// entries are matched one to one in order, never by position. Right after a
+/// pan one down starts twice at one point (the platform's synthetic,
+/// fling-stopping contact, then the real one); what each touch does after
+/// its start (`progressed`) tells that apart from two downs.
 #[cfg(target_os = "android")]
 fn down_watch() -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |_, _, window, _| {
             window.on_mouse_event(|event: &TouchDragEvent, phase, _, _| {
-                if phase == DispatchPhase::Capture && event.phase == TouchPhase::Started {
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
+                if event.phase == TouchPhase::Started {
                     crate::android::touch_started(event.start_position);
+                } else {
+                    crate::android::touch_progressed();
                 }
             });
             window.on_mouse_event(|event: &ScrollWheelEvent, phase, _, _| {
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
                 let still = match event.delta {
                     ScrollDelta::Pixels(delta) => delta == Point::default(),
                     ScrollDelta::Lines(delta) => delta == Point::default(),
                 };
-                if phase == DispatchPhase::Capture
-                    && event.touch_phase == TouchPhase::Started
-                    && still
-                {
-                    crate::android::touch_started(event.position);
+                match event.touch_phase {
+                    TouchPhase::Started if still => crate::android::touch_started(event.position),
+                    // The synthetic contact's only other event: the still
+                    // pan it began, cancelled. Not a touch going on.
+                    TouchPhase::Cancelled if still => {}
+                    _ => crate::android::touch_progressed(),
+                }
+            });
+            // A tap (synthesized as the finger lifts) and a long press.
+            window.on_mouse_event(|_: &MouseDownEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture {
+                    crate::android::touch_progressed();
+                }
+            });
+            window.on_mouse_event(|_: &MouseUpEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture {
+                    crate::android::touch_progressed();
+                }
+            });
+            window.on_mouse_event(|_: &LongPressEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture {
+                    crate::android::touch_progressed();
                 }
             });
         },

@@ -226,13 +226,22 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
     // The pane this press begins on goes into the queue with its down, in the
     // order GPUI gets the downs (the lock is held across the post), so the
     // renderer stamps the tap with it however late it handles it.
-    let mut downs = (action == 0).then(lock_downs);
+    let mut downs = (action == 0 || action == 3).then(lock_downs);
     if let Some(downs) = downs.as_mut() {
-        downs.queued(stamp.max(0) as u64);
+        if action == 0 {
+            downs.queued(stamp.max(0) as u64);
+        } else {
+            // A cancelled touch may end with no event from GPUI: never take
+            // it for the platform's synthetic, fling-stopping contact.
+            downs.cancelled();
+        }
     }
     let posted =
         gpui_mobile::android::host::motion_event(action as u32, action_index as usize, &pointers);
-    if !posted && let Some(downs) = downs.as_mut() {
+    if !posted
+        && action == 0
+        && let Some(downs) = downs.as_mut()
+    {
         // A platform view took it: GPUI never handles this down.
         downs.withdrawn();
     }
@@ -251,10 +260,15 @@ fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
 }
 
 /// GPUI reported a touch-down starting at `position` (see `ui::down_watch`):
-/// it takes the next queued stamp, unless it is the second start of one down.
+/// it takes the next queued stamp, unless it is the real contact after the
+/// platform's synthetic one (`DownStamps::started`).
 pub(crate) fn touch_started(position: gpui::Point<gpui::Pixels>) {
-    let at = (f32::from(position.x), f32::from(position.y));
-    lock_downs().started(at, std::time::Instant::now());
+    lock_downs().started((f32::from(position.x), f32::from(position.y)));
+}
+
+/// The touch in progress went on past its start (see `ui::down_watch`).
+pub(crate) fn touch_progressed() {
+    lock_downs().progressed();
 }
 
 /// The gesture GPUI is handling: the down it handled last, with the stamp
