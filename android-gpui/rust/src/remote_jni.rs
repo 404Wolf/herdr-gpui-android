@@ -324,9 +324,10 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollHeld(
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_herdr_android_RemoteNative_saveClosed(
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_savePane(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
+    handle: jlong,
     pane: JString<'_>,
     path: JString<'_>,
 ) -> jboolean {
@@ -336,8 +337,35 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_saveClosed(
     let Some(path) = read(&mut env, &path, 4096) else {
         return 0;
     };
-    match remote::save_closed(&pane, &path) {
+    match remote::save_pane(u64::try_from(handle).unwrap_or(0), &pane, &path) {
         Ok(saved) => u8::from(saved),
+        Err(error) => {
+            fail(&mut env, &error.to_string());
+            0
+        }
+    }
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_holdNote(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    pane: JString<'_>,
+    title: JString<'_>,
+    note: JString<'_>,
+    cols: jint,
+    rows: jint,
+) -> jlong {
+    let (Some(pane), Some(title), Some(note)) = (
+        read(&mut env, &pane, 1024),
+        read(&mut env, &title, 4096),
+        read(&mut env, &note, 4096),
+    ) else {
+        return 0;
+    };
+    let size = |value: jint| u16::try_from(value.clamp(0, 400)).unwrap_or(80);
+    match remote::hold_note(&pane, &title, &note, size(cols), size(rows)) {
+        Ok(id) => id as jlong,
         Err(error) => {
             fail(&mut env, &error.to_string());
             0

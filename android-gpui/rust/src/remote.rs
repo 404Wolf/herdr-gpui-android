@@ -220,16 +220,26 @@ pub(crate) struct Session {
 pub(crate) struct Heard {
     born: std::time::Instant,
     at_ms: AtomicU64,
+    /// Bytes of pane output received so far (every pane this session showed):
+    /// the phone checkpoints the pane on screen only while this moves.
+    output: AtomicU64,
 }
 impl Default for Heard {
     fn default() -> Self {
         Self {
             born: std::time::Instant::now(),
             at_ms: AtomicU64::new(0),
+            output: AtomicU64::new(0),
         }
     }
 }
 impl Heard {
+    pub(crate) fn printed(&self, bytes: usize) {
+        self.output.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    pub(crate) fn output(&self) -> u64 {
+        self.output.load(Ordering::Relaxed)
+    }
     pub(crate) fn mark(&self) {
         let now = u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.at_ms.store(now, Ordering::Relaxed);
@@ -349,9 +359,52 @@ pub fn close(id: u64) {
     let mut state = lock(&owner.state);
     if let Some(terminal) = state.terminal.take() {
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+        // This grid is newer than any copy of the same pane kept on a switch.
+        lock(departed()).retain(|held| held.pane != pane);
         *lock(closed()) = Some(Held { terminal: terminal.clone(), pane: pane.clone() });
         hold(terminal, pane);
     }
+}
+/// Most grids of switched-away panes kept at once, each until the phone saves
+/// it. A grid is at most the phone's scrollback (10,000 rows), so this bounds
+/// what a quick run of switches can keep alive to two such grids.
+pub(crate) const DEPARTED_MAX: usize = 2;
+/// Grids of panes a session just switched away from, oldest first: an attach
+/// drops its outgoing grid, and the phone saves it from here on its own thread
+/// (maybe after the next attach), so a pane looked at online can be read offline.
+fn departed() -> &'static Mutex<std::collections::VecDeque<Held>> {
+    static DEPARTED: OnceLock<Mutex<std::collections::VecDeque<Held>>> = OnceLock::new();
+    DEPARTED.get_or_init(Mutex::default)
+}
+/// An attach is replacing `pane`'s grid with another pane's: keep it for saving.
+/// Only the grid object moves here; nothing is sent and no size changes.
+pub(crate) fn depart(terminal: Arc<gpui_rio::Session>, pane: String) {
+    if pane.is_empty() {
+        return;
+    }
+    {
+        // A copy kept from an earlier close of the same pane is older.
+        let mut closed = lock(closed());
+        if closed.as_ref().is_some_and(|held| held.pane == pane) {
+            closed.take();
+        }
+    }
+    let mut kept = lock(departed());
+    kept.retain(|held| held.pane != pane);
+    kept.push_back(Held { terminal, pane });
+    while kept.len() > DEPARTED_MAX {
+        kept.pop_front();
+    }
+}
+#[cfg(test)]
+pub(crate) fn departed_holds(terminal: &Arc<gpui_rio::Session>) -> bool {
+    lock(departed()).iter().any(|held| Arc::ptr_eq(&held.terminal, terminal))
+}
+/// Serializes the tests that count what the shared departed slot holds.
+#[cfg(test)]
+pub(crate) fn departed_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    lock(&LOCK)
 }
 /// The last closed session's grid, kept for saving even after a new pane
 /// attaches (the save runs on a worker, maybe after that attach).
@@ -388,13 +441,32 @@ pub(crate) fn release_held() {
     lock(held()).take();
     lock(cached()).take();
 }
-/// Saves the last closed session's grid to `path` when it was `pane`'s: the
-/// phone's copy of that conversation, for reading it later with no link. False
-/// when another pane (or nothing) was closed last. Disk work: never on the UI thread.
-pub fn save_closed(pane: &str, path: &str) -> Result<bool> {
-    let terminal = match lock(closed()).as_ref() {
-        Some(held) if !pane.is_empty() && held.pane == pane => held.terminal.clone(),
-        _ => return Ok(false),
+/// Saves `pane`'s grid to `path`: the phone's copy of that conversation, for
+/// reading it later with no link. The grid is the newest the phone holds: the
+/// live one when session `id` (0: none) shows `pane`, else the one kept when a
+/// switch left it (freed once saved), else the last closed session's. False
+/// when none of them is `pane`'s. Disk work: never on the UI thread.
+pub fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
+    if pane.is_empty() {
+        return Ok(false);
+    }
+    let live = lock(sessions()).get(&id).cloned().and_then(|owner| {
+        let state = lock(&owner.state);
+        if state.view["pane_id"] == pane { state.terminal.clone() } else { None }
+    });
+    let switched = || {
+        let mut kept = lock(departed());
+        let at = kept.iter().position(|held| held.pane == pane)?;
+        kept.remove(at).map(|held| held.terminal)
+    };
+    let last_closed = || {
+        lock(closed())
+            .as_ref()
+            .filter(|held| held.pane == pane)
+            .map(|held| held.terminal.clone())
+    };
+    let Some(terminal) = live.or_else(switched).or_else(last_closed) else {
+        return Ok(false);
     };
     let grid = terminal.grid().lock();
     crate::snapshot::save(&grid, pane, std::path::Path::new(path))?;
@@ -410,6 +482,21 @@ pub fn open_saved(path: &str) -> Result<u64> {
     let id = crate::core_session::next_render_id();
     *lock(cached()) = Some((id, terminal.clone()));
     hold(terminal, pane);
+    Ok(id)
+}
+/// Makes `pane`'s stand-in the held frame when it has no saved copy: `title`
+/// and one dim `note` line on a `cols`×`rows` grid, drawn under a new render id
+/// (returned) until a live pane attaches. Never touches a session or the disk.
+pub fn hold_note(pane: &str, title: &str, note: &str, cols: u16, rows: u16) -> Result<u64> {
+    let terminal = crate::snapshot::restore(crate::snapshot::Saved {
+        cols: cols.clamp(20, 400),
+        rows: rows.clamp(5, 200),
+        pane: pane.into(),
+        bytes: crate::snapshot::note(title, note),
+    })?;
+    let id = crate::core_session::next_render_id();
+    *lock(cached()) = Some((id, terminal.clone()));
+    hold(terminal, pane.into());
     Ok(id)
 }
 /// Scrolls the held frame's own history, with no link: `delta` rows back
@@ -477,12 +564,14 @@ pub fn poll_terminal(
             "fetch": view["fetch"],
             "local_offset": local_offset,
             "quiet_ms": owner.heard.quiet_ms(),
+            "output": owner.heard.output(),
         })
         .to_string());
     }
     let mut view = view.clone();
     view["local_offset"] = json!(local_offset);
     view["quiet_ms"] = json!(owner.heard.quiet_ms());
+    view["output"] = json!(owner.heard.output());
     Ok(view.to_string())
 }
 pub fn focus(id: u64, terminal: &str) -> Result<String> {

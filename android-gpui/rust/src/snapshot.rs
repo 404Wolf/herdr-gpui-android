@@ -171,6 +171,19 @@ pub(crate) fn parse(mut bytes: Vec<u8>) -> Result<Saved> {
 }
 
 /// A read-only terminal showing `saved`: no transport, input goes nowhere.
+/// The most characters of a title or note an uncached pane shows.
+const MAX_NOTE_CHARS: usize = 200;
+
+/// What a pane with no saved copy draws while there is no link: its title,
+/// bold, and one dim line under it, with no cursor (nothing can be typed into
+/// it). Text only: control characters in either string are dropped.
+pub(crate) fn note(title: &str, line: &str) -> Vec<u8> {
+    let clean = |text: &str| -> String {
+        text.chars().filter(|c| !c.is_control()).take(MAX_NOTE_CHARS).collect()
+    };
+    format!("\x1b[0m\x1b[1m{}\x1b[0m\r\n\x1b[2m{}\x1b[0m\x1b[?25l", clean(title), clean(line)).into_bytes()
+}
+
 pub(crate) fn restore(saved: Saved) -> Result<Arc<gpui_rio::Session>> {
     let session = gpui_rio::Session::start(
         io::Cursor::new(saved.bytes),
@@ -190,6 +203,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_uncached_pane_draws_its_title_and_one_dim_line_and_nothing_else() {
+        let bytes = note("lead \x1b[2Jwindow 2", "not cached · opens when the link is back");
+        let shown = parsed(&bytes, 60, 6);
+        let text = shown.screen_text();
+        let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+        // The escape in the title was dropped, never run (no screen clear).
+        assert_eq!(lines, vec!["lead [2Jwindow 2", "not cached · opens when the link is back"]);
+        let grid = shown.grid().lock();
+        assert!(grid.grid.style_of(&grid.grid[Line(0)][Column(0)]).flags.contains(rio_vt::crosswords::style::StyleFlags::BOLD));
+        assert!(grid.grid.style_of(&grid.grid[Line(1)][Column(0)]).flags.contains(rio_vt::crosswords::style::StyleFlags::DIM));
+        assert!(!grid.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR));
+        drop(grid);
+        let long = note(&"x".repeat(1000), "");
+        assert!(long.len() < 300);
+    }
 
     fn parsed(text: &[u8], cols: u16, rows: u16) -> Arc<gpui_rio::Session> {
         let session = restore(Saved { cols, rows, pane: "t1".into(), bytes: text.to_vec() }).unwrap();
