@@ -199,25 +199,24 @@ pub fn plain_view_tap(lifted: Option<(bool, Gesture)>, now: Gesture) -> (Tapped,
 /// touch-drag offer) and nothing more: it never moves, lifts or is held.
 /// Then the real contact starts at the same point. The two starts are the
 /// one down Java queued, so the second takes no entry of its own
-/// ([`DownStamps::started`]). They are told apart from two downs by what the
-/// first contact did, never by timing: the synthetic contact is the only one
-/// that ends unseen. A real touch is seen to go on (moves, lifts, is held:
-/// [`DownStamps::progressed`]) or is cancelled through the host
+/// ([`DownStamps::started`]). They are told apart from two downs by what
+/// the first contact did, never by timing: the synthetic contact is the only
+/// one that ends unseen, and a down has at most these two starts. A real
+/// touch is seen to go on (moves, lifts, is held: [`DownStamps::progressed`])
+/// or, once GPUI has handled its down, is cancelled through the host
 /// ([`DownStamps::cancelled`]) before another down starts.
 #[derive(Debug)]
 pub struct DownStamps {
     /// Downs queued and not yet handled whose stamps were dropped to keep
     /// the bound: the oldest of all, so they come first and take NO_STAMP.
     dropped: usize,
-    /// The other downs queued and not yet handled, oldest first: each one's
-    /// stamp, and whether the host has already cancelled its touch.
-    queue: std::collections::VecDeque<(u64, bool)>,
+    /// The stamps of the other downs queued and not yet handled, oldest first.
+    queue: std::collections::VecDeque<u64>,
     /// The down GPUI handled last: the touch in progress.
     current: Gesture,
-    /// Where the touch in progress started, when its start took an entry.
-    start: Option<(f32, f32)>,
-    /// The touch in progress went on past its start (see [`Self::progressed`]).
-    progressed: bool,
+    /// Where the touch in progress first started, while a second start there
+    /// can still be its own (see [`Self::started`]); `None` once it cannot.
+    pairs_at: Option<(f32, f32)>,
 }
 
 impl Default for DownStamps {
@@ -235,52 +234,50 @@ impl DownStamps {
             dropped: 0,
             queue: std::collections::VecDeque::new(),
             current: Gesture::NONE,
-            start: None,
-            progressed: false,
+            pairs_at: None,
         }
     }
 
     /// GPUI reported a down starting at `position` (logical pixels): a
     /// touch-drag offer, or a still scroll start (a down that stopped a
-    /// fling). Returns its stamp. A start at exactly the point where the touch
-    /// in progress started, while that touch has done nothing since, is the
-    /// same down (the platform's synthetic contact came first): it keeps the
-    /// gesture in progress and takes no entry. Any other start takes the next
-    /// entry, in order, as [`Self::handled`] does.
+    /// fling). Returns its stamp.
+    ///
+    /// A start at exactly the point where the touch in progress first
+    /// started is that touch's second start (the platform's synthetic contact
+    /// came first) while the touch has done nothing since, was not cancelled
+    /// after GPUI handled it, has started only once, and took a stamp: it
+    /// keeps the gesture and takes no entry. Any other start takes the next
+    /// entry, in order, as [`Self::handled`] does. A start with no stamp
+    /// (none queued, or one dropped past the bound) never pairs, so it can
+    /// never hold back the next down's stamp.
     pub fn started(&mut self, position: (f32, f32)) -> u64 {
-        let same_down = !self.progressed && self.start == Some(position);
-        self.progressed = false;
-        if same_down {
+        if self.pairs_at.take() == Some(position) {
             return self.current.stamp;
         }
-        let took = self.dropped > 0 || !self.queue.is_empty();
-        let cancelled =
-            self.dropped == 0 && self.queue.front().is_some_and(|(_, cancelled)| *cancelled);
         let stamp = self.handled();
-        // A start that found no down queued is no down to repeat: a later
-        // down at that point takes its own entry.
-        self.start = took.then_some(position);
-        self.progressed = cancelled;
+        self.pairs_at = (stamp != NO_STAMP).then_some(position);
         stamp
+    }
+
+    /// The touch in progress went on past its start: it moved, lifted, was
+    /// held, or was offered as a tap. A real touch does one of these, or is
+    /// cancelled, before the next down starts; the platform's synthetic
+    /// contact never does. The next start, wherever it is, is a down of its
+    /// own.
+    pub fn progressed(&mut self) {
+        self.pairs_at = None;
     }
 
     /// The host cancelled the touch of the down it queued last (the platform
     /// took the gesture, or the host claimed it: a scroll, a pinch). GPUI may
-    /// report nothing more for it, so it counts as gone on, whether GPUI has
-    /// handled its down yet or not.
+    /// report nothing more for it. Once GPUI has handled that down, the touch
+    /// in progress is over: the next start is a down of its own. Before then
+    /// the cancel needs no record: GPUI handles the down's starts before its
+    /// cancel, and a down starts at most twice.
     pub fn cancelled(&mut self) {
-        match self.queue.back_mut() {
-            Some((_, cancelled)) => *cancelled = true,
-            None => self.progressed = true,
+        if self.dropped == 0 && self.queue.is_empty() {
+            self.pairs_at = None;
         }
-    }
-
-    /// The touch in progress went on past its start: it moved, lifted, was
-    /// held, or was offered as a tap. A real touch always does one of these
-    /// before the next down starts; the platform's synthetic contact never
-    /// does. The next start, wherever it is, is then a down of its own.
-    pub fn progressed(&mut self) {
-        self.progressed = true;
     }
 
     /// A down went into GPUI's queue with `stamp`. Past the bound the oldest
@@ -291,7 +288,7 @@ impl DownStamps {
             self.queue.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.queue.push_back((stamp, false));
+        self.queue.push_back(stamp);
     }
 
     /// The down queued last never reached GPUI (the platform kept it).
@@ -306,7 +303,7 @@ impl DownStamps {
             self.dropped -= 1;
             NO_STAMP
         } else {
-            self.queue.pop_front().map_or(NO_STAMP, |(stamp, _)| stamp)
+            self.queue.pop_front().unwrap_or(NO_STAMP)
         };
         self.current = Gesture {
             id: self.current.id + 1,
@@ -725,25 +722,48 @@ mod tests {
     #[test]
     fn a_touch_the_host_cancelled_is_never_taken_for_the_synthetic_contact() {
         // A scroll the activity claims before GPUI saw it pass the slop: GPUI
-        // reports nothing after its start. The next down at the very same
-        // point (a test's repeated coordinates) is still a down of its own,
-        // whether the cancel came before or after GPUI handled the start.
+        // reports nothing after its start. Once GPUI has handled that down,
+        // the next down at the very same point is a down of its own.
         let mut downs = DownStamps::default();
         downs.queued(1);
         assert_eq!(downs.started((5., 5.)), 1);
         downs.cancelled();
         downs.queued(2);
         assert_eq!(downs.started((5., 5.)), 2);
+    }
 
-        downs.queued(3);
+    #[test]
+    fn a_cancel_queued_before_gpui_handles_the_down_keeps_its_pair_together() {
+        // GPUI is behind: Java queues down 10, cancels it, queues down 20.
+        // GPUI then handles 10's synthetic and real starts (its cancel comes
+        // after them), then 20's down.
+        let mut downs = DownStamps::default();
+        downs.queued(10);
         downs.cancelled();
-        downs.queued(4);
-        assert_eq!(downs.started((7., 7.)), 3);
-        assert_eq!(downs.started((7., 7.)), 4);
-        // The platform's synthetic contact still pairs with its real one.
-        downs.progressed();
-        downs.queued(5);
-        assert_eq!(after_a_pan(&mut downs, (7., 7.)), 5);
+        downs.queued(20);
+        assert_eq!(after_a_pan(&mut downs, (40., 80.)), 10);
+        assert_eq!(downs.started((90., 90.)), 20);
+        // A down starts at most twice: a third start at the point is the next down.
+        let mut downs = DownStamps::default();
+        downs.queued(10);
+        downs.cancelled();
+        downs.queued(20);
+        assert_eq!(after_a_pan(&mut downs, (40., 80.)), 10);
+        assert_eq!(downs.started((40., 80.)), 20);
+    }
+
+    #[test]
+    fn past_the_bound_a_dropped_down_never_holds_back_the_next() {
+        // Losing a stamp past the bound is allowed; shifting the next down's
+        // stamp is not. A start with no stamp never pairs.
+        let mut downs = DownStamps::default();
+        downs.queued(10);
+        downs.cancelled();
+        for stamp in 20..20 + DownStamps::CAPACITY as u64 {
+            downs.queued(stamp);
+        }
+        assert_eq!(downs.started((40., 80.)), NO_STAMP);
+        assert_eq!(downs.started((40., 80.)), 20);
     }
 
     #[test]
