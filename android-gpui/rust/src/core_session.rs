@@ -3991,6 +3991,8 @@ mod claim_tests {
     /// path cannot carry it. An older core gets exactly the attach it always got.
     #[test]
     fn resize_history_is_asked_for_only_while_offered_and_echoed() {
+        // Its switches put mock session 0's t1 in the shared departed slot.
+        let _serial = crate::remote::departed_test_lock();
         let echoing = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
             Script { echo: true, ..Script::default() });
         let Seen::Attach(params) = echoing.next() else { panic!("attach first") };
