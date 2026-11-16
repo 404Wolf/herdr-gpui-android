@@ -35,10 +35,8 @@ public final class DictationRoutingTest {
         }
 
         @Override public void enter() {
-            // As ComposerBar.enter: while a session records or transcribes, Enter waits on it.
-            if (state == DictationEngine.State.CONNECTING || state == DictationEngine.State.LISTENING
-                    || state == DictationEngine.State.ON_DEVICE || state == DictationEngine.State.OFFLINE_RECORDING
-                    || state == DictationEngine.State.TRANSCRIBING) {
+            // ComposerBar.enter's own decision: while a session records or transcribes, Enter waits.
+            if (DictationRouting.onEnter(state) != DictationRouting.Enter.SEND) {
                 routing.sendWhenDone();
                 return;
             }
@@ -79,6 +77,23 @@ public final class DictationRoutingTest {
                 String.class, String.class, long.class, long.class);
         c.setAccessible(true);
         return c.newInstance("clip-1", target, 1L, 2000L);
+    }
+
+    @Test public void enterWaitsWhileASessionRecordsOrTranscribes() {
+        for (DictationEngine.State st : DictationEngine.State.values()) {
+            DictationRouting.Enter expected;
+            switch (st) {
+                case CONNECTING: case LISTENING: case ON_DEVICE: case OFFLINE_RECORDING:
+                    expected = DictationRouting.Enter.STOP_THEN_SEND;
+                    break;
+                case TRANSCRIBING:
+                    expected = DictationRouting.Enter.SEND_WHEN_DONE;
+                    break;
+                default:
+                    expected = DictationRouting.Enter.SEND;
+            }
+            assertEquals(st.name(), expected, DictationRouting.onEnter(st));
+        }
     }
 
     @Test public void theOldPanesFinalSendsTheEnterPressedOnTheNewPane() {

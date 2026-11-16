@@ -156,13 +156,14 @@ public final class ServerDictationEngineTest {
             if (server != null) server.close();
             server = new FakeServer(Behaviour.fast(ready).finalAfter(4000));
             FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 50);
-            Run run = dictate(server.uri(), phone, 300);
+            log.clear();
+            // Stops once the phone has taken over (on the state, not on time: a loaded machine).
+            Run run = dictateUntil(server.uri(), phone, DictationEngine.State.ON_DEVICE);
             run.awaitEnd();
             assertPhoneText(run);
-            // Handed over before stop: no budget waited after it.
-            assertTrue(run.listener.states.indexOf(DictationEngine.State.ON_DEVICE)
-                    < run.listener.states.indexOf(DictationEngine.State.TRANSCRIBING));
-            assertTrue(run.listener.endedAt - run.stoppedAt < TIMEOUTS.finalBudgetMs);
+            // Handed over before stop, on the backend word: no budget waited after it.
+            assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("desktop out (backend ")));
+            assertFalse(log.toString(), log.stream().anyMatch(l -> l.contains("no final in time")));
         }
     }
 
@@ -301,12 +302,26 @@ public final class ServerDictationEngineTest {
         return dictate(uri, phone, talkMs, new Run());
     }
 
+    /** Like {@link #dictate}, stopping once the session reached {@code state} (10 s at most). */
+    private Run dictateUntil(URI uri, FakeRecognizer phone, DictationEngine.State state) throws Exception {
+        Run run = new Run();
+        dictate(uri, phone, 0, run, () -> run.listener.states.contains(state));
+        assertTrue("reached " + state, run.listener.states.contains(state));
+        return run;
+    }
+
     private Run dictate(URI uri, FakeRecognizer phone, long talkMs, Run run) throws Exception {
+        return dictate(uri, phone, talkMs, run, null);
+    }
+
+    private Run dictate(URI uri, FakeRecognizer phone, long talkMs, Run run,
+            java.util.function.BooleanSupplier stopWhen) throws Exception {
         if (phone != null) phone.mic = run.mic;
         ServerDictationEngine engine = new ServerDictationEngine(uri, pending, new TestMain(mainThread),
                 run.mic, () -> true, phone == null ? null : cb -> phone.start(cb), TIMEOUTS, log::add);
         mainThread.submit(() -> engine.start("host/pane", run.listener)).get();
         Thread.sleep(talkMs);
+        for (int i = 0; stopWhen != null && i < 2000 && !stopWhen.getAsBoolean(); i++) Thread.sleep(5);
         run.stoppedAt = System.currentTimeMillis();
         mainThread.submit(engine::stop).get();
         return run;

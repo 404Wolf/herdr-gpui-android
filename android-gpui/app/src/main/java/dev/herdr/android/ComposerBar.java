@@ -1038,8 +1038,7 @@ final class ComposerBar {
 
     /** The microphone is open: the clock runs, and "talk" stops it. */
     static boolean recording(DictationEngine.State s) {
-        return s == DictationEngine.State.CONNECTING || s == DictationEngine.State.LISTENING
-                || s == DictationEngine.State.ON_DEVICE || s == DictationEngine.State.OFFLINE_RECORDING;
+        return DictationRouting.recording(s);
     }
 
     /** A session runs: IDLE and PENDING both mean none does. */
@@ -1089,14 +1088,15 @@ final class ComposerBar {
      * queue it as one paste plus Enter; otherwise Enter goes to the program.
      */
     private void enter() {
-        if (recording(dictationState)) {
-            routing.sendWhenDone();
-            dictation.stop();
-            return;
-        }
-        if (dictationState == DictationEngine.State.TRANSCRIBING) {
-            routing.sendWhenDone();
-            return;
+        switch (DictationRouting.onEnter(dictationState)) {
+            case STOP_THEN_SEND:
+                routing.sendWhenDone();
+                dictation.stop();
+                return;
+            case SEND_WHEN_DONE:
+                routing.sendWhenDone();
+                return;
+            default:
         }
         if (typing) {
             // Commit the keyboard's underlined word into the draft before reading it.
