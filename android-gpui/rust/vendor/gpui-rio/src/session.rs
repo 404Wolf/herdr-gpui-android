@@ -604,7 +604,7 @@ pub fn fitted_font_size(
     max: f32,
 ) -> f32 {
     let (columns, _) = pane_cells(size, cell);
-    if !(base > 0.) || grid.0 == 0 || grid.0 >= columns {
+    if base.is_nan() || base <= 0. || grid.0 == 0 || grid.0 >= columns {
         return base;
     }
     // Cells widen in proportion to the type. Rows round up to whole pixels:
