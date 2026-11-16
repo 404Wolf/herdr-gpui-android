@@ -2679,6 +2679,28 @@ b"}"#), None);
     }
 }
 
+/// A mock core reads the phone's hello line on a socket with a short read
+/// timeout (so its frame loop can poll). A loaded machine may send the hello
+/// later than that, so time-outs are retried here until a long deadline.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+fn read_hello(core: &UnixStream, hello: &mut String) {
+    let mut reader = io::BufReader::new(core.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut line = Vec::new();
+    while !line.ends_with(b"\n") {
+        match io::BufRead::read_until(&mut reader, b'\n', &mut line) {
+            Ok(0) => panic!("the phone closed before its hello"),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                assert!(Instant::now() < deadline, "no hello from the phone in 60 s");
+            }
+            Err(e) => panic!("reading the hello: {e}"),
+        }
+    }
+    *hello = String::from_utf8(line).unwrap();
+}
+
 #[cfg(test)]
 mod connection_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2835,7 +2857,7 @@ mod connection_tests {
         let (observed, events) = mpsc::sync_channel(2);
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
-            io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            read_hello(&core, &mut hello);
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
             // The second doc.get is projects.order (the project switcher's order).
@@ -2940,7 +2962,7 @@ mod connection_tests {
         let log = seen.clone();
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
-            io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            read_hello(&core, &mut hello);
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
             let mut counts: HashMap<String, usize> = HashMap::new();
@@ -2974,7 +2996,7 @@ mod connection_tests {
         });
         let (tx, reply) = mpsc::sync_channel(1);
         commands.try_send(Operation::Action(action.into(), tx)).unwrap();
-        let result = reply.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = reply.recv_timeout(Duration::from_secs(60)).unwrap();
         owner.cancel.cancel();
         let _ = runtime.join();
         let _ = peer.join();
@@ -3722,7 +3744,6 @@ mod claim_tests {
     use super::*;
     use crate::remote::State;
     use herdr_remote_transport::CancellationToken;
-    use std::io::BufRead;
     use std::sync::atomic::AtomicBool;
 
     #[derive(Debug, PartialEq)]
@@ -3780,7 +3801,7 @@ mod claim_tests {
             let peer = std::thread::spawn(move || {
                 let mut attaches = 0;
                 let mut hello = String::new();
-                io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+                read_hello(&core, &mut hello);
                 let reply = json!({"jsonrpc":"2.0","id":0,"result":{"generation":1,"core":{"id":"fixture"},"framed":true,"features":features}});
                 core.write_all(format!("{reply}\n").as_bytes()).unwrap();
                 let mut decoder = Decoder::default();
