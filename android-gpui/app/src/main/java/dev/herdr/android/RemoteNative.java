@@ -30,6 +30,11 @@ final class RemoteNative {
     static native long connectGrid(String configJson, String credentialJson, String grid,
             boolean surfaceActive);
     static native String poll(long handle, long sinceRevision, boolean mirror);
+    /**
+     * Wolf used the phone (item 71, latest-touched device wins): a touch, a
+     * key, typing, Herdr in front, the keyboard or a fold. Cheap; any thread.
+     */
+    static native void used();
     /** Paints the native body and returns metadata only; zero tokens refresh frame/navigation. */
     static native String pollTerminal(long handle, long sinceRevision, long sinceChromeRevision,
             long generation, String hostName, String shortcuts);

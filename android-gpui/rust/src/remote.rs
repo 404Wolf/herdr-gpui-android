@@ -359,6 +359,55 @@ pub fn set_visible(id: u64, visible: bool) -> Result<()> {
         .store(visible, Ordering::Relaxed);
     Ok(())
 }
+/// Wolf just used the phone (item 71, latest-touched device wins): a touch
+/// anywhere in Herdr, a key, Herdr coming to the front, the keyboard showing,
+/// a fold or unfold. The session on screen tells its core at once (at most
+/// once a second), and the next attach says how long ago this was.
+pub fn used() {
+    USE.mark();
+}
+/// The phone's last use, process-wide: whatever Wolf touched, the pane on
+/// screen is the one he chose.
+pub(crate) struct LastUse {
+    born: OnceLock<std::time::Instant>,
+    /// Milliseconds after `born` of the last use, plus one (0: never).
+    at_ms: AtomicU64,
+    /// Uses so far: a session sees a new one by a change.
+    count: AtomicU64,
+}
+impl LastUse {
+    pub(crate) const fn new() -> Self {
+        Self {
+            born: OnceLock::new(),
+            at_ms: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        let born = self.born.get_or_init(std::time::Instant::now);
+        u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+    pub(crate) fn mark(&self) {
+        let now = self.now_ms();
+        self.at_ms.store(now.saturating_add(1), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+    /// Milliseconds since the last use, at most [`IDLE_MAX_MS`] (also when
+    /// there was none): the attach's `idle_ms`.
+    pub(crate) fn idle_ms(&self) -> u64 {
+        let now = self.now_ms();
+        match self.at_ms.load(Ordering::Relaxed) {
+            0 => IDLE_MAX_MS,
+            at => now.saturating_sub(at - 1).min(IDLE_MAX_MS),
+        }
+    }
+}
+/// An idle age past a day says nothing more; never used is that old.
+pub(crate) const IDLE_MAX_MS: u64 = 86_400_000;
+pub(crate) static USE: LastUse = LastUse::new();
 pub fn close(id: u64) {
     let Some(owner) = lock(sessions()).remove(&id) else {
         return;
