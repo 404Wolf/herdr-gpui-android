@@ -121,6 +121,24 @@ final class ProjectBar {
         return out.toString();
     }
 
+    /**
+     * What the bar is rebuilt on (the activity's cache key): the exact text
+     * drawn (drawn), and what is drawn or acted on but is not text: each
+     * window's status (the dot's colour, what the chip says it is to a screen
+     * reader), its terminal and tab, which is shown, whether its tab is its
+     * project's alone (its menu's scope); and the need-you count, the fold.
+     */
+    static String signature(List<ProjectModel.Project> all, ProjectModel.Project p, String repo, List<Chip> chips,
+            int needYou, boolean compact) {
+        StringBuilder out = new StringBuilder(p == null ? "" : p.key).append('\t').append(needYou).append('\t')
+                .append(compact).append('\n').append(drawn(p, repo, chips, chips.size() - 1));
+        for (Chip c : chips) {
+            out.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.window.status)
+                    .append('\t').append(c.active).append('\t').append(ProjectModel.ownsTab(all, p, c.window)).append('\n');
+        }
+        return out.toString();
+    }
+
     /** The project chip: "[name]"; the waiting count is drawn beside it. */
     static String projectText(ProjectModel.Project p) {
         return "[" + (p == null ? "-" : p.name) + "]";

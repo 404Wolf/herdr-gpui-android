@@ -335,6 +335,43 @@ public final class ProjectModelTest {
     }
 
     @Test
+    public void everyStatusChangeRebuildsTheBarEvenWhenTheDotLooksTheSame() throws Exception {
+        JSONArray workspaces = new JSONArray().put(new JSONObject().put("id", "s1").put("label", "w"));
+        JSONArray tabs = new JSONArray()
+                .put(new JSONObject().put("id", "a").put("workspace_id", "s1").put("label", "lead"))
+                .put(new JSONObject().put("id", "b").put("workspace_id", "s1").put("label", "traces"));
+        JSONObject worker = new JSONObject().put("id", "t11").put("workspace_id", "s1").put("tab_id", "b").put("parent", "t10");
+        JSONArray panes = new JSONArray()
+                .put(new JSONObject().put("id", "t10").put("workspace_id", "s1").put("tab_id", "a").put("role", "pm")
+                        .put("project", "research-ui").put("created_ms", 1))
+                .put(worker);
+        String[] statuses = {"", "idle", "working", "done", "error", "blocked"};
+        java.util.Map<String, String> signatures = new HashMap<>();
+        for (String status : statuses) {
+            worker.put("status", status);
+            List<ProjectModel.Project> all = ProjectModel.projects(workspaces, tabs, panes);
+            ProjectModel.Project p = all.get(0);
+            List<ProjectBar.Chip> chips = ProjectBar.chips(p, 0, false);
+            signatures.put(status, ProjectBar.signature(all, p, "monopoly", chips, ProjectBar.needYou(all), false));
+        }
+        // Each transition (working -> done -> error draw the same " ●", in another colour) rebuilds.
+        for (String from : statuses) {
+            for (String to : statuses) {
+                if (!from.equals(to)) {
+                    org.junit.Assert.assertNotEquals(from + " -> " + to, signatures.get(from), signatures.get(to));
+                }
+            }
+        }
+        // While the same text is drawn: only the status tells them apart.
+        worker.put("status", "working");
+        List<ProjectModel.Project> all = ProjectModel.projects(workspaces, tabs, panes);
+        String working = ProjectBar.drawn(all.get(0), null, ProjectBar.chips(all.get(0), 0, false), 1);
+        worker.put("status", "done");
+        all = ProjectModel.projects(workspaces, tabs, panes);
+        assertEquals(working, ProjectBar.drawn(all.get(0), null, ProjectBar.chips(all.get(0), 0, false), 1));
+    }
+
+    @Test
     public void aCloneIsNamedByItsRemoteAsTheDesktopNamesIt() {
         // git.look's answer: a clone in /w/clone whose origin is org/monopoly, and a repo with no remote.
         FleetTree.GitLook look = FleetTree.parseGitLook(

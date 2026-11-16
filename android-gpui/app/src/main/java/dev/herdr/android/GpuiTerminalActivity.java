@@ -2193,27 +2193,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Rebuild only when what the bar shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
-        // The exact text drawn (project chip, crumb, chips), and what is not
-        // drawn but acted on: which terminal and tab each chip is, and whether
-        // its tab is its project's alone (its menu's scope).
-        StringBuilder signature = new StringBuilder(project == null ? "" : project.key).append('\t')
-                .append(needYou).append('\t').append(compact).append('\n')
-                .append(ProjectBar.drawn(project, repo, chips, chips.size() - 1));
-        for (ProjectBar.Chip c : chips) {
-            signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.active)
-                    .append('\t').append(ProjectModel.ownsTab(projects, project, c.window)).append('\n');
-        }
+        String signature = ProjectBar.signature(projects, project, repo, chips, needYou, compact);
         // Everything drawn before the shown chip, and it: a change there moves it.
         String before = ProjectBar.drawn(project, repo, chips, shown);
         String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
-        if (signature.toString().equals(tabSignature)) return;
+        if (signature.equals(tabSignature)) return;
         // A fold (the cover cuts names), or windows before it (or it) renamed,
         // move the shown chip too.
         boolean activeMoved = !activeId.equals(tabActive) || compact != tabCompact
                 || !before.equals(tabBefore);
         tabCompact = compact;
         tabBefore = before;
-        tabSignature = signature.toString();
+        tabSignature = signature;
         tabActive = activeId;
         tabStrip.removeAllViews();
         final Connection target = current;
