@@ -78,14 +78,22 @@ struct Connection<'a> {
     negotiated: bool,
     /// How this viewer claims the attached pane's grid.
     claim: Claim,
-    /// The core's hello offered `resize_history`: asked for on every attach.
+    /// Whether to ask for `resize_history`: the core's hello offered it, and
+    /// no attach reply has failed to echo it (a path that cannot carry it).
     /// Then the repaint after a RESIZE may carry the pane's history after an
     /// ESC[3J, which makes the phone's scrollback after a resize exactly the
     /// core's. Nothing depends on it arriving: the phone's own no-loss
     /// handling of a resize (the old screen kept on the paint's first ED 2)
     /// is erased by that ESC[3J when the history comes, and stands when only
-    /// the screen comes (an older relay, or a paint the core had to cut).
+    /// the screen comes (a paint the core had to cut to its cap).
     history_on_resize: bool,
+    /// The attached stream ended with the pane still listed (a relay closes
+    /// it when the path loses a confirmed `resize_history`): attach it again,
+    /// once, from the session loop.
+    reattach: Option<String>,
+    /// When the last such reattach was made, so a pane that keeps closing
+    /// is left ended instead of reattached in a loop.
+    reattached_at: Option<Instant>,
 }
 
 /// History rows asked for in the repaint after a RESIZE: the attach's own
@@ -93,6 +101,8 @@ struct Connection<'a> {
 /// would cut the phone's history shorter than the attach gave it, and more
 /// buys nothing the phone ever had. Bounding the bytes is the core's cap.
 const RESIZE_HISTORY: usize = 1000;
+/// At most one automatic reattach of an ended stream this often.
+const REATTACH_EVERY: Duration = Duration::from_secs(5);
 
 /// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
 const DETACH: u8 = 2;
@@ -316,12 +326,19 @@ impl Connection<'_> {
                 2 => {
                     self.output = None;
                     let mut state = lock(&self.owner.state);
+                    let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
                     state.view["state"] = json!("connecting");
                     state.view["status"] =
                         json!("Terminal stream ended; select a terminal to attach again");
                     state.terminal = None;
                     state.render_id = 0;
                     bump(&mut state.view);
+                    drop(state);
+                    // Once in a while, not in a loop: a pane whose program
+                    // ended refuses the attach and stays ended.
+                    if !pane.is_empty() && self.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY) {
+                        self.reattach = Some(pane);
+                    }
                 }
                 _ => {}
             }
@@ -927,6 +944,11 @@ impl Connection<'_> {
             params["resize_history"] = json!(RESIZE_HISTORY);
         }
         let reply = self.call("terminal.attach", params)?;
+        // Only the owner's echo confirms it (relays pass on only that): no
+        // echo, and the path cannot carry it, so it is not asked again.
+        if self.history_on_resize && reply["resize_history"].as_u64().unwrap_or(0) == 0 {
+            self.history_on_resize = false;
+        }
         // A core (and path) that will send RESIZE before repainting says so;
         // an older one does not, and the phone's own size stays the grid.
         self.negotiated = reply["resize_notifications"] == true;
@@ -1674,6 +1696,8 @@ pub(crate) fn run(
             ..Claim::default()
         },
         history_on_resize: offers(&hello, "resize_history"),
+        reattach: None,
+        reattached_at: None,
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -1793,6 +1817,20 @@ fn serve(
         }
         if let Some(frame) = connection.read()? {
             connection.deliver(frame)?;
+        }
+        if let Some(pane) = connection.reattach.take() {
+            connection.reattached_at = Some(Instant::now());
+            match connection.attach(&pane, cols, rows) {
+                Ok(()) => {}
+                // Refused (the program ended, the pane is gone): it stays ended.
+                Err(Error::Protocol(_) | Error::Rpc { .. }) => {
+                    let mut state = lock(&owner.state);
+                    state.view["state"] = json!("connecting");
+                    state.view["status"] = json!("Terminal stream ended; select a terminal to attach again");
+                    bump(&mut state.view);
+                }
+                Err(error) => return Err(error),
+            }
         }
         if refreshed.elapsed() >= Duration::from_secs(2)
             || (connection.dirty
@@ -3627,9 +3665,20 @@ mod claim_tests {
         Frame(u32, u8, Vec<u8>),
     }
 
+    /// How the scripted core answers beyond the defaults: whether it echoes
+    /// the `resize_history` an attach asked for (the owner's confirmation),
+    /// and from which attach on (counting from 1) it refuses attaches.
+    #[derive(Default)]
+    struct Script {
+        echo: bool,
+        refuse_from: Option<usize>,
+    }
+
     struct Mock {
         owner: Arc<Session>,
         seen: mpsc::Receiver<Seen>,
+        /// Frames for the core to write to the phone: (channel, kind, bytes).
+        push: mpsc::Sender<(u32, u8, Vec<u8>)>,
         session: Option<std::thread::JoinHandle<Result<()>>>,
         peer: Option<std::thread::JoinHandle<()>>,
     }
@@ -3638,6 +3687,10 @@ mod claim_tests {
         /// `features` is what hello advertises; `confirm` is whether the
         /// attach reply confirms VISIBILITY frames when asked for them.
         fn start(features: Value, confirm: bool, visible: bool, active: bool) -> Self {
+            Self::scripted(features, confirm, visible, active, Script::default())
+        }
+
+        fn scripted(features: Value, confirm: bool, visible: bool, active: bool, script: Script) -> Self {
             let (phone, mut core) = UnixStream::pair().unwrap();
             core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             let (commands, rx) = mpsc::sync_channel(256);
@@ -3657,7 +3710,9 @@ mod claim_tests {
             let worker = owner.clone();
             let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
             let (tx, seen) = mpsc::channel();
+            let (push, pushed) = mpsc::channel::<(u32, u8, Vec<u8>)>();
             let peer = std::thread::spawn(move || {
+                let mut attaches = 0;
                 let mut hello = String::new();
                 io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
                 let reply = json!({"jsonrpc":"2.0","id":0,"result":{"generation":1,"core":{"id":"fixture"},"framed":true,"features":features}});
@@ -3666,6 +3721,9 @@ mod claim_tests {
                 let mut next_channel = 2;
                 let mut bytes = [0; 4096];
                 loop {
+                    while let Ok((channel, kind, bytes)) = pushed.try_recv() {
+                        write_frame(&mut core, channel, kind, &bytes).unwrap();
+                    }
                     match core.read(&mut bytes) {
                         Ok(0) => return,
                         Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
@@ -3689,9 +3747,20 @@ mod claim_tests {
                             "terminal.attach" => {
                                 let asked = request["params"]["visibility_updates"] == true;
                                 let _ = tx.send(Seen::Attach(request["params"].clone()));
+                                attaches += 1;
+                                if script.refuse_from.is_some_and(|from| attaches >= from) {
+                                    let error = json!({"jsonrpc":"2.0","id":request["id"],
+                                        "error":{"code":1,"message":"t1 has finished","data":{"kind":"finished"}}});
+                                    write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).unwrap();
+                                    continue;
+                                }
                                 next_channel += 1;
-                                json!({"channel":next_channel - 1,"resize_notifications":false,
-                                       "visibility_updates": asked && confirm})
+                                let mut result = json!({"channel":next_channel - 1,"resize_notifications":false,
+                                       "visibility_updates": asked && confirm});
+                                if script.echo && request["params"].get("resize_history").is_some() {
+                                    result["resize_history"] = request["params"]["resize_history"].clone();
+                                }
+                                result
                             }
                             other => panic!("unexpected {other}"),
                         };
@@ -3700,7 +3769,7 @@ mod claim_tests {
                     }
                 }
             });
-            Self { owner, seen, session: Some(session), peer: Some(peer) }
+            Self { owner, seen, push, session: Some(session), peer: Some(peer) }
         }
 
         fn next(&self) -> Seen {
@@ -3852,22 +3921,81 @@ mod claim_tests {
     }
 
     /// The history repaint is asked for only from a core whose hello offers
-    /// it; an older core gets exactly the attach it always got.
+    /// it, and asked again only while the owner echoes it: no echo means the
+    /// path cannot carry it. An older core gets exactly the attach it always got.
     #[test]
-    fn resize_history_is_asked_for_only_when_the_core_offers_it() {
-        let core = Mock::start(json!(["viewer_visibility", "resize_history"]), true, true, true);
-        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+    fn resize_history_is_asked_for_only_while_offered_and_echoed() {
+        let echoing = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, ..Script::default() });
+        let Seen::Attach(params) = echoing.next() else { panic!("attach first") };
         assert_eq!(params["resize_history"], 1000);
         let mut without = params.clone();
         without.as_object_mut().unwrap().remove("resize_history");
         assert_eq!(without, attach_params("t1", 90, 40, true), "nothing else changes");
-        core.close();
+        *lock(&echoing.owner.focus) = Some(("t2".into(), Instant::now()));
+        let second = loop {
+            if let Seen::Attach(params) = echoing.next() { break params }
+        };
+        assert_eq!(second["resize_history"], 1000, "echoed: asked again");
+        echoing.close();
+
+        // Offered but not echoed (a relay whose owner lacks it): asked once, then not.
+        let silent = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true, Script::default());
+        let Seen::Attach(params) = silent.next() else { panic!("attach first") };
+        assert_eq!(params["resize_history"], 1000);
+        *lock(&silent.owner.focus) = Some(("t2".into(), Instant::now()));
+        let second = loop {
+            if let Seen::Attach(params) = silent.next() { break params }
+        };
+        assert!(second.get("resize_history").is_none(), "not echoed: not asked again");
+        silent.close();
 
         let older = Mock::start(json!(["viewer_visibility"]), true, true, true);
         let Seen::Attach(params) = older.next() else { panic!("attach first") };
         assert!(params.get("resize_history").is_none());
         assert_eq!(params, attach_params("t1", 90, 40, true));
         older.close();
+    }
+
+    /// A stream the core closes while the pane is still there (a relay does
+    /// that when the path loses a confirmed `resize_history`) is attached
+    /// again; a pane that refuses (its program ended) stays ended.
+    #[test]
+    fn a_stream_closed_under_the_pane_is_attached_again_once() {
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, refuse_from: Some(3) });
+        let Seen::Attach(first) = core.next() else { panic!("attach first") };
+        assert_eq!(first["terminal"], "t1");
+        // The core ends the stream: the phone attaches t1 again by itself.
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(again["terminal"], "t1");
+        // Ended again at once: no loop (one reattach per REATTACH_EVERY).
+        core.push.send((3, 2, Vec::new())).unwrap();
+        core.quiet(Duration::from_millis(500));
+        assert_eq!(lock(&core.owner.state).view["state"], "connecting");
+        core.close();
+    }
+
+    /// When the reattach is refused, the pane says it ended.
+    #[test]
+    fn a_refused_reattach_leaves_the_pane_ended() {
+        let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
+            Script { refuse_from: Some(2), ..Script::default() });
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(again["terminal"], "t1", "tried once");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&core.owner.state).view["status"] != "Terminal stream ended; select a terminal to attach again" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        core.close();
     }
 
     #[test]
