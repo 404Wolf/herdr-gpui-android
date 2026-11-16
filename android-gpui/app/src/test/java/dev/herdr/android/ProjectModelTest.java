@@ -28,11 +28,18 @@ public final class ProjectModelTest {
         }
     }
 
-    private static String window(ProjectModel.Window w) {
+    private static String window(ProjectModel.Window w) throws Exception {
         return (w.terminal != null ? w.terminal : "tab:" + w.tab) + " " + w.name;
     }
 
-    private static Map<String, ProjectModel.GitName> git(JSONObject c) {
+    /** A JSON object's keys (android.jar's JSONObject, which the tests compile against, has no keySet). */
+    private static List<String> keys(JSONObject o) throws Exception {
+        List<String> out = new ArrayList<>();
+        for (Iterator<String> it = o.keys(); it.hasNext(); ) out.add(it.next());
+        return out;
+    }
+
+    private static Map<String, ProjectModel.GitName> git(JSONObject c) throws Exception {
         Map<String, ProjectModel.GitName> out = new HashMap<>();
         JSONObject g = c.optJSONObject("git");
         if (g == null) return out;
@@ -63,8 +70,8 @@ public final class ProjectModelTest {
             if (projects != null) {
                 Map<String, ProjectModel.Project> byKey = new HashMap<>();
                 for (ProjectModel.Project p : all) byKey.put(p.key, p);
-                assertEquals(name + ": the projects", sorted(projects.keySet()), sorted(byKey.keySet()));
-                for (String key : projects.keySet()) {
+                assertEquals(name + ": the projects", sorted(keys(projects)), sorted(byKey.keySet()));
+                for (String key : keys(projects)) {
                     JSONObject want = projects.getJSONObject(key);
                     ProjectModel.Project p = byKey.get(key);
                     assertEquals(name + " " + key + " name", want.getString("name"), p.name);
@@ -108,9 +115,9 @@ public final class ProjectModelTest {
             }
             JSONObject owns = expect.optJSONObject("owns_tab");
             if (owns != null) {
-                for (String key : owns.keySet()) {
+                for (String key : keys(owns)) {
                     ProjectModel.Project p = keyed.get(key);
-                    for (String terminal : owns.getJSONObject(key).keySet()) {
+                    for (String terminal : keys(owns.getJSONObject(key))) {
                         ProjectModel.Window w = null;
                         for (ProjectModel.Window x : p.windows) if (terminal.equals(x.terminal)) w = x;
                         assertEquals(name + " " + key + " owns " + terminal + "'s tab",
@@ -148,7 +155,7 @@ public final class ProjectModelTest {
     }
 
     @Test
-    public void windowNamesFollowTheDesktop() {
+    public void windowNamesFollowTheDesktop() throws Exception {
         assertEquals("Fix the limits", ProjectModel.windowName("tb3", false, "claude", "✳ Fix the limits"));
         assertEquals("review", ProjectModel.windowName("review", true, "claude", "✳ Fix the limits"));
         assertEquals("claude", ProjectModel.windowName("tb3", null, "claude", ""));
@@ -161,7 +168,7 @@ public final class ProjectModelTest {
     }
 
     @Test
-    public void orderByPlacesTheListedFirstAndKeepsTheRest() {
+    public void orderByPlacesTheListedFirstAndKeepsTheRest() throws Exception {
         List<String> list = java.util.Arrays.asList("a", "b", "c", "d");
         assertEquals(java.util.Arrays.asList("c", "a", "b", "d"),
                 ProjectModel.orderBy(list, java.util.Arrays.asList("c", "gone", "a"), x -> x, null));
@@ -213,7 +220,7 @@ public final class ProjectModelTest {
         org.junit.Assert.assertNull(ProjectBar.newWindowPlace(space, 0));
     }
 
-    private static ProjectModel.Window window(String name, int n) {
+    private static ProjectModel.Window window(String name, int n) throws Exception {
         ProjectModel.Window w = new ProjectModel.Window("t1", "a", "s", "", name, "", 0, 0);
         w.n = n;
         return w;
@@ -244,7 +251,7 @@ public final class ProjectModelTest {
     }
 
     @Test
-    public void theShownChipIsRevealedByTheLeastScrollThatShowsItWhole() {
+    public void theShownChipIsRevealedByTheLeastScrollThatShowsItWhole() throws Exception {
         // t1xw's case: a 270 px chip at 100..370 in a 284 px bar at 0: whole at 93 (7 px each side).
         int to = ProjectBar.revealScroll(100, 370, 0, 284, 24);
         assertEquals(93, to);
@@ -296,7 +303,7 @@ public final class ProjectModelTest {
     }
 
     /** The ownership part of the bar's signature, as the activity draws it. */
-    private static String ownership(List<ProjectModel.Project> all, ProjectModel.Project p) {
+    private static String ownership(List<ProjectModel.Project> all, ProjectModel.Project p) throws Exception {
         StringBuilder out = new StringBuilder();
         for (ProjectModel.Window w : p.windows) out.append(w.terminal).append(ProjectModel.ownsTab(all, p, w));
         return out.toString();
@@ -372,7 +379,7 @@ public final class ProjectModelTest {
     }
 
     @Test
-    public void aCloneIsNamedByItsRemoteAsTheDesktopNamesIt() {
+    public void aCloneIsNamedByItsRemoteAsTheDesktopNamesIt() throws Exception {
         // git.look's answer: a clone in /w/clone whose origin is org/monopoly, and a repo with no remote.
         FleetTree.GitLook look = FleetTree.parseGitLook(
                 "P\t/w/clone\t/w/clone/.git\t/w/clone\tmain\t0\t0\n"
@@ -407,13 +414,13 @@ public final class ProjectModelTest {
         assertEquals("pm:t10", g.repos.get(0).projects.get(1).key);
     }
 
-    private static List<String> strings(JSONArray a) {
+    private static List<String> strings(JSONArray a) throws Exception {
         List<String> out = new ArrayList<>();
         for (int i = 0; i < a.length(); i++) out.add(a.getString(i));
         return out;
     }
 
-    private static List<String> sorted(java.util.Set<String> keys) {
+    private static List<String> sorted(java.util.Collection<String> keys) throws Exception {
         List<String> out = new ArrayList<>(keys);
         java.util.Collections.sort(out);
         return out;
