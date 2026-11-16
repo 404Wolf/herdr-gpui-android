@@ -2196,15 +2196,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         StringBuilder signature = new StringBuilder(project == null ? "" : project.key).append('\t')
                 .append(project == null ? 0 : project.waiting).append('\t').append(needYou).append('\t')
                 .append(compact).append('\t').append(repo).append('\n');
-        for (ProjectBar.Chip c : chips) {
+        // Whether each window's tab is its project's alone is drawn too (its
+        // menu's scope): another project's terminal joining the tab rebuilds.
+        StringBuilder before = new StringBuilder();
+        for (int i = 0; i < chips.size(); i++) {
+            ProjectBar.Chip c = chips.get(i);
             signature.append(c.window.terminal).append('\t').append(c.window.tab).append('\t').append(c.text)
-                    .append('\t').append(c.window.status).append('\t').append(c.active).append('\n');
+                    .append('\t').append(c.window.status).append('\t').append(c.active).append('\t')
+                    .append(ProjectModel.ownsTab(projects, project, c.window)).append('\n');
+            if (i <= shown) before.append(c.text).append('\n');
         }
         String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
         if (signature.toString().equals(tabSignature)) return;
-        // A fold (the cover cuts names) or renamed windows move the shown chip too.
-        boolean activeMoved = !activeId.equals(tabActive) || compact != tabCompact;
+        // A fold (the cover cuts names), or windows before it (or it) renamed,
+        // move the shown chip too.
+        boolean activeMoved = !activeId.equals(tabActive) || compact != tabCompact
+                || !before.toString().equals(tabBefore);
         tabCompact = compact;
+        tabBefore = before.toString();
         tabSignature = signature.toString();
         tabActive = activeId;
         tabStrip.removeAllViews();
@@ -2232,8 +2241,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (w.terminal != null) focusRemotePane(target, w.terminal);
                 else note("Nothing runs in " + w.name + ": open it on the desktop");
             });
-            boolean owns = ProjectModel.ownsTab(projects, project, w);
-            Runnable menu = () -> showWindowActions(target, w, owns);
+            Runnable menu = () -> showWindowActions(target, w);
             if (w == project.lead) {
                 // Window 1 stays the lead: it is never dragged (item 79).
                 chip.setOnLongClickListener(v -> { menu.run(); return true; });
@@ -2280,6 +2288,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private boolean tabCompact;
+    /** The chips up to the shown one as last drawn: their text moves it. */
+    private String tabBefore = "";
     /** The shown chip is to be revealed once the rebuilt bar is laid out. */
     private boolean revealPending;
 
@@ -2291,13 +2301,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void revealActiveChip() {
         if (tabStrip == null || tabScroll == null) return;
         View active = tabStrip.findViewWithTag(PANE_PILL_ACTIVE);
-        if (active == null || active.getWidth() == 0 || tabScroll.getWidth() == 0) return;
+        int width = tabScroll.getWidth();
+        if (active == null || active.getWidth() == 0 || width == 0) return;
+        // Never wider than the bar: a name too long for it is cut with "…",
+        // so the shown chip can always be whole.
+        if (active instanceof TextView && ((TextView) active).getMaxWidth() != width) {
+            TextView text = (TextView) active;
+            text.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            text.setMaxWidth(width);
+            if (active.getWidth() > width) {
+                revealPending = true; // revealed after this relayout
+                return;
+            }
+        }
         revealPending = false;
-        int left = active.getLeft(), right = active.getRight();
-        int from = tabScroll.getScrollX(), width = tabScroll.getWidth();
-        if (left >= from && right <= from + width) return;
-        int to = right > from + width && right - left < width ? right - width + dp(24) : left - dp(24);
-        tabScroll.smoothScrollTo(Math.max(0, to), 0);
+        int to = ProjectBar.revealScroll(active.getLeft(), active.getRight(), tabScroll.getScrollX(), width, dp(24));
+        if (to >= 0) tabScroll.smoothScrollTo(to, 0);
     }
 
     /**
@@ -2306,9 +2325,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * shares with another project's terminal: this window's terminal only,
      * so nothing of the other project is ever ended or moved with it.
      */
-    private void showWindowActions(Connection target, ProjectModel.Window w, boolean ownsTab) {
-        if (ownsTab && w.tab != null && !w.tab.isEmpty()) {
-            showTabActions(target, w.space, w.tab, w.name);
+    private void showWindowActions(Connection target, ProjectModel.Window w) {
+        // Decided from the view as it is now, and again before anything
+        // tab-wide is done: another project's terminal may join the tab
+        // while the bar (or this menu) is shown.
+        java.util.function.BooleanSupplier owned = () -> windowOwnsTab(target, w);
+        if (owned.getAsBoolean()) {
+            showTabActions(target, w.space, w.tab, w.name, owned);
             return;
         }
         if (w.terminal == null) {
@@ -2563,7 +2586,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    private void showTabActions(Connection target, String space, String tab, String label) {
+    /**
+     * Whether {@code w}'s tab is still its project's alone in {@code target}'s
+     * view as it is now (ProjectModel.ownsTab); false when the window or its
+     * project is gone, so nothing tab-wide is done on a guess.
+     */
+    private boolean windowOwnsTab(Connection target, ProjectModel.Window w) {
+        if (w.tab == null || w.tab.isEmpty()) return false;
+        java.util.List<ProjectModel.Project> all = ProjectModel.projects(target.workspaces, target.tabs, target.panes);
+        for (ProjectModel.Project p : all) {
+            for (ProjectModel.Window o : p.windows) {
+                boolean same = w.terminal != null ? w.terminal.equals(o.terminal)
+                        : o.terminal == null && w.tab.equals(o.tab) && w.space.equals(o.space);
+                if (same) return w.tab.equals(o.tab) && w.space.equals(o.space) && ProjectModel.ownsTab(all, p, o);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A tab's menu. {@code owned}: checked again as each tab-wide action is
+     * done; when the tab is no longer its project's alone, nothing is done.
+     */
+    private void showTabActions(Connection target, String space, String tab, String label,
+            java.util.function.BooleanSupplier owned) {
         java.util.List<String[]> spaces = new java.util.ArrayList<>();
         JSONArray all = target.workspaces;
         for (int i = 0; all != null && i < all.length(); i++) {
@@ -2574,20 +2620,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         new ActionSheet(this, chrome, label)
                 .add("Rename…", () -> ActionSheet.prompt(this, chrome, "Rename window", label,
-                        name -> runEdit(target, "Rename", "op", "tab.rename", "space", space, "tab", tab, "name", name)))
-                .add("Split: new shell beside it", () -> runEdit(target, "Split", "op", "tab.split",
-                        "space", space, "tab", tab))
+                        name -> { if (stillOwned(owned, label)) runEdit(target, "Rename", "op", "tab.rename", "space", space, "tab", tab, "name", name); }))
+                .add("Split: new shell beside it", () -> { if (stillOwned(owned, label)) runEdit(target, "Split", "op", "tab.split",
+                        "space", space, "tab", tab); })
                 .add("Move to space…", () -> {
                     ActionSheet pick = new ActionSheet(this, chrome, "Move " + label + " to");
                     for (String[] other : spaces) {
-                        pick.add(other[1], () -> runEdit(target, "Move", "op", "tab.space", "space", space,
-                                "tab", tab, "to", other[0]));
+                        pick.add(other[1], () -> { if (stillOwned(owned, label)) runEdit(target, "Move", "op", "tab.space", "space", space,
+                                "tab", tab, "to", other[0]); });
                     }
                     pick.show();
                 })
-                .danger("Close window", () -> runEdit(target, "Close " + label, "op", "tab.close",
-                        "space", space, "tab", tab))
+                .danger("Close window", () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
+                        "space", space, "tab", tab); })
                 .show();
+    }
+
+    private boolean stillOwned(java.util.function.BooleanSupplier owned, String label) {
+        if (owned.getAsBoolean()) return true;
+        note(label + " now shares its tab with another project: nothing was changed. Hold it again for its own menu");
+        return false;
     }
 
     /**

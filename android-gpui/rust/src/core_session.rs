@@ -721,31 +721,35 @@ impl Connection<'_> {
                 folder,
                 kind,
             } => {
-                let cwd = folder.map(Value::from).unwrap_or_else(|| {
+                let (cwd, space, space_name) = {
                     let state = lock(&self.owner.state);
-                    state.view["panes"]
-                        .as_array()
-                        .and_then(|p| p.iter().find(|p| p["id"] == lead.as_str()))
-                        .map(|p| p["cwd"].clone())
-                        .unwrap_or(Value::Null)
-                });
+                    let cwd = folder.map(Value::from).unwrap_or_else(|| {
+                        state.view["panes"]
+                            .as_array()
+                            .and_then(|p| p.iter().find(|p| p["id"] == lead.as_str()))
+                            .map(|p| p["cwd"].clone())
+                            .unwrap_or(Value::Null)
+                    });
+                    let (space, name) = window_space(&state.view, &space, &lead);
+                    (cwd, space, name)
+                };
                 let tab = format!(
                     "mobile-{}-{}",
                     std::process::id(),
                     NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
                 );
-                let run = window_run(&space, &tab, &lead, cwd, kind, cols, rows);
+                let run = window_run(&space, &tab, &lead, cwd.clone(), kind, cols, rows);
                 let result = self.call("terminal.run", run)?;
                 let terminal = result["address"]
                     .as_str()
                     .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
                     .to_owned();
                 // Its tab in herdr-app's layout, so it can be renamed, moved or
-                // closed from here and the desktop places it without a repair.
-                // A space the layout lacks (one only labels name) keeps it label-only.
+                // closed from here and the desktop places it without a repair;
+                // a space the layout lacks (one only labels name) is added to it.
                 let block = format!("p{:x}", NEXT_RENDER.fetch_add(1, Ordering::Relaxed));
                 let entry = window_tab(&tab, &terminal, &block, kind);
-                let _ = self.edit_doc(|doc| add_tab(doc, &space, &entry));
+                let placed = self.edit_doc(|doc| add_window_tab(doc, &space, &space_name, &cwd, &entry));
                 // Labelled at birth; set again for a core that drops run labels.
                 // A failure leaves the run's own label, which a current core keeps.
                 let _ = self.call(
@@ -753,7 +757,14 @@ impl Connection<'_> {
                     json!({"terminal":terminal,"labels":{"parent":lead}}),
                 );
                 self.refresh()?;
-                self.attach(&terminal, cols, rows)
+                self.attach(&terminal, cols, rows)?;
+                // Started, and shown; but say so when its tab is not in the
+                // layout, rather than offer a menu that cannot work.
+                placed.map_err(|error| {
+                    Error::Protocol(format!(
+                        "the window started, but its tab could not be saved in the layout ({error}); rename or move it on the desktop"
+                    ))
+                })
             }
             TabEdit::WindowsMove {
                 project,
@@ -1137,6 +1148,54 @@ fn window_run(space: &str, tab: &str, lead: &str, cwd: Value, kind: &str, cols: 
 fn window_tab(tab: &str, terminal: &str, block: &str, kind: &str) -> Value {
     let root = json!({"children":[{"content":{"terminal":terminal},"id":block,"type":"block"}],"id":tab,"type":"row"});
     json!({"id":tab,"name":kind,"named":false,"root":root})
+}
+/// Where a project's new window goes: its lead's space, named as the phone
+/// shows it; for a lead in no space ("loose", no herdr.space label) a space
+/// of its own, named after the lead's project, else its folder.
+fn window_space(view: &Value, space: &str, lead: &str) -> (String, String) {
+    if space != "loose" && !space.is_empty() {
+        let name = view["workspaces"]
+            .as_array()
+            .and_then(|s| s.iter().find(|s| s["id"] == space))
+            .and_then(|s| s["label"].as_str())
+            .unwrap_or(space);
+        return (space.to_owned(), name.to_owned());
+    }
+    let pane = view["panes"].as_array().and_then(|p| p.iter().find(|p| p["id"] == lead));
+    let text = |key: &str| pane.and_then(|p| p[key].as_str()).filter(|v| !v.is_empty());
+    let name = text("project")
+        .or_else(|| text("cwd").and_then(|cwd| cwd.trim_end_matches('/').rsplit('/').next()).filter(|n| !n.is_empty()))
+        .unwrap_or(lead);
+    let id = format!("mobile-{}-{}", std::process::id(), NEXT_RENDER.fetch_add(1, Ordering::Relaxed));
+    (id, name.to_owned())
+}
+/// Puts a new window's tab in herdr-app's layout: appended to `space`'s
+/// tabs, the space itself added when the layout lacks it (a space only
+/// labels name), so the window can be renamed, moved and closed.
+fn add_window_tab(doc: &mut Value, space: &str, name: &str, folder: &Value, entry: &Value) -> Result<()> {
+    if doc.is_null() {
+        *doc = json!({});
+    }
+    if !doc["spaces"].is_array() {
+        doc["spaces"] = json!([]);
+    }
+    let spaces = doc["spaces"].as_array_mut().ok_or(Error::StaleTarget)?;
+    match spaces.iter_mut().find(|s| s["id"] == space) {
+        Some(found) => {
+            if !found["tabs"].is_array() {
+                found["tabs"] = json!([]);
+            }
+            let tabs = found["tabs"].as_array_mut().ok_or(Error::StaleTarget)?;
+            if !tabs.iter().any(|t| t["id"] == entry["id"]) {
+                tabs.push(entry.clone());
+            }
+            Ok(())
+        }
+        None => {
+            spaces.push(json!({"folder":folder,"id":space,"name":name,"tabs":[entry]}));
+            Ok(())
+        }
+    }
 }
 /// Appends `entry` to `space`'s tabs in herdr-app's layout.
 fn add_tab(doc: &mut Value, space: &str, entry: &Value) -> Result<()> {
@@ -2273,8 +2332,41 @@ b"}"#), None);
         rename_tab(&mut doc, "s1", "mobile-1-9", "review").unwrap();
         project(&mut view, &terminals, &doc).unwrap();
         assert_eq!((view["tabs"][0]["label"].clone(), view["tabs"][0]["named"].clone()), (json!("review"), json!(true)));
-        // A space the layout lacks keeps the window label-only.
+        // add_tab alone needs the space; add_window_tab adds it (next test).
         assert!(add_tab(&mut doc, "nowhere", &tab).is_err());
+    }
+
+    #[test]
+    fn a_window_of_a_lead_the_layout_lacks_gets_a_space_there_and_renames() {
+        // A PM only labels place (herdr.space s9, not in herdr-app's layout),
+        // and one in no space at all.
+        let terminals = json!([
+            {"address":"t5","state":"live","labels":{"herdr.space":"s9","herdr.tab":"x","role":"pm","project":"research-ui"},"cwd":"/w/monopoly","title":"pm","status":{}},
+            {"address":"t6","state":"live","labels":{"role":"pm","project":"incident-fixes"},"cwd":"/w/other","title":"pm","status":{}}]);
+        let mut doc = json!({"spaces":[{"id":"s1","name":"work","tabs":[]}]});
+        let mut view = json!({"pane_id":"t5"});
+        project(&mut view, &terminals, &doc).unwrap();
+        assert_eq!(window_space(&view, "s9", "t5"), ("s9".to_owned(), "monopoly".to_owned()));
+        let tab = window_tab("mobile-1-9", "t44", "p9", "claude");
+        add_window_tab(&mut doc, "s9", "monopoly", &json!("/w/monopoly"), &tab).unwrap();
+        add_window_tab(&mut doc, "s9", "monopoly", &json!("/w/monopoly"), &tab).unwrap();
+        assert_eq!(doc["spaces"][1]["tabs"].as_array().unwrap().len(), 1, "added once");
+        let mut terminals = terminals;
+        terminals.as_array_mut().unwrap().push(json!({"address":"t44","state":"live","labels":{"herdr.space":"s9","herdr.tab":"mobile-1-9","parent":"t5"},"title":"Fix tests","status":{}}));
+        project(&mut view, &terminals, &doc).unwrap();
+        assert!(view["panes"].as_array().unwrap().iter().any(|p| p["id"] == "t5" && p["workspace_id"] == "s9"), "the lead keeps its space");
+        rename_tab(&mut doc, "s9", "mobile-1-9", "review").unwrap();
+        project(&mut view, &terminals, &doc).unwrap();
+        let renamed = view["tabs"].as_array().unwrap().iter().find(|t| t["id"] == "mobile-1-9").unwrap().clone();
+        assert_eq!((renamed["label"].clone(), renamed["named"].clone()), (json!("review"), json!(true)));
+        // A lead in no space: a space of its own, named after its project.
+        let (id, name) = window_space(&view, "loose", "t6");
+        assert!(id.starts_with("mobile-") && id != "loose");
+        assert_eq!(name, "incident-fixes");
+        // A layout space without a tab list gets one.
+        let mut bare = json!({"spaces":[{"id":"s2","name":"b"}]});
+        add_window_tab(&mut bare, "s2", "b", &Value::Null, &tab).unwrap();
+        assert_eq!(bare["spaces"][0]["tabs"][0]["id"], "mobile-1-9");
     }
 
     #[test]

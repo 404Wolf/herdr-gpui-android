@@ -71,6 +71,22 @@ final class ProjectBar {
         return ProjectModel.windowMove(p, from, to, centre > centres[to]);
     }
 
+    /**
+     * Where the bar scrolls so the shown chip ({@code left}..{@code right},
+     * bar coordinates) is whole in a window {@code width} wide now at
+     * {@code from}: the least scroll that shows it, with up to {@code margin}
+     * beside it where there is room; -1 when it is already whole (a scroll
+     * Wolf made stays). A chip wider than the window shows its start.
+     */
+    static int revealScroll(int left, int right, int from, int width, int margin) {
+        if (left >= from && right <= from + width) return -1;
+        int chip = right - left;
+        if (chip >= width) return Math.max(0, left);
+        int room = Math.min(margin, (width - chip) / 2);
+        int to = left < from ? left - room : right - width + room;
+        return Math.max(0, to);
+    }
+
     /** The project chip: "[name]"; the waiting count is drawn beside it. */
     static String projectText(ProjectModel.Project p) {
         return "[" + (p == null ? "-" : p.name) + "]";

@@ -244,6 +244,65 @@ public final class ProjectModelTest {
     }
 
     @Test
+    public void theShownChipIsRevealedByTheLeastScrollThatShowsItWhole() {
+        // t1xw's case: a 270 px chip at 100..370 in a 284 px bar at 0: whole at 93 (7 px each side).
+        int to = ProjectBar.revealScroll(100, 370, 0, 284, 24);
+        assertEquals(93, to);
+        org.junit.Assert.assertTrue(100 >= to && 370 <= to + 284);
+        // Room to spare: the full margin.
+        assertEquals(370 - 284 + 24, ProjectBar.revealScroll(300, 370, 0, 284, 24));
+        // Off the left: its start, less the margin, never below 0.
+        assertEquals(176, ProjectBar.revealScroll(200, 260, 500, 284, 24));
+        assertEquals(0, ProjectBar.revealScroll(10, 60, 300, 284, 24));
+        // Already whole: no scroll, a scroll Wolf made stays.
+        assertEquals(-1, ProjectBar.revealScroll(100, 200, 50, 284, 24));
+        // Wider than the bar (the activity then cuts it to the bar): its start.
+        assertEquals(400, ProjectBar.revealScroll(400, 800, 0, 284, 24));
+        // Every whole-able chip ends whole, for any start.
+        for (int left = 0; left < 600; left += 7) {
+            for (int chip = 1; chip <= 284; chip += 13) {
+                for (int from = 0; from < 600; from += 31) {
+                    int got = ProjectBar.revealScroll(left, left + chip, from, 284, 24);
+                    int at = got < 0 ? from : got;
+                    org.junit.Assert.assertTrue(left + " " + chip + " " + from, left >= at && left + chip <= at + 284);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void aTabStopsBeingItsProjectsAloneWhenAnotherProjectsTerminalJoinsIt() throws Exception {
+        // t1xw's round-2 case: t10 (research-ui) alone in its tab, then incident-fixes' t21 joins it.
+        JSONArray workspaces = new JSONArray().put(new JSONObject().put("id", "s1").put("label", "w"));
+        JSONArray tabs = new JSONArray()
+                .put(new JSONObject().put("id", "a").put("workspace_id", "s1").put("label", "a"))
+                .put(new JSONObject().put("id", "b").put("workspace_id", "s1").put("label", "b"))
+                .put(new JSONObject().put("id", "c").put("workspace_id", "s1").put("label", "c"));
+        JSONObject t10 = new JSONObject().put("id", "t10").put("workspace_id", "s1").put("tab_id", "a").put("role", "pm")
+                .put("project", "research-ui").put("created_ms", 1);
+        JSONObject t20 = new JSONObject().put("id", "t20").put("workspace_id", "s1").put("tab_id", "b").put("role", "pm")
+                .put("project", "incident-fixes").put("created_ms", 2);
+        JSONObject t21 = new JSONObject().put("id", "t21").put("workspace_id", "s1").put("tab_id", "c").put("parent", "t20");
+        List<ProjectModel.Project> all = ProjectModel.projects(workspaces, tabs, new JSONArray().put(t10).put(t20).put(t21));
+        ProjectModel.Project research = all.get(0);
+        org.junit.Assert.assertTrue(ProjectModel.ownsTab(all, research, research.windows.get(0)));
+        String drawn = ownership(all, research);
+        t21.put("tab_id", "a");
+        all = ProjectModel.projects(workspaces, tabs, new JSONArray().put(t10).put(t20).put(t21));
+        research = all.get(0);
+        org.junit.Assert.assertFalse(ProjectModel.ownsTab(all, research, research.windows.get(0)));
+        // What the activity adds to its bar signature changes, so the bar (and the menus) are rebuilt.
+        org.junit.Assert.assertNotEquals(drawn, ownership(all, research));
+    }
+
+    /** The ownership part of the bar's signature, as the activity draws it. */
+    private static String ownership(List<ProjectModel.Project> all, ProjectModel.Project p) {
+        StringBuilder out = new StringBuilder();
+        for (ProjectModel.Window w : p.windows) out.append(w.terminal).append(ProjectModel.ownsTab(all, p, w));
+        return out.toString();
+    }
+
+    @Test
     public void aCloneIsNamedByItsRemoteAsTheDesktopNamesIt() {
         // git.look's answer: a clone in /w/clone whose origin is org/monopoly, and a repo with no remote.
         FleetTree.GitLook look = FleetTree.parseGitLook(
