@@ -88,11 +88,13 @@ struct Connection<'a> {
     /// the screen comes (a paint the core had to cut to its cap).
     history_on_resize: bool,
     /// The attached stream ended with the pane still listed (a relay closes
-    /// it when the path loses a confirmed `resize_history`): attach it again,
-    /// once, from the session loop.
+    /// it when the path loses a confirmed `resize_history`, or on overflow):
+    /// attach it again from the session loop. Any attach clears it.
     reattach: Option<String>,
-    /// When the last such reattach was made, so a pane that keeps closing
-    /// is left ended instead of reattached in a loop.
+    /// When the last such reattach was made: the next waits until
+    /// REATTACH_EVERY has passed (it is put off, never dropped), so a pane
+    /// that keeps closing is reattached at most that often. Only a refused
+    /// attach leaves it ended.
     reattached_at: Option<Instant>,
 }
 
@@ -334,9 +336,11 @@ impl Connection<'_> {
                     state.render_id = 0;
                     bump(&mut state.view);
                     drop(state);
-                    // Once in a while, not in a loop: a pane whose program
-                    // ended refuses the attach and stays ended.
-                    if !pane.is_empty() && self.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY) {
+                    // Attached again by the session loop, at most once per
+                    // REATTACH_EVERY: a close sooner than that is put off, not
+                    // dropped. A pane whose program ended refuses the attach
+                    // and stays ended.
+                    if !pane.is_empty() {
                         self.reattach = Some(pane);
                     }
                 }
@@ -923,6 +927,8 @@ impl Connection<'_> {
         Ok(())
     }
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
+        // This attach replaces any reattach still waiting for its turn.
+        self.reattach = None;
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
@@ -1818,18 +1824,27 @@ fn serve(
         if let Some(frame) = connection.read()? {
             connection.deliver(frame)?;
         }
-        if let Some(pane) = connection.reattach.take() {
-            connection.reattached_at = Some(Instant::now());
-            match connection.attach(&pane, cols, rows) {
-                Ok(()) => {}
-                // Refused (the program ended, the pane is gone): it stays ended.
-                Err(Error::Protocol(_) | Error::Rpc { .. }) => {
-                    let mut state = lock(&owner.state);
-                    state.view["state"] = json!("connecting");
-                    state.view["status"] = json!("Terminal stream ended; select a terminal to attach again");
-                    bump(&mut state.view);
+        if connection.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY)
+            && let Some(pane) = connection.reattach.take()
+        {
+            if !connection.may_attach() {
+                // Hidden by now on a path that cannot say so: parked like any
+                // hidden pane, attached when shown.
+                connection.detach()?;
+                connection.claim.parked = Some(pane);
+            } else {
+                connection.reattached_at = Some(Instant::now());
+                match connection.attach(&pane, cols, rows) {
+                    Ok(()) => {}
+                    // Refused (the program ended, the pane is gone): it stays ended.
+                    Err(Error::Protocol(_) | Error::Rpc { .. }) => {
+                        let mut state = lock(&owner.state);
+                        state.view["state"] = json!("connecting");
+                        state.view["status"] = json!("Terminal stream ended; select a terminal to attach again");
+                        bump(&mut state.view);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
         if refreshed.elapsed() >= Duration::from_secs(2)
@@ -4012,7 +4027,7 @@ mod claim_tests {
     /// that when the path loses a confirmed `resize_history`) is attached
     /// again; a pane that refuses (its program ended) stays ended.
     #[test]
-    fn a_stream_closed_under_the_pane_is_attached_again_once() {
+    fn a_stream_closed_again_soon_is_attached_again_when_the_wait_ends() {
         let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
             Script { echo: true, refuse_from: Some(3) });
         let Seen::Attach(first) = core.next() else { panic!("attach first") };
@@ -4023,10 +4038,62 @@ mod claim_tests {
             if let Seen::Attach(params) = core.next() { break params }
         };
         assert_eq!(again["terminal"], "t1");
-        // Ended again at once: no loop (one reattach per REATTACH_EVERY).
+        let reattached = Instant::now();
+        // Ended again 1 s later: no loop, but not dropped either. It is
+        // attached again once REATTACH_EVERY has passed since the last one.
+        std::thread::sleep(Duration::from_secs(1));
         core.push.send((3, 2, Vec::new())).unwrap();
-        core.quiet(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(500));
         assert_eq!(lock(&core.owner.state).view["state"], "connecting");
+        let third = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        // Not before the wait was over, and soon after it.
+        let after = reattached.elapsed();
+        assert_eq!(third["terminal"], "t1");
+        assert!(after >= REATTACH_EVERY && after < REATTACH_EVERY + Duration::from_millis(1500), "{after:?}");
+        // That one is refused (the program ended): the pane stays ended, and
+        // nothing is tried again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&core.owner.state).view["status"] != "Terminal stream ended; select a terminal to attach again" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "tried again after a refusal");
+            }
+        }
+        core.close();
+    }
+
+    /// A reattach put off past the moment the phone hid the session, on a
+    /// core that cannot be told it is hidden, is parked like any hidden pane:
+    /// nothing is attached while hidden, and the pane comes back when shown.
+    #[test]
+    fn a_reattach_put_off_while_hidden_waits_to_be_shown() {
+        let core = Mock::start(json!([]), true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(again["terminal"], "t1");
+        core.push.send((3, 2, Vec::new())).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        core.set_visible(false);
+        let deadline = Instant::now() + REATTACH_EVERY + Duration::from_millis(1000);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "attached while hidden");
+            }
+        }
+        core.set_visible(true);
+        let shown = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(shown["terminal"], "t1", "the same pane comes back");
         core.close();
     }
 
