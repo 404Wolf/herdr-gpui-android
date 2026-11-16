@@ -1059,13 +1059,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         android.content.Context themed = new android.view.ContextThemeWrapper(this, chrome.popupTheme());
         android.widget.PopupMenu menu = new android.widget.PopupMenu(themed, anchor);
         ColorStateList tint = ColorStateList.valueOf(themeColor(themed, android.R.attr.textColorPrimary));
-        menu.getMenu().add(0, 1, 0, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
-        menu.getMenu().add(0, 2, 1, "Session actions").setIcon(R.drawable.ic_bar_session).setIconTintList(tint);
-        menu.getMenu().add(0, 3, 2, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
+        menu.getMenu().add(0, 1, MoreMenu.VIEW, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
+        menu.getMenu().add(0, 2, MoreMenu.SESSION, "Session actions").setIcon(R.drawable.ic_bar_session)
+                .setIconTintList(tint);
+        menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
         if (navigation && !shellMode()) {
-            menu.getMenu().add(0, 4, -2, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
-            menu.getMenu().add(0, 5, -1, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts).setIconTintList(tint);
-            menu.getMenu().add(0, 6, 3, "Gestures");
+            menu.getMenu().add(0, 4, MoreMenu.PANES, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
+            menu.getMenu().add(0, 5, MoreMenu.HOSTS, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts)
+                    .setIconTintList(tint);
+            menu.getMenu().add(0, 6, MoreMenu.GESTURES, "Gestures");
         }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
