@@ -239,6 +239,19 @@ public final class DictationFakes {
         /** Every other text message the phone sent (stop, cancel), in order. */
         public final List<String> texts = Collections.synchronizedList(new ArrayList<>());
 
+        /**
+         * When this server's (first) final was due, epoch ms: taken just before sending it, whether
+         * or not the phone still listened. For ordering checks that do not depend on the machine's
+         * load ({@link #awaitFinalDue}).
+         */
+        public volatile long finalDueAt;
+        private final java.util.concurrent.CountDownLatch finalDue = new java.util.concurrent.CountDownLatch(1);
+
+        /** Waits until the final was due (see {@link #finalDueAt}); its time, or 0 if it never was. */
+        public long awaitFinalDue(long timeoutMs) throws InterruptedException {
+            return finalDue.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) ? finalDueAt : 0;
+        }
+
         public FakeServer(Behaviour behaviour) throws IOException {
             this.behaviour = behaviour;
             Thread t = new Thread(this::serve, "fake-dictation-server");
@@ -313,6 +326,10 @@ public final class DictationFakes {
                             send(out, "{\"type\":\"status\",\"state\":\"finishing\",\"tail_s\":12.3}");
                         }
                         Thread.sleep(behaviour.finalDelayMs);
+                        if (finalDue.getCount() > 0) {
+                            finalDueAt = System.currentTimeMillis();
+                            finalDue.countDown();
+                        }
                         send(out, behaviour.finalJson != null ? behaviour.finalJson
                                 : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
                         s.close();

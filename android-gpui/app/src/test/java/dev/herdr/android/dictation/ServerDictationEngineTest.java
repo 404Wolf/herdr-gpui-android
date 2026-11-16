@@ -113,12 +113,18 @@ public final class ServerDictationEngineTest {
         Run run = dictate(server.uri(), phone, 300);
         run.awaitEnd();
         assertPhoneText(run);
+        // Not before the budget: the engine's timer cannot fire early (a guarantee, not a timing).
         long afterStop = run.listener.endedAt - run.stoppedAt;
-        assertTrue("the phone's text came " + afterStop + " ms after stop",
-                afterStop >= TIMEOUTS.finalBudgetMs - 50 && afterStop < TIMEOUTS.finalBudgetMs + 4000);
+        assertTrue("the phone's text came " + afterStop + " ms after stop, before the budget",
+                afterStop >= TIMEOUTS.finalBudgetMs - 50);
+        // Not waiting for the desktop: the phone's text came before the desktop's final was even
+        // due. An order, not a duration, so a loaded machine cannot make it fail.
+        long due = server.awaitFinalDue(10_000);
+        assertTrue("the desktop's final was due", due > 0);
+        assertTrue("the phone's text came before the desktop's final", run.listener.endedAt <= due);
         assertKeptWithAllAudio(run);
         // The desktop's late final never lands a second text.
-        Thread.sleep(500);
+        Thread.sleep(200);
         assertEquals(1, run.listener.finals);
     }
 
