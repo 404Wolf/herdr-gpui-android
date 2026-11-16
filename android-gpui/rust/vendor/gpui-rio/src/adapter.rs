@@ -39,6 +39,10 @@ macro_rules! __bind_gpui {
                 bounds: Bounds<Pixels>,
                 /// The grid cell (row, column) drawn at the pane's top-left.
                 view_origin: (i32, usize),
+                /// A column the reader panned a wider grid to (see `ColumnPan`).
+                pan: $crate::ColumnPan,
+                /// The pane's size in cells at the last paint.
+                pane: (u16, u16),
                 cell: Size<Pixels>,
                 selecting: bool,
                 scroll_delta: f32,
@@ -110,6 +114,8 @@ macro_rules! __bind_gpui {
                             visible: true,
                             bounds: Bounds::default(),
                             view_origin: (0, 0),
+                            pan: $crate::ColumnPan::default(),
+                            pane: (0, 0),
                             cell: size(px(8.), px(18.)),
                             selecting: false,
                             scroll_delta: 0.,
@@ -177,6 +183,15 @@ macro_rules! __bind_gpui {
                 /// its touch begin, never one begun on a view it replaced mid-tap.
                 pub fn set_touch_presses(&mut self, touch: bool) {
                     self.touch_presses = touch;
+                }
+                /// Pans a grid wider than the pane `dx` to the right (negative:
+                /// left), as the host's pan buttons do. Client-local: the program
+                /// sees nothing. True when the window moved; the host then
+                /// notifies this view.
+                pub fn pan(&mut self, dx: Pixels) -> bool {
+                    let columns = f32::from(dx) / f32::from(self.cell.width);
+                    let (grid_cols, _) = self.session.grid_size();
+                    self.pan.pan(columns, self.view_origin.1, grid_cols, self.pane.0)
                 }
                 fn tap_stamp(&self) -> $crate::tap::Gesture {
                     self.tap_listener.as_ref().map_or($crate::tap::Gesture::NONE, |(stamp, _)| stamp())
@@ -453,11 +468,16 @@ macro_rules! __bind_gpui {
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
                     let offset = grid.display_offset() as i32;
-                    let (row_off, col_off) = if offset == 0 {
-                        $crate::viewport_origin((grid_cols, grid_rows), pane, (cursor.pos.row.0, cursor.pos.col.0))
-                    } else {
-                        (0, 0)
-                    };
+                    // A column the reader panned to wins over the caret, in
+                    // history too, so wide rows can be read to their end.
+                    self.pane = pane;
+                    let (row_off, col_off) = $crate::view_origin(
+                        (grid_cols, grid_rows),
+                        pane,
+                        (cursor.pos.row.0, cursor.pos.col.0),
+                        offset != 0,
+                        self.pan.column(grid_cols, pane.0),
+                    );
                     self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
@@ -508,7 +528,7 @@ macro_rules! __bind_gpui {
                                 ));
                             }
                             if let Some((spans, _)) = &self.pressed_link
-                                && spans.iter().any(|(line, range)| *line == pos.row && range.contains(&col))
+                                && $crate::links::pressed(spans, &pos.row, col, col_off)
                             {
                                 // Pressed link: a soft wash and a rule under it.
                                 let mut wash = rgb_color(theme.foreground);
@@ -585,6 +605,23 @@ macro_rules! __bind_gpui {
                     }
                     grid.reset_damage();
                     drop(grid);
+                    // More of a wider grid off either side: a faint rule on that
+                    // edge, so a cut row is not taken for the whole row.
+                    let mut edge = rgb_color(theme.foreground);
+                    edge.a = 0.35;
+                    let drawn_width = self.cell.width * cols;
+                    let drawn_height = self.cell.height * rows as f32;
+                    for (shown, x) in [
+                        (col_off > 0, px(0.)),
+                        (col_off + cols < usize::from(grid_cols), drawn_width - px(2.)),
+                    ] {
+                        if shown {
+                            window.paint_quad(fill(
+                                Bounds::new(bounds.origin + point(x, px(0.)), size(px(2.), drawn_height)),
+                                edge,
+                            ));
+                        }
+                    }
                     // The caret as drawn, only while visible and the view is at the bottom.
                     let caret = (cursor.content != CursorShape::Hidden && offset == 0)
                         .then(|| {
@@ -799,7 +836,18 @@ macro_rules! __bind_gpui {
                         )
                         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                             this.cancel_press();
-                            let delta = event.delta.pixel_delta(this.cell.height).y;
+                            let delta = event.delta.pixel_delta(this.cell.height);
+                            // A sideways drag (GPUI locks a touch pan to one axis)
+                            // pans a grid wider than the pane; the content follows
+                            // the finger. Otherwise it scrolls history as before.
+                            if delta.x.abs() > delta.y.abs() {
+                                if this.pan(-delta.x) {
+                                    cx.notify();
+                                }
+                                cx.stop_propagation();
+                                return;
+                            }
+                            let delta = delta.y;
                             this.scroll_delta += f32::from(delta) / f32::from(this.cell.height);
                             let lines = this.scroll_delta.trunc() as i32;
                             this.scroll_delta -= lines as f32;

@@ -95,6 +95,8 @@ impl TerminalView {
         }
         #[cfg(unix)]
         self.attach_shell(state.shell, cx);
+        #[cfg(unix)]
+        self.pan_shell(cx);
         #[cfg(not(unix))]
         let _ = cx;
         let new_generation = self.state.generation != state.generation;
@@ -186,6 +188,23 @@ impl TerminalView {
                 });
                 (handle, terminal)
             });
+    }
+
+    /// Hands queued pan steps (the pan buttons) to the shell's view, which
+    /// owns the column offset of a grid wider than the pane.
+    #[cfg(unix)]
+    fn pan_shell(&mut self, cx: &mut Context<Self>) {
+        let dx = model::mailbox().take_shell_pan();
+        if dx == 0. {
+            return;
+        }
+        if let Some((_, terminal)) = &self.shell {
+            terminal.update(cx, |terminal, cx| {
+                if terminal.pan(px(dx)) {
+                    cx.notify();
+                }
+            });
+        }
     }
 
     #[cfg(unix)]

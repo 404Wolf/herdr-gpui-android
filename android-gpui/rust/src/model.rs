@@ -1152,6 +1152,9 @@ pub struct Mailbox {
     pan: f32,
     /// Furthest useful pan: the painted row width beyond the surface.
     pan_limit: f32,
+    /// Pan steps for the terminal view drawing `shell`, which owns its own
+    /// column offset; the view takes them (`take_shell_pan`).
+    shell_pan: f32,
     pub follow: bool,
     /// Raw SSH shell drawn instead of a Herdr pane, or 0.
     shell: u64,
@@ -1205,6 +1208,7 @@ impl Default for Mailbox {
             display_preferences: DisplayPreferences::default(),
             pan: 0.,
             pan_limit: MAX_PAN,
+            shell_pan: 0.,
             // A fresh session tails its pane until the user scrolls back.
             follow: true,
             shell: 0,
@@ -1228,6 +1232,7 @@ impl Mailbox {
             self.ime_session = 0;
             self.preedit = Arc::from("");
             self.pan = 0.;
+            self.shell_pan = 0.;
             self.shell = 0;
         }
         if !active {
@@ -1316,6 +1321,8 @@ impl Mailbox {
             return false;
         }
         self.shell = shell;
+        // Steps meant for the view of another pane never move the new one.
+        self.shell_pan = 0.;
         self.revision = self.revision.wrapping_add(1);
         #[cfg(feature = "android-ui")]
         signal_change();
@@ -1373,6 +1380,16 @@ impl Mailbox {
         if !delta.is_finite() {
             return false;
         }
+        if self.shell != 0 {
+            // A core pane (or shell) is drawn by its own terminal view, which
+            // knows its grid and clamps the offset there; the snapshot's limit
+            // describes no rows here.
+            self.shell_pan += delta;
+            self.revision = self.revision.wrapping_add(1);
+            #[cfg(feature = "android-ui")]
+            signal_change();
+            return true;
+        }
         let next = (self.pan + delta).clamp(0., self.pan_limit);
         if (next - self.pan).abs() < 0.5 {
             return false;
@@ -1398,6 +1415,7 @@ impl Mailbox {
     /// Drops the horizontal offset, e.g. when the pane or the type size changes,
     /// so a new pane never opens scrolled into the middle of itself.
     pub fn reset_pan(&mut self) {
+        self.shell_pan = 0.;
         if self.pan == 0. {
             return;
         }
@@ -1405,6 +1423,11 @@ impl Mailbox {
         self.revision = self.revision.wrapping_add(1);
         #[cfg(feature = "android-ui")]
         signal_change();
+    }
+
+    /// The pan steps queued for the shell's view since it last took them.
+    pub fn take_shell_pan(&mut self) -> f32 {
+        std::mem::take(&mut self.shell_pan)
     }
 
     /// Capture the held body without requiring an active input connection.
@@ -2041,6 +2064,37 @@ mod tests {
         assert_eq!(box_.state().pan, 96.);
         assert!(box_.set_active(11, false));
         assert_eq!(box_.state().pan, 0.);
+    }
+
+    #[test]
+    fn pan_steps_queue_for_a_drawn_core_pane_and_never_carry_to_another() {
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        assert!(box_.set_shell(10, 7));
+        // The snapshot has no rows to bound it; the terminal view clamps.
+        let revision = box_.state().revision;
+        assert!(box_.pan(96.));
+        assert!(box_.pan(96.));
+        assert!(box_.pan(-48.));
+        assert_eq!(box_.state().pan, 0.);
+        assert_eq!(box_.state().revision, revision + 3);
+        assert_eq!(box_.take_shell_pan(), 144.);
+        assert_eq!(box_.take_shell_pan(), 0.);
+        assert!(!box_.pan(f32::NAN));
+        // A pane switch, another pane drawn or a new session drops queued steps.
+        box_.pan(96.);
+        box_.reset_pan();
+        assert_eq!(box_.take_shell_pan(), 0.);
+        box_.pan(96.);
+        assert!(box_.set_shell(10, 8));
+        assert_eq!(box_.take_shell_pan(), 0.);
+        box_.pan(96.);
+        assert!(box_.set_active(11, true));
+        assert_eq!(box_.take_shell_pan(), 0.);
+        // With no core pane drawn, panning is the snapshot's, as before.
+        assert!(box_.pan(96.));
+        assert_eq!(box_.state().pan, 96.);
+        assert_eq!(box_.take_shell_pan(), 0.);
     }
 
     #[test]

@@ -569,6 +569,85 @@ pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize))
     (row, col)
 }
 
+#[doc(hidden)]
+/// The window actually drawn: [`viewport_origin`], except that a column the
+/// reader panned to (`pan`) wins over following the caret, and a view scrolled
+/// back into history starts at the top row and, unpanned, the left column.
+pub fn view_origin(
+    grid: (u16, u16),
+    pane: (u16, u16),
+    cursor: (i32, usize),
+    scrolled: bool,
+    pan: Option<usize>,
+) -> (i32, usize) {
+    let (row, caret_col) = if scrolled {
+        (0, 0)
+    } else {
+        viewport_origin(grid, pane, cursor)
+    };
+    let last = usize::from(grid.0).saturating_sub(usize::from(pane.0.max(1)));
+    (row, pan.map_or(caret_col, |col| col.min(last)))
+}
+
+#[doc(hidden)]
+/// A column offset the reader chose by panning a grid wider than the pane
+/// (one the remote side drew wider than this screen). Client-local: nothing
+/// is sent. Kept only for the grid width it was chosen on.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ColumnPan {
+    /// The grid column drawn at the pane's left; `None` follows the caret.
+    col: Option<usize>,
+    /// Columns of drag not yet a whole one, so slow drags still move.
+    rest: f32,
+    grid_cols: u16,
+}
+
+impl ColumnPan {
+    /// Moves the window `columns` to the right (negative: left) from `drawn`,
+    /// the column the last frame started at, stopping at either edge. Back at
+    /// the left edge, the window follows the caret again. True when the column
+    /// to draw from changed.
+    pub fn pan(&mut self, columns: f32, drawn: usize, grid_cols: u16, pane_cols: u16) -> bool {
+        self.forget_other_grid(grid_cols);
+        let last = usize::from(grid_cols).saturating_sub(usize::from(pane_cols.max(1)));
+        if last == 0 || !columns.is_finite() {
+            self.rest = 0.;
+            return false;
+        }
+        // A reversed drag starts from no remainder, so it moves at once.
+        if (self.rest > 0.) != (columns > 0.) {
+            self.rest = 0.;
+        }
+        self.rest += columns;
+        let whole = self.rest.trunc();
+        self.rest -= whole;
+        let from = self.col.unwrap_or(drawn).min(last);
+        let next = (from as f32 + whole).clamp(0., last as f32) as usize;
+        let col = (next > 0).then_some(next);
+        let moved = next != from || col != self.col;
+        self.col = col;
+        moved
+    }
+
+    /// The column to draw from (within the grid), or `None` to follow the
+    /// caret. A grid of another width (a resize) drops the offset: its rows
+    /// were drawn again at that width.
+    pub fn column(&mut self, grid_cols: u16, pane_cols: u16) -> Option<usize> {
+        self.forget_other_grid(grid_cols);
+        let last = usize::from(grid_cols).saturating_sub(usize::from(pane_cols.max(1)));
+        self.col.map(|col| col.min(last))
+    }
+
+    fn forget_other_grid(&mut self, grid_cols: u16) {
+        if self.grid_cols != grid_cols {
+            *self = Self {
+                grid_cols,
+                ..Self::default()
+            };
+        }
+    }
+}
+
 pub fn resolve_index(grid: &Crosswords<Listener>, theme: TerminalTheme, index: usize) -> ColorRgb {
     if index < 269
         && let Some(color) = grid.colors()[index]
@@ -933,6 +1012,91 @@ mod tests {
         // Never past the grid's end.
         assert_eq!(viewport_origin((120, 40), (80, 24), (39, 119)), (16, 40));
         assert_eq!(viewport_origin((120, 40), (80, 24), (60, 500)), (16, 40));
+    }
+
+    #[test]
+    fn a_panned_column_wins_over_the_caret_and_holds_in_history() {
+        use super::view_origin;
+        // Unpanned: the caret is followed live; history starts top-left.
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), false, None),
+            (7, 21)
+        );
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), true, None),
+            (0, 0)
+        );
+        // Panned: that column, live or scrolled back; rows as before.
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), false, Some(5)),
+            (7, 5)
+        );
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), true, Some(33)),
+            (0, 33)
+        );
+        // Never past the grid's last full window, nor beside a grid that fits.
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (0, 0), false, Some(90)),
+            (0, 40)
+        );
+        assert_eq!(
+            view_origin((40, 10), (80, 24), (0, 0), true, Some(7)),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn a_column_pan_moves_by_whole_columns_within_the_grid() {
+        use super::ColumnPan;
+        let mut pan = ColumnPan::default();
+        // Nothing to pan when the grid fits the pane.
+        assert!(!pan.pan(10., 0, 40, 80));
+        assert_eq!(pan.column(40, 80), None);
+        // A wider grid: 200 columns on a 50-column pane, 150 to pan.
+        assert!(pan.pan(12., 0, 200, 50));
+        assert_eq!(pan.column(200, 50), Some(12));
+        // Fractions add up, so a slow drag still moves.
+        assert!(!pan.pan(0.6, 12, 200, 50));
+        assert!(pan.pan(0.6, 12, 200, 50));
+        assert_eq!(pan.column(200, 50), Some(13));
+        // Clamped at the right edge; the next step left moves at once.
+        pan.pan(1000., 13, 200, 50);
+        assert_eq!(pan.column(200, 50), Some(150));
+        assert!(!pan.pan(5., 150, 200, 50));
+        assert!(pan.pan(-1., 150, 200, 50));
+        assert_eq!(pan.column(200, 50), Some(149));
+        // A wider pane (unfolded, smaller type) clamps without forgetting.
+        assert_eq!(pan.column(200, 120), Some(80));
+        assert_eq!(pan.column(200, 50), Some(149));
+        // Back at the left edge it follows the caret again.
+        pan.pan(-1000., 149, 200, 50);
+        assert_eq!(pan.column(200, 50), None);
+        assert!(!pan.pan(f32::NAN, 0, 200, 50));
+    }
+
+    #[test]
+    fn a_column_pan_starts_from_the_window_drawn() {
+        use super::ColumnPan;
+        let mut pan = ColumnPan::default();
+        // The caret had the window at column 30: a pan moves from there.
+        assert!(pan.pan(-4., 30, 200, 50));
+        assert_eq!(pan.column(200, 50), Some(26));
+    }
+
+    #[test]
+    fn a_new_grid_width_drops_the_pan_but_new_rows_keep_it() {
+        use super::ColumnPan;
+        let mut pan = ColumnPan::default();
+        pan.pan(20., 0, 200, 50);
+        pan.pan(0.5, 20, 200, 50);
+        // Rows are not part of it: a keyboard opening never moves the window.
+        assert_eq!(pan.column(200, 50), Some(20));
+        // Another width: the program drew its rows again; follow the caret.
+        assert_eq!(pan.column(118, 50), None);
+        // The dropped half column does not come back either.
+        assert!(!pan.pan(0.6, 0, 118, 50));
+        assert_eq!(pan.column(200, 50), None);
     }
 
     #[test]
