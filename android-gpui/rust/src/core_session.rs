@@ -937,7 +937,9 @@ impl Connection<'_> {
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
         // This attach replaces any reattach still waiting for its turn.
         self.reattach = None;
-        let resumed = self.ended.take().is_some_and(|ended| ended == terminal);
+        // Taken only once an attach of that pane is accepted (below): a pick
+        // the core refuses leaves it for the fallback to the previous pane.
+        let resumed = self.ended.as_deref() == Some(terminal);
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
@@ -969,6 +971,9 @@ impl Connection<'_> {
             params["resumed"] = json!(true);
         }
         let reply = self.call("terminal.attach", params)?;
+        if resumed {
+            self.ended = None;
+        }
         // Only the owner's echo confirms it (relays pass on only that): no
         // echo, and the path cannot carry it, so it is not asked again.
         if self.history_on_resize && reply["resize_history"].as_u64().unwrap_or(0) == 0 {
@@ -1809,7 +1814,6 @@ fn serve(
                 // A person's pick: an owed reattach of another pane is off.
                 if connection.reattach.as_ref().is_some_and(|owed| *owed != terminal) {
                     connection.reattach = None;
-                    connection.ended = None;
                 }
                 connection.claim.parked = Some(terminal);
             }
@@ -3911,6 +3915,12 @@ mod claim_tests {
                                 let asked = request["params"]["visibility_updates"] == true;
                                 let _ = tx.send(Seen::Attach(request["params"].clone()));
                                 attaches += 1;
+                                // A pane that ended under a stale pick.
+                                if request["params"]["terminal"] == "gone" {
+                                    let error = json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"gone has finished","data":{"kind":"finished"}}});
+                                    if write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).is_err() { return; }
+                                    continue;
+                                }
                                 if killed || script.refuse_from.is_some_and(|from| attaches >= from) {
                                     let error = json!({"jsonrpc":"2.0","id":request["id"],
                                         "error":{"code":1,"message":"t1 has finished","data":{"kind":"finished"}}});
@@ -4486,5 +4496,47 @@ mod claim_tests {
                 assert_eq!(rows, all, "the attach's own history brings every row back");
             }
         }
+    }
+
+    /// t21s, #27 at ea56f49: a pick the core refuses must not use up the
+    /// previous pane's owed replacement; the fallback to it is `resumed`.
+    #[test]
+    fn reviewer_refused_pick_keeps_the_previous_panes_resume_debt() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, resizes: true, ..Script::default() });
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        // First CLOSE establishes the cooldown for the next CLOSE.
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = reviewer_attach(&core);
+        assert_eq!(again["resumed"], true);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        let previous = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        core.push.send((3, 0, owner_main_paint(&again, &all[..40], &all[40..], 40))).unwrap();
+        reviewer_wait(|| previous.screen_text().contains("row 049"));
+        core.push.send((3, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
+        reviewer_wait(|| previous.screen_text().contains("ALT"));
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        // A stale pane pick fails; the normal connection loop falls back to t1.
+        *lock(&core.owner.focus) = Some(("gone".into(), Instant::now()));
+        assert_eq!(reviewer_attach(&core)["terminal"], "gone");
+        let fallback = reviewer_attach(&core);
+        assert_eq!(fallback["terminal"], "t1");
+        assert_eq!(fallback["resize_history"], 1000);
+        eprintln!("fallback after refused pick: {fallback}");
+        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &previous)));
+        let pane = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        let mut alt = connection_tests::core_paint(&[], &[], 40);
+        alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT restored");
+        core.push.send((4, 0, alt)).unwrap();
+        reviewer_wait(|| pane.screen_text().contains("ALT restored"));
+        core.push.send((4, 0, owner_main_paint(&fallback, &all[..40], &all[40..], 40))).unwrap();
+        reviewer_wait(|| pane.screen_text().contains("row 049"));
+        let got: Vec<String> = connection_tests::all_rows(&pane).into_iter().filter(|s| !s.is_empty()).collect();
+        core.close();
+        assert_eq!(got, all, "path A fallback to the previous pane still owes its repair");
     }
 }
