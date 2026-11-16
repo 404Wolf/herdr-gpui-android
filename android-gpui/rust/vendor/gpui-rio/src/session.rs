@@ -864,11 +864,10 @@ mod tests {
         (session, remote)
     }
 
-    /// The host's side: each down queued with its pane's stamp, then started
-    /// by GPUI at the point it was posted at.
+    /// The host's side: each down queued with its pane's stamp, then handled.
     fn handled(downs: &mut crate::tap::DownStamps, stamp: u64) -> crate::tap::Gesture {
-        let at = downs.queued(stamp, (10., 20.));
-        downs.started(at, 1.);
+        downs.queued(stamp);
+        downs.handled();
         downs.now()
     }
 

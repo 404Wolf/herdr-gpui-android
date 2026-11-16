@@ -2218,7 +2218,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre-mobile"
 version = "0.1.0"
-source = "git+https://github.com/longbridge/gpui-mobile?rev=9075e3aa3eea812127f2c60ed66f0cd5798ff245#9075e3aa3eea812127f2c60ed66f0cd5798ff245"
+source = "git+https://github.com/404Wolf/gpui-mobile?rev=cf8eabe1391da50055ca7f3609c6eb82216c90aa#cf8eabe1391da50055ca7f3609c6eb82216c90aa"
 dependencies = [
  "android-activity",
  "android_logger",

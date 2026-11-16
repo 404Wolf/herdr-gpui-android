@@ -182,51 +182,27 @@ pub fn plain_view_tap(lifted: Option<(bool, Gesture)>, now: Gesture) -> (Tapped,
     }
 }
 
-/// The stamps a host sends along with each touch-down, taken back as GPUI
-/// handles the downs. The host's own state (which pane it shows) changes at
-/// once, while a touch waits in GPUI's queue, so the stamp travels with the
-/// down instead.
+/// The stamps a host sends along with each touch-down, taken back in the
+/// order GPUI handles the downs. The host's own state (which pane it shows)
+/// changes at once, while a touch waits in GPUI's queue, so the stamp
+/// travels with the down instead, in a queue kept in the same order.
 ///
-/// Every down is matched by its identity, carried by the touch itself: the
-/// host posts each down at a point marked with a code of its own ([`mark`]:
-/// a few units in the last place of the coordinates, far below a pixel), and
-/// GPUI reports a down starting at exactly that point (its touch-drag offer,
-/// or the still scroll start of a down that stopped a fling). No order,
-/// position heuristic or clock is involved.
-///
-/// One down can reach GPUI as two contacts. Within a few seconds of a pan,
-/// the Android platform layer (gpui-mobile's `FlingGuard`) relays a
-/// synthetic contact, begun and cancelled at the real one's point, before
-/// the real one, to stop any fling still coasting. GPUI reports its start
-/// too. Both starts are at the down's marked point, so both are that one
-/// down: the first takes its entry, the second finds it is the down in
-/// progress.
+/// Every down is matched by identity, one entry per down in order, never by
+/// position: the host's render thread reports each touch it posted as it hands
+/// it to GPUI ([`DownStamps::observed`], from gpui-mobile's touch observer).
+/// Contacts the platform layer adds never reach that report: the fling guard
+/// relays a synthetic contact before a down that may land on a fling, which
+/// GPUI reports as a start of its own, so counting GPUI's starts instead
+/// took the synthetic contact for the down and left the real one without.
 #[derive(Debug)]
 pub struct DownStamps {
-    /// The downs queued and not yet started, oldest first: each one's stamp
-    /// and the marked point it was posted at (physical pixels).
-    queue: std::collections::VecDeque<(u64, (f32, f32))>,
-    /// The code the next down is marked with.
-    next_code: u8,
-    /// The down GPUI started last: the touch in progress.
+    /// Downs queued and not yet handled whose stamps were dropped to keep
+    /// the bound: the oldest of all, so they come first and take NO_STAMP.
+    dropped: usize,
+    /// The stamps of the other downs queued and not yet handled, oldest first.
+    queue: std::collections::VecDeque<u64>,
+    /// The down GPUI handled last: the touch in progress.
     current: Gesture,
-    /// Where the touch in progress started (logical pixels, as GPUI reports it).
-    current_at: Option<(f32, f32)>,
-}
-
-/// `point` with `code` written into the low bits of its coordinates'
-/// mantissas, in steps of 8 units in the last place: 16 values in each
-/// coordinate, 256 in all, at most 120 units in the last place from the
-/// original (under 0.03 px below 4096 px). Steps of 8 stay distinct
-/// after GPUI divides by any display scale up to 4.
-pub fn mark(point: (f32, f32), code: u8) -> (f32, f32) {
-    fn put(value: f32, bits: u8) -> f32 {
-        if !value.is_finite() {
-            return value;
-        }
-        f32::from_bits((value.to_bits() & !(0xF << 3)) | (u32::from(bits & 0xF) << 3))
-    }
-    (put(point.0, code & 0xF), put(point.1, code >> 4))
 }
 
 impl Default for DownStamps {
@@ -236,30 +212,26 @@ impl Default for DownStamps {
 }
 
 impl DownStamps {
-    /// Downs kept waiting at most; the oldest is dropped past it (it is then
-    /// started with no stamp). Fewer than the 256 codes, so no two waiting
-    /// downs, nor a waiting down and the one in progress, share a code.
+    /// Downs kept waiting at most; the oldest is dropped past it.
     pub const CAPACITY: usize = 64;
 
     pub const fn new() -> Self {
         Self {
+            dropped: 0,
             queue: std::collections::VecDeque::new(),
-            next_code: 0,
             current: Gesture::NONE,
-            current_at: None,
         }
     }
 
-    /// A down at `point` (physical pixels) goes into GPUI's queue with
-    /// `stamp`. Returns the marked point to post it at.
-    pub fn queued(&mut self, stamp: u64, point: (f32, f32)) -> (f32, f32) {
-        let at = mark(point, self.next_code);
-        self.next_code = self.next_code.wrapping_add(1);
+    /// A down went into GPUI's queue with `stamp`. Past the bound the oldest
+    /// stamp is dropped, but its down still holds its place: it is handled
+    /// with NO_STAMP, so no later down's stamp shifts onto it.
+    pub fn queued(&mut self, stamp: u64) {
         if self.queue.len() == Self::CAPACITY {
             self.queue.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
         }
-        self.queue.push_back((stamp, at));
-        at
+        self.queue.push_back(stamp);
     }
 
     /// The down queued last never reached GPUI (the platform kept it).
@@ -267,50 +239,38 @@ impl DownStamps {
         self.queue.pop_back();
     }
 
-    /// GPUI reported a down starting at `at` (logical pixels: GPUI's point is
-    /// the posted one divided by `scale`). Returns its stamp.
-    ///
-    /// The queued down posted at that point is now the touch in progress;
-    /// downs queued before it that never started (none should) are dropped
-    /// with it, so nothing left over can reach a later down. A start at the
-    /// point of the touch in progress is that down again: the real contact
-    /// after the platform's synthetic one. A start of no queued down is a
-    /// touch of its own with no stamp.
-    pub fn started(&mut self, at: (f32, f32), scale: f32) -> u64 {
-        let posted_at = |(x, y): (f32, f32)| (x / scale, y / scale);
-        if let Some(index) = self
-            .queue
-            .iter()
-            .position(|(_, point)| posted_at(*point) == at)
-        {
-            let stamp = self
-                .queue
-                .drain(..=index)
-                .last()
-                .map_or(NO_STAMP, |(stamp, _)| stamp);
-            return self.begin(at, stamp);
+    /// The render thread is handing GPUI a touch the host posted, with this
+    /// single-pointer action (`0` down, `1` up, `2` move, `3` cancel): a down
+    /// takes its entry ([`Self::handled`]); the rest take nothing.
+    pub fn observed(&mut self, action: u32) {
+        const DOWN: u32 = 0;
+        if action == DOWN {
+            self.handled();
         }
-        if self.current_at == Some(at) {
-            return self.current.stamp;
-        }
-        self.begin(at, NO_STAMP)
     }
 
-    fn begin(&mut self, at: (f32, f32), stamp: u64) -> u64 {
+    /// GPUI handled the next queued down: its stamp is the touch in progress
+    /// now, and is returned. [`NO_STAMP`] when none was queued.
+    pub fn handled(&mut self) -> u64 {
+        let stamp = if self.dropped > 0 {
+            self.dropped -= 1;
+            NO_STAMP
+        } else {
+            self.queue.pop_front().unwrap_or(NO_STAMP)
+        };
         self.current = Gesture {
             id: self.current.id + 1,
             stamp,
         };
-        self.current_at = Some(at);
         stamp
     }
 
-    /// The stamp of the touch in progress: the down GPUI started last.
+    /// The stamp of the touch in progress: the down GPUI handled last.
     pub fn current(&self) -> u64 {
         self.current.stamp
     }
 
-    /// The gesture in progress: the down GPUI started last.
+    /// The gesture in progress: the down GPUI handled last.
     pub fn now(&self) -> Gesture {
         self.current
     }
@@ -362,8 +322,8 @@ impl Touch {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownStamps, Gesture, Lift, NO_STAMP, Press, Tapped, Touch, cell_at, lift, mark, next_id,
-        owns, plain_view_tap,
+        DownStamps, Gesture, Lift, NO_STAMP, Press, Tapped, Touch, cell_at, lift, next_id, owns,
+        plain_view_tap,
     };
 
     fn g(id: u64, stamp: u64) -> Gesture {
@@ -521,228 +481,117 @@ mod tests {
         assert_eq!(cell_at((5., 5.), (0., 20.), (0, 0), GRID), None);
     }
 
-    /// The display scale of the emulator and the Fold (420 dpi).
-    const SCALE: f32 = 2.625;
-
-    /// Java queues a down at `point` (physical pixels) and posts it at the
-    /// marked point; GPUI reports its start there, divided by the scale.
-    fn down(downs: &mut DownStamps, stamp: u64, point: (f32, f32)) -> (f32, f32) {
-        let (x, y) = downs.queued(stamp, point);
-        (x / SCALE, y / SCALE)
-    }
-
-    /// The platform's synthetic contact, then the real one: two starts at
-    /// the one down's point.
-    fn pair(downs: &mut DownStamps, at: (f32, f32)) -> u64 {
-        let synthetic = downs.started(at, SCALE);
-        let gesture = downs.now();
-        let real = downs.started(at, SCALE);
-        assert_eq!(synthetic, real, "one down, one stamp");
-        assert_eq!(downs.now(), gesture, "one down, one gesture");
-        real
-    }
-
-    const P: (f32, f32) = (105., 210.);
-
     #[test]
     fn a_touch_keeps_the_stamp_it_was_queued_with() {
         // The host shows pane 1, a finger goes down, then the host switches to
         // pane 2 before GPUI handles that down: the touch is still pane 1's.
         let mut downs = DownStamps::default();
-        let a = down(&mut downs, 1, P);
-        let b = down(&mut downs, 2, (300., 400.));
-        assert_eq!(downs.started(a, SCALE), 1);
+        downs.queued(1);
+        downs.queued(2);
+        assert_eq!(downs.handled(), 1);
         assert_eq!(downs.current(), 1);
-        assert_eq!(downs.started(b, SCALE), 2);
-        assert_eq!(downs.started((1., 1.), SCALE), NO_STAMP);
+        assert_eq!(downs.handled(), 2);
+        assert_eq!(downs.handled(), NO_STAMP);
     }
 
     #[test]
-    fn downs_at_one_position_are_told_apart_by_their_marks() {
-        // Three downs on the very same pixel, the middle one a down that stops
-        // a fling (a still scroll start at its point): each its own entry.
+    fn downs_at_one_position_are_told_apart_by_order() {
+        // Two downs at the same spot with a fling-stopping down between them:
+        // each handled down takes its own entry, never another at that spot.
         let mut downs = DownStamps::default();
-        let a = down(&mut downs, 10, P);
-        let b = down(&mut downs, 11, P);
-        let c = down(&mut downs, 12, P);
-        assert!(a != b && b != c && a != c);
-        assert_eq!(downs.started(a, SCALE), 10);
-        assert_eq!(downs.started(b, SCALE), 11);
-        assert_eq!(downs.started(c, SCALE), 12);
+        downs.queued(10); // a tap at (10, 10) on pane A
+        downs.queued(11); // a down that stops a fling: no touch starts
+        downs.queued(12); // a tap at (10, 10) on pane B
+        assert_eq!(downs.handled(), 10);
+        assert_eq!(downs.handled(), 11);
+        assert_eq!(downs.handled(), 12);
     }
 
     #[test]
     fn a_down_the_platform_kept_takes_no_entry() {
         let mut downs = DownStamps::default();
-        let a = down(&mut downs, 1, P);
-        down(&mut downs, 2, P);
+        downs.queued(1);
+        downs.queued(2);
         downs.withdrawn();
-        let c = down(&mut downs, 3, P);
-        assert_eq!(downs.started(a, SCALE), 1);
-        assert_eq!(downs.started(c, SCALE), 3);
+        downs.queued(3);
+        assert_eq!(downs.handled(), 1);
+        assert_eq!(downs.handled(), 3);
     }
 
     #[test]
-    fn past_the_bound_the_oldest_down_starts_without_a_stamp() {
+    fn past_the_bound_the_oldest_downs_keep_their_place_without_a_stamp() {
         let mut downs = DownStamps::default();
-        // Pane A's down, then CAPACITY downs on pane B: A's entry is dropped.
-        let a = down(&mut downs, 1, P);
-        let bs: Vec<_> = (0..DownStamps::CAPACITY)
-            .map(|_| down(&mut downs, 2, P))
-            .collect();
-        // GPUI starts A's down first: it gets no stamp, never B's.
-        assert_eq!(downs.started(a, SCALE), NO_STAMP);
-        for b in bs {
-            assert_eq!(downs.started(b, SCALE), 2);
+        // Pane A's down, then CAPACITY downs on pane B: A's stamp is dropped.
+        downs.queued(1);
+        for _ in 0..DownStamps::CAPACITY {
+            downs.queued(2);
         }
-    }
-
-    #[test]
-    fn a_down_that_never_started_is_dropped_by_the_next_that_does() {
-        // Nothing left over reaches a later down: a down GPUI skipped is
-        // dropped once a down queued after it starts.
-        let mut downs = DownStamps::default();
-        let a = down(&mut downs, 1, P);
-        let b = down(&mut downs, 2, (300., 400.));
-        assert_eq!(downs.started(b, SCALE), 2);
-        assert_eq!(downs.started(a, SCALE), NO_STAMP);
-        let c = down(&mut downs, 3, P);
-        assert_eq!(downs.started(c, SCALE), 3);
-    }
-
-    #[test]
-    fn marks_are_distinct_after_any_display_scale_and_far_below_a_pixel() {
-        for scale in [1., 1.5, 2., 2.625, 3., 3.5, 4.] {
-            for point in [
-                (0., 0.),
-                (0.5, 7.25),
-                (105.3, 2399.9),
-                (1855.75, 2159.5),
-                (-3., 12.),
-            ] {
-                let marked: Vec<_> = (0..=255u8)
-                    .map(|code| mark(point, code))
-                    .map(|(x, y)| ((x / scale).to_bits(), (y / scale).to_bits()))
-                    .collect();
-                let mut unique = marked.clone();
-                unique.sort_unstable();
-                unique.dedup();
-                assert_eq!(unique.len(), 256, "codes collide at {point:?} / {scale}");
-                for code in 0..=255u8 {
-                    let (x, y) = mark(point, code);
-                    assert!((x - point.0).abs() < 0.03 && (y - point.1).abs() < 0.03);
-                }
-            }
+        // GPUI handles A's down first: it gets no stamp, never B's.
+        assert_eq!(downs.handled(), NO_STAMP);
+        for _ in 0..DownStamps::CAPACITY {
+            assert_eq!(downs.handled(), 2);
         }
-        assert!(mark((f32::NAN, 1.), 9).0.is_nan());
+        assert_eq!(downs.handled(), NO_STAMP);
     }
 
     #[test]
-    fn a_tap_right_after_a_fling_keeps_its_stamp() {
-        // The emulator case (4 of 4 taps dropped): a fling, then a tap 0.7 s
-        // later while it still coasts. The synthetic contact stops the fling
-        // (a still scroll start at the tap's point), then the tap is offered.
+    fn overflow_counts_every_dropped_down_in_order() {
         let mut downs = DownStamps::default();
-        let fling = down(&mut downs, 3, (500., 300.));
-        assert_eq!(downs.started(fling, SCALE), 3);
-        let tap = down(&mut downs, 3, (10., 150.));
-        assert_eq!(pair(&mut downs, tap), 3);
-    }
-
-    #[test]
-    fn a_pair_keeps_its_gesture_held_or_not() {
-        for held in [false, true] {
-            let mut downs = DownStamps::default();
-            let at = down(&mut downs, 10, P);
-            downs.started(at, SCALE);
-            let id = downs.now();
-            let mut touch = Touch::default();
-            touch.began(id);
-            downs.started(at, SCALE);
-            touch.began(downs.now());
-            if held {
-                touch.held();
-            }
-            assert_eq!(downs.now(), id);
-            let expected = if held { Tapped::Ignored } else { Tapped::Plain };
-            assert_eq!(plain_view_tap(touch.lifted(), downs.now()), (expected, 10));
+        for i in 0..(DownStamps::CAPACITY as u64 + 5) {
+            downs.queued(i);
         }
-    }
-
-    // t1ws's review probes (/tmp/gpui-pr16-review), each with its downs at
-    // their marked points. None needs a clock, a lifecycle signal or a cancel.
-
-    #[test]
-    fn two_taps_on_one_point_drained_together_are_two_downs() {
-        let mut downs = DownStamps::default();
-        let a = down(&mut downs, 10, P);
-        let b = down(&mut downs, 20, P);
-        assert_eq!(downs.started(a, SCALE), 10);
-        let id = downs.now().id;
-        assert_eq!(downs.started(b, SCALE), 20);
-        assert_ne!(downs.now().id, id);
-        // Nothing is left over for the next pane's down.
-        let c = down(&mut downs, 30, (90., 90.));
-        assert_eq!(downs.started(c, SCALE), 30);
-    }
-
-    #[test]
-    fn a_start_of_no_queued_down_never_swallows_the_next() {
-        let mut downs = DownStamps::default();
-        assert_eq!(downs.started((40., 80.), SCALE), NO_STAMP);
-        let b = down(&mut downs, 20, (40. * SCALE, 80. * SCALE));
-        assert_eq!(downs.started(b, SCALE), 20);
-    }
-
-    #[test]
-    fn a_pair_is_one_down_however_long_gpui_pauses_and_whatever_follows() {
-        let mut downs = DownStamps::default();
-        let a = down(&mut downs, 10, P);
-        let b = down(&mut downs, 20, P);
-        assert_eq!(pair(&mut downs, a), 10);
-        assert_eq!(downs.started(b, SCALE), 20);
-        // A start one float step off a down's point is no down of the queue.
-        let c = down(&mut downs, 30, P);
-        let off = (f32::from_bits(c.0.to_bits() + 1), c.1);
-        assert_eq!(downs.started(off, SCALE), NO_STAMP);
-        assert_eq!(downs.started(c, SCALE), 30);
-    }
-
-    #[test]
-    fn a_cancelled_down_with_or_without_a_pair_keeps_the_next_downs_stamp() {
-        // GPUI is behind: Java queues down A, cancels it (a claimed scroll or
-        // pinch: GPUI reports nothing for the cancel), queues down B on the
-        // same pixel. With the platform's pair, or without, B keeps its stamp.
-        for with_pair in [true, false] {
-            let mut downs = DownStamps::default();
-            let a = down(&mut downs, 10, P);
-            let b = down(&mut downs, 20, P);
-            let first = if with_pair {
-                pair(&mut downs, a)
-            } else {
-                downs.started(a, SCALE)
-            };
-            assert_eq!(first, 10);
-            assert_eq!(downs.started(b, SCALE), 20);
-            let c = down(&mut downs, 30, (90., 90.));
-            assert_eq!(downs.started(c, SCALE), 30);
+        // The five oldest downs lost their stamps; each is still handled, first.
+        for _ in 0..5 {
+            assert_eq!(downs.handled(), NO_STAMP);
         }
+        assert_eq!(downs.handled(), 5);
     }
 
     #[test]
-    fn past_the_bound_a_dropped_downs_pair_takes_no_surviving_stamp() {
+    fn a_withdrawn_down_after_an_overflow_leaves_the_order_intact() {
         let mut downs = DownStamps::default();
-        let a = down(&mut downs, 10, (200., 200.));
-        let b = down(&mut downs, 11, P);
-        let rest: Vec<_> = (20..20 + DownStamps::CAPACITY as u64)
-            .map(|stamp| (stamp, down(&mut downs, stamp, P)))
-            .collect();
-        // A and B lost their entries: their starts have no stamp, B's pair too.
-        assert_eq!(downs.started(a, SCALE), NO_STAMP);
-        assert_eq!(pair(&mut downs, b), NO_STAMP);
-        for (stamp, at) in rest {
-            assert_eq!(downs.started(at, SCALE), stamp);
+        for i in 0..(DownStamps::CAPACITY as u64 + 1) {
+            downs.queued(i);
         }
+        // The newest down never reached GPUI: only it leaves.
+        downs.withdrawn();
+        assert_eq!(downs.handled(), NO_STAMP); // down 0, its stamp dropped
+        assert_eq!(downs.handled(), 1);
+        for i in 2..(DownStamps::CAPACITY as u64) {
+            assert_eq!(downs.handled(), i);
+        }
+        assert_eq!(downs.handled(), NO_STAMP);
+    }
+
+    // Touch actions as the observer reports them.
+    const DOWN: u32 = 0;
+    const UP: u32 = 1;
+    const MOVE: u32 = 2;
+    const CANCEL: u32 = 3;
+
+    /// One posted touch gesture as the render thread reports it: a down, its
+    /// moves, and its end. The platform's synthetic contacts never appear.
+    fn gesture(downs: &mut DownStamps, end: u32) -> Gesture {
+        downs.observed(DOWN);
+        let now = downs.now();
+        downs.observed(MOVE);
+        downs.observed(end);
+        now
+    }
+
+    #[test]
+    fn only_observed_downs_take_entries_one_to_one_in_order() {
+        let mut downs = DownStamps::default();
+        downs.queued(1);
+        downs.queued(2);
+        downs.queued(3);
+        // A pan, a tap after it (the fling guard's synthetic contact before
+        // it is never observed), a cancelled scroll: one entry each, in order.
+        assert_eq!(gesture(&mut downs, UP).stamp, 1);
+        assert_eq!(gesture(&mut downs, UP).stamp, 2);
+        assert_eq!(gesture(&mut downs, CANCEL).stamp, 3);
+        assert_eq!(gesture(&mut downs, UP).stamp, NO_STAMP);
+        assert_eq!(downs.now().id, 4, "one gesture per observed down");
     }
 
     #[test]
@@ -799,11 +648,11 @@ mod tests {
         // and lifts just inside it: the view saw no new start.
         let mut downs = DownStamps::default();
         let mut touch = Touch::default();
-        let at = downs.queued(1, P);
-        downs.started(at, 1.);
+        downs.queued(1);
+        downs.handled();
         touch.began(downs.now());
-        let at = downs.queued(1, P);
-        downs.started(at, 1.); // off the view: no began
+        downs.queued(1);
+        downs.handled(); // off the view: no began
         assert!(!touch.owned_now(downs.now()));
         assert_eq!(
             plain_view_tap(touch.lifted(), downs.now()),
@@ -815,10 +664,10 @@ mod tests {
     fn gesture_ids_rise_with_every_down_handled() {
         let mut downs = DownStamps::default();
         assert_eq!(downs.now(), Gesture::NONE);
-        let at = downs.queued(3, P);
-        downs.started(at, 1.);
+        downs.queued(3);
+        downs.handled();
         assert_eq!(downs.now(), g(1, 3));
-        downs.started((1., 1.), 1.); // no down queued there: a new gesture, no stamp
+        downs.handled(); // nothing queued: still a new gesture, no stamp
         assert_eq!(downs.now(), g(2, NO_STAMP));
     }
 }
