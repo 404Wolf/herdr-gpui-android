@@ -3423,7 +3423,7 @@ mod connection_tests {
         }
     }
 
-    /// The core's policy (#88 v3): a RESIZE is followed by ESC[3J and the
+    /// The core's policy (#88): a RESIZE is followed by ESC[3J and the
     /// history only when the whole confirmed N fits; otherwise by a
     /// screen-only paint with no ESC[3J. That paint must keep every row the
     /// phone held, whichever side moved more rows, even when it arrives cut
@@ -3446,6 +3446,31 @@ mod connection_tests {
             }
             let firsts: Vec<usize> = all.iter().map(|l| rows_seen.iter().position(|r| r == l).unwrap()).collect();
             assert!(firsts.windows(2).all(|w| w[0] < w[1]), "out of order at 10 -> {rows}: {rows_seen:?}");
+        }
+    }
+
+    /// The core's repair (#88): a history replacement that was cut (live
+    /// output overflowed the backlog, or the line dropped) is sent again
+    /// whole later, with no RESIZE before it. Whatever the phone held then,
+    /// rows doubled by a screen-only paint or a replacement cut short, the
+    /// repair leaves exactly the core's scrollback.
+    #[test]
+    fn a_repair_without_a_resize_leaves_exactly_the_cores_scrollback() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        let screen_only = core_paint(&[], &all[42..], 8);
+        let mut cut = core_resize_paint(&all[..42], &all[42..], 8);
+        cut.truncate(cut.len() / 2);
+        let repair = core_resize_paint(&all[..42], &all[42..], 8);
+        let seen = |chunks: Vec<Chunk>| -> Vec<String> {
+            all_rows(&streamed(20, 10, chunks)).into_iter().filter(|r| !r.is_empty()).collect()
+        };
+        for (name, before) in [("screen-only", screen_only), ("cut", cut)] {
+            let held = || vec![Chunk::Data(first.clone()), Chunk::Grid(20, 8), Chunk::Data(before.clone())];
+            assert_ne!(seen(held()), all, "{name}: the phone's rows differ before the repair");
+            let mut repaired = held();
+            repaired.push(Chunk::Data(repair.clone()));
+            assert_eq!(seen(repaired), all, "{name}");
         }
     }
 
