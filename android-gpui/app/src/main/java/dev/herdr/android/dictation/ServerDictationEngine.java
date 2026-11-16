@@ -586,9 +586,12 @@ public final class ServerDictationEngine implements DictationEngine {
                             log.accept("dictation: desktop final " + (System.nanoTime() - stoppedAt) / 1_000_000
                                     + " ms after stop");
                             end();
-                            if (micDone) recording.discard();
+                            // The text is stored first (the composer saves its draft at once);
+                            // only then is the recording deleted: a crash in between keeps the
+                            // audio, recovered at the next start.
                             listener.onFinal(text, false);
                             listener.onState(State.IDLE);
+                            if (micDone) recording.discard();
                         });
                         return;
                     } else if (type.equals("error")) {

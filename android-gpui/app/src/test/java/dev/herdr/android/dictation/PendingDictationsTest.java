@@ -59,7 +59,7 @@ public final class PendingDictationsTest {
         assertEquals(ClipStore.BYTES_PER_SECOND * 2, Files.size(again.audio(clip.id).toPath()));
     }
 
-    @Test public void aDiscardedOrUnfinishedRecordingLeavesNothing() {
+    @Test public void aDiscardedRecordingLeavesNothingAndAnUnfinishedOneIsRecovered() {
         ClipStore store = store();
         ClipStore.Recording gone = store.record("t", 1);
         gone.write(audio(100, 1), 100);
@@ -67,10 +67,14 @@ public final class PendingDictationsTest {
         ClipStore.Recording killed = store.record("t", 1);
         killed.write(audio(100, 1), 100); // the process dies before keep()
         ClipStore again = store();
-        assertEquals(0, again.size());
+        // Never deleted without a stored final: the killed session's audio comes back, parked.
+        assertEquals(1, again.size());
+        assertEquals(killed.id, again.parked().get(0).id);
         File[] left = new File(dir.getRoot(), "pending").listFiles();
         assertNotNull(left);
-        for (File f : left) assertEquals(ClipStore.INDEX, f.getName());
+        for (File f : left) {
+            assertTrue(f.getName(), f.getName().equals(ClipStore.INDEX) || f.getName().equals(killed.id + ".pcm"));
+        }
     }
 
     @Test public void anEmptyRecordingIsNotKept() {

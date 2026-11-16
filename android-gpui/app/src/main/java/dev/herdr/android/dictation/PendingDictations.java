@@ -225,8 +225,12 @@ public final class PendingDictations {
     public void retry(String id) {
         if (!store.unpark(id)) return;
         changed();
+        // The user's word: it goes now, whatever the desktop was last seen doing.
         worker.execute(() -> {
-            if (!degraded) schedule(0);
+            degraded = false;
+            degradedUntil = 0;
+            retryMs = FIRST_RETRY_MS;
+            reschedule(0);
         });
     }
 
@@ -246,6 +250,8 @@ public final class PendingDictations {
     /** Worker thread: transcribes waiting clips, oldest first, until one fails. */
     void pass() {
         scheduled = null;
+        // An index write that failed earlier (a full disk): try again first.
+        store.flush();
         long now = clock.getAsLong();
         if (degraded && now < degradedUntil) {
             // Something asked early (a new clip, a retry): the degraded wait still holds.

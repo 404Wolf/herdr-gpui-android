@@ -88,7 +88,8 @@ final class OutboxCourier {
     /** A transcribed dictation for a queued message; true when one held its token. */
     boolean fillDictation(String clipId, String spoken) {
         if (!outbox.fillDictation(clipId, spoken)) return false;
-        thread.execute(outbox::save);
+        // Saved before returning: the caller deletes the recording next.
+        if (!outbox.save()) thread.execute(outbox::save);
         changed();
         return true;
     }

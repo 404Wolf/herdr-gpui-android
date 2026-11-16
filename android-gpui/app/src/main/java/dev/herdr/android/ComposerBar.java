@@ -180,6 +180,10 @@ final class ComposerBar {
             finishing = true;
             pushGhost();
         }
+
+        @Override public void persistNow() {
+            ComposerBar.this.persistNow();
+        }
     });
     /** The desktop said its final waits for a decode ("finishing…"), until the session ends. */
     private boolean finishing;
@@ -258,15 +262,28 @@ final class ComposerBar {
         if (pane == null) return false;
         clipLengths.remove(clipId);
         if (pane.equals(drafts.pane())) showText(drafts.text());
-        persist();
+        persistNow();
         return true;
     }
 
-    /** A dictation whose chip is gone from everywhere: it joins the end of its pane's draft. */
+    /**
+     * A dictation whose chip is gone from everywhere: it joins the end of its pane's draft (a
+     * recovered recording, whose pane is not known, joins the pane on screen).
+     */
     void appendDictation(String pane, String text) {
+        if (pane == null || pane.isEmpty()) pane = drafts.pane();
         String draft = drafts.append(pane, text);
-        if ((pane == null ? "" : pane).equals(drafts.pane())) showText(draft);
-        persist();
+        if (pane.equals(drafts.pane())) showText(draft);
+        persistNow();
+    }
+
+    /**
+     * Saves the drafts to disk before returning: a dictation's text is stored before its
+     * recording is deleted (the courier's {@code delivered}, the live engine's discard).
+     */
+    void persistNow() {
+        field.removeCallbacks(saveDrafts);
+        preferences.edit().putString(DRAFTS, drafts.encode()).commit();
     }
 
     /** Where the drawn screen is busy, from the renderer after a paint that changed it. */
@@ -727,7 +744,10 @@ final class ComposerBar {
         java.util.List<String> out = new java.util.ArrayList<>();
         java.util.List<String> inDraft = DictationToken.ids(drafts.text());
         for (PendingClip clip : Dictation.pending(context).parked()) {
-            if (inDraft.contains(clip.id) || drafts.pane().equals(clip.target)) out.add(clip.id);
+            // A recovered recording's pane is not known: it shows on every pane.
+            if (inDraft.contains(clip.id) || clip.target.isEmpty() || drafts.pane().equals(clip.target)) {
+                out.add(clip.id);
+            }
         }
         return out;
     }

@@ -237,6 +237,38 @@ public final class ServerDictationEngineTest {
         assertEquals("the courier resends it under the same id", run.listener.pendingClip.id, start.getString("id"));
     }
 
+    @Test public void theRecordingIsDeletedOnlyAfterTheFinalWasStored() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        File dirFile = new File(dir.getRoot(), "pending");
+        boolean[] audioAtFinal = {false};
+        run.listener.atFinal = () -> {
+            File[] parts = dirFile.listFiles((d, n) -> n.endsWith(".part"));
+            audioAtFinal[0] = parts != null && parts.length == 1 && parts[0].length() > 0;
+        };
+        dictate(server.uri(), null, 300, run);
+        run.awaitEnd();
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertTrue("the audio was still there when the final was handed over", audioAtFinal[0]);
+        Thread.sleep(200);
+        File[] left = dirFile.listFiles((d, n) -> n.endsWith(".part") || n.endsWith(".pcm"));
+        assertEquals("deleted once stored", 0, left == null ? 0 : left.length);
+    }
+
+    @Test public void aCrashWhileStoringTheFinalKeepsTheAudioForTheNextStart() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.listener.atFinal = () -> {
+            throw new IllegalStateException("killed while storing the text");
+        };
+        dictate(server.uri(), null, 300, run);
+        Thread.sleep(1500);
+        // The next start finds the audio and offers it as "not transcribed yet".
+        ClipStore restarted = new ClipStore(new File(dir.getRoot(), "pending"));
+        assertEquals(1, restarted.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(restarted.audio(restarted.parked().get(0).id).toPath()));
+    }
+
     @Test public void finishingIsShownAndTheFinalStillLands() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU).finishing().finalAfter(300));
         Run run = dictate(server.uri(), null, 300);
@@ -382,7 +414,12 @@ public final class ServerDictationEngineTest {
             throw new AssertionError("engines call onFinal(text, onDevice)");
         }
 
+        /** Run when the final arrives, before anything else (a check, or a simulated crash). */
+        volatile Runnable atFinal;
+
         @Override public void onFinal(String text, boolean onDevice) {
+            Runnable r = atFinal;
+            if (r != null) r.run();
             finalText = text;
             this.onDevice = onDevice;
             finals++;

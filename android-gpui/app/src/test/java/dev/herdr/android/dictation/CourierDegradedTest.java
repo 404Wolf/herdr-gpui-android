@@ -178,6 +178,29 @@ public final class CourierDegradedTest {
         assertEquals(clip.id, store.untranscribed().get(0).id);
     }
 
+    @Test public void retryAfterTheLastClipParkedWhileDegradedSendsAtOnce() {
+        ClipStore store = store();
+        PendingClip clip = record(store, "pane", 10);
+        boolean[] slow = {true};
+        List<Long> sends = new ArrayList<>();
+        PendingDictations pending = new PendingDictations(store, (c, file) -> {
+            sends.add(now.get());
+            if (slow[0]) throw slow();
+            return "finally";
+        }, worker, Runnable::run, line -> { }, now::get);
+        pending.saved();
+        worker.advance(2 * 60 * 60 * 1000);
+        assertEquals(ClipStore.MAX_ATTEMPTS, sends.size());
+        assertEquals(1, store.parked().size());
+        // The degraded pass that found nothing waiting left no job: retry must start one itself.
+        slow[0] = false;
+        pending.retry(clip.id);
+        worker.advance(0);
+        assertEquals(ClipStore.MAX_ATTEMPTS + 1, sends.size());
+        assertTrue(store.parked().isEmpty());
+        assertTrue(store.untranscribed().isEmpty());
+    }
+
     @Test public void aParkedClipIsSentAgainOnlyByHand() {
         ClipStore store = store();
         PendingClip clip = record(store, "pane", 10);

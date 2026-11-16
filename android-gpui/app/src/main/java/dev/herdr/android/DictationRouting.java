@@ -36,6 +36,9 @@ final class DictationRouting {
 
         /** The desktop's final waits for a decode: "finishing…" instead of "transcribing…". */
         default void finishing() { }
+
+        /** Saves the drafts to disk now, before the recording a final came from is deleted. */
+        default void persistNow() { }
     }
 
     /** What the composer's Enter does in a dictation state ({@link #onEnter}). */
@@ -108,6 +111,8 @@ final class DictationRouting {
                     // Switched away while it finished: it joins the end of its own pane's draft.
                     bar.appendDictation(pane, text);
                 }
+                // Saved before the engine deletes the recording.
+                bar.persistNow();
                 // The session is over (IDLE follows): Enter must send, not wait again.
                 settle(DictationEngine.State.IDLE);
             }
