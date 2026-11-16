@@ -270,40 +270,6 @@ impl Session {
         }
     }
 
-    /// Takes `from`'s scrollback as this session's, keeping this screen and
-    /// scroll position: a mirror of another terminal adopting its history.
-    /// False when it could not (an alternate screen, another width).
-    pub fn replace_history_from(&self, from: &Session) -> bool {
-        let replaced = {
-            let mut grid = self.grid.lock();
-            let source = from.grid.lock();
-            grid.replace_history_from(&source)
-        };
-        if replaced {
-            self.dirty.store(true, Ordering::Release);
-        }
-        replaced
-    }
-
-    /// Whether `other` shows exactly this screen: every cell's text and the
-    /// cursor (scrollback not compared).
-    pub fn same_screen(&self, other: &Session) -> bool {
-        let a = self.grid.lock();
-        let b = other.grid.lock();
-        if a.columns() != b.columns() || a.screen_lines() != b.screen_lines() {
-            return false;
-        }
-        if a.grid.cursor.pos != b.grid.cursor.pos {
-            return false;
-        }
-        (0..a.screen_lines() as i32).all(|row| {
-            (0..a.columns()).all(|col| {
-                let pos = Pos::new(Line(row), Column(col));
-                a.grid.cell_text(pos).eq(b.grid.cell_text(pos))
-            })
-        })
-    }
-
     /// The remote side's authoritative grid (it sends one before repainting at
     /// that size). The grid follows it; nothing is offered back. False for an
     /// empty size.
@@ -555,7 +521,13 @@ impl Reader {
                 }
                 drop(grid);
                 *lock(&self.shared.negotiated) = Some((columns, lines));
-                apply_grid(&self.grid, &self.shared, (columns, lines), None);
+                if apply_grid(&self.grid, &self.shared, (columns, lines), None) {
+                    // The remote side moved rows between screen and history
+                    // its own way and repaints only its screen next: that
+                    // repaint's erase keeps this screen in history, so no row
+                    // is lost (at worst some show twice).
+                    self.grid.lock().scroll_next_erase_into_history();
+                }
                 self.dirty.store(true, Ordering::Release);
             }
             let flush = processor
