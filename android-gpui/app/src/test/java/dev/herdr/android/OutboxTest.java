@@ -268,6 +268,39 @@ public final class OutboxTest {
         assertEquals("see the words", courier.outbox().shown("h", "t1", 1).get(0).text);
     }
 
+    @Test public void anOlderSaveNeverLandsOverANewerOne() throws Exception {
+        // The courier's thread snapshots the outbox and is paused before writing; meanwhile a
+        // dictation's fill is saved on the main thread. The older write must not win.
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        String token = DictationToken.of("c1");
+        outbox.add("h", "t1", "see " + token, 1);
+        java.util.concurrent.CountDownLatch paused = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+        Thread courier = new Thread(() -> {
+            outbox.beforeWrite = () -> {
+                outbox.beforeWrite = null;
+                paused.countDown();
+                try {
+                    go.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            };
+            outbox.save();
+        });
+        courier.start();
+        assertTrue(paused.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertTrue(outbox.fillDictation("c1", "the words"));
+        Thread main = new Thread(outbox::save);
+        main.start();
+        Thread.sleep(200);
+        go.countDown();
+        courier.join(5000);
+        main.join(5000);
+        assertEquals("see the words", reopened().shown("h", "t1", 2).get(0).text);
+    }
+
     private static List<String> ids(List<Outbox.Message> messages) {
         List<String> out = new ArrayList<>();
         for (Outbox.Message m : messages) out.add(m.id);

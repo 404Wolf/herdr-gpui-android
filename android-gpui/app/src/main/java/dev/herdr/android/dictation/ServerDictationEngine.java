@@ -506,8 +506,17 @@ public final class ServerDictationEngine implements DictationEngine {
 
         /** Main thread, after a desktop final: delete the recording, or keep it if the text is not stored. */
         private void settleRecording() {
-            if (keepAfterFinal) recording.keepTranscribedOnPhone();
+            if (keepAfterFinal) keepUnstored();
             else recording.discard();
+        }
+
+        /**
+         * The final's text could not be stored: the recording stays as a durable parked clip
+         * ("not transcribed yet · retry"), never rescue audio that expires.
+         */
+        private void keepUnstored() {
+            recording.keepParked();
+            pending.saved();
         }
 
         private void micFinished() {
@@ -517,7 +526,7 @@ public final class ServerDictationEngine implements DictationEngine {
                     // Over (final, failure or cancel) before the mic finished: only keepIfDone or
                     // deliverLocalIfDone, which need micDone, keep a recording; a final whose text
                     // could not be stored keeps it too.
-                    if (keepAfterFinal && !cancelled) recording.keepTranscribedOnPhone();
+                    if (keepAfterFinal && !cancelled) keepUnstored();
                     else recording.discard();
                     return;
                 }

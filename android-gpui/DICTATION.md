@@ -131,7 +131,7 @@ On 15 November 2026 one 124.6 s clip was uploaded four times in two minutes. Eac
 - **A degraded desktop means a long wait.** That is `ready.backend` other than `gpu`, or `backend_slow` / `backend_unavailable`, on an upload or in a live session. The wait is 2 min, doubling to 30 min. New sessions, the network coming back and new clips do not cut it short. Only a live session finding the desktop on its GPU ends it.
 - **An upload the desktop took and did not finish is counted.** After 3 (`ClipStore.MAX_ATTEMPTS`, kept on disk) the clip is parked. Its audio is kept and its chip reads `[2:04 not transcribed yet · retry]`. The prompt line gets a `retry` control that sends the pane's parked clips again. A clip's audio is deleted only once its final has been received and stored.
 - **A recording is never lost: its audio stays on disk until a final has been received and stored.**
-  - A live session's recording is deleted only after the composer has saved the text (`persistNow`, a synchronous write).
+  - A live session's recording is deleted only after the composer has saved the text (`persistNow`, a synchronous write whose result is checked). If that write fails, the recording stays as a parked clip with no expiry, "not transcribed yet · retry".
   - A queued clip's audio is deleted only after its text is in the index.
   - A failed index write (a full disk) keeps the audio and the clip, and the index is written again at the next courier pass.
   - Audio no index entry holds (a kill mid-session or mid-write) is recovered at the next start as a parked clip, "not transcribed yet", shown on every pane since its pane is unknown.

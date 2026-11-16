@@ -166,6 +166,16 @@ final class ClipStore {
          * Keeps whatever audio reached the disk, even after a write failed partway: audio is
          * never deleted without a stored final. Null only when nothing was saved at all.
          */
+        /**
+         * Keeps the audio of a session whose final could not be stored, as a parked clip with no
+         * expiry: shown "not transcribed yet · retry", sent again only by hand. Null if none.
+         */
+        PendingClip keepParked() {
+            PendingClip clip = keep(0);
+            if (clip != null) park(clip.id);
+            return clip;
+        }
+
         private PendingClip keep(long keptUntil) {
             synchronized (this) {
                 closeQuietly();

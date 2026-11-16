@@ -77,7 +77,8 @@ public interface DictationEngine {
 
         /**
          * Asked right after onFinal: whether its text is durably stored. Only then is the
-         * recording deleted; otherwise it is kept as rescue audio ({@link ClipStore#KEEP_MS}).
+         * recording deleted; otherwise it is kept as a parked clip, with no expiry, shown "not
+         * transcribed yet · retry".
          */
         default boolean finalStored() {
             return true;

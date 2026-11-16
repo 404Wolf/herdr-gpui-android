@@ -263,10 +263,14 @@ public final class ServerDictationEngineTest {
         run.awaitEnd();
         Thread.sleep(300);
         assertEquals(DESKTOP_WORDS, run.listener.finalText);
-        // Kept as rescue audio: never sent, never offered, but there.
-        assertEquals(1, store.keptClips().size());
-        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.keptClips().get(0).id).toPath()));
+        // A durable parked clip, "not transcribed yet · retry": no 48 h expiry, never sent on its own.
+        assertTrue("not rescue audio that expires", store.keptClips().isEmpty());
+        assertEquals(1, store.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.parked().get(0).id).toPath()));
         assertTrue(store.untranscribed().isEmpty());
+        // Still there after a restart, however long after.
+        ClipStore later = new ClipStore(new File(dir.getRoot(), "pending"), () -> System.currentTimeMillis() + 3 * ClipStore.KEEP_MS);
+        assertEquals(1, later.parked().size());
     }
 
     @Test public void aCrashWhileStoringTheFinalKeepsTheAudioForTheNextStart() throws Exception {

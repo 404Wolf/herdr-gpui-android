@@ -174,27 +174,39 @@ final class Outbox {
 
     /** Writes the file if anything changed since the last write; true when it is current. */
     boolean save() {
-        String text;
-        long at;
-        synchronized (this) {
-            if (version == savedVersion) return true;
-            at = version;
+        // One writer at a time, each writing the state it read inside the lock: a slower save of
+        // an older state (the courier's thread) can never land over a newer one (a dictation's
+        // fill saved on the main thread).
+        synchronized (writeLock) {
+            String text;
+            long at;
+            synchronized (this) {
+                if (version == savedVersion) return true;
+                at = version;
+                try {
+                    text = encode();
+                } catch (JSONException impossible) {
+                    return false;
+                }
+            }
+            Runnable hook = beforeWrite;
+            if (hook != null) hook.run();
             try {
-                text = encode();
-            } catch (JSONException impossible) {
+                write(file, text);
+            } catch (IOException failed) {
                 return false;
             }
+            synchronized (this) {
+                if (savedVersion < at) savedVersion = at;
+            }
+            return true;
         }
-        try {
-            write(file, text);
-        } catch (IOException failed) {
-            return false;
-        }
-        synchronized (this) {
-            if (savedVersion < at) savedVersion = at;
-        }
-        return true;
     }
+
+    /** Serializes {@link #save}: snapshot and write together. */
+    private final Object writeLock = new Object();
+    /** Tests: runs between a save's snapshot and its write. */
+    volatile Runnable beforeWrite;
 
     /**
      * Queues {@code text} for {@code pane} on {@code host}; null when it is
