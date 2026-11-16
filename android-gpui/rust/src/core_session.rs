@@ -3809,7 +3809,8 @@ mod claim_tests {
                 let mut bytes = [0; 4096];
                 loop {
                     while let Ok((channel, kind, bytes)) = pushed.try_recv() {
-                        write_frame(&mut core, channel, kind, &bytes).unwrap();
+                        // The phone hung up (the test is closing): done, as on a read error.
+                        if write_frame(&mut core, channel, kind, &bytes).is_err() { return; }
                     }
                     match core.read(&mut bytes) {
                         Ok(0) => return,
@@ -3838,7 +3839,7 @@ mod claim_tests {
                                 if script.refuse_from.is_some_and(|from| attaches >= from) {
                                     let error = json!({"jsonrpc":"2.0","id":request["id"],
                                         "error":{"code":1,"message":"t1 has finished","data":{"kind":"finished"}}});
-                                    write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).unwrap();
+                                    if write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).is_err() { return; }
                                     continue;
                                 }
                                 next_channel += 1;
@@ -3852,7 +3853,7 @@ mod claim_tests {
                             other => panic!("unexpected {other}"),
                         };
                         let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
-                        write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
+                        if write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).is_err() { return; }
                     }
                 }
             });
