@@ -20,6 +20,8 @@ final class ClusterPlacement {
         final int guard;
         /** The controls as the renderer drew them; empty when it had no room. */
         java.util.List<ControlTargets.Cells> controls = java.util.Collections.emptyList();
+        /** The queue's rows as the renderer drew them above the prompt ("echo-<row id>"), oldest first. */
+        java.util.List<ControlTargets.Cells> echoes = java.util.Collections.emptyList();
         /** The first row touch targets may cover (the prompt's caret row). */
         int targetsTop;
         /** Whether the renderer drew the draft; when not, the composer shows it. */
@@ -70,6 +72,17 @@ final class ClusterPlacement {
                         controls.add(new ControlTargets.Cells(c.getString("id"), row, start, end));
                     }
                     hint.controls = controls;
+                }
+                JSONArray rowsDrawn = o.optJSONArray("echoes");
+                if (rowsDrawn != null) {
+                    java.util.List<ControlTargets.Cells> echoes = new java.util.ArrayList<>();
+                    for (int i = 0; i < rowsDrawn.length() && i < 8; i++) {
+                        JSONObject c = rowsDrawn.getJSONObject(i);
+                        int row = c.getInt("row"), start = c.getInt("start"), end = c.getInt("end");
+                        if (row < 0 || row >= rows || start < 0 || end < start || end > cols) return null;
+                        echoes.add(new ControlTargets.Cells(c.getString("id"), row, start, end));
+                    }
+                    hint.echoes = echoes;
                 }
                 hint.targetsTop = Math.max(0, Math.min(rows, o.optInt("targetsTop", rows)));
                 hint.draftShown = o.optBoolean("draftShown");

@@ -112,6 +112,11 @@ final class Outbox {
         State state;
         /** Not saved: a refusal is only a reason to wait a little. */
         long blockedUntil;
+        /**
+         * Saved: the user cleared it (item 76) and may still undo until this epoch time. A cleared
+         * message is never sent, shown or counted; it goes for good after the window.
+         */
+        long clearedUntil;
 
         Entry(String id, String host, String pane, String boot, String text, long created, State state) {
             this.id = id;
@@ -170,6 +175,51 @@ final class Outbox {
             boots.putIfAbsent(boot.getKey(), boot.getValue());
         }
         if (!merged.isEmpty() || !loadedBoots.isEmpty()) version++;
+        // Cleared messages past their window stay (never sent, shown or counted) until the
+        // composer's clear has settled: an undo accepted before a restart still brings them back.
+        diskRead = true;
+    }
+
+    private volatile boolean diskRead;
+
+    /** Whether {@link #load} has run: until then cleared messages on disk are not known. */
+    boolean loaded() {
+        return diskRead;
+    }
+
+    /** A message the user cleared, still recoverable: for a clear's recovery after a restart. */
+    static final class Cleared {
+        final String id, pane, text;
+        final long until;
+
+        Cleared(String id, String pane, String text, long until) {
+            this.id = id;
+            this.pane = pane;
+            this.text = text;
+            this.until = until;
+        }
+    }
+
+    /** Messages on {@code host} cleared and still in their undo window at {@code now}. */
+    synchronized List<Cleared> clearedOn(String host, long now) {
+        List<Cleared> out = new ArrayList<>();
+        for (Entry e : entries) {
+            if (e.host.equals(host) && e.clearedUntil > now) out.add(new Cleared(e.id, e.pane, e.text, e.clearedUntil));
+        }
+        return out;
+    }
+
+    /** The texts of every message not cleared (any host, pane or state): what still holds its chips. */
+    synchronized List<String> liveTexts() {
+        List<String> out = new ArrayList<>();
+        for (Entry e : entries) if (e.clearedUntil == 0) out.add(e.text);
+        return out;
+    }
+
+    /** The text of message {@code id}, cleared or not; null when there is none. */
+    synchronized String text(String id) {
+        Entry e = find(id);
+        return e == null ? null : e.text;
     }
 
     /** Writes the file if anything changed since the last write; true when it is current. */
@@ -270,7 +320,7 @@ final class Outbox {
     synchronized Message next(String host, long now) {
         Set<String> headed = new HashSet<>();
         for (Entry entry : entries) {
-            if (!entry.host.equals(host)) continue;
+            if (!entry.host.equals(host) || entry.clearedUntil > 0) continue;
             // GONE messages never block their pane's line: they are not sent.
             if (entry.state == State.GONE || !headed.add(entry.pane)) continue;
             if (entry.state == State.QUEUED && entry.blockedUntil <= now && !entry.boot.isEmpty()
@@ -284,7 +334,8 @@ final class Outbox {
     /** The message is about to be handed to the core: from now on its fate is unknown until answered. */
     synchronized boolean sending(String id) {
         Entry entry = find(id);
-        if (entry == null || entry.state != State.QUEUED) return false;
+        // Cleared since the sender picked it (item 76): never sent.
+        if (entry == null || entry.state != State.QUEUED || entry.clearedUntil > 0) return false;
         entry.state = State.SENDING;
         version++;
         return true;
@@ -331,7 +382,7 @@ final class Outbox {
     synchronized Runnable fillDictationUndoably(String clipId, String spoken) {
         for (int i = 0; i < entries.size(); i++) {
             Entry entry = entries.get(i);
-            if (entry.state == State.SENDING) continue;
+            if (entry.state == State.SENDING || entry.clearedUntil > 0) continue;
             String filled = DictationToken.fill(entry.text, clipId, spoken);
             if (filled == null) continue;
             String oldText = entry.text;
@@ -382,6 +433,86 @@ final class Outbox {
     }
 
     /**
+     * The composer's clear (item 76): every message {@link #shown} for {@code pane}, except one
+     * being sent, is marked cleared until {@code until} (epoch ms): kept on disk, never sent,
+     * shown or counted, so an undo (or a restart within the window) can bring it back. Their ids.
+     */
+    synchronized List<String> clearAll(String host, String pane, long until, long now) {
+        return clear(clearable(host, pane, now), until);
+    }
+
+    /** What a clear of {@code pane} would take: the messages {@link #shown}, but one being sent. */
+    synchronized List<String> clearable(String host, String pane, long now) {
+        List<String> ids = new ArrayList<>();
+        for (Message message : shown(host, pane, now)) {
+            if (message.state != State.SENDING) ids.add(message.id);
+        }
+        return ids;
+    }
+
+    /** Marks these messages cleared until {@code until}, never one being sent; those marked. */
+    synchronized List<String> clear(java.util.Collection<String> ids, long until) {
+        List<String> marked = new ArrayList<>();
+        for (String id : ids) {
+            Entry entry = find(id);
+            if (entry == null || entry.state == State.SENDING || entry.clearedUntil > 0) continue;
+            entry.clearedUntil = until;
+            marked.add(id);
+        }
+        if (!marked.isEmpty()) version++;
+        return marked;
+    }
+
+    /** The clear's undo: the messages are back where they were, as they were. */
+    synchronized boolean unclear(java.util.Collection<String> ids) {
+        boolean changed = false;
+        for (String id : ids) {
+            Entry entry = find(id);
+            if (entry == null || entry.clearedUntil == 0) continue;
+            entry.clearedUntil = 0;
+            changed = true;
+        }
+        if (changed) version++;
+        return changed;
+    }
+
+    /** The undo window closed: cleared messages go for good. */
+    synchronized boolean purgeCleared(java.util.Collection<String> ids) {
+        boolean changed = false;
+        for (String id : ids) {
+            Entry entry = find(id);
+            if (entry == null || entry.clearedUntil == 0) continue;
+            remove(entry);
+            changed = true;
+        }
+        if (changed) version++;
+        return changed;
+    }
+
+    /** Cleared messages whose window has passed (e.g. while the app was not running) go. */
+    synchronized boolean purgeExpired(long now) {
+        boolean changed = false;
+        for (Entry entry : new ArrayList<>(entries)) {
+            if (entry.clearedUntil > 0 && entry.clearedUntil <= now) {
+                remove(entry);
+                changed = true;
+            }
+        }
+        if (changed) version++;
+        return changed;
+    }
+
+    /** The cleared messages among {@code ids}, as they were, for an undo after a restart. */
+    synchronized List<Message> cleared(java.util.Collection<String> ids, long now) {
+        List<Message> out = new ArrayList<>();
+        for (String id : ids) {
+            Entry entry = find(id);
+            if (entry != null && entry.clearedUntil > 0) out.add(entry.view(now));
+        }
+        return out;
+    }
+
+    /**
      * What the strip shows for {@code pane}: its own messages in order, then
      * the computer's gone ones (their panes are not on screen any more).
      */
@@ -389,7 +520,7 @@ final class Outbox {
         List<Message> own = new ArrayList<>();
         List<Message> gone = new ArrayList<>();
         for (Entry entry : entries) {
-            if (!entry.host.equals(host)) continue;
+            if (!entry.host.equals(host) || entry.clearedUntil > 0) continue;
             if (entry.pane.equals(pane) && entry.state != State.GONE) own.add(entry.view(now));
             else if (entry.state == State.GONE) gone.add(entry.view(now));
         }
@@ -400,7 +531,10 @@ final class Outbox {
     /** Whether {@code pane} has anything not yet settled, so new input must queue behind it. */
     synchronized boolean holds(String host, String pane) {
         for (Entry entry : entries) {
-            if (entry.host.equals(host) && entry.pane.equals(pane) && entry.state != State.GONE) return true;
+            if (entry.host.equals(host) && entry.pane.equals(pane) && entry.state != State.GONE
+                    && entry.clearedUntil == 0) {
+                return true;
+            }
         }
         return false;
     }
@@ -409,7 +543,7 @@ final class Outbox {
     synchronized int waiting(String host) {
         int count = 0;
         for (Entry entry : entries) {
-            if (entry.host.equals(host) && entry.state != State.GONE) count++;
+            if (entry.host.equals(host) && entry.state != State.GONE && entry.clearedUntil == 0) count++;
         }
         return count;
     }
@@ -437,7 +571,8 @@ final class Outbox {
                     .put("boot", entry.boot)
                     .put("text", entry.text)
                     .put("created", entry.created)
-                    .put("state", entry.state.name()));
+                    .put("state", entry.state.name())
+                    .put("clearedUntil", entry.clearedUntil));
         }
         JSONObject bootMap = new JSONObject();
         for (Map.Entry<String, String> boot : boots.entrySet()) bootMap.put(boot.getKey(), boot.getValue());
@@ -469,8 +604,10 @@ final class Outbox {
                 if (id.isEmpty() || host.isEmpty() || pane.isEmpty() || !sendable(messageText)) continue;
                 if (chars + messageText.length() > MAX_CHARS) break;
                 chars += messageText.length();
-                into.add(new Entry(id, host, pane, item.optString("boot", ""), messageText,
-                        item.optLong("created", 0), state));
+                Entry entry = new Entry(id, host, pane, item.optString("boot", ""), messageText,
+                        item.optLong("created", 0), state);
+                entry.clearedUntil = item.optLong("clearedUntil", 0);
+                into.add(entry);
             }
             JSONObject bootMap = root.optJSONObject("boots");
             if (bootMap != null) {

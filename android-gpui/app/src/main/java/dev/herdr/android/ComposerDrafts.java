@@ -40,6 +40,11 @@ final class ComposerDrafts {
 
     String pane() { return pane; }
 
+    /** Every pane's draft (the dictation chips they hold must keep their recordings). */
+    java.util.List<String> all() {
+        return new java.util.ArrayList<>(drafts.values());
+    }
+
     String text() {
         String text = drafts.get(pane);
         return text == null ? "" : text;
@@ -127,6 +132,16 @@ final class ComposerDrafts {
      * thrown away, and the next utterance builds on them.
      */
     String dictationEnded() {
+        dictationBase = null;
+        return text();
+    }
+
+    /**
+     * The user cleared the utterance in progress (item 74): unlike {@link #dictationEnded}, its
+     * words leave the draft, which is as it was before the dictation began.
+     */
+    String dictationCancelled() {
+        if (dictationBase != null) edit(dictationBase);
         dictationBase = null;
         return text();
     }

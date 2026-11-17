@@ -4,7 +4,7 @@
 //! JSON: `{"kind":"claude"|"codex"|"other","reserve":N,"reserveFrom":ROW,
 //! "colors":{"text":RGB,"dim":RGB,"warn":RGB,"background":RGB},
 //! "draft":[{"t":"..","s":"text"|"partial"|"chip"|"selected"}, {"t":"","s":"caret"}],
-//! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"}]],
+//! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"|"chip"|"bright"|"info"|"danger"}]],
 //! "controls":[{"id":"talk","spans":[{"t":"talk","s":"dim"|"bright"|"danger"|"info"|"warn"}]}]}`.
 //! Colours also take "bright", "danger" and "info".
 // The JNI entry points that call in here exist only on Android.
@@ -15,11 +15,13 @@ use serde::Deserialize;
 
 /// The most text a ghost may carry; the composer's own bound is lower.
 const MAX_TEXT_BYTES: usize = 65_536;
-const MAX_SPANS: usize = 64;
+const MAX_SPANS: usize = 128;
 const MAX_ECHOES: usize = 8;
-/// type or clear, talk, retry, send, with room to spare.
+/// type, clear, undo, talk, send, queue (items 75, 76; "type" is left out while typing).
 const MAX_CONTROLS: usize = 6;
 const MAX_CONTROL_ID: usize = 16;
+/// A queue row's id (a message's or a recording's UUID).
+const MAX_ECHO_ID: usize = 48;
 /// Columns a host may keep clear; past this the draft would have no room.
 const MAX_RESERVE: usize = 64;
 
@@ -37,6 +39,9 @@ struct Wire {
     draft: Vec<WireSpan>,
     #[serde(default)]
     echoes: Vec<Vec<WireSpan>>,
+    /// The host's id for each echo, reported back with its cells as `echo-<id>`.
+    #[serde(default, rename = "echoIds")]
+    echo_ids: Vec<String>,
     #[serde(default)]
     controls: Vec<WireControl>,
 }
@@ -135,6 +140,16 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
     {
         return Err(Error::InvalidCommand);
     }
+    let bad_id = |id: &String| {
+        id.is_empty()
+            || id.len() > MAX_ECHO_ID
+            || !id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    };
+    if !wire.echo_ids.is_empty()
+        && (wire.echo_ids.len() != wire.echoes.len() || wire.echo_ids.iter().any(bad_id))
+    {
+        return Err(Error::InvalidCommand);
+    }
     if spans > MAX_SPANS
         || wire.echoes.len() > MAX_ECHOES
         || bytes > MAX_TEXT_BYTES
@@ -149,11 +164,15 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         GhostStyle::Selected,
         GhostStyle::Caret,
     ];
+    // A queue row: its words, a selected row bright, its state in the state's colour.
     let echo_styles = [
         GhostStyle::Echo,
         GhostStyle::Tag,
         GhostStyle::Warn,
         GhostStyle::Chip,
+        GhostStyle::Bright,
+        GhostStyle::Info,
+        GhostStyle::Danger,
     ];
     let control_styles = [
         GhostStyle::Dim,
@@ -178,6 +197,7 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
                     .collect::<Result<_>>()
             })
             .collect::<Result<_>>()?,
+        echo_ids: wire.echo_ids,
         controls: wire
             .controls
             .into_iter()
@@ -221,6 +241,11 @@ pub(crate) fn hint_json(hint: &gpui_rio::ghost::LayoutHint) -> String {
         "draftShown": hint.draft_shown,
         "controls": hint
             .controls
+            .iter()
+            .map(|c| serde_json::json!({"id": c.id, "row": c.row, "start": c.start, "end": c.end}))
+            .collect::<Vec<_>>(),
+        "echoes": hint
+            .echoes
             .iter()
             .map(|c| serde_json::json!({"id": c.id, "row": c.row, "start": c.start, "end": c.end}))
             .collect::<Vec<_>>(),
@@ -270,6 +295,25 @@ mod tests {
 
     const COLORS: &str =
         r#""colors":{"text":11720918,"dim":4868682,"warn":16763755,"background":0}"#;
+
+    #[test]
+    fn echo_ids_must_match_the_echoes_and_be_plain() {
+        let echo = r#"[{"t":"❯ hi","s":"echo"}]"#;
+        let with = |ids: &str, n: usize| {
+            let echoes = vec![echo; n].join(",");
+            parse(&format!(
+                r#"{{"kind":"claude",{COLORS},"echoes":[{echoes}],"echoIds":{ids}}}"#
+            ))
+        };
+        let ok = with(r#"["6f1c2a9e-0000-4000-8000-000000000001","link"]"#, 2).unwrap();
+        assert_eq!(ok.echo_ids, vec!["6f1c2a9e-0000-4000-8000-000000000001", "link"]);
+        assert!(with(r#"["a"]"#, 2).is_err(), "one id per echo");
+        assert!(with(r#"["a b","c"]"#, 2).is_err(), "plain characters only");
+        assert!(with(r#"["","c"]"#, 2).is_err());
+        assert!(with(&format!(r#"["{}","c"]"#, "x".repeat(49)), 2).is_err());
+        // None given: echoes are reported by index, as before.
+        assert!(with("[]", 2).unwrap().echo_ids.is_empty());
+    }
 
     #[test]
     fn a_ghost_parses_with_its_draft_and_echoes() {
@@ -355,6 +399,26 @@ mod tests {
     }
 
     #[test]
+    fn six_controls_and_coloured_queue_rows_are_accepted() {
+        let control = |id: &str| format!(r#"{{"id":"{id}","spans":[{{"t":"{id}","s":"dim"}}]}}"#);
+        let six: Vec<String> = ["type", "talk", "clear", "undo", "send", "queue"].iter().map(|id| control(id)).collect();
+        let ghost = parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{}]}}"#, six.join(",")))
+            .expect("six controls");
+        assert_eq!(ghost.controls.len(), 6);
+        assert_eq!(ghost.controls[2].id, "clear");
+        let seven = format!("{},{}", six.join(","), control("more"));
+        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{seven}]}}"#)).is_err());
+        let rows = format!(
+            r#"{{"kind":"claude",{COLORS},"echoes":[[{{"t":"❯ hi","s":"bright"}},{{"t":"  ● sending…","s":"info"}}],[{{"t":"❯ x","s":"echo"}},{{"t":"  ✗ not sent","s":"danger"}}]]}}"#
+        );
+        let ghost = parse(&rows).expect("rows");
+        assert_eq!(ghost.echoes[0][0].style, GhostStyle::Bright);
+        assert_eq!(ghost.echoes[1][1].style, GhostStyle::Danger);
+        // A row is still never a draft's revisable tail.
+        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"echoes":[[{{"t":"x","s":"partial"}}]]}}"#)).is_err());
+    }
+
+    #[test]
     fn a_hint_is_handed_over_as_flat_json() {
         let hint = gpui_rio::ghost::LayoutHint {
             left: 0.,
@@ -372,6 +436,12 @@ mod tests {
                 start: 60,
                 end: 64,
             }],
+            echoes: vec![gpui_rio::ghost::PlacedControl {
+                id: "echo-1".into(),
+                row: 30,
+                start: 0,
+                end: 40,
+            }],
             targets_top: 38,
             draft_shown: false,
             guard: 1,
@@ -383,6 +453,8 @@ mod tests {
             }],
         };
         let value: serde_json::Value = serde_json::from_str(&hint_json(&hint)).expect("json");
+        assert_eq!(value["echoes"][0]["id"], "echo-1");
+        assert_eq!(value["echoes"][0]["row"], 30);
         assert_eq!(value["cellHeight"], 15.0);
         assert_eq!(value["busy"][1], 12);
         assert_eq!(value["anchored"], true);

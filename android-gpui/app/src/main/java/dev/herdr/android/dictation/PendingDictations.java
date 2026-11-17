@@ -173,6 +173,34 @@ public final class PendingDictations {
         offer();
     }
 
+    /**
+     * The user cleared where these recordings go (the composer's clear): they are held, never
+     * sent or offered, until {@link #release} (its undo) or for 48 h as rescue audio. All or
+     * none, in one write: false when it could not be saved (then none is held). Main thread.
+     */
+    public boolean hold(java.util.Collection<String> ids) {
+        if (!store.holdAll(ids)) return false;
+        for (String id : ids) offered.remove(id);
+        changed();
+        return true;
+    }
+
+    /**
+     * Undoes {@link #hold}: they wait for the desktop again (parked ones stay parked), and their
+     * text is offered. All or none, in one write: false when it could not be saved (then they are
+     * still held, and the caller tries again). Main thread.
+     */
+    public boolean release(java.util.Collection<String> ids) {
+        java.util.List<String> held = new java.util.ArrayList<>();
+        for (String id : ids) if (store.isHeld(id)) held.add(id);
+        if (held.isEmpty()) return true;
+        if (!store.releaseAll(held)) return false;
+        changed();
+        offer();
+        kick(0);
+        return true;
+    }
+
     /** The user threw the recording away. Main thread. */
     public void drop(String id) {
         delivered(id);
@@ -287,7 +315,9 @@ public final class PendingDictations {
             long t = System.nanoTime();
             // Counted before it is sent, on disk: a crash or a lost index write never lets a long
             // clip be re-sent without end. No count written, no send.
-            if (store.charge(clip.id) < 0) {
+            int charged = store.charge(clip.id);
+            if (charged == -2) continue; // held or parked since this pass began: never sent
+            if (charged < 0) {
                 log.accept(line(sent, sentMs, waiting.size() - sent, started)
                         + ", cannot record the attempt (storage), retry in " + retryMs / 1000 + " s");
                 schedule(retryMs);

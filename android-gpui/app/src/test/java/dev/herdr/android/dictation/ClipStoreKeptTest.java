@@ -97,4 +97,37 @@ public final class ClipStoreKeptTest {
         assertEquals(minutes / 10 - 1, store.keptClips().size());
         assertEquals(1, store.untranscribed().size());
     }
+
+    @Test public void aClearedRecordingIsHeldNeverSentOrOfferedAndAnUndoLetsItGo() {
+        ClipStore store = store();
+        PendingClip waiting = recording(store, 1).keep();
+        assertNotNull(waiting);
+        assertEquals(1, store.untranscribed().size());
+        assertTrue(store.hold(waiting.id));
+        assertTrue("not sent", store.untranscribed().isEmpty());
+        assertEquals(1, store.keptClips().size());
+        assertFalse("a held clip's late text is dropped", store.transcribed(waiting.id, "late"));
+        assertTrue(store.audio(waiting.id).isFile());
+        assertTrue(store.release(waiting.id));
+        assertEquals(waiting.id, store.untranscribed().get(0).id);
+        // A transcribed one waiting to be placed is hidden while held.
+        assertTrue(store.transcribed(waiting.id, "text"));
+        assertEquals(1, store.transcribed().size());
+        assertTrue(store.hold(waiting.id));
+        assertTrue(store.transcribed().isEmpty());
+        assertTrue(store.release(waiting.id));
+        assertEquals(1, store.transcribed().size());
+    }
+
+    @Test public void holdingAParkedRecordingKeepsItParkedThroughAnUndo() {
+        ClipStore store = store();
+        PendingClip clip = recording(store, 1).keep();
+        for (int i = 0; i < ClipStore.MAX_ATTEMPTS; i++) store.attempted(clip.id);
+        assertEquals(1, store.parked().size());
+        assertTrue(store.hold(clip.id));
+        assertTrue(store.parked().isEmpty());
+        assertTrue(store.release(clip.id));
+        assertEquals("still parked: no surprise resend", 1, store.parked().size());
+        assertTrue(store.untranscribed().isEmpty());
+    }
 }

@@ -220,6 +220,91 @@ public final class PendingDictationsTest {
         assertFalse(store.audio(a.id).exists());
     }
 
+    @Test public void aClipClearedWhileAPassRunsIsNeverSent() {
+        // The pass copied its list before the clear: the hold is checked again at dispatch.
+        ClipStore store = store();
+        PendingClip a = record(store, "1", 10);
+        PendingClip b = record(store, "2", 10);
+        List<String> sent = new ArrayList<>();
+        PendingDictations[] self = new PendingDictations[1];
+        self[0] = new PendingDictations(store, (clip, file) -> {
+            sent.add(clip.id);
+            // The user clears b's place while a is with the desktop.
+            if (clip.id.equals(a.id)) assertTrue(self[0].hold(List.of(b.id)));
+            return "text " + clip.target;
+        }, worker, Runnable::run);
+        Composer composer = new Composer();
+        composer.from = self[0];
+        self[0].setListener(composer);
+        self[0].pass();
+        assertEquals("b never uploaded", List.of(a.id), sent);
+        assertTrue("b's audio kept", store.audio(b.id).isFile());
+        assertTrue(store.isHeld(b.id));
+        assertEquals("not charged", -2, store.charge(b.id));
+        // Undo: b waits again and goes on the next pass (the courier's thread, kicked by the release).
+        self[0].release(List.of(b.id));
+        try {
+            worker.submit(() -> { }).get();
+            Thread.sleep(100);
+            worker.submit(() -> { }).get();
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+        assertEquals(List.of(a.id, b.id), sent);
+    }
+
+    @Test public void aHoldThatCannotBeSavedHoldsNothing() {
+        ClipStore store = store();
+        PendingClip a = record(store, "1", 10);
+        PendingClip b = record(store, "2", 10);
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> "x", worker, Runnable::run);
+        assertTrue(pending.hold(List.of(a.id)));
+        File blocker = new File(new File(dir.getRoot(), "pending"), ClipStore.INDEX + ".tmp");
+        assertTrue(blocker.mkdirs());
+        assertFalse("the caller is told: the clear is not done", pending.hold(List.of(b.id)));
+        assertFalse(store.isHeld(b.id));
+        assertTrue("an earlier hold stays", store.isHeld(a.id));
+    }
+
+    @Test public void aMultiClipHoldThatFailsHoldsNoneOfThem() {
+        // The second entry's write fails: nothing is half held (one index write for all).
+        File clips = new File(dir.getRoot(), "clips");
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean();
+        ClipStore store = new ClipStore(clips, () -> {
+            if (armed.get() && calls.incrementAndGet() == 2) assertTrue(new File(clips, ClipStore.INDEX + ".tmp").mkdir());
+            return 1_000_000;
+        });
+        PendingClip first = record(store, "A", 32);
+        PendingClip second = record(store, "A", 32);
+        PendingDictations pending = new PendingDictations(store, (c, f) -> "speech", worker, Runnable::run);
+        armed.set(true);
+        assertFalse(pending.hold(List.of(first.id, second.id)));
+        assertFalse(store.isHeld(first.id));
+        assertTrue(new File(clips, ClipStore.INDEX + ".tmp").delete());
+        assertEquals("a refused clear leaves every recording waiting", 2, pending.waiting().size());
+        assertTrue(store.keptClips().isEmpty());
+        // And on disk.
+        ClipStore reread = new ClipStore(clips, () -> 1_000_000);
+        assertEquals(2, reread.untranscribed().size());
+    }
+
+    @Test public void aReleaseThatFailsReleasesNoneAndSaysSo() {
+        ClipStore store = store();
+        PendingClip a = record(store, "1", 10);
+        PendingClip b = record(store, "2", 10);
+        PendingDictations pending = new PendingDictations(store, (c, f) -> "x", worker, Runnable::run);
+        assertTrue(pending.hold(List.of(a.id, b.id)));
+        File blocker = new File(new File(dir.getRoot(), "pending"), ClipStore.INDEX + ".tmp");
+        assertTrue(blocker.mkdirs());
+        assertFalse(pending.release(List.of(a.id, b.id)));
+        assertTrue(store.isHeld(a.id) && store.isHeld(b.id));
+        assertTrue(blocker.delete());
+        assertTrue(pending.release(List.of(a.id, b.id)));
+        assertFalse(store.isHeld(a.id) || store.isHeld(b.id));
+        assertTrue("nothing held: nothing to do", pending.release(List.of(a.id)));
+    }
+
     @Test public void textThatCouldNotBeStoredIsOfferedAgainAndTheRecordingKept() {
         ClipStore store = store();
         PendingClip a = record(store, "1", 10);

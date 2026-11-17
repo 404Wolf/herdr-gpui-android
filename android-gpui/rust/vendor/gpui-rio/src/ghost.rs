@@ -109,6 +109,9 @@ pub struct Ghost {
     pub draft: Vec<GhostSpan>,
     /// Queued messages, oldest first, one line each.
     pub echoes: Vec<Vec<GhostSpan>>,
+    /// The host's id for each echo (same order), reported back with its cells as `echo-<id>`;
+    /// missing ids are reported by index.
+    pub echo_ids: Vec<String>,
     /// The host's controls, right to left in reading order (drawn left to right).
     pub controls: Vec<Control>,
     /// Columns kept clear on the right, where the host floats its controls,
@@ -139,6 +142,9 @@ pub struct LayoutHint {
     pub guard: usize,
     /// The controls as drawn; empty when there was no room for them.
     pub controls: Vec<PlacedControl>,
+    /// The queue rows as drawn above the prompt, `echo-N` for `Ghost::echoes[N]`, oldest
+    /// first; the host lays touch targets on them while its queue is open.
+    pub echoes: Vec<PlacedControl>,
     /// The first row the host's touch targets may cover: the prompt's caret
     /// row (text above it is the program's, to scroll and select).
     pub targets_top: usize,
@@ -362,6 +368,9 @@ fn place_with(
 pub struct Layout {
     pub placed: Vec<Placed>,
     pub controls: Vec<PlacedControl>,
+    /// Where each queue row was drawn: `echo-<id>` with the host's `Ghost::echo_ids`, else
+    /// `echo-N` for `Ghost::echoes[N]`.
+    pub echoes: Vec<PlacedControl>,
     pub targets_top: usize,
     pub draft_shown: bool,
 }
@@ -408,6 +417,104 @@ fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, us
     (spans, marks)
 }
 
+/// The controls for a grid too narrow for the host's line: only the clear (✕) and the queue
+/// control (items 75, 76), then "talk" (the stop while recording) last, never dropped. The
+/// decoration gives way first: the frame (` a ─ b ─ talk ──`), then the spaces between them;
+/// then "talk" is cut, to one cell at the least; then the queue's count ("≡12" to "≡"). Only on
+/// a grid too narrow even for `✕≡●` does the clear give way, then the queue; "talk" never.
+fn narrow_line(controls: &[Control], cols: usize) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+    let width = |c: &Control| -> usize { c.spans.iter().map(|s| s.text.chars().count()).sum() };
+    let Some(main) = controls
+        .iter()
+        .find(|c| c.id == "talk")
+        .or(controls.last())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut others: Vec<Control> = controls
+        .iter()
+        .filter(|c| (c.id == "clear" || c.id == "queue") && c.id != main.id)
+        .cloned()
+        .collect();
+    let mut shortened = false;
+    loop {
+        let sum: usize = others.iter().map(width).sum();
+        let n = others.len();
+        // Framed, with "talk" at two cells at least.
+        let fixed = 1 + sum + 3 * n + 3;
+        if cols >= 8 && cols >= fixed + 2 {
+            let mut line = others.clone();
+            line.push(fit_control(main, cols - fixed));
+            return control_line(&line);
+        }
+        // Spaced, then tight.
+        for (gap, least) in [(1, 2), (0, 1)] {
+            let fixed = sum + gap * n;
+            if cols >= fixed + least {
+                let mut line = others.clone();
+                line.push(fit_control(main, cols - fixed));
+                return bare_line(&line, gap);
+            }
+        }
+        if !shortened {
+            // The queue's count goes before any control does.
+            shortened = true;
+            for c in others.iter_mut().filter(|c| c.id == "queue") {
+                let short = fit_control(c, 1);
+                *c = short;
+            }
+            continue;
+        }
+        if others.is_empty() {
+            return bare_line(&[fit_control(main, cols)], 0);
+        }
+        // A grid under three or four cells: the clear goes, then the queue.
+        let at = others.iter().position(|c| c.id == "clear").unwrap_or(0);
+        others.remove(at);
+    }
+}
+
+/// `control` cut to `room` cells: to its first character when only one cell is left (so "● stop"
+/// is still "●", not "…").
+fn fit_control(control: &Control, room: usize) -> Control {
+    if room == 1 {
+        let first = control.spans.iter().find_map(|s| s.text.chars().next().map(|ch| (ch, s.style)));
+        if let Some((ch, style)) = first {
+            return Control {
+                id: control.id.clone(),
+                spans: vec![GhostSpan {
+                    text: ch.to_string(),
+                    style,
+                }],
+            };
+        }
+    }
+    clip_control(control, room)
+}
+
+/// The controls with `gap` spaces between them and no frame, each one's cells marked.
+fn bare_line(controls: &[Control], gap: usize) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+    let mut spans = Vec::new();
+    let mut marks = Vec::new();
+    let mut col = 0;
+    for (i, control) in controls.iter().enumerate() {
+        if i > 0 && gap > 0 {
+            spans.push(GhostSpan {
+                text: " ".repeat(gap),
+                style: GhostStyle::Dim,
+            });
+            col += gap;
+        }
+        let start = col;
+        for span in &control.spans {
+            col += span.text.chars().count();
+            spans.push(span.clone());
+        }
+        marks.push((control.id.clone(), start, col));
+    }
+    (spans, marks)
+}
+
 /// Where the controls were drawn in the frame before, for a frame without
 /// the program's caret (a hidden cursor, the view scrolled into history).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,7 +534,9 @@ pub struct Previous {
 /// the draft on the row above it when that end is blank too. The controls are
 /// never dropped for lack of room: when the host's line is too wide for the
 /// grid (its words follow the last layout hint, which lags a fold or a zoom),
-/// only its "talk" control is drawn, cut to the grid if need be; and with no
+/// only its clear (✕), queue and "talk" controls are drawn, "talk" last and
+/// cut to the grid if need be (the clear gives way first, then the queue,
+/// never "talk"); and with no
 /// free row they cover the right end of the bottom row. The draft is never
 /// drawn over the program's text.
 pub fn place_all(
@@ -448,25 +557,8 @@ pub fn place_all(
     let roomy = len + if anchor.is_some() { 8 } else { 0 } <= cols;
     if len > 0 && !roomy {
         // The host's words are for a wider grid (it picks them from the last
-        // layout hint, which lags a fold or a zoom): its main control alone,
-        // "talk" (the stop while recording), cut to the grid if need be, so
-        // stop is never missing for a frame or for good.
-        // Under 8 cells the frame's ` ` and ` ──` would leave the words no room.
-        let framed = cols >= 8;
-        let room = if framed { cols - 4 } else { cols };
-        let main = ghost
-            .controls
-            .iter()
-            .find(|c| c.id == "talk")
-            .or(ghost.controls.last())
-            .map(|c| clip_control(c, room));
-        (line, marks) = match main {
-            Some(main) if !framed => {
-                let end = width(&main.spans);
-                (main.spans, vec![(main.id, 0, end)])
-            }
-            main => control_line(main.as_slice()),
-        };
+        // layout hint, which lags a fold or a zoom): see [`narrow_line`].
+        (line, marks) = narrow_line(&ghost.controls, cols);
         len = width(&line);
     }
     let fits = len > 0 && len <= cols && marks.iter().any(|(_, start, end)| end > start);
@@ -553,6 +645,7 @@ pub fn place_all(
                     Some(run)
                 });
             let draft: Vec<Placed> = draft.collect();
+            layout.echoes = echo_marks(ghost, anchor, &draft);
             // Shown only if some of its words were placed: with no free cells
             // at the caret (the controls fill its row) nothing is, and the host
             // shows the draft itself instead of losing it.
@@ -606,6 +699,31 @@ pub fn place_all(
         }
     }
     layout
+}
+
+/// Where each shown queue row went: the rows above the prompt's frame (`place_with` puts the
+/// newest that fit there, oldest first), one mark per row spanning its drawn words.
+fn echo_marks(ghost: &Ghost, anchor: Anchor, placed: &[Placed]) -> Vec<PlacedControl> {
+    let bottom = anchor.prompt_row.saturating_sub(1);
+    let shown = ghost.echoes.len().min(bottom);
+    let first = ghost.echoes.len() - shown;
+    (0..shown)
+        .filter_map(|i| {
+            let row = bottom - shown + i;
+            let runs = placed.iter().filter(|p| p.row == row);
+            let start = runs.clone().map(|p| p.col).min()?;
+            let end = runs.map(|p| p.col + p.text.chars().count()).max()?;
+            Some(PlacedControl {
+                id: match ghost.echo_ids.get(first + i) {
+                    Some(id) => format!("echo-{id}"),
+                    None => format!("echo-{}", first + i),
+                },
+                row,
+                start,
+                end,
+            })
+        })
+        .collect()
 }
 
 /// `control`'s words cut to `room` cells, marked with an ellipsis when cut.
@@ -956,6 +1074,7 @@ mod tests {
             kind: PromptKind::Claude,
             draft,
             echoes: Vec::new(),
+            echo_ids: Vec::new(),
             controls: Vec::new(),
             reserve: 0,
             reserve_from: 0,
@@ -1842,6 +1961,147 @@ mod tests {
         let placed = place(&g, anchor, rows.len(), 40);
         assert_eq!(placed.iter().map(|p| p.row).max(), Some(1));
         assert!(placed.iter().any(|p| p.text == "❯ third"));
+    }
+
+    #[test]
+    fn a_line_too_wide_for_the_grid_keeps_clear_the_queue_and_the_stop() {
+        // What the host sends for a wider grid (its words lag a fold); the stop last.
+        let control = |id: &str, t: &str| Control {
+            id: id.into(),
+            spans: vec![GhostSpan {
+                text: t.into(),
+                style: GhostStyle::Dim,
+            }],
+        };
+        let mut g = ghost(Vec::new());
+        g.controls = vec![
+            control("type", "type"),
+            control("clear", "✕"),
+            control("queue", "≡2"),
+            control("talk", "● rec 0:05 · tap to stop"),
+        ];
+        for cols in 5..60 {
+            let rows = screen(CLAUDE, cols);
+            let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+            for a in [anchor, None] {
+                let layout = place_all(&g, a, &rows, None);
+                let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
+                assert!(ids.contains(&"talk"), "{cols}: {ids:?}");
+                assert!(ids.contains(&"clear"), "{cols}: {ids:?}");
+                assert!(ids.contains(&"queue"), "{cols}: {ids:?}");
+                assert_eq!(ids.last(), Some(&"talk"), "{cols}: the stop stays last");
+                assert!(layout.controls.iter().all(|c| c.end <= cols), "{cols}: on the grid");
+            }
+        }
+        // The decoration goes first, then talk's words, then the queue's count.
+        let (line, marks) = narrow_line(&g.controls, 5);
+        let drawn: String = line.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(drawn, "✕≡2●…");
+        assert_eq!(marks.len(), 3);
+        let mut big = g.clone();
+        big.controls[2] = control("queue", "≡99+");
+        let (line, marks) = narrow_line(&big.controls, 5);
+        let drawn: String = line.iter().map(|s| s.text.as_str()).collect();
+        assert!(drawn.starts_with("✕≡●"), "the count gives way before a control: {drawn}");
+        assert_eq!(drawn.chars().count(), 5);
+        assert_eq!(marks.len(), 3);
+        // Only under four cells does the clear give way, then the queue; the stop never.
+        let ids = |cols| -> Vec<String> { narrow_line(&g.controls, cols).1.into_iter().map(|m| m.0).collect() };
+        assert_eq!(ids(3), vec!["clear", "queue", "talk"]);
+        assert_eq!(ids(2), vec!["queue", "talk"]);
+        assert_eq!(ids(1), vec!["talk"]);
+    }
+
+    /// The Java ladder's line at every width from 5 to 140 (`ControlLineTest` writes the same
+    /// table and fails if it differs), drawn by this renderer: ✕, the queue and talk always.
+    #[test]
+    fn the_hosts_line_at_every_width_keeps_clear_the_queue_and_talk() {
+        let table = include_str!("testdata/control_widths.tsv");
+        let mut failures = Vec::new();
+        for row in table.lines().filter(|l| !l.is_empty()) {
+            let mut parts = row.split('\t');
+            let cols: usize = parts.next().unwrap().parse().unwrap();
+            let state = parts.next().unwrap();
+            let mut g = ghost(Vec::new());
+            g.controls = parts
+                .map(|p| {
+                    let (id, text) = p.split_once('=').unwrap();
+                    Control {
+                        id: id.into(),
+                        spans: vec![GhostSpan {
+                            text: text.into(),
+                            style: GhostStyle::Dim,
+                        }],
+                    }
+                })
+                .collect();
+            let blank = vec![vec![' '; cols]; 10];
+            let claude = screen(CLAUDE, cols);
+            let cases = [
+                (&blank, Some(Anchor { prompt_row: 5, row: 6, col: 2, indent: 2 })),
+                (&blank, None),
+                (&claude, locate(&claude, Some((3, 2)), PromptKind::Claude)),
+                (&claude, None),
+            ];
+            for (rows, anchor) in cases {
+                let layout = place_all(&g, anchor, rows, None);
+                let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
+                let ok = ["clear", "queue", "talk"].iter().all(|id| ids.contains(id))
+                    && layout.controls.iter().all(|c| c.end <= cols && c.end > c.start);
+                if !ok {
+                    failures.push(format!("{state} {cols} {}: {ids:?}", anchor.is_some()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    #[test]
+    fn each_drawn_queue_row_is_reported_for_its_touch_target() {
+        let rows = screen(CLAUDE, 40);
+        let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+        let mut g = ghost(Vec::new());
+        g.echoes = vec![
+            vec![text("❯ first")],
+            vec![
+                text("❯ second"),
+                GhostSpan {
+                    text: "   ◌ queued 1st".into(),
+                    style: GhostStyle::Tag,
+                },
+            ],
+        ];
+        let layout = place_all(&g, anchor, &rows, None);
+        // The rule above the prompt is row 2: rows 0 and 1, each spanning its drawn words.
+        assert_eq!(
+            layout.echoes,
+            vec![
+                PlacedControl {
+                    id: "echo-0".into(),
+                    row: 0,
+                    start: 0,
+                    end: 7
+                },
+                PlacedControl {
+                    id: "echo-1".into(),
+                    row: 1,
+                    start: 0,
+                    end: 23
+                },
+            ]
+        );
+        // More rows than room: the newest are drawn, and keep their own indices.
+        g.echoes.insert(0, vec![text("❯ zeroth")]);
+        let layout = place_all(&g, anchor, &rows, None);
+        let ids: Vec<&str> = layout.echoes.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["echo-1", "echo-2"]);
+        // No prompt, no rows drawn: nothing to tap.
+        assert!(place_all(&g, None, &rows, None).echoes.is_empty());
+        // With the host's ids, each drawn row is reported by its own id, whatever its place.
+        g.echo_ids = vec!["m-zero".into(), "m-one".into(), "m-two".into()];
+        let layout = place_all(&g, anchor, &rows, None);
+        let ids: Vec<&str> = layout.echoes.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["echo-m-one", "echo-m-two"]);
     }
 
     #[test]

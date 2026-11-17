@@ -2,8 +2,8 @@
 
 The **talk** control drawn in an agent's prompt box (`type ─ talk ─ send`)
 dictates text: tap to start, tap it again (it reads `● rec 0:05 · tap to stop`,
-or `● 0:05 stop` on a narrow screen) to stop. While the keyboard is up, `↓ hide`
-(in place of `type`) puts it away. While recording, the whole bottom-right
+or `● 0:05 stop` on a narrow screen) to stop. While the keyboard is up, `type`
+is left out; the keyboard's own hide key, Back or a swipe down put it away. While recording, the whole bottom-right
 corner of the terminal is the stop, and **send** is hidden so a tap meant for
 stop never sends; Enter on the keyboard still stops and sends. Silence never
 ends a session. Speech is transcribed on the desktop's Whisper when it answers
@@ -75,7 +75,7 @@ its final was empty; some sessions opened and closed with no audio at all.
   away, but `talk` says `desktop error` instead of `offline`. A waiting clip the
   desktop took and failed on is counted (`ClipStore.MAX_ATTEMPTS`, below) and
   passed over in that pass, so newer clips still go; after the third it is
-  parked with its audio, for the `retry` control.
+  parked with its audio, for its queue row's `retry`.
 - The phone looks for a silenced microphone itself: Android's
   `AudioRecordingConfiguration.isClientSilenced()` for our recording (the
   privacy toggle, a call, another app) held for 0.3 s, or 3 s of samples within
@@ -173,7 +173,7 @@ On 15 November 2026 one 124.6 s clip was uploaded four times in two minutes. Eac
   The live session and every courier resend use the same id. The desktop resumes from what it already decoded, or answers from its cached final, and it holds an upload (`mode: upload`) to no realtime budget (agreed with server.py).
 - **The courier sends nothing to a desktop that is not on its GPU.** It reads `ready` first, and if the backend is not `gpu` it closes without sending audio, and that is not counted.
 - **A degraded desktop means a long wait.** That is `ready.backend` other than `gpu`, or `backend_slow` / `backend_unavailable`, on an upload or in a live session. The wait is 2 min, doubling to 30 min. New sessions, the network coming back and new clips do not cut it short. Only a live session finding the desktop on its GPU ends it.
-- **An upload the desktop took and did not finish is counted.** After 3 (`ClipStore.MAX_ATTEMPTS`, kept on disk) the clip is parked. Its audio is kept and its chip reads `[2:04 not transcribed yet · retry]`. The prompt line gets a `retry` control that sends the pane's parked clips again. A clip's audio is deleted only once its final has been received and stored.
+- **An upload the desktop took and did not finish is counted.** After 3 (`ClipStore.MAX_ATTEMPTS`, kept on disk) the clip is parked. Its audio is kept and its chip reads `[2:04 not transcribed yet · retry]`. Its row in the queue (above the prompt) has a `retry` action that sends it again. A clip's audio is deleted only once its final has been received and stored.
 - **A recording is never lost: its audio stays on disk until a final has been received and stored.**
   - A live session's recording is deleted only after the composer has saved the text (`persistNow`, a synchronous write whose result is checked). If that write fails, the recording stays as a parked clip with no expiry, "not transcribed yet · retry".
   - A queued clip's audio is deleted only after its text is in the index.
@@ -183,6 +183,30 @@ On 15 November 2026 one 124.6 s clip was uploaded four times in two minutes. Eac
   - A manual retry always starts a pass at once, whatever the desktop was last seen doing.
 - **After stop the desktop may say** `{"type":"status","state":"finishing","tail_s":12.3}`. `talk` then reads `finishing…`, and the final follows; it is not an error.
 - Tests: `NoLostAudioTest` covers a kill mid-session, an orphan, a full disk, a failed final store, and a crash while storing. `CourierDegradedTest` covers the 124.6 s replay (3 sends at most, growing gaps, one final, audio deleted only after it), sessions on the CPU never cutting the wait short, resuming on the GPU, a manual retry, and the upload protocol against a fake desktop.
+
+## Clearing a dictation (items 74, 76)
+
+The prompt line's `✕` clears the draft. While a dictation is recording or transcribing, it also cancels the dictation for good:
+- the engine is cancelled and the routing listener abandoned, so no partial, final (desktop or phone) or queued clip of that session lands afterwards;
+- an Enter waiting on it is dropped;
+- the draft returns to what it was before the dictation began.
+
+Recordings whose place is cleared are held. That covers chips in the draft or in cleared queued messages, and, when the queue is cleared, the pane's loose waiting and parked recordings. Held recordings are quarantined like rescue audio: never sent or placed. The courier checks the hold again when it is about to send each clip (`ClipStore.charge` refuses a held or parked clip). A pass that began before the clear therefore never uploads one.
+
+`undo` brings the draft, the messages and the recordings back as they were (parked ones stay parked). It lasts 6 s (`ClearUndo.DRAFT_WINDOW_MS`), or 8 s after clearing the queue too.
+
+A clear survives being killed at any step. Each write that makes the next step safe lands first, and `ClearUndo.reconcile` (after the outbox is read, on every outbox change, and soon after a failed write) puts right whatever a crash between steps left:
+
+- **A queue clear or a drop** first saves its intent in the record: the message and recording ids it is about to take. After a crash, reconcile finishes the step if its messages were cleared on disk (any pane's, GONE rows too). Otherwise it gives the recordings back, loose ones included.
+- **Clearing** holds the recordings first (one index write for all of them, all or none). Then it marks the messages cleared in the outbox (`clearedUntil`: kept, never sent, shown or counted). Last comes the undo record (`composer_clear`: pane, deadline, draft text, ids), written together with the emptied draft in one preferences commit.
+  - Killed after the holds: the draft and messages still have their chips, and reconcile lets those recordings go.
+  - Killed after the messages: they are cleared on disk with no record. Reconcile adopts them into the window, so undo still brings them back.
+- **Undo** writes the record, marked undone, together with the restored draft. If that write fails, the undo fails, says so, and stays on offer. Then the messages and recordings come back. Until those are saved too, the record stays, and reconcile finishes it (soon, or after a restart). A new clear waits until it is done.
+- **Always:** a recording a live draft or message holds is never held, so a refused or interrupted clear never strands a chip on held audio.
+- **A message the sender picked before the clear** is refused at dispatch: `Outbox.sending` checks `clearedUntil`.
+- **After a restart** the first pane shown is no pane switch: a resumed undo stays on offer. Past its window, the clear is finished. Expired cleared messages are dropped by reconcile, after any accepted undo was applied, not when the outbox is read.
+
+The queue UI and its gestures are described in the PR (#20) and `QueueView`/`ClearUndo`.
 
 ## Why this design: measurements (11 November 2026)
 

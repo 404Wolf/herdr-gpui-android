@@ -30,4 +30,20 @@ public final class ClusterPlacementTest {
         assertNull(ClusterPlacement.Hint.parse("{\"rows\":3,\"busy\":[1]}"));
         assertNull(ClusterPlacement.Hint.parse("not json"));
     }
+
+    @Test public void theQueueRowsAsDrawnAreParsedAndOutOfRangeOnesRefused() {
+        String base = "{\"left\":0,\"top\":0,\"cellWidth\":6,\"cellHeight\":12,\"cols\":40,\"rows\":10,"
+                + "\"busy\":[0],\"busyFrom\":9,";
+        ClusterPlacement.Hint h = ClusterPlacement.Hint.parse(base
+                + "\"echoes\":[{\"id\":\"echo-0\",\"row\":5,\"start\":0,\"end\":30}]}");
+        assertEquals(1, h.echoes.size());
+        assertEquals("echo-0", h.echoes.get(0).id);
+        assertEquals(5, h.echoes.get(0).row);
+        assertEquals(30, h.echoes.get(0).end);
+        // No echoes: none.
+        assertTrue(ClusterPlacement.Hint.parse(base + "\"guard\":1}").echoes.isEmpty());
+        // A row past the grid is malformed.
+        assertNull(ClusterPlacement.Hint.parse(base
+                + "\"echoes\":[{\"id\":\"echo-0\",\"row\":12,\"start\":0,\"end\":3}]}"));
+    }
 }

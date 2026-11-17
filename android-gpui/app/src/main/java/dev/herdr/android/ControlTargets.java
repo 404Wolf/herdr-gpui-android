@@ -115,4 +115,19 @@ final class ControlTargets {
         }
         return out;
     }
+
+    /**
+     * Targets for the queue's rows drawn above the prompt ("echo-<row id>", while the queue is open): each
+     * the full width of the grid and one row high, so a row is tapped anywhere along it. Rows do
+     * not overlap the controls' targets, which reach up only to the prompt's rule.
+     */
+    static List<Rect> rows(List<Cells> rows, float left, float top, float cellWidth, float cellHeight, int cols) {
+        List<Rect> out = new ArrayList<>();
+        for (Cells c : rows) {
+            float t = top + c.row * cellHeight;
+            out.add(new Rect(c.id, left, t, left + cols * cellWidth, t + cellHeight,
+                    left + c.start * cellWidth, left + c.end * cellWidth));
+        }
+        return out;
+    }
 }
