@@ -144,6 +144,9 @@ pub struct LayoutHint {
     pub targets_top: usize,
     /// Whether the draft was drawn; when not, the host shows it itself.
     pub draft_shown: bool,
+    /// The draft's runs as drawn at the prompt, so a tap on its words puts
+    /// the host's cursor there ([`draft_runs`]).
+    pub draft_runs: Vec<DraftRun>,
 }
 
 /// The program's input caret, in the rows as drawn.
@@ -203,6 +206,53 @@ pub struct Placed {
     pub col: usize,
     pub text: String,
     pub style: GhostStyle,
+    /// For a run of the draft at the prompt: which of the draft's characters
+    /// (counted across its spans, a caret counting none) its first cell shows.
+    pub source: Option<usize>,
+}
+
+/// A run of the draft as drawn: `len` cells from `col` on `row`, the first
+/// showing the draft's character `source`. The host maps a tap there to a
+/// place in its text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftRun {
+    pub row: usize,
+    pub col: usize,
+    pub len: usize,
+    pub source: usize,
+}
+
+/// The draft's drawn runs among `placed`, for the host's taps.
+pub fn draft_runs(placed: &[Placed]) -> Vec<DraftRun> {
+    placed
+        .iter()
+        .filter(|p| p.style != GhostStyle::Caret)
+        .filter_map(|p| {
+            p.source.map(|source| DraftRun {
+                row: p.row,
+                col: p.col,
+                len: p.text.chars().count(),
+                source,
+            })
+        })
+        .filter(|run| run.len > 0)
+        .collect()
+}
+
+/// A span with the draft character its text starts at.
+type Located = (GhostSpan, usize);
+
+/// `spans` with where each starts in the draft.
+fn located(spans: &[GhostSpan]) -> Vec<Located> {
+    let mut at = 0;
+    spans
+        .iter()
+        .map(|span| {
+            let start = at;
+            at += span.text.chars().count();
+            (span.clone(), start)
+        })
+        .collect()
 }
 
 /// How many bottom rows a layout hint reports.
@@ -245,13 +295,14 @@ fn place_with(
         Some(anchor) => {
             let width_at = |line: usize| width_of(anchor.row + line);
             let room = draft_rows.min(rows - anchor.row).clamp(1, MAX_DRAFT_ROWS);
-            let mut lines = wrap(&ghost.draft, anchor.col, anchor.indent, &width_at);
+            let draft = located(&ghost.draft);
+            let mut lines = wrap(&draft, anchor.col, anchor.indent, &width_at);
             // Too long for its rows: the caret end, where the words are being
             // typed or spoken, is packed into them against each row's own free
             // width, from where wrapped input starts, behind an ellipsis.
             let elided = lines.len() > room;
             if elided {
-                lines = tail(&ghost.draft, room, anchor.indent, &width_at);
+                lines = tail(&draft, room, anchor.indent, &width_at);
             }
             for (i, line) in lines.into_iter().enumerate() {
                 if line.is_empty() {
@@ -262,13 +313,14 @@ fn place_with(
                 } else {
                     anchor.indent
                 };
-                for span in line {
+                for (span, source) in line {
                     let len = span.text.chars().count();
                     out.push(Placed {
                         row: anchor.row + i,
                         col,
                         text: span.text,
                         style: span.style,
+                        source: Some(source),
                     });
                     col += len;
                 }
@@ -297,6 +349,7 @@ fn place_with(
                 col,
                 text,
                 style: span.style,
+                source: None,
             });
             col += len;
         }
@@ -448,6 +501,7 @@ pub fn place_all(
                 col,
                 text: span.text.clone(),
                 style: span.style,
+                source: None,
             });
             col += n;
         }
@@ -544,6 +598,7 @@ pub fn place_all(
                         col: cols - n - 1,
                         text: shown,
                         style: GhostStyle::Text,
+                        source: None,
                     });
                     layout.draft_shown = true;
                 }
@@ -592,18 +647,28 @@ fn clip_control(control: &Control, room: usize) -> Control {
 /// from column `indent` (line `i` ending at `width_of(i)`): what a long draft
 /// shows so that its caret end is always on screen.
 fn tail(
-    spans: &[GhostSpan],
+    spans: &[Located],
     room: usize,
     indent: usize,
     width_of: &dyn Fn(usize) -> usize,
-) -> Vec<Vec<GhostSpan>> {
-    let total: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+) -> Vec<Vec<Located>> {
+    let total: usize = spans.iter().map(|s| s.0.text.chars().count()).sum();
     let packed = |drop: usize| {
-        let mut rest = vec![GhostSpan {
-            text: "…".into(),
-            style: GhostStyle::Text,
-        }];
-        rest.extend(drop_front(spans, drop));
+        let kept = drop_front_located(spans, drop);
+        // The ellipsis stands for the dropped words: a tap on it goes to where
+        // the shown ones start.
+        let first = kept
+            .iter()
+            .find(|(s, _)| s.style != GhostStyle::Caret)
+            .map_or(total, |(_, at)| *at);
+        let mut rest = vec![(
+            GhostSpan {
+                text: "…".into(),
+                style: GhostStyle::Text,
+            },
+            first,
+        )];
+        rest.extend(kept);
         wrap(&rest, indent, indent, width_of)
     };
     // The fewest characters dropped from the front that still fit.
@@ -628,12 +693,21 @@ fn tail(
 }
 
 /// `spans` without their first `n` characters; a chip cut into goes whole.
-fn drop_front(spans: &[GhostSpan], mut n: usize) -> Vec<GhostSpan> {
+#[cfg(test)]
+fn drop_front(spans: &[GhostSpan], n: usize) -> Vec<GhostSpan> {
+    drop_front_located(&located(spans), n)
+        .into_iter()
+        .map(|(span, _)| span)
+        .collect()
+}
+
+/// [`drop_front`], each kept span still saying where it starts in the draft.
+fn drop_front_located(spans: &[Located], mut n: usize) -> Vec<Located> {
     let mut out = Vec::new();
-    for span in spans {
+    for (span, at) in spans {
         if span.style == GhostStyle::Caret {
             // An elided caret goes to where the shown words start.
-            out.push(span.clone());
+            out.push((span.clone(), *at));
             continue;
         }
         let len = span.text.chars().count();
@@ -645,10 +719,13 @@ fn drop_front(spans: &[GhostSpan], mut n: usize) -> Vec<GhostSpan> {
             n = 0;
             continue;
         }
-        out.push(GhostSpan {
-            text: span.text.chars().skip(n).collect(),
-            style: span.style,
-        });
+        out.push((
+            GhostSpan {
+                text: span.text.chars().skip(n).collect(),
+                style: span.style,
+            },
+            at + n,
+        ));
         n = 0;
     }
     out
@@ -669,12 +746,12 @@ fn clip(text: &str, room: usize) -> String {
 /// first from `first_col`, the rest from `indent`. Words move whole when they
 /// fit on a fresh line. Line 0 stays (maybe empty) so indices match rows.
 fn wrap(
-    spans: &[GhostSpan],
+    spans: &[Located],
     first_col: usize,
     indent: usize,
     width_of: &dyn Fn(usize) -> usize,
-) -> Vec<Vec<GhostSpan>> {
-    let mut lines: Vec<Vec<GhostSpan>> = vec![Vec::new()];
+) -> Vec<Vec<Located>> {
+    let mut lines: Vec<Vec<Located>> = vec![Vec::new()];
     let mut col = first_col;
     let mut width = width_of(0);
     if col >= width {
@@ -682,14 +759,17 @@ fn wrap(
         col = indent;
         width = width_of(1);
     }
-    for span in spans {
+    for (span, start) in spans {
         if span.style == GhostStyle::Caret {
             // Takes no cell, and is never merged into a neighbouring run.
             if let Some(line) = lines.last_mut() {
-                line.push(GhostSpan {
-                    text: String::new(),
-                    style: GhostStyle::Caret,
-                });
+                line.push((
+                    GhostSpan {
+                        text: String::new(),
+                        style: GhostStyle::Caret,
+                    },
+                    *start,
+                ));
             }
             continue;
         }
@@ -699,12 +779,16 @@ fn wrap(
         } else {
             split_words(&span.text)
         };
+        // Where the next piece starts in the draft.
+        let mut at = *start;
         for piece in pieces {
             let len = piece.chars().count();
+            let piece_at = at;
+            at += len;
             if piece.trim().is_empty() {
                 // Spaces never start a continuation line nor push one.
                 if col > indent && col + len <= width {
-                    push(lines.last_mut(), &piece, span.style);
+                    push(lines.last_mut(), &piece, span.style, piece_at);
                     col += len;
                 }
                 continue;
@@ -718,6 +802,7 @@ fn wrap(
             }
             // A word longer than a line breaks where the line ends.
             let mut rest: Vec<char> = piece.chars().collect();
+            let mut head_at = piece_at;
             while !rest.is_empty() {
                 let room = width.saturating_sub(col);
                 if room == 0 {
@@ -728,7 +813,8 @@ fn wrap(
                 }
                 let take = room.min(rest.len());
                 let head: String = rest.drain(..take).collect();
-                push(lines.last_mut(), &head, span.style);
+                push(lines.last_mut(), &head, span.style, head_at);
+                head_at += take;
                 col += take;
             }
         }
@@ -754,17 +840,23 @@ fn split_words(text: &str) -> Vec<String> {
     out
 }
 
-fn push(line: Option<&mut Vec<GhostSpan>>, text: &str, style: GhostStyle) {
+fn push(line: Option<&mut Vec<Located>>, text: &str, style: GhostStyle, at: usize) {
     let Some(line) = line else { return };
     if text.is_empty() {
         return;
     }
     match line.last_mut() {
-        Some(last) if last.style == style => last.text.push_str(text),
-        _ => line.push(GhostSpan {
-            text: text.to_owned(),
-            style,
-        }),
+        // Merged only when it continues the run in the draft too.
+        Some((last, start)) if last.style == style && *start + last.text.chars().count() == at => {
+            last.text.push_str(text)
+        }
+        _ => line.push((
+            GhostSpan {
+                text: text.to_owned(),
+                style,
+            },
+            at,
+        )),
     }
 }
 
@@ -967,6 +1059,61 @@ mod tests {
             text: t.into(),
             style,
         }
+    }
+
+    /// Every drawn draft run shows the draft's own characters from its source.
+    fn assert_sources(g: &Ghost, layout: &Layout) {
+        let draft: Vec<char> = g
+            .draft
+            .iter()
+            .flat_map(|s| s.text.chars())
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        let runs = super::draft_runs(&layout.placed);
+        assert!(!runs.is_empty());
+        for run in runs {
+            let placed = layout
+                .placed
+                .iter()
+                .find(|p| p.row == run.row && p.col == run.col && p.source == Some(run.source))
+                .expect("run placed");
+            if placed.text == "…" {
+                continue;
+            }
+            // A run cut short of the controls ends in "…".
+            let shown: Vec<char> = placed.text.trim_end_matches('…').chars().collect();
+            assert_eq!(
+                &draft[run.source..run.source + shown.len()],
+                shown.as_slice(),
+                "{placed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_drawn_run_knows_which_characters_of_the_draft_it_shows() {
+        // Wrapped, with a chip and the keyboard's marks between the words.
+        let (rows, anchor) = claude_box(24);
+        let g = controls(ghost(vec![
+            text("please keep the "),
+            styled("[0:09 waiting]", GhostStyle::Chip),
+            text(" build"),
+            styled("", GhostStyle::Caret),
+            styled(" dir", GhostStyle::Selected),
+            text(" and rerun"),
+        ]));
+        let layout = place_all(&g, anchor, &rows, None);
+        assert_sources(&g, &layout);
+        // Elided: the "…" stands for the first shown character.
+        let (rows, anchor) = claude_box(30);
+        let g = ghost(vec![text(&"word ".repeat(60)), text("end")]);
+        let layout = place_all(&g, anchor, &rows, None);
+        assert_sources(&g, &layout);
+        let runs = super::draft_runs(&layout.placed);
+        let first = &runs[0];
+        assert_eq!((first.len, first.col), (1, 2));
+        assert_eq!(first.source, runs[1].source);
+        assert_eq!(runs.last().map(|r| r.source + r.len), Some(303));
     }
 
     #[test]
@@ -1590,7 +1737,8 @@ mod tests {
                 row: 4,
                 col: 16,
                 text: "also check the".into(),
-                style: GhostStyle::Text
+                style: GhostStyle::Text,
+                source: Some(0),
             }
         );
         // Width is 40 - 10: no run reaches into the reserved columns.
@@ -1650,7 +1798,8 @@ mod tests {
                 row: 3,
                 col: 2,
                 text: "Testing, this is a test.".into(),
-                style: GhostStyle::Text
+                style: GhostStyle::Text,
+                source: Some(0),
             }]
         );
         // Wrapped input under it may be indented with no-break spaces too.
@@ -1683,7 +1832,8 @@ mod tests {
                 row: 0,
                 col: 7,
                 text: " queued".into(),
-                style: GhostStyle::Tag
+                style: GhostStyle::Tag,
+                source: None,
             }
         );
         assert_eq!(placed[2].row, 1);
@@ -1808,6 +1958,7 @@ mod tests {
             col: 2,
             text: "abc".into(),
             style: GhostStyle::Text,
+            source: None,
         }];
         assert_eq!(busy_columns(&rows, anchor, &placed)[6], 5);
     }

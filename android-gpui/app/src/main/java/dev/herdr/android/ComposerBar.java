@@ -443,12 +443,21 @@ final class ComposerBar {
      * keyboard is the caller's to show (false). See {@link TerminalTap}.
      */
     boolean terminalTapped(boolean clickedProgram) {
+        return terminalTapped(clickedProgram, Float.NaN, Float.NaN);
+    }
+
+    /**
+     * {@link #terminalTapped(boolean)} where the finger lifted, in the
+     * terminal surface's pixels (NaN when not known): a tap on the draft's
+     * words puts the cursor there, as in a text field.
+     */
+    boolean terminalTapped(boolean clickedProgram, float x, float y) {
         switch (TerminalTap.after(
                 clickedProgram ? TerminalTap.Outcome.CLICKED : TerminalTap.Outcome.PLAIN, agent)) {
             case NOTHING:
                 return true;
             case TYPE_INTO_DRAFT:
-                startTyping();
+                startTyping(cursorAt(x, y));
                 return true;
             default:
                 return false;
@@ -527,7 +536,21 @@ final class ComposerBar {
         pushGhost();
     }
 
+    /** Where in the draft a tap at ({@code x}, {@code y}) surface pixels puts the cursor; -1 off its words. */
+    private int cursorAt(float x, float y) {
+        if (layout == null || Float.isNaN(x) || Float.isNaN(y) || layout.draftRuns.length == 0) return -1;
+        float col = (x / density - layout.left) / layout.cellWidth;
+        int row = (int) Math.floor((y / density - layout.top) / layout.cellHeight);
+        int drawn = DraftTaps.drawnAt(layout.draftRuns, row, col);
+        return DraftTaps.fieldIndex(GhostText.fieldOffsets(drafts.text(), clipLengths, parkedIds()), drawn);
+    }
+
     private void startTyping() {
+        startTyping(-1);
+    }
+
+    /** Opens the keyboard into the draft, its cursor at {@code cursor} (-1: the end). */
+    private void startTyping(int cursor) {
         if (!agent) return;
         // Read when the keyboard connects, on the focus below.
         field.setPrivateImeOptions(privateImeOptions(drawsTalk()));
@@ -543,7 +566,8 @@ final class ComposerBar {
         field.post(() -> {
             if (!typing) return;
             field.requestFocus();
-            field.setSelection(field.getText().length());
+            int length = field.getText().length();
+            field.setSelection(cursor >= 0 && cursor <= length ? cursor : length);
             InputMethodManager input = context.getSystemService(InputMethodManager.class);
             if (input != null) input.showSoftInput(field, 0);
             if (android.os.Build.VERSION.SDK_INT >= 30 && field.getWindowInsetsController() != null) {
