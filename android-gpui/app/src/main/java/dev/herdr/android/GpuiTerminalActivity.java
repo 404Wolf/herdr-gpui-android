@@ -4844,10 +4844,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (hostStarted) nativeSurfaceDestroyed();
     }
 
+    /** Where the last finger lifted on the terminal (surface pixels): a tap on the draft's words puts the cursor there. */
+    private float liftX = Float.NaN, liftY = Float.NaN;
+
     private boolean forwardTouch(MotionEvent event) {
         int count = event.getPointerCount();
         if (!hostStarted || count < 1 || count > 16) return false;
         int masked = event.getActionMasked();
+        if (masked == MotionEvent.ACTION_UP) {
+            liftX = event.getX();
+            liftY = event.getY();
+        }
         if (masked == MotionEvent.ACTION_DOWN) rendererTouch.down(event.getPointerId(0));
         pinchDetector().onTouchEvent(event);
         if (pinching || count > 1 && masked != MotionEvent.ACTION_DOWN) {
@@ -5389,7 +5396,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { target = connection; }
         // An agent's pane types into the composer's draft instead.
         boolean handled = composer != null
-                ? composer.terminalTapped(clicked)
+                ? composer.terminalTapped(clicked, liftX, liftY)
                 : TerminalTap.after(outcome, false) == TerminalTap.Action.NOTHING;
         if (!handled && target != null && target.ready && terminalSurface != null) {
             final long generation = target.generation;

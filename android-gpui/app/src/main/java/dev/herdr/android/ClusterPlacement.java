@@ -24,6 +24,8 @@ final class ClusterPlacement {
         int targetsTop;
         /** Whether the renderer drew the draft; when not, the composer shows it. */
         boolean draftShown;
+        /** The draft's drawn runs: {row, col, cells, first drawn character} ({@link DraftTaps}). */
+        int[][] draftRuns = new int[0][];
 
         Hint(float left, float top, float cellWidth, float cellHeight, int cols, int rows,
                 boolean anchored, int[] busy, int guard) {
@@ -71,6 +73,16 @@ final class ClusterPlacement {
                 }
                 hint.targetsTop = Math.max(0, Math.min(rows, o.optInt("targetsTop", rows)));
                 hint.draftShown = o.optBoolean("draftShown");
+                JSONArray runs = o.optJSONArray("draft");
+                if (runs != null) {
+                    int n = Math.min(runs.length(), 256);
+                    hint.draftRuns = new int[n][];
+                    for (int i = 0; i < n; i++) {
+                        JSONArray r = runs.getJSONArray(i);
+                        if (r.length() != 4) return null;
+                        hint.draftRuns[i] = new int[] {r.getInt(0), r.getInt(1), r.getInt(2), r.getInt(3)};
+                    }
+                }
                 return hint;
             } catch (JSONException malformed) {
                 return null;
