@@ -161,27 +161,76 @@ public final class QueueViewTest {
         assertEquals("d", closed.get(1).id);
     }
 
-    @Test public void everyRowIsDrawnByThePhonesFontNeverAsABox() throws Exception {
-        List<Outbox.Message> messages = Arrays.asList(
-                msg("s", "t1", "going now", Outbox.State.SENDING, false),
-                msg("a", "t1", "first", Outbox.State.QUEUED, false),
-                msg("b", "t1", "second " + DictationToken.of("c9"), Outbox.State.QUEUED, false),
+    /**
+     * The words in {@code r} that are ours, not the user's: a message's or a sent one's own words
+     * (after the prompt mark) are the user's; dictation tokens are drawn as chips.
+     */
+    private static String ours(QueueView.Row r) {
+        String text = DictationToken.PATTERN.matcher(r.text).replaceAll("");
+        if (r.kind == QueueView.Kind.MESSAGE || r.kind == QueueView.Kind.SENT) {
+            assertTrue(r.text, r.text.startsWith(QueuedMessages.PROMPT));
+            return QueuedMessages.PROMPT;
+        }
+        return text;
+    }
+
+    /** Every row of {@code rows} draws, and one of them is a {@code kind} row. */
+    private static void drawn(String why, List<QueueView.Row> rows, QueueView.Kind kind) {
+        boolean seen = false;
+        for (QueueView.Row r : rows) {
+            seen |= r.kind == kind;
+            assertEquals(why + ": " + r.state, "", GridGlyphs.boxes(r.state));
+            assertEquals(why + ": " + r.text, "", GridGlyphs.boxes(ours(r)));
+        }
+        assertTrue(why + ": no " + kind + " row in " + rows.size(), seen);
+    }
+
+    @Test public void everyKindAndStateOfRowIsDrawnByThePhonesFontNeverAsABox() throws Exception {
+        // One at a time, so the shown rows' cap never hides one.
+        List<Outbox.Message> each = Arrays.asList(
+                msg("q", "t1", "first", Outbox.State.QUEUED, false),
                 msg("d", "t1", "behind a dialog", Outbox.State.QUEUED, true),
+                msg("w", "t1", "waits " + DictationToken.of("c9"), Outbox.State.QUEUED, false),
+                msg("s", "t1", "going now", Outbox.State.SENDING, false),
                 msg("u", "t1", "maybe", Outbox.State.UNSURE, false),
                 msg("g", "t2", "old pane", Outbox.State.GONE, false));
+        List<PendingClip> none = Collections.emptyList();
         for (int cols : new int[] {WIDE, COVER}) {
-            for (boolean expanded : new boolean[] {false, true}) {
-                QueueView view = new QueueView();
-                view.update("t1", messages, 0);
-                for (QueueView.Row r : view.rows("t1", messages, Collections.singletonList(clip("c1")),
-                        Collections.singletonList(clip("p1")), 2, cols, expanded, null, 0)) {
-                    assertEquals(cols + " cols: " + r.state, "", GridGlyphs.boxes(r.state));
-                    // A message's own words are the user's; every other row's are ours. Dictation
-                    // tokens are drawn as chips, not as their characters.
-                    String ours = DictationToken.PATTERN.matcher(r.text).replaceAll("");
-                    if (r.messageState == null) assertEquals(r.text, "", GridGlyphs.boxes(ours));
+            for (boolean open : new boolean[] {false, true}) {
+                String at = cols + " cols, " + (open ? "open" : "closed");
+                for (Outbox.Message m : each) {
+                    QueueView view = new QueueView();
+                    List<Outbox.Message> one = Collections.singletonList(m);
+                    view.update("t1", one, 0);
+                    drawn(at + ", " + m.state + (m.blocked ? " blocked" : ""),
+                            view.rows("t1", one, none, none, 0, cols, open, null, 0), QueueView.Kind.MESSAGE);
+                }
+                QueueView sent = new QueueView();
+                sent.update("t1", Collections.singletonList(each.get(0)), 0);
+                sent.update("t1", Collections.emptyList(), 10);
+                drawn(at + ", sent", sent.rows("t1", Collections.emptyList(), none, none, 0, cols, open, null, 20),
+                        QueueView.Kind.SENT);
+                drawn(at + ", a waiting recording", new QueueView().rows("t1", Collections.emptyList(),
+                        Collections.singletonList(clip("c1")), none, 0, cols, open, null, 0), QueueView.Kind.CLIP);
+                drawn(at + ", a parked recording", new QueueView().rows("t1", Collections.emptyList(), none,
+                        Collections.singletonList(clip("p1")), 0, cols, open, null, 0), QueueView.Kind.PARKED);
+                for (int typed : new int[] {1, 2}) {
+                    drawn(at + ", " + typed + " typed while the link is down", new QueueView().rows("t1",
+                            Collections.emptyList(), none, none, typed, cols, open, null, 0), QueueView.Kind.LINK);
                 }
             }
+        }
+    }
+
+    @Test public void theMoreRowIsDrawnByThePhonesFont() throws Exception {
+        List<Outbox.Message> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 12; i++) many.add(msg("m" + i, "t1", "message " + i, Outbox.State.QUEUED, false));
+        for (int cols : new int[] {WIDE, COVER}) {
+            QueueView view = new QueueView();
+            view.update("t1", many, 0);
+            List<PendingClip> none = Collections.emptyList();
+            drawn(cols + " cols, open", view.rows("t1", many, none, none, 0, cols, true, null, 0),
+                    QueueView.Kind.MORE);
         }
     }
 }
