@@ -12,6 +12,11 @@ import java.util.List;
  * The microphone as 16 kHz mono PCM16, read in 100 ms chunks on the caller's thread. It also
  * listens for Android silencing this recording ({@link #androidSilenced}), which Android does
  * without an error: the recorder then delivers zeros.
+ *
+ * <p>One at a time in the process: opening a microphone takes over from the one already open,
+ * whose next read fails with {@link Failure.Cause#TAKEN_OVER}, and waits until it is released.
+ * Across apps Android itself silences all but one recording, which the silenced session sees
+ * through {@link #androidSilenced} and ends on.
  */
 final class Microphone implements AudioInput {
     static final int RATE = 16000;
@@ -34,7 +39,9 @@ final class Microphone implements AudioInput {
             /** Started, but not recording: usually another app (a call, the camera) has it. */
             IN_USE,
             /** A read returned an error code partway. */
-            READ_ERROR
+            READ_ERROR,
+            /** A newer recording in this app took the microphone over. */
+            TAKEN_OVER
         }
 
         final Cause cause;
@@ -50,8 +57,16 @@ final class Microphone implements AudioInput {
         }
     }
 
+    /** How long a new microphone waits for the one it takes over from to let go. */
+    static final long TAKE_OVER_WAIT_MS = 600;
+    private static final Object OPEN = new Object();
+    /** The microphone open in this process, if any; guarded by {@link #OPEN}. */
+    private static Microphone current;
+
     private final AudioRecord record;
     private final AudioManager audio;
+    private volatile boolean takenOver;
+    private final java.util.concurrent.CountDownLatch released = new java.util.concurrent.CountDownLatch(1);
     private final AudioManager.AudioRecordingCallback watch;
     private volatile boolean silenced;
 
@@ -75,8 +90,27 @@ final class Microphone implements AudioInput {
         return false;
     }
 
+    /**
+     * Asks the microphone open in this process to let go, and waits a little for it: never two
+     * recorders at once, which would leave one of them silenced.
+     */
+    private static void takeOver() {
+        Microphone old;
+        synchronized (OPEN) {
+            old = current;
+        }
+        if (old == null) return;
+        old.takenOver = true;
+        try {
+            old.released.await(TAKE_OVER_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /** Opens and starts recording; the caller must hold RECORD_AUDIO. */
     static Microphone open(Context context) throws Failure {
+        takeOver();
         AudioRecord record;
         try {
             int min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO,
@@ -106,6 +140,9 @@ final class Microphone implements AudioInput {
         Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         AudioManager audio = app.getSystemService(AudioManager.class);
         Microphone mic = new Microphone(record, audio);
+        synchronized (OPEN) {
+            current = mic;
+        }
         if (audio != null) {
             // Callbacks on the main looper; the flag is read on the mic thread.
             audio.registerAudioRecordingCallback(mic.watch, null);
@@ -122,6 +159,7 @@ final class Microphone implements AudioInput {
     public int read(byte[] chunk, java.util.function.BooleanSupplier stop) throws Failure {
         int n = 0;
         while (n < chunk.length && !stop.getAsBoolean()) {
+            if (takenOver) throw new Failure(Failure.Cause.TAKEN_OVER, "A newer recording took the microphone");
             int r = record.read(chunk, n, chunk.length - n);
             if (r < 0) throw new Failure(Failure.Cause.READ_ERROR, "The microphone stopped (" + r + ")");
             n += r;
@@ -143,5 +181,9 @@ final class Microphone implements AudioInput {
             // Never started or already stopped: release is what matters.
         }
         record.release();
+        synchronized (OPEN) {
+            if (current == this) current = null;
+        }
+        released.countDown();
     }
 }

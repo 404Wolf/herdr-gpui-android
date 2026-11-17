@@ -78,11 +78,16 @@ its final was empty; some sessions opened and closed with no audio at all.
   stuck)`) and kept, and the next tap on `talk` tries it again.
 - The phone looks for a silenced microphone itself: Android's
   `AudioRecordingConfiguration.isClientSilenced()` for our recording (the
-  privacy toggle, a call, another app) held for 1 s, or 3 s of samples within
+  privacy toggle, a call, another app) held for 0.3 s, or 3 s of samples within
   ±2 of zero (`SilenceWatch`). With nothing heard before, the session ends with
   `talk mic silenced` and keeps nothing; after real audio, what was heard is
   kept as if stop was tapped. Why the microphone did not open (`DENIED`,
   `NOT_INITIALIZED`, `START_FAILED`, `IN_USE`, ...) is logged with a count.
+- One recording at a time: a new session in the app takes the microphone over
+  from the one recording (that one ends as if stop was tapped, keeping what
+  it heard; `Microphone.TAKE_OVER_WAIT_MS`), and across apps (the keyboard's
+  own dictation) Android silences all but one, which the silenced session
+  sees within 0.3 s and ends on, letting go of its recorder.
 - A session the phone ends while the desktop is still in it says why:
   `{"type":"cancel","reason":"cancelled"|"silenced"|"not_ready"|"no_final"|"slow_backend"}`
   and a websocket close. The server reads only `type`, so the reason is

@@ -15,8 +15,11 @@ final class SilenceWatch {
     static final int DEAD_PEAK = 2;
     /** Digital silence for this long (3 s) means the microphone is silenced. */
     static final int DEAD_CHUNKS = 30;
-    /** Android saying the recording is silenced for this long (1 s) means it is. */
-    static final int SILENCED_CHUNKS = 10;
+    /**
+     * Android saying the recording is silenced for this long (0.3 s) means it is: usually another
+     * app's recording took the microphone, and ours should let go of it soon.
+     */
+    static final int SILENCED_CHUNKS = 3;
 
     /** What the microphone has been doing. */
     enum Verdict {

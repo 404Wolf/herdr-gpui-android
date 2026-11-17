@@ -45,7 +45,7 @@ public final class SilenceWatchTest {
         assertTrue(w.heard());
     }
 
-    @Test public void androidsWordIsTakenAfterASecond() {
+    @Test public void androidsWordIsTakenAfterAMoment() {
         SilenceWatch w = new SilenceWatch();
         for (int i = 1; i < SilenceWatch.SILENCED_CHUNKS; i++) {
             assertEquals(SilenceWatch.Verdict.LIVE, w.chunk(chunk(400), Microphone.CHUNK_BYTES, true));
@@ -56,7 +56,7 @@ public final class SilenceWatchTest {
     @Test public void aMomentOfAndroidSilencingIsForgiven() {
         SilenceWatch w = new SilenceWatch();
         for (int i = 0; i < 5 * SilenceWatch.SILENCED_CHUNKS; i++) {
-            assertEquals(SilenceWatch.Verdict.LIVE, w.chunk(chunk(400), Microphone.CHUNK_BYTES, i % 5 != 0));
+            assertEquals(SilenceWatch.Verdict.LIVE, w.chunk(chunk(400), Microphone.CHUNK_BYTES, i % 3 != 0));
         }
     }
 }
