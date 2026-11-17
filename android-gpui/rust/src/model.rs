@@ -480,6 +480,11 @@ pub(crate) const MONO_ADVANCE_EM: f32 = 1229. / 2048.;
 #[cfg(any(feature = "android-ui", test))]
 const DEFAULT_FONT: f32 = 13.;
 
+/// The largest terminal type size (logical pixels), also the most a grid
+/// narrower than the pane grows the type to (see `ui::shell_style`).
+#[cfg(any(feature = "android-ui", test))]
+pub(crate) const MAX_FONT: f32 = 36.;
+
 /// A classic terminal width, which a raw shell keeps on narrow panels.
 #[cfg(any(feature = "android-ui", test))]
 const SHELL_COLUMNS: f32 = 80.;
@@ -494,7 +499,7 @@ pub(crate) fn shell_font_size(preferences: DisplayPreferences, viewport_width: f
         return preferences.font_size;
     }
     let classic = viewport_width.max(0.) / (SHELL_COLUMNS * MONO_ADVANCE_EM);
-    (classic.min(DEFAULT_FONT) * preferences.scale).clamp(11., 36.)
+    (classic.min(DEFAULT_FONT) * preferences.scale).clamp(11., MAX_FONT)
 }
 
 /// Most a pane's row pitch may be spread. Past this, rows read as islands and
@@ -1140,6 +1145,14 @@ fn display_text(text: &str) -> (String, bool) {
     (result, truncated)
 }
 
+/// Pan steps queued for one pane's terminal view: the generation and shell
+/// handle shown when they were queued.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ShellPan {
+    target: (i64, u64),
+    delta: f32,
+}
+
 pub struct Mailbox {
     generation: i64,
     active: bool,
@@ -1152,6 +1165,9 @@ pub struct Mailbox {
     pan: f32,
     /// Furthest useful pan: the painted row width beyond the surface.
     pan_limit: f32,
+    /// Pan steps for the terminal view drawing `shell`, which owns its own
+    /// column offset; the view takes them (`take_shell_pan`).
+    shell_pan: ShellPan,
     pub follow: bool,
     /// Raw SSH shell drawn instead of a Herdr pane, or 0.
     shell: u64,
@@ -1205,6 +1221,7 @@ impl Default for Mailbox {
             display_preferences: DisplayPreferences::default(),
             pan: 0.,
             pan_limit: MAX_PAN,
+            shell_pan: ShellPan::default(),
             // A fresh session tails its pane until the user scrolls back.
             follow: true,
             shell: 0,
@@ -1228,6 +1245,7 @@ impl Mailbox {
             self.ime_session = 0;
             self.preedit = Arc::from("");
             self.pan = 0.;
+            self.shell_pan = ShellPan::default();
             self.shell = 0;
         }
         if !active {
@@ -1316,6 +1334,8 @@ impl Mailbox {
             return false;
         }
         self.shell = shell;
+        // Steps meant for the view of another pane never move the new one.
+        self.shell_pan = ShellPan::default();
         self.revision = self.revision.wrapping_add(1);
         #[cfg(feature = "android-ui")]
         signal_change();
@@ -1373,6 +1393,20 @@ impl Mailbox {
         if !delta.is_finite() {
             return false;
         }
+        if self.shell != 0 {
+            // A core pane (or shell) is drawn by its own terminal view, which
+            // knows its grid and clamps the offset there; the snapshot's limit
+            // describes no rows here.
+            let target = (self.generation, self.shell);
+            if self.shell_pan.target != target {
+                self.shell_pan = ShellPan { target, delta: 0. };
+            }
+            self.shell_pan.delta += delta;
+            self.revision = self.revision.wrapping_add(1);
+            #[cfg(feature = "android-ui")]
+            signal_change();
+            return true;
+        }
         let next = (self.pan + delta).clamp(0., self.pan_limit);
         if (next - self.pan).abs() < 0.5 {
             return false;
@@ -1398,6 +1432,7 @@ impl Mailbox {
     /// Drops the horizontal offset, e.g. when the pane or the type size changes,
     /// so a new pane never opens scrolled into the middle of itself.
     pub fn reset_pan(&mut self) {
+        self.shell_pan = ShellPan::default();
         if self.pan == 0. {
             return;
         }
@@ -1405,6 +1440,20 @@ impl Mailbox {
         self.revision = self.revision.wrapping_add(1);
         #[cfg(feature = "android-ui")]
         signal_change();
+    }
+
+    /// The pan steps queued since they were last taken, for the view of
+    /// `shell` in `generation`. Steps queued for another pane are never
+    /// applied to the view asking: ones for the pane shown now wait for its
+    /// view; ones for a pane no longer shown are dropped.
+    pub fn take_shell_pan(&mut self, generation: i64, shell: u64) -> f32 {
+        if shell != 0 && self.shell_pan.target == (generation, shell) {
+            return std::mem::take(&mut self.shell_pan).delta;
+        }
+        if self.shell_pan.target != (self.generation, self.shell) {
+            self.shell_pan = ShellPan::default();
+        }
+        0.
     }
 
     /// Capture the held body without requiring an active input connection.
@@ -2041,6 +2090,66 @@ mod tests {
         assert_eq!(box_.state().pan, 96.);
         assert!(box_.set_active(11, false));
         assert_eq!(box_.state().pan, 0.);
+    }
+
+    #[test]
+    fn pan_steps_queue_for_a_drawn_core_pane_and_never_carry_to_another() {
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        assert!(box_.set_shell(10, 7));
+        // The snapshot has no rows to bound it; the terminal view clamps.
+        let revision = box_.state().revision;
+        assert!(box_.pan(96.));
+        assert!(box_.pan(96.));
+        assert!(box_.pan(-48.));
+        assert_eq!(box_.state().pan, 0.);
+        assert_eq!(box_.state().revision, revision + 3);
+        assert_eq!(box_.take_shell_pan(10, 7), 144.);
+        assert_eq!(box_.take_shell_pan(10, 7), 0.);
+        assert!(!box_.pan(f32::NAN));
+        // A pane switch, another pane drawn or a new session drops queued steps.
+        box_.pan(96.);
+        box_.reset_pan();
+        assert_eq!(box_.take_shell_pan(10, 7), 0.);
+        box_.pan(96.);
+        assert!(box_.set_shell(10, 8));
+        assert_eq!(box_.take_shell_pan(10, 8), 0.);
+        box_.pan(96.);
+        assert!(box_.set_active(11, true));
+        assert_eq!(box_.take_shell_pan(11, 0), 0.);
+        // With no core pane drawn, panning is the snapshot's, as before.
+        assert!(box_.pan(96.));
+        assert_eq!(box_.state().pan, 96.);
+        assert_eq!(box_.take_shell_pan(11, 0), 0.);
+    }
+
+    #[test]
+    fn pan_steps_reach_only_the_view_of_the_pane_they_were_queued_for() {
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        box_.set_shell(10, 7);
+        box_.pan(96.);
+        // The view still draws pane 7 when it takes them, but read its state
+        // before a switch to pane 8: it asks for 8, and 7's steps are dropped.
+        let stale = box_.state();
+        assert!(box_.set_shell(10, 8));
+        box_.shell_pan = ShellPan {
+            target: (10, 7),
+            delta: 96.,
+        };
+        assert_eq!(box_.take_shell_pan(stale.generation, 8), 0.);
+        assert_eq!(box_.take_shell_pan(10, 8), 0.);
+        // Steps queued for 8 after the switch never reach a view still on 7;
+        // they wait for 8's view.
+        box_.pan(48.);
+        assert_eq!(box_.take_shell_pan(10, 7), 0.);
+        box_.pan(48.);
+        assert_eq!(box_.take_shell_pan(10, 8), 96.);
+        // Nor does an older generation's view take a newer session's steps.
+        assert!(box_.set_active(11, true));
+        assert!(box_.set_shell(11, 8));
+        box_.pan(24.);
+        assert_eq!(box_.take_shell_pan(10, 8), 0.);
     }
 
     #[test]

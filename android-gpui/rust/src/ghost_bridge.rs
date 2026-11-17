@@ -3,7 +3,7 @@
 //!
 //! JSON: `{"kind":"claude"|"codex"|"other","reserve":N,"reserveFrom":ROW,
 //! "colors":{"text":RGB,"dim":RGB,"warn":RGB,"background":RGB},
-//! "draft":[{"t":"..","s":"text"|"partial"|"chip"}],
+//! "draft":[{"t":"..","s":"text"|"partial"|"chip"|"selected"}, {"t":"","s":"caret"}],
 //! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"}]],
 //! "controls":[{"id":"talk","spans":[{"t":"talk","s":"dim"|"bright"|"danger"|"info"|"warn"}]}]}`.
 //! Colours also take "bright", "danger" and "info".
@@ -17,7 +17,8 @@ use serde::Deserialize;
 const MAX_TEXT_BYTES: usize = 65_536;
 const MAX_SPANS: usize = 64;
 const MAX_ECHOES: usize = 8;
-const MAX_CONTROLS: usize = 4;
+/// type or clear, talk, retry, send, with room to spare.
+const MAX_CONTROLS: usize = 6;
 const MAX_CONTROL_ID: usize = 16;
 /// Columns a host may keep clear; past this the draft would have no room.
 const MAX_RESERVE: usize = 64;
@@ -81,6 +82,8 @@ fn span(wire: WireSpan, allowed: &[GhostStyle]) -> Result<GhostSpan> {
         "bright" => GhostStyle::Bright,
         "danger" => GhostStyle::Danger,
         "info" => GhostStyle::Info,
+        "selected" => GhostStyle::Selected,
+        "caret" => GhostStyle::Caret,
         _ => return Err(Error::InvalidCommand),
     };
     // Line breaks are drawn as spaces; other controls never reach the screen.
@@ -88,7 +91,9 @@ fn span(wire: WireSpan, allowed: &[GhostStyle]) -> Result<GhostSpan> {
         .t
         .chars()
         .any(|c| c.is_control() && c != '\n' && c != '\t');
-    if !allowed.contains(&style) || control {
+    // A caret marks a place; it carries no text.
+    let caret_text = style == GhostStyle::Caret && !wire.t.is_empty();
+    if !allowed.contains(&style) || control || caret_text {
         return Err(Error::InvalidCommand);
     }
     Ok(GhostSpan {
@@ -137,7 +142,13 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
     {
         return Err(Error::InvalidText);
     }
-    let draft_styles = [GhostStyle::Text, GhostStyle::Partial, GhostStyle::Chip];
+    let draft_styles = [
+        GhostStyle::Text,
+        GhostStyle::Partial,
+        GhostStyle::Chip,
+        GhostStyle::Selected,
+        GhostStyle::Caret,
+    ];
     let echo_styles = [
         GhostStyle::Echo,
         GhostStyle::Tag,
@@ -278,6 +289,29 @@ mod tests {
             .is_err()
         );
         assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn a_draft_carries_the_keyboards_cursor_and_selection() {
+        let json = format!(
+            r#"{{"kind":"claude",{COLORS},"draft":[{{"t":"fix ","s":"text"}},{{"t":"","s":"caret"}},{{"t":"the","s":"selected"}}]}}"#
+        );
+        let ghost = parse(&json).expect("valid ghost");
+        assert_eq!(ghost.draft[1].style, GhostStyle::Caret);
+        assert_eq!(ghost.draft[2].style, GhostStyle::Selected);
+        // A caret carries no text, and belongs only in the draft.
+        assert!(
+            parse(&format!(
+                r#"{{"kind":"claude",{COLORS},"draft":[{{"t":"x","s":"caret"}}]}}"#
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&format!(
+                r#"{{"kind":"claude",{COLORS},"echoes":[[{{"t":"","s":"caret"}}]]}}"#
+            ))
+            .is_err()
+        );
     }
 
     #[test]

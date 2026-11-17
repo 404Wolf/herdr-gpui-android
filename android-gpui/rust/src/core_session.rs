@@ -283,6 +283,7 @@ impl Connection<'_> {
         } else if frame.channel == self.channel && self.channel != 0 {
             match frame.kind {
                 0 => {
+                    self.owner.heard.printed(frame.bytes.len());
                     if let Some(output) = &self.output {
                         // 256 KiB starting credit bounds this queue. Credit is returned
                         // only as Rio consumes bytes, never when the network receives them.
@@ -618,10 +619,7 @@ impl Connection<'_> {
     }
     fn edit_tab(&mut self, edit: TabEdit, cols: u16, rows: u16) -> Result<()> {
         match edit {
-            TabEdit::Rename { space, tab, name } => self.edit_doc(|doc| {
-                tab_mut(doc, &space, &tab)?["name"] = json!(name);
-                Ok(())
-            }),
+            TabEdit::Rename { space, tab, name } => self.edit_doc(|doc| rename_tab(doc, &space, &tab, &name)),
             TabEdit::Move { space, tab, index } => self.edit_doc(|doc| {
                 let tabs = tabs_mut(doc, &space)?;
                 let at = tabs
@@ -717,6 +715,78 @@ impl Connection<'_> {
                 self.refresh()?;
                 self.attach(&terminal, cols, rows)
             }
+            TabEdit::WindowNew {
+                space,
+                lead,
+                folder,
+                kind,
+            } => {
+                let (cwd, space, space_name) = {
+                    let state = lock(&self.owner.state);
+                    let cwd = folder.map(Value::from).unwrap_or_else(|| {
+                        state.view["panes"]
+                            .as_array()
+                            .and_then(|p| p.iter().find(|p| p["id"] == lead.as_str()))
+                            .map(|p| p["cwd"].clone())
+                            .unwrap_or(Value::Null)
+                    });
+                    let (space, name) = window_space(&state.view, &space, &lead);
+                    (cwd, space, name)
+                };
+                let tab = format!(
+                    "mobile-{}-{}",
+                    std::process::id(),
+                    NEXT_RENDER.fetch_add(1, Ordering::Relaxed)
+                );
+                let run = window_run(&space, &tab, &lead, cwd.clone(), kind, cols, rows);
+                let result = self.call("terminal.run", run)?;
+                let terminal = result["address"]
+                    .as_str()
+                    .ok_or_else(|| Error::Protocol("missing terminal address".into()))?
+                    .to_owned();
+                // Its tab in herdr-app's layout, so it can be renamed, moved or
+                // closed from here and the desktop places it without a repair;
+                // a space the layout lacks (one only labels name) is added to it.
+                let block = format!("p{:x}", NEXT_RENDER.fetch_add(1, Ordering::Relaxed));
+                let entry = window_tab(&tab, &terminal, &block, kind);
+                let placed = self.edit_doc(|doc| add_window_tab(doc, &space, &space_name, &cwd, &entry));
+                // Labelled at birth; set again for a core that drops run labels.
+                // A failure leaves the run's own label, which a current core keeps.
+                let _ = self.call(
+                    "terminal.label",
+                    json!({"terminal":terminal,"labels":{"parent":lead}}),
+                );
+                self.refresh()?;
+                self.attach(&terminal, cols, rows)?;
+                // Started, and shown; but say so when its tab is not in the
+                // layout, rather than offer a menu that cannot work.
+                placed.map_err(|error| Error::WindowNotPlaced(Box::new(error)))
+            }
+            TabEdit::WindowsMove {
+                project,
+                id,
+                target,
+                after,
+                shown,
+            } => {
+                // One compare-and-set per try, from the doc as it is now: a drop
+                // never writes back another window's stale order.
+                for _ in 0..5 {
+                    let doc = self.call("doc.get", json!({"name":"projects.order"}))?;
+                    let Some(value) = order_move(&doc["value"], &project, &id, &target, after, &shown) else {
+                        return Ok(());
+                    };
+                    match self.call(
+                        "doc.set",
+                        json!({"name":"projects.order","value":value,"version":doc["version"]}),
+                    ) {
+                        Ok(_) => return self.refresh(),
+                        Err(Error::Rpc { kind, .. }) if kind == "conflict" => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(Error::Protocol("the window order kept changing; try again".into()))
+            }
             TabEdit::Interrupt { terminal } => {
                 self.call("terminal.interrupt", json!({"terminal":terminal}))?;
                 Ok(())
@@ -805,15 +875,35 @@ impl Connection<'_> {
         self.dirty = false;
         let list = self.call("terminal.list", json!({}))?;
         let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+        // Wolf's order of the projects (item 62), kept in this core's doc
+        // projects.order by the desktop's sidebar; the phone's project
+        // switcher reads it. A core without it (older, or never dragged) has
+        // no order: birth order then.
+        let order = self
+            .call("doc.get", json!({"name":"projects.order"}))
+            .map(|o| o["value"].clone())
+            .unwrap_or(Value::Null);
         let mut state = lock(&self.owner.state);
         project(&mut state.view, &list["terminals"], &doc["value"])?;
+        if state.view["projects_order"] != order {
+            state.view["projects_order"] = order;
+            bump(&mut state.view);
+        }
         Ok(())
     }
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
-            state.terminal = None;
+            // The outgoing pane's grid is kept for the phone to save (item 77:
+            // panes looked at online read offline). Only the grid object moves;
+            // what is sent to the core, and when, is unchanged.
+            if let Some(outgoing) = state.terminal.take() {
+                let pane = state.view["pane_id"].as_str().unwrap_or("");
+                if pane != terminal {
+                    crate::remote::depart(self.owner.id, outgoing, pane.to_owned());
+                }
+            }
             state.render_id = 0;
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
@@ -898,6 +988,15 @@ pub(crate) enum TabEdit {
     SpaceRename { space: String, name: String },
     SpaceMove { space: String, index: usize },
     SpaceNew { space: String, kind: &'static str },
+    /// A new window of a project (the desktop's C-a c): a tab in `space`,
+    /// in `folder` (else the lead's), its terminal labelled parent=<lead>
+    /// so it is that project's window wherever its tab goes.
+    WindowNew { space: String, lead: String, folder: Option<String>, kind: &'static str },
+    /// Wolf's drag of a project's window (item 79): `id` just before or after
+    /// `target` in the core doc projects.order's `windows[<project>]`, the
+    /// list the desktop's status line keeps; `shown`: the project's windows
+    /// after its lead as drawn (the lead never moves).
+    WindowsMove { project: String, id: String, target: String, after: bool, shown: Vec<String> },
     Interrupt { terminal: String },
     Kill { terminal: String },
     DeaconStart { machine: String },
@@ -953,6 +1052,40 @@ impl TabEdit {
                     _ => return None,
                 },
             },
+            "window.new" => Self::WindowNew {
+                space: id("space")?,
+                // A lead on this core only: a parent never names another computer's terminal.
+                lead: id("lead").filter(|l| !l.contains('/'))?,
+                folder: match &value["folder"] {
+                    Value::Null => None,
+                    v => Some(folder(v)?),
+                },
+                kind: match value["kind"].as_str()? {
+                    "shell" => "shell",
+                    "claude" => "claude",
+                    "codex" => "codex",
+                    _ => return None,
+                },
+            },
+            "windows.move" => {
+                // As herdr-projects-order bounds them: 1 to 200 characters, at most 1000 names.
+                let name = |v: &Value| {
+                    v.as_str()
+                        .filter(|x| !x.is_empty() && x.len() <= 200 && !x.chars().any(char::is_control))
+                        .map(str::to_owned)
+                };
+                let shown = value["shown"].as_array()?;
+                if shown.len() > 1000 {
+                    return None;
+                }
+                Self::WindowsMove {
+                    project: name(&value["project"])?,
+                    id: name(&value["id"])?,
+                    target: name(&value["target"])?,
+                    after: value["after"].as_bool()?,
+                    shown: shown.iter().map(name).collect::<Option<Vec<_>>>()?,
+                }
+            }
             "pane.interrupt" => Self::Interrupt { terminal: id("terminal")? },
             "pane.kill" => Self::Kill { terminal: id("terminal")? },
             "deacon.start" => Self::DeaconStart { machine: name().unwrap_or_default() },
@@ -994,6 +1127,127 @@ impl TabEdit {
             _ => return None,
         })
     }
+}
+/// The terminal.run of a project's new window (`WindowNew`): a tab of its own
+/// in `space`, in `cwd`, working for `lead` (parent=<lead>), as the desktop's
+/// C-a c adopts it; an agent through the login shell, as `space.new` starts one.
+fn window_run(space: &str, tab: &str, lead: &str, cwd: Value, kind: &str, cols: u16, rows: u16) -> Value {
+    let mut run = json!({"cwd":cwd,"keep":true,"labels":{"herdr.space":space,"herdr.tab":tab,"parent":lead},"size":{"cols":cols,"rows":rows},"display":display()});
+    if kind != "shell" {
+        run["line"] = json!(format!("exec \"${{SHELL:-/bin/sh}}\" -lic {kind}"));
+        run["labels"]["agent.kind"] = json!(kind);
+    }
+    run
+}
+/// The herdr-app tab of a project's new window: unnamed, so it goes by its
+/// agent's task, as a tab the desktop makes does.
+fn window_tab(tab: &str, terminal: &str, block: &str, kind: &str) -> Value {
+    let root = json!({"children":[{"content":{"terminal":terminal},"id":block,"type":"block"}],"id":tab,"type":"row"});
+    json!({"id":tab,"name":kind,"named":false,"root":root})
+}
+/// Where a project's new window goes: its lead's space, named as the phone
+/// shows it; for a lead in no space ("loose", no herdr.space label) a space
+/// of its own, named after the lead's project, else its folder.
+fn window_space(view: &Value, space: &str, lead: &str) -> (String, String) {
+    if space != "loose" && !space.is_empty() {
+        let name = view["workspaces"]
+            .as_array()
+            .and_then(|s| s.iter().find(|s| s["id"] == space))
+            .and_then(|s| s["label"].as_str())
+            .unwrap_or(space);
+        return (space.to_owned(), name.to_owned());
+    }
+    let pane = view["panes"].as_array().and_then(|p| p.iter().find(|p| p["id"] == lead));
+    let text = |key: &str| pane.and_then(|p| p[key].as_str()).filter(|v| !v.is_empty());
+    let name = text("project")
+        .or_else(|| text("cwd").and_then(|cwd| cwd.trim_end_matches('/').rsplit('/').next()).filter(|n| !n.is_empty()))
+        .unwrap_or(lead);
+    let id = format!("mobile-{}-{}", std::process::id(), NEXT_RENDER.fetch_add(1, Ordering::Relaxed));
+    (id, name.to_owned())
+}
+/// Puts a new window's tab in herdr-app's layout: appended to `space`'s
+/// tabs, the space itself added when the layout lacks it (a space only
+/// labels name), so the window can be renamed, moved and closed.
+fn add_window_tab(doc: &mut Value, space: &str, name: &str, folder: &Value, entry: &Value) -> Result<()> {
+    if doc.is_null() {
+        *doc = json!({});
+    }
+    if !doc["spaces"].is_array() {
+        doc["spaces"] = json!([]);
+    }
+    let spaces = doc["spaces"].as_array_mut().ok_or(Error::StaleTarget)?;
+    match spaces.iter_mut().find(|s| s["id"] == space) {
+        Some(found) => {
+            if !found["tabs"].is_array() {
+                found["tabs"] = json!([]);
+            }
+            let tabs = found["tabs"].as_array_mut().ok_or(Error::StaleTarget)?;
+            if !tabs.iter().any(|t| t["id"] == entry["id"]) {
+                tabs.push(entry.clone());
+            }
+            Ok(())
+        }
+        None => {
+            spaces.push(json!({"folder":folder,"id":space,"name":name,"tabs":[entry]}));
+            Ok(())
+        }
+    }
+}
+/// A rename names the tab for good: `named`, so its window goes by this name
+/// and no longer by its agent's task.
+fn rename_tab(doc: &mut Value, space: &str, tab: &str, name: &str) -> Result<()> {
+    let item = tab_mut(doc, space, tab)?;
+    item["name"] = json!(name);
+    item["named"] = json!(true);
+    Ok(())
+}
+/// herdr-projects-order's reading of the projects.order doc: lists of names
+/// only, `windows` only once something is stored there.
+fn order_clean(value: &Value) -> Value {
+    let names = |v: &Value| -> Vec<Value> {
+        v.as_array()
+            .map(|a| a.iter().filter(|x| x.is_string()).cloned().collect())
+            .unwrap_or_default()
+    };
+    let lists = |v: &Value| -> serde_json::Map<String, Value> {
+        v.as_object()
+            .map(|o| o.iter().filter(|(_, ids)| ids.is_array()).map(|(k, ids)| (k.clone(), Value::from(names(ids)))).collect())
+            .unwrap_or_default()
+    };
+    let mut out = json!({"repos": names(&value["repos"]), "projects": lists(&value["projects"])});
+    let windows = lists(&value["windows"]);
+    if !windows.is_empty() {
+        out["windows"] = Value::from(windows);
+    }
+    out
+}
+/// One window move in projects.order (item 79), as herdr-projects-order makes
+/// it: the stored list for `project` less the windows no longer shown (they
+/// ended), then those `shown` adds, with `id` just before or after `target`.
+/// None: nothing moves (either is missing, or it is already there).
+fn order_move(value: &Value, project: &str, id: &str, target: &str, after: bool, shown: &[String]) -> Option<Value> {
+    let mut v = order_clean(value);
+    let stored: Vec<String> = v["windows"][project]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    let stored: Vec<String> = if shown.is_empty() { stored } else { stored.into_iter().filter(|x| shown.contains(x)).collect() };
+    let mut ids = stored.clone();
+    ids.extend(shown.iter().filter(|x| !stored.contains(x)).cloned());
+    if id == target || !ids.iter().any(|x| x == id) || !ids.iter().any(|x| x == target) {
+        return None;
+    }
+    let mut rest: Vec<String> = ids.iter().filter(|x| *x != id).cloned().collect();
+    let at = rest.iter().position(|x| x == target)? + usize::from(after);
+    rest.insert(at, id.to_owned());
+    if rest == ids || rest.len() > 1000 {
+        return None;
+    }
+    if !v["windows"].is_object() {
+        v["windows"] = json!({});
+    }
+    v["windows"][project] = json!(rest);
+    Some(v)
 }
 /// Appends one space to herdr-app's document, keeping every space and tab
 /// already there (edit_doc hands it the freshest version on each try).
@@ -1075,6 +1329,8 @@ $c
 "*) continue;; esac
   seen="$seen$c
 "
+  u=$(git -C "$p" remote get-url origin 2>/dev/null) || u=$(git -C "$p" remote -v 2>/dev/null | sed -n '1s/^[^	]*	\([^ ]*\).*/\1/p')
+  printf 'U\t%s\t%s\n' "$c" "$u"
   printf 'R\t%s\n' "$c"
   w=$(git -C "$p" worktree list --porcelain 2>/dev/null)
   if [ "${#w}" -gt 2000000 ]; then
@@ -1401,7 +1657,12 @@ pub(crate) fn run(
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
-    result
+    match result {
+        // Cancelled while waiting on the socket: the phone closed the session,
+        // which is how it ends normally, not a failure.
+        Err(Error::Closed) if owner.cancel.is_cancelled() => Ok(()),
+        result => result,
+    }
 }
 
 fn serve(
@@ -1560,7 +1821,9 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             if let Some(items) = space["tabs"].as_array() {
                 for tab in items {
                     if let Some(tab_id) = tab["id"].as_str() {
-                        tabs.push(json!({"id":tab_id,"workspace_id":id,"label":tab["name"].as_str().unwrap_or(tab_id),"focused":false,"zoomed":false,"status":""}));
+                        // `named`: whether someone named the tab (the desktop's
+                        // window names: an unnamed one goes by its task).
+                        tabs.push(json!({"id":tab_id,"workspace_id":id,"label":tab["name"].as_str().unwrap_or(tab_id),"named":tab["named"].as_bool(),"focused":false,"zoomed":false,"status":""}));
                     }
                 }
             }
@@ -1629,6 +1892,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "parent": label("parent").or(terminal["parent"].as_str()).unwrap_or(""),
             "role": label("role").unwrap_or(""),
             "project": label("project").unwrap_or(""),
+            // The repo a project sits under, when a label says so (item 61).
+            "repo": label("repo").unwrap_or(""),
             "kind": kind.unwrap_or(""),
             // What the deacon view shows under each agent: the program's own
             // status message, why it is blocked, and since when (core clock, ms).
@@ -1742,6 +2007,11 @@ mod tests {
         assert!(before >= 40);
         heard.mark();
         assert!(heard.quiet_ms() < before);
+        // Pane output is counted apart from the link's own traffic.
+        assert_eq!(heard.output(), 0);
+        heard.printed(12);
+        heard.printed(3);
+        assert_eq!(heard.output(), 15);
     }
 
     #[test]
@@ -2036,6 +2306,102 @@ mod tests {
 b"}"#), None);
     }
     #[test]
+    fn a_new_project_window_is_a_layout_tab_that_renames_for_good() {
+        let mut doc = json!({"spaces":[{"id":"s1","name":"monopoly","tabs":[]}]});
+        let tab = window_tab("mobile-1-9", "t44", "p9", "claude");
+        add_window_tab(&mut doc, "s1", "monopoly", &Value::Null, &tab).unwrap();
+        add_window_tab(&mut doc, "s1", "monopoly", &Value::Null, &tab).unwrap();
+        assert_eq!(doc["spaces"][0]["tabs"].as_array().unwrap().len(), 1, "added once");
+        let terminals = json!([{"address":"t44","state":"live","labels":{"herdr.space":"s1","herdr.tab":"mobile-1-9","parent":"t5"},"title":"Fix tests","status":{}}]);
+        let mut view = json!({"pane_id":"t44"});
+        project(&mut view, &terminals, &doc).unwrap();
+        assert_eq!(view["tabs"][0]["named"], false, "goes by its task until renamed");
+        // A rename finds it in the layout and names it for good.
+        rename_tab(&mut doc, "s1", "mobile-1-9", "review").unwrap();
+        project(&mut view, &terminals, &doc).unwrap();
+        assert_eq!((view["tabs"][0]["label"].clone(), view["tabs"][0]["named"].clone()), (json!("review"), json!(true)));
+    }
+
+    #[test]
+    fn a_window_whose_tab_was_not_saved_keeps_the_layout_failure_as_its_source() {
+        use std::error::Error as _;
+        let error = Error::WindowNotPlaced(Box::new(Error::Rpc { kind: "denied".into(), message: "read-only".into() }));
+        // The layout write's own error, typed, as the source (boxed: Error holds itself).
+        let source = error.source().and_then(|s| s.downcast_ref::<Box<Error>>()).map(|b| &**b);
+        assert!(matches!(source, Some(Error::Rpc { kind, .. }) if kind == "denied"));
+        assert!(matches!(&error, Error::WindowNotPlaced(cause) if matches!(**cause, Error::Rpc { .. })));
+        assert!(error.to_string().starts_with("The window started, but its tab could not be saved in the layout"));
+        assert!(error.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn a_window_of_a_lead_the_layout_lacks_gets_a_space_there_and_renames() {
+        // A PM only labels place (herdr.space s9, not in herdr-app's layout),
+        // and one in no space at all.
+        let terminals = json!([
+            {"address":"t5","state":"live","labels":{"herdr.space":"s9","herdr.tab":"x","role":"pm","project":"research-ui"},"cwd":"/w/monopoly","title":"pm","status":{}},
+            {"address":"t6","state":"live","labels":{"role":"pm","project":"incident-fixes"},"cwd":"/w/other","title":"pm","status":{}}]);
+        let mut doc = json!({"spaces":[{"id":"s1","name":"work","tabs":[]}]});
+        let mut view = json!({"pane_id":"t5"});
+        project(&mut view, &terminals, &doc).unwrap();
+        assert_eq!(window_space(&view, "s9", "t5"), ("s9".to_owned(), "monopoly".to_owned()));
+        let tab = window_tab("mobile-1-9", "t44", "p9", "claude");
+        add_window_tab(&mut doc, "s9", "monopoly", &json!("/w/monopoly"), &tab).unwrap();
+        add_window_tab(&mut doc, "s9", "monopoly", &json!("/w/monopoly"), &tab).unwrap();
+        assert_eq!(doc["spaces"][1]["tabs"].as_array().unwrap().len(), 1, "added once");
+        let mut terminals = terminals;
+        terminals.as_array_mut().unwrap().push(json!({"address":"t44","state":"live","labels":{"herdr.space":"s9","herdr.tab":"mobile-1-9","parent":"t5"},"title":"Fix tests","status":{}}));
+        project(&mut view, &terminals, &doc).unwrap();
+        assert!(view["panes"].as_array().unwrap().iter().any(|p| p["id"] == "t5" && p["workspace_id"] == "s9"), "the lead keeps its space");
+        rename_tab(&mut doc, "s9", "mobile-1-9", "review").unwrap();
+        project(&mut view, &terminals, &doc).unwrap();
+        let renamed = view["tabs"].as_array().unwrap().iter().find(|t| t["id"] == "mobile-1-9").unwrap().clone();
+        assert_eq!((renamed["label"].clone(), renamed["named"].clone()), (json!("review"), json!(true)));
+        // A lead in no space: a space of its own, named after its project.
+        let (id, name) = window_space(&view, "loose", "t6");
+        assert!(id.starts_with("mobile-") && id != "loose");
+        assert_eq!(name, "incident-fixes");
+        // A layout space without a tab list gets one.
+        let mut bare = json!({"spaces":[{"id":"s2","name":"b"}]});
+        add_window_tab(&mut bare, "s2", "b", &Value::Null, &tab).unwrap();
+        assert_eq!(bare["spaces"][0]["tabs"][0]["id"], "mobile-1-9");
+    }
+
+    #[test]
+    fn window_moves_keep_their_own_list_in_projects_order() {
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // As herdr-projects-order's test_item_79: its own list beside the others.
+        let got = order_move(&json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]}}), "research-ui", "t1s7", "t1s6", false,
+            &ids(&["t1s6", "t1s7", "tab:s3/4"])).unwrap();
+        assert_eq!(got, json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]},"windows":{"research-ui":["t1s7","t1s6","tab:s3/4"]}}));
+        // Windows that ended leave the list at the next move; a new one joins.
+        let again = order_move(&got, "research-ui", "t1new", "t1s6", false, &ids(&["t1s6", "t1new"])).unwrap();
+        assert_eq!(again["windows"]["research-ui"], json!(["t1new", "t1s6"]));
+        // Nothing moves: the same place, a name not shown (the lead), or onto itself.
+        assert!(order_move(&again, "research-ui", "t1new", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, "research-ui", "t9r", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, "research-ui", "t1s6", "t1s6", true, &ids(&["t1new", "t1s6"])).is_none());
+        // After, and a doc that was never written.
+        let fresh = order_move(&Value::Null, "x#t1", "a", "c", true, &ids(&["a", "b", "c"])).unwrap();
+        assert_eq!(fresh, json!({"repos":[],"projects":{},"windows":{"x#t1":["b","c","a"]}}));
+        // A doc with no windows yet reads without the key, as the tool keeps it.
+        assert_eq!(order_clean(&json!({"repos":["a"],"projects":{},"windows":{}})), json!({"repos":["a"],"projects":{}}));
+    }
+
+    #[test]
+    fn a_project_window_works_for_its_lead_like_c_a_c() {
+        let run = window_run("s1", "mobile-1-2", "t5", json!("/w/x"), "codex", 80, 24);
+        assert_eq!(run["labels"]["parent"], "t5");
+        assert_eq!(run["labels"]["herdr.space"], "s1");
+        assert_eq!(run["labels"]["agent.kind"], "codex");
+        assert_eq!(run["cwd"], "/w/x");
+        assert!(run["labels"]["herdr.tab"].as_str().is_some_and(|t| t.starts_with("mobile-")));
+        let shell = window_run("s1", "mobile-1-3", "t5", Value::Null, "shell", 80, 24);
+        assert!(shell["line"].is_null() && shell["labels"]["agent.kind"].is_null());
+        assert_eq!(shell["labels"]["parent"], "t5");
+    }
+
+    #[test]
     fn tab_edits_parse_only_bounded_known_operations() {
         use super::TabEdit;
         assert_eq!(
@@ -2067,6 +2433,24 @@ b"}"#), None);
             Some(TabEdit::SpaceOpen { folder: "/w/kache-wt".into() })
         );
         assert_eq!(TabEdit::parse(r#"{"op":"space.open","folder":"/w/a\nb"}"#), None);
+        // A project's new window (the desktop's C-a c): its lead on this core only.
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"claude","folder":"/w/x"}"#),
+            Some(TabEdit::WindowNew { space: "s1".into(), lead: "t5".into(), folder: Some("/w/x".into()), kind: "claude" })
+        );
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"shell"}"#),
+            Some(TabEdit::WindowNew { space: "s1".into(), lead: "t5".into(), folder: None, kind: "shell" })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"laptop/t5","kind":"shell"}"#), None);
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"windows.move","project":"same#t31","id":"t1c","target":"tab:s1/4","after":true,"shown":["t1c","tab:s1/4"]}"#),
+            Some(TabEdit::WindowsMove { project: "same#t31".into(), id: "t1c".into(), target: "tab:s1/4".into(), after: true, shown: vec!["t1c".into(), "tab:s1/4".into()] })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"windows.move","project":"p","id":"a","target":"b","shown":[]}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"windows.move","project":"p","id":"a\nb","target":"b","after":false,"shown":[]}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"vim"}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"t5","kind":"shell","folder":"rel"}"#), None);
         assert_eq!(
             TabEdit::parse(r#"{"op":"pane.send","terminal":"t3","text":"I want to start a new project on server."}"#),
             Some(TabEdit::Send { terminal: "t3".into(), text: "I want to start a new project on server.".into() })
@@ -2259,6 +2643,7 @@ mod connection_tests {
             .unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
+            id: 0,
             state: Mutex::new(State {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
@@ -2283,9 +2668,11 @@ mod connection_tests {
             assert_eq!(hello["params"], json!({"framed":true,"generation":1}));
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
+            // The second doc.get is projects.order (the project switcher's order).
             for expected in [
                 "events.subscribe",
                 "terminal.list",
+                "doc.get",
                 "doc.get",
                 "terminal.attach",
             ] {
@@ -2358,6 +2745,7 @@ mod connection_tests {
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
+            id: 0,
             state: Mutex::new(State {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
@@ -2377,7 +2765,8 @@ mod connection_tests {
             io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
-            for expected in ["events.subscribe", "terminal.list", "doc.get", "terminal.attach"] {
+            // The second doc.get is projects.order (the project switcher's order).
+            for expected in ["events.subscribe", "terminal.list", "doc.get", "doc.get", "terminal.attach"] {
                 let request: Value = serde_json::from_slice(&frame(&mut core, &mut decoder).bytes).unwrap();
                 assert_eq!(request["method"], expected);
                 let result = match expected {
@@ -2464,6 +2853,7 @@ mod connection_tests {
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
+            id: 0,
             state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0 }),
             cancel: CancellationToken::new(),
             commands: commands.clone(),
@@ -2652,6 +3042,8 @@ mod connection_tests {
 
     #[test]
     fn a_held_frame_scrolls_its_own_history_with_no_link_and_lets_go_on_attach() {
+        // The closed slot is shared with the departed-pane test.
+        let _serial = crate::remote::departed_test_lock();
         let (tx, rx) = mpsc::sync_channel(16);
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
@@ -2668,7 +3060,7 @@ mod connection_tests {
         }
         // The link is gone: the stream ends, the grid stays.
         drop(tx);
-        crate::remote::hold(session.clone(), "t9".into());
+        crate::remote::hold(session.clone());
         let offset = |reply: String| serde_json::from_str::<Value>(&reply).unwrap()["local_offset"].as_u64().unwrap();
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 5);
         assert_eq!(offset(crate::remote::scroll_held(-2, false)), 3);
@@ -2677,10 +3069,10 @@ mod connection_tests {
         // Saved for its own pane only, then read back as the held frame.
         let path = std::env::temp_dir().join(format!("herdr-held-{}.snap", std::process::id()));
         let path = path.to_str().unwrap();
-        assert!(!crate::remote::save_closed("t1", path).unwrap());
-        crate::remote::closed_for_test(session.clone(), "t9");
-        assert!(!crate::remote::save_closed("t1", path).unwrap());
-        assert!(crate::remote::save_closed("t9", path).unwrap());
+        assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
+        crate::remote::closed_for_test(0, session.clone(), "t9");
+        assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
+        assert!(crate::remote::save_pane(0, "t9", path).unwrap());
         let id = crate::remote::open_saved(path).unwrap();
         let restored = crate::remote::renderer(id).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2697,6 +3089,412 @@ mod connection_tests {
         assert_eq!(offset(crate::remote::scroll_held(5, false)), 0);
         assert!(crate::remote::renderer(id).is_none());
     }
+    /// A grid for tests: 20x4, with `text` written into it.
+    fn grid_with(text: &str) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        tx.send(Chunk::Data(text.as_bytes().to_vec())).unwrap();
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen_text().contains(text) {
+            assert!(Instant::now() < deadline, "the text never reached the grid");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session
+    }
+
+    /// A grid started at `start` (the phone's own size), then given the
+    /// core's `grid` before any byte (as an attach does), with `lines`
+    /// numbered rows written into it: "row 0" first, the caret on a blank row
+    /// after the last.
+    fn written(start: (u16, u16), grid: (u16, u16), lines: usize) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        session.set_grid(grid.0, grid.1);
+        let text: String = (0..lines).map(|n| format!("row {n}\r\n")).collect();
+        tx.send(Chunk::Data(text.into_bytes())).unwrap();
+        drop(tx);
+        let last = format!("row {}", lines - 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen_text().contains(&last) || session.is_alive() {
+            assert!(Instant::now() < deadline, "the rows never reached the grid");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session
+    }
+
+    /// The rows drawn `offset` rows back, read the way the renderer reads
+    /// them (Line(row - offset) for each screen row), each trimmed; every
+    /// screen row is returned, blank ones too.
+    fn rows_back(session: &gpui_rio::Session, offset: i32) -> Vec<String> {
+        use rio_vt::crosswords::{grid::Scroll, pos::{Column, Line}};
+        let mut grid = session.grid().lock();
+        grid.scroll_display(Scroll::Bottom);
+        grid.scroll_display(Scroll::Delta(offset));
+        let shown = grid.display_offset() as i32;
+        let rows = (0..grid.screen_lines() as i32)
+            .map(|row| {
+                (0..grid.columns())
+                    .map(|col| match grid.grid[Line(row - shown)][Column(col)].c() {
+                        '\0' => ' ',
+                        c => c,
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        grid.scroll_display(Scroll::Bottom);
+        rows
+    }
+
+    /// What `offset` rows back must show on a `rows`-row screen after
+    /// `lines` numbered rows and a blank caret row: rows in order, newest last.
+    fn expected_back(lines: usize, rows: usize, offset: usize) -> Vec<String> {
+        // Screen rows are the last `rows` of: row 0 .. row lines-1, then "".
+        let all: Vec<String> = (0..lines).map(|n| format!("row {n}")).chain([String::new()]).collect();
+        let bottom = all.len() - offset;
+        all[bottom - rows..bottom].to_vec()
+    }
+
+    #[test]
+    fn scrolled_back_a_grid_shows_its_history_in_order_whatever_size_it_started_at() {
+        for (start, grid) in [((20, 4), (20, 4)), ((20, 6), (20, 4)), ((20, 3), (20, 4)), ((30, 5), (20, 4))] {
+            let session = written(start, grid, 30);
+            let history = session.grid().lock().history_size();
+            assert_eq!(history, 27, "{start:?} -> {grid:?}");
+            for offset in [1, 5, 21, 27] {
+                assert_eq!(rows_back(&session, offset as i32), expected_back(30, 4, offset), "{start:?} -> {grid:?} at {offset}");
+            }
+        }
+    }
+
+    /// All rows from the oldest history row to the last screen row, read the
+    /// way the renderer reads them: what scrolling all the way back shows,
+    /// then the screen.
+    fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
+        let history = session.grid().lock().history_size();
+        let mut out: Vec<String> = Vec::new();
+        for offset in (0..=history).rev() {
+            let shown = rows_back(session, offset as i32);
+            if offset == history {
+                out.extend(shown);
+            } else if let Some(last) = shown.last() {
+                out.push(last.clone());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_grid_made_smaller_then_larger_again_keeps_its_scrollback_in_order() {
+        // Each size the phone's pane goes through (keyboard up and down, a
+        // fold, the core's RESIZE): rows go into history and come back.
+        for (lines, small) in [(8usize, 5u16), (8, 3), (30, 5), (30, 8), (12, 9)] {
+            let session = written((20, 10), (20, 10), lines);
+            let before = all_rows(&session);
+            session.set_grid(20, small);
+            session.set_grid(20, 10);
+            let history = session.grid().lock().history_size();
+            let after = all_rows(&session);
+            assert_eq!(after.iter().filter(|r| !r.is_empty()).collect::<Vec<_>>(),
+                before.iter().filter(|r| !r.is_empty()).collect::<Vec<_>>(),
+                "{lines} rows, 10 -> {small} -> 10, history {history}");
+            // No row is shown twice: history never repeats the screen.
+            let mut seen = std::collections::HashSet::new();
+            for row in after.iter().filter(|r| !r.is_empty()) {
+                assert!(seen.insert(row.clone()), "{row} shown twice after 10 -> {small} -> 10: {after:?}");
+            }
+        }
+    }
+
+    /// What herdr-core sends a viewer to repaint a pane (ghostty-vt
+    /// `Terminal::paint`): a reset ending in ESC[H ESC[2J, then (on a first
+    /// paint) the history pushed up with newlines and erased, then the scroll
+    /// region and the screen rows from the top.
+    fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+        let mut out = String::from("\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J");
+        if !history.is_empty() {
+            out.push_str(&history.join("\r\n"));
+            out.push_str("\x1b[0m\r\n");
+            out.push_str(&"\n".repeat(rows));
+            out.push_str("\x1b[H\x1b[2J");
+        }
+        out.push_str(&format!("\x1b[1;{rows}r\x1b[H"));
+        out.push_str(&screen.join("\r\n"));
+        out.into_bytes()
+    }
+
+    /// A pane fed `chunks` in order, as one attach would deliver them.
+    fn painted(cols: u16, rows: u16, chunks: Vec<Vec<u8>>) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (commands, _credits) = mpsc::sync_channel(64);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        for chunk in chunks {
+            tx.send(Chunk::Data(chunk)).unwrap();
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.is_alive() {
+            assert!(Instant::now() < deadline, "the paint was never parsed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session
+    }
+
+    /// Item 77 (A): scrolling back showed the screen again, as if the rows
+    /// had rotated. Each core repaint (first paint, a RESIZE, showing the
+    /// viewer again) starts with ESC[2J, which copied the screen into the
+    /// phone's scrollback. The scrollback is the pane's history, once.
+    #[test]
+    fn core_repaints_never_copy_the_screen_into_the_scrollback() {
+        let line = |name: &str, n: usize| format!("{name} {n}");
+        // A pane longer than the screen: 30 history rows, a 10-row screen.
+        let history: Vec<String> = (0..30).map(|n| line("old", n)).collect();
+        let screen: Vec<String> = (0..10).map(|n| line("now", n)).collect();
+        let first = core_paint(&history, &screen, 10);
+        let again = core_paint(&[], &screen, 10);
+        let pane = painted(20, 10, vec![first, again.clone(), again]);
+        let shown: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+        let expected: Vec<String> = history.iter().chain(&screen).cloned().collect();
+        assert_eq!(shown, expected);
+        // Every offset shows rows in order, newest at the bottom.
+        let history_rows = pane.grid().lock().history_size();
+        let top = rows_back(&pane, history_rows as i32);
+        assert_eq!(top.first().map(String::as_str), Some("old 0"));
+        // A pane that fits its screen has nothing to scroll back to, however often it is repainted.
+        let short: Vec<String> = (0..4).map(|n| line("note", n)).collect();
+        let fits = painted(20, 10, vec![core_paint(&[], &short, 10), core_paint(&[], &short, 10), core_paint(&[], &short, 10)]);
+        assert_eq!(fits.grid().lock().history_size(), 0);
+        assert_eq!(rows_back(&fits, 5), rows_back(&fits, 0), "nothing to scroll back to");
+    }
+
+    /// A pane fed `chunks` (DATA and the core's RESIZE) in stream order.
+    fn streamed(cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
+        let (tx, rx) = mpsc::sync_channel(64);
+        let (commands, _credits) = mpsc::sync_channel(4096);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9 };
+        let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
+        *lock(&slot) = Arc::downgrade(&pane);
+        pane.set_grid(cols, rows);
+        for chunk in chunks {
+            tx.send(chunk).unwrap();
+        }
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.is_alive() {
+            assert!(Instant::now() < deadline, "the stream was never parsed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pane
+    }
+
+    /// Item 77 / review of #24: after the core resizes a pane it repaints
+    /// only its screen, and it may have moved more (or fewer) rows into its
+    /// history than the phone did. The repaint right after a RESIZE keeps the
+    /// phone's old screen in history, so no row is ever lost; at worst a few
+    /// show twice. Repaints without a RESIZE still copy nothing.
+    #[test]
+    fn a_core_resize_never_loses_a_row_whichever_side_moved_more() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        // The core moved 4 rows into its history (the phone moves 2), and the
+        // core moved none on the way back (the phone pulls some back).
+        for (rows, shown) in [(8u16, 6usize), (8, 8), (6, 6), (12, 10)] {
+            let after = core_paint(&[], &all[all.len() - shown..], usize::from(rows));
+            let pane = streamed(20, 10, vec![Chunk::Data(first.clone()), Chunk::Grid(20, rows), Chunk::Data(after)]);
+            let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+            for line in &all {
+                assert!(rows_seen.contains(line), "{line} lost at 10 -> {rows} rows: {rows_seen:?}");
+            }
+            // In order: each line first appears after the one before it.
+            let firsts: Vec<usize> = all.iter().map(|l| rows_seen.iter().position(|r| r == l).unwrap()).collect();
+            assert!(firsts.windows(2).all(|w| w[0] < w[1]), "out of order at 10 -> {rows}: {rows_seen:?}");
+        }
+        // A repaint with no resize before it copies nothing.
+        let again = core_paint(&[], &all[40..], 10);
+        let pane = streamed(20, 10, vec![Chunk::Data(first), Chunk::Data(again.clone()), Chunk::Data(again)]);
+        let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+        assert_eq!(rows_seen, all);
+    }
+
+    /// A saved copy read back (a switch, a close or a checkpoint wrote it).
+    fn restored(session: &gpui_rio::Session, max_bytes: usize) -> Arc<gpui_rio::Session> {
+        let bytes = crate::snapshot::encode(&session.grid().lock(), max_bytes);
+        let (cols, rows) = session.grid_size();
+        let copy = crate::snapshot::restore(crate::snapshot::Saved { cols, rows, pane: "t1".into(), bytes }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while copy.is_alive() {
+            assert!(Instant::now() < deadline, "the copy was never parsed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        copy
+    }
+
+    #[test]
+    fn a_saved_copy_scrolls_back_through_the_same_history_in_order() {
+        let session = written((20, 6), (20, 4), 30);
+        let copy = restored(&session, crate::snapshot::MAX_BYTES);
+        assert_eq!(copy.grid().lock().history_size(), 27);
+        for offset in [1, 5, 21, 27] {
+            assert_eq!(rows_back(&copy, offset), expected_back(30, 4, offset as usize), "at {offset}");
+        }
+    }
+
+    #[test]
+    fn a_copy_cut_to_its_size_cap_keeps_the_newest_history_in_order() {
+        let session = written((20, 4), (20, 4), 300);
+        // Room for the screen and about 50 rows of history ("row NNN" + CRLF).
+        let copy = restored(&session, 60 * 9);
+        let history = copy.grid().lock().history_size();
+        assert!((40..60).contains(&history), "kept {history} rows");
+        for offset in [1, history / 2, history] {
+            assert_eq!(rows_back(&copy, offset as i32), expected_back(300, 4, offset), "at {offset}");
+        }
+    }
+
+    #[test]
+    fn a_grid_wider_than_the_pane_scrolls_back_in_order_and_keeps_its_pan() {
+        // The core holds a 40-column grid; the phone's pane is 20 wide (#15).
+        let session = written((20, 4), (40, 4), 30);
+        assert_eq!(session.grid_size(), (40, 4));
+        assert_eq!(rows_back(&session, 9), expected_back(30, 4, 9));
+        // Scrolled back, the drawn window starts at the top row and the panned column.
+        assert_eq!(gpui_rio::view_origin((40, 4), (20, 4), (3, 0), true, Some(12)), (0, 12));
+        assert_eq!(gpui_rio::view_origin((40, 4), (20, 4), (3, 0), true, None), (0, 0));
+    }
+
+    #[test]
+    fn a_pane_switched_away_from_is_saved_once_from_the_kept_grid_and_the_slot_stays_bounded() {
+        let _serial = crate::remote::departed_test_lock();
+        let dir = std::env::temp_dir().join(format!("herdr-departed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.snap");
+        let path = path.to_str().unwrap();
+        let read_back = |path: &str| {
+            let saved = crate::snapshot::load(std::path::Path::new(path)).unwrap();
+            let restored = crate::snapshot::restore(saved).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while restored.is_alive() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            restored.screen_text()
+        };
+        // Closed first, then looked at again and switched away from: the
+        // switch's grid is the newer one and wins.
+        crate::remote::closed_for_test(0, grid_with("old copy"), "dep-a");
+        let newer = grid_with("new copy");
+        crate::remote::depart(0, newer.clone(), "dep-a".into());
+        assert!(crate::remote::save_pane(0, "dep-a", path).unwrap());
+        assert!(read_back(path).contains("new copy"));
+        // Freed once saved, and the older closed copy went with the switch.
+        assert!(!crate::remote::departed_holds(&newer));
+        assert!(!crate::remote::save_pane(0, "dep-a", path).unwrap());
+        // Never more than DEPARTED_MAX grids: the oldest goes first.
+        let grids: Vec<_> = (0..=crate::remote::DEPARTED_MAX).map(|n| grid_with(&format!("pane {n}"))).collect();
+        for (n, grid) in grids.iter().enumerate() {
+            crate::remote::depart(0, grid.clone(), format!("dep-b{n}"));
+        }
+        assert!(!crate::remote::departed_holds(&grids[0]));
+        assert!(grids[1..].iter().all(crate::remote::departed_holds));
+        assert!(!crate::remote::save_pane(0, "dep-b0", path).unwrap());
+        // An empty pane id keeps nothing.
+        let nameless = grid_with("nameless");
+        crate::remote::depart(0, nameless.clone(), String::new());
+        assert!(!crate::remote::departed_holds(&nameless));
+        for n in 1..=crate::remote::DEPARTED_MAX {
+            assert!(crate::remote::save_pane(0, &format!("dep-b{n}"), path).unwrap());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// Review #22 finding 2: two computers both have a t1. A save queued for
+    /// one computer's t1 must write that computer's grid, even after the
+    /// other's t1 was switched away from (or closed) before the save ran.
+    #[test]
+    fn a_saved_pane_is_the_grid_its_own_session_showed_never_another_computers_same_pane_id() {
+        let _serial = crate::remote::departed_test_lock();
+        let dir = std::env::temp_dir().join(format!("herdr-origin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.snap");
+        let path = path.to_str().unwrap();
+        let text = |path: &str| {
+            let copy = crate::snapshot::restore(crate::snapshot::load(std::path::Path::new(path)).unwrap()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while copy.is_alive() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            copy.screen_text()
+        };
+        // Session 901 (computer A) leaves its t1; then session 902 (B) leaves its t1.
+        crate::remote::depart(901, grid_with("host A data"), "t1".into());
+        crate::remote::depart(902, grid_with("host B data"), "t1".into());
+        // A's queued save runs now: A's grid, not B's.
+        assert!(crate::remote::save_pane(901, "t1", path).unwrap());
+        assert!(text(path).contains("host A data"));
+        // B's is still kept for B, and a save for a session that kept nothing finds nothing.
+        assert!(!crate::remote::save_pane(903, "t1", path).unwrap());
+        assert!(crate::remote::save_pane(902, "t1", path).unwrap());
+        assert!(text(path).contains("host B data"));
+        // Closes are kept per session too: B's close does not drop A's switch copy, nor the reverse.
+        crate::remote::depart(901, grid_with("A again"), "t1".into());
+        crate::remote::closed_for_test(902, grid_with("B closed"), "t1");
+        crate::remote::depart(902, grid_with("B moved"), "t2".into());
+        assert!(crate::remote::save_pane(901, "t1", path).unwrap());
+        assert!(text(path).contains("A again"));
+        assert!(crate::remote::save_pane(902, "t1", path).unwrap());
+        assert!(text(path).contains("B closed"));
+        assert!(crate::remote::save_pane(902, "t2", path).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review #22 finding 4: the grid is copied under its lock and written
+    /// after it is released, so a save stuck on the disk never blocks the
+    /// painter (which takes the same lock).
+    #[test]
+    fn a_save_waiting_on_the_disk_does_not_hold_the_grid() {
+        let _serial = crate::remote::departed_test_lock();
+        let dir = std::env::temp_dir().join(format!("herdr-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.snap");
+        // The save writes p.tmp first: a FIFO there blocks it until a reader opens it.
+        let fifo = dir.join("p.tmp");
+        let _ = std::fs::remove_file(&fifo);
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let grid = grid_with("painted");
+        crate::remote::depart(904, grid.clone(), "t1".into());
+        let target = path.to_str().unwrap().to_owned();
+        let saver = std::thread::spawn(move || crate::remote::save_pane(904, "t1", &target));
+        // Wait until the save is blocked opening the FIFO, then the grid must be free.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!saver.is_finished(), "the save should be waiting on the FIFO");
+        assert!(grid.grid().try_lock_unfair().is_some(), "the grid is locked during disk I/O");
+        // Release the writer: read the FIFO to its end.
+        let mut bytes = Vec::new();
+        std::fs::File::open(&fifo).unwrap().read_to_end(&mut bytes).unwrap();
+        // (A FIFO cannot be synced, so this save then fails; a file would not.)
+        let _ = saver.join().unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("painted"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_resize_inside_a_synchronized_update_flushes_it_at_the_old_grid_first() {
         // BSU, then a move to column 30 on a 20-column grid plus "A" (buffered
@@ -2793,6 +3591,7 @@ mod claim_tests {
             core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             let (commands, rx) = mpsc::sync_channel(256);
             let owner = Arc::new(Session {
+                id: 0,
                 state: Mutex::new(State {
                     view: json!({"revision":0,"panes":[]}),
                     terminal: None,
@@ -2971,6 +3770,36 @@ mod claim_tests {
         core.close();
     }
 
+    /// Item 77 keeps the outgoing pane's grid on a switch; what the core sees
+    /// (attach parameters, DETACH, RESIZE and VISIBILITY frames, in order, byte
+    /// for byte) is the same as before that change: this test passes unchanged
+    /// on phone-feedback 0ba5116.
+    #[test]
+    fn a_switch_sends_the_core_exactly_what_it_did_and_keeps_the_outgoing_grid() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        let Seen::Attach(first) = core.next() else { panic!("attach first") };
+        assert_eq!(first, attach_params("t1", 90, 40, true));
+        core.measured(2, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 30)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        let outgoing = lock(&core.owner.state).terminal.clone().unwrap();
+
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        assert_eq!(core.next(), Seen::Frame(2, DETACH, Vec::new()));
+        let Seen::Attach(second) = core.next() else { panic!("attach the pick") };
+        assert_eq!(second, attach_params("t2", 100, 30, true), "the attach starts at the measured size");
+        core.measured(3, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(100, 30)));
+        assert_eq!(core.next(), Seen::Frame(3, VISIBILITY, vec![1]));
+        core.quiet(Duration::from_millis(300));
+        assert!(crate::remote::departed_holds(&outgoing), "t1's grid is kept for the phone to save");
+        assert_eq!(
+            core.close(),
+            vec![Seen::Frame(3, VISIBILITY, vec![0]), Seen::Frame(3, DETACH, Vec::new())]
+        );
+    }
+
     #[test]
     fn an_inactive_session_attaches_nothing_until_a_pane_is_picked() {
         let core = Mock::start(json!(["viewer_visibility"]), true, true, false);
@@ -2978,6 +3807,13 @@ mod claim_tests {
         *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
         let Seen::Attach(params) = core.next() else { panic!("attach the pick") };
         assert_eq!(params["terminal"], "t2");
+        // Closed only once the attach was answered: closing while it waits
+        // for its reply ends the session before there is a channel to detach.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&core.owner.state).view["pane_id"] != "t2" {
+            assert!(Instant::now() < deadline, "the attach was never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(core.close().iter().any(|seen| *seen == Seen::Frame(2, DETACH, Vec::new())));
     }
 }

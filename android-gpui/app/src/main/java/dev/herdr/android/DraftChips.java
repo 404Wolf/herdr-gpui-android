@@ -22,12 +22,15 @@ final class DraftChips {
         final int color;
         final float density;
         final Map<String, Long> lengths;
+        /** Recordings the desktop gave up on: their chips say so, and "retry" sends them again. */
+        final java.util.Set<String> parked;
         final Drawable clock;
 
-        Style(int color, float density, Map<String, Long> lengths, Drawable clock) {
+        Style(int color, float density, Map<String, Long> lengths, java.util.Set<String> parked, Drawable clock) {
             this.color = color;
             this.density = density;
             this.lengths = lengths;
+            this.parked = parked;
             this.clock = clock;
         }
     }
@@ -57,8 +60,13 @@ final class DraftChips {
 
     /** The words on a chip. */
     static String label(Long durationMs) {
-        return durationMs == null ? "waiting for desktop"
-                : clock(durationMs) + " waiting for desktop";
+        return label(durationMs, false);
+    }
+
+    /** The words on a chip; a parked recording's say it is not transcribed and can be retried. */
+    static String label(Long durationMs, boolean parked) {
+        String state = parked ? "not transcribed yet · retry" : "waiting for desktop";
+        return durationMs == null ? state : clock(durationMs) + " " + state;
     }
 
     /** Puts a chip over every token in {@code text}, replacing the old ones. */
@@ -66,7 +74,7 @@ final class DraftChips {
         for (Chip old : text.getSpans(0, text.length(), Chip.class)) text.removeSpan(old);
         Matcher m = DictationToken.PATTERN.matcher(text);
         while (m.find()) {
-            text.setSpan(new Chip(label(style.lengths.get(m.group(1))), style),
+            text.setSpan(new Chip(label(style.lengths.get(m.group(1)), style.parked.contains(m.group(1))), style),
                     m.start(), m.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
         }
     }

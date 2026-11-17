@@ -18,6 +18,26 @@ final class RendererTouch {
      */
     static final int SLOP_DP = 8;
 
+    /** A drag still within the slop: no axis yet. */
+    static final int AXIS_NONE = 0;
+    /** A sideways drag: the renderer pans a grid wider than the pane. */
+    static final int AXIS_X = 1;
+    /** An up-or-down drag: the activity scrolls the conversation. */
+    static final int AXIS_Y = 2;
+
+    /**
+     * The axis a drag locks to once it leaves the slop, as GPUI's recognizer
+     * decides it (the movement's length past the slop, then its dominant
+     * axis, vertical on a tie). The activity and the renderer must agree:
+     * a drag GPUI locked sideways is a pan for the rest of the gesture, so
+     * the activity must not take it for a scroll when it later drifts
+     * vertically. {@code slopPx} is {@link #SLOP_DP} in pixels.
+     */
+    static int axis(float dx, float dy, float slopPx) {
+        if (Float.isNaN(dx) || Float.isNaN(dy) || Math.hypot(dx, dy) <= slopPx) return AXIS_NONE;
+        return Math.abs(dx) <= Math.abs(dy) ? AXIS_Y : AXIS_X;
+    }
+
     /** No finger: the renderer follows none, or was told the gesture is gone. */
     static final int NONE = -1;
 

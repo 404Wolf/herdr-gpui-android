@@ -39,6 +39,10 @@ macro_rules! __bind_gpui {
                 bounds: Bounds<Pixels>,
                 /// The grid cell (row, column) drawn at the pane's top-left.
                 view_origin: (i32, usize),
+                /// A column the reader panned a wider grid to (see `ColumnPan`).
+                pan: $crate::ColumnPan,
+                /// The pane's size in cells at the last paint.
+                pane: (u16, u16),
                 cell: Size<Pixels>,
                 selecting: bool,
                 scroll_delta: f32,
@@ -110,6 +114,8 @@ macro_rules! __bind_gpui {
                             visible: true,
                             bounds: Bounds::default(),
                             view_origin: (0, 0),
+                            pan: $crate::ColumnPan::default(),
+                            pane: (0, 0),
                             cell: size(px(8.), px(18.)),
                             selecting: false,
                             scroll_delta: 0.,
@@ -177,6 +183,16 @@ macro_rules! __bind_gpui {
                 /// its touch begin, never one begun on a view it replaced mid-tap.
                 pub fn set_touch_presses(&mut self, touch: bool) {
                     self.touch_presses = touch;
+                }
+                /// Pans a grid wider than the pane `dx` to the right (negative:
+                /// left), as the host's pan buttons do. Client-local: the program
+                /// sees nothing. Holds until the grid's width changes or the user
+                /// types (see `ColumnPan`). True when the window moved; the host
+                /// then notifies this view.
+                pub fn pan(&mut self, dx: Pixels) -> bool {
+                    let columns = f32::from(dx) / f32::from(self.cell.width);
+                    let (grid_cols, _) = self.session.grid_size();
+                    self.pan.pan(columns, self.view_origin.1, (grid_cols, self.pane.0), self.session.inputs())
                 }
                 fn tap_stamp(&self) -> $crate::tap::Gesture {
                     self.tap_listener.as_ref().map_or($crate::tap::Gesture::NONE, |(stamp, _)| stamp())
@@ -342,16 +358,26 @@ macro_rules! __bind_gpui {
                     let hex = |color: u32| -> Hsla { rgb(color & 0x00ff_ffff).into() };
                     let colors = ghost.colors;
                     let mut caret: Option<Point<Pixels>> = None;
+                    // The keyboard's cursor, when the host says where it is in the draft.
+                    let mut explicit: Option<Point<Pixels>> = None;
                     for run in placed {
                         let len = run.text.chars().count();
+                        let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
+                        if run.style == GhostStyle::Caret {
+                            if anchor.is_some_and(|a| run.row >= a.row) {
+                                explicit = Some(at);
+                            }
+                            continue;
+                        }
                         if len == 0 {
                             continue;
                         }
-                        let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
                         let width = self.cell.width * len;
-                        window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(colors.background)));
+                        let back = if run.style == GhostStyle::Selected { colors.info } else { colors.background };
+                        window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(back)));
                         let color = match run.style {
                             GhostStyle::Text | GhostStyle::Partial => colors.text,
+                            GhostStyle::Selected | GhostStyle::Caret => colors.background,
                             GhostStyle::Echo | GhostStyle::Tag | GhostStyle::Dim => colors.dim,
                             GhostStyle::Chip | GhostStyle::Warn => colors.warn,
                             GhostStyle::Bright => colors.bright,
@@ -389,61 +415,75 @@ macro_rules! __bind_gpui {
                             }
                         }
                         if anchor.is_some_and(|a| run.row >= a.row)
-                            && matches!(run.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip)
+                            && matches!(
+                                run.style,
+                                GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip | GhostStyle::Selected
+                            )
                         {
                             caret = Some(at + point(width, px(0.)));
                         }
                     }
-                    if let Some(at) = caret {
+                    if let Some(at) = explicit.or(caret) {
                         window.paint_quad(fill(Bounds::new(at, size(px(1.5), self.cell.height)), hex(colors.text)));
                     }
                 }
 
                 fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
                     self.bounds = bounds;
-                    let font_size = px(if self.style.font_size.is_finite() {
+                    let base_size = if self.style.font_size.is_finite() {
                         self.style.font_size.clamp(1., 256.)
-                    } else { 13. });
+                    } else { 13. };
                     let font = font(terminal_font_family(self.style.font_family.clone().into(), cx));
-                    let run = TextRun {
-                        len: 1,
-                        font: font.clone(),
-                        color: rgb_color(self.style.theme.foreground),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let measure = window
-                        .text_system()
-                        .shape_line("M".into(), font_size, &[run], None);
                     // The font's own line spacing, as other terminals use: tall
                     // glyphs and box drawing meet row to row, and no added leading
                     // takes rows from a small screen.
-                    self.cell = size(
-                        measure.width.max(px(1.)),
-                        (measure.ascent + measure.descent).ceil().max(px(1.)),
+                    let measure = |font_size: f32, window: &mut Window| {
+                        let run = TextRun {
+                            len: 1,
+                            font: font.clone(),
+                            color: rgb_color(self.style.theme.foreground),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let m = window.text_system().shape_line("M".into(), px(font_size), &[run], None);
+                        size(m.width.max(px(1.)), (m.ascent + m.descent).ceil().max(px(1.)))
+                    };
+                    let base_cell = measure(base_size, window);
+                    let pixels = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                    // The pane is measured, and offered, at the style's own size
+                    // only: what the type grows to below never reaches the remote
+                    // side, so it can never feed back into the grid.
+                    let (cols, rows) = $crate::pane_cells(
+                        pixels,
+                        (f32::from(base_cell.width), f32::from(base_cell.height)),
                     );
-                    let cols = (f32::from(bounds.size.width) / f32::from(self.cell.width))
-                        .floor()
-                        .clamp(2., 1000.) as u16;
-                    let rows = (f32::from(bounds.size.height) / f32::from(self.cell.height))
-                        .floor()
-                        .clamp(1., 1000.) as u16;
                     // Resize before locking: the session locks the grid itself.
-                    self.session.resize(
-                        cols,
-                        rows,
-                        f32::from(bounds.size.width) as u16,
-                        f32::from(bounds.size.height) as u16,
-                    );
-                    // The grid may be the remote side's negotiated one. Smaller than
-                    // the pane: drawn whole, the rest left empty (letterboxed).
+                    self.session.resize(cols, rows, pixels.0 as u16, pixels.1 as u16);
+                    // The grid may be the remote side's negotiated one. Fewer
+                    // columns than the pane: drawn with type grown to fill it
+                    // (when the host asks), the rest left empty (letterboxed).
                     // Larger: a pane-sized window into it that follows the caret.
                     let (grid_cols, grid_rows) = self.session.grid_size();
-                    let pane = (cols, rows);
+                    let drawn_size = self.style.grow_to_grid.map_or(base_size, |max| {
+                        $crate::fitted_font_size(
+                            base_size,
+                            (f32::from(base_cell.width), f32::from(base_cell.height)),
+                            pixels,
+                            (grid_cols, grid_rows),
+                            max,
+                        )
+                    });
+                    self.cell = if drawn_size == base_size { base_cell } else { measure(drawn_size, window) };
+                    let font_size = px(drawn_size);
+                    let pane = if drawn_size == base_size {
+                        (cols, rows)
+                    } else {
+                        $crate::pane_cells(pixels, (f32::from(self.cell.width), f32::from(self.cell.height)))
+                    };
                     let (cols, rows) = (
-                        usize::from(cols.min(grid_cols)),
-                        usize::from(rows.min(grid_rows)),
+                        usize::from(pane.0.min(grid_cols)),
+                        usize::from(pane.1.min(grid_rows)),
                     );
                     let theme = self.style.theme;
                     let mut grid = self.session.grid().lock();
@@ -453,11 +493,16 @@ macro_rules! __bind_gpui {
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
                     let offset = grid.display_offset() as i32;
-                    let (row_off, col_off) = if offset == 0 {
-                        $crate::viewport_origin((grid_cols, grid_rows), pane, (cursor.pos.row.0, cursor.pos.col.0))
-                    } else {
-                        (0, 0)
-                    };
+                    // A column the reader panned to wins over the caret, in
+                    // history too, so wide rows can be read to their end.
+                    self.pane = pane;
+                    let (row_off, col_off) = $crate::view_origin(
+                        (grid_cols, grid_rows),
+                        pane,
+                        (cursor.pos.row.0, cursor.pos.col.0),
+                        offset != 0,
+                        self.pan.column((grid_cols, pane.0), self.session.inputs()),
+                    );
                     self.view_origin = (row_off, col_off);
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
@@ -508,7 +553,7 @@ macro_rules! __bind_gpui {
                                 ));
                             }
                             if let Some((spans, _)) = &self.pressed_link
-                                && spans.iter().any(|(line, range)| *line == pos.row && range.contains(&col))
+                                && $crate::links::pressed(spans, &pos.row, col, col_off)
                             {
                                 // Pressed link: a soft wash and a rule under it.
                                 let mut wash = rgb_color(theme.foreground);
@@ -585,6 +630,23 @@ macro_rules! __bind_gpui {
                     }
                     grid.reset_damage();
                     drop(grid);
+                    // More of a wider grid off either side: a faint rule on that
+                    // edge, so a cut row is not taken for the whole row.
+                    let mut edge = rgb_color(theme.foreground);
+                    edge.a = 0.35;
+                    let drawn_width = self.cell.width * cols;
+                    let drawn_height = self.cell.height * rows as f32;
+                    for (shown, x) in [
+                        (col_off > 0, px(0.)),
+                        (col_off + cols < usize::from(grid_cols), drawn_width - px(2.)),
+                    ] {
+                        if shown {
+                            window.paint_quad(fill(
+                                Bounds::new(bounds.origin + point(x, px(0.)), size(px(2.), drawn_height)),
+                                edge,
+                            ));
+                        }
+                    }
                     // The caret as drawn, only while visible and the view is at the bottom.
                     let caret = (cursor.content != CursorShape::Hidden && offset == 0)
                         .then(|| {
@@ -799,7 +861,18 @@ macro_rules! __bind_gpui {
                         )
                         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                             this.cancel_press();
-                            let delta = event.delta.pixel_delta(this.cell.height).y;
+                            let delta = event.delta.pixel_delta(this.cell.height);
+                            // A sideways drag (GPUI locks a touch pan to one axis)
+                            // pans a grid wider than the pane; the content follows
+                            // the finger. Otherwise it scrolls history as before.
+                            if delta.x.abs() > delta.y.abs() {
+                                if this.pan(-delta.x) {
+                                    cx.notify();
+                                }
+                                cx.stop_propagation();
+                                return;
+                            }
+                            let delta = delta.y;
                             this.scroll_delta += f32::from(delta) / f32::from(this.cell.height);
                             let lines = this.scroll_delta.trunc() as i32;
                             this.scroll_delta -= lines as f32;

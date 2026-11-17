@@ -27,6 +27,40 @@ public final class Dictation {
                 settings.dictationFinalTimeoutMs);
     }
 
+    private static DictationEngine shared;
+    private static URI sharedUrl;
+    /** The composer whose session the shared engine runs, or null. */
+    private static Object owner;
+
+    /**
+     * The process's one engine, made on first use and again only when the provisioned server
+     * changes: Herdr has one microphone entry point ("talk"), and one engine means one
+     * recording, whichever window started it. Call on the main thread.
+     */
+    public static DictationEngine shared(Context context) {
+        URI url = ProvisionedSettings.get(context).dictationUrl;
+        if (shared == null || !java.util.Objects.equals(url, sharedUrl)) {
+            if (shared != null) shared.cancel();
+            owner = null;
+            shared = create(context.getApplicationContext());
+            sharedUrl = url;
+        }
+        return shared;
+    }
+
+    /** {@code composer} starts a session on the shared engine. */
+    static void own(Object composer) { owner = composer; }
+
+    /** {@code composer}'s session ended (or it never had one). */
+    static void release(Object composer) {
+        if (owner == composer) owner = null;
+    }
+
+    static boolean owns(Object composer) { return owner == composer; }
+
+    /** Another window's composer has a session running on the shared engine. */
+    static boolean busyElsewhere(Object composer) { return owner != null && owner != composer; }
+
     /** The process's recordings waiting for the desktop (none ever without a server). */
     public static PendingDictations pending(Context context) {
         return PendingDictations.shared(context, ProvisionedSettings.get(context).dictationUrl);

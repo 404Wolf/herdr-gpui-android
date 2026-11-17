@@ -115,4 +115,38 @@ public final class RendererTouchTest {
         // window's logical pixel is a dp.
         assertEquals(8, RendererTouch.SLOP_DP);
     }
+
+    @Test
+    public void aDragLocksToOneAxisWhereGpuiDoes() {
+        float slop = 8f * 2.625f; // 8 dp at 420 dpi
+        // Within the slop: no axis yet, whichever way it leans.
+        assertEquals(RendererTouch.AXIS_NONE, RendererTouch.axis(-14f, 14f, slop));
+        assertEquals(RendererTouch.AXIS_NONE, RendererTouch.axis(0f, 0f, slop));
+        // Past it: the dominant axis, vertical on a tie (GPUI's rule).
+        assertEquals(RendererTouch.AXIS_X, RendererTouch.axis(-30f, 9f, slop));
+        assertEquals(RendererTouch.AXIS_X, RendererTouch.axis(22f, -3f, slop));
+        assertEquals(RendererTouch.AXIS_Y, RendererTouch.axis(9f, -30f, slop));
+        assertEquals(RendererTouch.AXIS_Y, RendererTouch.axis(20f, 20f, slop));
+        assertEquals(RendererTouch.AXIS_NONE, RendererTouch.axis(Float.NaN, 40f, slop));
+    }
+
+    @Test
+    public void aSidewaysDragStaysTheRenderersAfterItDriftsVertically() {
+        // The activity's rule, step by step: the axis is decided once. A pan
+        // that later drifts 9 px down (past the old |dy| > slop test) is never
+        // claimed for a scroll, so the renderer keeps the whole gesture.
+        float slop = 21f;
+        Renderer renderer = new Renderer();
+        renderer.down(0);
+        int locked = RendererTouch.AXIS_NONE;
+        float[][] moves = {{-4f, 1f}, {-22f, 4f}, {-30f, 9f}, {-60f, 30f}};
+        for (float[] move : moves) {
+            if (locked == RendererTouch.AXIS_NONE) locked = RendererTouch.axis(move[0], move[1], slop);
+            if (locked == RendererTouch.AXIS_Y) renderer.claim();
+            renderer.event("move");
+        }
+        renderer.up();
+        assertEquals(RendererTouch.AXIS_X, locked);
+        assertEquals(java.util.Arrays.asList("down 0", "move", "move", "move", "move", "up"), renderer.sent);
+    }
 }

@@ -109,6 +109,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private ScrollView sidebarScroll;
     private ImageButton sidebarButton;
+    /**
+     * Wolf's item 83: the docked rail open, minimized to a strip or closed,
+     * this device's choice (RailPanel). The strip is shown while the rail is
+     * closed and {@code railMinimized}; it and the toolbar's rail button keep
+     * the needs-you badge, the bar's count ({@code barNeedYou}).
+     */
+    private RailPanel railPanel = RailPanel.DEFAULT;
+    private boolean railMinimized;
+    private int barNeedYou;
+    private LinearLayout railBody, railControls, railStrip;
+    private TextView railStripBadge, sidebarBadge;
     /** Rail parent when it sits beside the terminal; compact windows float it instead. */
     private LinearLayout railColumns;
     private View railScrim, railEdge, railFade;
@@ -198,6 +209,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         flingRemainder = 0f;
     }
     private boolean scrolling;
+    /** The current drag left the slop sideways: the renderer pans it to its end. */
+    private boolean panning;
     /** Locally accumulated scrollback target; polls only resync it while idle. */
     private long desiredScroll, lastSentScroll = -1;
     /** A fetch whose frame never arrived is asked for again after this long. */
@@ -358,6 +371,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabStrip.setGravity(android.view.Gravity.CENTER_VERTICAL);
         tabStrip.setPadding(dp(6), 0, dp(6), 0);
         tabScroll.addView(tabStrip, new FrameLayout.LayoutParams(-2, -1));
+        // The shown window stays whole when the bar is rebuilt (its chips laid
+        // out only then) and when its width changes (a fold, a rotation).
+        tabStrip.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (revealPending) revealActiveChip();
+        });
+        tabScroll.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (r - l != or - ol) v.post(this::revealActiveChip);
+        });
         // An agent's pane has no bottom bar: the strip's end holds what the bar's
         // buttons did (panes, hosts, view, session, close).
         tabRow = new PullDownRow(this);
@@ -392,7 +413,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         content.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
             if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
         });
-        composer = new ComposerBar(this, chrome, Dictation.create(this), composerHost());
+        composer = new ComposerBar(this, chrome, Dictation.shared(this), composerHost());
         Dictation.pending(this).setListener(pendingDictations);
         composer.setWaiting(Dictation.pending(this).count());
         shortcutBar = createShortcutBar();
@@ -421,11 +442,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         sidebarScroll.addView(sidebarRows, new android.widget.FrameLayout.LayoutParams(-1, -2));
         // Hosts and workspaces exceed one screen; the fade says the list keeps going.
         android.widget.FrameLayout railFrame = new android.widget.FrameLayout(this);
-        railFrame.addView(sidebarScroll, new android.widget.FrameLayout.LayoutParams(-1, -1));
+        // Docked, the rail's own header minimizes or closes it (item 83); the
+        // list scrolls under it.
+        railBody = new LinearLayout(this);
+        railBody.setOrientation(LinearLayout.VERTICAL);
+        railControls = createRailControls();
+        railBody.addView(railControls, new LinearLayout.LayoutParams(-1, dp(48)));
+        railBody.addView(sidebarScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        railFrame.addView(railBody, new android.widget.FrameLayout.LayoutParams(-1, -1));
         railFade = new View(this);
         railFade.setLayoutParams(new android.widget.FrameLayout.LayoutParams(
                 -1, dp(24), android.view.Gravity.BOTTOM));
         railFrame.addView(railFade);
+        railStrip = createRailStrip();
+        railFrame.addView(railStrip, new android.widget.FrameLayout.LayoutParams(-1, -1));
         sidebar.addView(railFrame, new LinearLayout.LayoutParams(0, -1, 1));
         railEdge = new View(this);
         sidebar.addView(railEdge, new LinearLayout.LayoutParams(dp(1), -1));
@@ -492,14 +522,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean railOverlay;
 
     private boolean railAsDrawer() {
-        return compactWindow() || railOverlay;
+        return railShown().drawer(compactWindow());
     }
 
     /** Opens the rail as a drawer over the terminal, never narrowing it. */
     private void showRailOverlay() {
         if (sidebarOpen) return;
-        railOverlay = !compactWindow();
-        setSidebarOpen(true);
+        // Transient: nothing docked (the stored choice, the strip) changes.
+        setRailShown(railShown().floated(compactWindow()));
+        applySidebarWidth();
+        updateHostSampling();
+        revealedPane = "";
+        refreshSidebar(true);
+    }
+
+    /** The rail as it is now (item 83's transitions are RailPanel.Shown's). */
+    private RailPanel.Shown railShown() {
+        return new RailPanel.Shown(sidebarOpen, railOverlay, railMinimized);
+    }
+
+    private void setRailShown(RailPanel.Shown next) {
+        if (sidebarOpen != next.open) sidebarSignature = null;
+        sidebarOpen = next.open;
+        railOverlay = next.overlay;
+        railMinimized = next.minimized;
     }
 
     private void styleRail() {
@@ -526,6 +572,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railFade.setBackground(new android.graphics.drawable.GradientDrawable(
                 android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
                 new int[] {GpuiChrome.withAlpha(chrome.surface, 0), chrome.surface}));
+        for (android.view.ViewGroup group : new android.view.ViewGroup[] {railControls, railStrip}) {
+            for (int i = 0; group != null && i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child instanceof TextView && child != railStripBadge) {
+                    ((TextView) child).setTextColor(chrome.onSurfaceVariant);
+                }
+            }
+        }
+        updateRailBadge();
     }
 
     /** Moves the rail between the drawer layer and the column beside the terminal. */
@@ -700,6 +755,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (banner != null) banner.setVisibility(View.GONE);
     }
 
+    /**
+     * Another computer was picked: the attempt in flight (a reconnect or a
+     * switch) is for the old one. Its opening handle is closed so it fails
+     * fast, and whatever it returns later is ignored. Main thread.
+     */
+    private void pickedAnotherHost() {
+        hostEpoch.change();
+        long opening = reconnectHandle;
+        reconnectHandle = 0;
+        if (opening > 0) RemoteNative.close(opening);
+    }
+
+    /** After a stale attempt ends: try the computer picked now, if one is wanted. Main thread. */
+    private void retryCurrentHost() {
+        if (destroyed || !hostResumed || monitor == null || !monitor.reconnecting()) return;
+        reconnectCurrentHost();
+    }
+
     /** Reuses the saved host for this session; no credential is kept in memory. */
     private void reconnectCurrentHost() {
         if (shellMode()) {
@@ -712,6 +785,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (reconnectRunning) return;
         reconnectRunning = true;
         final String id = currentHostId;
+        final int epoch = hostEpoch.now();
         hideReconnectBanner();
         publishCurrent("Reconnecting…");
         worker.execute(() -> {
@@ -727,6 +801,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (host == null) {
                 runOnUiThread(() -> {
                     reconnectRunning = false;
+                    if (destroyed || !hostResumed) return;
+                    // A lookup for a computer no longer picked must not stop the
+                    // monitor, label or banner of the one picked since.
+                    if (hostEpoch.stale(epoch)) {
+                        retryCurrentHost();
+                        return;
+                    }
                     if (monitor != null) monitor.succeeded();
                     showLinkUp();
                     showReconnectBanner("Open the host list to reconnect");
@@ -747,6 +828,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 reconnectHandle = handle;
                 // Paused before the handle was published: attach nothing.
                 if (!hostResumed) throw new IllegalStateException("left the screen");
+                // Another computer was picked meanwhile (it closed the handle if it saw it).
+                if (hostEpoch.stale(epoch)) throw new IllegalStateException("another computer was picked");
                 // The same computer again: back to its remembered terminal, not its Deacon.
                 String chosen = awaitHostPane(handle, host.id, null, false);
                 reconnectHandle = 0;
@@ -760,8 +843,21 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         RemoteNative.close(readyHandle);
                         return;
                     }
+                    if (hostEpoch.stale(epoch) || !readyHost.id.equals(currentHostId)) {
+                        // Another computer was picked while this one connected: never adopt it.
+                        RemoteNative.close(readyHandle);
+                        retryCurrentHost();
+                        return;
+                    }
                     hideReconnectBanner();
                     adoptHost(readyHost, readyHandle, readyPane);
+                    // A pane picked offline after the session chose where to land.
+                    String picked = rememberedHostPane(readyHost.id);
+                    Connection now;
+                    synchronized (stateLock) { now = connection; }
+                    if (now != null && !picked.isEmpty() && !picked.equals(readyPane) && hasPane(now.panes, picked)) {
+                        focusRemotePane(now, picked);
+                    }
                 });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
@@ -772,6 +868,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     reconnectRunning = false;
                     // Left the screen meanwhile: onResume reconnects; say nothing.
                     if (!hostResumed) return;
+                    // A stale attempt for a computer no longer picked says nothing either.
+                    if (hostEpoch.stale(epoch)) {
+                        retryCurrentHost();
+                        return;
+                    }
                     if (monitor != null) {
                         // Keep trying, quickly, while the terminal is on screen.
                         monitor.failed();
@@ -851,7 +952,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!shellMode()) {
             sidebarButton = iconButton(R.drawable.ic_bar_hosts, "Hosts",
                     "Show the host and workspace sidebar", view -> toggleSidebar());
-            pinned.addView(sidebarButton);
+            // While the rail is not open, its button keeps the needs-you badge (item 83).
+            FrameLayout railButton = new FrameLayout(this);
+            sidebarButton.setLayoutParams(new FrameLayout.LayoutParams(dp(48), dp(48)));
+            railButton.addView(sidebarButton);
+            sidebarBadge = needYouBadge(10);
+            railButton.addView(sidebarBadge, new FrameLayout.LayoutParams(-2, -2,
+                    android.view.Gravity.TOP | android.view.Gravity.END));
+            pinned.addView(railButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
             pinned.addView(iconButton(R.drawable.ic_bar_panes, "Panes",
                     "Workspaces, tabs and panes for this host", view -> showPanes()));
         }
@@ -915,6 +1023,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         View bar = composer.bar(chrome, pinned, scrolling);
         updateControlButton();
         updateRailToggle();
+        // A rebuilt toolbar (theme, posture) gets the badge now, not at the count's next change.
+        updateRailBadge();
         return bar;
     }
 
@@ -1011,13 +1121,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         android.content.Context themed = new android.view.ContextThemeWrapper(this, chrome.popupTheme());
         android.widget.PopupMenu menu = new android.widget.PopupMenu(themed, anchor);
         ColorStateList tint = ColorStateList.valueOf(themeColor(themed, android.R.attr.textColorPrimary));
-        menu.getMenu().add(0, 1, 0, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
-        menu.getMenu().add(0, 2, 1, "Session actions").setIcon(R.drawable.ic_bar_session).setIconTintList(tint);
-        menu.getMenu().add(0, 3, 2, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
+        menu.getMenu().add(0, 1, MoreMenu.VIEW, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
+        menu.getMenu().add(0, 2, MoreMenu.SESSION, "Session actions").setIcon(R.drawable.ic_bar_session)
+                .setIconTintList(tint);
+        menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
         if (navigation && !shellMode()) {
-            menu.getMenu().add(0, 4, -2, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
-            menu.getMenu().add(0, 5, -1, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts).setIconTintList(tint);
-            menu.getMenu().add(0, 6, 3, "Gestures");
+            menu.getMenu().add(0, 4, MoreMenu.PANES, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
+            menu.getMenu().add(0, 5, MoreMenu.HOSTS, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts)
+                    .setIconTintList(tint);
+            menu.getMenu().add(0, 6, MoreMenu.GESTURES, "Gestures");
         }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
@@ -1722,8 +1834,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             note("Trust " + host.name + " from Remote hosts first");
             return;
         }
+        if (monitor != null && monitor.offline()) {
+            // No network at all: no attempt to wait on, show it from the cache.
+            switchHostOffline(host, pane);
+            return;
+        }
         switchingHost = true;
         switchingTo = host.id;
+        pickedAnotherHost();
+        final int epoch = hostEpoch.now();
         // The mirror for this host is released before the real session opens;
         // two connections to one host would waste the handle budget.
         HostSample target = hostSamples.get(host.id);
@@ -1750,14 +1869,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 String chosen = awaitHostPane(handle, host.id, forcedPane, true);
                 final long readyHandle = handle;
                 final String readyPane = chosen;
-                runOnUiThread(() -> adoptHost(host, readyHandle, readyPane));
+                runOnUiThread(() -> {
+                    if (hostEpoch.stale(epoch)) {
+                        // Picked something else meanwhile.
+                        RemoteNative.close(readyHandle);
+                        switchingHost = false;
+                        switchingTo = null;
+                        return;
+                    }
+                    adoptHost(host, readyHandle, readyPane);
+                });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
                 if (handle != 0) RemoteNative.close(handle);
                 runOnUiThread(() -> {
                     switchingHost = false;
                     switchingTo = null;
-                    note("Could not switch to " + host.name);
+                    if (destroyed || !hostResumed || hostEpoch.stale(epoch)) return;
+                    // Unreachable: show it from the cache; the monitor keeps trying it.
+                    switchHostOffline(host, forcedPane);
                 });
             }
         });
@@ -1819,13 +1949,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (pane.isEmpty() || !hasPane(panes, pane)) pane = panes.getJSONObject(0).optString("id", "");
         rememberHostPane(hostId, pane);
         if (pane.isEmpty()) throw new IllegalStateException("no pane id");
-        RemoteNative.focus(handle, pane);
-        until = SystemClock.uptimeMillis() + 20_000;
-        while (SystemClock.uptimeMillis() < until) {
-            state = new JSONObject(RemoteNative.poll(handle, 0, false));
-            if (pane.equals(state.optString("pane_id"))
-                    && "ready".equals(state.optString("state"))) return pane;
-            Thread.sleep(150);
+        // A pane picked offline while this connected (item 77) is where it lands.
+        for (int pick = 0; pick < 3; pick++) {
+            RemoteNative.focus(handle, pane);
+            until = SystemClock.uptimeMillis() + 20_000;
+            boolean landed = false;
+            while (!landed && SystemClock.uptimeMillis() < until) {
+                state = new JSONObject(RemoteNative.poll(handle, 0, false));
+                landed = pane.equals(state.optString("pane_id")) && "ready".equals(state.optString("state"));
+                if (!landed) Thread.sleep(150);
+            }
+            if (!landed) break;
+            String picked = rememberedHostPane(hostId);
+            if (machineSwitch || picked.isEmpty() || picked.equals(pane) || !hasPane(panes, picked)) return pane;
+            pane = picked;
         }
         return pane;
     }
@@ -1842,7 +1979,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (previous != null) previous.close();
             // Resuming the same host keeps the last frame, the strip and the
             // keyboard until the new session paints; another host starts clean.
-            boolean resume = previous != null && previous.remoteHandle > 0 && host.id.equals(currentHostId);
+            boolean resume = previous != null && (previous.remoteHandle > 0 || previous.offline)
+                    && host.id.equals(currentHostId);
+            checkpoint.reset();
             if (!resume) pendingInput.discardAll();
             next = new Connection(GENERATIONS.incrementAndGet(), handle);
             if (resume) {
@@ -1885,15 +2024,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // The stored value is the preference for a panel with room. Folding to the
         // cover must not keep half the terminal covered by the rail, and unfolding
         // restores what the user asked for.
+        // Item 83: the stored choice is open, minimized to a strip, or closed.
         int widthDp = getResources().getConfiguration().screenWidthDp;
-        boolean wantsRail = getSharedPreferences("terminal-display", MODE_PRIVATE)
-                .getBoolean("list", true);
-        boolean fits = widthDp >= 600;
-        boolean open = wantsRail && fits && !shellMode();
-        if (sidebarOpen != open) sidebarSignature = null;
-        sidebarOpen = open;
+        // A drawer open across the fold ends here: it never decides the docked choice.
+        railPanel = storedRailPanel();
+        RailPanel.Shown next = RailPanel.Shown.configured(railPanel, widthDp >= 600, shellMode());
+        boolean opening = next.open && !sidebarOpen;
+        setRailShown(next);
         applySidebarWidth();
         updateHostSampling();
+        // A closed rail builds no rows (refreshSidebar), so one docked by
+        // unfolding would stay empty until the tree next changed: fill it now.
+        if (opening) refreshSidebar(true);
     }
 
     private static SurfaceView findSurface(View view) {
@@ -1961,20 +2103,148 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void setSidebarOpen(boolean open) {
-        sidebarOpen = open;
         // The stored choice is for a pinned panel with room; a drawer (the
-        // cover's, or one opened by a gesture) is transient.
-        boolean transientDrawer = railAsDrawer();
-        if (!open) railOverlay = false;
-        if (!transientDrawer) {
-            getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                    .putBoolean("list", sidebarOpen).apply();
-        }
+        // cover's, or one opened by a gesture) is transient: it shuts to what
+        // was docked, the strip included.
+        if (!railAsDrawer()) storeRailPanel(railPanel.with(open ? RailPanel.Mode.OPEN : RailPanel.Mode.CLOSED));
+        setRailShown(railShown().toggled(open, compactWindow()));
         applySidebarWidth();
         updateHostSampling();
         if (sidebarOpen) {
             revealedPane = "";
             refreshSidebar(true);
+        }
+    }
+
+    /** This device's choice for the docked rail (item 83); the older open/closed flag before it. */
+    private RailPanel storedRailPanel() {
+        SharedPreferences preferences = getSharedPreferences("terminal-display", MODE_PRIVATE);
+        return RailPanel.read(preferences.getString(RailPanel.MODE_KEY, null),
+                preferences.getString(RailPanel.LAST_KEY, null),
+                preferences.contains(RailPanel.LEGACY_KEY) ? preferences.getBoolean(RailPanel.LEGACY_KEY, true) : null);
+    }
+
+    private void storeRailPanel(RailPanel next) {
+        railPanel = next;
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                .putString(RailPanel.MODE_KEY, RailPanel.name(next.mode))
+                .putString(RailPanel.LAST_KEY, RailPanel.name(next.last))
+                .putBoolean(RailPanel.LEGACY_KEY, next.mode == RailPanel.Mode.OPEN).apply();
+    }
+
+    /**
+     * The docked rail to {@code next} (item 83): open beside the terminal, a
+     * strip with the needs-you badge, or closed. The terminal takes the width
+     * it frees, as the toolbar's toggle has always made it. On the cover there
+     * is nothing docked: the rail stays the drawer its button opens.
+     */
+    private void setRailPanel(RailPanel next) {
+        if (shellMode()) return;
+        if (compactWindow()) {
+            note("Unfold the phone to dock, minimize or close the rail");
+            return;
+        }
+        storeRailPanel(next);
+        RailPanel.Shown shown = RailPanel.Shown.docked(next);
+        boolean opening = shown.open && !sidebarOpen;
+        setRailShown(shown);
+        applySidebarWidth();
+        updateHostSampling();
+        if (opening) {
+            revealedPane = "";
+            refreshSidebar(true);
+        }
+    }
+
+    /** ctrl-alt-w closes the rail and brings back what was there; ctrl-alt-b minimizes it and back. */
+    private void railKey(boolean close) {
+        if (compactWindow()) {
+            toggleSidebar();
+            return;
+        }
+        // What the rail shows now, an open drawer over the terminal included, is what the key acts on.
+        RailPanel now = sidebarOpen && railAsDrawer() ? railPanel.with(RailPanel.Mode.OPEN) : railPanel;
+        setRailPanel(close ? now.toggle() : now.minimize());
+    }
+
+    /** The docked rail's header: minimize to the strip, close (item 83). */
+    private LinearLayout createRailControls() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL | android.view.Gravity.END);
+        row.setPadding(0, 0, dp(4), 0);
+        row.addView(railControl("–", "Minimize the rail to a strip (ctrl-alt-b)",
+                () -> setRailPanel(railPanel.with(RailPanel.Mode.MINIMIZED))));
+        row.addView(railControl("×", "Close the rail (ctrl-alt-w brings it back)",
+                () -> setRailPanel(railPanel.with(RailPanel.Mode.CLOSED))));
+        return row;
+    }
+
+    private TextView railControl(String glyph, String description, Runnable action) {
+        TextView button = new TextView(this);
+        button.setText(glyph);
+        button.setTextSize(16);
+        button.setGravity(android.view.Gravity.CENTER);
+        button.setContentDescription(description);
+        button.setTooltipText(description);
+        button.setOnClickListener(view -> action.run());
+        // A 48 dp touch target, as every control here; the glyph stays small.
+        button.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
+        return button;
+    }
+
+    /** The minimized rail: a strip that opens it again and keeps the needs-you badge. */
+    private LinearLayout createRailStrip() {
+        LinearLayout strip = new LinearLayout(this);
+        strip.setOrientation(LinearLayout.VERTICAL);
+        strip.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+        strip.setPadding(0, dp(6), 0, 0);
+        strip.setVisibility(View.GONE);
+        strip.setContentDescription("Open the rail");
+        strip.setOnClickListener(view -> setRailPanel(railPanel.with(RailPanel.Mode.OPEN)));
+        TextView open = new TextView(this);
+        open.setText("»");
+        open.setTextSize(18);
+        open.setGravity(android.view.Gravity.CENTER);
+        open.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        strip.addView(open, new LinearLayout.LayoutParams(-1, dp(40)));
+        railStripBadge = needYouBadge(12);
+        strip.addView(railStripBadge, new LinearLayout.LayoutParams(-2, -2));
+        return strip;
+    }
+
+    /** The needs-you count as a small filled badge; hidden while nobody waits. */
+    private TextView needYouBadge(int textSp) {
+        TextView badge = new TextView(this);
+        badge.setTextSize(textSp);
+        badge.setGravity(android.view.Gravity.CENTER);
+        badge.setSingleLine(true);
+        badge.setMinWidth(dp(16));
+        badge.setPadding(dp(4), 0, dp(4), 0);
+        badge.setVisibility(View.GONE);
+        badge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        return badge;
+    }
+
+    /** The strip's and the toolbar button's badge follow the bar's count of agents waiting on Wolf. */
+    private void updateRailBadge() {
+        String text = RailPanel.badge(barNeedYou);
+        String waiting = text.isEmpty() ? "" : ", " + barNeedYou + (barNeedYou == 1 ? " agent needs" : " agents need") + " you";
+        for (TextView badge : new TextView[] {railStripBadge, sidebarBadge}) {
+            if (badge == null) continue;
+            if (!text.contentEquals(badge.getText())) badge.setText(text);
+            android.graphics.drawable.GradientDrawable fill = new android.graphics.drawable.GradientDrawable();
+            fill.setColor(chrome.status("blocked"));
+            fill.setCornerRadius(dp(8));
+            badge.setBackground(fill);
+            badge.setTextColor(chrome.surface);
+            // The toolbar's copy only while the rail is not open: open, the rail's header says it.
+            boolean wanted = !text.isEmpty() && (badge == railStripBadge || !sidebarOpen);
+            badge.setVisibility(wanted ? View.VISIBLE : View.GONE);
+        }
+        if (railStrip != null) railStrip.setContentDescription("Open the rail" + waiting);
+        if (sidebarButton != null && !sidebarOpen) {
+            sidebarButton.setContentDescription("Show the host and workspace sidebar" + waiting);
         }
     }
 
@@ -1984,8 +2254,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int available = terminalRoot == null ? 0
                 : terminalRoot.getWidth() - terminalRoot.getPaddingLeft() - terminalRoot.getPaddingRight();
         int width;
+        boolean strip = railShown().strip(compactWindow());
         if (!sidebarOpen) {
-            width = 0;
+            width = strip ? dp(RailPanel.STRIP_DP) : 0;
         } else if (railAsDrawer()) {
             // Modal drawer: wide enough to read titles, never the whole window.
             width = available > 0 ? Math.min(dp(320), Math.round(available * 0.86f)) : dp(300);
@@ -1998,7 +2269,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             layout.width = width;
             sidebar.setLayoutParams(layout);
         }
+        if (railStrip != null) {
+            railStrip.setVisibility(strip ? View.VISIBLE : View.GONE);
+            railBody.setVisibility(strip ? View.GONE : View.VISIBLE);
+            railFade.setVisibility(strip ? View.GONE : View.VISIBLE);
+            // A drawer closes by Back or a tap outside; only the docked rail has the header.
+            railControls.setVisibility(sidebarOpen && !railAsDrawer() ? View.VISIBLE : View.GONE);
+        }
         updateRailToggle();
+        updateRailBadge();
     }
 
     /** The toggle shows its state as a selected container, not a changing word. */
@@ -2025,13 +2304,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private OutboxCourier outbox;
     /** Each pane's last grid on disk, drawn when the terminal opens with no link. */
     private PaneSnapshots snapshots;
-    /** The computer whose saved pane is on screen (until its live pane attaches), and when it was saved. */
-    private String savedShownHost;
-    private long savedShownAt;
+    /**
+     * The computer whose saved pane is on screen (until its live pane attaches),
+     * and when it was saved: 0 for a pane with no copy (its title and a note).
+     */
+    private volatile String savedShownHost;
+    private volatile long savedShownAt;
+    /** The link status reads as a cached pane's label (dim), not a warning. Main thread. */
+    private boolean linkStatusDim;
+    /** When to checkpoint the pane on screen. Under stateLock. */
+    private final PaneCheckpoint checkpoint = new PaneCheckpoint();
+    /** Each computer's lists as this terminal last saw them live: newer than Home's cache. */
+    private final java.util.Map<String, JSONArray[]> seenLists = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Home's last view of each computer, for switching with no link; read once per resume. */
+    private volatile java.util.Map<String, HomeCache.Entry> fleetCache = java.util.Collections.emptyMap();
     /** The terminal has been on screen before (later resumes reopen the pane last shown). */
     private boolean openedOnce;
     /** One reconnect at a time. Main thread. */
     private boolean reconnectRunning;
+    /**
+     * Which computer was picked last: an attempt (reconnect or switch) that
+     * began before another pick is stale and must not adopt its host.
+     */
+    private final HostEpoch hostEpoch = new HostEpoch();
     /** The session a reconnect is opening; closed if the terminal leaves the screen first. */
     private volatile long reconnectHandle;
     /** The pane the rail last scrolled into view. */
@@ -2063,7 +2358,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
         // The menu stays wherever the bar is gone, tabs or not.
         if (tabRow != null) tabRow.setVisibility(current != null && !shellMode() ? View.VISIBLE : View.GONE);
-        if (!show) return;
+        if (!show) {
+            if (barNeedYou != 0) {
+                barNeedYou = 0;
+                updateRailBadge();
+            }
+            return;
+        }
         String space = "", paneTab = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -2074,151 +2375,278 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         updateCrumb(current, space);
-        java.util.List<FleetTree.Member> fleetMembers = FleetPanes.members(current.workspaces, current.tabs,
-                current.panes, FleetTree.Member::new);
-        FleetTree.Strip roleStrip = FleetTree.stripFor(fleetMembers, FleetPanes.LOOKS.get(currentHostId),
-                current.paneId, current.ready);
-        if (stripChoice().showsGroup(currentHostId, space, roleStrip)) {
-            showRoleStrip(current, roleStrip, space);
-            return;
+        // The project focus is in and its windows only (Wolf's items 60, 70, 78; the desktop's
+        // status line): window 1 its lead, the shown one filled. Nothing toggles it.
+        java.util.List<ProjectModel.Project> projects = ProjectModel.ordered(
+                ProjectModel.projects(current.workspaces, current.tabs, current.panes), current.projectsOrder);
+        ProjectModel.Project project = ProjectModel.currentOf(projects, current.paneId, paneTab, space);
+        int shown = ProjectModel.shownIndex(project, current.paneId, paneTab);
+        boolean compact = compactWindow();
+        java.util.List<ProjectBar.Chip> chips = ProjectBar.chips(project, shown, compact);
+        int needYou = ProjectBar.needYou(projects);
+        if (needYou != barNeedYou) {
+            barNeedYou = needYou;
+            updateRailBadge();
         }
-        // Rebuild only when what the strip shows changes. Agents retitle their
+        String repo = compact || project == null || project.deacon ? null
+                : ProjectModel.repoOf(project, gitNames(), ProjectModel.repoLabels(current.panes));
+        // Rebuild only when what the bar shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
-        JSONArray tabs = current.tabs;
-        java.util.List<String[]> shown = new java.util.ArrayList<>();
-        StringBuilder signature = new StringBuilder(space).append(roleStrip != null ? "\tgroup" : "").append('\n');
-        String activeId = "";
-        for (int i = 0; i < tabs.length(); i++) {
-            JSONObject tab = tabs.optJSONObject(i);
-            if (tab == null || !space.equals(tab.optString("workspace_id"))) continue;
-            String id = tab.optString("id");
-            String status = "";
-            JSONObject tabPane = null;
-            for (int j = 0; panes != null && j < panes.length(); j++) {
-                JSONObject pane = panes.optJSONObject(j);
-                if (pane != null && id.equals(pane.optString("tab_id"))
-                        && space.equals(pane.optString("workspace_id"))) {
-                    status = pane.optString("status");
-                    tabPane = pane;
-                }
-            }
-            // The pane being shown, which a tap moves at once, not the daemon's
-            // confirmation a round trip later.
-            boolean focused = id.equals(paneTab);
-            String label = HomeActivity.cleanTitle(tab.optString("label", id), id);
-            if (tabPane != null && RailTree.isTerminalId(label)) {
-                label = RailTree.fallbackTitle(HomeActivity.cleanTitle(
-                        chromeTitle(tabPane.optString("title", ""), id), id), tabPane);
-            }
-            shown.add(new String[] {id, label, status, focused ? "1" : ""});
-            signature.append(id).append('\t').append(label).append('\t').append(status)
-                    .append('\t').append(focused).append('\n');
-            if (focused) activeId = id;
-        }
-        if (signature.toString().equals(tabSignature)) return;
-        boolean activeMoved = !activeId.equals(tabActive);
-        tabSignature = signature.toString();
+        String signature = ProjectBar.signature(projects, project, repo, chips, needYou, compact);
+        // Everything drawn before the shown chip, and it: a change there moves it.
+        String before = ProjectBar.drawn(project, repo, chips, shown);
+        String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
+        if (signature.equals(tabSignature)) return;
+        // A fold (the cover cuts names), or windows before it (or it) renamed,
+        // move the shown chip too.
+        boolean activeMoved = !activeId.equals(tabActive) || compact != tabCompact
+                || !before.equals(tabBefore);
+        tabCompact = compact;
+        tabBefore = before;
+        tabSignature = signature;
         tabActive = activeId;
         tabStrip.removeAllViews();
-        View active = null;
-        for (String[] item : shown) {
-            String id = item[0], status = item[2];
-            boolean focused = !item[3].isEmpty();
-            TextView pill = tabPill(item[1], focused, status);
-            pill.setTag(focused ? PANE_PILL_ACTIVE : PANE_PILL);
-            final Connection target = current;
-            final String tabSpace = space, tabLabel = item[1];
-            pill.setOnClickListener(v -> { if (!focused) focusChrome(target, "tab", id); });
-            pill.setOnTouchListener(new TabDrag(pill, () -> showTabActions(target, tabSpace, id, tabLabel),
-                    to -> runEdit(target, "Move " + tabLabel, "op", "tab.move", "space", tabSpace,
-                            "tab", id, "index", to)));
-            pill.setContentDescription("Tab " + pill.getText() + (status.isEmpty() ? "" : ", " + status)
-                    + (focused ? ", current" : ""));
-            tabStrip.addView(pill);
-            if (focused) active = pill;
+        final Connection target = current;
+        tabStrip.addView(projectChip(project, target));
+        if (repo != null) {
+            TextView crumbText = new TextView(this);
+            crumbText.setText(ProjectBar.crumbText(repo));
+            crumbText.setTextSize(11);
+            crumbText.setSingleLine(true);
+            crumbText.setTextColor(chrome.onSurfaceVariant);
+            crumbText.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            crumbText.setPadding(0, 0, dp(6), 0);
+            tabStrip.addView(crumbText, new LinearLayout.LayoutParams(-2, dp(24)));
         }
-        TextView add = tabPill("+", false, "");
-        add.setContentDescription("New Claude, Codex or terminal tab in this space");
+        java.util.List<View> windowChips = new java.util.ArrayList<>();
+        for (int i = 0; i < chips.size(); i++) {
+            ProjectBar.Chip c = chips.get(i);
+            ProjectModel.Window w = c.window;
+            final int index = i;
+            TextView chip = windowChip(c.text, c.active, w.status, w.terminal == null);
+            chip.setTag(c.active ? PANE_PILL_ACTIVE : PANE_PILL);
+            chip.setOnClickListener(v -> {
+                if (c.active) return;
+                if (w.terminal != null) focusRemotePane(target, w.terminal);
+                else note("Nothing runs in " + w.name + ": open it on the desktop");
+            });
+            Runnable menu = () -> showWindowActions(target, w);
+            if (w == project.lead) {
+                // Window 1 stays the lead: it is never dragged (item 79).
+                chip.setOnLongClickListener(v -> { menu.run(); return true; });
+            } else {
+                // Held, then dragged: Wolf's order of the project's windows (item 79), kept in this
+                // core's projects.order as the desktop keeps it. Held and let go: the menu.
+                chip.setOnTouchListener(new WindowDrag(chip, menu, centre -> {
+                    float[] centres = new float[windowChips.size()];
+                    for (int k = 0; k < centres.length; k++) {
+                        View other = windowChips.get(k);
+                        centres[k] = other.getLeft() + other.getWidth() / 2f;
+                    }
+                    ProjectModel.WindowMove move = ProjectBar.dropMove(project, index, (float) centre, centres);
+                    if (move != null) moveWindow(target, move);
+                }));
+            }
+            chip.setContentDescription("Window " + w.n + ", " + w.name + (w.status.isEmpty() ? "" : ", " + w.status)
+                    + (c.active ? ", current" : "") + (w == project.lead ? "" : ". Hold and drag to reorder"));
+            tabStrip.addView(chip);
+            windowChips.add(chip);
+        }
+        TextView add = windowChip("+", false, "", false);
+        add.setContentDescription(project != null && project.led()
+                ? "New Claude, Codex or terminal window of " + project.name
+                : "New Claude, Codex or terminal tab in this space");
         add.setOnClickListener(this::showNewMenu);
         tabStrip.addView(add);
-        // Back to the role group (as the desktop's chip), when there is one.
-        if (roleStrip != null) {
-            final String chipSpace = space;
-            TextView group = tabPill(roleStrip.mode.equals("pm") ? "▤ " + roleStrip.name : "▤ Deacon", false, "");
-            group.setContentDescription("Show the " + (roleStrip.mode.equals("pm") ? roleStrip.name + " project" : "Deacon")
-                    + " group instead of this space's tabs");
-            group.setOnClickListener(v -> toggleStrip(chipSpace));
-            tabStrip.addView(group);
+        if (!compact && needYou > 0) {
+            TextView waiting = new TextView(this);
+            waiting.setText("! " + needYou + " need you");
+            waiting.setTextSize(12);
+            waiting.setSingleLine(true);
+            waiting.setTextColor(chrome.status("blocked"));
+            waiting.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            waiting.setPadding(dp(10), 0, dp(6), 0);
+            waiting.setContentDescription(needYou + " agents need you; go to the next one");
+            waiting.setOnClickListener(v -> focusNextWaiting(target, projects));
+            tabStrip.addView(waiting, new LinearLayout.LayoutParams(-2, dp(24)));
         }
-        if (active != null && activeMoved) {
-            final View activePill = active;
-            tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
+        if (activeMoved) {
+            revealPending = true;
+            tabScroll.post(this::revealActiveChip);
         }
+    }
+
+    private boolean tabCompact;
+    /** The chips up to the shown one as last drawn: their text moves it. */
+    private String tabBefore = "";
+    /** The shown chip is to be revealed once the rebuilt bar is laid out. */
+    private boolean revealPending;
+
+    /**
+     * Scrolls the bar so the shown window's chip is whole, by its measured
+     * bounds after layout, and only when it is not: a scroll Wolf made himself
+     * stays where he left it.
+     */
+    private void revealActiveChip() {
+        if (tabStrip == null || tabScroll == null) return;
+        View active = tabStrip.findViewWithTag(PANE_PILL_ACTIVE);
+        int width = tabScroll.getWidth();
+        if (active == null || active.getWidth() == 0 || width == 0) return;
+        // Never wider than the bar: a name too long for it is cut with "…",
+        // so the shown chip can always be whole.
+        if (active instanceof TextView && ((TextView) active).getMaxWidth() != width) {
+            TextView text = (TextView) active;
+            text.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            text.setMaxWidth(width);
+            if (active.getWidth() > width) {
+                revealPending = true; // revealed after this relayout
+                return;
+            }
+        }
+        revealPending = false;
+        int to = ProjectBar.revealScroll(active.getLeft(), active.getRight(), tabScroll.getScrollX(), width, dp(24));
+        if (to >= 0) tabScroll.smoothScrollTo(to, 0);
     }
 
     /**
-     * With a Deacon, a PM or a PM's worker focused, the strip shows that role
-     * context instead of the space's tabs (FleetTree.stripFor): each item is
-     * an exact terminal, possibly from another space, so a tap focuses that
-     * terminal and there is no close, move or rename. It is rebuilt from the
-     * live view on every refresh, so it never shows a stale group (what the
-     * desktop's projection handshake guards against). False: no role context.
+     * A window's menu. Its tab holds only this project's windows: the tab's
+     * own menu (rename, split, move, close: every terminal in it). A tab it
+     * shares with another project's terminal: this window's terminal only,
+     * so nothing of the other project is ever ended or moved with it.
      */
-    private void showRoleStrip(Connection current, FleetTree.Strip strip, String space) {
-        StringBuilder signature = new StringBuilder("role:").append(strip.mode).append('\t').append(space).append('\n');
-        for (FleetTree.StripItem item : strip.items) {
-            signature.append(item.id).append('\t').append(item.label).append('\t').append(item.status)
-                    .append('\t').append(item.id.equals(current.paneId)).append('\n');
+    private void showWindowActions(Connection target, ProjectModel.Window w) {
+        // Decided from the view as it is now, and again before anything
+        // tab-wide is done: another project's terminal may join the tab
+        // while the bar (or this menu) is shown.
+        java.util.function.BooleanSupplier owned = () -> windowOwnsTab(target, w);
+        if (owned.getAsBoolean()) {
+            showTabActions(target, w.space, w.tab, w.name, owned);
+            return;
         }
-        if (signature.toString().equals(tabSignature)) return;
-        boolean activeMoved = !current.paneId.equals(tabActive);
-        tabSignature = signature.toString();
-        tabActive = current.paneId;
-        tabStrip.removeAllViews();
-        View active = null;
-        for (FleetTree.StripItem item : strip.items) {
-            boolean focused = item.id.equals(current.paneId);
-            String label = ("worker".equals(item.role) ? "" : "pm".equals(item.role) ? "PM·" : "Deacon·") + item.label;
-            TextView pill = tabPill(label, focused, item.status);
-            pill.setTag(focused ? PANE_PILL_ACTIVE : PANE_PILL);
-            final Connection target = current;
-            pill.setOnClickListener(v -> { if (!focused) focusRemotePane(target, item.id); });
-            pill.setContentDescription((strip.mode.equals("pm") ? strip.name + ": " : "") + label
-                    + (item.status.isEmpty() ? "" : ", " + item.status) + (focused ? ", current" : ""));
-            tabStrip.addView(pill);
-            if (focused) active = pill;
+        if (w.terminal == null) {
+            note(w.name + " shares its tab with another project; change it on the desktop");
+            return;
         }
-        // To this space's own tabs (where +, close, move and rename are).
-        TextView tabsChip = tabPill("⊞ Tabs", false, "");
-        tabsChip.setContentDescription("Show this space's own tabs");
-        tabsChip.setOnClickListener(v -> toggleStrip(space));
-        tabStrip.addView(tabsChip);
-        if (active != null && activeMoved) {
-            final View activePill = active;
-            tabScroll.post(() -> tabScroll.smoothScrollTo(Math.max(0, activePill.getLeft() - dp(24)), 0));
-        }
+        new ActionSheet(this, chrome, w.name + " · shares its tab with another project")
+                .danger("Close this window (" + w.terminal + " only)", () ->
+                        runEdit(target, "Close " + w.name, "op", "pane.kill", "terminal", w.terminal))
+                .show();
     }
 
-    private FleetTree.StripChoice stripChoiceState;
-
-    /** The group/tabs choice per physical space, kept across refreshes and launches. */
-    private FleetTree.StripChoice stripChoice() {
-        if (stripChoiceState == null) {
-            java.util.Set<String> saved = new java.util.HashSet<>(getSharedPreferences("terminal-display", MODE_PRIVATE)
-                    .getStringSet("strip_tabs", java.util.Collections.emptySet()));
-            stripChoiceState = new FleetTree.StripChoice(saved);
-        }
-        return stripChoiceState;
+    /** Saves a dragged window's place in this core's projects.order; the bar follows when it is read back. */
+    private void moveWindow(Connection target, ProjectModel.WindowMove move) {
+        runEdit(target, "Move window", "op", "windows.move", "project", move.project, "id", move.id,
+                "target", move.target, "after", move.after, "shown", new JSONArray(move.shown));
     }
 
-    /** Switches this space's strip between the role group and its own tabs; focus is untouched. */
-    private void toggleStrip(String space) {
-        stripChoice().toggle(currentHostId, space);
-        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                .putStringSet("strip_tabs", new java.util.HashSet<>(stripChoice().physical)).apply();
-        tabSignature = "";
-        refreshTabStrip();
+    /**
+     * The project chip, `[name]` and how many of its own agents wait on Wolf:
+     * a tap lists this computer's projects (the desktop's switcher); it never
+     * changes which windows the bar lists (item 78).
+     */
+    private TextView projectChip(ProjectModel.Project project, Connection target) {
+        TextView chip = new TextView(this);
+        // ProjectBar.projectChipText, styled: the name bold, the waiting count in blocked's colour.
+        String drawn = ProjectBar.projectChipText(project);
+        int name = ProjectBar.projectText(project).length();
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(drawn);
+        text.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, name, 0);
+        if (drawn.length() > name) {
+            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.status("blocked")), name, drawn.length(), 0);
+        }
+        chip.setText(text);
+        chip.setTextSize(12);
+        chip.setSingleLine(true);
+        chip.setTextColor(chrome.onSurface);
+        chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        chip.setPadding(dp(4), 0, dp(8), 0);
+        chip.setContentDescription("Project " + (project == null ? "none" : project.name)
+                + (project != null && project.waiting > 0 ? ", " + project.waiting + " need you" : "") + ". Switch project");
+        chip.setOnClickListener(v -> showProjectSwitcher(target));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
+        params.setMarginEnd(dp(2));
+        chip.setLayoutParams(params);
+        return chip;
+    }
+
+    /**
+     * A window chip (item 60): a box with a border, the shown one filled; a
+     * status dot when an agent works, waits or is done there. {@code idle}:
+     * a tab with nothing running in it.
+     */
+    private TextView windowChip(String label, boolean active, String status, boolean idle) {
+        TextView chip = new TextView(this);
+        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(label);
+        if (ProjectBar.dotted(status)) {
+            int color = "error".equals(status) ? chrome.danger : chrome.status(status);
+            text.append(" ●", new android.text.style.ForegroundColorSpan(color), 0);
+        }
+        chip.setText(text);
+        chip.setTextSize(12);
+        chip.setSingleLine(true);
+        chip.setTextColor(active ? chrome.background : idle ? chrome.onSurfaceVariant : chrome.onSurface);
+        chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        chip.setPadding(dp(7), 0, dp(7), 0);
+        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
+        shape.setCornerRadius(dp(3));
+        shape.setColor(active ? chrome.primary : chrome.background);
+        shape.setStroke(dp(1), active ? chrome.primary : chrome.outline);
+        chip.setBackground(new android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(chrome.selected), shape,
+                new android.graphics.drawable.ColorDrawable(0xffffffff)));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
+        params.setMarginEnd(dp(3));
+        chip.setLayoutParams(params);
+        return chip;
+    }
+
+    /** What git said of this computer's folders: folder -> its repo's name and whether it is a linked worktree. */
+    private java.util.Map<String, ProjectModel.GitName> gitNames() {
+        return ProjectModel.gitNames(currentHostId == null ? null : FleetPanes.LOOKS.get(currentHostId));
+    }
+
+    /**
+     * The project switcher: this computer's projects as the desktop's sidebar
+     * orders them (the deacon, then each repo's projects by birth with Wolf's
+     * order from the core's projects.order over it, then those in no repo),
+     * each with how many of its agents wait on Wolf. A tap shows its lead.
+     */
+    private void showProjectSwitcher(Connection target) {
+        java.util.List<ProjectModel.Project> all = ProjectModel.projects(target.workspaces, target.tabs, target.panes);
+        ProjectModel.Groups groups = ProjectModel.groups(all, gitNames(), ProjectModel.repoLabels(target.panes),
+                target.projectsOrder);
+        ActionSheet sheet = new ActionSheet(this, chrome, "Projects on " + target.hostName);
+        java.util.List<ProjectModel.Project> listed = new java.util.ArrayList<>(groups.deacons);
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        for (ProjectModel.Project p : groups.deacons) labels.add("◆ deacon");
+        for (ProjectModel.Repo repo : groups.repos) {
+            for (ProjectModel.Project p : repo.projects) {
+                listed.add(p);
+                labels.add((repo.name == null ? "" : repo.name + " › ") + p.name);
+            }
+        }
+        for (int i = 0; i < listed.size(); i++) {
+            ProjectModel.Project p = listed.get(i);
+            String label = labels.get(i) + (p.waiting > 0 ? "   ! " + p.waiting + " need you" : "");
+            sheet.add(label, () -> {
+                ProjectModel.Window lead = p.lead;
+                if (lead != null && lead.terminal != null) focusRemotePane(target, lead.terminal);
+                else note(p.name + " has nothing running to show");
+            });
+        }
+        sheet.show();
+    }
+
+    /** "! N need you": the next waiting agent after the one shown, round all of them. */
+    private void focusNextWaiting(Connection target, java.util.List<ProjectModel.Project> projects) {
+        java.util.List<String> waiting = new java.util.ArrayList<>();
+        for (ProjectModel.Project p : projects) {
+            for (ProjectModel.Window w : p.windows) if ("blocked".equals(w.status) && w.terminal != null) waiting.add(w.terminal);
+        }
+        if (waiting.isEmpty()) return;
+        int at = waiting.indexOf(target.paneId);
+        focusRemotePane(target, waiting.get((at + 1) % waiting.size()));
     }
 
     private void updateCrumb(Connection current, String space) {
@@ -2349,34 +2777,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    private TextView tabPill(String label, boolean active, String status) {
-        TextView pill = new TextView(this);
-        android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
-        if ("working".equals(status) || "blocked".equals(status) || "done".equals(status) || "error".equals(status)) {
-            int color = "error".equals(status) ? chrome.danger : chrome.status(status);
-            text.append("● ", new android.text.style.ForegroundColorSpan(color), 0);
+    /**
+     * Whether {@code w}'s tab is still its project's alone in {@code target}'s
+     * view as it is now (ProjectModel.ownsTab); false when the window or its
+     * project is gone, so nothing tab-wide is done on a guess.
+     */
+    private boolean windowOwnsTab(Connection target, ProjectModel.Window w) {
+        if (w.tab == null || w.tab.isEmpty()) return false;
+        java.util.List<ProjectModel.Project> all = ProjectModel.projects(target.workspaces, target.tabs, target.panes);
+        for (ProjectModel.Project p : all) {
+            for (ProjectModel.Window o : p.windows) {
+                boolean same = w.terminal != null ? w.terminal.equals(o.terminal)
+                        : o.terminal == null && w.tab.equals(o.tab) && w.space.equals(o.space);
+                if (same) return w.tab.equals(o.tab) && w.space.equals(o.space) && ProjectModel.ownsTab(all, p, o);
+            }
         }
-        text.append(label.length() > 28 ? label.substring(0, 27) + "…" : label);
-        pill.setText(text);
-        pill.setTextSize(12);
-        pill.setSingleLine(true);
-        pill.setTextColor(active ? chrome.onSurface : chrome.onSurfaceVariant);
-        pill.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        pill.setPadding(dp(9), 0, dp(9), 0);
-        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
-        shape.setCornerRadius(dp(6));
-        shape.setColor(active ? chrome.control : chrome.background);
-        if (active) shape.setStroke(dp(1), chrome.outline);
-        pill.setBackground(new android.graphics.drawable.RippleDrawable(
-                android.content.res.ColorStateList.valueOf(chrome.selected), shape,
-                new android.graphics.drawable.ColorDrawable(0xffffffff)));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
-        params.setMarginEnd(dp(3));
-        pill.setLayoutParams(params);
-        return pill;
+        return false;
     }
 
-    private void showTabActions(Connection target, String space, String tab, String label) {
+    /**
+     * A tab's menu. {@code owned}: checked again as each tab-wide action is
+     * done; when the tab is no longer its project's alone, nothing is done.
+     */
+    private void showTabActions(Connection target, String space, String tab, String label,
+            java.util.function.BooleanSupplier owned) {
         java.util.List<String[]> spaces = new java.util.ArrayList<>();
         JSONArray all = target.workspaces;
         for (int i = 0; all != null && i < all.length(); i++) {
@@ -2387,20 +2811,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         new ActionSheet(this, chrome, label)
                 .add("Rename…", () -> ActionSheet.prompt(this, chrome, "Rename window", label,
-                        name -> runEdit(target, "Rename", "op", "tab.rename", "space", space, "tab", tab, "name", name)))
-                .add("Split: new shell beside it", () -> runEdit(target, "Split", "op", "tab.split",
-                        "space", space, "tab", tab))
+                        name -> { if (stillOwned(owned, label)) runEdit(target, "Rename", "op", "tab.rename", "space", space, "tab", tab, "name", name); }))
+                .add("Split: new shell beside it", () -> { if (stillOwned(owned, label)) runEdit(target, "Split", "op", "tab.split",
+                        "space", space, "tab", tab); })
                 .add("Move to space…", () -> {
                     ActionSheet pick = new ActionSheet(this, chrome, "Move " + label + " to");
                     for (String[] other : spaces) {
-                        pick.add(other[1], () -> runEdit(target, "Move", "op", "tab.space", "space", space,
-                                "tab", tab, "to", other[0]));
+                        pick.add(other[1], () -> { if (stillOwned(owned, label)) runEdit(target, "Move", "op", "tab.space", "space", space,
+                                "tab", tab, "to", other[0]); });
                     }
                     pick.show();
                 })
-                .danger("Close window", () -> runEdit(target, "Close " + label, "op", "tab.close",
-                        "space", space, "tab", tab))
+                .danger("Close window", () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
+                        "space", space, "tab", tab); })
                 .show();
+    }
+
+    private boolean stillOwned(java.util.function.BooleanSupplier owned, String label) {
+        if (owned.getAsBoolean()) return true;
+        note(label + " now shares its tab with another project: nothing was changed. Hold it again for its own menu");
+        return false;
     }
 
     /**
@@ -2408,27 +2838,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * scrolls the strip, a hold opens the actions, and a hold then drag lifts
      * the pill and drops it at a new position.
      */
-    private final class TabDrag implements View.OnTouchListener {
-        private final View pill;
+    /**
+     * Hold, then drag a window chip along the bar (item 79): it follows the
+     * finger and, let go, reports where its centre is (bar coordinates). Held
+     * and let go without moving: its menu. A plain tap stays the chip's click.
+     */
+    private final class WindowDrag implements View.OnTouchListener {
+        private final View chip;
         private final Runnable menu;
-        private final java.util.function.IntConsumer moved;
+        private final java.util.function.DoubleConsumer dropped;
         private final int slop = android.view.ViewConfiguration.get(GpuiTerminalActivity.this).getScaledTouchSlop();
         private float downX, downY;
-        private boolean held, dragging, cancelled;
+        private boolean held, dragging;
         private final Runnable hold = new Runnable() {
             @Override public void run() {
                 held = true;
-                pill.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
-                pill.animate().scaleX(1.08f).scaleY(1.08f).setDuration(90).start();
-                pill.setElevation(dp(6));
-                pill.getParent().requestDisallowInterceptTouchEvent(true);
+                chip.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+                chip.animate().scaleX(1.08f).scaleY(1.08f).setDuration(90).start();
+                chip.setElevation(dp(6));
+                chip.getParent().requestDisallowInterceptTouchEvent(true);
             }
         };
 
-        TabDrag(View pill, Runnable menu, java.util.function.IntConsumer moved) {
-            this.pill = pill;
+        WindowDrag(View chip, Runnable menu, java.util.function.DoubleConsumer dropped) {
+            this.chip = chip;
             this.menu = menu;
-            this.moved = moved;
+            this.dropped = dropped;
         }
 
         @Override public boolean onTouch(View view, MotionEvent event) {
@@ -2436,43 +2871,30 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 case MotionEvent.ACTION_DOWN:
                     downX = event.getRawX();
                     downY = event.getRawY();
-                    held = dragging = cancelled = false;
-                    pill.postDelayed(hold, android.view.ViewConfiguration.getLongPressTimeout());
+                    held = dragging = false;
+                    chip.postDelayed(hold, android.view.ViewConfiguration.getLongPressTimeout());
                     return false; // the pressed state and click stay the view's own
                 case MotionEvent.ACTION_MOVE: {
                     float dx = event.getRawX() - downX;
                     if (!held) {
-                        if (Math.abs(dx) > slop || Math.abs(event.getRawY() - downY) > slop) {
-                            pill.removeCallbacks(hold);
-                            cancelled = true;
-                        }
+                        if (Math.abs(dx) > slop || Math.abs(event.getRawY() - downY) > slop) chip.removeCallbacks(hold);
                         return false;
                     }
                     if (!dragging && Math.abs(dx) > slop) dragging = true;
-                    if (dragging) pill.setTranslationX(dx);
+                    if (dragging) chip.setTranslationX(dx);
                     return true;
                 }
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL: {
-                    pill.removeCallbacks(hold);
+                    chip.removeCallbacks(hold);
                     if (!held) return false;
                     boolean up = event.getActionMasked() == MotionEvent.ACTION_UP;
-                    int target = dropIndex();
-                    pill.animate().scaleX(1f).scaleY(1f).translationX(0).setDuration(120).start();
-                    pill.setElevation(0);
-                    pill.setPressed(false);
-                    if (up && dragging) {
-                        int from = tabStrip.indexOfChild(pill);
-                        if (target != from && target >= 0) {
-                            // Show the new order at once; herdr-core's answer confirms it.
-                            tabStrip.removeView(pill);
-                            tabStrip.addView(pill, target);
-                            tabSignature = "";
-                            moved.accept(target);
-                        }
-                    } else if (up) {
-                        menu.run();
-                    }
+                    float centre = chip.getLeft() + chip.getTranslationX() + chip.getWidth() / 2f;
+                    chip.animate().scaleX(1f).scaleY(1f).translationX(0).setDuration(120).start();
+                    chip.setElevation(0);
+                    chip.setPressed(false);
+                    if (up && dragging) dropped.accept(centre);
+                    else if (up) menu.run();
                     held = dragging = false;
                     return true;
                 }
@@ -2480,32 +2902,56 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     return false;
             }
         }
-
-        /** Where the lifted pill's centre now falls among the other tabs ("+" excluded). */
-        private int dropIndex() {
-            float centre = pill.getLeft() + pill.getTranslationX() + pill.getWidth() / 2f;
-            int tabs = tabStrip.getChildCount() - 1;
-            int index = 0;
-            for (int i = 0; i < tabs; i++) {
-                View other = tabStrip.getChildAt(i);
-                if (other == pill) continue;
-                if (centre > other.getLeft() + other.getWidth() / 2f) index++;
-            }
-            return Math.min(index, Math.max(0, tabs - 1));
-        }
     }
 
-    /** "+": what a new tab in this space should run. */
+    /** Where "+" puts a project's new window now (ProjectBar.newWindowPlace), or null: a plain new tab. */
+    private String[] newWindowPlace(Connection target) {
+        String space = "", tab = "";
+        JSONArray panes = target.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane != null && pane.optString("id").equals(target.paneId)) {
+                space = pane.optString("workspace_id");
+                tab = pane.optString("tab_id");
+            }
+        }
+        java.util.List<ProjectModel.Project> all = ProjectModel.ordered(
+                ProjectModel.projects(target.workspaces, target.tabs, target.panes), target.projectsOrder);
+        ProjectModel.Project p = ProjectModel.currentOf(all, target.paneId, tab, space);
+        return ProjectBar.newWindowPlace(p, ProjectModel.shownIndex(p, target.paneId, tab));
+    }
+
+    /**
+     * "+": a new Claude, Codex or shell window. Of a project with a lead, it
+     * is that project's window, as the desktop's C-a c makes one: a tab in the
+     * lead's space, in the shown window's folder (else the lead's), labelled
+     * parent=<lead> on this core (window.new). Elsewhere a plain new tab in the
+     * space shown.
+     */
     private void showNewMenu(View anchor) {
         Connection target;
         synchronized (stateLock) { target = connection; }
         if (target == null) return;
+        // Placed from the view as it is now, not as the bar was last drawn: a
+        // window that changed folder since makes the new one there.
+        String[] place = newWindowPlace(target);
         android.widget.PopupMenu menu = new android.widget.PopupMenu(
                 new android.view.ContextThemeWrapper(this, chrome.popupTheme()), anchor);
         menu.getMenu().add(0, 1, 0, "Claude");
         menu.getMenu().add(0, 2, 1, "Codex");
         menu.getMenu().add(0, 3, 2, "Shell");
         menu.setOnMenuItemClickListener(item -> {
+            if (place != null) {
+                String kind = item.getItemId() == 1 ? "claude" : item.getItemId() == 2 ? "codex" : "shell";
+                if (place[2] != null && place[2].startsWith("/")) {
+                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
+                            "folder", place[2], "kind", kind);
+                } else {
+                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
+                            "kind", kind);
+                }
+                return true;
+            }
             String action = item.getItemId() == 1 ? "agent.claude" : item.getItemId() == 2 ? "agent.codex" : "tab.new";
             runSessionAction(target, action, "New " + item.getTitle());
             return true;
@@ -2523,7 +2969,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             HostSample sample = hostSamples.get(host.id);
             signature.append(host.id).append(':');
             if (host.id.equals(currentHostId)) {
-                signature.append("live:").append(current == null ? 0 : current.chromeRevision);
+                signature.append("live:").append(current == null ? 0 : current.chromeRevision)
+                        .append(current != null && current.ready && !current.isClosed() ? "+" : "-");
             } else if (sample == null) {
                 signature.append("none");
             } else if (!sample.connected) {
@@ -2570,6 +3017,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     : sample == null ? null : sample.panes;
             JSONArray tabs = live && current != null ? current.tabs
                     : sample == null ? null : sample.tabs;
+            JSONArray[] last = live || panes != null ? null : lastLists(host.id);
+            if (last != null) {
+                // Not reachable yet: its last lists, read only (item 77).
+                workspaces = last[0];
+                tabs = last[1];
+                panes = last[2];
+            }
             addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
         }
@@ -3340,14 +3794,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.host = host;
         // Connection state is the thing a glance should answer, so it gets its
         // own dot shape: solid when connected, ring while dialling, hollow when down.
-        String status = live || (sample != null && sample.connected) ? "connected"
-                : sample != null ? "connecting" : "offline";
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        // The machine on screen says what its link really is: a cached
+        // stand-in or a dropped link is offline, never "live".
+        String status = OfflineSwitch.railStatus(live, OfflineSwitch.link(current == null, current != null && current.offline,
+                current != null && current.isClosed(), current != null && current.ready),
+                sample != null, sample != null && sample.connected);
         if (!status.equals(holder.status)) {
             boolean pulse = holder.status != null;
             holder.status = status;
             // Colour alone cannot say it, so the dot is paired with its word.
-            String word = "connected".equals(status) ? "live"
-                    : "connecting".equals(status) ? "dialling" : "";
+            String word = OfflineSwitch.railWord(status, live);
             holder.state.setText(word);
             holder.hostState = word;
             holder.row.setContentDescription(hostDescription(holder));
@@ -3498,6 +3956,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 workspaces = sample == null ? null : sample.workspaces;
                 tabs = sample == null ? null : sample.tabs;
                 connected = sample != null && sample.connected;
+                JSONArray[] last = panes != null ? null : lastLists(host.id);
+                if (last != null) {
+                    workspaces = last[0];
+                    tabs = last[1];
+                    panes = last[2];
+                }
             }
             // A pick focuses that computer's canonical live Deacon, in its exact
             // terminal; with none, the rail shows Start Deacon; offline (a cached
@@ -3981,9 +4445,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void focusRemotePane(Connection target, String paneId) {
         if (paneId.isEmpty() || paneId.length() > 128
                 || !paneId.matches("[A-Za-z0-9_./:-]+")) return;
-        if (target.remoteHandle <= 0) {
-            note("Switch panes from Remote hosts for this connection");
-            return;
+        switch (OfflineSwitch.route(target.offline, target.isClosed(), target.remoteHandle)) {
+            case REFUSE:
+                note("Switch panes from Remote hosts for this connection");
+                return;
+            case OFFLINE:
+                focusOffline(target, paneId);
+                return;
+            default:
+                break;
         }
         try {
             switchAskedAt = SystemClock.uptimeMillis();
@@ -4002,12 +4472,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             refreshSidebar(false);
         } catch (Exception | LinkageError failure) {
             // The only failure left is a session that has ended (the switch
-            // itself is a slot that cannot overflow): reconnect, landing on
-            // the asked-for window, instead of telling Wolf to reopen.
+            // itself is a slot that cannot overflow): show the pane's saved
+            // copy now; the reconnect lands on it.
             android.util.Log.w("herdr-switch", "switch to " + paneId + " failed: " + failure);
-            rememberHostPane(paneId);
-            reconnectCurrentHost();
+            focusOffline(target, paneId);
         }
+    }
+
+    /**
+     * A switch with no session (item 77): the pane is remembered, so the
+     * reconnect lands on it; the selection moves at once; its saved copy is
+     * drawn (or its title and a note when it has none). Nothing is asked of
+     * the core: the live grid replaces this one when the pane attaches.
+     */
+    private void focusOffline(Connection target, String paneId) {
+        String host = target.hostId != null ? target.hostId : currentHostId;
+        rememberHostPane(host, paneId);
+        synchronized (stateLock) {
+            if (connection != target) return;
+            target.paneId = paneId;
+            target.pendingPane = "";
+        }
+        nativeResetPan();
+        showSaved(host, paneId);
+        refreshSidebar(false);
+        // One attempt now unless one is running; the monitor keeps trying.
+        reconnectCurrentHost();
     }
 
     /** Tabs and workspaces use the daemon's own switch requests. */
@@ -4033,6 +4523,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (!pane.isEmpty()) {
             focusRemotePane(target, pane);
+            return;
+        }
+        if (target.offline || target.remoteHandle > 0 && target.isClosed()) {
+            note("That needs the link");
             return;
         }
         if (target.remoteHandle <= 0) {
@@ -4227,10 +4721,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             new dev.herdr.android.dictation.PendingDictations.Listener() {
                 @Override public void onTranscribed(dev.herdr.android.dictation.PendingClip clip, String text) {
                     if (composer == null) return;
-                    if (!composer.placeDictation(clip.id, text) && !outbox.fillDictation(clip.id, text)) {
-                        composer.appendDictation(clip.target, text);
+                    // The recording goes only once its text is durably stored: in a draft, a queued
+                    // message, or the end of its pane's draft. A failed write leaves all as it was,
+                    // and the text is offered again shortly.
+                    int placed = composer.placeDictation(clip.id, text);
+                    if (placed == 0) placed = outbox.fillDictation(clip.id, text);
+                    if (placed == 0) placed = composer.appendDictation(clip.target, text) ? 1 : -1;
+                    dev.herdr.android.dictation.PendingDictations pending = Dictation.pending(GpuiTerminalActivity.this);
+                    if (placed > 0) {
+                        pending.delivered(clip.id);
+                    } else {
+                        main.postDelayed(() -> pending.offerAgain(clip.id), 5_000);
                     }
-                    Dictation.pending(GpuiTerminalActivity.this).delivered(clip.id);
                 }
 
                 @Override public void onChanged() {
@@ -4310,6 +4812,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         clearControl();
         synchronized (stateLock) {
             Connection target = connection;
+            if (target != null && OfflineSwitch.refusesKeys(target.offline, target.isClosed(), target.remoteHandle)) {
+                // What a key means depends on the screen at that moment: with
+                // no link it is refused, never queued (messages go to the Outbox).
+                main.post(() -> note(OfflineSwitch.KEYS_REFUSED));
+                return false;
+            }
             if (target != null && !target.ready && monitor != null && monitor.reconnecting()
                     && !target.paneId.isEmpty()) {
                 // Sent once, in order, when the same pane is back.
@@ -4363,6 +4871,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             lastMoveAt = SystemClock.uptimeMillis();
             scrollVelocity = 0f;
             scrolling = false;
+            panning = false;
             scrollFraction = 0f;
         } else if (masked == MotionEvent.ACTION_MOVE && count == 1 && !shellMode()) {
             // A shell has no rail, and GPUI turns its pans into Rio's own scrollback.
@@ -4383,7 +4892,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
             }
             if (edgeClaimed) return true;
-            if (!scrolling && Math.abs(event.getY() - touchDownY) > dp(RendererTouch.SLOP_DP)) {
+            // The axis is decided once, where GPUI decides it: a drag it locked
+            // sideways stays the renderer's pan however it drifts after.
+            int axis = scrolling || panning ? RendererTouch.AXIS_NONE : RendererTouch.axis(
+                    event.getX() - touchDownX, event.getY() - touchDownY, dp(RendererTouch.SLOP_DP));
+            if (axis == RendererTouch.AXIS_X) panning = true;
+            if (axis == RendererTouch.AXIS_Y) {
                 scrolling = true;
                 // Dragging the conversation down while typing puts the keyboard away.
                 if (event.getY() > touchDownY && composer != null) composer.hideKeyboard();
@@ -4468,7 +4982,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (hostId == null || pane == null || destroyed) return;
         Connection target;
         synchronized (stateLock) { target = connection; }
-        if (hostId.equals(currentHostId) && target != null && target.remoteHandle > 0) {
+        if (hostId.equals(currentHostId) && target != null && (target.remoteHandle > 0 || target.offline)) {
             focusRemotePane(target, pane);
             return;
         }
@@ -4490,6 +5004,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown);
         }
         if (monitor != null) monitor.start();
+        loadFleetCache();
         updateHostSampling();
         if (launch.shell) {
             synchronized (stateLock) {
@@ -4513,7 +5028,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         if (firstOpen && launch.paneId != null && !launch.paneId.isEmpty()) {
                             rememberHostPane(currentHostId, launch.paneId);
                         }
-                        showSaved(currentHostId, rememberedHostPane(currentHostId));
+                        String shown = rememberedHostPane(currentHostId);
+                        // The strip and the rail keep the last list seen, so
+                        // panes switch while the link is still down.
+                        installOffline(currentHostId, launch.name(), shown);
+                        showSaved(currentHostId, shown);
                         main.post(this::reconnectCurrentHost);
                         return;
                     }
@@ -5042,6 +5561,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /** ctrl-alt-w or ctrl-alt-b, nothing else held: the rail's keys (item 83). */
+    static boolean railKeyCode(KeyEvent event) {
+        int code = event.getKeyCode();
+        return (code == KeyEvent.KEYCODE_W || code == KeyEvent.KEYCODE_B)
+                && event.isCtrlPressed() && event.isAltPressed()
+                && !event.isShiftPressed() && !event.isMetaPressed();
+    }
+
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
         // Enter while typing into the composer is its send, whichever view has
@@ -5059,6 +5586,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (event.getAction() == KeyEvent.ACTION_UP) {
             capturedKeys.remove(code);
             if (oneShotKey == code) oneShotKey = KeyEvent.KEYCODE_UNKNOWN;
+            return true;
+        }
+        // Item 83's keys, as the desktop's Work panel has them: ctrl-alt-w closes the
+        // rail and brings it back, ctrl-alt-b minimizes it to its strip and back.
+        // Ctrl with Alt reaches no terminal here (refused below), so nothing is taken from it.
+        if (railKeyCode(event) && !shellMode()) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                railKey(code == KeyEvent.KEYCODE_W);
+            }
+            capturedKeys.add(code);
             return true;
         }
         // A one-shot Ctrl press must not turn into plain text when the same key repeats.
@@ -5370,6 +5907,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     fail(current, "The host stopped answering");
                     return;
                 }
+                // A checkpoint of the pane on screen, so it reads offline as it
+                // was (item 77): at its turn's end, and every two minutes at most
+                // while it prints.
+                String onScreen = state.optString("pane_id", "");
+                if (current.ready && current.hostId != null && onScreen.equals(current.chromePane)
+                        && checkpoint.observe(onScreen, paneStatus(current.panes, onScreen),
+                                state.optLong("output", 0), SystemClock.uptimeMillis())) {
+                    snapshots.save(current.hostId, onScreen, current.remoteHandle);
+                }
                 if (state.optBoolean("unchanged", false)) {
                     String quietPhase = state.optString("state", "");
                     String quietPane = state.optString("pane_id", "");
@@ -5464,11 +6010,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.workspaces = state.optJSONArray("workspaces");
                     current.tabs = state.optJSONArray("tabs");
                     current.panes = state.optJSONArray("panes");
+                    current.projectsOrder = state.optJSONObject("projects_order");
                     current.title = state.optString("title", current.hostName);
+                    if (current.hostId != null && current.panes != null && current.workspaces != null) {
+                        seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
+                    }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
                 // a title update on the pane the user is already reading.
                 if (selected && !pane.equals(current.chromePane)) {
+                    // The pane switched away from: its grid was kept natively
+                    // when the attach replaced it, and is saved (and freed) now.
+                    if (!current.chromePane.isEmpty() && current.hostId != null) {
+                        snapshots.save(current.hostId, current.chromePane, current.remoteHandle);
+                    }
                     if (switchAskedAt > 0) {
                         android.util.Log.w("herdr-switch", "pane " + pane + " shown "
                                 + (SystemClock.uptimeMillis() - switchAskedAt) + " ms after the tap");
@@ -5557,6 +6112,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 failed.ready = false;
                 holdUnsent(failed);
                 nativeHold(failed.generation);
+                // The frame held is the pane as of now; its copy is saved on close.
+                savedShownHost = failed.hostId;
+                savedShownAt = System.currentTimeMillis();
+                // A switch the core made but the poll never confirmed: the pane left is kept natively.
+                if (failed.hostId != null && !failed.chromePane.isEmpty() && !failed.chromePane.equals(failed.paneId)) {
+                    snapshots.save(failed.hostId, failed.chromePane, failed.remoteHandle);
+                }
                 publish(failed, message);
                 android.util.Log.i("herdr-reconnect", "link lost: " + message);
                 main.post(() -> {
@@ -5579,23 +6141,168 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /**
      * Draws {@code pane}'s saved grid, dimmed and scrollable, while there is no
-     * live pane: the terminal opened with no link, or came back to the screen
-     * before reconnecting. The live pane replaces it as soon as it attaches.
+     * live pane: the terminal opened with no link, came back to the screen
+     * before reconnecting, or switched panes or machines offline. A pane with
+     * no copy shows its title and one dim line instead. The live pane replaces
+     * either as soon as it attaches.
      */
     private void showSaved(String host, String pane) {
         if (snapshots == null || host == null || pane == null || pane.isEmpty()) return;
-        snapshots.open(host, pane, shown -> main.post(() -> {
-            synchronized (stateLock) {
-                Connection now = connection;
-                if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
-                long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
-                nativeHold(generation);
-                nativeAttachShell(generation, shown.renderId);
-                savedShownHost = host;
-                savedShownAt = shown.savedAt;
+        String title;
+        synchronized (stateLock) { title = paneTitle(connection, pane); }
+        int[] size = OfflineSwitch.gridSize(terminalGrid());
+        snapshots.open(host, pane, shown -> main.post(() -> drawSaved(host, pane, shown.renderId, shown.savedAt)),
+                () -> {
+                    long id;
+                    try {
+                        id = RemoteNative.holdNote(pane, title, OfflineSwitch.NOT_CACHED, size[0], size[1]);
+                    } catch (RuntimeException | LinkageError unavailable) {
+                        id = 0;
+                    }
+                    final long note = id;
+                    if (note > 0) main.post(() -> drawSaved(host, pane, note, 0));
+                });
+    }
+
+    /** Puts a saved pane (or an uncached pane's note) on screen, unless a later pick or the live pane won. Main thread. */
+    private void drawSaved(String host, String pane, long renderId, long savedAt) {
+        synchronized (stateLock) {
+            Connection now = connection;
+            if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
+            if (now != null && !pane.equals(now.paneId)) return;
+            long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
+            nativeHold(generation);
+            nativeAttachShell(generation, renderId);
+            savedShownHost = host;
+            savedShownAt = savedAt;
+        }
+        // A copy just drawn starts at its newest line.
+        showLatest(false);
+        showLinkDown();
+    }
+
+    /** The title a pane goes by in the strip, from the last list seen; its id when unlisted. */
+    private static String paneTitle(Connection source, String pane) {
+        JSONArray panes = source == null ? null : source.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject item = panes.optJSONObject(i);
+            if (item != null && pane.equals(item.optString("id"))) {
+                return RailTree.fallbackTitle(HomeActivity.cleanTitle(
+                        chromeTitle(item.optString("title", ""), pane), pane), item);
             }
-            showLinkDown();
-        }));
+        }
+        return pane;
+    }
+
+    /** The agent status of {@code pane} in {@code panes}, "" when unlisted. */
+    private static String paneStatus(JSONArray panes, String pane) {
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject item = panes.optJSONObject(i);
+            if (item != null && pane.equals(item.optString("id"))) return item.optString("status", "");
+        }
+        return "";
+    }
+
+    /**
+     * Makes the connection a stand-in for {@code hostId} with no session
+     * (unless one for that host is already here): its lists are Home's last
+     * view of that computer, so the strip and the rail switch panes offline.
+     * Under stateLock or on the main thread.
+     */
+    private void installOffline(String hostId, String hostName, String pane) {
+        synchronized (stateLock) {
+            Connection now = connection;
+            if (now != null && hostId.equals(now.hostId)) return;
+            Connection offline = new Connection(GENERATIONS.incrementAndGet(), 0L);
+            offline.offline = true;
+            offline.closed = true;
+            offline.hostId = hostId;
+            offline.hostName = hostName;
+            offline.title = hostName;
+            offline.paneId = pane == null ? "" : pane;
+            fillFromCache(offline);
+            connection = offline;
+            checkpoint.reset();
+            nativeHold(offline.generation);
+            if (imeSession > 0) nativeSetImeSession(offline.generation, imeSession);
+            publish(offline, "Offline");
+        }
+    }
+
+    /**
+     * A stand-in with no lists takes the ones this terminal last saw live for
+     * its computer, else Home's cached ones. Under stateLock.
+     */
+    private void fillFromCache(Connection offline) {
+        if (!offline.offline || offline.panes != null) return;
+        JSONArray[] last = lastLists(offline.hostId);
+        if (last == null) return;
+        offline.workspaces = last[0];
+        offline.tabs = last[1];
+        offline.panes = last[2];
+    }
+
+    /** {workspaces, tabs, panes} of a computer with no live list: as last seen here, else Home's cache; null if neither. */
+    private JSONArray[] lastLists(String hostId) {
+        if (hostId == null) return null;
+        JSONArray[] seen = seenLists.get(hostId);
+        if (seen != null) return seen;
+        HomeCache.Entry cached = fleetCache.get(hostId);
+        if (cached == null) return null;
+        return new JSONArray[] {cached.view.optJSONArray("workspaces"), cached.view.optJSONArray("tabs"),
+                cached.view.optJSONArray("panes")};
+    }
+
+    /** Reads Home's cached Fleet view off the UI thread; the rail and strip redraw with it. */
+    private void loadFleetCache() {
+        final java.io.File file = new java.io.File(getNoBackupFilesDir(), HomeCache.FILE_NAME);
+        worker.execute(() -> {
+            java.util.Map<String, HomeCache.Entry> read = HomeCache.read(file);
+            main.post(() -> {
+                if (destroyed) return;
+                fleetCache = java.util.Collections.unmodifiableMap(read);
+                synchronized (stateLock) {
+                    if (connection != null) fillFromCache(connection);
+                }
+                tabSignature = "";
+                sidebarSignature = "";
+                refreshSidebar(true);
+            });
+        });
+    }
+
+    /**
+     * Another computer picked while it cannot be reached (item 77): it
+     * becomes the one on screen anyway, as a terminal opened with no link
+     * does. Its picked (else last) pane is drawn from the cache and the
+     * monitor reconnects to it. Main thread.
+     */
+    private void switchHostOffline(SavedRemoteHost host, String pane) {
+        String shown = pane != null && !pane.isEmpty() ? pane : rememberedHostPane(host.id);
+        if (shown.isEmpty()) {
+            JSONArray[] last = lastLists(host.id);
+            if (last != null) {
+                try {
+                    shown = FleetPanes.switchLanding(new JSONObject().put("workspaces", last[0])
+                            .put("tabs", last[1]).put("panes", last[2]), "");
+                } catch (JSONException unexpected) {
+                    shown = "";
+                }
+            }
+        }
+        pickedAnotherHost();
+        stopConnection();
+        synchronized (stateLock) { pendingInput.discardAll(); }
+        currentHostId = host.id;
+        savedShownHost = null;
+        savedShownAt = 0;
+        if (!shown.isEmpty()) rememberHostPane(host.id, shown);
+        installOffline(host.id, host.name, shown);
+        showSaved(host.id, shown);
+        sidebarSignature = "";
+        refreshSidebar(true);
+        if (monitor != null) monitor.lost();
+        showLinkDown();
     }
 
     /** A Herdr session on a saved host: the pane outlives the link, so it can be resumed. */
@@ -5633,6 +6340,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** The status line while the link is down; dense, in the crumb's own slot. Main thread. */
     private void showLinkDown() {
         if (monitor == null || !monitor.reconnecting() || crumb == null) return;
+        // The rail's machine row says offline too.
+        refreshSidebar(false);
         String host;
         int held;
         synchronized (stateLock) {
@@ -5641,19 +6350,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String hostId = connection == null ? currentHostId : connection.hostId;
             if (hostId != null && outbox != null) held += outbox.outbox().waiting(hostId);
         }
-        StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
-        if (host != null && !host.isEmpty()) text.append(" to ").append(host);
-        text.append('…');
-        if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
-        if (savedShownAt > 0) {
-            text.append(" · showing ").append(android.text.format.DateFormat.getTimeFormat(this)
-                    .format(new java.util.Date(savedShownAt)));
+        long savedAt = savedShownAt;
+        if (savedShownHost != null) {
+            // A cached pane on screen: its age, the link, and what waits (item 77).
+            String when = savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
+                    java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
+                    java.util.Locale.getDefault()) : null;
+            linkStatus = OfflineSwitch.label(when, monitor.offline(), held);
+            linkStatusDim = true;
+        } else {
+            StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
+            if (host != null && !host.isEmpty()) text.append(" to ").append(host);
+            text.append('…');
+            if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
+            linkStatus = text.toString();
+            linkStatusDim = false;
         }
-        linkStatus = text.toString();
         // A note on screen keeps its moment; the link status follows it.
         if (crumbNote != null) return;
         crumb.setVisibility(View.VISIBLE);
-        crumb.setTextColor(chrome.warning);
+        crumb.setTextColor(linkStatusDim ? chrome.onSurfaceVariant : chrome.warning);
         crumb.setText(linkStatus);
         crumb.setContentDescription(linkStatus);
     }
@@ -5665,7 +6381,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumbText = null;
         if (crumb == null) return;
         if (linkStatus != null) {
-            crumb.setTextColor(chrome.warning);
+            crumb.setTextColor(linkStatusDim ? chrome.onSurfaceVariant : chrome.warning);
             crumb.setText(linkStatus);
             crumb.setContentDescription(linkStatus);
         } else refreshTabStrip();
@@ -5698,10 +6414,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         savedShownHost = null;
         savedShownAt = 0;
         if (monitor != null) monitor.succeeded();
-        if (linkStatus == null) return;
         linkStatus = null;
         crumbText = null;
-        refreshTabStrip();
+        // The strip and the rail's machine row (live again).
+        refreshSidebar(false);
     }
 
     /** A raw SSH shell instead of a Herdr pane: no rail, panes or session changes. */
@@ -5824,6 +6540,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private final class Connection {
+        /**
+         * A stand-in for a computer with no session (item 77): opened or
+         * switched to with no link. Its lists are the last ones seen; it is
+         * never polled, and the monitor's reconnect replaces it.
+         */
+        boolean offline;
         long degradedSince;
         /** Replaces a dropped session on the same host; its first ready ends the reconnect. */
         boolean resumed;
@@ -5857,6 +6579,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String text = "";
         boolean remotePainted;
         JSONArray workspaces, tabs, panes;
+        /** The core's projects.order doc (Wolf's order of repos and projects), or null. */
+        JSONObject projectsOrder;
         volatile long clipboardSerial;
         volatile long scrollOffset, scrollMax, scrollRows;
         String chromePane = "";
@@ -5902,7 +6626,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             RemoteNative.close(remoteHandle);
             // Its grid, for reading this conversation later with no link.
             if (remoteHandle > 0 && hostId != null && remoteClosed.compareAndSet(false, true)) {
-                snapshots.saveClosed(hostId, paneId);
+                snapshots.save(hostId, paneId, remoteHandle);
             }
         }
         /** Never blocks, so it is safe under stateLock on the UI thread. */

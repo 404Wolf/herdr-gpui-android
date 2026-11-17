@@ -69,6 +69,21 @@ public interface DictationEngine {
             onFinal(text);
         }
 
+        /**
+         * After stop, the desktop's final waits for a decode in flight or queued
+         * ({@code {"type":"status","state":"finishing"}}): show "finishing…"; the final follows.
+         */
+        default void onFinishing(double tailSeconds) { }
+
+        /**
+         * Asked right after onFinal: whether its text is durably stored. Only then is the
+         * recording deleted; otherwise it is kept as a parked clip, with no expiry, shown "not
+         * transcribed yet · retry".
+         */
+        default boolean finalStored() {
+            return true;
+        }
+
         void onState(State state);
 
         /**

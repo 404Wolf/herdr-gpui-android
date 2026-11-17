@@ -33,13 +33,10 @@ final class ClipStore {
     static final long MAX_TOTAL_BYTES = 30L * 60 * BYTES_PER_SECOND;
     static final int MAX_CLIPS = 64;
     static final String INDEX = "index-v1.json";
+    /** Uploads a clip gets before it is parked: a long clip is never re-decoded without end. */
+    static final int MAX_ATTEMPTS = 3;
     /** How long a recording the phone transcribed itself is kept: 48 h. */
     static final long KEEP_MS = 48L * 60 * 60 * 1000;
-    /**
-     * Desktop errors on one clip before the courier stops trying it by itself: it stays, as
-     * stuck, until the next tap on the microphone tries it again ({@link #retryStuck}).
-     */
-    static final int MAX_SERVER_ERRORS = 3;
 
     /** One saved clip; {@code text} is null until transcribed. */
     static final class Entry {
@@ -48,27 +45,39 @@ final class ClipStore {
         final String text;
         /** Non-zero for a kept clip (the phone transcribed it): deleted after this epoch time. */
         final long keptUntil;
-        /** Desktop errors while uploading it since the last manual retry. */
-        final int errors;
 
         Entry(PendingClip clip, long bytes, String text) {
-            this(clip, bytes, text, 0, 0);
+            this(clip, bytes, text, 0);
         }
 
-        Entry(PendingClip clip, long bytes, String text, long keptUntil, int errors) {
+        /** Uploads the desktop took and then failed to finish (slow, unavailable, cut off). */
+        final int attempts;
+        /** Parked by the courier (an explicit mark; {@link #parked()} is what counts). */
+        final boolean parkedFlag;
+
+        Entry(PendingClip clip, long bytes, String text, long keptUntil) {
+            this(clip, bytes, text, keptUntil, 0, false);
+        }
+
+        Entry(PendingClip clip, long bytes, String text, long keptUntil, int attempts, boolean parked) {
             this.clip = clip;
             this.bytes = bytes;
             this.text = text;
             this.keptUntil = keptUntil;
-            this.errors = errors;
-        }
-
-        boolean stuck() {
-            return text == null && !kept() && errors >= MAX_SERVER_ERRORS;
+            this.attempts = attempts;
+            this.parkedFlag = parked;
         }
 
         boolean kept() {
             return keptUntil != 0;
+        }
+
+        /**
+         * Given up on: kept and shown, sent again only by hand. Derived from the durable count, so
+         * a kill right after the last charge (before the mark was written) still stops a send.
+         */
+        boolean parked() {
+            return parkedFlag || attempts >= MAX_ATTEMPTS;
         }
     }
 
@@ -153,21 +162,30 @@ final class ClipStore {
             return keep(clock.getAsLong() + KEEP_MS);
         }
 
+        /**
+         * Keeps whatever audio reached the disk, even after a write failed partway: audio is
+         * never deleted without a stored final. Null only when nothing was saved at all.
+         */
+        /**
+         * Keeps the audio of a session whose final could not be stored, as a parked clip with no
+         * expiry: shown "not transcribed yet · retry", sent again only by hand. Null if none.
+         */
+        PendingClip keepParked() {
+            PendingClip clip = keep(0);
+            if (clip != null) park(clip.id);
+            return clip;
+        }
+
         private PendingClip keep(long keptUntil) {
             synchronized (this) {
-                boolean ok = out != null;
-                try {
-                    if (out != null) out.close();
-                } catch (IOException e) {
-                    ok = false;
-                }
-                out = null;
-                if (!ok || bytes == 0) {
-                    discard();
-                    return null;
-                }
+                closeQuietly();
             }
-            return ClipStore.this.keep(this, keptUntil);
+            long onDisk = file.isFile() ? file.length() : 0;
+            if (onDisk == 0) {
+                discard();
+                return null;
+            }
+            return ClipStore.this.keep(this, onDisk, keptUntil);
         }
 
         void discard() {
@@ -236,30 +254,34 @@ final class ClipStore {
         recording = Math.max(0, recording - n);
     }
 
-    private synchronized PendingClip keep(Recording r, long keptUntil) {
+    /**
+     * Files a finished recording. Its audio is never deleted here: past {@link #MAX_CLIPS} it is
+     * kept anyway (the byte budget bounds recording), and when the index cannot be written the
+     * clip stays in memory, the index is written again later ({@link #flush}), and a restart
+     * recovers the audio in any case ({@link #load}).
+     */
+    private synchronized PendingClip keep(Recording r, long bytes, long keptUntil) {
         release(r.bytes);
         dropExpired();
         if (entries.size() >= MAX_CLIPS) dropOldestKept();
-        if (entries.size() >= MAX_CLIPS) {
-            //noinspection ResultOfMethodCallIgnored
-            r.file.delete();
-            return null;
-        }
+        PendingClip clip = new PendingClip(r.id, r.target, r.createdAt, bytes * 1000 / BYTES_PER_SECOND);
         File pcm = audio(r.id);
         if (!r.file.renameTo(pcm)) {
-            //noinspection ResultOfMethodCallIgnored
-            r.file.delete();
-            return null;
+            // The .part stays where it is; the next start recovers it ("not transcribed yet").
+            indexDirty = true;
+            return clip;
         }
-        PendingClip clip = new PendingClip(r.id, r.target, r.createdAt, r.durationMs());
-        entries.add(new Entry(clip, r.bytes, null, keptUntil, 0));
-        if (!save()) {
-            entries.remove(entries.size() - 1);
-            //noinspection ResultOfMethodCallIgnored
-            pcm.delete();
-            return null;
-        }
+        entries.add(new Entry(clip, bytes, null, keptUntil));
+        save();
         return clip;
+    }
+
+    /** The index could not be written: {@link #flush} tries again. Guarded by this. */
+    private boolean indexDirty;
+
+    /** Writes the index if an earlier write failed; true when it is current. */
+    synchronized boolean flush() {
+        return !indexDirty || save();
     }
 
     /** Audio bytes of saved clips not yet transcribed, kept ones included. */
@@ -273,54 +295,89 @@ final class ClipStore {
         return new File(dir, id + ".pcm");
     }
 
-    /** The clips still waiting for the desktop, oldest first. */
+    /** The clips still waiting for the desktop, oldest first (parked and kept ones not). */
     synchronized List<PendingClip> untranscribed() {
         List<PendingClip> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text == null && !e.kept()) out.add(e.clip);
+        for (Entry e : entries) if (e.text == null && !e.kept() && !e.parked()) out.add(e.clip);
         return out;
     }
 
-    /** The clips the courier tries by itself: waiting and not stuck, oldest first. */
-    synchronized List<PendingClip> due() {
+    /** Clips given up on after {@link #MAX_ATTEMPTS} uploads, oldest first: sent again only by hand. */
+    synchronized List<PendingClip> parked() {
         List<PendingClip> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text == null && !e.kept() && !e.stuck()) out.add(e.clip);
+        for (Entry e : entries) if (e.text == null && !e.kept() && e.parked()) out.add(e.clip);
         return out;
     }
 
-    /** Waiting clips the courier stopped trying after {@link #MAX_SERVER_ERRORS} desktop errors. */
-    synchronized int stuck() {
-        int n = 0;
-        for (Entry e : entries) if (e.stuck()) n++;
+    /**
+     * An upload of {@code id} reached the desktop and did not come back with its text: counted,
+     * and at {@link #MAX_ATTEMPTS} the clip is parked. The attempts so far, -1 if unknown.
+     */
+    synchronized int attempted(String id) {
+        int n = charge(id);
+        if (n >= MAX_ATTEMPTS) park(id);
         return n;
     }
 
     /**
-     * One more desktop error for {@code id}; returns its count, or 0 when the clip is gone. The
-     * clip is kept either way: its audio is still good.
+     * Counts an upload of {@code id} before it is sent, durably: the attempts after it, or -1
+     * when the count could not be written (then the clip must not be sent: an upload the index
+     * does not know of could be repeated without end across restarts).
      */
-    synchronized int failed(String id) {
+    synchronized int charge(String id) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
-            if (!e.clip.id.equals(id) || e.text != null || e.kept()) continue;
-            Entry next = new Entry(e.clip, e.bytes, null, 0, e.errors + 1);
-            entries.set(i, next);
-            save();
-            return next.errors;
+            if (!e.clip.id.equals(id) || e.text != null) continue;
+            int n = e.attempts + 1;
+            if (e.parked()) return -1; // the cap: never a send past it
+            entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, e.parkedFlag));
+            if (!save()) {
+                entries.set(i, e);
+                return -1;
+            }
+            return n;
         }
+        return -1;
+    }
+
+    /** The charged upload never reached the desktop's decoder: it does not count. */
+    synchronized void refund(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.attempts == 0) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts - 1, e.parkedFlag));
+            // A refund that is not written leaves the count high: the safe side.
+            save();
+            return;
+        }
+    }
+
+    /** After {@link #MAX_ATTEMPTS} counted uploads: parked, sent again only by hand. */
+    synchronized void park(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.parkedFlag) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, e.attempts, true));
+            save();
+            return;
+        }
+    }
+
+    /** The counted uploads of {@code id} so far. */
+    synchronized int attempts(String id) {
+        for (Entry e : entries) if (e.clip.id.equals(id)) return e.attempts;
         return 0;
     }
 
-    /** The user asked again: stuck clips are tried afresh. Returns whether there were any. */
-    synchronized boolean retryStuck() {
-        boolean any = false;
+    /** The user's retry of a parked clip: it waits for the desktop again, its count reset. */
+    synchronized boolean unpark(String id) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
-            if (!e.stuck()) continue;
-            entries.set(i, new Entry(e.clip, e.bytes, null, 0, 0));
-            any = true;
+            if (!e.clip.id.equals(id) || !e.parked()) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, e.keptUntil, 0, false));
+            return save();
         }
-        if (any) save();
-        return any;
+        return false;
     }
 
     /**
@@ -374,38 +431,63 @@ final class ClipStore {
 
     private synchronized void load() {
         entries.clear();
+        Set<String> expired = new HashSet<>();
         String text = read(new File(dir, INDEX));
         if (text != null) {
             try {
                 JSONArray list = new JSONArray(text);
-                for (int i = 0; i < list.length() && entries.size() < MAX_CLIPS; i++) {
+                // Every entry, whatever the bound: keep() may file more than MAX_CLIPS rather than
+                // delete audio, so a load that stopped short would drop stored finals.
+                for (int i = 0; i < list.length(); i++) {
                     JSONObject o = list.getJSONObject(i);
                     String id = o.getString("id");
                     String clipText = o.isNull("text") ? null : o.optString("text", null);
                     long bytes = o.getLong("bytes");
                     long keptUntil = o.optLong("keptUntil", 0);
-                    int errors = o.optInt("errors", 0);
                     if (clipText == null && audio(id).length() != bytes) continue;
-                    if (keptUntil != 0 && keptUntil <= clock.getAsLong()) continue;
+                    if (keptUntil != 0 && keptUntil <= clock.getAsLong()) {
+                        expired.add(id);
+                        continue;
+                    }
                     PendingClip clip = new PendingClip(id, PendingClip.cutTarget(o.optString("target")),
                             o.getLong("created"), o.getLong("duration"));
-                    entries.add(new Entry(clip, bytes, clipText, keptUntil, errors));
+                    entries.add(new Entry(clip, bytes, clipText, keptUntil, o.optInt("attempts", 0),
+                            o.optBoolean("parked", false)));
                 }
             } catch (JSONException damaged) {
                 entries.clear();
             }
         }
-        // Leftovers of a session cut short by a kill, and audio no entry refers to.
+        // Audio no entry refers to (a session cut short by a kill, an index write that failed)
+        // is never deleted: it is recovered as a parked clip, "not transcribed yet", sent again
+        // only by hand. Only audio whose final is stored, or whose 48 h are up, goes.
+        Set<String> known = new HashSet<>();
+        for (Entry e : entries) known.add(e.clip.id);
         Set<String> wanted = new HashSet<>();
         for (Entry e : entries) if (e.text == null) wanted.add(e.clip.id + ".pcm");
         File[] files = dir.listFiles();
         if (files == null) return;
+        boolean recovered = false;
         for (File f : files) {
             String name = f.getName();
             if (name.equals(INDEX) || wanted.contains(name)) continue;
-            //noinspection ResultOfMethodCallIgnored
-            f.delete();
+            boolean pcm = name.endsWith(".pcm"), part = name.endsWith(".part");
+            if (!pcm && !part) continue;
+            String id = name.substring(0, name.lastIndexOf('.'));
+            if (known.contains(id) || expired.contains(id) || f.length() == 0) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+                continue;
+            }
+            File audio = audio(id);
+            if (part && !f.renameTo(audio)) continue;
+            long bytes = audio.length();
+            PendingClip clip = new PendingClip(id, "", f.lastModified(), bytes * 1000 / BYTES_PER_SECOND);
+            entries.add(new Entry(clip, bytes, null, 0, 0, true));
+            known.add(id);
+            recovered = true;
         }
+        if (recovered) save();
     }
 
     private boolean save() {
@@ -420,12 +502,15 @@ final class ClipStore {
                 o.put("bytes", e.bytes);
                 o.put("text", e.text == null ? JSONObject.NULL : e.text);
                 if (e.kept()) o.put("keptUntil", e.keptUntil);
-                if (e.errors != 0) o.put("errors", e.errors);
+                if (e.attempts > 0) o.put("attempts", e.attempts);
+                if (e.parkedFlag) o.put("parked", true);
                 list.put(o);
             }
             write(new File(dir, INDEX), list.toString());
+            indexDirty = false;
             return true;
         } catch (IOException | JSONException e) {
+            indexDirty = true;
             return false;
         }
     }

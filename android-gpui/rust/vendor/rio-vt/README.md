@@ -1,11 +1,23 @@
 # rio-vt
 
 > **Modified copy** of rio-vt 0.5.28 for Herdr GPUI Android (MIT, see
-> `LICENSE`). The one change: kitty graphics transmissions that name a file,
-> temporary file or shared-memory object are refused with `EINVAL: unsupported
-> medium` instead of being opened, mapped or deleted. A remote program's escape
-> sequence must never reach this device's files, and Android has no POSIX
-> shared memory. The examples and benchmark are not copied.
+> `LICENSE`). Two changes:
+>
+> - Kitty graphics transmissions that name a file, temporary file or
+>   shared-memory object are refused with `EINVAL: unsupported medium` instead
+>   of being opened, mapped or deleted. A remote program's escape sequence must
+>   never reach this device's files, and Android has no POSIX shared memory.
+> - `Crosswords::set_erase_scrolls_into_history(false)` makes ED 2 only erase
+>   the main screen (xterm) instead of scrolling it into history first. The
+>   phone mirrors herdr-core panes, which the core repaints with `ESC[H ESC[2J`
+>   (and whose history it replays itself), so each repaint used to copy the
+>   screen into the phone's scrollback again.
+>   `Crosswords::scroll_next_erase_into_history()` keeps Rio's behaviour for
+>   one ED 2: the repaint right after the core resizes the pane, so rows the
+>   core and the phone moved differently are never lost.
+>
+> The examples and benchmark are not copied (so `ansi::sixel::tests::load_sixel_files`,
+> which reads them, fails when this crate is tested on its own).
 
 Rio's embeddable terminal core: the VT state machine, ANSI/escape parser,
 grid with scrollback, selection, search, and PTY-facing event model,

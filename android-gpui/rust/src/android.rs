@@ -32,6 +32,10 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeStart<'
                 .with_tag("herdr-gpui"),
         );
         gpui_mobile::android::jni::install_panic_hook();
+        // Each touch Java posts, as the render thread hands it to GPUI.
+        gpui_mobile::android::host::set_touch_observer(Some(Box::new(|_, action| {
+            lock_downs().observed(action);
+        })));
         gpui_mobile::android::host::start(|cx: &mut App| {
             surface_fence::install(cx);
             // Android does not promise desktop generic aliases or GPUI's
@@ -226,7 +230,9 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
     // The pane this press begins on goes into the queue with its down, in the
     // order GPUI gets the downs (the lock is held across the post), so the
     // renderer stamps the tap with it however late it handles it.
-    let mut downs = (action == 0).then(lock_downs);
+    // gpui-mobile posts a down for ACTION_DOWN and for a POINTER_DOWN alike;
+    // each takes one entry, as its observer will see one down for each.
+    let mut downs = (action == 0 || action == 5).then(lock_downs);
     if let Some(downs) = downs.as_mut() {
         downs.queued(stamp.max(0) as u64);
     }
@@ -248,11 +254,6 @@ fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
     DOWNS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// GPUI handled the next queued touch-down (see `ui::down_watch`).
-pub(crate) fn touch_handled() {
-    lock_downs().handled();
 }
 
 /// The gesture GPUI is handling: the down it handled last, with the stamp

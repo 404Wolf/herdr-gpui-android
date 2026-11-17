@@ -95,6 +95,8 @@ impl TerminalView {
         }
         #[cfg(unix)]
         self.attach_shell(state.shell, cx);
+        #[cfg(unix)]
+        self.pan_shell(state.generation, cx);
         #[cfg(not(unix))]
         let _ = cx;
         let new_generation = self.state.generation != state.generation;
@@ -188,12 +190,36 @@ impl TerminalView {
             });
     }
 
+    /// Hands queued pan steps (the pan buttons) to the shell's view, which
+    /// owns the column offset of a grid wider than the pane.
+    #[cfg(unix)]
+    fn pan_shell(&mut self, generation: i64, cx: &mut Context<Self>) {
+        let Some((handle, terminal)) = &self.shell else {
+            return;
+        };
+        // Only steps queued for the pane drawn here: ones queued for another
+        // pane (a switch raced this take) are dropped by the mailbox.
+        let dx = model::mailbox().take_shell_pan(generation, *handle);
+        if dx == 0. {
+            return;
+        }
+        terminal.update(cx, |terminal, cx| {
+            if terminal.pan(px(dx)) {
+                cx.notify();
+            }
+        });
+    }
+
     #[cfg(unix)]
     fn shell_style(&self, width: Pixels) -> gpui_rio::TerminalStyle {
         gpui_rio::TerminalStyle {
             theme: crate::shell::theme(&model::palette()),
             font_family: crate::fonts::MONO_FAMILY.into(),
             font_size: model::shell_font_size(self.state.display_preferences, width.into()),
+            // A grid another viewer sized narrower than this pane fills it
+            // instead of leaving its right part empty; the pane is still
+            // offered at the size above, chosen or auto.
+            grow_to_grid: Some(model::MAX_FONT),
         }
     }
 
@@ -291,52 +317,8 @@ fn button(
         .child(div().min_w_0().truncate().child(label.into()))
 }
 
-/// Takes the stamp Java queued with each touch-down, in the order GPUI
-/// handles the downs, before any view sees the touch (capture phase). Every
-/// down GPUI handles shows as one of two events: a touch drag offered as the
-/// touch starts, or (a down that stops a fling, starting no touch) a touch
-/// scroll that starts with no movement. Both take their down's entry, so
-/// entries are matched one to one in order, never by position.
-#[cfg(target_os = "android")]
-fn down_watch() -> impl IntoElement {
-    canvas(
-        |_, _, _| {},
-        move |_, _, window, _| {
-            window.on_mouse_event(|event: &TouchDragEvent, phase, _, _| {
-                if phase == DispatchPhase::Capture && event.phase == TouchPhase::Started {
-                    crate::android::touch_handled();
-                }
-            });
-            window.on_mouse_event(|event: &ScrollWheelEvent, phase, _, _| {
-                let still = match event.delta {
-                    ScrollDelta::Pixels(delta) => delta == Point::default(),
-                    ScrollDelta::Lines(delta) => delta == Point::default(),
-                };
-                if phase == DispatchPhase::Capture
-                    && event.touch_phase == TouchPhase::Started
-                    && still
-                {
-                    crate::android::touch_handled();
-                }
-            });
-        },
-    )
-    .absolute()
-    .size_full()
-}
-
-#[cfg(target_os = "android")]
-fn down_watch_child() -> Option<AnyElement> {
-    Some(down_watch().into_any_element())
-}
-
-#[cfg(not(target_os = "android"))]
-fn down_watch_child() -> Option<AnyElement> {
-    None
-}
-
 /// Watches, without claiming them, the gestures GPUI offers every touch: its
-/// start (to take back the stamp Java queued with its down) and a long press.
+/// start (to note the stamp of the down in progress) and a long press.
 /// The pane's own view reports its taps from them, as the shell's view does.
 #[cfg(target_os = "android")]
 fn tap_watch(view: Entity<TerminalView>) -> impl IntoElement {
@@ -866,9 +848,6 @@ impl Render for TerminalView {
             .when(false, |root| root)
             .font_family(crate::fonts::SANS_FAMILY)
             .track_focus(&self.focus)
-            // Whichever view draws the pane, every touch-down GPUI handles takes
-            // the stamp Java queued with it, in order.
-            .children(down_watch_child())
             // A shell has no pane title or agent state to show: its rows take
             // the header's height, and its exit or failure shows in the banner.
             .when(!shell_mode, |root| {

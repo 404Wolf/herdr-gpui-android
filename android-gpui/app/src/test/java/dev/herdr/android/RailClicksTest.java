@@ -154,7 +154,8 @@ public final class RailClicksTest {
             assertTrue(constructor[0], row.contains("holder.mark.setBackground(railBackground(false))"));
             assertTrue(constructor[0], row.contains("holder.mark.setOnClickListener("));
         }
-        String pill = section(rail, "private TextView tabPill(", "private void showTabActions(");
+        // The project bar's window chips (item 70; tabPill before them) press with a ripple too.
+        String pill = section(rail, "private TextView windowChip(", "private void showTabActions(");
         assertTrue(pill.contains("RippleDrawable("));
         String header = section(rail, "private RailWorkspaceRow createRailWorkspaceRow(", "private void updateRailWorkspaceRow(");
         String primary = header.substring(header.indexOf("holder.row.setOnClickListener("));

@@ -14,7 +14,8 @@ import java.util.concurrent.Executor;
  * Each pane's last terminal grid on disk (see the native snapshot module), so a
  * cold start with no link draws the conversation as it last was, dimmed, and
  * it still scrolls. Saved whenever a session closes (a lost link, leaving the
- * screen); the newest few panes are kept.
+ * screen), before every pane switch, and as a checkpoint of the pane on screen
+ * (PaneCheckpoint); the newest few panes are kept.
  *
  * <p>Files live in the app's no-backup directory, named by a hash of the
  * computer and pane, and are written and read on this class's own thread.
@@ -63,33 +64,58 @@ final class PaneSnapshots {
         this.thread = thread;
     }
 
-    /** The session that showed {@code pane} on {@code host} just closed: keep its grid. */
-    void saveClosed(String host, String pane) {
+    /**
+     * Keeps {@code pane}'s grid on disk as session {@code handle} showed it:
+     * its live grid while it shows the pane, else the copy kept when a switch
+     * or a close left it. The handle names the computer too: every core has
+     * its own t1, so a save never takes another session's grid. Called when a
+     * switch is confirmed, on close, and as a checkpoint of the pane on
+     * screen. A failed save never truncates the previous copy.
+     */
+    void save(String host, String pane, long handle) {
         if (host == null || pane == null || pane.isEmpty()) return;
         thread.execute(() -> {
             if (!dir.isDirectory() && !dir.mkdirs()) return;
             try {
-                if (RemoteNative.saveClosed(pane, file(host, pane).getPath())) prune();
+                if (RemoteNative.savePane(handle, pane, file(host, pane).getPath())) prune();
             } catch (RuntimeException | LinkageError unsaved) {
-                // The previous copy, if any, stays: a failed save never truncates it.
+                // The previous copy, if any, stays.
             }
         });
     }
 
+    interface Missing {
+        void missing();
+    }
+
     /** Reads {@code pane}'s saved grid into the held frame; {@code then} runs on this thread if there was one. */
     void open(String host, String pane, Then then) {
+        open(host, pane, then, () -> { });
+    }
+
+    /**
+     * As {@link #open(String, String, Then)}, and {@code missing} runs on this
+     * thread instead when there is no readable copy. Opens run in the order
+     * asked, so the last pane picked is the one drawn.
+     */
+    void open(String host, String pane, Then then, Missing missing) {
         if (host == null || pane == null || pane.isEmpty()) return;
         thread.execute(() -> {
             File saved = file(host, pane);
-            if (!saved.isFile()) return;
+            if (!saved.isFile()) {
+                missing.missing();
+                return;
+            }
             long id;
             try {
                 id = RemoteNative.openSaved(saved.getPath());
             } catch (RuntimeException | LinkageError unreadable) {
                 saved.delete();
+                missing.missing();
                 return;
             }
             if (id > 0) then.shown(new Shown(id, saved.lastModified()));
+            else missing.missing();
         });
     }
 

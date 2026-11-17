@@ -23,7 +23,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -94,6 +94,9 @@ pub struct Session {
     dirty: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
+    /// Input sent so far (keys, typed and pasted text), counted so a view
+    /// can tell that the user typed since it last looked.
+    inputs: AtomicU64,
     // Type-erased so one session type serves every transport.
     resize: Box<dyn Fn(u16, u16) + Send + Sync>,
 }
@@ -123,14 +126,20 @@ impl Session {
             dirty: dirty.clone(),
             events,
         };
-        let grid = Arc::new(FairMutex::new(Crosswords::new(
+        let mut crosswords = Crosswords::new(
             CrosswordsSize::new(usize::from(columns), usize::from(lines)),
             CursorShape::Block,
             listener,
             WindowId::from(0),
             0,
             SCROLLBACK,
-        )));
+        );
+        // Every repaint of a herdr-core pane starts with ESC[H ESC[2J, and the
+        // core replays the pane's history itself: an erase must not copy the
+        // screen into this scrollback each time (it showed up as the screen
+        // repeated when scrolling back). xterm's plain erase.
+        crosswords.set_erase_scrolls_into_history(false);
+        let grid = Arc::new(FairMutex::new(crosswords));
         let shared = Arc::new(Shared {
             theme: Mutex::new(theme),
             size: Mutex::new(WindowSize {
@@ -185,6 +194,7 @@ impl Session {
             dirty,
             alive,
             shared,
+            inputs: AtomicU64::new(0),
             resize: Box::new(resize),
         }))
     }
@@ -454,7 +464,13 @@ impl Session {
             .is_some_and(|bytes| self.write(bytes))
     }
 
+    /// How many inputs (keys, typed or pasted text) were sent so far.
+    pub fn inputs(&self) -> u64 {
+        self.inputs.load(Ordering::Acquire)
+    }
+
     fn follow_input(&self) -> Mode {
+        self.inputs.fetch_add(1, Ordering::AcqRel);
         let mut grid = self.grid.lock();
         grid.scroll_display(Scroll::Bottom);
         grid.selection = None;
@@ -505,7 +521,13 @@ impl Reader {
                 }
                 drop(grid);
                 *lock(&self.shared.negotiated) = Some((columns, lines));
-                apply_grid(&self.grid, &self.shared, (columns, lines), None);
+                if apply_grid(&self.grid, &self.shared, (columns, lines), None) {
+                    // The remote side moved rows between screen and history
+                    // its own way and repaints only its screen next: that
+                    // repaint's erase keeps this screen in history, so no row
+                    // is lost (at worst some show twice).
+                    self.grid.lock().scroll_next_erase_into_history();
+                }
                 self.dirty.store(true, Ordering::Release);
             }
             let flush = processor
@@ -567,6 +589,132 @@ pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize))
         0
     };
     (row, col)
+}
+
+#[doc(hidden)]
+/// The cells (columns, rows) a pane of `size` pixels holds at `cell` pixels
+/// a cell.
+pub fn pane_cells(size: (f32, f32), cell: (f32, f32)) -> (u16, u16) {
+    let fit = |length: f32, cell: f32, least: f32| {
+        (length / cell.max(1.)).floor().clamp(least, 1000.) as u16
+    };
+    (fit(size.0, cell.0, 2.), fit(size.1, cell.1, 1.))
+}
+
+#[doc(hidden)]
+/// The type size to draw `grid` with in a pane of `size` pixels whose type
+/// size is `base` (a cell of `cell` pixels there). A grid with fewer columns
+/// than the pane holds at `base` (another viewer sized it) grows the type
+/// until it fills the pane's width, but never past its height, nor `max`.
+/// Any other grid is drawn at `base`: type is never shrunk here, and a pane
+/// the grid follows (its columns are the pane's own) is left as it is.
+pub fn fitted_font_size(
+    base: f32,
+    cell: (f32, f32),
+    size: (f32, f32),
+    grid: (u16, u16),
+    max: f32,
+) -> f32 {
+    let (columns, _) = pane_cells(size, cell);
+    if base.is_nan() || base <= 0. || grid.0 == 0 || grid.0 >= columns {
+        return base;
+    }
+    // Cells widen in proportion to the type. Rows round up to whole pixels:
+    // leave each a pixel, so every grid row still fits.
+    let width = size.0 / (f32::from(grid.0) * cell.0) * 0.999;
+    let rows = f32::from(grid.1.max(1));
+    let height = (size.1 / rows - 1.) / cell.1;
+    (base * width.min(height)).clamp(base, max.max(base))
+}
+
+#[doc(hidden)]
+/// The window actually drawn: [`viewport_origin`], except that a column the
+/// reader panned to (`pan`) wins over following the caret, and a view scrolled
+/// back into history starts at the top row and, unpanned, the left column.
+pub fn view_origin(
+    grid: (u16, u16),
+    pane: (u16, u16),
+    cursor: (i32, usize),
+    scrolled: bool,
+    pan: Option<usize>,
+) -> (i32, usize) {
+    let (row, caret_col) = if scrolled {
+        (0, 0)
+    } else {
+        viewport_origin(grid, pane, cursor)
+    };
+    let last = usize::from(grid.0).saturating_sub(usize::from(pane.0.max(1)));
+    (row, pan.map_or(caret_col, |col| col.min(last)))
+}
+
+#[doc(hidden)]
+/// A column offset the reader chose by panning a grid wider than the pane
+/// (one the remote side drew wider than this screen). Client-local: nothing
+/// is sent. Once panned, every column is a real position, the left edge too;
+/// the window follows the caret again only after the grid's width changes
+/// (its rows were drawn again) or the user types (their input is at the
+/// caret). A pane switch shows another session's view with its own offset.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ColumnPan {
+    /// The grid column drawn at the pane's left; `None` follows the caret.
+    col: Option<usize>,
+    /// Columns of drag not yet a whole one, so slow drags still move.
+    rest: f32,
+    /// The grid width and the session's input count it was chosen at.
+    basis: (u16, u64),
+}
+
+impl ColumnPan {
+    /// Moves the window `columns` to the right (negative: left) from `drawn`,
+    /// the column the last frame started at, stopping at either edge.
+    /// `inputs` is the session's input count ([`Session::inputs`]). True when
+    /// the column to draw from changed.
+    pub fn pan(
+        &mut self,
+        columns: f32,
+        drawn: usize,
+        (grid_cols, pane_cols): (u16, u16),
+        inputs: u64,
+    ) -> bool {
+        self.rebase(grid_cols, inputs);
+        let last = usize::from(grid_cols).saturating_sub(usize::from(pane_cols.max(1)));
+        if last == 0 || !columns.is_finite() {
+            self.rest = 0.;
+            return false;
+        }
+        // A reversed drag starts from no remainder, so it moves at once.
+        if (self.rest > 0.) != (columns > 0.) {
+            self.rest = 0.;
+        }
+        self.rest += columns;
+        let whole = self.rest.trunc();
+        self.rest -= whole;
+        if whole == 0. {
+            return false;
+        }
+        let from = self.col.unwrap_or(drawn).min(last);
+        let next = (from as f32 + whole).clamp(0., last as f32) as usize;
+        let moved = self.col != Some(next);
+        self.col = Some(next);
+        moved
+    }
+
+    /// The column to draw from (within the grid), or `None` to follow the
+    /// caret: never panned, or dropped by a new grid width or new input.
+    pub fn column(&mut self, (grid_cols, pane_cols): (u16, u16), inputs: u64) -> Option<usize> {
+        self.rebase(grid_cols, inputs);
+        let last = usize::from(grid_cols).saturating_sub(usize::from(pane_cols.max(1)));
+        self.col.map(|col| col.min(last))
+    }
+
+    fn rebase(&mut self, grid_cols: u16, inputs: u64) {
+        if self.basis != (grid_cols, inputs) {
+            *self = Self {
+                basis: (grid_cols, inputs),
+                ..Self::default()
+            };
+        }
+    }
 }
 
 pub fn resolve_index(grid: &Crosswords<Listener>, theme: TerminalTheme, index: usize) -> ColorRgb {
@@ -921,6 +1069,67 @@ mod tests {
         assert_eq!(session.grid_size(), (90, 25));
     }
 
+    /// The emulator's unfolded pane at 11 px type: 707 x 571 dp, a 6.6 x 13 cell.
+    const PANE: (f32, f32) = (707., 571.);
+    const CELL: (f32, f32) = (6.601, 13.);
+
+    #[test]
+    fn a_narrower_grid_grows_the_type_within_the_pane() {
+        use super::{fitted_font_size, pane_cells};
+        assert_eq!(pane_cells(PANE, CELL), (107, 43));
+        // Another viewer holds 60 x 30: the type grows until the grid fills
+        // the pane's width, or its height, whichever comes first.
+        let size = fitted_font_size(11., CELL, PANE, (60, 20), 36.);
+        let scale = size / 11.;
+        let drawn = pane_cells(PANE, (CELL.0 * scale, (CELL.1 * scale).ceil()));
+        assert_eq!(drawn.0, 60, "{size}");
+        assert!(drawn.1 >= 20);
+        let tall = fitted_font_size(11., CELL, PANE, (60, 40), 36.);
+        let scale = tall / 11.;
+        let drawn = pane_cells(PANE, (CELL.0 * scale, (CELL.1 * scale).ceil()));
+        assert!(drawn.0 >= 60 && drawn.1 >= 40, "{tall}: {drawn:?}");
+        assert!(tall > 11. && tall < size);
+        // Never past the cap, never below the pane's own size.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (10, 5), 36.), 36.);
+        assert_eq!(fitted_font_size(11., CELL, PANE, (60, 400), 36.), 11.);
+        assert_eq!(fitted_font_size(16., CELL, PANE, (60, 30), 12.), 16.);
+    }
+
+    #[test]
+    fn a_grid_as_wide_as_the_pane_or_wider_keeps_the_pane_s_type() {
+        use super::{fitted_font_size, pane_cells};
+        let (columns, rows) = pane_cells(PANE, CELL);
+        // The phone leads: the grid is its own offer. Nothing changes.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (columns, rows), 36.), 11.);
+        // Fewer rows but the same columns: no growth either.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (columns, 10), 36.), 11.);
+        // Wider (item 72's held 200 columns): panned, never shrunk.
+        assert_eq!(fitted_font_size(11., CELL, PANE, (200, 120), 36.), 11.);
+        assert!(fitted_font_size(f32::NAN, CELL, PANE, (60, 30), 36.).is_nan());
+    }
+
+    #[test]
+    fn the_offer_never_follows_the_grown_type() {
+        use super::{fitted_font_size, pane_cells};
+        // The pane is offered at its own size, whatever the grid makes the
+        // type: no offer, no resize, no loop.
+        let offer = pane_cells(PANE, CELL);
+        // The phone leads, another viewer narrows the grid, the phone leads
+        // again, a desktop holds it wider, the phone leads again.
+        for grid in [offer, (60, 30), (80, 43), offer, (200, 120), offer] {
+            let size = fitted_font_size(11., CELL, PANE, grid, 36.);
+            assert_eq!(
+                pane_cells(PANE, CELL),
+                offer,
+                "offer moved with {grid:?} at {size}"
+            );
+            // The grid back at the pane's own size restores its own type.
+            if grid == offer {
+                assert_eq!(size, 11.);
+            }
+        }
+    }
+
     #[test]
     fn a_grid_larger_than_the_pane_follows_the_caret() {
         use super::viewport_origin;
@@ -933,6 +1142,134 @@ mod tests {
         // Never past the grid's end.
         assert_eq!(viewport_origin((120, 40), (80, 24), (39, 119)), (16, 40));
         assert_eq!(viewport_origin((120, 40), (80, 24), (60, 500)), (16, 40));
+    }
+
+    #[test]
+    fn a_panned_column_wins_over_the_caret_and_holds_in_history() {
+        use super::view_origin;
+        // Unpanned: the caret is followed live; history starts top-left.
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), false, None),
+            (7, 21)
+        );
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), true, None),
+            (0, 0)
+        );
+        // Panned: that column, live or scrolled back; rows as before.
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), false, Some(5)),
+            (7, 5)
+        );
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (30, 100), true, Some(33)),
+            (0, 33)
+        );
+        // Never past the grid's last full window, nor beside a grid that fits.
+        assert_eq!(
+            view_origin((120, 40), (80, 24), (0, 0), false, Some(90)),
+            (0, 40)
+        );
+        assert_eq!(
+            view_origin((40, 10), (80, 24), (0, 0), true, Some(7)),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn a_column_pan_moves_by_whole_columns_within_the_grid() {
+        use super::ColumnPan;
+        const WIDE: (u16, u16) = (200, 50);
+        let mut pan = ColumnPan::default();
+        // Nothing to pan when the grid fits the pane.
+        assert!(!pan.pan(10., 0, (40, 80), 0));
+        assert_eq!(pan.column((40, 80), 0), None);
+        // A wider grid: 200 columns on a 50-column pane, 150 to pan.
+        assert!(pan.pan(12., 0, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(12));
+        // Fractions add up, so a slow drag still moves.
+        assert!(!pan.pan(0.6, 12, WIDE, 0));
+        assert!(pan.pan(0.6, 12, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(13));
+        // Clamped at the right edge; the next step left moves at once.
+        pan.pan(1000., 13, WIDE, 0);
+        assert_eq!(pan.column(WIDE, 0), Some(150));
+        assert!(!pan.pan(5., 150, WIDE, 0));
+        assert!(pan.pan(-1., 150, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(149));
+        // A wider pane (unfolded, smaller type) clamps without forgetting.
+        assert_eq!(pan.column((200, 120), 0), Some(80));
+        assert_eq!(pan.column(WIDE, 0), Some(149));
+        assert!(!pan.pan(f32::NAN, 149, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(149));
+    }
+
+    #[test]
+    fn the_left_edge_is_a_real_position_once_panned() {
+        use super::ColumnPan;
+        const WIDE: (u16, u16) = (200, 50);
+        let mut pan = ColumnPan::default();
+        pan.pan(-1000., 120, WIDE, 0);
+        // Panned to column 0 with the caret out at column 120: it stays at 0,
+        // never snapping back to the caret.
+        assert_eq!(pan.column(WIDE, 0), Some(0));
+        let caret = (49, 170);
+        let origin = super::view_origin((200, 50), (50, 50), caret, false, pan.column(WIDE, 0));
+        assert_eq!(origin, (0, 0));
+        // Further left changes nothing; right moves from there.
+        assert!(!pan.pan(-3., 0, WIDE, 0));
+        assert!(pan.pan(2., 0, WIDE, 0));
+        assert_eq!(pan.column(WIDE, 0), Some(2));
+    }
+
+    #[test]
+    fn a_column_pan_starts_from_the_window_drawn() {
+        use super::ColumnPan;
+        let mut pan = ColumnPan::default();
+        // The caret had the window at column 30: a pan moves from there.
+        assert!(pan.pan(-4., 30, (200, 50), 0));
+        assert_eq!(pan.column((200, 50), 0), Some(26));
+        // A drag under a whole column does not pin the window yet.
+        let mut pan = ColumnPan::default();
+        assert!(!pan.pan(0.4, 30, (200, 50), 0));
+        assert_eq!(pan.column((200, 50), 0), None);
+    }
+
+    #[test]
+    fn a_new_grid_width_or_typing_drops_the_pan_but_new_rows_keep_it() {
+        use super::ColumnPan;
+        let mut pan = ColumnPan::default();
+        pan.pan(20., 0, (200, 50), 3);
+        pan.pan(0.5, 20, (200, 50), 3);
+        // Rows are not part of it: a keyboard opening never moves the window.
+        assert_eq!(pan.column((200, 50), 3), Some(20));
+        // Another width: the program drew its rows again; follow the caret.
+        assert_eq!(pan.column((118, 50), 3), None);
+        // The dropped half column does not come back either.
+        assert!(!pan.pan(0.6, 0, (118, 50), 3));
+        assert_eq!(pan.column((200, 50), 3), None);
+        // Typing (the session counted another input): back to the caret.
+        pan.pan(20., 0, (200, 50), 3);
+        assert_eq!(pan.column((200, 50), 3), Some(20));
+        assert_eq!(pan.column((200, 50), 4), None);
+    }
+
+    #[test]
+    fn keys_typed_and_pasted_text_count_as_input_and_wheel_does_not() {
+        let (session, _remote, _) = session();
+        assert_eq!(session.inputs(), 0);
+        assert!(session.type_text("a"));
+        assert!(session.paste("b"));
+        assert!(session.key(&KeyPress {
+            key: "enter".into(),
+            control: false,
+            alt: false,
+            shift: false,
+            text: None,
+        }));
+        assert_eq!(session.inputs(), 3);
+        session.wheel(3);
+        assert_eq!(session.inputs(), 3);
     }
 
     #[test]

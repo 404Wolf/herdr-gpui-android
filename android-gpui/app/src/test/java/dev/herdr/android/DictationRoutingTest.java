@@ -38,10 +38,8 @@ public final class DictationRoutingTest {
         }
 
         @Override public void enter() {
-            // As ComposerBar.enter: while a session records or transcribes, Enter waits on it.
-            if (state == DictationEngine.State.CONNECTING || state == DictationEngine.State.LISTENING
-                    || state == DictationEngine.State.ON_DEVICE || state == DictationEngine.State.OFFLINE_RECORDING
-                    || state == DictationEngine.State.TRANSCRIBING) {
+            // ComposerBar.enter's own decision: while a session records or transcribes, Enter waits.
+            if (DictationRouting.onEnter(state) != DictationRouting.Enter.SEND) {
                 routing.sendWhenDone();
                 return;
             }
@@ -69,6 +67,12 @@ public final class DictationRoutingTest {
 
         @Override public void clipLength(String clipId, long durationMs) { }
 
+        boolean saves = true;
+
+        @Override public boolean persistNow() {
+            return saves;
+        }
+
         @Override public void transcribedOnPhone() {
             offlineTag = true;
         }
@@ -92,6 +96,23 @@ public final class DictationRoutingTest {
                 String.class, String.class, long.class, long.class);
         c.setAccessible(true);
         return c.newInstance("clip-1", target, 1L, 2000L);
+    }
+
+    @Test public void enterWaitsWhileASessionRecordsOrTranscribes() {
+        for (DictationEngine.State st : DictationEngine.State.values()) {
+            DictationRouting.Enter expected;
+            switch (st) {
+                case CONNECTING: case LISTENING: case ON_DEVICE: case OFFLINE_RECORDING:
+                    expected = DictationRouting.Enter.STOP_THEN_SEND;
+                    break;
+                case TRANSCRIBING:
+                    expected = DictationRouting.Enter.SEND_WHEN_DONE;
+                    break;
+                default:
+                    expected = DictationRouting.Enter.SEND;
+            }
+            assertEquals(st.name(), expected, DictationRouting.onEnter(st));
+        }
     }
 
     @Test public void theOldPanesFinalSendsTheEnterPressedOnTheNewPane() {
@@ -209,5 +230,20 @@ public final class DictationRoutingTest {
         }
         assertEquals("mic sent silence", ComposerBar.nothingHeardWords(
                 dev.herdr.android.dictation.DictationException.Reason.SILENT_AUDIO, true));
+    }
+
+    @Test public void aFinalWhoseDraftCouldNotBeSavedTellsTheEngineToKeepTheRecording() {
+        Composer c = new Composer();
+        c.drafts.switchTo("A");
+        c.drafts.dictationStarted();
+        DictationEngine.Listener a = c.routing.listener("A");
+        a.onFinal("words", false);
+        assertTrue(a.finalStored());
+        c.saves = false;
+        c.drafts.dictationStarted();
+        DictationEngine.Listener b = c.routing.listener("A");
+        b.onFinal("more words", false);
+        assertFalse("not saved: the engine keeps the recording", b.finalStored());
+        assertTrue("the words stay on screen", c.drafts.text().contains("more words"));
     }
 }

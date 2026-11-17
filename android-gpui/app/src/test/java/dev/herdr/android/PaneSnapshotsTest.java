@@ -1,6 +1,7 @@
 package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -37,5 +38,24 @@ public final class PaneSnapshotsTest {
         assertEquals(Arrays.asList(files.get(1), files.get(0)), PaneSnapshots.stale(files, 3, 10_000));
         assertEquals(Arrays.asList(files.get(2), files.get(1), files.get(0)), PaneSnapshots.stale(files, 16, 250));
         assertEquals(0, PaneSnapshots.stale(files, 16, 10_000).size());
+    }
+
+    @Test public void aPaneWithNoReadableCopyIsReportedMissingAndAnUnreadableOneGoes() throws Exception {
+        java.util.List<String> heard = new java.util.ArrayList<>();
+        File folder = dir.newFolder("panes");
+        PaneSnapshots snapshots = new PaneSnapshots(folder, Runnable::run);
+        snapshots.open("h", "t1", shown -> heard.add("shown"), () -> heard.add("missing"));
+        assertEquals(java.util.Collections.singletonList("missing"), heard);
+        // A copy that cannot be read (here: no native library) is deleted, then missing.
+        File bad = snapshots.file("h", "t2");
+        Files.write(bad.toPath(), new byte[] {1, 2, 3});
+        heard.clear();
+        snapshots.open("h", "t2", shown -> heard.add("shown"), () -> heard.add("missing"));
+        assertEquals(java.util.Collections.singletonList("missing"), heard);
+        assertFalse(bad.exists());
+        // No pane, nothing asked.
+        heard.clear();
+        snapshots.open("h", "", shown -> heard.add("shown"), () -> heard.add("missing"));
+        assertTrue(heard.isEmpty());
     }
 }

@@ -69,7 +69,9 @@ mv "$RECORD" "$ROOT/build/native-build$BUILD_SUFFIX.json"
 if "$BIN/llvm-readelf" -d "$LIB" | grep -q 'Shared library: \[libc++_shared.so\]'; then
     CPP="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/sysroot/usr/lib/$TARGET/libc++_shared.so"
     python3 "$ROOT/scripts/verify-native-library.py" --abi "$ABI" --runtime "$CPP"
-    cp "$CPP" "$DEST/libc++_shared.so"
+    # The NDK's copy is read-only (a Nix store, say): cp would carry that
+    # mode over and refuse to overwrite it on the next build.
+    install -m 0644 "$CPP" "$DEST/libc++_shared.so"
 fi
 sha256sum "$DEST/libherdr_gpui_android.so"
 printf '\nBuilt actual GPUI %s Android library: %s\n' "$ABI" "$DEST/libherdr_gpui_android.so"

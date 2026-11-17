@@ -59,7 +59,7 @@ public final class PendingDictationsTest {
         assertEquals(ClipStore.BYTES_PER_SECOND * 2, Files.size(again.audio(clip.id).toPath()));
     }
 
-    @Test public void aDiscardedOrUnfinishedRecordingLeavesNothing() {
+    @Test public void aDiscardedRecordingLeavesNothingAndAnUnfinishedOneIsRecovered() {
         ClipStore store = store();
         ClipStore.Recording gone = store.record("t", 1);
         gone.write(audio(100, 1), 100);
@@ -67,10 +67,14 @@ public final class PendingDictationsTest {
         ClipStore.Recording killed = store.record("t", 1);
         killed.write(audio(100, 1), 100); // the process dies before keep()
         ClipStore again = store();
-        assertEquals(0, again.size());
+        // Never deleted without a stored final: the killed session's audio comes back, parked.
+        assertEquals(1, again.size());
+        assertEquals(killed.id, again.parked().get(0).id);
         File[] left = new File(dir.getRoot(), "pending").listFiles();
         assertNotNull(left);
-        for (File f : left) assertEquals(ClipStore.INDEX, f.getName());
+        for (File f : left) {
+            assertTrue(f.getName(), f.getName().equals(ClipStore.INDEX) || f.getName().equals(killed.id + ".pcm"));
+        }
     }
 
     @Test public void anEmptyRecordingIsNotKept() {
@@ -132,7 +136,7 @@ public final class PendingDictationsTest {
         PendingDictations pending = new PendingDictations(store, (clip, file) -> {
             sent.add(clip.id);
             assertTrue(file.isFile());
-            return PendingDictations.Transcript.of("text " + clip.target);
+            return "text " + clip.target;
         }, worker, Runnable::run);
         Composer composer = new Composer();
         composer.from = pending;
@@ -163,7 +167,7 @@ public final class PendingDictationsTest {
     @Test public void textWithNoOneToPlaceItIsHeldOnDiskAndOfferedLater() {
         ClipStore store = store();
         PendingClip a = record(store, "1", 10);
-        new PendingDictations(store, (clip, file) -> PendingDictations.Transcript.of("hello"), worker, Runnable::run).pass();
+        new PendingDictations(store, (clip, file) -> "hello", worker, Runnable::run).pass();
         // The app was killed before a composer took it.
         PendingDictations restarted = new PendingDictations(store(), (clip, file) -> {
             throw new AssertionError("already transcribed");
@@ -188,7 +192,7 @@ public final class PendingDictationsTest {
         boolean[] up = {false};
         PendingDictations pending = new PendingDictations(store, (clip, file) -> {
             if (!up[0]) throw new IOException("refused with private details");
-            return PendingDictations.Transcript.of("private words");
+            return "private words";
         }, worker, Runnable::run, lines::add);
         pending.pass();
         up[0] = true;
@@ -216,15 +220,39 @@ public final class PendingDictationsTest {
         assertFalse(store.audio(a.id).exists());
     }
 
-    @Test public void aClipTheDesktopErrsOnNeverHoldsUpNewerOnesAndStopsAfterItsTries() throws Exception {
+    @Test public void textThatCouldNotBeStoredIsOfferedAgainAndTheRecordingKept() {
+        ClipStore store = store();
+        PendingClip a = record(store, "1", 10);
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> "words", worker, Runnable::run);
+        java.util.List<String> got = new java.util.ArrayList<>();
+        pending.setListener(new PendingDictations.Listener() {
+            @Override public void onTranscribed(PendingClip clip, String text) {
+                got.add(text); // not stored: no delivered()
+            }
+
+            @Override public void onChanged() { }
+        });
+        pending.pass();
+        assertEquals(1, got.size());
+        assertEquals("still held until delivered", 1, pending.count());
+        pending.offerAgain(a.id);
+        assertEquals(2, got.size());
+        pending.delivered(a.id);
+        assertEquals(0, pending.count());
+    }
+
+    @Test public void aClipTheDesktopFailsOnNeverHoldsUpNewerOnesAndIsParkedAfterItsTries() {
         ClipStore store = store();
         PendingClip bad = record(store, "1", 10);
         PendingClip good = record(store, "2", 10);
         List<String> tried = new ArrayList<>();
         PendingDictations pending = new PendingDictations(store, (clip, file) -> {
             tried.add(clip.id);
-            if (clip.id.equals(bad.id)) throw new PendingDictations.DesktopError("");
-            return PendingDictations.Transcript.of("words");
+            if (clip.id.equals(bad.id)) {
+                // An error without a code, after the desktop took the whole clip.
+                throw new UploadFailure(UploadFailure.Kind.FAILED, true, "server error : x");
+            }
+            return "words";
         }, worker, Runnable::run);
         Composer composer = new Composer();
         composer.from = pending;
@@ -232,28 +260,12 @@ public final class PendingDictationsTest {
         pending.pass();
         assertEquals("the newer clip went past the failing one", List.of(bad.id, good.id), tried);
         assertEquals(List.of(good.id + "=words"), composer.got);
-        for (int i = 1; i < ClipStore.MAX_SERVER_ERRORS; i++) pending.pass();
-        assertEquals(1, pending.stuck());
-        assertEquals("kept, with its audio", 1, pending.waiting().size());
+        for (int i = 1; i < ClipStore.MAX_ATTEMPTS; i++) pending.pass();
+        assertEquals("parked after its tries, its audio kept", List.of(bad), pending.parked());
         assertTrue(store.audio(bad.id).exists());
         tried.clear();
         pending.pass();
-        assertTrue("a stuck clip is not tried by itself", tried.isEmpty());
-        // The next tap on the microphone tries it again.
-        pending.retryStuck();
-        worker.submit(() -> { }).get();
-        assertEquals(0, pending.stuck());
-    }
-
-    @Test public void theErrorCountSurvivesARestart() {
-        ClipStore store = store();
-        PendingClip a = record(store, "1", 10);
-        for (int i = 0; i < ClipStore.MAX_SERVER_ERRORS; i++) store.failed(a.id);
-        ClipStore again = store();
-        assertEquals(1, again.stuck());
-        assertTrue(again.due().isEmpty());
-        assertTrue(again.retryStuck());
-        assertEquals(List.of(a), store().due());
+        assertTrue("a parked clip is not tried by itself", tried.isEmpty());
     }
 
     @Test public void aClipWithNothingToTranscribeIsDroppedAndTheNextIsSent() {
@@ -261,9 +273,12 @@ public final class PendingDictationsTest {
         PendingClip silent = record(store, "1", 10);
         PendingClip spoken = record(store, "2", 10);
         List<DictationException.Reason> nothing = new ArrayList<>();
-        PendingDictations pending = new PendingDictations(store, (clip, file) -> clip.id.equals(silent.id)
-                ? PendingDictations.Transcript.nothing(DictationException.Reason.SILENT_AUDIO, "silent_audio")
-                : PendingDictations.Transcript.of("words"), worker, Runnable::run);
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> {
+            if (clip.id.equals(silent.id)) {
+                throw UploadFailure.nothing(DictationException.Reason.SILENT_AUDIO, "silent_audio");
+            }
+            return "words";
+        }, worker, Runnable::run);
         Composer composer = new Composer() {
             @Override public void onNothing(PendingClip clip, DictationException.Reason reason) {
                 nothing.add(reason);
@@ -272,10 +287,11 @@ public final class PendingDictationsTest {
         composer.from = pending;
         pending.setListener(composer);
         pending.pass();
-        assertEquals("its placeholder goes with an empty text",
+        assertEquals("its chip goes with an empty text",
                 List.of(silent.id + "=", spoken.id + "=words"), composer.got);
         assertEquals(List.of(DictationException.Reason.SILENT_AUDIO), nothing);
         assertEquals(0, pending.count());
+        assertTrue(pending.parked().isEmpty());
         assertFalse(store.audio(silent.id).exists());
     }
 

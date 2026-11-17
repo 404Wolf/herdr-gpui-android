@@ -60,6 +60,11 @@ pub enum GhostStyle {
     Danger,
     /// Connecting, transcribing, a queued count.
     Info,
+    /// Draft text the keyboard has selected: drawn reversed, in the info colour.
+    Selected,
+    /// Where the keyboard's cursor is in the draft: an empty run, drawn as a
+    /// thin bar before the next cell. Without one the bar follows the draft.
+    Caret,
 }
 
 /// One of the host's controls, drawn as words in the program's frame.
@@ -501,7 +506,10 @@ pub fn place_all(
                 && draft.iter().any(|p| {
                     matches!(
                         p.style,
-                        GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip
+                        GhostStyle::Text
+                            | GhostStyle::Partial
+                            | GhostStyle::Chip
+                            | GhostStyle::Selected
                     ) && !p
                         .text
                         .trim_matches(|c: char| c == '…' || c.is_whitespace())
@@ -623,6 +631,11 @@ fn tail(
 fn drop_front(spans: &[GhostSpan], mut n: usize) -> Vec<GhostSpan> {
     let mut out = Vec::new();
     for span in spans {
+        if span.style == GhostStyle::Caret {
+            // An elided caret goes to where the shown words start.
+            out.push(span.clone());
+            continue;
+        }
         let len = span.text.chars().count();
         if n >= len {
             n -= len;
@@ -670,6 +683,16 @@ fn wrap(
         width = width_of(1);
     }
     for span in spans {
+        if span.style == GhostStyle::Caret {
+            // Takes no cell, and is never merged into a neighbouring run.
+            if let Some(line) = lines.last_mut() {
+                line.push(GhostSpan {
+                    text: String::new(),
+                    style: GhostStyle::Caret,
+                });
+            }
+            continue;
+        }
         // A chip is one unit: it never splits across lines.
         let pieces = if span.style == GhostStyle::Chip {
             vec![span.text.clone()]
@@ -937,6 +960,87 @@ mod tests {
                 .filter(|p| p.row == 1 && p.style == GhostStyle::Text)
                 .all(|p| p.col + p.text.chars().count() < first_control)
         );
+    }
+
+    fn styled(t: &str, style: GhostStyle) -> GhostSpan {
+        GhostSpan {
+            text: t.into(),
+            style,
+        }
+    }
+
+    #[test]
+    fn the_keyboards_cursor_is_drawn_inside_the_draft() {
+        // "fix the build" with the cursor after "fix " and "the" selected.
+        let (rows, anchor) = claude_box(60);
+        let g = ghost(vec![
+            text("fix "),
+            styled("", GhostStyle::Caret),
+            styled("the", GhostStyle::Selected),
+            text(" build"),
+        ]);
+        let layout = place_all(&g, anchor, &rows, None);
+        let caret: Vec<&Placed> = layout
+            .placed
+            .iter()
+            .filter(|p| p.style == GhostStyle::Caret)
+            .collect();
+        assert_eq!(caret.len(), 1);
+        // The prompt's text starts at col 2: "fix " takes 2..6.
+        assert_eq!((caret[0].row, caret[0].col), (3, 6));
+        let selected = layout
+            .placed
+            .iter()
+            .find(|p| p.style == GhostStyle::Selected)
+            .expect("selection drawn");
+        assert_eq!(
+            (selected.row, selected.col, selected.text.as_str()),
+            (3, 6, "the")
+        );
+        assert_eq!(drawn(&layout, 3, 60), "  fix the build");
+        assert!(layout.draft_shown);
+    }
+
+    #[test]
+    fn a_cursor_in_the_elided_start_of_a_long_draft_stays_on_screen() {
+        // 30 cols, a draft far longer than the rows it may use, the cursor
+        // at its very start: the caret end is shown, the cursor after "…".
+        let (rows, anchor) = claude_box(30);
+        let long = "word ".repeat(60);
+        let g = ghost(vec![styled("", GhostStyle::Caret), text(&long)]);
+        let layout = place_all(&g, anchor, &rows, None);
+        let caret = layout
+            .placed
+            .iter()
+            .find(|p| p.style == GhostStyle::Caret)
+            .expect("caret kept");
+        assert_eq!(caret.row, 3);
+        assert_eq!(drawn(&layout, 3, 30).chars().nth(2), Some('…'));
+        assert_eq!(caret.col, 3);
+    }
+
+    #[test]
+    fn a_cursor_wraps_with_its_words() {
+        // The cursor after a word that wraps to the next row moves with it.
+        let (rows, anchor) = claude_box(20);
+        let g = ghost(vec![
+            text("one two three "),
+            text("four"),
+            styled("", GhostStyle::Caret),
+        ]);
+        let layout = place_all(&g, anchor, &rows, None);
+        let caret = layout
+            .placed
+            .iter()
+            .find(|p| p.style == GhostStyle::Caret)
+            .expect("caret kept");
+        let four = layout
+            .placed
+            .iter()
+            .find(|p| p.text.contains("four"))
+            .expect("four drawn");
+        assert_eq!(caret.row, four.row);
+        assert_eq!(caret.col, four.col + four.text.trim_end().chars().count());
     }
 
     #[test]

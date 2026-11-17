@@ -33,6 +33,12 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import static dev.herdr.android.dictation.DictationFakes.*;
+import dev.herdr.android.dictation.DictationFakes.Behaviour;
+import dev.herdr.android.dictation.DictationFakes.FakeRecognizer;
+import dev.herdr.android.dictation.DictationFakes.FakeServer;
+import dev.herdr.android.dictation.DictationFakes.ScriptedMic;
+import dev.herdr.android.dictation.DictationFakes.TestMain;
 
 /**
  * The engine against a fake desktop dictation server (the real protocol over a local socket,
@@ -43,22 +49,6 @@ import org.junit.rules.TemporaryFolder;
 public final class ServerDictationEngineTest {
     @Rule public final TemporaryFolder dir = new TemporaryFolder();
 
-    // The desktop's messages, exactly as server.py sends them.
-    static final String READY_GPU = "{\"type\":\"ready\",\"backend\":\"gpu\"}";
-    static final String READY_CPU = "{\"type\":\"ready\",\"backend\":\"cpu\"}";
-    static final String READY_DOWN = "{\"type\":\"ready\",\"backend\":\"down\"}";
-    static final String READY_OLD = "{\"type\":\"ready\"}";
-    static final String ERROR_SLOW = "{\"type\":\"error\",\"code\":\"backend_slow\","
-            + "\"message\":\"transcription backend slow\",\"kind\":\"partial\",\"elapsed_s\":3.0,\"budget_s\":3.0}";
-    static final String ERROR_UNAVAILABLE = "{\"type\":\"error\",\"code\":\"backend_unavailable\","
-            + "\"message\":\"transcription backend unavailable\"}";
-    static final String ERROR_BAD_START = "{\"type\":\"error\",\"code\":\"bad_start\","
-            + "\"message\":\"expected start at 16000 Hz\"}";
-    static final String ERROR_TOO_LONG = "{\"type\":\"error\",\"code\":\"session_too_long\","
-            + "\"message\":\"session too long\"}";
-
-    static final String DESKTOP_WORDS = "words from the desktop";
-    static final String PHONE_WORDS = "words from the phone";
 
     /** Short waits so the suite is quick; the shape of each wait is what is tested. */
     static final ServerDictationEngine.Timeouts TIMEOUTS =
@@ -167,13 +157,14 @@ public final class ServerDictationEngineTest {
             if (server != null) server.close();
             server = new FakeServer(Behaviour.fast(ready).finalAfter(4000));
             FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 50);
-            Run run = dictate(server.uri(), phone, 300);
+            log.clear();
+            // Stops once the phone has taken over (on the state, not on time: a loaded machine).
+            Run run = dictateUntil(server.uri(), phone, DictationEngine.State.ON_DEVICE);
             run.awaitEnd();
             assertPhoneText(run);
-            // Handed over before stop: no budget waited after it.
-            assertTrue(run.listener.states.indexOf(DictationEngine.State.ON_DEVICE)
-                    < run.listener.states.indexOf(DictationEngine.State.TRANSCRIBING));
-            assertTrue(run.listener.endedAt - run.stoppedAt < TIMEOUTS.finalBudgetMs);
+            // Handed over before stop, on the backend word: no budget waited after it.
+            assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("desktop out (backend ")));
+            assertFalse(log.toString(), log.stream().anyMatch(l -> l.contains("no final in time")));
         }
     }
 
@@ -235,6 +226,104 @@ public final class ServerDictationEngineTest {
         assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(run.listener.pendingClip.id).toPath()));
     }
 
+    @Test public void theLiveStartCarriesTheRecordingsIdThatAQueuedClipKeeps() throws Exception {
+        // Never ready, no recognizer: the session records for later, under the id it started with.
+        server = new FakeServer(Behaviour.silent());
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertNotNull(run.listener.pendingClip);
+        JSONObject start = server.starts.get(0);
+        assertEquals("live", start.getString("mode"));
+        assertEquals(16000, start.getInt("sample_rate"));
+        assertEquals("the courier resends it under the same id", run.listener.pendingClip.id, start.getString("id"));
+    }
+
+    @Test public void theRecordingIsDeletedOnlyAfterTheFinalWasStored() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        File dirFile = new File(dir.getRoot(), "pending");
+        boolean[] audioAtFinal = {false};
+        run.listener.atFinal = () -> {
+            File[] parts = dirFile.listFiles((d, n) -> n.endsWith(".part"));
+            audioAtFinal[0] = parts != null && parts.length == 1 && parts[0].length() > 0;
+        };
+        dictate(server.uri(), null, 300, run);
+        run.awaitEnd();
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertTrue("the audio was still there when the final was handed over", audioAtFinal[0]);
+        Thread.sleep(200);
+        File[] left = dirFile.listFiles((d, n) -> n.endsWith(".part") || n.endsWith(".pcm"));
+        assertEquals("deleted once stored", 0, left == null ? 0 : left.length);
+    }
+
+    @Test public void aFinalWhoseTextCouldNotBeStoredKeepsItsRecording() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.listener.stores = false;
+        dictate(server.uri(), null, 300, run);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        // A durable parked clip, "not transcribed yet · retry": no 48 h expiry, never sent on its own.
+        assertTrue("not rescue audio that expires", store.keptClips().isEmpty());
+        assertEquals(1, store.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.parked().get(0).id).toPath()));
+        assertTrue(store.untranscribed().isEmpty());
+        // Still there after a restart, however long after.
+        ClipStore later = new ClipStore(new File(dir.getRoot(), "pending"), () -> System.currentTimeMillis() + 3 * ClipStore.KEEP_MS);
+        assertEquals(1, later.parked().size());
+    }
+
+    @Test public void aPhoneFinalWhoseTextCouldNotBeStoredIsParkedNeverExpiring() throws Exception {
+        // The desktop is on its CPU: the phone transcribes; its text cannot be saved.
+        server = new FakeServer(Behaviour.fast(READY_CPU));
+        Run run = new Run();
+        run.listener.stores = false;
+        dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300, run);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(PHONE_WORDS, run.listener.finalText);
+        assertTrue(run.listener.onDevice);
+        assertTrue("not rescue audio that expires", store.keptClips().isEmpty());
+        assertEquals(1, store.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(store.audio(store.parked().get(0).id).toPath()));
+        ClipStore later = new ClipStore(new File(dir.getRoot(), "pending"),
+                () -> System.currentTimeMillis() + 3 * ClipStore.KEEP_MS);
+        assertEquals("still there 3 x 48 h later", 1, later.parked().size());
+    }
+
+    @Test public void aStoredPhoneFinalKeepsItsRecordingAsRescueAudio() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_CPU));
+        Run run = dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300);
+        run.awaitEnd();
+        Thread.sleep(300);
+        assertEquals(1, store.keptClips().size());
+        assertTrue(store.parked().isEmpty());
+    }
+
+    @Test public void aCrashWhileStoringTheFinalKeepsTheAudioForTheNextStart() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.listener.atFinal = () -> {
+            throw new IllegalStateException("killed while storing the text");
+        };
+        dictate(server.uri(), null, 300, run);
+        Thread.sleep(1500);
+        // The next start finds the audio and offers it as "not transcribed yet".
+        ClipStore restarted = new ClipStore(new File(dir.getRoot(), "pending"));
+        assertEquals(1, restarted.parked().size());
+        assertArrayEquals(run.mic.bytes(), Files.readAllBytes(restarted.audio(restarted.parked().get(0).id).toPath()));
+    }
+
+    @Test public void finishingIsShownAndTheFinalStillLands() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU).finishing().finalAfter(300));
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertEquals(1, run.listener.finishing);
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertFalse(run.listener.onDevice);
+    }
+
     @Test public void withoutARecognizerASlowDesktopIsWaitedForLonger() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU).finalAfter(1200));
         Run run = dictate(server.uri(), null, 300);
@@ -283,12 +372,6 @@ public final class ServerDictationEngineTest {
         return "{\"type\":\"final\",\"text\":\"\",\"code\":\"" + code + "\",\"message\":\"nothing\"}";
     }
 
-    @Test public void theStartMessageIsTheAgreedOneWithNoCapabilities() throws Exception {
-        server = new FakeServer(Behaviour.fast(READY_GPU));
-        dictate(server.uri(), null, 300).awaitEnd();
-        assertEquals("{\"type\":\"start\",\"sample_rate\":16000}", server.texts.get(0));
-    }
-
     @Test public void aFinalWithACodeInsertsNothingAndKeepsNothing() throws Exception {
         String[] codes = {"silent_audio", "quiet_audio", "no_audio", "a_future_code"};
         DictationException.Reason[] reasons = {DictationException.Reason.SILENT_AUDIO,
@@ -310,6 +393,7 @@ public final class ServerDictationEngineTest {
         Thread.sleep(200); // the mic thread's last chunk
         assertTrue("never queued", store.untranscribed().isEmpty());
         assertTrue("never kept", store.keptClips().isEmpty());
+        assertTrue("never parked", store.parked().isEmpty());
     }
 
     @Test public void anErrorWithAKnownFinalCodeIsFinalToo() throws Exception {
@@ -329,7 +413,7 @@ public final class ServerDictationEngineTest {
         run.awaitEnd();
         assertEquals(1, run.listener.desktopErrors);
         assertTrue(run.listener.states.contains(DictationEngine.State.OFFLINE_RECORDING));
-        assertNotNull("kept for the courier's bounded retries", run.listener.pendingClip);
+        assertNotNull("kept for the courier's counted retries", run.listener.pendingClip);
         assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("desktop error (no code)")));
     }
 
@@ -343,10 +427,11 @@ public final class ServerDictationEngineTest {
         assertEquals(null, run.listener.pendingClip);
         Thread.sleep(200);
         assertTrue(store.untranscribed().isEmpty());
+        assertTrue(store.parked().isEmpty());
         assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("microphone silenced (DIGITAL_SILENCE)")));
     }
 
-    @Test public void androidSilencingTheRecordingEndsItSooner() throws Exception {
+    @Test public void androidSilencingTheRecordingEndsItAndTellsTheDesktopWhy() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU));
         Run run = new Run();
         run.mic.androidSilenced = true;
@@ -356,8 +441,8 @@ public final class ServerDictationEngineTest {
         assertEquals(DictationException.Reason.SILENCED, run.listener.error.reason());
         assertEquals(0, run.listener.finals);
         assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("(SILENCED_BY_ANDROID)")));
-        // The desktop is told why it was let go.
-        assertTrue(waitFor(() -> server.texts.contains("{\"type\":\"cancel\",\"reason\":\"silenced\"}")));
+        assertTrue(server.texts.toString(), waitFor(
+                () -> server.texts.contains("{\"type\":\"cancel\",\"reason\":\"silenced\"}")));
     }
 
     @Test public void silenceAfterSpeechKeepsWhatWasHeard() throws Exception {
@@ -391,25 +476,27 @@ public final class ServerDictationEngineTest {
                 "dictation: the microphone did not open: IN_USE \\(\\d+ times? since the app started\\)")));
     }
 
-    @Test public void anUploadWithNothingToTranscribeIsFinalAndAnErrorWithoutACodeIsNot() throws Exception {
+    @Test public void anUploadWithNothingToTranscribeIsFinalAndAnErrorWithoutACodeIsCounted() throws Exception {
         File clip = dir.newFile("clip.pcm");
         Files.write(clip.toPath(), new byte[ClipStore.BYTES_PER_SECOND]);
         server = new FakeServer(Behaviour.fast(READY_GPU).finalJson(finalWithCode("silent_audio")));
-        PendingDictations.Transcript t = PendingDictations.upload(server.uri(), clip);
-        assertEquals(DictationException.Reason.SILENT_AUDIO, t.nothing);
-        assertEquals("", t.text);
-        assertEquals("{\"type\":\"start\",\"sample_rate\":16000}", server.texts.get(0));
-        server.close();
-        server = new FakeServer(Behaviour.fast(READY_GPU).errorOnAudio("{\"type\":\"error\",\"message\":\"x\"}"));
         try {
-            PendingDictations.upload(server.uri(), clip);
-            throw new AssertionError("an error without a code is the desktop's, to retry");
-        } catch (PendingDictations.DesktopError expected) {
-            assertEquals("", expected.code);
+            PendingDictations.upload(server.uri(), "id-1", clip);
+            throw new AssertionError("nothing to transcribe");
+        } catch (UploadFailure f) {
+            assertEquals(UploadFailure.Kind.NOTHING, f.kind);
+            assertEquals(DictationException.Reason.SILENT_AUDIO, f.nothing);
         }
         server.close();
-        server = new FakeServer(Behaviour.fast(READY_GPU));
-        assertEquals(DESKTOP_WORDS, PendingDictations.upload(server.uri(), clip).text);
+        server = new FakeServer(Behaviour.fast(READY_GPU).finalJson("{\"type\":\"error\",\"message\":\"x\"}"));
+        try {
+            PendingDictations.upload(server.uri(), "id-1", clip);
+            throw new AssertionError("an error without a code");
+        } catch (UploadFailure f) {
+            assertEquals("the desktop took it: counted, retried a bounded number of times",
+                    UploadFailure.Kind.FAILED, f.kind);
+            assertTrue(f.attempted);
+        }
     }
 
     private static boolean waitFor(BooleanSupplier condition) throws InterruptedException {
@@ -455,12 +542,26 @@ public final class ServerDictationEngineTest {
         return dictate(uri, phone, talkMs, new Run());
     }
 
+    /** Like {@link #dictate}, stopping once the session reached {@code state} (10 s at most). */
+    private Run dictateUntil(URI uri, FakeRecognizer phone, DictationEngine.State state) throws Exception {
+        Run run = new Run();
+        dictate(uri, phone, 0, run, () -> run.listener.states.contains(state));
+        assertTrue("reached " + state, run.listener.states.contains(state));
+        return run;
+    }
+
     private Run dictate(URI uri, FakeRecognizer phone, long talkMs, Run run) throws Exception {
+        return dictate(uri, phone, talkMs, run, null);
+    }
+
+    private Run dictate(URI uri, FakeRecognizer phone, long talkMs, Run run,
+            java.util.function.BooleanSupplier stopWhen) throws Exception {
         if (phone != null) phone.mic = run.mic;
         ServerDictationEngine engine = new ServerDictationEngine(uri, pending, new TestMain(mainThread),
                 run.mic, () -> true, phone == null ? null : cb -> phone.start(cb), TIMEOUTS, log::add);
         mainThread.submit(() -> engine.start("host/pane", run.listener)).get();
         Thread.sleep(talkMs);
+        for (int i = 0; stopWhen != null && i < 2000 && !stopWhen.getAsBoolean(); i++) Thread.sleep(5);
         run.stoppedAt = System.currentTimeMillis();
         mainThread.submit(engine::stop).get();
         return run;
@@ -476,134 +577,6 @@ public final class ServerDictationEngineTest {
         }
     }
 
-    /** The main thread's Handler, on a single-thread executor. */
-    private static final class TestMain implements ServerDictationEngine.Main {
-        private final ScheduledExecutorService exec;
-        private final Map<Runnable, List<ScheduledFuture<?>>> delayed = new ConcurrentHashMap<>();
-
-        TestMain(ScheduledExecutorService exec) {
-            this.exec = exec;
-        }
-
-        @Override public void post(Runnable r) {
-            exec.execute(r);
-        }
-
-        @Override public void postDelayed(Runnable r, long delayMs) {
-            delayed.computeIfAbsent(r, k -> Collections.synchronizedList(new ArrayList<>()))
-                    .add(exec.schedule(r, delayMs, TimeUnit.MILLISECONDS));
-        }
-
-        @Override public void remove(Runnable r) {
-            List<ScheduledFuture<?>> futures = delayed.remove(r);
-            if (futures != null) for (ScheduledFuture<?> f : futures) f.cancel(false);
-        }
-    }
-
-    /** A microphone giving a distinct 100 ms chunk every 20 ms until stopped. */
-    private static final class ScriptedMic implements AudioInput.Opener, AudioInput {
-        private final ByteArrayOutputStream given = new ByteArrayOutputStream();
-        private int index;
-        volatile boolean opened;
-        volatile boolean failToOpen;
-        /** From this chunk on, exact zeros (a silenced microphone); -1 never. */
-        volatile int zerosFrom = -1;
-        volatile boolean androidSilenced;
-
-        @Override public AudioInput open() throws Microphone.Failure {
-            if (failToOpen) throw new Microphone.Failure(Microphone.Failure.Cause.IN_USE, "in use");
-            opened = true;
-            return this;
-        }
-
-        @Override public int read(byte[] chunk, BooleanSupplier stop) {
-            try {
-                Thread.sleep(20);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return 0;
-            }
-            if (stop.getAsBoolean()) return 0;
-            index++;
-            boolean zero = zerosFrom >= 0 && index > zerosFrom;
-            for (int i = 0; i < chunk.length; i++) chunk[i] = zero ? 0 : (byte) (index * 31 + i);
-            synchronized (given) {
-                given.write(chunk, 0, chunk.length);
-            }
-            return chunk.length;
-        }
-
-        byte[] bytes() {
-            synchronized (given) {
-                return given.toByteArray();
-            }
-        }
-
-        @Override public boolean androidSilenced() {
-            return androidSilenced;
-        }
-
-        @Override public void close() { }
-    }
-
-    /**
-     * The phone's recognizer: hears the audio, says {@code text} {@code finalDelayMs} after the
-     * end of the audio, or fails at the end when {@code text} is null.
-     */
-    private static final class FakeRecognizer implements OnDeviceRecognizer {
-        final String text;
-        final long finalDelayMs;
-        final ByteArrayOutputStream heard = new ByteArrayOutputStream();
-        String partial;
-        boolean failOnFirstAudio;
-        /** The microphone it was started with; it must be open already. */
-        ScriptedMic mic;
-        volatile boolean startedBeforeTheMic;
-        volatile boolean started;
-        volatile boolean cancelled;
-        volatile boolean ended;
-        private Callback callback;
-
-        FakeRecognizer(String text, long finalDelayMs) {
-            this.text = text;
-            this.finalDelayMs = finalDelayMs;
-        }
-
-        OnDeviceRecognizer start(Callback cb) {
-            started = true;
-            if (mic != null && !mic.opened) startedBeforeTheMic = true;
-            callback = cb;
-            return this;
-        }
-
-        @Override public synchronized void write(byte[] chunk, int length) {
-            boolean first = heard.size() == 0;
-            heard.write(chunk, 0, length);
-            if (first && failOnFirstAudio) callback.onError("scripted failure");
-            if (first && partial != null) callback.onPartial(partial);
-        }
-
-        @Override public void endOfAudio() {
-            ended = true;
-            Thread t = new Thread(() -> {
-                try {
-                    Thread.sleep(finalDelayMs);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                if (cancelled) return;
-                if (text == null) callback.onError("scripted failure");
-                else callback.onFinal(text);
-            });
-            t.setDaemon(true);
-            t.start();
-        }
-
-        @Override public void cancel() {
-            cancelled = true;
-        }
-    }
-
     private static final class RecordingListener implements DictationEngine.Listener {
         final List<DictationEngine.State> states = Collections.synchronizedList(new ArrayList<>());
         final List<String> partials = Collections.synchronizedList(new ArrayList<>());
@@ -616,15 +589,36 @@ public final class ServerDictationEngineTest {
         volatile DictationException error;
         volatile int desktopErrors;
 
+        @Override public void onDesktopError() {
+            desktopErrors++;
+        }
+
         @Override public void onPartial(String text) {
             partials.add(text);
+        }
+
+        volatile int finishing;
+
+        @Override public void onFinishing(double tailSeconds) {
+            finishing++;
         }
 
         @Override public void onFinal(String text) {
             throw new AssertionError("engines call onFinal(text, onDevice)");
         }
 
+        /** Run when the final arrives, before anything else (a check, or a simulated crash). */
+        volatile Runnable atFinal;
+        /** What finalStored() answers: false as when the draft's write failed. */
+        volatile boolean stores = true;
+
+        @Override public boolean finalStored() {
+            return stores;
+        }
+
         @Override public void onFinal(String text, boolean onDevice) {
+            Runnable r = atFinal;
+            if (r != null) r.run();
             finalText = text;
             this.onDevice = onDevice;
             finals++;
@@ -643,189 +637,9 @@ public final class ServerDictationEngineTest {
             states.add(null);
         }
 
-        @Override public void onDesktopError() {
-            desktopErrors++;
-        }
-
         @Override public void onPending(PendingClip clip) {
             pendingClip = clip;
         }
     }
 
-    /** What the fake desktop does in a session. */
-    private static final class Behaviour {
-        String ready;
-        long finalDelayMs;
-        String errorOnAudio;
-        boolean dropOnAudio;
-        /** The desktop's answer to stop, instead of its words. */
-        String finalJson;
-
-        static Behaviour fast(String ready) {
-            Behaviour b = new Behaviour();
-            b.ready = ready;
-            return b;
-        }
-
-        static Behaviour silent() {
-            return new Behaviour();
-        }
-
-        Behaviour finalAfter(long ms) {
-            finalDelayMs = ms;
-            return this;
-        }
-
-        Behaviour errorOnAudio(String error) {
-            errorOnAudio = error;
-            return this;
-        }
-
-        Behaviour finalJson(String json) {
-            finalJson = json;
-            return this;
-        }
-
-        Behaviour dropOnAudio() {
-            dropOnAudio = true;
-            return this;
-        }
-    }
-
-    /** The desktop's dictation server, speaking server.py's protocol on a local port. */
-    private static final class FakeServer implements java.io.Closeable {
-        private final ServerSocket socket = new ServerSocket(0);
-        private final Behaviour behaviour;
-        private final ByteArrayOutputStream audio = new ByteArrayOutputStream();
-        private final List<Socket> open = Collections.synchronizedList(new ArrayList<>());
-        /** Every text message the phone sent, start included, in order. */
-        final List<String> texts = Collections.synchronizedList(new ArrayList<>());
-
-        FakeServer(Behaviour behaviour) throws IOException {
-            this.behaviour = behaviour;
-            Thread t = new Thread(this::serve, "fake-dictation-server");
-            t.setDaemon(true);
-            t.start();
-        }
-
-        URI uri() {
-            return URI.create("ws://127.0.0.1:" + socket.getLocalPort() + "/v1/dictate");
-        }
-
-        byte[] audio() {
-            synchronized (audio) {
-                return audio.toByteArray();
-            }
-        }
-
-        private void serve() {
-            while (!socket.isClosed()) {
-                try {
-                    Socket s = socket.accept();
-                    open.add(s);
-                    Thread t = new Thread(() -> session(s), "fake-dictation-session");
-                    t.setDaemon(true);
-                    t.start();
-                } catch (IOException closed) {
-                    return;
-                }
-            }
-        }
-
-        private void session(Socket s) {
-            try {
-                InputStream in = s.getInputStream();
-                OutputStream out = s.getOutputStream();
-                handshake(in, out);
-                WebSocketFrames.Reader reader = new WebSocketFrames.Reader(in, 1 << 20);
-                WebSocketFrames.Message start = reader.next();
-                texts.add(start.text());
-                assertEquals("start", new JSONObject(start.text()).getString("type"));
-                if (behaviour.ready == null) {
-                    while (true) { // never ready: read until the phone gives up
-                        WebSocketFrames.Message m = reader.next();
-                        if (m.opcode == WebSocketFrames.TEXT) texts.add(m.text());
-                    }
-                }
-                send(out, behaviour.ready);
-                boolean heard = false;
-                while (true) {
-                    WebSocketFrames.Message m = reader.next();
-                    if (m.opcode == WebSocketFrames.BINARY) {
-                        synchronized (audio) {
-                            audio.write(m.payload, 0, m.payload.length);
-                        }
-                        if (!heard) {
-                            heard = true;
-                            if (behaviour.errorOnAudio != null) {
-                                send(out, behaviour.errorOnAudio);
-                                s.close();
-                                return;
-                            }
-                            if (behaviour.dropOnAudio) {
-                                s.close();
-                                return;
-                            }
-                            send(out, "{\"type\":\"partial\",\"text\":\"words\"}");
-                        }
-                    } else if (m.opcode == WebSocketFrames.TEXT) {
-                        texts.add(m.text());
-                        if (!new JSONObject(m.text()).getString("type").equals("stop")) continue;
-                        Thread.sleep(behaviour.finalDelayMs);
-                        send(out, behaviour.finalJson != null ? behaviour.finalJson
-                                : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
-                        s.close();
-                        return;
-                    }
-                }
-            } catch (Exception gone) {
-                // The phone hung up: that is its right.
-            }
-        }
-
-        private static void handshake(InputStream in, OutputStream out) throws IOException {
-            String key = null;
-            for (String line = line(in); !line.isEmpty(); line = line(in)) {
-                if (line.startsWith("Sec-WebSocket-Key:")) key = line.substring(18).trim();
-            }
-            out.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                    + "Sec-WebSocket-Accept: " + WebSocketFrames.acceptFor(key) + "\r\n\r\n")
-                    .getBytes(StandardCharsets.US_ASCII));
-            out.flush();
-        }
-
-        /** One request line, read a byte at a time so no websocket bytes are taken with it. */
-        private static String line(InputStream in) throws IOException {
-            StringBuilder b = new StringBuilder();
-            for (int c = in.read(); c != '\n'; c = in.read()) {
-                if (c < 0) throw new IOException("closed during the handshake");
-                if (c != '\r') b.append((char) c);
-            }
-            return b.toString();
-        }
-
-        /** Unmasked server text frame. */
-        private static synchronized void send(OutputStream out, String text) throws IOException {
-            byte[] b = text.getBytes(StandardCharsets.UTF_8);
-            ByteArrayOutputStream f = new ByteArrayOutputStream();
-            f.write(0x80 | WebSocketFrames.TEXT);
-            if (b.length < 126) {
-                f.write(b.length);
-            } else {
-                f.write(126);
-                f.write(b.length >>> 8);
-                f.write(b.length & 0xFF);
-            }
-            f.write(b, 0, b.length);
-            out.write(f.toByteArray());
-            out.flush();
-        }
-
-        @Override public void close() throws IOException {
-            socket.close();
-            synchronized (open) {
-                for (Socket s : open) s.close();
-            }
-        }
-    }
 }
