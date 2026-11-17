@@ -204,6 +204,38 @@ final class GhostText {
         }
     }
 
+    /**
+     * For each character of the draft as drawn ({@link #json}: a cut draft's
+     * "…", a chip's label, counted in code points as the renderer counts
+     * cells), where it is in the typed text {@code draft}; one more entry for
+     * the end. A tap on a chip puts the cursor after it.
+     */
+    static int[] fieldOffsets(String draft, Map<String, Long> lengths, java.util.Set<String> parked) {
+        String text = draft == null ? "" : draft;
+        int base = 0;
+        java.util.ArrayList<Integer> out = new java.util.ArrayList<>();
+        if (text.length() > MAX_CHARS) {
+            base = text.length() - MAX_CHARS;
+            out.add(base);
+            text = text.substring(base);
+        }
+        Matcher m = DictationToken.PATTERN.matcher(text);
+        int at = 0;
+        while (true) {
+            boolean found = m.find();
+            int plainEnd = found ? m.start() : text.length();
+            for (int i = at; i < plainEnd; i = text.offsetByCodePoints(i, 1)) out.add(base + i);
+            if (!found) break;
+            String label = "[" + DraftChips.label(lengths.get(m.group(1)), parked.contains(m.group(1))) + "]";
+            for (int i = 0, n = label.codePointCount(0, label.length()); i < n; i++) out.add(base + m.end());
+            at = m.end();
+        }
+        out.add(base + text.length());
+        int[] offsets = new int[out.size()];
+        for (int i = 0; i < offsets.length; i++) offsets[i] = out.get(i);
+        return offsets;
+    }
+
     /** {@code text} as spans of {@code style}, each dictation token a chip. */
     private static void spans(JSONArray out, String text, String style, Map<String, Long> lengths,
             java.util.Set<String> parked) throws JSONException {
