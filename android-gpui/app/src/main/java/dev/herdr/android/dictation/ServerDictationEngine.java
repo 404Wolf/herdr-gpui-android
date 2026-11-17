@@ -39,9 +39,20 @@ public final class ServerDictationEngine implements DictationEngine {
     static final int CHUNK_BYTES = Microphone.CHUNK_BYTES;
     /** Audio kept in memory while connecting: 10 s (it is on disk as well). */
     static final int MAX_PENDING_CHUNKS = 100;
+    /** The TCP connect alone; the websocket upgrade after it has {@link #HANDSHAKE_TIMEOUT_MS}. */
     static final int CONNECT_TIMEOUT_MS = 2500;
-    /** From the tap until the server says ready, else the desktop is out of the session. */
+    /**
+     * Each read of the TLS and websocket upgrade: a relayed tailnet path (DERP on cellular, 200
+     * ms and more a round trip) needs more than the connect's 2.5 s.
+     */
+    static final int HANDSHAKE_TIMEOUT_MS = 8000;
+    /** From the tap until the server says ready, else the phone's recognizer takes over. */
     static final int READY_TIMEOUT_MS = 4000;
+    /**
+     * The same with no recognizer on the phone, where giving up only means recording for later:
+     * room for a slow handshake, within the {@link #MAX_PENDING_CHUNKS} held for sending.
+     */
+    static final int READY_ALONE_TIMEOUT_MS = HANDSHAKE_TIMEOUT_MS + 1000;
     /** From stop to the desktop's final, when the phone's own text is there to fall back on. */
     public static final int DEFAULT_FINAL_BUDGET_MS = 5000;
     /** From stop to the desktop's final with nothing on the phone to fall back on. */
@@ -61,21 +72,36 @@ public final class ServerDictationEngine implements DictationEngine {
     /** How long each wait may take, in milliseconds. */
     static final class Timeouts {
         final long readyMs;
+        /** {@link #readyMs} when the phone has no recognizer to take over. */
+        final long readyAloneMs;
         final long finalBudgetMs;
         final long finalMs;
         final long onDeviceFinalMs;
 
         Timeouts(long readyMs, long finalBudgetMs, long finalMs, long onDeviceFinalMs) {
+            this(readyMs, readyMs, finalBudgetMs, finalMs, onDeviceFinalMs);
+        }
+
+        Timeouts(long readyMs, long readyAloneMs, long finalBudgetMs, long finalMs, long onDeviceFinalMs) {
             this.readyMs = readyMs;
+            this.readyAloneMs = readyAloneMs;
             this.finalBudgetMs = finalBudgetMs;
             this.finalMs = finalMs;
             this.onDeviceFinalMs = onDeviceFinalMs;
         }
 
         static Timeouts withFinalBudget(long finalBudgetMs) {
-            return new Timeouts(READY_TIMEOUT_MS, finalBudgetMs, FINAL_TIMEOUT_MS, ON_DEVICE_FINAL_TIMEOUT_MS);
+            return new Timeouts(READY_TIMEOUT_MS, READY_ALONE_TIMEOUT_MS, finalBudgetMs, FINAL_TIMEOUT_MS,
+                    ON_DEVICE_FINAL_TIMEOUT_MS);
         }
     }
+
+    /** Microphone open failures this process, by cause: the log carries counts, never audio. */
+    private static final java.util.concurrent.atomic.AtomicIntegerArray OPEN_FAILURES =
+            new java.util.concurrent.atomic.AtomicIntegerArray(Microphone.Failure.Cause.values().length);
+
+    /** The start message: the same for a live session and an upload. */
+    static final String START = "{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}";
 
     private final URI uri;
     private final PendingDictations pending;
@@ -101,7 +127,7 @@ public final class ServerDictationEngine implements DictationEngine {
      */
     public ServerDictationEngine(Context context, URI uri, PendingDictations pending,
             OnDeviceRecognizer.Factory onDevice, long finalBudgetMs) {
-        this(uri, pending, androidMain(), Microphone::open, permission(context), onDevice,
+        this(uri, pending, androidMain(), opener(context), permission(context), onDevice,
                 Timeouts.withFinalBudget(finalBudgetMs),
                 line -> android.util.Log.i(PendingDictations.TAG, line));
     }
@@ -134,6 +160,11 @@ public final class ServerDictationEngine implements DictationEngine {
                 h.removeCallbacks(r);
             }
         };
+    }
+
+    private static AudioInput.Opener opener(Context context) {
+        Context app = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        return () -> Microphone.open(app);
     }
 
     private static BooleanSupplier permission(Context context) {
@@ -197,8 +228,8 @@ public final class ServerDictationEngine implements DictationEngine {
         private final Listener listener;
         private final ClipStore.Recording recording;
         private final long startedAt = System.nanoTime();
-        private final Runnable readyTimeout = () -> goOffline("not ready in time", null);
-        private final Runnable finishTimeout = () -> goOffline("no final in time", null);
+        private final Runnable readyTimeout = () -> goOffline("not_ready", "not ready in time", null);
+        private final Runnable finishTimeout = () -> goOffline("no_final", "no final in time", null);
         private final Runnable onDeviceTimeout = () -> onDeviceFailed("no final in time");
         /** Counted down once the server is ready or given up on, for a stop that came first. */
         private final CountDownLatch settled = new CountDownLatch(1);
@@ -219,10 +250,14 @@ public final class ServerDictationEngine implements DictationEngine {
         private volatile boolean stopping;
         private volatile boolean cancelled;
         private volatile DictationSocket socket;
+        /** The desktop is out of the session or it is over: a socket that opens late just closes. */
+        private volatile boolean gaveUp;
         /** Set once the server is ready and cleared when it is given up on: where audio goes. */
         private volatile DictationSocket ready;
         /** What the mic thread feeds besides the clip and the desktop; null when none. */
         private volatile OnDeviceRecognizer localFeed;
+        /** Mic thread only: whether the microphone delivers more than silence. */
+        private final SilenceWatch silence = new SilenceWatch();
 
         Session(Listener listener, ClipStore.Recording recording) {
             this.listener = listener;
@@ -238,11 +273,16 @@ public final class ServerDictationEngine implements DictationEngine {
                 mic = microphone.open();
             } catch (Microphone.Failure e) {
                 micDone = true;
-                fail(new DictationException(DictationException.Reason.AUDIO, e.getMessage(), e));
+                int times = OPEN_FAILURES.incrementAndGet(e.cause.ordinal());
+                log.accept("dictation: the microphone did not open: " + e.cause + " (" + times
+                        + (times == 1 ? " time" : " times") + " since the app started)");
+                fail(new DictationException(e.cause == Microphone.Failure.Cause.DENIED
+                        ? DictationException.Reason.PERMISSION : DictationException.Reason.AUDIO,
+                        e.getMessage(), e));
                 return;
             }
             startOnDevice();
-            main.postDelayed(readyTimeout, timeouts.readyMs);
+            main.postDelayed(readyTimeout, local != null ? timeouts.readyMs : timeouts.readyAloneMs);
             new Thread(() -> record(mic), "dictation-mic").start();
             new Thread(this::converse, "dictation-socket").start();
         }
@@ -296,20 +336,35 @@ public final class ServerDictationEngine implements DictationEngine {
         /** Main thread, after {@link #cancel}: release everything, no more callbacks. */
         void abort() {
             cancelled = true;
-            release();
+            release("cancelled");
             if (micDone) recording.discard();
         }
 
-        private void release() {
+        /** {@code reason} for the desktop when we end a session it is still in; null when it ended it. */
+        private void release(String reason) {
             stopping = true;
             main.remove(readyTimeout);
             main.remove(finishTimeout);
             main.remove(onDeviceTimeout);
             ready = null;
+            gaveUp = true;
             settled.countDown();
-            DictationSocket s = socket;
-            if (s != null) s.close();
+            hangUp(reason);
             stopOnDevice();
+        }
+
+        /** Main thread: lets the desktop go, telling it why when it is still listening. */
+        private void hangUp(String reason) {
+            DictationSocket s = socket;
+            if (s == null) return;
+            if (reason == null) {
+                s.close();
+                return;
+            }
+            // Sending is network I/O: off the main thread, bounded by the socket's own buffers.
+            Thread t = new Thread(() -> s.cancel(reason), "dictation-hangup");
+            t.setDaemon(true);
+            t.start();
         }
 
         private void stopOnDevice() {
@@ -321,8 +376,12 @@ public final class ServerDictationEngine implements DictationEngine {
 
         /** Main thread: the session is over; later callbacks for it are dropped. */
         private void end() {
+            end(null);
+        }
+
+        private void end(String reason) {
             if (session == this) session = null;
-            release();
+            release(reason);
         }
 
         /**
@@ -330,15 +389,15 @@ public final class ServerDictationEngine implements DictationEngine {
          * recognizer carries on if there is one; otherwise the audio so far is in the recording,
          * so nothing heard is lost; if it is not being saved either, the session fails instead.
          */
-        private void goOffline(String why, Exception cause) {
+        private void goOffline(String reason, String why, Exception cause) {
             if (session != this || offline) return;
             offline = true;
+            gaveUp = true;
             main.remove(readyTimeout);
             main.remove(finishTimeout);
             ready = null;
             settled.countDown();
-            DictationSocket s = socket;
-            if (s != null) s.close();
+            hangUp(reason);
             log.accept("dictation: desktop out (" + why
                     + (cause == null ? "" : ", " + cause.getClass().getSimpleName() + ": " + cause.getMessage())
                     + ") " + sinceStart() + (local != null ? ", the phone transcribes" : ", recording for later"));
@@ -439,12 +498,60 @@ public final class ServerDictationEngine implements DictationEngine {
         }
 
         private void fail(DictationException error) {
+            fail(error, null);
+        }
+
+        private void fail(DictationException error, String reason) {
             if (session != this) return;
-            end();
+            end(reason);
             if (micDone) recording.discard();
             listener.onError(error);
             listener.onState(State.IDLE);
         }
+
+        /**
+         * Main thread: the desktop says the audio holds nothing to transcribe ({@code code}).
+         * Final: nothing is inserted and the recording is not kept, as no retry can help.
+         */
+        private void nothing(DictationException.Reason reason, String code) {
+            if (session != this || offline) return;
+            log.accept("dictation: desktop had nothing to transcribe (" + code + "), " + chunks
+                    + " chunks of which " + deadChunks + " digital silence, " + sinceStart());
+            fail(new DictationException(reason, DictationException.nothingMessage(reason)));
+        }
+
+        /**
+         * Main thread: the desktop answered with an error that a retry may cure (its Whisper slow
+         * or down). Shown as a desktop error, not as away; the audio goes on as if it were.
+         */
+        private void desktopError(String code) {
+            if (session != this || offline) return;
+            log.accept("dictation: desktop error (" + (code.isEmpty() ? "no code" : code) + ") " + sinceStart());
+            listener.onDesktopError();
+            goOffline(null, "desktop error", null);
+        }
+
+        /**
+         * Main thread: the microphone gives only silence ({@code verdict}). With nothing heard
+         * before, the session fails and keeps nothing; after real audio, what was heard is kept
+         * as if stop was tapped.
+         */
+        private void silenced(SilenceWatch.Verdict verdict, boolean heard) {
+            if (session != this || stopping) return;
+            log.accept("dictation: microphone silenced (" + verdict + "), " + chunks + " chunks of which "
+                    + deadChunks + " digital silence, " + sinceStart()
+                    + (heard ? ", keeping what was heard" : ", nothing kept"));
+            if (heard) {
+                finish();
+                return;
+            }
+            fail(new DictationException(DictationException.Reason.SILENCED,
+                    DictationException.nothingMessage(DictationException.Reason.SILENCED)), "silenced");
+        }
+
+        /** Mic thread writes, main thread reads for the log: counts only. */
+        private volatile int chunks;
+        private volatile int deadChunks;
 
         private String sinceStart() {
             return (System.nanoTime() - startedAt) / 1_000_000 + " ms into the session";
@@ -460,11 +567,22 @@ public final class ServerDictationEngine implements DictationEngine {
         /** Mic thread: records until stop, saving everything and sending while the server is ready. */
         private void record(AudioInput opened) {
             ArrayDeque<byte[]> unsent = new ArrayDeque<>();
+            boolean reportedSilence = false;
             try (AudioInput mic = opened) {
                 while (!stopping) {
                     byte[] chunk = new byte[CHUNK_BYTES];
                     int n = mic.read(chunk, () -> stopping);
                     if (n == 0) continue;
+                    if (!reportedSilence) {
+                        SilenceWatch.Verdict v = silence.chunk(chunk, n, mic.androidSilenced());
+                        chunks = silence.chunks();
+                        deadChunks = silence.deadChunks();
+                        if (v != SilenceWatch.Verdict.LIVE) {
+                            reportedSilence = true;
+                            boolean heard = silence.heard();
+                            post(() -> silenced(v, heard));
+                        }
+                    }
                     if (!recording.write(chunk, n)) {
                         // A storage or session limit: end the session as if tapped.
                         post(this::finish);
@@ -477,6 +595,7 @@ public final class ServerDictationEngine implements DictationEngine {
                 }
             } catch (Microphone.Failure e) {
                 // The mic failed partway: keep what was heard, as if the user tapped stop.
+                log.accept("dictation: the microphone failed partway: " + e.cause);
                 post(this::finish);
             }
             OnDeviceRecognizer l = localFeed;
@@ -496,7 +615,7 @@ public final class ServerDictationEngine implements DictationEngine {
                 send(unsent);
                 s.sendText("{\"type\":\"stop\"}");
             } catch (IOException e) {
-                post(() -> goOffline("send failed", e));
+                post(() -> goOffline(null, "send failed", e));
             }
         }
 
@@ -523,7 +642,7 @@ public final class ServerDictationEngine implements DictationEngine {
                 drain(unsent, s);
             } catch (IOException e) {
                 ready = null;
-                post(() -> goOffline("send failed", e));
+                post(() -> goOffline(null, "send failed", e));
             }
         }
 
@@ -531,15 +650,18 @@ public final class ServerDictationEngine implements DictationEngine {
         private void converse() {
             DictationSocket s;
             try {
-                s = DictationSocket.connect(uri, CONNECT_TIMEOUT_MS);
+                s = DictationSocket.connect(uri, CONNECT_TIMEOUT_MS, HANDSHAKE_TIMEOUT_MS);
             } catch (IOException e) {
-                post(() -> goOffline("unreachable", e));
+                // Classes and timings only: why the desktop did not take the session.
+                log.accept("dictation: " + e.getMessage() + (cancelled ? " (already cancelled)" : ""));
+                post(() -> goOffline(null, "unreachable", e));
                 return;
             }
             socket = s;
             try {
-                if (cancelled) return;
-                s.sendText("{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}");
+                // Given up while connecting (cancel, a final, or not ready in time): nothing to say.
+                if (cancelled || gaveUp) return;
+                s.sendText(START);
                 while (true) {
                     WebSocketFrames.Message m = s.read();
                     if (m == null) throw new IOException("the server closed the session");
@@ -554,7 +676,7 @@ public final class ServerDictationEngine implements DictationEngine {
                             if (offline) return;
                             if (!fast && local != null) {
                                 // Its text would be late: the phone's is used from the start.
-                                goOffline("backend " + backend, null);
+                                goOffline("slow_backend", "backend " + backend, null);
                                 return;
                             }
                             main.remove(readyTimeout);
@@ -570,6 +692,12 @@ public final class ServerDictationEngine implements DictationEngine {
                             listener.onPartial(text);
                         });
                     } else if (type.equals("final")) {
+                        String code = e.optString("code", "");
+                        DictationException.Reason nothing = DictationException.Reason.ofFinalCode(code);
+                        if (nothing != null) {
+                            post(() -> nothing(nothing, code));
+                            return;
+                        }
                         post(() -> {
                             if (offline) return;
                             log.accept("dictation: desktop final " + (System.nanoTime() - stoppedAt) / 1_000_000
@@ -581,13 +709,19 @@ public final class ServerDictationEngine implements DictationEngine {
                         });
                         return;
                     } else if (type.equals("error")) {
-                        // e.g. the desktop's Whisper is slow or down: the recording is still good.
-                        String code = e.optString("code", "unknown");
-                        throw new IOException("server error " + code + ": " + e.optString("message"));
+                        String code = e.optString("code", "");
+                        DictationException.Reason nothing = DictationException.Reason.ofErrorCode(code);
+                        if (nothing != null) {
+                            post(() -> nothing(nothing, code));
+                        } else {
+                            // e.g. the desktop's Whisper is slow or down: the recording is still good.
+                            post(() -> desktopError(code));
+                        }
+                        return;
                     }
                 }
             } catch (IOException | JSONException e) {
-                post(() -> goOffline("dropped", e));
+                post(() -> goOffline(null, "dropped", e));
             } finally {
                 s.close();
             }

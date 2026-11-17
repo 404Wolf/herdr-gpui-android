@@ -36,20 +36,75 @@ final class DictationSocket implements Closeable {
         this.out = out;
     }
 
+    /**
+     * Why a connection failed before the websocket was open, as classes for the log (never
+     * content): which step, and how it ended.
+     */
+    static final class HandshakeException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        /** The step that failed. */
+        enum Step { CONNECT, TLS, UPGRADE }
+
+        /** How it failed. */
+        enum Kind {
+            /** No answer in time. */
+            TIMEOUT,
+            /** Reset or refused by the peer. */
+            RESET,
+            /** The server closed the connection. */
+            CLOSED,
+            /** The server answered the upgrade with another status ({@link #status}). */
+            STATUS,
+            /** The server's answer was not a valid websocket handshake. */
+            BAD_ANSWER,
+            /** Anything else (a host that does not resolve, a certificate). */
+            OTHER
+        }
+
+        final Step step;
+        final Kind kind;
+        /** The HTTP status for {@link Kind#STATUS}, else 0. */
+        final int status;
+        final long elapsedMs;
+
+        HandshakeException(Step step, Kind kind, int status, long elapsedMs, Throwable source) {
+            super("websocket " + step + " failed: " + kind + (status != 0 ? " HTTP " + status : "")
+                    + " after " + elapsedMs + " ms", source);
+            this.step = step;
+            this.kind = kind;
+            this.status = status;
+            this.elapsedMs = elapsedMs;
+        }
+    }
+
+    /** {@code timeoutMillis} bounds the TCP connect and, as before, the whole handshake. */
     static DictationSocket connect(URI uri, int timeoutMillis) throws IOException {
+        return connect(uri, timeoutMillis, timeoutMillis);
+    }
+
+    /**
+     * {@code connectMillis} bounds the TCP connect; {@code handshakeMillis} each read of the TLS
+     * and HTTP upgrade after it, which over a relayed tailnet path (DERP, cellular) takes
+     * several round trips of a few hundred milliseconds each.
+     */
+    static DictationSocket connect(URI uri, int connectMillis, int handshakeMillis) throws IOException {
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
         boolean tls = scheme.equals("wss");
         if (!tls && !scheme.equals("ws")) throw new IOException("not a ws:// or wss:// URL: " + uri);
         String host = uri.getHost();
         if (host == null) throw new IOException("no host in " + uri);
         int port = uri.getPort() > 0 ? uri.getPort() : tls ? 443 : 80;
+        long started = System.nanoTime();
+        HandshakeException.Step step = HandshakeException.Step.CONNECT;
         Socket raw = new Socket();
         try {
-            raw.connect(new InetSocketAddress(host, port), timeoutMillis);
+            raw.connect(new InetSocketAddress(host, port), connectMillis);
             raw.setTcpNoDelay(true);
-            raw.setSoTimeout(timeoutMillis);
+            raw.setSoTimeout(handshakeMillis);
             Socket socket = raw;
             if (tls) {
+                step = HandshakeException.Step.TLS;
                 SSLSocket ssl = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault())
                         .createSocket(raw, host, port, true);
                 ssl.startHandshake();
@@ -59,6 +114,7 @@ final class DictationSocket implements Closeable {
                 }
                 socket = ssl;
             }
+            step = HandshakeException.Step.UPGRADE;
             InputStream in = new BufferedInputStream(socket.getInputStream());
             OutputStream out = socket.getOutputStream();
             handshake(uri, host, port, tls, in, out);
@@ -67,7 +123,59 @@ final class DictationSocket implements Closeable {
             return new DictationSocket(socket, in, out);
         } catch (IOException e) {
             raw.close();
-            throw e;
+            throw classify(step, e, (System.nanoTime() - started) / 1_000_000);
+        }
+    }
+
+    static HandshakeException classify(HandshakeException.Step step, IOException e, long elapsedMs) {
+        if (e instanceof HandshakeException) return (HandshakeException) e;
+        HandshakeException.Kind kind;
+        int status = 0;
+        if (e instanceof Refused) {
+            kind = HandshakeException.Kind.STATUS;
+            status = ((Refused) e).status;
+        } else if (e instanceof java.net.SocketTimeoutException) {
+            kind = HandshakeException.Kind.TIMEOUT;
+        } else if (e instanceof java.net.ConnectException || e instanceof java.net.SocketException) {
+            kind = HandshakeException.Kind.RESET;
+        } else if (e instanceof java.io.EOFException) {
+            kind = HandshakeException.Kind.CLOSED;
+        } else if (e instanceof BadAnswer) {
+            kind = HandshakeException.Kind.BAD_ANSWER;
+        } else {
+            kind = HandshakeException.Kind.OTHER;
+        }
+        return new HandshakeException(step, kind, status, elapsedMs, e);
+    }
+
+    /** The upgrade was answered with another status. */
+    private static final class Refused extends IOException {
+        private static final long serialVersionUID = 1L;
+        final int status;
+
+        Refused(int status) {
+            super("websocket refused: HTTP " + status);
+            this.status = status;
+        }
+    }
+
+    /** The answer to the upgrade was malformed. */
+    private static final class BadAnswer extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        BadAnswer(String what) {
+            super(what);
+        }
+    }
+
+    /** The status code of an HTTP status line, or 0 when it is not one. */
+    static int statusCode(String line) {
+        String[] parts = line.split(" ", 3);
+        if (parts.length < 2 || !parts[0].startsWith("HTTP/")) return 0;
+        try {
+            return Integer.parseInt(parts[1]);
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 
@@ -88,7 +196,11 @@ final class DictationSocket implements Closeable {
         out.write(request.getBytes(StandardCharsets.US_ASCII));
         out.flush();
         String status = readLine(in);
-        if (!status.startsWith("HTTP/1.1 101")) throw new IOException("websocket refused: " + status);
+        if (!status.startsWith("HTTP/1.1 101")) {
+            int code = statusCode(status);
+            if (code == 0) throw new BadAnswer("not an HTTP status line");
+            throw new Refused(code);
+        }
         String accept = null;
         for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
             int colon = line.indexOf(':');
@@ -97,7 +209,7 @@ final class DictationSocket implements Closeable {
             }
         }
         if (!WebSocketFrames.acceptFor(key).equals(accept)) {
-            throw new IOException("websocket handshake did not echo the key");
+            throw new BadAnswer("websocket handshake did not echo the key");
         }
     }
 
@@ -105,10 +217,10 @@ final class DictationSocket implements Closeable {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         while (true) {
             int b = in.read();
-            if (b < 0) throw new IOException("connection closed during handshake");
+            if (b < 0) throw new java.io.EOFException("connection closed during handshake");
             if (b == '\n') break;
             if (b != '\r') line.write(b);
-            if (line.size() > 8192) throw new IOException("handshake line too long");
+            if (line.size() > 8192) throw new BadAnswer("handshake line too long");
         }
         return new String(line.toByteArray(), StandardCharsets.ISO_8859_1);
     }
@@ -145,6 +257,22 @@ final class DictationSocket implements Closeable {
     /** Bounds each later {@link #read} (0 waits for ever); a timeout throws an IOException. */
     void readTimeout(int millis) throws IOException {
         socket.setSoTimeout(millis);
+    }
+
+    /**
+     * Ends the session from our side: {@code {"type":"cancel","reason":...}} (the server ignores
+     * fields it does not know, and drops the session on cancel), a websocket close, then the
+     * socket. Blocking I/O, so never on the main thread; failures are ignored (it is going away).
+     */
+    void cancel(String reason) {
+        try {
+            sendText("{\"type\":\"cancel\",\"reason\":\"" + reason + "\"}");
+            byte[] normal = {0x03, (byte) 0xE8}; // 1000: normal closure
+            send(WebSocketFrames.CLOSE, normal, 0, normal.length);
+        } catch (IOException ignored) {
+            // Already closed or reset: the close below is all that is left.
+        }
+        close();
     }
 
     /** Closes without the closing handshake; unblocks a pending {@link #read}. */

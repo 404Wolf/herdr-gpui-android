@@ -4236,6 +4236,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 @Override public void onChanged() {
                     if (composer != null) composer.setWaiting(Dictation.pending(GpuiTerminalActivity.this).count());
                 }
+
+                @Override public void onNothing(dev.herdr.android.dictation.PendingClip clip,
+                        dev.herdr.android.dictation.DictationException.Reason reason) {
+                    if (composer != null) composer.nothingHeard(reason);
+                }
             };
 
     /** Pane ids in a poll's pane list. */

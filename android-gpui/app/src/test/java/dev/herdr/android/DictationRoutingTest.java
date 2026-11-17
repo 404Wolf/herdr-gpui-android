@@ -27,6 +27,9 @@ public final class DictationRoutingTest {
         final List<String> sent = new ArrayList<>();
         DictationEngine.State state = DictationEngine.State.IDLE;
         boolean offlineTag;
+        final List<String> notices = new ArrayList<>();
+        dev.herdr.android.dictation.DictationException.Reason nothingHeard;
+        boolean desktopError;
 
         @Override public void showText(String text) { }
 
@@ -48,7 +51,17 @@ public final class DictationRoutingTest {
             drafts.sent();
         }
 
-        @Override public void notice(String text) { }
+        @Override public void notice(String text) {
+            notices.add(text);
+        }
+
+        @Override public void nothingHeard(dev.herdr.android.dictation.DictationException.Reason reason) {
+            nothingHeard = reason;
+        }
+
+        @Override public void desktopError() {
+            desktopError = true;
+        }
 
         @Override public void appendDictation(String pane, String text) {
             drafts.append(pane, text);
@@ -172,5 +185,29 @@ public final class DictationRoutingTest {
         a.onError(new DictationException(DictationException.Reason.AUDIO, "The recording could not be saved"));
         assertEquals(Collections.emptyList(), c.sent);
         assertFalse(c.routing.sendPending());
+    }
+
+    @Test public void nothingHeardIsSaidInTalkNotInANote() {
+        Composer c = new Composer();
+        c.drafts.switchTo("A");
+        c.drafts.dictationStarted();
+        DictationEngine.Listener l = c.routing.listener("A");
+        l.onError(new dev.herdr.android.dictation.DictationException(
+                dev.herdr.android.dictation.DictationException.Reason.SILENT_AUDIO, "The mic sent silence"));
+        assertEquals(dev.herdr.android.dictation.DictationException.Reason.SILENT_AUDIO, c.nothingHeard);
+        assertTrue(c.notices.isEmpty());
+        assertEquals(DictationEngine.State.IDLE, c.state);
+        l.onDesktopError();
+        assertTrue(c.desktopError);
+    }
+
+    @Test public void eachReasonHasItsOwnWords() {
+        java.util.Set<String> said = new java.util.HashSet<>();
+        for (dev.herdr.android.dictation.DictationException.Reason r
+                : dev.herdr.android.dictation.DictationException.Reason.values()) {
+            if (r.nothingHeard()) assertTrue(r.toString(), said.add(ComposerBar.nothingHeardWords(r, true)));
+        }
+        assertEquals("mic sent silence", ComposerBar.nothingHeardWords(
+                dev.herdr.android.dictation.DictationException.Reason.SILENT_AUDIO, true));
     }
 }

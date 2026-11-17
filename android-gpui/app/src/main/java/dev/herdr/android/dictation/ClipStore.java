@@ -35,6 +35,11 @@ final class ClipStore {
     static final String INDEX = "index-v1.json";
     /** How long a recording the phone transcribed itself is kept: 48 h. */
     static final long KEEP_MS = 48L * 60 * 60 * 1000;
+    /**
+     * Desktop errors on one clip before the courier stops trying it by itself: it stays, as
+     * stuck, until the next tap on the microphone tries it again ({@link #retryStuck}).
+     */
+    static final int MAX_SERVER_ERRORS = 3;
 
     /** One saved clip; {@code text} is null until transcribed. */
     static final class Entry {
@@ -43,16 +48,23 @@ final class ClipStore {
         final String text;
         /** Non-zero for a kept clip (the phone transcribed it): deleted after this epoch time. */
         final long keptUntil;
+        /** Desktop errors while uploading it since the last manual retry. */
+        final int errors;
 
         Entry(PendingClip clip, long bytes, String text) {
-            this(clip, bytes, text, 0);
+            this(clip, bytes, text, 0, 0);
         }
 
-        Entry(PendingClip clip, long bytes, String text, long keptUntil) {
+        Entry(PendingClip clip, long bytes, String text, long keptUntil, int errors) {
             this.clip = clip;
             this.bytes = bytes;
             this.text = text;
             this.keptUntil = keptUntil;
+            this.errors = errors;
+        }
+
+        boolean stuck() {
+            return text == null && !kept() && errors >= MAX_SERVER_ERRORS;
         }
 
         boolean kept() {
@@ -240,7 +252,7 @@ final class ClipStore {
             return null;
         }
         PendingClip clip = new PendingClip(r.id, r.target, r.createdAt, r.durationMs());
-        entries.add(new Entry(clip, r.bytes, null, keptUntil));
+        entries.add(new Entry(clip, r.bytes, null, keptUntil, 0));
         if (!save()) {
             entries.remove(entries.size() - 1);
             //noinspection ResultOfMethodCallIgnored
@@ -266,6 +278,49 @@ final class ClipStore {
         List<PendingClip> out = new ArrayList<>();
         for (Entry e : entries) if (e.text == null && !e.kept()) out.add(e.clip);
         return out;
+    }
+
+    /** The clips the courier tries by itself: waiting and not stuck, oldest first. */
+    synchronized List<PendingClip> due() {
+        List<PendingClip> out = new ArrayList<>();
+        for (Entry e : entries) if (e.text == null && !e.kept() && !e.stuck()) out.add(e.clip);
+        return out;
+    }
+
+    /** Waiting clips the courier stopped trying after {@link #MAX_SERVER_ERRORS} desktop errors. */
+    synchronized int stuck() {
+        int n = 0;
+        for (Entry e : entries) if (e.stuck()) n++;
+        return n;
+    }
+
+    /**
+     * One more desktop error for {@code id}; returns its count, or 0 when the clip is gone. The
+     * clip is kept either way: its audio is still good.
+     */
+    synchronized int failed(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.text != null || e.kept()) continue;
+            Entry next = new Entry(e.clip, e.bytes, null, 0, e.errors + 1);
+            entries.set(i, next);
+            save();
+            return next.errors;
+        }
+        return 0;
+    }
+
+    /** The user asked again: stuck clips are tried afresh. Returns whether there were any. */
+    synchronized boolean retryStuck() {
+        boolean any = false;
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.stuck()) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, null, 0, 0));
+            any = true;
+        }
+        if (any) save();
+        return any;
     }
 
     /**
@@ -329,11 +384,12 @@ final class ClipStore {
                     String clipText = o.isNull("text") ? null : o.optString("text", null);
                     long bytes = o.getLong("bytes");
                     long keptUntil = o.optLong("keptUntil", 0);
+                    int errors = o.optInt("errors", 0);
                     if (clipText == null && audio(id).length() != bytes) continue;
                     if (keptUntil != 0 && keptUntil <= clock.getAsLong()) continue;
                     PendingClip clip = new PendingClip(id, PendingClip.cutTarget(o.optString("target")),
                             o.getLong("created"), o.getLong("duration"));
-                    entries.add(new Entry(clip, bytes, clipText, keptUntil));
+                    entries.add(new Entry(clip, bytes, clipText, keptUntil, errors));
                 }
             } catch (JSONException damaged) {
                 entries.clear();
@@ -364,6 +420,7 @@ final class ClipStore {
                 o.put("bytes", e.bytes);
                 o.put("text", e.text == null ? JSONObject.NULL : e.text);
                 if (e.kept()) o.put("keptUntil", e.keptUntil);
+                if (e.errors != 0) o.put("errors", e.errors);
                 list.put(o);
             }
             write(new File(dir, INDEX), list.toString());

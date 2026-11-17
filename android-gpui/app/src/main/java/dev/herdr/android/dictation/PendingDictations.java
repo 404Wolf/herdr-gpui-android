@@ -40,13 +40,57 @@ public final class PendingDictations {
          */
         void onTranscribed(PendingClip clip, String text);
 
-        /** The clips waiting changed: {@link #count} may differ. */
+        /** The clips waiting changed: {@link #count} or {@link #stuck} may differ. */
         void onChanged();
+
+        /**
+         * The desktop found nothing to transcribe in {@code clip} ({@code reason}): it is gone,
+         * and {@link #onTranscribed} gave it an empty text so its placeholder goes too.
+         */
+        default void onNothing(PendingClip clip, DictationException.Reason reason) { }
     }
 
-    /** Turns one clip's audio into text; an IOException means "try again later". */
+    /**
+     * Turns one clip's audio into text. A {@link DesktopError} means the desktop answered with an
+     * error (counted against the clip); any other IOException means it is away (try later).
+     */
     interface Transcriber {
-        String transcribe(PendingClip clip, File audio) throws IOException;
+        Transcript transcribe(PendingClip clip, File audio) throws IOException;
+    }
+
+    /** What the desktop made of a clip: its text, or nothing to transcribe, for good. */
+    static final class Transcript {
+        final String text;
+        /** Non-null when there was nothing to transcribe; then {@link #text} is empty. */
+        final DictationException.Reason nothing;
+        /** The desktop's code for {@link #nothing}, for the log. */
+        final String code;
+
+        private Transcript(String text, DictationException.Reason nothing, String code) {
+            this.text = text;
+            this.nothing = nothing;
+            this.code = code;
+        }
+
+        static Transcript of(String text) {
+            return new Transcript(text == null ? "" : text, null, "");
+        }
+
+        static Transcript nothing(DictationException.Reason reason, String code) {
+            return new Transcript("", reason, code);
+        }
+    }
+
+    /** The desktop answered with an error that may pass (no code, or one not known as final). */
+    static final class DesktopError extends IOException {
+        private static final long serialVersionUID = 1L;
+        /** The error's code, or "" without one. */
+        final String code;
+
+        DesktopError(String code) {
+            super("desktop error " + (code.isEmpty() ? "without a code" : code));
+            this.code = code;
+        }
     }
 
     static final String TAG = "HerdrDictation";
@@ -130,6 +174,26 @@ public final class PendingDictations {
         return store.size();
     }
 
+    /** Waiting recordings the courier stopped trying by itself, after repeated desktop errors. */
+    public int stuck() {
+        return store.stuck();
+    }
+
+    /**
+     * The user tapped the microphone: stuck recordings are tried again, as is everything waiting.
+     * Main thread; the work is on the courier's thread.
+     */
+    public void retryStuck() {
+        worker.execute(() -> {
+            if (store.retryStuck()) {
+                log.accept("dictation: stuck clips tried again on a tap");
+                main.execute(this::changed);
+            }
+            retryMs = FIRST_RETRY_MS;
+            schedule(0);
+        });
+    }
+
     /** Recordings still waiting for the desktop, oldest first. */
     public List<PendingClip> waiting() {
         return store.untranscribed();
@@ -169,37 +233,78 @@ public final class PendingDictations {
         scheduled = worker.schedule(this::pass, delayMs, TimeUnit.MILLISECONDS);
     }
 
-    /** Worker thread: transcribes waiting clips, oldest first, until one fails. */
+    /**
+     * Worker thread: transcribes waiting clips, oldest first, until the desktop is away. A clip
+     * the desktop answers with an error is counted and passed over, so it never holds up newer
+     * ones; one with nothing to transcribe is dropped.
+     */
     void pass() {
         scheduled = null;
         // Cheap (an index scan): recordings the phone transcribed go once their 48 h are up.
         store.dropExpired();
-        List<PendingClip> waiting = store.untranscribed();
+        List<PendingClip> waiting = store.due();
         if (waiting.isEmpty()) return;
         int sent = 0;
+        int errors = 0;
+        int dropped = 0;
+        boolean again = false;
         long sentMs = 0;
         long started = System.nanoTime();
         for (PendingClip clip : waiting) {
-            String text;
+            Transcript result;
             long t = System.nanoTime();
             try {
-                text = transcriber.transcribe(clip, store.audio(clip.id));
+                result = transcriber.transcribe(clip, store.audio(clip.id));
+            } catch (DesktopError e) {
+                errors++;
+                int n = store.failed(clip.id);
+                boolean stuck = n >= ClipStore.MAX_SERVER_ERRORS;
+                again |= n > 0 && !stuck;
+                log.accept("dictation: desktop error on a " + clip.durationMs / 1000 + " s clip ("
+                        + (e.code.isEmpty() ? "no code" : e.code) + "), " + n + " of "
+                        + ClipStore.MAX_SERVER_ERRORS + (stuck ? ", stuck until the next mic tap" : ""));
+                main.execute(this::changed);
+                continue;
             } catch (IOException e) {
-                log.accept(line(sent, sentMs, waiting.size() - sent, started)
+                log.accept(line(sent, sentMs, waiting.size() - sent - errors - dropped, started)
                         + ", desktop unreachable (" + e.getClass().getSimpleName() + "), retry in "
                         + retryMs / 1000 + " s");
-                schedule(retryMs);
-                retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
+                retryLater();
                 return;
+            }
+            if (result.nothing != null) {
+                dropped++;
+                log.accept("dictation: a " + clip.durationMs / 1000 + " s clip had nothing to transcribe ("
+                        + result.code + "), dropped");
+                DictationException.Reason reason = result.nothing;
+                if (store.transcribed(clip.id, "")) {
+                    main.execute(() -> {
+                        offer();
+                        Listener l = listener;
+                        if (l != null) l.onNothing(clip, reason);
+                    });
+                }
+                continue;
             }
             sent++;
             sentMs += clip.durationMs;
             log.accept("dictation: sent a " + clip.durationMs / 1000 + " s clip in "
                     + (System.nanoTime() - t) / 1_000_000 + " ms");
-            if (store.transcribed(clip.id, text)) main.execute(this::offer);
+            if (store.transcribed(clip.id, result.text)) main.execute(this::offer);
         }
-        log.accept(line(sent, sentMs, 0, started) + ", all sent");
-        retryMs = FIRST_RETRY_MS;
+        log.accept(line(sent, sentMs, 0, started) + (dropped > 0 ? ", " + dropped + " with nothing to transcribe" : "")
+                + (errors > 0 ? ", " + errors + " desktop errors" : ", all sent"));
+        if (again) {
+            retryLater();
+        } else {
+            retryMs = FIRST_RETRY_MS;
+        }
+    }
+
+    /** Worker thread: another pass after the backoff, which grows. */
+    private void retryLater() {
+        schedule(retryMs);
+        retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
     }
 
     private static String line(int sent, long sentMs, int left, long started) {
@@ -226,11 +331,12 @@ public final class PendingDictations {
 
     static final int UPLOAD_FRAME_BYTES = 64 * 1024;
 
-    /** Sends a whole clip through the dictation protocol and returns the server's final text. */
-    static String upload(URI uri, File audio) throws IOException {
-        try (DictationSocket s = DictationSocket.connect(uri, ServerDictationEngine.CONNECT_TIMEOUT_MS);
+    /** Sends a whole clip through the dictation protocol and returns what the server made of it. */
+    static Transcript upload(URI uri, File audio) throws IOException {
+        try (DictationSocket s = DictationSocket.connect(uri, ServerDictationEngine.CONNECT_TIMEOUT_MS,
+                ServerDictationEngine.HANDSHAKE_TIMEOUT_MS);
              InputStream in = new BufferedInputStream(new FileInputStream(audio))) {
-            s.sendText("{\"type\":\"start\",\"sample_rate\":" + Microphone.RATE + "}");
+            s.sendText(ServerDictationEngine.START);
             byte[] frame = new byte[UPLOAD_FRAME_BYTES];
             for (int n; (n = in.read(frame)) > 0; ) s.sendBinary(frame, 0, n);
             s.sendText("{\"type\":\"stop\"}");
@@ -243,8 +349,16 @@ public final class PendingDictations {
                 if (m.opcode != WebSocketFrames.TEXT) continue;
                 JSONObject e = new JSONObject(m.text());
                 String type = e.optString("type");
-                if (type.equals("final")) return e.optString("text");
-                if (type.equals("error")) throw new IOException("server: " + e.optString("message"));
+                String code = e.optString("code", "");
+                if (type.equals("final")) {
+                    DictationException.Reason nothing = DictationException.Reason.ofFinalCode(code);
+                    return nothing != null ? Transcript.nothing(nothing, code) : Transcript.of(e.optString("text"));
+                }
+                if (type.equals("error")) {
+                    DictationException.Reason nothing = DictationException.Reason.ofErrorCode(code);
+                    if (nothing != null) return Transcript.nothing(nothing, code);
+                    throw new DesktopError(code);
+                }
             }
         } catch (JSONException e) {
             throw new IOException("bad message from the dictation server", e);

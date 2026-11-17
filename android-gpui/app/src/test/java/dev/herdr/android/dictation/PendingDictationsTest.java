@@ -108,7 +108,7 @@ public final class PendingDictationsTest {
     }
 
     /** Collects deliveries; delivers back at once unless told to hold. */
-    private static final class Composer implements PendingDictations.Listener {
+    private static class Composer implements PendingDictations.Listener {
         final List<String> got = new ArrayList<>();
         PendingDictations from;
         boolean place = true;
@@ -132,7 +132,7 @@ public final class PendingDictationsTest {
         PendingDictations pending = new PendingDictations(store, (clip, file) -> {
             sent.add(clip.id);
             assertTrue(file.isFile());
-            return "text " + clip.target;
+            return PendingDictations.Transcript.of("text " + clip.target);
         }, worker, Runnable::run);
         Composer composer = new Composer();
         composer.from = pending;
@@ -163,7 +163,7 @@ public final class PendingDictationsTest {
     @Test public void textWithNoOneToPlaceItIsHeldOnDiskAndOfferedLater() {
         ClipStore store = store();
         PendingClip a = record(store, "1", 10);
-        new PendingDictations(store, (clip, file) -> "hello", worker, Runnable::run).pass();
+        new PendingDictations(store, (clip, file) -> PendingDictations.Transcript.of("hello"), worker, Runnable::run).pass();
         // The app was killed before a composer took it.
         PendingDictations restarted = new PendingDictations(store(), (clip, file) -> {
             throw new AssertionError("already transcribed");
@@ -188,7 +188,7 @@ public final class PendingDictationsTest {
         boolean[] up = {false};
         PendingDictations pending = new PendingDictations(store, (clip, file) -> {
             if (!up[0]) throw new IOException("refused with private details");
-            return "private words";
+            return PendingDictations.Transcript.of("private words");
         }, worker, Runnable::run, lines::add);
         pending.pass();
         up[0] = true;
@@ -214,5 +214,80 @@ public final class PendingDictationsTest {
         pending.pass();
         assertEquals(0, pending.count());
         assertFalse(store.audio(a.id).exists());
+    }
+
+    @Test public void aClipTheDesktopErrsOnNeverHoldsUpNewerOnesAndStopsAfterItsTries() throws Exception {
+        ClipStore store = store();
+        PendingClip bad = record(store, "1", 10);
+        PendingClip good = record(store, "2", 10);
+        List<String> tried = new ArrayList<>();
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> {
+            tried.add(clip.id);
+            if (clip.id.equals(bad.id)) throw new PendingDictations.DesktopError("");
+            return PendingDictations.Transcript.of("words");
+        }, worker, Runnable::run);
+        Composer composer = new Composer();
+        composer.from = pending;
+        pending.setListener(composer);
+        pending.pass();
+        assertEquals("the newer clip went past the failing one", List.of(bad.id, good.id), tried);
+        assertEquals(List.of(good.id + "=words"), composer.got);
+        for (int i = 1; i < ClipStore.MAX_SERVER_ERRORS; i++) pending.pass();
+        assertEquals(1, pending.stuck());
+        assertEquals("kept, with its audio", 1, pending.waiting().size());
+        assertTrue(store.audio(bad.id).exists());
+        tried.clear();
+        pending.pass();
+        assertTrue("a stuck clip is not tried by itself", tried.isEmpty());
+        // The next tap on the microphone tries it again.
+        pending.retryStuck();
+        worker.submit(() -> { }).get();
+        assertEquals(0, pending.stuck());
+    }
+
+    @Test public void theErrorCountSurvivesARestart() {
+        ClipStore store = store();
+        PendingClip a = record(store, "1", 10);
+        for (int i = 0; i < ClipStore.MAX_SERVER_ERRORS; i++) store.failed(a.id);
+        ClipStore again = store();
+        assertEquals(1, again.stuck());
+        assertTrue(again.due().isEmpty());
+        assertTrue(again.retryStuck());
+        assertEquals(List.of(a), store().due());
+    }
+
+    @Test public void aClipWithNothingToTranscribeIsDroppedAndTheNextIsSent() {
+        ClipStore store = store();
+        PendingClip silent = record(store, "1", 10);
+        PendingClip spoken = record(store, "2", 10);
+        List<DictationException.Reason> nothing = new ArrayList<>();
+        PendingDictations pending = new PendingDictations(store, (clip, file) -> clip.id.equals(silent.id)
+                ? PendingDictations.Transcript.nothing(DictationException.Reason.SILENT_AUDIO, "silent_audio")
+                : PendingDictations.Transcript.of("words"), worker, Runnable::run);
+        Composer composer = new Composer() {
+            @Override public void onNothing(PendingClip clip, DictationException.Reason reason) {
+                nothing.add(reason);
+            }
+        };
+        composer.from = pending;
+        pending.setListener(composer);
+        pending.pass();
+        assertEquals("its placeholder goes with an empty text",
+                List.of(silent.id + "=", spoken.id + "=words"), composer.got);
+        assertEquals(List.of(DictationException.Reason.SILENT_AUDIO), nothing);
+        assertEquals(0, pending.count());
+        assertFalse(store.audio(silent.id).exists());
+    }
+
+    @Test public void codesAreReadAsAgreed() {
+        assertEquals(DictationException.Reason.SILENT_AUDIO, DictationException.Reason.ofFinalCode("silent_audio"));
+        assertEquals(DictationException.Reason.QUIET_AUDIO, DictationException.Reason.ofFinalCode("quiet_audio"));
+        assertEquals(DictationException.Reason.NO_AUDIO, DictationException.Reason.ofFinalCode("no_audio"));
+        assertEquals("any code on a final is final", DictationException.Reason.NOTHING,
+                DictationException.Reason.ofFinalCode("future_code"));
+        assertNull(DictationException.Reason.ofFinalCode(""));
+        assertEquals(DictationException.Reason.SILENT_AUDIO, DictationException.Reason.ofErrorCode("silent_audio"));
+        assertNull("other error codes pass", DictationException.Reason.ofErrorCode("backend_slow"));
+        assertNull(DictationException.Reason.ofErrorCode(""));
     }
 }
