@@ -137,8 +137,6 @@ final class ComposerBar {
     private int linkDown;
     /** Taps on controls that just moved are ignored ({@link TapGuard}). */
     private final TapGuard tapGuard = new TapGuard();
-    /** The target a finger went down on, until its click: that click is a touch, not a named activation. */
-    private View touchedTarget;
     /** The clear (✕) and its undo (item 76). */
     private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
         @Override public boolean cancelDictation() { return cancelDictationForClear(); }
@@ -894,11 +892,10 @@ final class ComposerBar {
             View target = new View(context);
             target.setTag(rect.id);
             target.setContentDescription(describe(rect.id));
-            target.setOnClickListener(this::targetTapped);
-            target.setOnTouchListener((v, e) -> {
-                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) touchedTarget = v;
-                return false;
-            });
+            // One per target: each finger's gesture is decided on its own touch path.
+            GuardedTarget guarded = new GuardedTarget(rect.id, tapGuard, this::targetTapped);
+            target.setOnTouchListener(guarded);
+            target.setOnClickListener(guarded);
             if ("send".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { setKeysOpen(!keysOpen); return true; });
             } else if ("clear".equals(rect.id)) {
@@ -919,20 +916,45 @@ final class ComposerBar {
     }
 
     /**
-     * What a tap on the target {@code id} does: {@code id}, or null when it is a finger's tap
-     * ({@code touch}) on a control that just slid under it ({@link TapGuard}, e.g. "talk" into
-     * undo's place as its window ends). A named activation (TalkBack's double tap, a
-     * performClick) says which control it means, so it always acts.
+     * A control's touch target, as both its touch and its click listener. The guard is decided
+     * on the touch path: a finger that goes down on a control that just slid under it
+     * ({@link TapGuard}, e.g. "talk" into undo's place as its window ends) has its whole gesture
+     * taken, so it never becomes a click. A click that does arrive (a finger on a settled
+     * control, TalkBack's double tap, a performClick) always acts: a named activation says
+     * which control it means. One per target, so each finger's gesture is its own, and the
+     * gesture's state ends with its UP or CANCEL.
      */
-    static String tapAction(TapGuard guard, String id, boolean touch, long now) {
-        return touch && !guard.accepts(id, now) ? null : id;
+    static final class GuardedTarget implements View.OnTouchListener, View.OnClickListener {
+        final String id;
+        private final TapGuard guard;
+        private final java.util.function.Consumer<String> act;
+        /** The gesture in progress began on this control while it was still moving: all of it is taken. */
+        private boolean taking;
+
+        GuardedTarget(String id, TapGuard guard, java.util.function.Consumer<String> act) {
+            this.id = id;
+            this.guard = guard;
+            this.act = act;
+        }
+
+        @Override public boolean onTouch(View v, MotionEvent e) {
+            return touch(e.getActionMasked(), android.os.SystemClock.uptimeMillis());
+        }
+
+        /** Whether this event of the gesture is taken here (so the view never makes it a click). */
+        boolean touch(int action, long now) {
+            if (action == MotionEvent.ACTION_DOWN) taking = !guard.accepts(id, now);
+            boolean taken = taking;
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) taking = false;
+            return taken;
+        }
+
+        @Override public void onClick(View v) {
+            act.accept(id);
+        }
     }
 
-    private void targetTapped(View target) {
-        boolean touch = target == touchedTarget;
-        touchedTarget = null;
-        String id = tapAction(tapGuard, String.valueOf(target.getTag()), touch, android.os.SystemClock.uptimeMillis());
-        if (id == null) return;
+    private void targetTapped(String id) {
         if (id.startsWith("echo-")) {
             tapRow(id);
             return;

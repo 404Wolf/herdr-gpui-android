@@ -2,9 +2,9 @@ package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import android.view.MotionEvent;
 import java.util.Arrays;
 import java.util.List;
 import org.junit.Test;
@@ -134,22 +134,105 @@ public final class TapGuardTest {
         assertTrue(guard.accepts("send", 5_000 + TapGuard.SETTLE_MS));
     }
 
-    @Test public void composerBarDispatchesAFingersTapOnlyOnceTheControlSettled() {
-        // ComposerBar.targetTapped acts on what tapAction returns.
-        TapGuard guard = new TapGuard();
-        guard.laid(Arrays.asList(at("talk", 50, 80)), 0);
-        guard.laid(Arrays.asList(at("talk", 100, 130)), 6_000);
-        assertNull("a finger's tap on talk as it slides in does nothing",
-                ComposerBar.tapAction(guard, "talk", true, 6_050));
-        assertEquals("talk", ComposerBar.tapAction(guard, "talk", true, 6_000 + TapGuard.SETTLE_MS));
+    // ---- through the composer's own listener (ComposerBar.GuardedTarget) ----------------------
+
+    /** A target whose clicks are recorded, laid out (appeared) at {@code at}. */
+    private static ComposerBar.GuardedTarget target(TapGuard guard, String id, List<String> acted) {
+        return new ComposerBar.GuardedTarget(id, guard, acted::add);
     }
 
-    @Test public void aNamedActivationAlwaysActs() {
-        // TalkBack's double tap or a performClick names its control: movement cannot redirect it.
+    /**
+     * What Android does with a finger's tap on a view: DOWN and UP to its touch listener, and
+     * a click only if the listener took neither.
+     */
+    private static void fingerTap(ComposerBar.GuardedTarget g, long now) {
+        boolean taken = g.touch(MotionEvent.ACTION_DOWN, now);
+        taken |= g.touch(MotionEvent.ACTION_UP, now);
+        if (!taken) g.onClick(null);
+    }
+
+    @Test public void aFingersTapOnAControlThatJustAppearedDoesNothingThroughTheListener() {
+        TapGuard guard = new TapGuard();
+        guard.laid(Arrays.asList(at("queue", 10, 60)), 1_000);
+        List<String> acted = new java.util.ArrayList<>();
+        ComposerBar.GuardedTarget queue = target(guard, "queue", acted);
+        fingerTap(queue, 1_010);
+        assertTrue("taken on the touch path, no click", acted.isEmpty());
+        fingerTap(queue, 1_000 + TapGuard.SETTLE_MS);
+        assertEquals(Arrays.asList("queue"), acted);
+    }
+
+    @Test public void aNamedActivationAlwaysActsThroughTheListener() {
+        // TalkBack's double tap or a performClick names its control: no touch, just the click.
         TapGuard guard = new TapGuard();
         guard.laid(Arrays.asList(at("undo", 110, 200)), 1_000);
-        assertEquals("undo", ComposerBar.tapAction(guard, "undo", false, 1_001));
-        assertNull(ComposerBar.tapAction(guard, "undo", true, 1_001));
+        List<String> acted = new java.util.ArrayList<>();
+        target(guard, "undo", acted).onClick(null);
+        assertEquals(Arrays.asList("undo"), acted);
+    }
+
+    @Test public void aCancelledOrAbandonedGestureLeavesNothingBehind() {
+        TapGuard guard = new TapGuard();
+        guard.laid(Arrays.asList(at("queue", 10, 60)), 1_000);
+        List<String> acted = new java.util.ArrayList<>();
+        ComposerBar.GuardedTarget queue = target(guard, "queue", acted);
+        // The strip takes a drag over: the target gets DOWN, then CANCEL.
+        assertTrue(queue.touch(MotionEvent.ACTION_DOWN, 1_010));
+        assertTrue(queue.touch(MotionEvent.ACTION_CANCEL, 1_015));
+        queue.onClick(null); // then a named activation
+        assertEquals(Arrays.asList("queue"), acted);
+        // An UP that makes no click (a long press, say), then a named activation.
+        queue.touch(MotionEvent.ACTION_DOWN, 1_020);
+        queue.touch(MotionEvent.ACTION_UP, 1_030);
+        queue.onClick(null);
+        assertEquals(Arrays.asList("queue", "queue"), acted);
+        // And the next finger on the settled control is decided afresh.
+        fingerTap(queue, 1_000 + TapGuard.SETTLE_MS);
+        assertEquals(3, acted.size());
+    }
+
+    @Test public void eachFingerIsDecidedOnItsOwnTarget() {
+        // Split multi-touch: each child gets its own DOWN; one must not decide the other.
+        TapGuard guard = new TapGuard();
+        guard.laid(Arrays.asList(at("type", 300, 340)), 0);
+        guard.laid(Arrays.asList(at("type", 300, 340), at("queue", 10, 60)), 1_000);
+        List<String> acted = new java.util.ArrayList<>();
+        ComposerBar.GuardedTarget queue = target(guard, "queue", acted), type = target(guard, "type", acted);
+        boolean queueTaken = queue.touch(MotionEvent.ACTION_DOWN, 1_010);
+        boolean typeTaken = type.touch(MotionEvent.ACTION_DOWN, 1_011);
+        assertTrue("queue just appeared", queueTaken);
+        assertFalse("type had settled", typeTaken);
+        type.touch(MotionEvent.ACTION_CANCEL, 1_012); // the other finger's gesture ends
+        queueTaken |= queue.touch(MotionEvent.ACTION_UP, 1_020);
+        if (!queueTaken) queue.onClick(null);
+        assertTrue("the first finger's tap is still guarded", acted.isEmpty());
+    }
+
+    @Test public void aTapAimedAtUndoAsItsWindowEndsDoesNothingThroughTheListener() {
+        // The real line and targets at every width, through the listener the composer installs.
+        for (int c = 30; c <= 120; c++) {
+            ControlLine.State in = new ControlLine.State();
+            in.talks = java.util.Collections.singletonList(new GhostText.Control("talk", "talk", "dim"));
+            in.clearable = true;
+            in.queued = 1;
+            in.undoWide = "cleared · undo";
+            in.undoNarrow = "undo";
+            List<ControlTargets.Rect> before = laidOut(in, c);
+            ControlTargets.Rect u = null;
+            for (ControlTargets.Rect r : before) if (r.id.equals("undo")) u = r;
+            if (u == null) continue;
+            in.undoWide = null;
+            in.undoNarrow = null;
+            List<ControlTargets.Rect> later = laidOut(in, c);
+            String under = hit(later, (u.labelLeft + u.labelRight) / 2, (u.top + u.bottom) / 2);
+            if (under == null) continue;
+            TapGuard guard = new TapGuard();
+            guard.laid(before, 0);
+            guard.laid(later, 6_000);
+            List<String> acted = new java.util.ArrayList<>();
+            fingerTap(target(guard, under, acted), 6_050);
+            assertTrue(c + " cols: " + under + " acted on a tap meant for undo", acted.isEmpty());
+        }
     }
 
     @Test public void anIdNeverLaidOutIsNotBlocked() {
