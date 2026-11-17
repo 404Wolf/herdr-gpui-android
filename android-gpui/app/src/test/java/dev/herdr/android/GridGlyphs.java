@@ -20,7 +20,7 @@ import java.util.regex.Pattern;
  * would refuse most of what draws, so it is not one.
  */
 final class GridGlyphs {
-    static final String SEEN = "·…↓≡─◌●▲";
+    static final String SEEN = "·…↓≡─◌●▲⁞";
     /** gpui-rio's glyph stand-ins, relative to the app module (Gradle's and the plain run's directory). */
     static final Path GLYPHS_RS = Paths.get("../rust/vendor/gpui-rio/src/glyphs.rs");
     static final Set<Integer> STAND_INS = standIns();

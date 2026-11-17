@@ -300,9 +300,13 @@ final class ComposerBar {
         }
 
         @Override public void appendDictation(String pane, String text) {
+            appendDictation(pane, text, null);
+        }
+
+        @Override public void appendDictation(String pane, String text, int[] unverifiedCuts) {
             // A live final for another pane: it stays in memory either way; persistNow follows.
             if (pane == null || pane.isEmpty()) pane = drafts.pane();
-            String draft = drafts.append(pane, text);
+            String draft = drafts.append(pane, text, unverifiedCuts);
             if (pane.equals(drafts.pane())) showText(draft);
         }
 
@@ -693,7 +697,8 @@ final class ComposerBar {
         float col = (x / density - layout.left) / layout.cellWidth;
         int row = (int) Math.floor((y / density - layout.top) / layout.cellHeight);
         int drawn = DraftTaps.drawnAt(layout.draftRuns, row, col);
-        return DraftTaps.fieldIndex(GhostText.fieldOffsets(drafts.text(), clipLengths, parkedIds()), drawn);
+        return DraftTaps.fieldIndex(GhostText.fieldOffsets(drafts.text(), drafts.cuts(), clipLengths, parkedIds()),
+                drawn);
     }
 
     private void startTyping() {
@@ -1269,7 +1274,7 @@ final class ComposerBar {
             long now = android.os.SystemClock.uptimeMillis();
             shownRows = queue.rows(drafts.pane(), queuedMessages, loose, parkedHere(), linkDown, cols, queueOpen,
                     selectedRow, now);
-            json = GhostText.json(GhostText.kind(kind), draft, marks, clipLengths, parkedIds(),
+            json = GhostText.json(GhostText.kind(kind), draft, marks, drafts.cuts(), clipLengths, parkedIds(),
                     shownRows, queueOpen, selectedRow, cols, controls(loose), GhostText.Colors.of(chrome));
         }
         if (json.equals(lastGhost)) return;

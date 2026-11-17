@@ -68,6 +68,18 @@ public interface DictationEngine {
         default void onFinal(String text, boolean onDevice) {
             onFinal(text);
         }
+        /**
+         * {@link #onPartial(String)}, with where the desktop cut the audio without a verified
+         * seam ({@link UnverifiedCuts}: offsets into {@code text}, often none). Only the desktop
+         * sends them; by default they are dropped.
+         */
+        default void onPartial(String text, int[] unverifiedCuts) {
+            onPartial(text);
+        }
+        /** {@link #onFinal(String, boolean)}, with the desktop's unverified cuts (see onPartial). */
+        default void onFinal(String text, boolean onDevice, int[] unverifiedCuts) {
+            onFinal(text, onDevice);
+        }
 
         /**
          * After stop, the desktop's final waits for a decode in flight or queued
