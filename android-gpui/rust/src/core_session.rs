@@ -78,7 +78,38 @@ struct Connection<'a> {
     negotiated: bool,
     /// How this viewer claims the attached pane's grid.
     claim: Claim,
+    /// Whether to ask for `resize_history`: the core's hello offered it, and
+    /// no attach reply has failed to echo it (a path that cannot carry it).
+    /// Then the repaint after a RESIZE may carry the pane's history after an
+    /// ESC[3J, which makes the phone's scrollback after a resize exactly the
+    /// core's. Nothing depends on it arriving: the phone's own no-loss
+    /// handling of a resize (the old screen kept on the paint's first ED 2)
+    /// is erased by that ESC[3J when the history comes, and stands when only
+    /// the screen comes (a paint the core had to cut to its cap).
+    history_on_resize: bool,
+    /// The attached stream ended with the pane still listed (a relay closes
+    /// it when the path loses a confirmed `resize_history`, or on overflow):
+    /// attach it again from the session loop. Any attach clears it.
+    reattach: Option<String>,
+    /// When the last such reattach was made: the next waits until
+    /// REATTACH_EVERY has passed (it is put off, never dropped), so a pane
+    /// that keeps closing is reattached at most that often. Only a refused
+    /// attach leaves it ended.
+    reattached_at: Option<Instant>,
+    /// The pane whose stream the core ended: the next attach of it (the
+    /// automatic reattach, also one parked while hidden and made when shown,
+    /// or a person picking it again) is `resumed` where the path confirmed
+    /// `resize_history`, so the owner owes one whole history replacement.
+    ended: Option<String>,
 }
+
+/// History rows asked for in the repaint after a RESIZE: the attach's own
+/// (`attach_params`). That ESC[3J replaces the whole scrollback, so fewer
+/// would cut the phone's history shorter than the attach gave it, and more
+/// buys nothing the phone ever had. Bounding the bytes is the core's cap.
+const RESIZE_HISTORY: usize = 1000;
+/// At most one automatic reattach of an ended stream this often.
+const REATTACH_EVERY: Duration = Duration::from_secs(5);
 
 /// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
 const DETACH: u8 = 2;
@@ -302,12 +333,24 @@ impl Connection<'_> {
                 2 => {
                     self.output = None;
                     let mut state = lock(&self.owner.state);
+                    let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+                    if !pane.is_empty() {
+                        self.ended = Some(pane.clone());
+                    }
                     state.view["state"] = json!("connecting");
                     state.view["status"] =
                         json!("Terminal stream ended; select a terminal to attach again");
                     state.terminal = None;
                     state.render_id = 0;
                     bump(&mut state.view);
+                    drop(state);
+                    // Attached again by the session loop, at most once per
+                    // REATTACH_EVERY: a close sooner than that is put off, not
+                    // dropped. A pane whose program ended refuses the attach
+                    // and stays ended.
+                    if !pane.is_empty() {
+                        self.reattach = Some(pane);
+                    }
                 }
                 _ => {}
             }
@@ -892,6 +935,11 @@ impl Connection<'_> {
         Ok(())
     }
     fn attach(&mut self, terminal: &str, cols: u16, rows: u16) -> Result<()> {
+        // This attach replaces any reattach still waiting for its turn.
+        self.reattach = None;
+        // Taken only once an attach of that pane is accepted (below): a pick
+        // the core refuses leaves it for the fallback to the previous pane.
+        let resumed = self.ended.as_deref() == Some(terminal);
         self.detach()?;
         {
             let mut state = lock(&self.owner.state);
@@ -908,10 +956,29 @@ impl Connection<'_> {
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
         }
-        let reply = self.call(
-            "terminal.attach",
-            attach_params(terminal, cols, rows, self.claim.offered),
-        )?;
+        let mut params = attach_params(terminal, cols, rows, self.claim.offered);
+        if self.history_on_resize {
+            params["resize_history"] = json!(RESIZE_HISTORY);
+        }
+        if resumed && self.history_on_resize {
+            // The same pane again after the core ended its stream, on a path
+            // that confirmed `resize_history`: the owner then owes one whole
+            // history replacement (at once on the main screen, or on the
+            // return to it), which replaces this grid's history; the phone
+            // replays nothing itself. Elsewhere an ordinary attach (its
+            // history, maybe some rows twice; on the alternate screen an old
+            // owner sends none, so the main history is not brought back).
+            params["resumed"] = json!(true);
+        }
+        let reply = self.call("terminal.attach", params)?;
+        if resumed {
+            self.ended = None;
+        }
+        // Only the owner's echo confirms it (relays pass on only that): no
+        // echo, and the path cannot carry it, so it is not asked again.
+        if self.history_on_resize && reply["resize_history"].as_u64().unwrap_or(0) == 0 {
+            self.history_on_resize = false;
+        }
         // A core (and path) that will send RESIZE before repainting says so;
         // an older one does not, and the phone's own size stays the grid.
         self.negotiated = reply["resize_notifications"] == true;
@@ -1352,6 +1419,12 @@ fn attach_params(terminal: &str, cols: u16, rows: u16, visibility: bool) -> Valu
     }
     params
 }
+/// Whether the core's hello lists `feature`.
+fn offers(hello: &Value, feature: &str) -> bool {
+    hello["result"]["features"]
+        .as_array()
+        .is_some_and(|features| features.iter().any(|f| f == feature))
+}
 /// The PTY's grid from an attach reply, when the path negotiated RESIZE.
 fn initial_grid(reply: &Value) -> Option<(u16, u16)> {
     if reply["resize_notifications"] != true {
@@ -1649,11 +1722,13 @@ pub(crate) fn run(
         dirty: false,
         negotiated: false,
         claim: Claim {
-            offered: hello["result"]["features"]
-                .as_array()
-                .is_some_and(|features| features.iter().any(|f| f == "viewer_visibility")),
+            offered: offers(&hello, "viewer_visibility"),
             ..Claim::default()
         },
+        history_on_resize: offers(&hello, "resize_history"),
+        reattach: None,
+        reattached_at: None,
+        ended: None,
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -1736,6 +1811,10 @@ fn serve(
         if !connection.may_attach() {
             // Hidden without VISIBILITY frames: remember the pick, claim nothing.
             if let Some((terminal, _)) = switch.take() {
+                // A person's pick: an owed reattach of another pane is off.
+                if connection.reattach.as_ref().is_some_and(|owed| *owed != terminal) {
+                    connection.reattach = None;
+                }
                 connection.claim.parked = Some(terminal);
             }
         }
@@ -1773,6 +1852,32 @@ fn serve(
         }
         if let Some(frame) = connection.read()? {
             connection.deliver(frame)?;
+        }
+        if connection.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY)
+            && let Some(pane) = connection.reattach.take()
+            // A newer pick (also one parked while hidden) wins over the old pane.
+            && connection.claim.parked.as_ref().is_none_or(|parked| *parked == pane)
+            && lock(&owner.state).view["pane_id"] == pane.as_str()
+        {
+            if !connection.may_attach() {
+                // Hidden by now on a path that cannot say so: parked like any
+                // hidden pane, attached when shown.
+                connection.detach()?;
+                connection.claim.parked = Some(pane);
+            } else {
+                connection.reattached_at = Some(Instant::now());
+                match connection.attach(&pane, cols, rows) {
+                    Ok(()) => {}
+                    // Refused (the program ended, the pane is gone): it stays ended.
+                    Err(Error::Protocol(_) | Error::Rpc { .. }) => {
+                        let mut state = lock(&owner.state);
+                        state.view["state"] = json!("connecting");
+                        state.view["status"] = json!("Terminal stream ended; select a terminal to attach again");
+                        bump(&mut state.view);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         if refreshed.elapsed() >= Duration::from_secs(2)
             || (connection.dirty
@@ -2606,6 +2711,28 @@ b"}"#), None);
     }
 }
 
+/// A mock core reads the phone's hello line on a socket with a short read
+/// timeout (so its frame loop can poll). A loaded machine may send the hello
+/// later than that, so time-outs are retried here until a long deadline.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+fn read_hello(core: &UnixStream, hello: &mut String) {
+    let mut reader = io::BufReader::new(core.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut line = Vec::new();
+    while !line.ends_with(b"\n") {
+        match io::BufRead::read_until(&mut reader, b'\n', &mut line) {
+            Ok(0) => panic!("the phone closed before its hello"),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                assert!(Instant::now() < deadline, "no hello from the phone in 60 s");
+            }
+            Err(e) => panic!("reading the hello: {e}"),
+        }
+    }
+    *hello = String::from_utf8(line).unwrap();
+}
+
 #[cfg(test)]
 mod connection_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2762,7 +2889,7 @@ mod connection_tests {
         let (observed, events) = mpsc::sync_channel(2);
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
-            io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            read_hello(&core, &mut hello);
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
             // The second doc.get is projects.order (the project switcher's order).
@@ -2867,7 +2994,7 @@ mod connection_tests {
         let log = seen.clone();
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
-            io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+            read_hello(&core, &mut hello);
             core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
             let mut decoder = Decoder::default();
             let mut counts: HashMap<String, usize> = HashMap::new();
@@ -2901,7 +3028,7 @@ mod connection_tests {
         });
         let (tx, reply) = mpsc::sync_channel(1);
         commands.try_send(Operation::Action(action.into(), tx)).unwrap();
-        let result = reply.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = reply.recv_timeout(Duration::from_secs(60)).unwrap();
         owner.cancel.cancel();
         let _ = runtime.join();
         let _ = peer.join();
@@ -3182,7 +3309,7 @@ mod connection_tests {
     /// All rows from the oldest history row to the last screen row, read the
     /// way the renderer reads them: what scrolling all the way back shows,
     /// then the screen.
-    fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
+    pub(super) fn all_rows(session: &gpui_rio::Session) -> Vec<String> {
         let history = session.grid().lock().history_size();
         let mut out: Vec<String> = Vec::new();
         for offset in (0..=history).rev() {
@@ -3222,7 +3349,7 @@ mod connection_tests {
     /// `Terminal::paint`): a reset ending in ESC[H ESC[2J, then (on a first
     /// paint) the history pushed up with newlines and erased, then the scroll
     /// region and the screen rows from the top.
-    fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+    pub(super) fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
         let mut out = String::from("\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J");
         if !history.is_empty() {
             out.push_str(&history.join("\r\n"));
@@ -3284,6 +3411,16 @@ mod connection_tests {
     }
 
     /// A pane fed `chunks` (DATA and the core's RESIZE) in stream order.
+    /// What herdr-core sends after a RESIZE to a viewer that asked for
+    /// `resize_history` (home-manager-conf #88): CAN, the paint's reset
+    /// (ending ESC[H ESC[2J), ESC[3J, then the history and the screen.
+    pub(super) fn core_resize_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+        let paint = core_paint(history, screen, rows);
+        let reset = b"\x1b[H\x1b[2J";
+        let at = paint.windows(reset.len()).position(|w| w == reset).unwrap() + reset.len();
+        [b"\x18".as_slice(), &paint[..at], b"\x1b[3J", &paint[at..]].concat()
+    }
+
     fn streamed(cols: u16, rows: u16, chunks: Vec<Chunk>) -> Arc<gpui_rio::Session> {
         let (tx, rx) = mpsc::sync_channel(64);
         let (commands, _credits) = mpsc::sync_channel(4096);
@@ -3332,6 +3469,78 @@ mod connection_tests {
         let pane = streamed(20, 10, vec![Chunk::Data(first), Chunk::Data(again.clone()), Chunk::Data(again)]);
         let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
         assert_eq!(rows_seen, all);
+    }
+
+    /// With a core that sends its history after a RESIZE, the scrollback
+    /// becomes exactly the core's, whichever side moved more rows: the old
+    /// screen the phone keeps on the paint's first erase is cleared by the
+    /// ESC[3J that follows. No row is lost and none shows twice.
+    #[test]
+    fn a_history_repaint_after_a_resize_leaves_exactly_the_cores_scrollback() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        for (rows, shown) in [(8u16, 6usize), (8, 8), (6, 6), (12, 10)] {
+            // The core's history after its own resize, with a row only it still holds.
+            let at = all.len() - shown;
+            let mut history = vec!["only the core".to_owned()];
+            history.extend_from_slice(&all[..at]);
+            let repaint = core_resize_paint(&history, &all[at..], usize::from(rows));
+            let pane = streamed(20, 10, vec![Chunk::Data(first.clone()), Chunk::Grid(20, rows), Chunk::Data(repaint)]);
+            let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+            let expected: Vec<String> = history.iter().chain(&all[at..]).cloned().collect();
+            assert_eq!(rows_seen, expected, "10 -> {rows} rows");
+        }
+    }
+
+    /// The core's policy (#88): a RESIZE is followed by ESC[3J and the
+    /// history only when the whole confirmed N fits; otherwise by a
+    /// screen-only paint with no ESC[3J. That paint must keep every row the
+    /// phone held, whichever side moved more rows, even when it arrives cut
+    /// into 3-byte pieces (escape sequences split across frames).
+    #[test]
+    fn a_screen_only_paint_after_a_resize_keeps_the_old_history() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let pieces = |bytes: Vec<u8>| bytes.chunks(3).map(|piece| Chunk::Data(piece.to_vec())).collect::<Vec<_>>();
+        for (rows, shown) in [(8u16, 5usize), (8, 8), (6, 6), (12, 10)] {
+            let mut chunks = pieces(core_paint(&all[..40], &all[40..], 10));
+            chunks.push(Chunk::Grid(20, rows));
+            // Screen-only: no ESC[3J, no history, just the core's screen.
+            let screen_only = core_paint(&[], &all[all.len() - shown..], usize::from(rows));
+            assert!(!screen_only.windows(4).any(|w| w == b"\x1b[3J"));
+            chunks.extend(pieces(screen_only));
+            let pane = streamed(20, 10, chunks);
+            let rows_seen: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+            for line in &all {
+                assert!(rows_seen.contains(line), "{line} lost at 10 -> {rows}: {rows_seen:?}");
+            }
+            let firsts: Vec<usize> = all.iter().map(|l| rows_seen.iter().position(|r| r == l).unwrap()).collect();
+            assert!(firsts.windows(2).all(|w| w[0] < w[1]), "out of order at 10 -> {rows}: {rows_seen:?}");
+        }
+    }
+
+    /// The core's repair (#88): a history replacement that was cut (live
+    /// output overflowed the backlog, or the line dropped) is sent again
+    /// whole later, with no RESIZE before it. Whatever the phone held then,
+    /// rows doubled by a screen-only paint or a replacement cut short, the
+    /// repair leaves exactly the core's scrollback.
+    #[test]
+    fn a_repair_without_a_resize_leaves_exactly_the_cores_scrollback() {
+        let all: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        let screen_only = core_paint(&[], &all[42..], 8);
+        let mut cut = core_resize_paint(&all[..42], &all[42..], 8);
+        cut.truncate(cut.len() / 2);
+        let repair = core_resize_paint(&all[..42], &all[42..], 8);
+        let seen = |chunks: Vec<Chunk>| -> Vec<String> {
+            all_rows(&streamed(20, 10, chunks)).into_iter().filter(|r| !r.is_empty()).collect()
+        };
+        for (name, before) in [("screen-only", screen_only), ("cut", cut)] {
+            let held = || vec![Chunk::Data(first.clone()), Chunk::Grid(20, 8), Chunk::Data(before.clone())];
+            assert_ne!(seen(held()), all, "{name}: the phone's rows differ before the repair");
+            let mut repaired = held();
+            repaired.push(Chunk::Data(repair.clone()));
+            assert_eq!(seen(repaired), all, "{name}");
+        }
     }
 
     /// A saved copy read back (a switch, a close or a checkpoint wrote it).
@@ -3556,6 +3765,46 @@ mod connection_tests {
         assert_eq!(cell(0, 19), 'A', "{}", session.screen_text());
         assert_eq!(cell(0, 29), ' ', "{}", session.screen_text());
     }
+
+    // t21s's probes from the #27 review (gpui-pr27-artifacts), kept as regression tests.
+    fn reviewer_rows(chunks: Vec<Chunk>) -> Vec<String> {
+        all_rows(&streamed(20, 10, chunks)).into_iter().filter(|s| !s.is_empty()).collect()
+    }
+
+    #[test]
+    fn reviewer_interrupted_paint_then_two_resizes_and_repair() {
+        let all: Vec<String> = (0..70).map(|n| format!("row {n:03}")).collect();
+        let first = core_paint(&all[..60], &all[60..], 10);
+        let paint8 = core_resize_paint(&all[..62], &all[62..], 8);
+        let paint6 = core_resize_paint(&all[..64], &all[64..], 6);
+        let paint12 = core_resize_paint(&all[..58], &all[58..], 12);
+        // Interrupt inside CAN/reset, ED3, history, the history/screen separator,
+        // and final screen, then resize again. Final repair is unfragmented in
+        // stream meaning only: DATA splits every escape into three-byte pieces.
+        for cut in [0, 1, 2, 5, 20, 35, 45, 80, paint8.len()/2, paint8.len()-2, paint8.len()] {
+            for (final_rows, final_paint) in [(6, &paint6), (12, &paint12)] {
+                let mut chunks = vec![Chunk::Data(first.clone()), Chunk::Grid(20, 8)];
+                chunks.extend(paint8[..cut].chunks(3).map(|b| Chunk::Data(b.to_vec())));
+                chunks.push(Chunk::Grid(20, final_rows));
+                chunks.extend(final_paint.chunks(3).map(|b| Chunk::Data(b.to_vec())));
+                assert_eq!(reviewer_rows(chunks), all, "cut {cut}, final rows {final_rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_alt_resize_and_main_repair_keep_history() {
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        let first = core_paint(&all[..40], &all[40..], 10);
+        let enter = b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec();
+        let alt = b"\x18\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J\x1b[?1049h\x1b[H\x1b[2JALT resized".to_vec();
+        let repair = core_resize_paint(&all[..42], &all[42..], 8);
+        let mut chunks = vec![Chunk::Data(first), Chunk::Data(enter), Chunk::Grid(20, 8)];
+        chunks.extend(alt.chunks(3).map(|b| Chunk::Data(b.to_vec())));
+        chunks.extend(repair.chunks(3).map(|b| Chunk::Data(b.to_vec())));
+        assert_eq!(reviewer_rows(chunks), all);
+    }
+
 }
 
 /// A scripted herdr-core on the far end of the socket: it answers every RPC
@@ -3567,7 +3816,6 @@ mod claim_tests {
     use super::*;
     use crate::remote::State;
     use herdr_remote_transport::CancellationToken;
-    use std::io::BufRead;
     use std::sync::atomic::AtomicBool;
 
     #[derive(Debug, PartialEq)]
@@ -3576,9 +3824,24 @@ mod claim_tests {
         Frame(u32, u8, Vec<u8>),
     }
 
+    /// How the scripted core answers beyond the defaults: whether it echoes
+    /// the `resize_history` an attach asked for (the owner's confirmation),
+    /// and from which attach on (counting from 1) it refuses attaches.
+    #[derive(Default)]
+    struct Script {
+        echo: bool,
+        /// Echo `resize_history` only on attaches up to this one (counting from 1).
+        echo_until: Option<usize>,
+        /// The attach reply confirms RESIZE frames (and gives a 90x40 grid).
+        resizes: bool,
+        refuse_from: Option<usize>,
+    }
+
     struct Mock {
         owner: Arc<Session>,
         seen: mpsc::Receiver<Seen>,
+        /// Frames for the core to write to the phone: (channel, kind, bytes).
+        push: mpsc::Sender<(u32, u8, Vec<u8>)>,
         session: Option<std::thread::JoinHandle<Result<()>>>,
         peer: Option<std::thread::JoinHandle<()>>,
     }
@@ -3587,6 +3850,10 @@ mod claim_tests {
         /// `features` is what hello advertises; `confirm` is whether the
         /// attach reply confirms VISIBILITY frames when asked for them.
         fn start(features: Value, confirm: bool, visible: bool, active: bool) -> Self {
+            Self::scripted(features, confirm, visible, active, Script::default())
+        }
+
+        fn scripted(features: Value, confirm: bool, visible: bool, active: bool, script: Script) -> Self {
             let (phone, mut core) = UnixStream::pair().unwrap();
             core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             let (commands, rx) = mpsc::sync_channel(256);
@@ -3606,15 +3873,22 @@ mod claim_tests {
             let worker = owner.clone();
             let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
             let (tx, seen) = mpsc::channel();
+            let (push, pushed) = mpsc::channel::<(u32, u8, Vec<u8>)>();
             let peer = std::thread::spawn(move || {
+                let mut attaches = 0;
+                let mut killed = false;
                 let mut hello = String::new();
-                io::BufReader::new(core.try_clone().unwrap()).read_line(&mut hello).unwrap();
+                read_hello(&core, &mut hello);
                 let reply = json!({"jsonrpc":"2.0","id":0,"result":{"generation":1,"core":{"id":"fixture"},"framed":true,"features":features}});
                 core.write_all(format!("{reply}\n").as_bytes()).unwrap();
                 let mut decoder = Decoder::default();
                 let mut next_channel = 2;
                 let mut bytes = [0; 4096];
                 loop {
+                    while let Ok((channel, kind, bytes)) = pushed.try_recv() {
+                        // The phone hung up (the test is closing): done, as on a read error.
+                        if write_frame(&mut core, channel, kind, &bytes).is_err() { return; }
+                    }
                     match core.read(&mut bytes) {
                         Ok(0) => return,
                         Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
@@ -3631,6 +3905,8 @@ mod claim_tests {
                         let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
                         let result = match request["method"].as_str().unwrap() {
                             "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                            "terminal.kill" => { killed = true; json!({}) },
+                            "terminal.list" if killed => json!({"terminals": [{"address":"t2","state":"live","labels":{},"cwd":"/tmp"}]}),
                             "terminal.list" => json!({"terminals":[
                                 {"address":"t1","state":"live","labels":{},"cwd":"/tmp"},
                                 {"address":"t2","state":"live","labels":{},"cwd":"/tmp"}]}),
@@ -3638,18 +3914,35 @@ mod claim_tests {
                             "terminal.attach" => {
                                 let asked = request["params"]["visibility_updates"] == true;
                                 let _ = tx.send(Seen::Attach(request["params"].clone()));
+                                attaches += 1;
+                                // A pane that ended under a stale pick.
+                                if request["params"]["terminal"] == "gone" {
+                                    let error = json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":1,"message":"gone has finished","data":{"kind":"finished"}}});
+                                    if write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).is_err() { return; }
+                                    continue;
+                                }
+                                if killed || script.refuse_from.is_some_and(|from| attaches >= from) {
+                                    let error = json!({"jsonrpc":"2.0","id":request["id"],
+                                        "error":{"code":1,"message":"t1 has finished","data":{"kind":"finished"}}});
+                                    if write_frame(&mut core, 0, 0, &serde_json::to_vec(&error).unwrap()).is_err() { return; }
+                                    continue;
+                                }
                                 next_channel += 1;
-                                json!({"channel":next_channel - 1,"resize_notifications":false,
-                                       "visibility_updates": asked && confirm})
+                                let mut result = json!({"channel":next_channel - 1,"resize_notifications":script.resizes,"terminal":{"cols":90,"rows":40},
+                                       "visibility_updates": asked && confirm});
+                                if script.echo && script.echo_until.is_none_or(|n| attaches <= n) && request["params"].get("resize_history").is_some() {
+                                    result["resize_history"] = request["params"]["resize_history"].clone();
+                                }
+                                result
                             }
                             other => panic!("unexpected {other}"),
                         };
                         let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
-                        write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
+                        if write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).is_err() { return; }
                     }
                 }
             });
-            Self { owner, seen, session: Some(session), peer: Some(peer) }
+            Self { owner, seen, push, session: Some(session), peer: Some(peer) }
         }
 
         fn next(&self) -> Seen {
@@ -3800,6 +4093,138 @@ mod claim_tests {
         );
     }
 
+    /// The history repaint is asked for only from a core whose hello offers
+    /// it, and asked again only while the owner echoes it: no echo means the
+    /// path cannot carry it. An older core gets exactly the attach it always got.
+    #[test]
+    fn resize_history_is_asked_for_only_while_offered_and_echoed() {
+        // Its switches put mock session 0's t1 in the shared departed slot.
+        let _serial = crate::remote::departed_test_lock();
+        let echoing = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, ..Script::default() });
+        let Seen::Attach(params) = echoing.next() else { panic!("attach first") };
+        assert_eq!(params["resize_history"], 1000);
+        let mut without = params.clone();
+        without.as_object_mut().unwrap().remove("resize_history");
+        assert_eq!(without, attach_params("t1", 90, 40, true), "nothing else changes");
+        *lock(&echoing.owner.focus) = Some(("t2".into(), Instant::now()));
+        let second = loop {
+            if let Seen::Attach(params) = echoing.next() { break params }
+        };
+        assert_eq!(second["resize_history"], 1000, "echoed: asked again");
+        echoing.close();
+
+        // Offered but not echoed (a relay whose owner lacks it): asked once, then not.
+        let silent = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true, Script::default());
+        let Seen::Attach(params) = silent.next() else { panic!("attach first") };
+        assert_eq!(params["resize_history"], 1000);
+        *lock(&silent.owner.focus) = Some(("t2".into(), Instant::now()));
+        let second = loop {
+            if let Seen::Attach(params) = silent.next() { break params }
+        };
+        assert!(second.get("resize_history").is_none(), "not echoed: not asked again");
+        silent.close();
+
+        let older = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        let Seen::Attach(params) = older.next() else { panic!("attach first") };
+        assert!(params.get("resize_history").is_none());
+        assert_eq!(params, attach_params("t1", 90, 40, true));
+        older.close();
+    }
+
+    /// A stream the core closes while the pane is still there (a relay does
+    /// that when the path loses a confirmed `resize_history`) is attached
+    /// again; a pane that refuses (its program ended) stays ended.
+    #[test]
+    fn a_stream_closed_again_soon_is_attached_again_when_the_wait_ends() {
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, refuse_from: Some(3), ..Script::default() });
+        let Seen::Attach(first) = core.next() else { panic!("attach first") };
+        assert_eq!(first["terminal"], "t1");
+        // The core ends the stream: the phone attaches t1 again by itself.
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(again["terminal"], "t1");
+        let reattached = Instant::now();
+        // Ended again 1 s later: no loop, but not dropped either. It is
+        // attached again once REATTACH_EVERY has passed since the last one.
+        std::thread::sleep(Duration::from_secs(1));
+        core.push.send((3, 2, Vec::new())).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(lock(&core.owner.state).view["state"], "connecting");
+        let third = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        // Not before the wait was over, and soon after it.
+        let after = reattached.elapsed();
+        assert_eq!(third["terminal"], "t1");
+        assert!(after >= REATTACH_EVERY && after < REATTACH_EVERY + Duration::from_millis(1500), "{after:?}");
+        // That one is refused (the program ended): the pane stays ended, and
+        // nothing is tried again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&core.owner.state).view["status"] != "Terminal stream ended; select a terminal to attach again" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "tried again after a refusal");
+            }
+        }
+        core.close();
+    }
+
+    /// A reattach put off past the moment the phone hid the session, on a
+    /// core that cannot be told it is hidden, is parked like any hidden pane:
+    /// nothing is attached while hidden, and the pane comes back when shown.
+    #[test]
+    fn a_reattach_put_off_while_hidden_waits_to_be_shown() {
+        let core = Mock::start(json!([]), true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(again["terminal"], "t1");
+        core.push.send((3, 2, Vec::new())).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        core.set_visible(false);
+        let deadline = Instant::now() + REATTACH_EVERY + Duration::from_millis(1000);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "attached while hidden");
+            }
+        }
+        core.set_visible(true);
+        let shown = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(shown["terminal"], "t1", "the same pane comes back");
+        core.close();
+    }
+
+    /// When the reattach is refused, the pane says it ended.
+    #[test]
+    fn a_refused_reattach_leaves_the_pane_ended() {
+        let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
+            Script { refuse_from: Some(2), ..Script::default() });
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = loop {
+            if let Seen::Attach(params) = core.next() { break params }
+        };
+        assert_eq!(again["terminal"], "t1", "tried once");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&core.owner.state).view["status"] != "Terminal stream ended; select a terminal to attach again" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        core.close();
+    }
+
     #[test]
     fn an_inactive_session_attaches_nothing_until_a_pane_is_picked() {
         let core = Mock::start(json!(["viewer_visibility"]), true, true, false);
@@ -3815,5 +4240,303 @@ mod claim_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(core.close().iter().any(|seen| *seen == Seen::Frame(2, DETACH, Vec::new())));
+    }
+
+    // t21s's probes from the #27 review (gpui-pr27-artifacts), kept as regression tests.
+    fn reviewer_wait(mut done: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < until, "fixture condition timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn reviewer_attach(core: &Mock) -> Value {
+        loop {
+            if let Seen::Attach(params) = core.next() { return params; }
+        }
+    }
+
+    #[test]
+    fn reviewer_downgrade_echo_is_sticky_across_close_and_switch() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, echo_until: Some(1), ..Script::default() });
+        assert_eq!(reviewer_attach(&core)["resize_history"], 1000);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((2, 2, br#"{"reason":"relay_overflow"}"#.to_vec())).unwrap();
+        assert_eq!(reviewer_attach(&core)["resize_history"], 1000);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        let third = reviewer_attach(&core);
+        assert_eq!(third["terminal"], "t2");
+        assert!(third.get("resize_history").is_none(), "downgrade must disable later requests");
+        reviewer_wait(|| lock(&core.owner.state).view["pane_id"] == "t2");
+        core.close();
+    }
+
+    #[test]
+    fn reviewer_a_user_switch_cancels_the_owed_reattach() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        reviewer_attach(&core);
+        core.push.send((2, 2, Vec::new())).unwrap();
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        assert_eq!(reviewer_attach(&core)["terminal"], "t2");
+        reviewer_wait(|| lock(&core.owner.state).view["pane_id"] == "t2");
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "unexpected old-pane reattach: {seen:?}");
+            }
+        }
+        core.close();
+    }
+
+    #[test]
+    fn reviewer_hidden_user_pick_wins_over_the_owed_reattach() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::start(json!([]), false, true, true);
+        reviewer_attach(&core);
+        core.push.send((2, 2, Vec::new())).unwrap();
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        core.set_visible(false);
+        loop {
+            if core.next() == Seen::Frame(3, DETACH, Vec::new()) { break; }
+        }
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        reviewer_wait(|| lock(&core.owner.focus).is_none());
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "attached while hidden");
+            }
+        }
+        core.set_visible(true);
+        let shown = reviewer_attach(&core);
+        core.close();
+        assert_eq!(shown["terminal"], "t2", "the user's newer parked pick must win");
+    }
+
+    #[test]
+    fn reviewer_close_on_alt_screen_retains_main_history() {
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, resizes: true, ..Script::default() });
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        let first = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        let paint = connection_tests::core_paint(&all[..40], &all[40..], 40);
+        core.push.send((2, 0, paint)).unwrap();
+        reviewer_wait(|| first.screen_text().contains("row 049"));
+        let rows = |p: &gpui_rio::Session| connection_tests::all_rows(p)
+            .into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+        assert_eq!(rows(&first), all, "fixture starts with all main rows");
+        core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT before close".to_vec())).unwrap();
+        reviewer_wait(|| first.screen_text().contains("ALT before close"));
+        core.push.send((2, 2, br#"{"reason":"relay_overflow"}"#.to_vec())).unwrap();
+        let reattach = reviewer_attach(&core);
+        eprintln!("automatic reattach parameters: {reattach}");
+        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
+        let second = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        // A fresh attach on the alternate screen has no history in its
+        // first paint. No `resumed` loss is recorded by the owner, so exit
+        // from alt has only the program's screen, not a history repair.
+        let mut alt = connection_tests::core_paint(&[], &[], 40);
+        alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT after reattach");
+        core.push.send((3, 0, alt)).unwrap();
+        reviewer_wait(|| second.screen_text().contains("ALT after reattach"));
+        // The owner contract (#88): this resumed, opted-in stream owes a
+        // whole history replacement on its return to the main screen.
+        let main = owner_main_paint(&reattach, &all[..40], &all[40..], 40);
+        core.push.send((3, 0, main)).unwrap();
+        reviewer_wait(|| second.screen_text().contains("row 049"));
+        let got = rows(&second);
+        core.close();
+        assert_eq!(got, all, "main history held before a stream CLOSE must survive reattach on alt");
+    }
+
+    #[test]
+    fn reviewer_user_closed_pane_is_never_revived_or_started() {
+        let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
+        reviewer_attach(&core);
+        core.push.send((2, 2, Vec::new())).unwrap();
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        let (tx, rx) = mpsc::sync_channel(1);
+        core.owner.commands.send(Operation::Action("pane.close".into(), tx)).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+        // Current code still attempts the pending attach, but the owner's
+        // finished/missing rejection must leave the pane ended. No run/start
+        // RPC is supported by this mock: either would panic the test.
+        assert_eq!(reviewer_attach(&core)["terminal"], "t1");
+        reviewer_wait(|| lock(&core.owner.state).view["status"] == "Terminal stream ended; select a terminal to attach again");
+        assert!(lock(&core.owner.state).terminal.is_none());
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "reattempt after closed-pane refusal");
+            }
+        }
+        core.close();
+    }
+
+    /// What a #88 owner sends a stream when its program is (back) on the main
+    /// screen: to a `resumed` attach that asked `resize_history`, the one
+    /// whole history replacement it owes (CAN, reset, ESC[3J, history,
+    /// screen); otherwise the screen only.
+    fn owner_main_paint(request: &Value, history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
+        if request["resumed"] == true && request["resize_history"].as_u64().unwrap_or(0) > 0 {
+            connection_tests::core_resize_paint(history, screen, rows)
+        } else {
+            connection_tests::core_paint(&[], screen, rows)
+        }
+    }
+
+    /// #27 (t21s's reviews, t1jf's decision): the reattach of a pane whose
+    /// stream the core ended is `resumed` with `resize_history`, also when it
+    /// was put off while hidden on a path without visibility frames (parked)
+    /// and made when shown; the owner's replacement on the return to the main
+    /// screen then gives back every row.
+    #[test]
+    fn a_parked_reattach_shown_later_is_resumed_and_gets_the_history_back() {
+        let core = Mock::scripted(json!(["resize_history"]), false, true, true,
+            Script { echo: true, resizes: true, ..Script::default() });
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        let first = lock(&core.owner.state).terminal.clone().unwrap();
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        core.push.send((2, 0, connection_tests::core_paint(&all[..40], &all[40..], 40))).unwrap();
+        reviewer_wait(|| first.screen_text().contains("row 049"));
+        core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
+        reviewer_wait(|| first.screen_text().contains("ALT"));
+        // Ended, reattached at once, then ended again within 5 s.
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = reviewer_attach(&core);
+        assert_eq!((again["resumed"].clone(), again["resize_history"].clone()), (json!(true), json!(1000)));
+        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        core.set_visible(false);
+        let until = Instant::now() + REATTACH_EVERY + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if let Ok(seen) = core.seen.recv_timeout(left) {
+                assert!(!matches!(seen, Seen::Attach(_)), "attached while hidden");
+            }
+        }
+        core.set_visible(true);
+        let shown = reviewer_attach(&core);
+        assert_eq!(shown["terminal"], "t1");
+        assert_eq!(shown["resumed"], true, "still the reattach after park and show");
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        let third = lock(&core.owner.state).terminal.clone().unwrap();
+        let mut alt = connection_tests::core_paint(&[], &[], 40);
+        alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT again");
+        core.push.send((4, 0, alt)).unwrap();
+        reviewer_wait(|| third.screen_text().contains("ALT again"));
+        core.push.send((4, 0, owner_main_paint(&shown, &all[..40], &all[40..], 40))).unwrap();
+        reviewer_wait(|| third.screen_text().contains("row 049"));
+        let rows: Vec<String> = connection_tests::all_rows(&third).into_iter().filter(|s| !s.is_empty()).collect();
+        core.close();
+        assert_eq!(rows, all);
+    }
+
+    /// (B), documented: where the path does not confirm `resize_history` (an
+    /// old owner or relay, a downgrade), the reattach is an ordinary attach
+    /// asking the attach's history. On the main screen that history comes
+    /// back (some rows maybe twice, none lost). On the alternate screen an
+    /// old owner sends none, so on the return to main the old main history is
+    /// gone: the same as before #27 on such paths.
+    #[test]
+    fn without_resize_history_the_reattach_is_ordinary() {
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        for on_alt in [false, true] {
+            let core = Mock::scripted(json!(["viewer_visibility"]), true, true, true,
+                Script { resizes: true, ..Script::default() });
+            reviewer_attach(&core);
+            reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+            let first = lock(&core.owner.state).terminal.clone().unwrap();
+            core.push.send((2, 0, connection_tests::core_paint(&all[..40], &all[40..], 40))).unwrap();
+            reviewer_wait(|| first.screen_text().contains("row 049"));
+            if on_alt {
+                core.push.send((2, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
+                reviewer_wait(|| first.screen_text().contains("ALT"));
+            }
+            core.push.send((2, 2, Vec::new())).unwrap();
+            let again = reviewer_attach(&core);
+            assert!(again.get("resumed").is_none() && again.get("resize_history").is_none());
+            assert_eq!(again["history"], 1000, "never history 0: the core sends what it has");
+            reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &first)));
+            let second = lock(&core.owner.state).terminal.clone().unwrap();
+            if on_alt {
+                // The old owner's attach paint on the alternate screen: no history.
+                let mut alt = connection_tests::core_paint(&[], &[], 40);
+                alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT again");
+                core.push.send((3, 0, alt)).unwrap();
+                reviewer_wait(|| second.screen_text().contains("ALT again"));
+                core.push.send((3, 0, owner_main_paint(&again, &all[..40], &all[40..], 40))).unwrap();
+            } else {
+                core.push.send((3, 0, connection_tests::core_paint(&all[..40], &all[40..], 40))).unwrap();
+            }
+            reviewer_wait(|| second.screen_text().contains("row 049"));
+            let rows: Vec<String> = connection_tests::all_rows(&second).into_iter().filter(|s| !s.is_empty()).collect();
+            core.close();
+            if on_alt {
+                assert_eq!(rows, all[40..].to_vec(), "documented: the old main history is not brought back");
+            } else {
+                assert_eq!(rows, all, "the attach's own history brings every row back");
+            }
+        }
+    }
+
+    /// t21s, #27 at ea56f49: a pick the core refuses must not use up the
+    /// previous pane's owed replacement; the fallback to it is `resumed`.
+    #[test]
+    fn reviewer_refused_pick_keeps_the_previous_panes_resume_debt() {
+        let _serial = crate::remote::departed_test_lock();
+        let core = Mock::scripted(json!(["viewer_visibility", "resize_history"]), true, true, true,
+            Script { echo: true, resizes: true, ..Script::default() });
+        reviewer_attach(&core);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        // First CLOSE establishes the cooldown for the next CLOSE.
+        core.push.send((2, 2, Vec::new())).unwrap();
+        let again = reviewer_attach(&core);
+        assert_eq!(again["resumed"], true);
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_some());
+        let previous = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        let all: Vec<String> = (0..50).map(|n| format!("row {n:03}")).collect();
+        core.push.send((3, 0, owner_main_paint(&again, &all[..40], &all[40..], 40))).unwrap();
+        reviewer_wait(|| previous.screen_text().contains("row 049"));
+        core.push.send((3, 0, b"\x1b[?1049h\x1b[H\x1b[2JALT".to_vec())).unwrap();
+        reviewer_wait(|| previous.screen_text().contains("ALT"));
+        core.push.send((3, 2, Vec::new())).unwrap();
+        reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
+        // A stale pane pick fails; the normal connection loop falls back to t1.
+        *lock(&core.owner.focus) = Some(("gone".into(), Instant::now()));
+        assert_eq!(reviewer_attach(&core)["terminal"], "gone");
+        let fallback = reviewer_attach(&core);
+        assert_eq!(fallback["terminal"], "t1");
+        assert_eq!(fallback["resize_history"], 1000);
+        eprintln!("fallback after refused pick: {fallback}");
+        reviewer_wait(|| lock(&core.owner.state).terminal.as_ref().is_some_and(|p| !Arc::ptr_eq(p, &previous)));
+        let pane = lock(&core.owner.state).terminal.as_ref().unwrap().clone();
+        let mut alt = connection_tests::core_paint(&[], &[], 40);
+        alt.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2JALT restored");
+        core.push.send((4, 0, alt)).unwrap();
+        reviewer_wait(|| pane.screen_text().contains("ALT restored"));
+        core.push.send((4, 0, owner_main_paint(&fallback, &all[..40], &all[40..], 40))).unwrap();
+        reviewer_wait(|| pane.screen_text().contains("row 049"));
+        let got: Vec<String> = connection_tests::all_rows(&pane).into_iter().filter(|s| !s.is_empty()).collect();
+        core.close();
+        assert_eq!(got, all, "path A fallback to the previous pane still owes its repair");
     }
 }
