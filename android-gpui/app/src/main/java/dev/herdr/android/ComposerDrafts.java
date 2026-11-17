@@ -39,8 +39,12 @@ final class ComposerDrafts {
     static final int MAX_CUTS = 16;
     /** Each pane's unverified-cut marks: {length, hash} of the draft's text before each. */
     private final Map<String, java.util.List<long[]>> cutMarks = new java.util.HashMap<>();
-    /** The utterance in progress's cuts, as offsets in the draft; they become marks when it ends. */
-    private int[] liveCuts = new int[0];
+    /**
+     * The utterance in progress's cuts, anchored like the settled marks ({length, hash} of the
+     * pane's draft before each): they show, move with a filled chip, and become marks when it
+     * ends, only while the words before them are unchanged.
+     */
+    private java.util.List<long[]> liveMarks = new java.util.ArrayList<>();
 
     /** Shows {@code next}'s draft, keeping the current one for later. */
     String switchTo(String next) {
@@ -97,7 +101,7 @@ final class ComposerDrafts {
     String dictationPartial(String utterance, int[] cuts) {
         if (dictationBase == null) dictationBase = text();
         edit(join(dictationBase, utterance));
-        liveCuts = placed(dictationBase, utterance, cuts);
+        liveMarks = anchors(text(), placed(dictationBase, utterance, cuts));
         return text();
     }
 
@@ -194,7 +198,7 @@ final class ComposerDrafts {
     void sent() {
         drafts.remove(pane);
         cutMarks.remove(pane);
-        liveCuts = new int[0];
+        liveMarks = new java.util.ArrayList<>();
         dictationBase = null;
     }
 
@@ -207,14 +211,10 @@ final class ComposerDrafts {
         java.util.TreeSet<Integer> out = new java.util.TreeSet<>();
         java.util.List<long[]> marks = cutMarks.get(pane);
         if (marks != null) {
-            for (long[] m : marks) {
-                if (m[0] > 0 && m[0] < text.length() && text.substring(0, (int) m[0]).hashCode() == m[1]) {
-                    out.add((int) m[0]);
-                }
-            }
+            for (long[] m : marks) if (holds(text, m)) out.add((int) m[0]);
         }
         if (dictationBase != null) {
-            for (int at : liveCuts) if (at > 0 && at < text.length()) out.add(at);
+            for (long[] m : liveMarks) if (holds(text, m)) out.add((int) m[0]);
         }
         int[] result = new int[out.size()];
         int i = 0;
@@ -227,7 +227,12 @@ final class ComposerDrafts {
      * (a chip filled in): the marks after them move with their text instead of being dropped.
      */
     private void shiftMarks(String pane, String before, int at, String after) {
-        java.util.List<long[]> marks = cutMarks.get(pane);
+        shift(cutMarks.get(pane), before, at, after);
+        // The utterance in progress is in the draft on screen.
+        if (pane.equals(this.pane) && dictationBase != null) shift(liveMarks, before, at, after);
+    }
+
+    private static void shift(java.util.List<long[]> marks, String before, int at, String after) {
         if (marks == null || at < 0) return;
         int delta = after.length() - before.length();
         for (long[] m : marks) {
@@ -245,9 +250,24 @@ final class ComposerDrafts {
     private void settleCuts(boolean keep) {
         if (keep && dictationBase != null) {
             String text = text();
-            for (int at : liveCuts) mark(pane, text, at);
+            // Only where the words before a cut are still the ones it was made in.
+            for (long[] m : liveMarks) if (holds(text, m)) mark(pane, text, (int) m[0]);
         }
-        liveCuts = new int[0];
+        liveMarks = new java.util.ArrayList<>();
+    }
+
+    /** Whether mark {@code m} ({length, hash}) still stands in {@code text}: the words before it unchanged. */
+    private static boolean holds(String text, long[] m) {
+        return m[0] > 0 && m[0] < text.length() && text.substring(0, (int) m[0]).hashCode() == m[1];
+    }
+
+    /** Marks for {@code offsets} in {@code text}, anchored by the words before each. */
+    private static java.util.List<long[]> anchors(String text, int[] offsets) {
+        java.util.List<long[]> out = new java.util.ArrayList<>();
+        for (int at : offsets) {
+            if (at > 0 && at < text.length()) out.add(new long[] {at, text.substring(0, at).hashCode()});
+        }
+        return out;
     }
 
     private void mark(String pane, String text, int at) {
@@ -304,7 +324,9 @@ final class ComposerDrafts {
             for (long[] m : e.getValue()) copy.add(m.clone());
             marks.put(e.getKey(), copy);
         }
-        return new Object[] {new LinkedHashMap<>(drafts), dictationBase, marks, liveCuts.clone()};
+        java.util.List<long[]> live = new java.util.ArrayList<>();
+        for (long[] m : liveMarks) live.add(m.clone());
+        return new Object[] {new LinkedHashMap<>(drafts), dictationBase, marks, live};
     }
 
     @SuppressWarnings("unchecked")
@@ -313,9 +335,18 @@ final class ComposerDrafts {
         drafts.clear();
         drafts.putAll((Map<String, String>) s[0]);
         dictationBase = (String) s[1];
+        // Copies: a snapshot rolled back to twice must not see the first rollback's changes.
         cutMarks.clear();
-        cutMarks.putAll((Map<String, java.util.List<long[]>>) s[2]);
-        liveCuts = (int[]) s[3];
+        for (Map.Entry<String, java.util.List<long[]>> e : ((Map<String, java.util.List<long[]>>) s[2]).entrySet()) {
+            cutMarks.put(e.getKey(), copy(e.getValue()));
+        }
+        liveMarks = copy((java.util.List<long[]>) s[3]);
+    }
+
+    private static java.util.List<long[]> copy(java.util.List<long[]> marks) {
+        java.util.List<long[]> out = new java.util.ArrayList<>();
+        for (long[] m : marks) out.add(m.clone());
+        return out;
     }
 
     void restore(String saved) {

@@ -161,6 +161,50 @@ public final class CutMarksTest {
         assertArrayEquals(new int[] {before - token.length() + "hello".length()}, drafts.cuts());
     }
 
+    /** A pending chip, then a live utterance with a cut after "abc" (review of #33, t278). */
+    private static ComposerDrafts liveAfterAChip() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("t1");
+        drafts.dictationStarted();
+        drafts.dictationPending("c1");
+        drafts.dictationStarted();
+        drafts.dictationPartial("abcdefghijklmnopqrstuvwxyz", new int[] {3});
+        return drafts;
+    }
+
+    @Test public void aLiveCutMovesWhenAnEarlierChipIsFilledIn() {
+        ComposerDrafts drafts = liveAfterAChip();
+        drafts.placeDictation("c1", "hello");
+        assertEquals("hello abcdefghijklmnopqrstuvwxyz", drafts.text());
+        assertArrayEquals("still after \"abc\"", new int[] {9}, drafts.cuts());
+    }
+
+    @Test public void aSessionEndingAfterAChipFillSettlesTheLiveCutWhereItIs() {
+        ComposerDrafts drafts = liveAfterAChip();
+        drafts.placeDictation("c1", "hello");
+        drafts.dictationEnded(); // an error: the partial stays, its cut with it
+        assertArrayEquals(new int[] {9}, drafts.cuts());
+        // A shorter fill moves it the other way, never off the words.
+        ComposerDrafts shorter = liveAfterAChip();
+        shorter.placeDictation("c1", "hi");
+        shorter.dictationEnded();
+        assertEquals("hi abcdefghijklmnopqrstuvwxyz", shorter.text());
+        assertArrayEquals(new int[] {6}, shorter.cuts());
+    }
+
+    @Test public void aLiveCutWhoseWordsBeforeItAreEditedIsNeitherShownNorSettled() {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.switchTo("t1");
+        drafts.dictationStarted();
+        drafts.dictationPartial("abcdef", new int[] {3});
+        drafts.edit("abXdef"); // the field stays editable while dictating
+        assertArrayEquals(new int[0], drafts.cuts());
+        drafts.dictationEnded();
+        assertArrayEquals("not anchored to the edited words", new int[0], drafts.cuts());
+        drafts.edit("abcdef");
+        assertArrayEquals("nor brought back with them", new int[0], drafts.cuts());
+    }
+
     @Test public void aRolledBackChangeBringsBackTheMarksAsTheyWere() {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.switchTo("t1");
@@ -173,6 +217,14 @@ public final class CutMarksTest {
         drafts.placeDictation("c1", "a much longer text");
         drafts.rollback(snapshot);
         assertArrayEquals(was, drafts.cuts());
+        // Live ones too, and a snapshot rolled back to twice is unchanged by the first.
+        ComposerDrafts live = liveAfterAChip();
+        Object before = live.snapshot();
+        live.placeDictation("c1", "hello");
+        live.rollback(before);
+        live.placeDictation("c1", "hello");
+        live.rollback(before);
+        assertArrayEquals(new int[] {DictationToken.of("c1").length() + 1 + 3}, live.cuts());
     }
 
     // ---- the routing hands them on ----------------------------------------------------------
