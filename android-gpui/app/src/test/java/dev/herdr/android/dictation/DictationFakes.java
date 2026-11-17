@@ -55,6 +55,8 @@ public final class DictationFakes {
     public static final class TestMain implements ServerDictationEngine.Main {
         private final ScheduledExecutorService exec;
         private final Map<Runnable, List<ScheduledFuture<?>>> delayed = new ConcurrentHashMap<>();
+        /** Every delay the engine asked for, in order: its timeouts, checked without a clock. */
+        public final List<Long> delays = Collections.synchronizedList(new ArrayList<>());
 
         TestMain(ScheduledExecutorService exec) {
             this.exec = exec;
@@ -65,6 +67,7 @@ public final class DictationFakes {
         }
 
         @Override public void postDelayed(Runnable r, long delayMs) {
+            delays.add(delayMs);
             delayed.computeIfAbsent(r, k -> Collections.synchronizedList(new ArrayList<>()))
                     .add(exec.schedule(r, delayMs, TimeUnit.MILLISECONDS));
         }
@@ -201,6 +204,20 @@ public final class DictationFakes {
             return this;
         }
 
+        java.util.concurrent.CountDownLatch finalGate;
+        long finalGateSafetyMs;
+
+        /**
+         * The final waits for {@code gate}, not for a time: the test opens it once it has seen what
+         * must come first (e.g. the phone's text), so load cannot reorder the two. After
+         * {@code safetyMs} unopened, the final goes anyway and {@link FakeServer#gateTimedOut} says so.
+         */
+        public Behaviour finalWhen(java.util.concurrent.CountDownLatch gate, long safetyMs) {
+            finalGate = gate;
+            finalGateSafetyMs = safetyMs;
+            return this;
+        }
+
         public Behaviour errorOnAudio(String error) {
             errorOnAudio = error;
             return this;
@@ -238,6 +255,15 @@ public final class DictationFakes {
         public final List<JSONObject> starts = Collections.synchronizedList(new ArrayList<>());
         /** Every other text message the phone sent (stop, cancel), in order. */
         public final List<String> texts = Collections.synchronizedList(new ArrayList<>());
+
+        /** A {@link Behaviour#finalWhen} gate was never opened: the final went on its safety timeout. */
+        public volatile boolean gateTimedOut;
+        private final java.util.concurrent.CountDownLatch finalDone = new java.util.concurrent.CountDownLatch(1);
+
+        /** Waits until the final was sent (or failed: the phone had hung up) and the session closed. */
+        public boolean awaitFinalDone(long timeoutMs) throws InterruptedException {
+            return finalDone.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
 
         public FakeServer(Behaviour behaviour) throws IOException {
             this.behaviour = behaviour;
@@ -313,9 +339,17 @@ public final class DictationFakes {
                             send(out, "{\"type\":\"status\",\"state\":\"finishing\",\"tail_s\":12.3}");
                         }
                         Thread.sleep(behaviour.finalDelayMs);
-                        send(out, behaviour.finalJson != null ? behaviour.finalJson
-                                : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
-                        s.close();
+                        if (behaviour.finalGate != null && !behaviour.finalGate.await(
+                                behaviour.finalGateSafetyMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                            gateTimedOut = true;
+                        }
+                        try {
+                            send(out, behaviour.finalJson != null ? behaviour.finalJson
+                                    : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
+                        } finally {
+                            s.close();
+                            finalDone.countDown();
+                        }
                         return;
                     }
                 }

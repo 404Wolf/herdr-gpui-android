@@ -108,18 +108,32 @@ public final class ServerDictationEngineTest {
     // ---- the desktop is slow or out: the phone's text, marked offline ------------------------
 
     @Test public void aSlowDesktopFinalGivesThePhonesTextAfterTheBudget() throws Exception {
-        server = new FakeServer(Behaviour.fast(READY_GPU).finalAfter(4000));
+        // The desktop's final is held until the phone's text has landed (a gate, not a timer):
+        // however loaded the machine, the desktop is "slow" by construction.
+        java.util.concurrent.CountDownLatch phoneLanded = new java.util.concurrent.CountDownLatch(1);
+        server = new FakeServer(Behaviour.fast(READY_GPU).finalWhen(phoneLanded, 30_000));
         FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 100);
         Run run = dictate(server.uri(), phone, 300);
         run.awaitEnd();
         assertPhoneText(run);
+        // The wait for the desktop is the budget, read from the engine's own timer, not a clock.
+        assertTrue("stop waits the budget for the desktop: " + run.main.delays,
+                run.main.delays.contains(TIMEOUTS.finalBudgetMs));
+        // Not before the budget: the engine's timer cannot fire early (a guarantee, not a timing).
         long afterStop = run.listener.endedAt - run.stoppedAt;
-        assertTrue("the phone's text came " + afterStop + " ms after stop",
-                afterStop >= TIMEOUTS.finalBudgetMs - 50 && afterStop < TIMEOUTS.finalBudgetMs + 4000);
-        assertKeptWithAllAudio(run);
-        // The desktop's late final never lands a second text.
-        Thread.sleep(500);
+        assertTrue("the phone's text came " + afterStop + " ms after stop, before the budget",
+                afterStop >= TIMEOUTS.finalBudgetMs - 50);
+        // The phone's text came while the desktop's final was still held: the engine did not
+        // wait for it. Then the desktop's late final goes, and lands nowhere.
         assertEquals(1, run.listener.finals);
+        phoneLanded.countDown();
+        assertTrue("the desktop's late final was sent", server.awaitFinalDone(10_000));
+        assertFalse("the gate was opened by the phone's text, not by its safety timeout", server.gateTimedOut);
+        // Anything the engine read from the socket is handled on its main thread: flush it.
+        mainThread.submit(() -> { }).get();
+        assertKeptWithAllAudio(run);
+        assertEquals("the late desktop final never lands a second text", 1, run.listener.finals);
+        assertEquals(PHONE_WORDS, run.listener.finalText);
     }
 
     @Test public void anUnreachableDesktopGivesThePhonesText() throws Exception {
@@ -557,7 +571,8 @@ public final class ServerDictationEngineTest {
     private Run dictate(URI uri, FakeRecognizer phone, long talkMs, Run run,
             java.util.function.BooleanSupplier stopWhen) throws Exception {
         if (phone != null) phone.mic = run.mic;
-        ServerDictationEngine engine = new ServerDictationEngine(uri, pending, new TestMain(mainThread),
+        run.main = new TestMain(mainThread);
+        ServerDictationEngine engine = new ServerDictationEngine(uri, pending, run.main,
                 run.mic, () -> true, phone == null ? null : cb -> phone.start(cb), TIMEOUTS, log::add);
         mainThread.submit(() -> engine.start("host/pane", run.listener)).get();
         Thread.sleep(talkMs);
@@ -569,6 +584,7 @@ public final class ServerDictationEngineTest {
 
     private static final class Run {
         final ScriptedMic mic = new ScriptedMic();
+        TestMain main;
         final RecordingListener listener = new RecordingListener();
         long stoppedAt;
 
