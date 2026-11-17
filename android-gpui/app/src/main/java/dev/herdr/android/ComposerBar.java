@@ -135,6 +135,8 @@ final class ComposerBar {
     private List<QueueView.Row> shownRows = Collections.emptyList();
     /** Input typed while the link is down, waiting for it. */
     private int linkDown;
+    /** Taps on controls that just moved are ignored ({@link TapGuard}). */
+    private final TapGuard tapGuard = new TapGuard();
     /** The clear (✕) and its undo (item 76). */
     private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
         @Override public boolean cancelDictation() { return cancelDictationForClear(); }
@@ -863,6 +865,7 @@ final class ComposerBar {
         // The queue's rows above the prompt, while it is open: one target per row, its full width.
         if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.left, layout.top, layout.cellWidth,
                 layout.cellHeight, layout.cols));
+        tapGuard.laid(rects, android.os.SystemClock.uptimeMillis());
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
             return;
@@ -901,6 +904,8 @@ final class ComposerBar {
 
     private void targetTapped(View target) {
         String id = String.valueOf(target.getTag());
+        // A control that just slid under the finger (e.g. "talk" into undo's place) is not tapped.
+        if (!tapGuard.accepts(id, android.os.SystemClock.uptimeMillis())) return;
         if (id.startsWith("echo-")) {
             tapRow(id);
             return;
