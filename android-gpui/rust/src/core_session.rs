@@ -423,6 +423,10 @@ impl Connection<'_> {
                 }
                 2 => {
                     self.output = None;
+                    // That stream is gone: no focus frame goes on it. The
+                    // reattach (or a pick) negotiates focus again.
+                    self.focus.frames = false;
+                    self.focus.on = false;
                     let mut state = lock(&self.owner.state);
                     let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
                     if !pane.is_empty() {
@@ -4299,6 +4303,41 @@ mod claim_tests {
                 Seen::Frame(2, DETACH, Vec::new())
             ]
         );
+    }
+
+    /// #27 attaches a pane again by itself when the core ends its stream.
+    /// That stream is gone: no focus frame goes on it, and the new attach
+    /// carries the focus (Herdr still shows the pane) and the true idle time.
+    #[test]
+    fn a_stream_the_core_ended_gets_no_focus_frames_and_its_reattach_is_focused() {
+        let core = Mock::start_with(json!(FOCUS_CORE), true, true, true, true);
+        let Seen::Attach(_) = core.next() else { panic!("attach first") };
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        core.owner.uses.mark();
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
+        // The core ends the stream, and Wolf keeps using the phone.
+        core.push.send((2, DETACH, Vec::new())).unwrap();
+        std::thread::sleep(FOCUS_EVERY);
+        core.owner.uses.mark();
+        let mut before = Vec::new();
+        let again = loop {
+            match core.next() {
+                Seen::Attach(params) => break params,
+                seen => before.push(seen),
+            }
+        };
+        assert!(
+            !before.iter().any(|seen| matches!(seen, Seen::Frame(2, WINDOW_FOCUS, _))),
+            "a focus frame on the ended stream: {before:?}"
+        );
+        assert_eq!(again["terminal"], "t1");
+        assert_eq!(again["focus_updates"], true);
+        assert_eq!(again["focused"], true, "Herdr still shows the pane");
+        assert!(again["idle_ms"].as_u64().unwrap() < 5_000);
+        assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(3, VISIBILITY, vec![1]));
+        core.close();
     }
 
     #[test]
