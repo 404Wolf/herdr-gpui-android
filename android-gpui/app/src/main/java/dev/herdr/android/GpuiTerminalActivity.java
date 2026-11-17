@@ -413,7 +413,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         content.addOnLayoutChangeListener((view, l, t, r, b, ol, ot, or, ob) -> {
             if (l != ol || t != ot || r != or || b != ob) view.post(this::applyPosture);
         });
-        composer = new ComposerBar(this, chrome, Dictation.create(this), composerHost());
+        composer = new ComposerBar(this, chrome, Dictation.shared(this), composerHost());
         Dictation.pending(this).setListener(pendingDictations);
         composer.setWaiting(Dictation.pending(this).count());
         shortcutBar = createShortcutBar();

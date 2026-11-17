@@ -2,6 +2,7 @@ package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -36,18 +37,15 @@ public final class ComposerBarTest {
         assertFalse(ComposerBar.isAgent("bash"));
     }
 
-    @Test public void whileTheKeyboardIsUpAHideControlTakesTypesPlace() {
+    @Test public void whileTheKeyboardIsUpTypeIsLeftOutAndNoHerdrHideIsDrawn() {
         java.util.List<GhostText.Control> idle = ComposerBar.controls(false,
                 IDLE, java.util.Collections.emptyList(), Integer.MAX_VALUE);
         assertEquals("type", idle.get(0).id);
         assertEquals("type", idle.get(0).spans[0]);
+        // The keyboard's own hide key puts it away: talk and send keep their cells.
         java.util.List<GhostText.Control> typing = ComposerBar.controls(true,
                 IDLE, java.util.Collections.emptyList(), Integer.MAX_VALUE);
-        // The same place, so the target stays put, but its own control, word and colour.
-        assertEquals("hide", typing.get(0).id);
-        assertEquals("↓ hide", typing.get(0).spans[0]);
-        assertEquals("info", typing.get(0).spans[1]);
-        assertEquals(3, typing.size());
+        assertEquals("talk send", ids(typing));
     }
 
     @Test public void sendCarriesTheQueuedCountAndTalkIsLeftOutWithoutDictation() {
@@ -150,41 +148,29 @@ public final class ComposerBarTest {
         assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.PENDING));
     }
 
-    @Test public void theKeyboardsUnderlinedWordIsTheRevisableTailOnlyAtTheEnd() {
-        // "fix the bu|g": composing "bug" at the end of an 11-character draft.
-        assertEquals(8, ComposerBar.composingFrom(11, 8, 11));
-        // No composing word, an empty one, or one not at the end (the ghost
-        // caret is always at the end, so nothing is marked).
-        assertEquals(-1, ComposerBar.composingFrom(11, -1, -1));
-        assertEquals(-1, ComposerBar.composingFrom(11, 11, 11));
-        assertEquals(-1, ComposerBar.composingFrom(11, 0, 3));
-        assertEquals(0, ComposerBar.composingFrom(3, 0, 3));
+    @Test public void clearShowsOnlyWithADraftAndUndoBrieflyAfter() {
+        assertEquals("clear", ComposerBar.clearControl("fix it", false, false).id);
+        assertEquals("clear", ComposerBar.clearControl("fix it", false, true).id);
+        // Nothing to clear; just cleared, the same place offers it back.
+        assertNull(ComposerBar.clearControl("", false, false));
+        assertNull(ComposerBar.clearControl("  \n", false, false));
+        assertEquals("undo", ComposerBar.clearControl("", false, true).id);
+        // While a dictation runs its words are on their way into the draft.
+        assertNull(ComposerBar.clearControl("fix it", true, false));
+        assertNull(ComposerBar.clearControl("", true, true));
     }
 
-    @Test public void theTypedDraftsCursorAlwaysGoesBackToTheEnd() {
-        // "abc" with the cursor after it: where the ghost caret is drawn.
-        assertFalse(ComposerBar.keepsAtEnd(3, 3, 3));
-        // Left arrow (ab|c), a spacebar swipe to the start, a selection, a
-        // selection running to the end: all go back.
-        assertTrue(ComposerBar.keepsAtEnd(2, 2, 3));
-        assertTrue(ComposerBar.keepsAtEnd(0, 0, 3));
-        assertTrue(ComposerBar.keepsAtEnd(0, 3, 3));
-        assertTrue(ComposerBar.keepsAtEnd(1, 3, 3));
-        // No selection at all (the field is not focused), and an empty draft.
-        assertFalse(ComposerBar.keepsAtEnd(-1, -1, 3));
-        assertFalse(ComposerBar.keepsAtEnd(0, 0, 0));
-    }
-
-    @Test public void cursorKeysDoNothingWhileTypingButEnterAndLettersStillWork() {
-        for (int code : new int[] {android.view.KeyEvent.KEYCODE_DPAD_LEFT, android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
-                android.view.KeyEvent.KEYCODE_DPAD_UP, android.view.KeyEvent.KEYCODE_DPAD_DOWN,
-                android.view.KeyEvent.KEYCODE_MOVE_HOME, android.view.KeyEvent.KEYCODE_MOVE_END,
-                android.view.KeyEvent.KEYCODE_PAGE_UP, android.view.KeyEvent.KEYCODE_PAGE_DOWN}) {
-            assertTrue(String.valueOf(code), ComposerBar.movesCursor(code));
-        }
-        assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_ENTER));
-        assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_DEL));
-        assertFalse(ComposerBar.movesCursor(android.view.KeyEvent.KEYCODE_A));
+    @Test public void clearSitsLeftOfTalkAndGivesWayFirstAfterType() {
+        GhostText.Control clear = ComposerBar.clearControl("x", false, false);
+        java.util.List<Outbox.Message> none = java.util.Collections.emptyList();
+        assertEquals("type clear talk send", ids(ComposerBar.controls(false, IDLE, none, 100, false, clear)));
+        assertEquals("clear talk send", ids(ComposerBar.controls(true, IDLE, none, 100, false, clear)));
+        // Narrow: "type" goes before "clear".
+        int width = ComposerBar.lineWidth(ComposerBar.controls(false, IDLE, none, 100, false, clear));
+        assertEquals("clear talk send",
+                ids(ComposerBar.controls(false, IDLE, none, width + ComposerBar.CONTROLS_MARGIN - 1, false, clear)));
+        // While recording there is no "clear" (the caller gives none) and no "send".
+        assertEquals("type talk", ids(ComposerBar.controls(false, RECORDING, none, 100, true, null)));
     }
 
     @Test public void whileRecordingSendIsNotDrawnSoTheStopOwnsTheCorner() {
@@ -244,23 +230,14 @@ public final class ComposerBarTest {
         assertFalse(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(shell, ComposerBar.privateImeOptions(false)));
     }
 
-    @Test public void hideStaysOnNarrowGridsWhereTypeWouldBeLeftOut() {
+    @Test public void typingNarrowGridsKeepTheStopAndNeverDrawAHide() {
         java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED, QUEUED);
-        // Not typing, 38 columns while recording: "type" is left out.
-        assertEquals("talk send", ids(ComposerBar.controls(false, RECORDING, queued, 38)));
-        // Typing: "↓ hide" stays, down to the tiny grid's bare stop.
-        for (int cols : new int[] {100, 50, 38, 30}) {
+        for (int cols : new int[] {100, 50, 38, 30, 22}) {
             java.util.List<GhostText.Control> line = ComposerBar.controls(true, RECORDING, queued, cols);
-            assertEquals("hide at " + cols, "hide", line.get(0).id);
+            assertFalse("no hide at " + cols, ids(line).contains("hide"));
             assertTrue("talk at " + cols, ids(line).contains("talk"));
-            assertTrue("fits at " + cols, ComposerBar.lineWidth(line) + ComposerBar.CONTROLS_MARGIN <= cols);
         }
-        // While recording (no send) and typing: hide and the stop, the stop last.
-        assertEquals("hide talk", ids(ComposerBar.controls(true, RECORDING, queued, 50, true)));
-        // Only the narrowest grid leaves nothing but the stop.
-        assertEquals("talk", ids(ComposerBar.controls(true, RECORDING, queued, 22)));
-        // Without dictation, typing on a narrow grid: hide before send.
-        assertEquals("hide", ids(ComposerBar.controls(true, NONE, queued, 14)));
+        assertEquals("talk", ids(ComposerBar.controls(true, RECORDING, queued, 50, true)));
     }
 
     @Test public void aTouchBetweenTheControlsTargetsReachesTheTerminal() {

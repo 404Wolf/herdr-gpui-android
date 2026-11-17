@@ -173,23 +173,23 @@ public final class ControlTargetsTest {
         }
     }
 
-    @Test public void hideStaysTappableBesideTheConnectingStopAtPinchZoom() {
-        // The review's case: typing while connecting, 31 columns of 13.2 dp
-        // (the cover screen at 22 pt): " ↓ hide ─ connecting… ──".
+    @Test public void typeStaysTappableBesideTheConnectingStopAtPinchZoom() {
+        // 31 columns of 13.2 dp (the cover screen at 22 pt), connecting:
+        // " type ─ connecting… ──".
         int cols = 31;
         float cw = 13.2f;
-        List<GhostText.Control> line = ComposerBar.controls(true, words("connecting…", "connecting…", "…"),
+        List<GhostText.Control> line = ComposerBar.controls(false, words("connecting…", "connecting…", "…"),
                 java.util.Collections.emptyList(), cols, true);
         List<ControlTargets.Cells> cells = drawn(line, cols, 17);
         List<ControlTargets.Rect> rects = ControlTargets.layout(cells, 0, 0, cw, 26f, 17, 20 * 26f, cols * cw, true);
-        ControlTargets.Cells hideCells = cells.get(0);
-        assertEquals("hide", hideCells.id);
-        ControlTargets.Rect hide = find(rects, "hide"), stop = find(rects, "talk");
-        // The whole of "↓ hide" (x 237.6 to 316.8) hides the keyboard; the stop starts after it.
-        assertEquals(237.6f, hideCells.start * cw, 0.01f);
-        assertEquals(316.8f, hideCells.end * cw, 0.01f);
-        assertTrue(hide.right >= 316.8f - 0.01f);
-        assertTrue(stop.left >= 316.8f - 0.01f);
+        ControlTargets.Cells typeCells = cells.get(0);
+        assertEquals("type", typeCells.id);
+        ControlTargets.Rect type = find(rects, "type"), stop = find(rects, "talk");
+        // The whole of "type" (x 132 to 184.8) opens the keyboard; the stop starts after it.
+        assertEquals(132f, typeCells.start * cw, 0.01f);
+        assertEquals(184.8f, typeCells.end * cw, 0.01f);
+        assertTrue(type.right >= 184.8f - 0.01f);
+        assertTrue(stop.left >= 184.8f - 0.01f);
         assertEquals(cols * cw, stop.right, 0.01f);
     }
 
