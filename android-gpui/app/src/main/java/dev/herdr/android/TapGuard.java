@@ -34,6 +34,12 @@ final class TapGuard {
         movedAt.keySet().retainAll(next.keySet());
     }
 
+    /** The controls were hidden: every one is forgotten, and new when it is laid out again. */
+    void hidden() {
+        places.clear();
+        movedAt.clear();
+    }
+
     /** Whether a tap at {@code now} on {@code id} acts: it has been where it is long enough. */
     boolean accepts(String id, long now) {
         Long moved = movedAt.get(id);

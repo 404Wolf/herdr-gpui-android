@@ -2,6 +2,7 @@ package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
@@ -120,6 +121,35 @@ public final class TapGuardTest {
         guard.laid(Arrays.asList(at("talk", 50, 80)), 1_000);
         guard.laid(Arrays.asList(at("undo", 110, 200)), 2_000);
         assertFalse(guard.accepts("undo", 2_100));
+    }
+
+    @Test public void controlsShownAgainAfterBeingHiddenAreNew() {
+        // ComposerBar hides the strip (a cover, a shell) and shows it again: same ids, same place.
+        TapGuard guard = new TapGuard();
+        List<ControlTargets.Rect> line = Arrays.asList(at("send", 210, 250));
+        guard.laid(line, 0);
+        guard.hidden();
+        guard.laid(line, 5_000);
+        assertFalse("visible again for 10 ms only", guard.accepts("send", 5_010));
+        assertTrue(guard.accepts("send", 5_000 + TapGuard.SETTLE_MS));
+    }
+
+    @Test public void composerBarDispatchesAFingersTapOnlyOnceTheControlSettled() {
+        // ComposerBar.targetTapped acts on what tapAction returns.
+        TapGuard guard = new TapGuard();
+        guard.laid(Arrays.asList(at("talk", 50, 80)), 0);
+        guard.laid(Arrays.asList(at("talk", 100, 130)), 6_000);
+        assertNull("a finger's tap on talk as it slides in does nothing",
+                ComposerBar.tapAction(guard, "talk", true, 6_050));
+        assertEquals("talk", ComposerBar.tapAction(guard, "talk", true, 6_000 + TapGuard.SETTLE_MS));
+    }
+
+    @Test public void aNamedActivationAlwaysActs() {
+        // TalkBack's double tap or a performClick names its control: movement cannot redirect it.
+        TapGuard guard = new TapGuard();
+        guard.laid(Arrays.asList(at("undo", 110, 200)), 1_000);
+        assertEquals("undo", ComposerBar.tapAction(guard, "undo", false, 1_001));
+        assertNull(ComposerBar.tapAction(guard, "undo", true, 1_001));
     }
 
     @Test public void anIdNeverLaidOutIsNotBlocked() {

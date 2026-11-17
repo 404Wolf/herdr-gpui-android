@@ -137,6 +137,8 @@ final class ComposerBar {
     private int linkDown;
     /** Taps on controls that just moved are ignored ({@link TapGuard}). */
     private final TapGuard tapGuard = new TapGuard();
+    /** The target a finger went down on, until its click: that click is a touch, not a named activation. */
+    private View touchedTarget;
     /** The clear (✕) and its undo (item 76). */
     private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
         @Override public boolean cancelDictation() { return cancelDictationForClear(); }
@@ -817,7 +819,10 @@ final class ComposerBar {
         }
         keysOverlay.setVisibility(agent && keysOpen && !covered ? View.VISIBLE : View.GONE);
         field.setVisibility(agent && typing ? View.VISIBLE : View.GONE);
-        if (!agent || covered) targets.setVisibility(View.GONE);
+        if (!agent || covered) {
+            tapGuard.hidden();
+            targets.setVisibility(View.GONE);
+        }
         place();
         pushGhost();
     }
@@ -860,6 +865,8 @@ final class ComposerBar {
     /** Lays the invisible targets over the drawn words ({@link ControlTargets}). */
     private void placeTargets(boolean show, float left, float top, float surfaceBottom) {
         if (!show) {
+            // Hidden controls are forgotten: shown again, even in the same place, they are new.
+            tapGuard.hidden();
             targets.setVisibility(View.GONE);
             return;
         }
@@ -888,6 +895,10 @@ final class ComposerBar {
             target.setTag(rect.id);
             target.setContentDescription(describe(rect.id));
             target.setOnClickListener(this::targetTapped);
+            target.setOnTouchListener((v, e) -> {
+                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) touchedTarget = v;
+                return false;
+            });
             if ("send".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { setKeysOpen(!keysOpen); return true; });
             } else if ("clear".equals(rect.id)) {
@@ -907,10 +918,21 @@ final class ComposerBar {
         targets.setVisibility(View.VISIBLE);
     }
 
+    /**
+     * What a tap on the target {@code id} does: {@code id}, or null when it is a finger's tap
+     * ({@code touch}) on a control that just slid under it ({@link TapGuard}, e.g. "talk" into
+     * undo's place as its window ends). A named activation (TalkBack's double tap, a
+     * performClick) says which control it means, so it always acts.
+     */
+    static String tapAction(TapGuard guard, String id, boolean touch, long now) {
+        return touch && !guard.accepts(id, now) ? null : id;
+    }
+
     private void targetTapped(View target) {
-        String id = String.valueOf(target.getTag());
-        // A control that just slid under the finger (e.g. "talk" into undo's place) is not tapped.
-        if (!tapGuard.accepts(id, android.os.SystemClock.uptimeMillis())) return;
+        boolean touch = target == touchedTarget;
+        touchedTarget = null;
+        String id = tapAction(tapGuard, String.valueOf(target.getTag()), touch, android.os.SystemClock.uptimeMillis());
+        if (id == null) return;
         if (id.startsWith("echo-")) {
             tapRow(id);
             return;
