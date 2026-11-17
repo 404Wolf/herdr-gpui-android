@@ -45,6 +45,17 @@ public final class FocusByUseTest {
         assertTrue("an edit the program made is not Wolf's", typed > watcher.indexOf("if (updatingField) return;"));
     }
 
+    @Test public void theRailsKeysAreAUseAndStillNeverReachTheTerminal() throws IOException {
+        // Item 83's ctrl-alt-w / ctrl-alt-b and item 71's use share dispatchKeyEvent.
+        String keys = section(source(UI), "@Override public boolean dispatchKeyEvent(", "nativeSendKey(");
+        int used = keys.indexOf("markUsed();");
+        int rail = keys.indexOf("if (railKeyCode(event) && !shellMode())");
+        assertTrue("every key down is a use, the rail's too", used >= 0 && rail > used);
+        String branch = keys.substring(rail, keys.indexOf("return true;", rail));
+        assertTrue("the rail branch acts and consumes the key", branch.contains("railKey(code == KeyEvent.KEYCODE_W)"));
+        assertTrue("before anything is sent to the terminal", !branch.contains("nativeSend"));
+    }
+
     @Test public void onlyAHerdrSessionOnScreenReportsUse() throws IOException {
         String used = section(source(UI), "private void markUsed(", "@Override public boolean dispatchTouchEvent(");
         assertTrue(used.contains("launch.shell") && used.contains("!hostStarted"));
