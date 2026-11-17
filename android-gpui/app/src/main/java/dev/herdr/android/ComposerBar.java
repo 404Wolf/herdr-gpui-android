@@ -439,7 +439,11 @@ final class ComposerBar {
     }
 
     void destroy() {
-        dictation.cancel();
+        // The engine is the process's: only this window's own session is cancelled.
+        if (Dictation.owns(this)) {
+            dictation.cancel();
+            Dictation.release(this);
+        }
         routing.forget();
         persist();
         host.setGhost("");
@@ -690,7 +694,8 @@ final class ComposerBar {
         String id = String.valueOf(target.getTag());
         switch (id) {
             case "type": toggleTyping(); break;
-            case "hide": hideKeyboard(); break;
+            case "clear": clearDraft(); break;
+            case "undo": undoClear(); break;
             case "talk": toggleDictation(); break;
             case "retry": retryParked(); break;
             case "send": {
@@ -710,7 +715,8 @@ final class ComposerBar {
     private static String describe(String id) {
         switch (id) {
             case "type": return "Type a message";
-            case "hide": return "Hide the keyboard";
+            case "clear": return "Clear the message";
+            case "undo": return "Bring back the cleared message";
             case "talk": return "Dictate; tap again to stop";
             case "retry": return "Send the recordings not transcribed yet to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
@@ -806,7 +812,7 @@ final class ComposerBar {
                 ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
                 : java.util.Collections.emptyList();
         java.util.List<GhostText.Control> out = controls(typing, talks, queuedMessages, cols,
-                recording(dictationState));
+                recording(dictationState), clearControl());
         sendCount = 0;
         for (GhostText.Control control : out) {
             if ("send".equals(control.id) && control.spans.length > 2) sendCount = control.spans[2].length();
@@ -821,33 +827,36 @@ final class ComposerBar {
     static final int CONTROLS_MARGIN = 8;
 
     /**
-     * "type ─ talk ─ send", made to fit {@code cols}: "type" gives way to
-     * "↓ hide" while the keyboard is up, "talk" is left out with no dictation,
-     * and "send" carries the queued count in the most pressing message's
-     * colour. {@code talks} are "talk"'s words from the fullest to the
-     * shortest, none without dictation. When the full line is too wide for
-     * the grid (the Fold's cover screen while recording), "talk" takes its
-     * short words, then "type" (never "↓ hide"), the count and "send" are left out in turn,
-     * and last "talk" takes its shortest words. "talk", the stop while
-     * recording, is never left out.
+     * "type ─ talk ─ send", made to fit {@code cols}: "type" is left out while
+     * the keyboard is up (its own hide key puts it away), "talk" is left out
+     * with no dictation, and "send" carries the queued count in the most
+     * pressing message's colour. {@code talks} are "talk"'s words from the
+     * fullest to the shortest, none without dictation. When the full line is
+     * too wide for the grid (the Fold's cover screen while recording), "talk"
+     * takes its short words, then "type", the count and "send" are left out
+     * in turn, and last "talk" takes its shortest words. "talk", the stop
+     * while recording, is never left out.
      */
     static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
             List<Outbox.Message> queued, int cols) {
-        return controls(typing, talks, queued, cols, false);
+        return controls(typing, talks, queued, cols, false, null);
+    }
+
+    static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
+            List<Outbox.Message> queued, int cols, boolean recording) {
+        return controls(typing, talks, queued, cols, recording, null);
     }
 
     /**
      * The controls while {@code recording}: no "send", so the stop can take the
      * bottom-right corner ({@link ControlTargets}) and no tap meant for it
-     * sends. Enter on the keyboard still stops and sends.
+     * sends. Enter on the keyboard still stops and sends. {@code clear}
+     * ("clear" with a draft, "undo" just after one was cleared, else null)
+     * goes left of "talk", and gives way first on a narrow grid, after "type".
      */
     static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
-            List<Outbox.Message> queued, int cols, boolean recording) {
-        // While the keyboard is up "type" gives way to "↓ hide", in colour so it is
-        // found, and it stays on narrow grids, where "type" would be left out.
-        GhostText.Control lead = typing ? new GhostText.Control("hide", "↓ hide", "info")
-                : new GhostText.Control("type", "type", "dim");
-        GhostText.Control narrowLead = typing ? lead : null;
+            List<Outbox.Message> queued, int cols, boolean recording, GhostText.Control clear) {
+        GhostText.Control lead = typing ? null : new GhostText.Control("type", "type", "dim");
         String count = queued.isEmpty() ? "" : "·" + QueuedMessages.badge(queued.size());
         String countStyle;
         switch (QueuedMessages.urgency(queued)) {
@@ -862,12 +871,15 @@ final class ComposerBar {
         GhostText.Control shorter = talks.isEmpty() ? null : talks.get(Math.min(1, talks.size() - 1));
         GhostText.Control shortest = talks.isEmpty() ? null : talks.get(talks.size() - 1);
         java.util.List<java.util.List<GhostText.Control>> ladder = java.util.Arrays.asList(
+                line(lead, clear, talk, send),
+                line(lead, clear, shorter, send),
+                line(null, clear, shorter, send),
+                line(null, clear, shorter, bareSend),
                 line(lead, talk, send),
                 line(lead, shorter, send),
-                line(narrowLead, shorter, send),
-                line(narrowLead, shorter, bareSend),
-                line(narrowLead, shorter, null),
-                line(narrowLead, shortest, null),
+                line(null, shorter, send),
+                line(null, shorter, bareSend),
+                line(null, shorter, null),
                 line(null, shortest, null));
         java.util.List<GhostText.Control> barest = null;
         for (java.util.List<GhostText.Control> line : ladder) {
@@ -944,44 +956,87 @@ final class ComposerBar {
         }
     }
 
+    /** How long "undo" stands in for "clear" after a clear. */
+    static final long UNDO_MS = 6000;
+    /** The draft "clear" took, while "undo" can bring it back; null otherwise. */
+    private String cleared;
+    /** The pane {@link #cleared} was taken from: undo never lands in another. */
+    private String clearedPane;
+
+    private final Runnable forgetCleared = () -> {
+        cleared = null;
+        pushGhost();
+    };
+
+    /**
+     * "clear" while there is a draft and no dictation runs (its words are on
+     * their way into the draft), "undo" for a moment after a clear, else none.
+     */
+    private GhostText.Control clearControl() {
+        return clearControl(drafts.text(), dictating(), cleared != null && drafts.pane().equals(clearedPane));
+    }
+
+    static GhostText.Control clearControl(String draft, boolean dictating, boolean undoable) {
+        if (dictating) return null;
+        if (draft != null && !draft.trim().isEmpty()) return new GhostText.Control("clear", "clear", "dim");
+        return undoable ? new GhostText.Control("undo", "undo", "info") : null;
+    }
+
+    /** "clear": the draft goes, saved at once; "undo" brings it back for a moment. */
+    private void clearDraft() {
+        if (dictating()) return;
+        String text = typing ? field.getText().toString() : drafts.text();
+        if (text.trim().isEmpty()) return;
+        cleared = text;
+        clearedPane = drafts.pane();
+        drafts.edit("");
+        showText("");
+        persistNow();
+        field.removeCallbacks(forgetCleared);
+        field.postDelayed(forgetCleared, UNDO_MS);
+    }
+
+    private void undoClear() {
+        field.removeCallbacks(forgetCleared);
+        String text = cleared;
+        cleared = null;
+        if (text == null || !drafts.pane().equals(clearedPane) || !drafts.text().isEmpty()) {
+            pushGhost();
+            return;
+        }
+        drafts.edit(text);
+        showText(text);
+        persistNow();
+    }
+
     /** Hands the renderer the pane's draft, queued messages and controls, unless unchanged. */
     private void pushGhost() {
         String json = "";
         if (agent) {
             // While typing, the keyboard's underlined word reads as the
             // revisable tail, as an engine's partial words do.
+            String draft = drafts.text();
             int partialFrom = drafts.partialFrom();
-            if (partialFrom < 0 && typing) {
-                // Against the draft's length: a field out of step marks nothing.
+            GhostText.Marks marks;
+            if (partialFrom >= 0 && partialFrom <= draft.length()) {
+                // An engine's revisable words, at the draft's end.
+                marks = new GhostText.Marks(-1, -1, -1, partialFrom, draft.length());
+            } else if (typing && field.getText().toString().equals(draft)) {
+                // The keyboard's cursor, selection and underlined word, where
+                // they are in the draft (a field out of step marks nothing).
                 Editable typed = field.getText();
-                partialFrom = composingFrom(drafts.text().length(), BaseInputConnection.getComposingSpanStart(typed),
+                marks = GhostText.Marks.of(field.getSelectionStart(), field.getSelectionEnd(),
+                        BaseInputConnection.getComposingSpanStart(typed),
                         BaseInputConnection.getComposingSpanEnd(typed));
+            } else {
+                marks = GhostText.Marks.NONE;
             }
-            json = GhostText.json(GhostText.kind(kind), drafts.text(), partialFrom, clipLengths, parkedIds(),
+            json = GhostText.json(GhostText.kind(kind), draft, marks, clipLengths, parkedIds(),
                     queuedMessages, drafts.pane(), controls(), GhostText.Colors.of(chrome));
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;
         host.setGhost(json);
-    }
-
-    /**
-     * Where the keyboard's underlined (composing) word starts in a typed draft
-     * of {@code length} characters, when it is the draft's tail; else -1. The
-     * renderer only draws a revisable tail, and the caret is at the end.
-     */
-    static int composingFrom(int length, int start, int end) {
-        return start >= 0 && start < end && end == length ? start : -1;
-    }
-
-    /**
-     * Whether a selection {@code start..end} in a typed draft of
-     * {@code length} characters must go back to the end: the ghost caret is
-     * drawn only there, so a cursor anywhere else would take typing to a
-     * place nobody can see. A negative start means no selection.
-     */
-    static boolean keepsAtEnd(int start, int end, int length) {
-        return start >= 0 && (start != length || end != length);
     }
 
     /**
@@ -1026,31 +1081,14 @@ final class ComposerBar {
         return agent && dictation.isAvailable();
     }
 
-    /** Keys that would move the hidden cursor; while typing they do nothing. */
-    static boolean movesCursor(int keyCode) {
-        switch (keyCode) {
-            case KeyEvent.KEYCODE_DPAD_LEFT:
-            case KeyEvent.KEYCODE_DPAD_RIGHT:
-            case KeyEvent.KEYCODE_DPAD_UP:
-            case KeyEvent.KEYCODE_DPAD_DOWN:
-            case KeyEvent.KEYCODE_MOVE_HOME:
-            case KeyEvent.KEYCODE_MOVE_END:
-            case KeyEvent.KEYCODE_PAGE_UP:
-            case KeyEvent.KEYCODE_PAGE_DOWN:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     private EditText createField() {
-        // The cursor never leaves the end, whoever moves it (arrow keys, a
-        // keyboard's spacebar swipe or its own setSelection): the ghost caret
-        // is drawn at the end of the draft, and typing must land where it is.
+        // The cursor and selection go where the keyboard puts them (arrow
+        // keys, its cursor pad or spacebar swipe, select all): the renderer
+        // draws both in the draft at the prompt, as a text field would.
         EditText edit = new EditText(context) {
             @Override protected void onSelectionChanged(int start, int end) {
                 super.onSelectionChanged(start, end);
-                if (keepsAtEnd(start, end, length())) setSelection(length());
+                if (typing) pushGhost();
             }
         };
         edit.setSaveEnabled(false);
@@ -1079,7 +1117,7 @@ final class ComposerBar {
             enter();
             return true;
         });
-        edit.setOnKeyListener((view, code, event) -> movesCursor(code) || enterKey(event));
+        edit.setOnKeyListener((view, code, event) -> enterKey(event));
         edit.addTextChangedListener(new TextWatcher() {
             private int changeStart, changeBefore, changeCount;
 
@@ -1142,6 +1180,7 @@ final class ComposerBar {
     private void setDictationState(DictationEngine.State state) {
         boolean wasRecording = recording(dictationState);
         dictationState = state;
+        if (!dictating()) Dictation.release(this);
         if (state != DictationEngine.State.TRANSCRIBING) finishing = false;
         boolean recording = recording(state);
         if (recording && !wasRecording) recordingSince = android.os.SystemClock.elapsedRealtime();
@@ -1159,6 +1198,13 @@ final class ComposerBar {
             return;
         }
         if (dictating()) return;
+        if (Dictation.busyElsewhere(this)) {
+            // One recording at a time: another Herdr window's is finished first (its words go
+            // to its own pane), then "talk" here starts a new one.
+            dictation.stop();
+            host.notice("Finishing the recording in Herdr's other window");
+            return;
+        }
         if (!dictation.isAvailable()) {
             host.notice("Dictation is not set up on this phone");
             return;
@@ -1168,12 +1214,13 @@ final class ComposerBar {
     }
 
     private void startDictation() {
-        if (!agent || dictating()) return;
+        if (!agent || dictating() || Dictation.busyElsewhere(this)) return;
         if (typing) drafts.edit(field.getText().toString());
         drafts.dictationStarted();
         transcribedOnPhone = false;
         final String pane = drafts.pane();
         routing.forget();
+        Dictation.own(this);
         dictation.start(pane, routing.listener(pane));
     }
 
