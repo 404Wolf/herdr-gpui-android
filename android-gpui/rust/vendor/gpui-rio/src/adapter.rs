@@ -358,16 +358,26 @@ macro_rules! __bind_gpui {
                     let hex = |color: u32| -> Hsla { rgb(color & 0x00ff_ffff).into() };
                     let colors = ghost.colors;
                     let mut caret: Option<Point<Pixels>> = None;
+                    // The keyboard's cursor, when the host says where it is in the draft.
+                    let mut explicit: Option<Point<Pixels>> = None;
                     for run in placed {
                         let len = run.text.chars().count();
+                        let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
+                        if run.style == GhostStyle::Caret {
+                            if anchor.is_some_and(|a| run.row >= a.row) {
+                                explicit = Some(at);
+                            }
+                            continue;
+                        }
                         if len == 0 {
                             continue;
                         }
-                        let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
                         let width = self.cell.width * len;
-                        window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(colors.background)));
+                        let back = if run.style == GhostStyle::Selected { colors.info } else { colors.background };
+                        window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(back)));
                         let color = match run.style {
                             GhostStyle::Text | GhostStyle::Partial => colors.text,
+                            GhostStyle::Selected | GhostStyle::Caret => colors.background,
                             GhostStyle::Echo | GhostStyle::Tag | GhostStyle::Dim => colors.dim,
                             GhostStyle::Chip | GhostStyle::Warn => colors.warn,
                             GhostStyle::Bright => colors.bright,
@@ -405,12 +415,15 @@ macro_rules! __bind_gpui {
                             }
                         }
                         if anchor.is_some_and(|a| run.row >= a.row)
-                            && matches!(run.style, GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip)
+                            && matches!(
+                                run.style,
+                                GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip | GhostStyle::Selected
+                            )
                         {
                             caret = Some(at + point(width, px(0.)));
                         }
                     }
-                    if let Some(at) = caret {
+                    if let Some(at) = explicit.or(caret) {
                         window.paint_quad(fill(Bounds::new(at, size(px(1.5), self.cell.height)), hex(colors.text)));
                     }
                 }
