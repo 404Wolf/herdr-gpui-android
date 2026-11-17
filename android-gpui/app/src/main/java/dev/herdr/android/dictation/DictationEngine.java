@@ -86,7 +86,17 @@ public interface DictationEngine {
 
         void onState(State state);
 
-        /** The session failed; {@link State#IDLE} follows and no onFinal. */
+        /**
+         * The desktop answered this session with an error a retry may cure (not away, not
+         * unreachable): show it as a desktop error. The session goes on as if the desktop were
+         * away ({@link State#ON_DEVICE} or {@link State#OFFLINE_RECORDING}).
+         */
+        default void onDesktopError() { }
+
+        /**
+         * The session failed; {@link State#IDLE} follows and no onFinal. A reason that
+         * {@link DictationException.Reason#nothingHeard} means nothing was heard and nothing is kept.
+         */
         void onError(DictationException error);
 
         /**

@@ -81,9 +81,12 @@ public final class DictationFakes {
         private int index;
         volatile boolean opened;
         volatile boolean failToOpen;
+        /** From this chunk on, exact zeros (a silenced microphone); -1 never. */
+        volatile int zerosFrom = -1;
+        volatile boolean androidSilenced;
 
         @Override public AudioInput open() throws Microphone.Failure {
-            if (failToOpen) throw new Microphone.Failure("The microphone could not be opened");
+            if (failToOpen) throw new Microphone.Failure(Microphone.Failure.Cause.IN_USE, "in use");
             opened = true;
             return this;
         }
@@ -97,7 +100,8 @@ public final class DictationFakes {
             }
             if (stop.getAsBoolean()) return 0;
             index++;
-            for (int i = 0; i < chunk.length; i++) chunk[i] = (byte) (index * 31 + i);
+            boolean zero = zerosFrom >= 0 && index > zerosFrom;
+            for (int i = 0; i < chunk.length; i++) chunk[i] = zero ? 0 : (byte) (index * 31 + i);
             synchronized (given) {
                 given.write(chunk, 0, chunk.length);
             }
@@ -108,6 +112,10 @@ public final class DictationFakes {
             synchronized (given) {
                 return given.toByteArray();
             }
+        }
+
+        @Override public boolean androidSilenced() {
+            return androidSilenced;
         }
 
         @Override public void close() { }
@@ -203,6 +211,14 @@ public final class DictationFakes {
             return this;
         }
 
+        /** The desktop's answer to stop, instead of its words. */
+        String finalJson;
+
+        public Behaviour finalJson(String json) {
+            finalJson = json;
+            return this;
+        }
+
         boolean finishing;
 
         /** After stop: {"type":"status","state":"finishing"} before the final. */
@@ -220,6 +236,8 @@ public final class DictationFakes {
         private final List<Socket> open = Collections.synchronizedList(new ArrayList<>());
         /** Every session's start message, in order. */
         public final List<JSONObject> starts = Collections.synchronizedList(new ArrayList<>());
+        /** Every other text message the phone sent (stop, cancel), in order. */
+        public final List<String> texts = Collections.synchronizedList(new ArrayList<>());
 
         public FakeServer(Behaviour behaviour) throws IOException {
             this.behaviour = behaviour;
@@ -262,7 +280,10 @@ public final class DictationFakes {
                 assertEquals("start", new JSONObject(start.text()).getString("type"));
                 starts.add(new JSONObject(start.text()));
                 if (behaviour.ready == null) {
-                    while (true) reader.next(); // never ready: read until the phone gives up
+                    while (true) { // never ready: read until the phone gives up
+                        WebSocketFrames.Message m = reader.next();
+                        if (m.opcode == WebSocketFrames.TEXT) texts.add(m.text());
+                    }
                 }
                 send(out, behaviour.ready);
                 boolean heard = false;
@@ -285,13 +306,15 @@ public final class DictationFakes {
                             }
                             send(out, "{\"type\":\"partial\",\"text\":\"words\"}");
                         }
-                    } else if (m.opcode == WebSocketFrames.TEXT
-                            && new JSONObject(m.text()).getString("type").equals("stop")) {
+                    } else if (m.opcode == WebSocketFrames.TEXT) {
+                        texts.add(m.text());
+                        if (!new JSONObject(m.text()).getString("type").equals("stop")) continue;
                         if (behaviour.finishing) {
                             send(out, "{\"type\":\"status\",\"state\":\"finishing\",\"tail_s\":12.3}");
                         }
                         Thread.sleep(behaviour.finalDelayMs);
-                        send(out, "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
+                        send(out, behaviour.finalJson != null ? behaviour.finalJson
+                                : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
                         s.close();
                         return;
                     }

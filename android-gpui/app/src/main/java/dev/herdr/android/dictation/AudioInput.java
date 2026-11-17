@@ -16,6 +16,11 @@ interface AudioInput extends Closeable {
      */
     int read(byte[] chunk, BooleanSupplier stop) throws Microphone.Failure;
 
+    /** Whether Android says it is silencing this input now (privacy toggle, a call, another app). */
+    default boolean androidSilenced() {
+        return false;
+    }
+
     @Override
     void close();
 }

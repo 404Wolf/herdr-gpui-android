@@ -34,6 +34,12 @@ final class DictationRouting {
         /** The text just placed on screen is the phone's: say so ("talk offline"). */
         void transcribedOnPhone();
 
+        /** The session heard nothing ({@code reason}): "talk" says why until the next one. */
+        default void nothingHeard(DictationException.Reason reason) { }
+
+        /** The desktop answered this session with an error: say so rather than "offline". */
+        default void desktopError() { }
+
         /** The desktop's final waits for a decode: "finishing…" instead of "transcribing…". */
         default void finishing() { }
 
@@ -145,10 +151,19 @@ final class DictationRouting {
                 bar.setDictationState(state);
             }
 
+            @Override public void onDesktopError() {
+                bar.desktopError();
+            }
+
             @Override public void onError(DictationException error) {
                 forget();
                 bar.setDictationState(DictationEngine.State.IDLE);
                 if (pane.equals(drafts.pane())) bar.showText(drafts.dictationEnded());
+                if (error.reason().nothingHeard()) {
+                    // Said where the mic is, in "talk": no note over the terminal.
+                    bar.nothingHeard(error.reason());
+                    return;
+                }
                 bar.notice(error.getMessage() == null ? "Dictation stopped" : error.getMessage());
             }
         };

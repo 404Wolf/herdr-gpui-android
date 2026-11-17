@@ -137,8 +137,9 @@ public final class WebSocketFramesTest {
             try {
                 DictationSocket.connect(new URI("ws://127.0.0.1:" + server.getLocalPort() + "/"), 2000);
                 fail();
-            } catch (IOException expected) {
-                assertTrue(expected.getMessage().contains("echo"));
+            } catch (DictationSocket.HandshakeException expected) {
+                assertTrue(expected.kind == DictationSocket.HandshakeException.Kind.BAD_ANSWER);
+                assertTrue(expected.getCause().getMessage().contains("echo"));
             }
             peer.join(2000);
         }

@@ -57,6 +57,50 @@ tap → ServerDictationEngine ── ws:// over the tailnet ──▶ dictation 
   of `server.py`; a waiting clip uses the same protocol, sent as fast as the
   link allows.
 
+## Nothing heard, desktop errors and slow handshakes
+
+Some dictations reached the desktop as near-silence (window RMS under 120), so
+its final was empty; some sessions opened and closed with no audio at all.
+
+- The server answers audio with nothing to transcribe with
+  `{"type":"final","text":"","code":"silent_audio"|"quiet_audio"|"no_audio","message":...}`.
+  A final with any `code` is permanent: nothing is inserted (not even the
+  phone's own text), the recording is not kept, and a waiting clip that gets it
+  is dropped (its chip goes, as for an empty text) so it never holds up the
+  queue. `talk` then reads `talk mic sent silence`, `talk too quiet` or
+  `talk no audio` until the next dictation, a send or a pane switch. The same
+  codes on an `error` are permanent too; any other `error` (no code, or
+  `backend_slow` and the like) is transient.
+- A transient desktop error in a live session goes on as if the desktop were
+  away, but `talk` says `desktop error` instead of `offline`. A waiting clip the
+  desktop took and failed on is counted (`ClipStore.MAX_ATTEMPTS`, below) and
+  passed over in that pass, so newer clips still go; after the third it is
+  parked with its audio, for the `retry` control.
+- The phone looks for a silenced microphone itself: Android's
+  `AudioRecordingConfiguration.isClientSilenced()` for our recording (the
+  privacy toggle, a call, another app) held for 0.3 s, or 3 s of samples within
+  ±2 of zero (`SilenceWatch`). With nothing heard before, the session ends with
+  `talk mic silenced` and keeps nothing; after real audio, what was heard is
+  kept as if stop was tapped. Why the microphone did not open (`DENIED`,
+  `NOT_INITIALIZED`, `START_FAILED`, `IN_USE`, ...) is logged with a count.
+- One recording at a time: a new session in the app takes the microphone over
+  from the one recording (that one ends as if stop was tapped, keeping what
+  it heard; `Microphone.TAKE_OVER_WAIT_MS`), and across apps (the keyboard's
+  own dictation) Android silences all but one, which the silenced session
+  sees within 0.3 s and ends on, letting go of its recorder. The microphone
+  opens on the session's own thread, so that wait never holds the UI.
+- A session the phone ends while the desktop is still in it says why:
+  `{"type":"cancel","reason":"cancelled"|"silenced"|"not_ready"|"no_final"|"slow_backend"}`
+  and a websocket close. The server reads only `type`, so the reason is
+  harmless to an older one.
+- The TCP connect has 2.5 s, but the TLS and websocket upgrade reads after it
+  have 8 s each (`HANDSHAKE_TIMEOUT_MS`): a relayed tailnet path (DERP on
+  cellular) needs several round trips of 200 ms and more. A failed handshake is
+  logged as its step and kind (`CONNECT`/`TLS`/`UPGRADE`, `TIMEOUT`, `RESET`,
+  `CLOSED`, `STATUS` with the HTTP code, `BAD_ANSWER`). With no recognizer on
+  the phone the session waits 9 s for the desktop's ready (4 s with one).
+- None of the log lines carry audio or text: counts, classes, codes and timings.
+
 ## When the desktop is away or slow
 
 On 15 November 2026 the desktop's Whisper silently ran on its CPU: a 2.6 s

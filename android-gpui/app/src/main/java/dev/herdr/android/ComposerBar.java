@@ -144,6 +144,13 @@ final class ComposerBar {
      */
     private boolean transcribedOnPhone;
     /**
+     * Why the last dictation heard nothing (a silenced mic, or the desktop's code), said after
+     * "talk" until the next dictation, a send or a pane switch; null for nothing to say.
+     */
+    private dev.herdr.android.dictation.DictationException.Reason nothingHeard;
+    /** This session's desktop answered with an error: "desktop error" rather than "offline". */
+    private boolean desktopError;
+    /**
      * Each session's text, and an Enter pressed while it finishes: kept with the pane it was
      * pressed in and settled at that session's end, never left for a later dictation.
      */
@@ -177,6 +184,15 @@ final class ComposerBar {
 
         @Override public void transcribedOnPhone() {
             transcribedOnPhone = true;
+        }
+
+        @Override public void nothingHeard(dev.herdr.android.dictation.DictationException.Reason reason) {
+            ComposerBar.this.nothingHeard(reason);
+        }
+
+        @Override public void desktopError() {
+            desktopError = true;
+            pushGhost();
         }
 
         @Override public void finishing() {
@@ -254,6 +270,27 @@ final class ComposerBar {
         DraftChips.apply(field.getText(), chip());
         lastGhost = "";
         pushGhost();
+    }
+
+    /**
+     * A dictation, live or a recording sent later, held nothing to transcribe ({@code reason}):
+     * "talk" says why, in place, until the next dictation.
+     */
+    void nothingHeard(dev.herdr.android.dictation.DictationException.Reason reason) {
+        nothingHeard = reason;
+        lastGhost = "";
+        pushGhost();
+    }
+
+    /** How "talk" says why nothing was heard, in as many words as fit. */
+    static String nothingHeardWords(dev.herdr.android.dictation.DictationException.Reason reason, boolean full) {
+        switch (reason) {
+            case SILENCED: return full ? "mic silenced" : "silenced";
+            case SILENT_AUDIO: return full ? "mic sent silence" : "silence";
+            case QUIET_AUDIO: return full ? "too quiet" : "quiet";
+            case NO_AUDIO: return "no audio";
+            default: return full ? "nothing heard" : "nothing";
+        }
     }
 
     /**
@@ -387,6 +424,7 @@ final class ComposerBar {
         String text = drafts.switchTo(paneId);
         if (switched) {
             transcribedOnPhone = false;
+            nothingHeard = null;
             keysOpen = false;
             showText(text);
         }
@@ -956,10 +994,11 @@ final class ComposerBar {
                         : finishing ? "finishing…" : "transcribing…", "info");
             case ON_DEVICE: {
                 // The phone transcribes: the warning colour says offline when the words cannot.
+                String why = desktopError ? "desktop error" : "offline";
                 String text;
                 switch (words) {
-                    case FULL: text = "● offline · rec " + clock + " · tap to stop"; break;
-                    case SHORT: text = "● offline " + clock + " stop"; break;
+                    case FULL: text = "● " + why + " · rec " + clock + " · tap to stop"; break;
+                    case SHORT: text = "● " + (desktopError ? "error" : "offline") + " " + clock + " stop"; break;
                     default: text = "● stop";
                 }
                 return new GhostText.Control("talk", text, "warn");
@@ -968,15 +1007,18 @@ final class ComposerBar {
                 // No recognizer on the phone: the recording waits for the desktop.
                 String text;
                 switch (words) {
-                    case FULL: text = "offline · queued · rec " + clock + " · tap to stop"; break;
+                    case FULL: text = (desktopError ? "desktop error" : "offline") + " · queued · rec " + clock
+                            + " · tap to stop"; break;
                     case SHORT: text = "● queued " + clock + " stop"; break;
                     default: text = "● stop";
                 }
                 return new GhostText.Control("talk", text, "warn");
             }
             default:
+                String said = nothingHeard == null || words == Words.TINY ? ""
+                        : " " + nothingHeardWords(nothingHeard, words == Words.FULL);
                 return new GhostText.Control("talk", "talk", "dim",
-                        (transcribedOnPhone ? " offline" : "") + (waiting > 0 ? "·" + waiting : ""), "warn");
+                        (transcribedOnPhone ? " offline" : "") + said + (waiting > 0 ? "·" + waiting : ""), "warn");
         }
     }
 
@@ -1242,6 +1284,8 @@ final class ComposerBar {
         if (typing) drafts.edit(field.getText().toString());
         drafts.dictationStarted();
         transcribedOnPhone = false;
+        nothingHeard = null;
+        desktopError = false;
         final String pane = drafts.pane();
         routing.forget();
         Dictation.own(this);
@@ -1279,6 +1323,7 @@ final class ComposerBar {
         if (!host.send(outgoing)) return;
         drafts.sent();
         transcribedOnPhone = false;
+        nothingHeard = null;
         showText("");
     }
 

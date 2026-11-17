@@ -146,7 +146,8 @@ public final class ServerDictationEngineTest {
             run.awaitEnd();
             assertPhoneText(run);
             assertTrue(error, run.listener.states.contains(DictationEngine.State.ON_DEVICE));
-            assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("desktop out (dropped")));
+            assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("desktop out (desktop error")));
+            assertEquals("shown as a desktop error, not as away", 1, run.listener.desktopErrors);
         }
         assertEquals(4, store.keptClips().size());
     }
@@ -365,6 +366,147 @@ public final class ServerDictationEngineTest {
         assertEquals(DESKTOP_WORDS, run.listener.finalText);
     }
 
+    // ---- nothing to transcribe, a silenced microphone, desktop errors -------------------------
+
+    static String finalWithCode(String code) {
+        return "{\"type\":\"final\",\"text\":\"\",\"code\":\"" + code + "\",\"message\":\"nothing\"}";
+    }
+
+    @Test public void aFinalWithACodeInsertsNothingAndKeepsNothing() throws Exception {
+        String[] codes = {"silent_audio", "quiet_audio", "no_audio", "a_future_code"};
+        DictationException.Reason[] reasons = {DictationException.Reason.SILENT_AUDIO,
+                DictationException.Reason.QUIET_AUDIO, DictationException.Reason.NO_AUDIO,
+                DictationException.Reason.NOTHING};
+        for (int i = 0; i < codes.length; i++) {
+            for (boolean withPhone : new boolean[] {true, false}) {
+                if (server != null) server.close();
+                server = new FakeServer(Behaviour.fast(READY_GPU).finalJson(finalWithCode(codes[i])));
+                FakeRecognizer phone = withPhone ? new FakeRecognizer(PHONE_WORDS, 0) : null;
+                Run run = dictate(server.uri(), phone, 300);
+                run.awaitEnd();
+                assertEquals(codes[i], reasons[i], run.listener.error.reason());
+                assertEquals("nothing inserted, not even the phone's words", 0, run.listener.finals);
+                assertEquals(null, run.listener.pendingClip);
+                assertEquals(DictationEngine.State.IDLE, last(run.listener.states));
+            }
+        }
+        Thread.sleep(200); // the mic thread's last chunk
+        assertTrue("never queued", store.untranscribed().isEmpty());
+        assertTrue("never kept", store.keptClips().isEmpty());
+        assertTrue("never parked", store.parked().isEmpty());
+    }
+
+    @Test public void anErrorWithAKnownFinalCodeIsFinalToo() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU).errorOnAudio(
+                "{\"type\":\"error\",\"code\":\"silent_audio\",\"message\":\"silence\"}"));
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertEquals(DictationException.Reason.SILENT_AUDIO, run.listener.error.reason());
+        assertEquals(null, run.listener.pendingClip);
+        Thread.sleep(200);
+        assertTrue(store.untranscribed().isEmpty());
+    }
+
+    @Test public void anErrorWithoutACodeIsADesktopErrorAndTheAudioIsKept() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU).errorOnAudio("{\"type\":\"error\",\"message\":\"x\"}"));
+        Run run = dictate(server.uri(), null, 300);
+        run.awaitEnd();
+        assertEquals(1, run.listener.desktopErrors);
+        assertTrue(run.listener.states.contains(DictationEngine.State.OFFLINE_RECORDING));
+        assertNotNull("kept for the courier's counted retries", run.listener.pendingClip);
+        assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("desktop error (no code)")));
+    }
+
+    @Test public void aMicrophoneGivingOnlyZerosEndsTheSessionAndKeepsNothing() throws Exception {
+        Run run = new Run();
+        run.mic.zerosFrom = 0;
+        // 30 chunks of zeros come in 0.6 s here; the session ends itself before the stop.
+        dictate(closedPort(), null, 1500, run);
+        run.awaitEnd();
+        assertEquals(DictationException.Reason.SILENCED, run.listener.error.reason());
+        assertEquals(null, run.listener.pendingClip);
+        Thread.sleep(200);
+        assertTrue(store.untranscribed().isEmpty());
+        assertTrue(store.parked().isEmpty());
+        assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("microphone silenced (DIGITAL_SILENCE)")));
+    }
+
+    @Test public void androidSilencingTheRecordingEndsItAndTellsTheDesktopWhy() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        run.mic.androidSilenced = true;
+        run.mic.zerosFrom = 0;
+        dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 0), 1500, run);
+        run.awaitEnd();
+        assertEquals(DictationException.Reason.SILENCED, run.listener.error.reason());
+        assertEquals(0, run.listener.finals);
+        assertTrue(log.toString(), log.stream().anyMatch(l -> l.contains("(SILENCED_BY_ANDROID)")));
+        assertTrue(server.texts.toString(), waitFor(
+                () -> server.texts.contains("{\"type\":\"cancel\",\"reason\":\"silenced\"}")));
+    }
+
+    @Test public void silenceAfterSpeechKeepsWhatWasHeard() throws Exception {
+        Run run = new Run();
+        run.mic.zerosFrom = 5;
+        dictate(closedPort(), null, 1500, run);
+        run.awaitEnd();
+        assertNotNull("what was said before the silence is kept", run.listener.pendingClip);
+        assertEquals(null, run.listener.error);
+    }
+
+    @Test public void aCancelTellsTheDesktopWhy() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = new Run();
+        ServerDictationEngine engine = new ServerDictationEngine(server.uri(), pending, new TestMain(mainThread),
+                run.mic, () -> true, null, TIMEOUTS, log::add);
+        mainThread.submit(() -> engine.start("host/pane", run.listener)).get();
+        Thread.sleep(300);
+        mainThread.submit(engine::cancel).get();
+        assertTrue(server.texts.toString(), waitFor(
+                () -> server.texts.contains("{\"type\":\"cancel\",\"reason\":\"cancelled\"}")));
+    }
+
+    @Test public void aMicrophoneThatDoesNotOpenIsLoggedByCause() throws Exception {
+        Run run = new Run();
+        run.mic.failToOpen = true;
+        dictate(closedPort(), null, 100, run);
+        run.awaitEnd();
+        assertEquals(DictationException.Reason.AUDIO, run.listener.error.reason());
+        assertTrue(log.toString(), log.stream().anyMatch(l -> l.matches(
+                "dictation: the microphone did not open: IN_USE \\(\\d+ times? since the app started\\)")));
+    }
+
+    @Test public void anUploadWithNothingToTranscribeIsFinalAndAnErrorWithoutACodeIsCounted() throws Exception {
+        File clip = dir.newFile("clip.pcm");
+        Files.write(clip.toPath(), new byte[ClipStore.BYTES_PER_SECOND]);
+        server = new FakeServer(Behaviour.fast(READY_GPU).finalJson(finalWithCode("silent_audio")));
+        try {
+            PendingDictations.upload(server.uri(), "id-1", clip);
+            throw new AssertionError("nothing to transcribe");
+        } catch (UploadFailure f) {
+            assertEquals(UploadFailure.Kind.NOTHING, f.kind);
+            assertEquals(DictationException.Reason.SILENT_AUDIO, f.nothing);
+        }
+        server.close();
+        server = new FakeServer(Behaviour.fast(READY_GPU).finalJson("{\"type\":\"error\",\"message\":\"x\"}"));
+        try {
+            PendingDictations.upload(server.uri(), "id-1", clip);
+            throw new AssertionError("an error without a code");
+        } catch (UploadFailure f) {
+            assertEquals("the desktop took it: counted, retried a bounded number of times",
+                    UploadFailure.Kind.FAILED, f.kind);
+            assertTrue(f.attempted);
+        }
+    }
+
+    private static boolean waitFor(BooleanSupplier condition) throws InterruptedException {
+        for (int i = 0; i < 100; i++) {
+            if (condition.getAsBoolean()) return true;
+            Thread.sleep(20);
+        }
+        return condition.getAsBoolean();
+    }
+
     // ---- helpers ---------------------------------------------------------------------------
 
     private void assertPhoneText(Run run) {
@@ -444,6 +586,12 @@ public final class ServerDictationEngineTest {
         volatile int finals;
         volatile PendingClip pendingClip;
         volatile long endedAt;
+        volatile DictationException error;
+        volatile int desktopErrors;
+
+        @Override public void onDesktopError() {
+            desktopErrors++;
+        }
 
         @Override public void onPartial(String text) {
             partials.add(text);
@@ -485,6 +633,7 @@ public final class ServerDictationEngineTest {
         }
 
         @Override public void onError(DictationException error) {
+            this.error = error;
             states.add(null);
         }
 

@@ -42,6 +42,12 @@ public final class PendingDictations {
 
         /** The clips waiting changed: {@link #count} may differ. */
         void onChanged();
+
+        /**
+         * The desktop found nothing to transcribe in {@code clip} ({@code reason}): it is gone,
+         * and {@link #onTranscribed} gave it an empty text so its chip goes too.
+         */
+        default void onNothing(PendingClip clip, DictationException.Reason reason) { }
     }
 
     /** Turns one clip's audio into text; an IOException means "try again later". */
@@ -253,7 +259,11 @@ public final class PendingDictations {
         scheduled = worker.schedule(this::pass, delayMs, TimeUnit.MILLISECONDS);
     }
 
-    /** Worker thread: transcribes waiting clips, oldest first, until one fails. */
+    /**
+     * Worker thread: transcribes waiting clips, oldest first, until the desktop is away or
+     * degraded. A clip it took and failed on is counted ({@link #failed}) and passed over, so it
+     * never holds up newer ones; one with nothing to transcribe is dropped.
+     */
     void pass() {
         scheduled = null;
         // An index write that failed earlier (a full disk): try again first.
@@ -269,6 +279,7 @@ public final class PendingDictations {
         List<PendingClip> waiting = store.untranscribed();
         if (waiting.isEmpty()) return;
         int sent = 0;
+        int passedOver = 0;
         long sentMs = 0;
         long started = System.nanoTime();
         for (PendingClip clip : waiting) {
@@ -285,6 +296,19 @@ public final class PendingDictations {
             }
             try {
                 text = transcriber.transcribe(clip, store.audio(clip.id));
+            } catch (UploadFailure f) {
+                if (f.kind == UploadFailure.Kind.NOTHING) {
+                    nothing(clip, f);
+                    continue;
+                }
+                if (f.kind == UploadFailure.Kind.FAILED && f.attempted) {
+                    // This clip's trouble, not the desktop's: counted, and the next one goes.
+                    failed(clip, f, line(sent, sentMs, waiting.size() - sent, started));
+                    passedOver++;
+                    continue;
+                }
+                failed(clip, f, line(sent, sentMs, waiting.size() - sent, started));
+                return;
             } catch (IOException e) {
                 failed(clip, e, line(sent, sentMs, waiting.size() - sent, started));
                 return;
@@ -294,6 +318,11 @@ public final class PendingDictations {
             log.accept("dictation: sent a " + clip.durationMs / 1000 + " s clip in "
                     + (System.nanoTime() - t) / 1_000_000 + " ms");
             if (store.transcribed(clip.id, text)) main.execute(this::offer);
+        }
+        if (passedOver > 0) {
+            // failed() set the backoff for the clips passed over.
+            log.accept(line(sent, sentMs, passedOver, started) + ", the rest sent");
+            return;
         }
         log.accept(line(sent, sentMs, 0, started) + ", all sent");
         retryMs = FIRST_RETRY_MS;
@@ -336,6 +365,22 @@ public final class PendingDictations {
         retryMs = Math.min(MAX_RETRY_MS, retryMs * 2);
     }
 
+    /**
+     * Worker thread: the desktop found nothing to transcribe in {@code clip}. It is dropped for
+     * good (an empty text, so its chip goes), never resent and never parked.
+     */
+    private void nothing(PendingClip clip, UploadFailure f) {
+        log.accept("dictation: a " + clip.durationMs / 1000 + " s clip had nothing to transcribe ("
+                + f.nothing + "), dropped");
+        if (!store.transcribed(clip.id, "")) return;
+        DictationException.Reason reason = f.nothing;
+        main.execute(() -> {
+            offer();
+            Listener l = listener;
+            if (l != null) l.onNothing(clip, reason);
+        });
+    }
+
     private static String line(int sent, long sentMs, int left, long started) {
         return "dictation: " + sent + " sent (" + sentMs / 1000 + " s of audio) in "
                 + (System.nanoTime() - started) / 1_000_000 + " ms, " + left + " waiting";
@@ -373,7 +418,8 @@ public final class PendingDictations {
     static String upload(URI uri, String id, File audio) throws IOException {
         DictationSocket s;
         try {
-            s = DictationSocket.connect(uri, ServerDictationEngine.CONNECT_TIMEOUT_MS);
+            s = DictationSocket.connect(uri, ServerDictationEngine.CONNECT_TIMEOUT_MS,
+                    ServerDictationEngine.HANDSHAKE_TIMEOUT_MS);
         } catch (IOException e) {
             throw new UploadFailure(UploadFailure.Kind.UNREACHABLE, false, "not reached", e);
         }
@@ -403,8 +449,18 @@ public final class PendingDictations {
                 JSONObject e = read(socket);
                 if (e == null) throw new UploadFailure(UploadFailure.Kind.FAILED, true, "closed before the final");
                 String type = e.optString("type");
-                if (type.equals("final")) return e.optString("text");
-                if (type.equals("error")) throw failure(e, true);
+                String code = e.optString("code", "");
+                if (type.equals("final")) {
+                    // A final with a code: nothing to transcribe, for good.
+                    DictationException.Reason nothing = DictationException.Reason.ofFinalCode(code);
+                    if (nothing != null) throw UploadFailure.nothing(nothing, code);
+                    return e.optString("text");
+                }
+                if (type.equals("error")) {
+                    DictationException.Reason nothing = DictationException.Reason.ofErrorCode(code);
+                    if (nothing != null) throw UploadFailure.nothing(nothing, code);
+                    throw failure(e, true);
+                }
                 // "partial", "status" (finishing…): the final follows.
             }
         } catch (UploadFailure f) {
