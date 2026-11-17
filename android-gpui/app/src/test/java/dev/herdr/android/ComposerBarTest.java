@@ -37,95 +37,6 @@ public final class ComposerBarTest {
         assertFalse(ComposerBar.isAgent("bash"));
     }
 
-    @Test public void whileTheKeyboardIsUpTypeIsLeftOutAndNoHerdrHideIsDrawn() {
-        java.util.List<GhostText.Control> idle = ComposerBar.controls(false,
-                IDLE, java.util.Collections.emptyList(), Integer.MAX_VALUE);
-        assertEquals("type", idle.get(0).id);
-        assertEquals("type", idle.get(0).spans[0]);
-        // The keyboard's own hide key puts it away: talk and send keep their cells.
-        java.util.List<GhostText.Control> typing = ComposerBar.controls(true,
-                IDLE, java.util.Collections.emptyList(), Integer.MAX_VALUE);
-        assertEquals("talk send", ids(typing));
-    }
-
-    @Test public void sendCarriesTheQueuedCountAndTalkIsLeftOutWithoutDictation() {
-        Outbox.Message queued = new Outbox.Message("a", "h", "t1", "b", "x", 1, Outbox.State.QUEUED, false);
-        java.util.List<GhostText.Control> controls = ComposerBar.controls(false, NONE,
-                java.util.Arrays.asList(queued, queued), Integer.MAX_VALUE);
-        assertEquals(2, controls.size());
-        GhostText.Control send = controls.get(1);
-        assertEquals("send", send.id);
-        assertEquals("·2", send.spans[2]);
-        assertEquals("info", send.spans[3]);
-    }
-
-    private static String ids(java.util.List<GhostText.Control> controls) {
-        StringBuilder out = new StringBuilder();
-        for (GhostText.Control c : controls) out.append(out.length() == 0 ? "" : " ").append(c.id);
-        return out.toString();
-    }
-
-    @Test public void theLineIsMeasuredAsTheRendererDrawsIt() {
-        // " type ─ talk ─ send ──"
-        assertEquals(22, ComposerBar.lineWidth(ComposerBar.controls(false, IDLE,
-                java.util.Collections.emptyList(), Integer.MAX_VALUE)));
-        // " type ─ ● rec 0:05 · tap to stop ─ send·2 ──": the dot and rules are one cell each.
-        assertEquals(44, ComposerBar.lineWidth(ComposerBar.controls(false, RECORDING,
-                java.util.Arrays.asList(QUEUED, QUEUED), Integer.MAX_VALUE)));
-    }
-
-    @Test public void stopAlwaysFitsWhileRecordingEvenOnTheCoverScreen() {
-        java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED, QUEUED);
-        for (int cols = 24; cols <= 120; cols++) {
-            java.util.List<GhostText.Control> line = ComposerBar.controls(false, RECORDING, queued, cols);
-            assertTrue("talk at " + cols, ids(line).contains("talk"));
-            if (cols >= 18) { // " ● stop ──" is 10 cells
-                assertTrue("fits at " + cols, ComposerBar.lineWidth(line) + ComposerBar.CONTROLS_MARGIN <= cols);
-            }
-        }
-        // Wide enough (the inner screen): every word.
-        java.util.List<GhostText.Control> wide = ComposerBar.controls(false, RECORDING, queued, 100);
-        assertEquals("type talk send", ids(wide));
-        assertEquals("● rec 0:05 · tap to stop", wide.get(1).spans[0]);
-        assertEquals("·3", wide.get(2).spans[2]);
-        // The cover screen (about 50 columns): the short stop, everything else kept.
-        java.util.List<GhostText.Control> cover = ComposerBar.controls(false, RECORDING, queued, 50);
-        assertEquals("type talk send", ids(cover));
-        assertEquals("● 0:05 stop", cover.get(1).spans[0]);
-        assertEquals("·3", cover.get(2).spans[2]);
-        // Narrower: "type" goes, then the count, then "send"; never the stop.
-        assertEquals("talk send", ids(ComposerBar.controls(false, RECORDING, queued, 38)));
-        java.util.List<GhostText.Control> narrow = ComposerBar.controls(false, RECORDING, queued, 30);
-        assertEquals("talk send", ids(narrow));
-        assertEquals(2, narrow.get(1).spans.length);
-        assertEquals("● 0:05 stop", ComposerBar.controls(false, RECORDING, queued, 24).get(0).spans[0]);
-        // Pinch zoom at 24 pt on the cover screen (~22 to 28 columns): the shortest stop.
-        java.util.List<GhostText.Control> tiny = ComposerBar.controls(false, RECORDING, queued, 22);
-        assertEquals("talk", ids(tiny));
-        assertEquals("● stop", tiny.get(0).spans[0]);
-        // Narrower than any line: the barest one still has the stop.
-        assertEquals("● stop", ComposerBar.controls(false, RECORDING, queued, 5).get(0).spans[0]);
-    }
-
-    @Test public void withoutDictationTheNarrowLineKeepsSend() {
-        assertEquals("send", ids(ComposerBar.controls(false, NONE,
-                java.util.Collections.emptyList(), 5)));
-    }
-
-    @Test public void offlineStopFitsAtPinchZoomOnTheCoverScreen() {
-        java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED, QUEUED);
-        for (int cols : new int[] {22, 28}) {
-            java.util.List<GhostText.Control> line = ComposerBar.controls(false, OFFLINE, queued, cols);
-            assertTrue("talk at " + cols, ids(line).contains("talk"));
-            assertTrue("fits at " + cols, ComposerBar.lineWidth(line) + ComposerBar.CONTROLS_MARGIN <= cols);
-        }
-        assertEquals("● stop", ComposerBar.controls(false, OFFLINE, queued, 28).get(0).spans[0]);
-        // The fold's first frame at 62 columns: no longer the full line, but every control.
-        java.util.List<GhostText.Control> folded = ComposerBar.controls(false, OFFLINE, queued, 62);
-        assertEquals("type talk send", ids(folded));
-        assertEquals("● offline 0:05 stop", folded.get(1).spans[0]);
-    }
-
     @Test public void theMicrophoneIsOpenWhileConnectingListeningOnDeviceOrRecordingOffline() {
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.CONNECTING));
         assertTrue(ComposerBar.recording(dev.herdr.android.dictation.DictationEngine.State.LISTENING));
@@ -146,46 +57,6 @@ public final class ComposerBarTest {
         assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.CONNECTING));
         assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.IDLE));
         assertFalse(ComposerBar.keepsAcrossPaneSwitch(dev.herdr.android.dictation.DictationEngine.State.PENDING));
-    }
-
-    @Test public void clearShowsOnlyWithADraftAndUndoBrieflyAfter() {
-        assertEquals("clear", ComposerBar.clearControl("fix it", false, false).id);
-        assertEquals("clear", ComposerBar.clearControl("fix it", false, true).id);
-        // Nothing to clear; just cleared, the same place offers it back.
-        assertNull(ComposerBar.clearControl("", false, false));
-        assertNull(ComposerBar.clearControl("  \n", false, false));
-        assertEquals("undo", ComposerBar.clearControl("", false, true).id);
-        // While a dictation runs its words are on their way into the draft.
-        assertNull(ComposerBar.clearControl("fix it", true, false));
-        assertNull(ComposerBar.clearControl("", true, true));
-    }
-
-    @Test public void clearSitsLeftOfTalkAndGivesWayFirstAfterType() {
-        GhostText.Control clear = ComposerBar.clearControl("x", false, false);
-        java.util.List<Outbox.Message> none = java.util.Collections.emptyList();
-        assertEquals("type clear talk send", ids(ComposerBar.controls(false, IDLE, none, 100, false, clear)));
-        assertEquals("clear talk send", ids(ComposerBar.controls(true, IDLE, none, 100, false, clear)));
-        // Narrow: "type" goes before "clear".
-        int width = ComposerBar.lineWidth(ComposerBar.controls(false, IDLE, none, 100, false, clear));
-        assertEquals("clear talk send",
-                ids(ComposerBar.controls(false, IDLE, none, width + ComposerBar.CONTROLS_MARGIN - 1, false, clear)));
-        // While recording there is no "clear" (the caller gives none) and no "send".
-        assertEquals("type talk", ids(ComposerBar.controls(false, RECORDING, none, 100, true, null)));
-    }
-
-    @Test public void whileRecordingSendIsNotDrawnSoTheStopOwnsTheCorner() {
-        java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED);
-        for (int cols : new int[] {22, 50, 100}) {
-            java.util.List<GhostText.Control> line = ComposerBar.controls(false, RECORDING, queued, cols, true);
-            assertFalse("send at " + cols, ids(line).contains("send"));
-            assertTrue("talk at " + cols, ids(line).contains("talk"));
-            // The stop is last: the right end of the line, the bottom-right corner.
-            assertEquals("talk", line.get(line.size() - 1).id);
-        }
-        // With send gone the full words fit sooner: 35 cells plus the margin of 8.
-        assertEquals("type talk", ids(ComposerBar.controls(false, RECORDING, queued, 43, true)));
-        assertEquals("● rec 0:05 · tap to stop",
-                ComposerBar.controls(false, RECORDING, queued, 43, true).get(1).spans[0]);
     }
 
     @Test public void whereHerdrDrawsTalkTheKeyboardIsAskedToDropItsMicrophone() {
@@ -230,16 +101,6 @@ public final class ComposerBarTest {
         assertFalse(dev.gpui.mobile.GpuiInputActivity.imeOptionsChanged(shell, ComposerBar.privateImeOptions(false)));
     }
 
-    @Test public void typingNarrowGridsKeepTheStopAndNeverDrawAHide() {
-        java.util.List<Outbox.Message> queued = java.util.Arrays.asList(QUEUED, QUEUED, QUEUED);
-        for (int cols : new int[] {100, 50, 38, 30, 22}) {
-            java.util.List<GhostText.Control> line = ComposerBar.controls(true, RECORDING, queued, cols);
-            assertFalse("no hide at " + cols, ids(line).contains("hide"));
-            assertTrue("talk at " + cols, ids(line).contains("talk"));
-        }
-        assertEquals("talk", ids(ComposerBar.controls(true, RECORDING, queued, 50, true)));
-    }
-
     @Test public void aTouchBetweenTheControlsTargetsReachesTheTerminal() {
         // The strip around the targets lets a finger that went down on none of
         // them through to the terminal (a program's own tab under the gap)...
@@ -249,15 +110,4 @@ public final class ComposerBarTest {
         assertTrue(ComposerBar.stripKeeps(android.view.MotionEvent.ACTION_UP));
     }
 
-    @Test public void aParkedRecordingAddsRetryAfterTalk() {
-        java.util.List<GhostText.Control> line = ComposerBar.withRetry(java.util.Arrays.asList(
-                new GhostText.Control("type", "type", "dim"), TALK, new GhostText.Control("send", "send", "bright")), 1);
-        assertEquals("type talk retry send", ids(line));
-        assertEquals("retry", line.get(2).spans[0]);
-        assertEquals("warn", line.get(2).spans[1]);
-        assertEquals("retry 2", ComposerBar.withRetry(java.util.Collections.singletonList(TALK), 2).get(1).spans[0]);
-        // Without dictation there is no talk: retry leads.
-        assertEquals("retry send", ids(ComposerBar.withRetry(java.util.Collections.singletonList(
-                new GhostText.Control("send", "send", "bright")), 1)));
-    }
 }

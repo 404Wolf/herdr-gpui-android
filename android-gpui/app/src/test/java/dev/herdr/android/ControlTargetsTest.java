@@ -106,7 +106,7 @@ public final class ControlTargetsTest {
      */
     private static List<ControlTargets.Cells> drawn(List<GhostText.Control> controls, int cols, int row) {
         List<ControlTargets.Cells> cells = new java.util.ArrayList<>();
-        int col = cols - ComposerBar.lineWidth(controls);
+        int col = cols - ControlLine.width(controls);
         for (int i = 0; i < controls.size(); i++) {
             col += i == 0 ? 1 : 3;
             int start = col;
@@ -131,7 +131,6 @@ public final class ControlTargetsTest {
                 words("desktop offline · rec 0:05 · tap to stop", "● offline 0:05 stop", "● stop"),
                 words("transcribing…", "transcribing…", "…"),
                 java.util.Collections.<GhostText.Control>emptyList());
-        Outbox.Message queued = new Outbox.Message("a", "h", "t1", "b", "x", 1, Outbox.State.QUEUED, false);
         // Cell widths from compact text to pinch zoom; grids from the cover screen at
         // its largest text to the inner screen.
         for (float cw : new float[] {5.9f, 8f, 10f, 13.2f, 18.6f}) {
@@ -140,9 +139,17 @@ public final class ControlTargetsTest {
                 for (List<GhostText.Control> talks : states) {
                     for (boolean typing : new boolean[] {false, true}) {
                         for (boolean recording : new boolean[] {false, true}) {
-                            List<GhostText.Control> line = ComposerBar.controls(typing, talks,
-                                    Arrays.asList(queued, queued), cols, recording);
-                            if (ComposerBar.lineWidth(line) > cols) continue; // the renderer's own fallback
+                            // With ✕, an undo and a queue: the fullest line items 75 and 76 draw.
+                            ControlLine.State in = new ControlLine.State();
+                            in.typing = typing;
+                            in.talks = talks;
+                            in.queued = 2;
+                            in.recording = recording;
+                            in.clearable = true;
+                            in.undoWide = "cleared · undo";
+                            in.undoNarrow = "undo";
+                            List<GhostText.Control> line = ControlLine.controls(in, cols);
+                            if (ControlLine.width(line) > cols) continue; // the renderer's own fallback
                             List<ControlTargets.Cells> cells = drawn(line, cols, 41);
                             List<ControlTargets.Rect> rects = ControlTargets.layout(cells, 0, 0, cw, 26f,
                                     40, 43 * 26f, maxRight, recording);
@@ -178,8 +185,11 @@ public final class ControlTargetsTest {
         // " type ─ connecting… ──".
         int cols = 31;
         float cw = 13.2f;
-        List<GhostText.Control> line = ComposerBar.controls(false, words("connecting…", "connecting…", "…"),
-                java.util.Collections.emptyList(), cols, true);
+        ControlLine.State in = new ControlLine.State();
+        in.typing = false;
+        in.talks = words("connecting…", "connecting…", "…");
+        in.recording = true;
+        List<GhostText.Control> line = ControlLine.controls(in, cols);
         List<ControlTargets.Cells> cells = drawn(line, cols, 17);
         List<ControlTargets.Rect> rects = ControlTargets.layout(cells, 0, 0, cw, 26f, 17, 20 * 26f, cols * cw, true);
         ControlTargets.Cells typeCells = cells.get(0);
@@ -191,6 +201,21 @@ public final class ControlTargetsTest {
         assertTrue(type.right >= 184.8f - 0.01f);
         assertTrue(stop.left >= 184.8f - 0.01f);
         assertEquals(cols * cw, stop.right, 0.01f);
+    }
+
+    @Test public void queueRowsAreTappedAnywhereAlongThemOneRowHigh() {
+        List<ControlTargets.Rect> rows = ControlTargets.rows(Arrays.asList(
+                new ControlTargets.Cells("echo-0", 30, 0, 20), new ControlTargets.Cells("echo-1", 31, 0, 44)),
+                4, 10, CW, CH, 50);
+        assertEquals(2, rows.size());
+        ControlTargets.Rect first = rows.get(0), second = rows.get(1);
+        assertEquals("echo-0", first.id);
+        assertEquals(4f, first.left, 0.01f);
+        assertEquals(4 + 50 * CW, first.right, 0.01f);
+        assertEquals(10 + 30 * CH, first.top, 0.01f);
+        assertEquals(first.top + CH, first.bottom, 0.01f);
+        // Stacked, never overlapping.
+        assertEquals(first.bottom, second.top, 0.01f);
     }
 
     @Test public void theStopNeverLeavesTheGrid() {

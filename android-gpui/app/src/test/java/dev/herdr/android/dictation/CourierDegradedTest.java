@@ -223,7 +223,7 @@ public final class CourierDegradedTest {
         assertEquals(ClipStore.MAX_ATTEMPTS, restarted.attempts(clip.id));
         assertEquals(1, restarted.parked().size());
         assertTrue(restarted.untranscribed().isEmpty());
-        assertEquals("no charge past the cap", -1, restarted.charge(clip.id));
+        assertEquals("no charge past the cap", -2, restarted.charge(clip.id));
         PendingDictations second = new PendingDictations(restarted, (c, file) -> {
             sends[0]++;
             return "a fourth upload";

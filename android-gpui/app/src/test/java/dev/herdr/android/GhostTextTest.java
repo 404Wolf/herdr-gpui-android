@@ -1,6 +1,7 @@
 package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -22,8 +23,8 @@ public final class GhostTextTest {
         lengths.put("c-1", 9_000L);
         String draft = "fix " + token + " then the remote test";
         int partial = draft.indexOf("the remote");
-        JSONObject o = new JSONObject(GhostText.json("claude", draft, partial, lengths,
-                Collections.emptyList(), "t1", NONE, COLORS));
+        JSONObject o = new JSONObject(GhostText.json("claude", draft, partial, lengths, Collections.emptySet(),
+                Collections.emptyList(), false, null, Integer.MAX_VALUE, NONE, COLORS));
         assertEquals("claude", o.getString("kind"));
         assertEquals(0xFFCB6B, o.getJSONObject("colors").getInt("warn"));
         assertEquals(0xF07178, o.getJSONObject("colors").getInt("danger"));
@@ -36,22 +37,81 @@ public final class GhostTextTest {
         assertEquals("partial", d.getJSONObject(3).getString("s"));
     }
 
-    @Test public void queuedMessagesBecomeEchoesWithTheirState() throws Exception {
-        Outbox.Message queued = new Outbox.Message("a", "h", "t1", "b", "first\nline", 1, Outbox.State.QUEUED, false);
-        Outbox.Message unsure = new Outbox.Message("b", "h", "t1", "b", "second", 2, Outbox.State.UNSURE, false);
-        JSONObject o = new JSONObject(GhostText.json("codex", "", -1, new HashMap<>(),
-                Arrays.asList(queued, unsure), "t1", NONE, COLORS));
+    private static QueueView.Row row(String id, String text, String state, String style) {
+        return new QueueView.Row(id, QueueView.Kind.MESSAGE, text, state, style, true, Outbox.State.QUEUED);
+    }
+
+    @Test public void queueRowsBecomeEchoesWithTheirStateAtTheRightEnd() throws Exception {
+        java.util.List<QueueView.Row> rows = Arrays.asList(
+                row("a", "❯ first ⏎ line", "◌ queued 1st", "tag"),
+                row("b", "❯ second", "? may have been sent", "warn"));
+        JSONObject o = new JSONObject(GhostText.json("codex", "", -1, new HashMap<>(), Collections.emptySet(), rows,
+                true, null, 40, NONE, COLORS));
         JSONArray echoes = o.getJSONArray("echoes");
-        assertEquals("❯ first ⏎ line", echoes.getJSONArray(0).getJSONObject(0).getString("t"));
-        assertEquals("tag", echoes.getJSONArray(0).getJSONObject(1).getString("s"));
-        assertEquals("  may have been sent", echoes.getJSONArray(1).getJSONObject(1).getString("t"));
+        JSONArray first = echoes.getJSONArray(0);
+        assertEquals("❯ first ⏎ line", first.getJSONObject(0).getString("t"));
+        assertEquals("echo", first.getJSONObject(0).getString("s"));
+        // The state is right-aligned: the row is one cell short of the grid's width.
+        String state = first.getJSONObject(1).getString("t");
+        assertEquals("tag", first.getJSONObject(1).getString("s"));
+        assertEquals("◌ queued 1st", state.trim());
+        assertEquals(39, width(first));
         assertEquals("warn", echoes.getJSONArray(1).getJSONObject(1).getString("s"));
         assertEquals(0, o.getJSONArray("draft").length());
     }
 
+    @Test public void eachEchoCarriesItsRowsIdSoATapNeverLandsOnAnotherRow() throws Exception {
+        java.util.List<QueueView.Row> rows = Arrays.asList(
+                row("6f1c2a9e-0000-4000-8000-000000000001", "❯ first", "◌1", "tag"),
+                row("6f1c2a9e-0000-4000-8000-000000000002", "❯ second", "◌2", "tag"));
+        JSONObject o = new JSONObject(GhostText.json("claude", "", -1, new HashMap<>(), Collections.emptySet(), rows,
+                true, null, 40, NONE, COLORS));
+        JSONArray ids = o.getJSONArray("echoIds");
+        assertEquals(o.getJSONArray("echoes").length(), ids.length());
+        assertEquals("6f1c2a9e-0000-4000-8000-000000000001", ids.getString(0));
+        assertEquals("6f1c2a9e-0000-4000-8000-000000000002", ids.getString(1));
+        // No rows, no ids.
+        JSONObject none = new JSONObject(GhostText.json("claude", "", -1, new HashMap<>(), Collections.emptySet(),
+                Collections.emptyList(), true, null, 40, NONE, COLORS));
+        assertTrue(!none.has("echoIds"));
+    }
+
+    @Test public void aLongRowIsCutWithAnEllipsisAndASelectedRowIsBright() throws Exception {
+        QueueView.Row long_ = row("a", "❯ a long message that will not fit in the cover screen width", "◌1", "tag");
+        JSONArray cut = GhostText.row(long_, true, true, 30, new HashMap<>(), Collections.emptySet());
+        String words = cut.getJSONObject(0).getString("t");
+        assertTrue(words, words.endsWith("…"));
+        assertEquals("bright", cut.getJSONObject(0).getString("s"));
+        assertEquals(29, width(cut));
+        assertEquals("◌1", cut.getJSONObject(1).getString("t").trim());
+        // A closed queue's rows are dim, their state too.
+        JSONArray closed = GhostText.row(row("b", "❯ x", "✗ not sent", "danger"), false, false, 30, new HashMap<>(), Collections.emptySet());
+        assertEquals("tag", closed.getJSONObject(1).getString("s"));
+    }
+
+    @Test public void aChipInARowIsNeverCutInHalf() throws Exception {
+        Map<String, Long> lengths = new HashMap<>();
+        lengths.put("c-1", 12_000L);
+        QueueView.Row clip = row("c", "❯ check this " + DictationToken.of("c-1") + " and more words", "◌", "tag");
+        JSONArray cut = GhostText.row(clip, true, false, 24, lengths, Collections.emptySet());
+        for (int i = 0; i < cut.length(); i++) {
+            String t = cut.getJSONObject(i).getString("t");
+            if ("chip".equals(cut.getJSONObject(i).getString("s"))) assertTrue(t, t.startsWith("[") && t.endsWith("]"));
+        }
+    }
+
+    private static int width(JSONArray spans) throws Exception {
+        int n = 0;
+        for (int i = 0; i < spans.length(); i++) {
+            String t = spans.getJSONObject(i).getString("t");
+            n += t.codePointCount(0, t.length());
+        }
+        return n;
+    }
+
     @Test public void controlsCarryTheirIdsAndStyledWords() throws Exception {
-        JSONObject o = new JSONObject(GhostText.json("claude", "", -1, new HashMap<>(),
-                Collections.emptyList(), "t1", Arrays.asList(
+        JSONObject o = new JSONObject(GhostText.json("claude", "", -1, new HashMap<>(), Collections.emptySet(),
+                Collections.emptyList(), false, null, Integer.MAX_VALUE, Arrays.asList(
                         new GhostText.Control("talk", "● rec 0:06 · tap to stop", "danger"),
                         new GhostText.Control("send", "send", "bright", "·2", "info", "", "dim")),
                 COLORS));
@@ -74,7 +134,7 @@ public final class GhostTextTest {
         Map<String, Long> lengths = new HashMap<>();
         lengths.put("c-2", 124_600L);
         JSONObject o = new JSONObject(GhostText.json("claude", "see " + token, -1, lengths,
-                Collections.singleton("c-2"), Collections.emptyList(), "t1", NONE, COLORS));
+                Collections.singleton("c-2"), Collections.emptyList(), false, null, Integer.MAX_VALUE, NONE, COLORS));
         assertEquals("[2:04 not transcribed yet · retry]", o.getJSONArray("draft").getJSONObject(1).getString("t"));
     }
 
@@ -107,7 +167,8 @@ public final class GhostTextTest {
         String draft = "see " + token + " now";
         int inside = draft.indexOf(token) + 3;
         JSONArray d = new JSONObject(GhostText.json("claude", draft, GhostText.Marks.of(inside, inside, -1, -1),
-                new HashMap<>(), Collections.emptySet(), Collections.emptyList(), "t1", NONE, COLORS))
+                new HashMap<>(), Collections.emptySet(), Collections.emptyList(), false, null, Integer.MAX_VALUE,
+                NONE, COLORS))
                 .getJSONArray("draft");
         assertEquals("see ", d.getJSONObject(0).getString("t"));
         assertEquals("chip", d.getJSONObject(1).getString("s"));

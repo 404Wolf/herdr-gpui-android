@@ -402,6 +402,11 @@ public final class DictationFakes {
                     phone == null ? null : phone::start, TIMEOUTS, log::add);
         }
 
+        /** Recordings saved for the desktop (waiting, not transcribed). */
+        public int waitingClips() {
+            return store.untranscribed().size();
+        }
+
         /** Runs {@code work} on the engine's main thread and waits for it. */
         public <T> T onMain(Callable<T> work) throws Exception {
             return main.submit(work).get(10, TimeUnit.SECONDS);

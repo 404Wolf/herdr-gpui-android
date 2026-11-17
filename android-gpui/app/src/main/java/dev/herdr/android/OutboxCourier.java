@@ -109,6 +109,56 @@ final class OutboxCourier {
         changed();
     }
 
+    /**
+     * The composer's clear: the pane's messages, never one being sent, marked cleared until
+     * {@code until} and saved before returning; their ids, or null when the save failed (then
+     * nothing is cleared).
+     */
+    java.util.List<String> clearAll(String host, String pane, long until) {
+        java.util.List<String> ids = outbox.clearable(host, pane, System.currentTimeMillis());
+        return clear(ids, until) ? ids : null;
+    }
+
+    /**
+     * Marks these messages cleared until {@code until} (never one being sent) and saves that
+     * before returning; false when the save failed: then none is cleared.
+     */
+    boolean clear(java.util.Collection<String> ids, long until) {
+        java.util.List<String> marked = outbox.clear(ids, until);
+        if (marked.isEmpty()) return true;
+        if (!outbox.save()) {
+            outbox.unclear(marked);
+            return false;
+        }
+        changed();
+        return true;
+    }
+
+    /** One message cleared (a dropped row), saved; false when the save failed (nothing cleared). */
+    boolean clear(String id, long until) {
+        return clear(java.util.Collections.singletonList(id), until);
+    }
+
+    /**
+     * The clear's undo: the messages back in line at once; true when that is saved too. Not
+     * saved, they are still back here, the save is tried again on the courier's thread, and the
+     * caller keeps its record until a later call saves (a restart finds them cleared on disk).
+     */
+    boolean unclear(java.util.Collection<String> ids) {
+        boolean changed = outbox.unclear(ids);
+        if (changed) changed();
+        if (outbox.save()) return true;
+        thread.execute(outbox::save);
+        return false;
+    }
+
+    /** The undo window closed: the cleared messages go for good. */
+    void purgeCleared(java.util.Collection<String> ids) {
+        if (!outbox.purgeCleared(ids)) return;
+        thread.execute(outbox::save);
+        changed();
+    }
+
     String take(String id) {
         String text = outbox.take(id);
         if (text == null) return null;

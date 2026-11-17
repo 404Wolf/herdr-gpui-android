@@ -14,8 +14,10 @@ import org.json.JSONObject;
  * queued messages above the prompt. Pure: no views.
  */
 final class GhostText {
-    /** Queued messages shown above the prompt; the renderer keeps the newest that fit. */
+    /** Queue rows shown above the prompt; the renderer keeps the newest that fit. */
     static final int MAX_ECHOES = 6;
+    /** A row's words are cut, with an ellipsis, to leave its state room; never narrower than this. */
+    static final int MIN_ROW_TEXT = 8;
     /** The renderer refuses more; the composer's own bound is far lower. */
     static final int MAX_CHARS = 16_000;
 
@@ -62,23 +64,17 @@ final class GhostText {
     }
 
     /**
-     * @param partialFrom where an engine's revisable words start in {@code draft}, or -1
-     * @param lengths recording lengths by clip id, for chips
-     * @param reserve columns kept clear on rows from {@code reserveFrom} down
+     * As {@link #json(String, String, Marks, Map, java.util.Set, List, boolean, String, int, List, Colors)},
+     * with an engine's revisable words from {@code partialFrom} (or -1) as the only mark.
      */
     static String json(String kind, String draft, int partialFrom, Map<String, Long> lengths,
-            List<Outbox.Message> queued, String pane, List<Control> controls, Colors colors) {
-        return json(kind, draft, partialFrom, lengths, java.util.Collections.emptySet(), queued, pane, controls, colors);
-    }
-
-    /** @param parked recordings the desktop gave up on: their chips read "not transcribed yet · retry" */
-    static String json(String kind, String draft, int partialFrom, Map<String, Long> lengths,
-            java.util.Set<String> parked, List<Outbox.Message> queued, String pane, List<Control> controls,
+            java.util.Set<String> parked, List<QueueView.Row> rows, boolean open, String selected, int cols,
+            List<Control> controls,
             Colors colors) {
         String text = draft == null ? "" : draft;
         Marks marks = partialFrom >= 0 && partialFrom <= text.length()
                 ? new Marks(-1, -1, -1, partialFrom, text.length()) : Marks.NONE;
-        return json(kind, draft, marks, lengths, parked, queued, pane, controls, colors);
+        return json(kind, draft, marks, lengths, parked, rows, open, selected, cols, controls, colors);
     }
 
     /**
@@ -158,9 +154,18 @@ final class GhostText {
         return at;
     }
 
+    /**
+     * @param marks the keyboard's cursor, selection and composing word in {@code draft}, or an
+     *     engine's revisable words ({@link Marks})
+     * @param lengths recording lengths by clip id, for chips
+     * @param rows the queue's rows above the prompt ({@link QueueView}), oldest first
+     * @param open the queue is open (rows at full strength); closed, they are dim
+     * @param selected the row whose actions show (bright), or null
+     * @param cols the grid's width, to right-align each row's state; MAX_VALUE when unknown
+     */
     static String json(String kind, String draft, Marks marks, Map<String, Long> lengths,
-            java.util.Set<String> parked, List<Outbox.Message> queued, String pane, List<Control> controls,
-            Colors colors) {
+            java.util.Set<String> parked, List<QueueView.Row> rows, boolean open, String selected, int cols,
+            List<Control> controls, Colors colors) {
         try {
             JSONObject o = new JSONObject();
             o.put("kind", kind);
@@ -189,15 +194,15 @@ final class GhostText {
             }
             o.put("draft", spans);
             JSONArray echoes = new JSONArray();
-            int from = Math.max(0, queued.size() - MAX_ECHOES);
-            for (Outbox.Message message : queued.subList(from, queued.size())) {
-                JSONArray echo = new JSONArray();
-                spans(echo, QueuedMessages.PROMPT + QueuedMessages.oneLine(message.text), "echo", lengths, parked);
-                boolean unsure = message.state == Outbox.State.UNSURE || message.state == Outbox.State.GONE;
-                echo.put(span("  " + QueuedMessages.label(message, pane), unsure ? "warn" : "tag"));
-                echoes.put(echo);
+            JSONArray echoIds = new JSONArray();
+            int from = Math.max(0, rows.size() - MAX_ECHOES);
+            for (QueueView.Row row : rows.subList(from, rows.size())) {
+                echoes.put(row(row, open, row.id.equals(selected), cols, lengths, parked));
+                echoIds.put(row.id);
             }
             o.put("echoes", echoes);
+            // Taps come back as "echo-<id>": a row is found by its id, never by its place.
+            if (echoIds.length() > 0) o.put("echoIds", echoIds);
             return o.toString();
         } catch (JSONException impossible) {
             return "";
@@ -234,6 +239,44 @@ final class GhostText {
         int[] offsets = new int[out.size()];
         for (int i = 0; i < offsets.length; i++) offsets[i] = out.get(i);
         return offsets;
+    }
+
+    /**
+     * One queue row: its words (chips for dictations), cut to leave its state room, then the
+     * state at the right end. Closed, the row is dim; selected, bright.
+     */
+    static JSONArray row(QueueView.Row row, boolean open, boolean selected, int cols, Map<String, Long> lengths,
+            java.util.Set<String> parked) throws JSONException {
+        String textStyle = selected ? "bright" : "echo";
+        String stateStyle = open || selected ? row.stateStyle : "tag";
+        JSONArray words = new JSONArray();
+        spans(words, row.text, textStyle, lengths, parked);
+        int stateWidth = row.state.isEmpty() ? 0 : row.state.codePointCount(0, row.state.length()) + 2;
+        JSONArray out = new JSONArray();
+        int room = cols == Integer.MAX_VALUE ? Integer.MAX_VALUE : Math.max(MIN_ROW_TEXT, cols - stateWidth - 1);
+        int used = 0;
+        for (int i = 0; i < words.length(); i++) {
+            JSONObject w = words.getJSONObject(i);
+            String t = w.getString("t");
+            int n = t.codePointCount(0, t.length());
+            if (room != Integer.MAX_VALUE && used + n > room) {
+                int keep = Math.max(0, room - used - 1);
+                if ("chip".equals(w.getString("s"))) keep = 0; // a chip is never cut in half
+                String cut = t.substring(0, t.offsetByCodePoints(0, Math.min(keep, n)));
+                out.put(span(cut + "…", textStyle));
+                used += keep + 1;
+                break;
+            }
+            out.put(w);
+            used += n;
+        }
+        if (!row.state.isEmpty()) {
+            int pad = room == Integer.MAX_VALUE ? 2 : Math.max(2, cols - used - stateWidth + 2 - 1);
+            StringBuilder gap = new StringBuilder();
+            for (int i = 0; i < pad; i++) gap.append(' ');
+            out.put(span(gap + row.state, stateStyle));
+        }
+        return out;
     }
 
     /** {@code text} as spans of {@code style}, each dictation token a chip. */

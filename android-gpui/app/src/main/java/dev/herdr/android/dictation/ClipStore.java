@@ -322,14 +322,17 @@ final class ClipStore {
     /**
      * Counts an upload of {@code id} before it is sent, durably: the attempts after it, or -1
      * when the count could not be written (then the clip must not be sent: an upload the index
-     * does not know of could be repeated without end across restarts).
+     * does not know of could be repeated without end across restarts), or -2 when the clip may
+     * not be sent at all: parked (the cap) or held (the user cleared it). Checked here, at the
+     * moment of sending, so a pass whose list was made before a clear never uploads it.
      */
     synchronized int charge(String id) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
             if (!e.clip.id.equals(id) || e.text != null) continue;
             int n = e.attempts + 1;
-            if (e.parked()) return -1; // the cap: never a send past it
+            // Held (cleared by the user) or parked since the courier's list was made: not sent.
+            if (e.parked() || e.kept()) return -2;
             entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, e.parkedFlag));
             if (!save()) {
                 entries.set(i, e);
@@ -390,11 +393,90 @@ final class ClipStore {
         return out;
     }
 
-    /** Transcribed clips whose text the composer has not taken yet, oldest first. */
+    /** Transcribed clips whose text the composer has not taken yet, oldest first (held ones not). */
     synchronized List<Entry> transcribed() {
         List<Entry> out = new ArrayList<>();
-        for (Entry e : entries) if (e.text != null) out.add(e);
+        for (Entry e : entries) if (e.text != null && !e.kept()) out.add(e);
         return out;
+    }
+
+    /**
+     * Holds a clip whose place the user cleared (item 76): kept like a phone-transcribed one, never
+     * sent or offered, until {@link #release} or its {@link #KEEP_MS} run out. False if unknown.
+     */
+    synchronized boolean hold(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || e.kept()) continue;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, clock.getAsLong() + KEEP_MS, e.attempts, e.parkedFlag));
+            if (!save()) {
+                entries.set(i, e);
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Holds all of {@code ids} at once, in one index write: all held, or (the write failed) none,
+     * as before. Ids this store does not have, or already held, are left as they are.
+     */
+    synchronized boolean holdAll(java.util.Collection<String> ids) {
+        return changeAll(ids, true);
+    }
+
+    /**
+     * Undoes {@link #holdAll}, all at once, in one index write: all released (each back to how it
+     * was, waiting or parked), or none. A held clip whose audio is gone, with no text, stays held.
+     */
+    synchronized boolean releaseAll(java.util.Collection<String> ids) {
+        return changeAll(ids, false);
+    }
+
+    private boolean changeAll(java.util.Collection<String> ids, boolean hold) {
+        List<Entry> before = new ArrayList<>(entries);
+        boolean changed = false;
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!ids.contains(e.clip.id) || e.kept() == hold) continue;
+            if (!hold && e.text == null && !audio(e.clip.id).isFile()) continue;
+            long until = hold ? clock.getAsLong() + KEEP_MS : 0;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, until, e.attempts, e.parkedFlag));
+            changed = true;
+        }
+        if (!changed || save()) return true;
+        entries.clear();
+        entries.addAll(before);
+        return false;
+    }
+
+    /** Whether {@code id} is a clip this store has (in any state). */
+    synchronized boolean knows(String id) {
+        for (Entry e : entries) if (e.clip.id.equals(id)) return true;
+        return false;
+    }
+
+    /** Whether {@code id} is held (kept, not sent or offered). */
+    synchronized boolean isHeld(String id) {
+        for (Entry e : entries) if (e.clip.id.equals(id)) return e.kept();
+        return false;
+    }
+
+    /** Undoes {@link #hold}: the clip waits for the desktop (or to be placed) again. */
+    synchronized boolean release(String id) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (!e.clip.id.equals(id) || !e.kept()) continue;
+            if (e.text == null && !audio(id).isFile()) return false;
+            entries.set(i, new Entry(e.clip, e.bytes, e.text, 0, e.attempts, e.parkedFlag));
+            if (!save()) {
+                entries.set(i, e);
+                return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     /** Clips waiting or not yet placed; kept clips do not count. */

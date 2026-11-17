@@ -4619,7 +4619,60 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 note(message);
             }
 
-            @Override public void showQueue(java.util.List<Outbox.Message> messages) { queueSheet(messages); }
+            @Override public void showQueue(java.util.List<QueueView.Row> rows, java.util.List<Outbox.Message> messages) {
+                queueSheet(rows, messages);
+            }
+
+            @Override public String takeQueued(String id) { return outbox == null ? null : outbox.take(id); }
+
+            @Override public void resendQueued(String id) {
+                if (outbox != null) outbox.resend(id);
+            }
+
+            /** The host and pane on screen: what the composer's clear works on. */
+            private String[] onScreen() {
+                synchronized (stateLock) {
+                    String host = connection == null ? currentHostId : connection.hostId;
+                    String pane = connection == null ? "" : connection.paneId;
+                    return new String[] {host, pane};
+                }
+            }
+
+            @Override public java.util.List<String> clearableQueued() {
+                String[] at = onScreen();
+                if (outbox == null || at[0] == null) return java.util.Collections.emptyList();
+                return outbox.outbox().clearable(at[0], at[1], System.currentTimeMillis());
+            }
+
+            @Override public String queuedText(String id) {
+                return outbox == null ? null : outbox.outbox().text(id);
+            }
+
+            @Override public boolean clearQueued(java.util.List<String> ids, long until) {
+                return outbox != null && outbox.clear(ids, until);
+            }
+
+            @Override public boolean unclearQueued(java.util.List<String> ids) {
+                return outbox == null || outbox.unclear(ids);
+            }
+
+            @Override public void purgeCleared(java.util.List<String> ids) {
+                if (outbox != null) outbox.purgeCleared(ids);
+            }
+
+            @Override public boolean outboxLoaded() {
+                return outbox != null && outbox.outbox().loaded();
+            }
+
+            @Override public java.util.List<Outbox.Cleared> clearedQueued(long now) {
+                String[] at = onScreen();
+                if (outbox == null || at[0] == null) return java.util.Collections.emptyList();
+                return outbox.outbox().clearedOn(at[0], now);
+            }
+
+            @Override public java.util.List<String> liveQueuedTexts() {
+                return outbox == null ? java.util.Collections.emptyList() : outbox.outbox().liveTexts();
+            }
 
             @Override public void setGhost(String json) {
                 if (!hostStarted) return;
@@ -4774,35 +4827,57 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         composer.showQueued(host == null ? java.util.Collections.emptyList()
                 : outbox.outbox().shown(host, pane, System.currentTimeMillis()));
+        composer.setLinkDown(linkDownInputs());
     }
 
     /** The pane's queued messages, one row each; a row opens its actions. */
-    private void queueSheet(java.util.List<Outbox.Message> messages) {
-        if (messages.isEmpty()) return;
-        String pane;
-        synchronized (stateLock) {
-            pane = connection == null ? "" : connection.paneId;
-        }
-        ActionSheet sheet = new ActionSheet(this, chrome, QueuedMessages.title(messages.size()));
-        for (Outbox.Message message : messages) {
-            sheet.add(QueuedMessages.row(message, pane), () -> queuedActions(message));
+    /**
+     * The full list ("+N more"): every row of the pane's queue, messages and recordings alike,
+     * each with its actions; they go through the composer, so a drop is undoable as on the line.
+     */
+    private void queueSheet(java.util.List<QueueView.Row> rows, java.util.List<Outbox.Message> messages) {
+        if (rows.isEmpty()) return;
+        int waiting = 0;
+        for (QueueView.Row row : rows) if (row.kind != QueueView.Kind.SENT) waiting++;
+        ActionSheet sheet = new ActionSheet(this, chrome, QueuedMessages.title(waiting));
+        for (QueueView.Row row : rows) {
+            String line = row.state.isEmpty() ? row.text : row.text + "  " + row.state;
+            if (!row.actionable) {
+                sheet.add(line, () -> { });
+                continue;
+            }
+            Outbox.Message message = null;
+            for (Outbox.Message m : messages) if (m.id.equals(row.id)) message = m;
+            Outbox.Message m = message;
+            sheet.add(line, () -> rowActions(row, m));
         }
         sheet.show();
     }
 
-    /** What can be done with one queued message; an unsure one is resent only from here. */
-    private void queuedActions(Outbox.Message message) {
-        if (message.state == Outbox.State.SENDING) {
-            return;
+    /** What can be done with one row of the full list; an unsure message is resent only here. */
+    private void rowActions(QueueView.Row row, Outbox.Message message) {
+        ActionSheet sheet = new ActionSheet(this, chrome, row.text);
+        switch (row.kind) {
+            case MESSAGE:
+                if (message == null || message.state == Outbox.State.SENDING) return;
+                if (message.state == Outbox.State.UNSURE) {
+                    // The core may have typed it: look at the pane before sending it twice.
+                    sheet.add("Send again (check the pane first)", () -> composer.queueCommand(row.id, "again"));
+                }
+                sheet.add("Edit as draft", () -> composer.queueCommand(row.id, "edit"));
+                sheet.add("Copy", () -> ActionSheet.copy(this, "Message", message.text));
+                sheet.danger("Drop", () -> composer.queueCommand(row.id, "drop"));
+                break;
+            case PARKED:
+                sheet.add("Retry", () -> composer.queueCommand(row.id, "retry"));
+                sheet.danger("Drop", () -> composer.queueCommand(row.id, "drop"));
+                break;
+            case CLIP:
+                sheet.danger("Drop", () -> composer.queueCommand(row.id, "drop"));
+                break;
+            default:
+                return;
         }
-        ActionSheet sheet = new ActionSheet(this, chrome, QueuedMessages.PROMPT + QueuedMessages.oneLine(message.text));
-        if (message.state == Outbox.State.UNSURE) {
-            // The core may have typed it: look at the pane before sending it twice.
-            sheet.add("Send again (check the pane first)", () -> outbox.resend(message.id));
-        }
-        sheet.add("Edit as draft", () -> composer.takeBack(outbox.take(message.id)));
-        sheet.add("Copy", () -> ActionSheet.copy(this, "Message", message.text));
-        sheet.danger("Drop", () -> outbox.take(message.id));
         sheet.show();
     }
 
@@ -6345,7 +6420,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** The status line while the link is down; dense, in the crumb's own slot. Main thread. */
+    /** Input typed while reconnecting, waiting for the link: a row in the composer's queue. */
+    private int linkDownInputs() {
+        if (monitor == null || !monitor.reconnecting()) return 0;
+        synchronized (stateLock) {
+            return pendingInput.size();
+        }
+    }
+
     private void showLinkDown() {
+        if (composer != null) composer.setLinkDown(linkDownInputs());
         if (monitor == null || !monitor.reconnecting() || crumb == null) return;
         // The rail's machine row says offline too.
         refreshSidebar(false);

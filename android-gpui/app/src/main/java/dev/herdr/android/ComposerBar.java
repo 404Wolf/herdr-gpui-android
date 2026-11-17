@@ -62,8 +62,31 @@ final class ComposerBar {
         void hideKeyboard();
         /** A short status for the user; the connection stays as it is. */
         void notice(String message);
-        /** The Enter badge was tapped: list the pane's queued messages. */
-        void showQueue(List<Outbox.Message> messages);
+        /**
+         * The "+N more" row was tapped: list every row of the pane's queue (messages, waiting and
+         * parked recordings), each with its actions ({@link #queueCommand}).
+         */
+        void showQueue(List<QueueView.Row> rows, List<Outbox.Message> messages);
+        /** The user took one queued message back into the draft (edit); its text, or null. */
+        String takeQueued(String id);
+        /** "send again" on a message that may have been sent. */
+        void resendQueued(String id);
+        /** What the composer's clear takes: the pane's queued messages but one being sent. */
+        List<String> clearableQueued();
+        /** A queued message's text, cleared or not; null when there is none. */
+        String queuedText(String id);
+        /** Marks messages cleared until {@code until} (epoch ms), saved; false when that failed (none). */
+        boolean clearQueued(List<String> ids, long until);
+        /** The clear's undo: those messages back in line at once; true when that is saved too. */
+        boolean unclearQueued(List<String> ids);
+        /** The undo window closed: the cleared messages go for good. */
+        void purgeCleared(List<String> ids);
+        /** Whether the outbox has been read from disk. */
+        boolean outboxLoaded();
+        /** The host's messages cleared and still in their undo window. */
+        List<Outbox.Cleared> clearedQueued(long now);
+        /** The texts of every queued message not cleared (any pane). */
+        List<String> liveQueuedTexts();
         /**
          * Runs {@code granted} once the microphone may be used: at once when
          * RECORD_AUDIO is already granted, or after the user allows it.
@@ -103,8 +126,111 @@ final class ComposerBar {
     private final KeysOverlay keysOverlay;
     /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
     private final TargetStrip targets;
-    /** Recordings waiting for the desktop, counted after "talk". */
-    private int waiting;
+    /** Everything waiting to reach the pane, drawn as rows above the prompt (item 75). */
+    private final QueueView queue = new QueueView();
+    /** The queue's rows are open (tap "N queued"), and the row whose actions show. */
+    private boolean queueOpen;
+    private String selectedRow;
+    /** The rows as last drawn, oldest first: the renderer reports them as "echo-<row id>". */
+    private List<QueueView.Row> shownRows = Collections.emptyList();
+    /** Input typed while the link is down, waiting for it. */
+    private int linkDown;
+    /** The clear (✕) and its undo (item 76). */
+    private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
+        @Override public boolean cancelDictation() { return cancelDictationForClear(); }
+
+        @Override public String draftText() { return drafts.text(); }
+
+        @Override public void setDraft(String text) {
+            drafts.edit(text);
+            if (text.isEmpty()) transcribedOnPhone = false;
+            showText(text);
+        }
+
+        @Override public void restoreDraft(String text) {
+            String now = drafts.text();
+            String joined = now.trim().isEmpty() ? text : text.replaceAll("\\s+$", "") + " " + now;
+            drafts.edit(joined);
+            showText(joined);
+        }
+
+        @Override public List<String> clearable() { return host.clearableQueued(); }
+
+        @Override public String messageText(String id) { return host.queuedText(id); }
+
+        @Override public List<String> looseClips() {
+            List<String> ids = new java.util.ArrayList<>();
+            for (PendingClip clip : ComposerBar.this.looseClips()) ids.add(clip.id);
+            // Parked recordings the pane shows on their own are part of its queue too.
+            java.util.Set<String> placed = new java.util.HashSet<>(DictationToken.ids(drafts.text()));
+            for (Outbox.Message m : queuedMessages) placed.addAll(DictationToken.ids(m.text));
+            for (PendingClip clip : parkedHere()) if (!placed.contains(clip.id)) ids.add(clip.id);
+            return ids;
+        }
+
+        @Override public boolean holdClips(List<String> ids) { return Dictation.pending(context).hold(ids); }
+
+        @Override public boolean releaseClips(List<String> ids) { return Dictation.pending(context).release(ids); }
+
+        @Override public boolean clearMessages(List<String> ids, long until) {
+            if (!host.clearQueued(ids, until)) return false;
+            for (String id : ids) queue.forget(id);
+            return true;
+        }
+
+        @Override public boolean unclearMessages(List<String> ids) { return host.unclearQueued(ids); }
+
+        @Override public void purgeMessages(List<String> ids) { host.purgeCleared(ids); }
+
+        @Override public boolean outboxLoaded() { return host.outboxLoaded(); }
+
+        @Override public List<Outbox.Cleared> clearedMessages(long now) { return host.clearedQueued(now); }
+
+        @Override public List<String> liveTexts() {
+            List<String> out = new java.util.ArrayList<>(drafts.all());
+            out.addAll(host.liveQueuedTexts());
+            return out;
+        }
+
+        @Override public void retryLater() {
+            if (field == null) return;
+            field.removeCallbacks(reconcileClear);
+            field.postDelayed(reconcileClear, RETRY_CLEAR_MS);
+        }
+
+        @Override public boolean persist(String record) {
+            // Also from the constructor (a clear resumed after a restart), before the field exists.
+            if (field != null) field.removeCallbacks(saveDrafts);
+            return preferences.edit().putString(DRAFTS, drafts.encode()).putString(CLEAR_RECORD, record).commit();
+        }
+
+        @Override public void failed(String why) { host.notice(why); }
+    });
+    /** The clear's undo record (see {@link ClearUndo#encode}), so an undo outlives a restart. */
+    private static final String CLEAR_RECORD = "composer_clear";
+    /** After a write a clear or an undo needs failed: try again this much later. */
+    private static final long RETRY_CLEAR_MS = 2000;
+    private final Runnable reconcileClear = new Runnable() {
+        @Override public void run() {
+            clearing.reconcile(wall());
+            pushGhost();
+            scheduleQueueRefresh();
+        }
+    };
+
+    /** Wall-clock time: a clear's undo window outlives the process. */
+    private static long wall() {
+        return System.currentTimeMillis();
+    }
+
+    /** Redraws when an undo window closes or a "sent" row fades. */
+    private final Runnable refreshQueue = new Runnable() {
+        @Override public void run() {
+            clearing.reconcile(wall());
+            pushGhost();
+            scheduleQueueRefresh();
+        }
+    };
     /** When the microphone opened, for the clock in the controls; 0 while not recording. */
     private long recordingSince;
     /** In the keys' overlay: the keyboard typing straight into the program. */
@@ -203,6 +329,11 @@ final class ComposerBar {
         @Override public boolean persistNow() {
             return ComposerBar.this.persistNow();
         }
+
+        @Override public void abandonedClip(PendingClip clip) {
+            // A cleared session's recording was saved anyway: held, never placed (item 74).
+            Dictation.pending(context).hold(java.util.Collections.singletonList(clip.id));
+        }
     });
     /** The desktop said its final waits for a decode ("finishing…"), until the session ends. */
     private boolean finishing;
@@ -217,6 +348,8 @@ final class ComposerBar {
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         drafts.restore(preferences.getString(DRAFTS, ""));
+        // A clear made before a restart: its undo is still on offer within its window.
+        clearing.resume(preferences.getString(CLEAR_RECORD, ""), wall());
         field = createField();
         field.setVisibility(View.GONE);
         targets = new TargetStrip(context);
@@ -263,10 +396,9 @@ final class ComposerBar {
         return kind != null && !kind.isEmpty() && !SHELLS.contains(kind);
     }
 
-    /** Recordings waiting for the desktop, counted after "talk"; their lengths label their chips. */
+    /** Recordings waiting for the desktop changed: their lengths label their chips and rows. */
     void setWaiting(int count) {
         for (PendingClip clip : Dictation.pending(context).waiting()) clipLengths.put(clip.id, clip.durationMs);
-        waiting = Math.max(0, count);
         DraftChips.apply(field.getText(), chip());
         lastGhost = "";
         pushGhost();
@@ -352,6 +484,17 @@ final class ComposerBar {
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
     void showQueued(List<Outbox.Message> messages) {
         queuedMessages = messages;
+        queue.update(drafts.pane(), messages, android.os.SystemClock.uptimeMillis());
+        // The outbox changed (or was just read from disk): an interrupted clear or undo is put right.
+        clearing.reconcile(wall());
+        if (selectedRow != null) {
+            boolean still = false;
+            for (Outbox.Message m : messages) if (m.id.equals(selectedRow)) still = m.state != Outbox.State.SENDING;
+            for (PendingClip clip : looseClips()) if (clip.id.equals(selectedRow)) still = true;
+            for (PendingClip clip : parkedHere()) if (clip.id.equals(selectedRow)) still = true;
+            if (!still) selectedRow = null;
+        }
+        scheduleQueueRefresh();
         pushGhost();
     }
 
@@ -407,7 +550,8 @@ final class ComposerBar {
      * program's kind ("claude", "codex", another agent's), or "" for a shell.
      */
     void setPane(String paneId, String paneKind) {
-        boolean switched = !drafts.pane().equals(paneId == null ? "" : paneId);
+        String previous = drafts.pane();
+        boolean switched = !previous.equals(paneId == null ? "" : paneId);
         if (switched && keepsAcrossPaneSwitch(dictationState)) {
             // Keep the recording and its text: offline it finds its pane's draft later, by
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
@@ -423,6 +567,11 @@ final class ComposerBar {
         }
         String text = drafts.switchTo(paneId);
         if (switched) {
+            // An undo belongs to the pane it cleared; the rows to the pane on screen. The first
+            // pane after a start is no switch: a clear resumed from before it stays on offer.
+            if (clearing.endsOnPaneChange(previous, drafts.pane())) clearing.commit();
+            queueOpen = false;
+            selectedRow = null;
             transcribedOnPhone = false;
             nothingHeard = null;
             keysOpen = false;
@@ -681,7 +830,7 @@ final class ComposerBar {
         surface.getLocationInWindow(at);
         frame.getLocationInWindow(origin);
         float left = at[0] - origin[0], top = at[1] - origin[1];
-        // While typing too: "↓ hide" takes "type"'s place, and "talk" and "send" work.
+        // While typing too: "talk", "✕" and "send" work ("type" is left out).
         boolean showing = agent && !covered;
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
@@ -708,9 +857,12 @@ final class ComposerBar {
             return;
         }
         float right = layout.left + layout.cols * layout.cellWidth;
-        java.util.List<ControlTargets.Rect> rects = ControlTargets.layout(layout.controls, layout.left,
-                layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
-                recording(dictationState));
+        java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
+                layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
+                recording(dictationState)));
+        // The queue's rows above the prompt, while it is open: one target per row, its full width.
+        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.left, layout.top, layout.cellWidth,
+                layout.cellHeight, layout.cols));
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
             return;
@@ -730,10 +882,8 @@ final class ComposerBar {
             target.setOnClickListener(this::targetTapped);
             if ("send".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { setKeysOpen(!keysOpen); return true; });
-                target.setOnTouchListener((v, e) -> {
-                    if (e.getActionMasked() == MotionEvent.ACTION_DOWN) sendTouchX = e.getX() / density + rect.left;
-                    return false;
-                });
+            } else if ("clear".equals(rect.id)) {
+                target.setOnLongClickListener(v -> { tapClear(true); return true; });
             }
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
                     Math.round(rect.width() * density), Math.round(rect.height() * density), Gravity.TOP | Gravity.START);
@@ -749,39 +899,49 @@ final class ComposerBar {
         targets.setVisibility(View.VISIBLE);
     }
 
-    /** Where the last touch on "send" went down (dp, surface), to tell its count apart. */
-    private float sendTouchX = -1;
-
     private void targetTapped(View target) {
         String id = String.valueOf(target.getTag());
+        if (id.startsWith("echo-")) {
+            tapRow(id);
+            return;
+        }
+        if (id.startsWith("row-")) {
+            rowAction(id);
+            return;
+        }
         switch (id) {
             case "type": toggleTyping(); break;
-            case "clear": clearDraft(); break;
-            case "undo": undoClear(); break;
             case "talk": toggleDictation(); break;
-            case "retry": retryParked(); break;
-            case "send": {
-                // The count after "send" lists the queue; the word itself sends.
-                ControlTargets.Cells cells = null;
-                for (ControlTargets.Cells c : layout.controls) if (c.id.equals("send")) cells = c;
-                float countFrom = cells == null ? Float.MAX_VALUE
-                        : layout.left + (cells.end - sendCount) * layout.cellWidth - layout.cellWidth / 2;
-                if (sendCount > 0 && sendTouchX >= countFrom) host.showQueue(queuedMessages);
-                else enter();
+            case "send": enter(); break;
+            case "clear": tapClear(false); break;
+            case "undo":
+                clearing.undo(wall());
+                pushGhost();
+                scheduleQueueRefresh();
                 break;
-            }
+            case "queue":
+                queueOpen = !queueOpen;
+                selectedRow = null;
+                pushGhost();
+                break;
             default:
         }
     }
 
     private static String describe(String id) {
+        if (id.startsWith("echo-")) return "A queued message: tap for its actions";
         switch (id) {
             case "type": return "Type a message";
-            case "clear": return "Clear the message";
-            case "undo": return "Bring back the cleared message";
             case "talk": return "Dictate; tap again to stop";
-            case "retry": return "Send the recordings not transcribed yet to the desktop again";
+            case "row-retry": return "Send this recording to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
+            case "clear": return "Clear the message; tap again or hold to clear the queue too";
+            case "undo": return "Undo the clear";
+            case "queue": return "Show or hide what waits to be sent";
+            case "row-edit": return "Take this message back into the draft";
+            case "row-drop": return "Drop this message";
+            case "row-again": return "Send this message again";
+            case "row-back": return "Back";
             default: return id;
         }
     }
@@ -813,9 +973,6 @@ final class ComposerBar {
         fallback.setLayoutParams(params);
     }
 
-    /** Characters of the queued count drawn after "send" ("·2"), 0 when none. */
-    private int sendCount;
-
     /** Recordings the desktop gave up on (after {@code ClipStore.MAX_ATTEMPTS} uploads). */
     private java.util.Set<String> parkedIds() {
         java.util.Set<String> ids = new java.util.HashSet<>();
@@ -823,151 +980,208 @@ final class ComposerBar {
         return ids;
     }
 
-    /** The pane's parked recordings: in its draft, or recorded for it. */
-    private java.util.List<String> parkedHere() {
-        java.util.List<String> out = new java.util.ArrayList<>();
-        java.util.List<String> inDraft = DictationToken.ids(drafts.text());
+    /** The pane's parked recordings: recorded for it, or in its draft or queued messages. */
+    private List<PendingClip> parkedHere() {
+        java.util.Set<String> held = new java.util.HashSet<>(DictationToken.ids(drafts.text()));
+        for (Outbox.Message m : queuedMessages) held.addAll(DictationToken.ids(m.text));
+        List<PendingClip> out = new java.util.ArrayList<>();
         for (PendingClip clip : Dictation.pending(context).parked()) {
             // A recovered recording's pane is not known: it shows on every pane.
-            if (inDraft.contains(clip.id) || clip.target.isEmpty() || drafts.pane().equals(clip.target)) {
-                out.add(clip.id);
-            }
+            if (held.contains(clip.id) || clip.target.isEmpty() || drafts.pane().equals(clip.target)) out.add(clip);
         }
         return out;
-    }
-
-    /** "retry": the pane's parked recordings go back to waiting for the desktop. */
-    private void retryParked() {
-        java.util.List<String> ids = parkedHere();
-        for (String id : ids) Dictation.pending(context).retry(id);
-        if (!ids.isEmpty()) host.notice(ids.size() == 1 ? "Sending the recording to the desktop again"
-                : "Sending " + ids.size() + " recordings to the desktop again");
-        DraftChips.apply(field.getText(), chip());
-        pushGhost();
     }
 
     /** The controls drawn in the program's frame, for the current state and the grid's width. */
-    private java.util.List<GhostText.Control> controls() {
-        java.util.List<GhostText.Control> line = basicControls();
-        int parked = parkedHere().size();
-        return parked == 0 ? line : withRetry(line, parked);
-    }
-
-    /**
-     * {@code line} with "retry" after "talk" (or first): the parked recordings' chips say
-     * "not transcribed yet · retry", and this sends them again. Never left out while any is parked.
-     */
-    static java.util.List<GhostText.Control> withRetry(java.util.List<GhostText.Control> line, int parked) {
-        java.util.List<GhostText.Control> out = new java.util.ArrayList<>(line);
-        int at = 0;
-        for (int i = 0; i < out.size(); i++) if ("talk".equals(out.get(i).id)) at = i + 1;
-        out.add(at, new GhostText.Control("retry", parked == 1 ? "retry" : "retry " + parked, "warn"));
-        return out;
-    }
-
-    private java.util.List<GhostText.Control> basicControls() {
+    private java.util.List<GhostText.Control> controls(List<PendingClip> loose) {
         boolean dictates = dictation.isAvailable();
         int cols = layout == null ? Integer.MAX_VALUE : layout.cols;
-        // Room for "retry" when a recording is parked, so the line still fits.
-        if (cols != Integer.MAX_VALUE && !parkedHere().isEmpty()) cols -= "retry 9".length() + 3;
-        java.util.List<GhostText.Control> talks = dictates
+        long now = android.os.SystemClock.uptimeMillis();
+        Line in = new Line();
+        in.typing = typing;
+        in.talks = dictates
                 ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
                 : java.util.Collections.emptyList();
-        java.util.List<GhostText.Control> out = controls(typing, talks, queuedMessages, cols,
-                recording(dictationState), clearControl());
-        sendCount = 0;
-        for (GhostText.Control control : out) {
-            if ("send".equals(control.id) && control.spans.length > 2) sendCount = control.spans[2].length();
+        in.recording = recording(dictationState);
+        in.queued = QueueView.count(queuedMessages, loose, parkedHere(), linkDown);
+        in.queueStyle = queueStyle(queuedMessages, loose.size() + parkedHere().size(), linkDown);
+        in.expanded = queueOpen;
+        in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
+        if (clearing.open(wall()) && clearing.pane().equals(drafts.pane())) {
+            in.undoWide = clearing.label(false);
+            in.undoNarrow = clearing.label(true);
+        }
+        QueueView.Row selected = selectedRow == null ? null : row(selectedRow);
+        if (queueOpen && selected != null) in.rowActions = rowActions(selected);
+        return controls(in, cols);
+    }
+
+    /** The shown row with {@code id}, or null. */
+    private QueueView.Row row(String id) {
+        for (QueueView.Row r : shownRows) if (r.id.equals(id)) return r;
+        return null;
+    }
+
+    /**
+     * Recordings waiting for the desktop that belong to the pane on screen and that neither its
+     * draft nor a queued message holds: rows of their own in the queue.
+     */
+    private List<PendingClip> looseClips() {
+        String pane = drafts.pane();
+        java.util.Set<String> held = new java.util.HashSet<>(DictationToken.ids(drafts.text()));
+        for (Outbox.Message m : queuedMessages) held.addAll(DictationToken.ids(m.text));
+        List<PendingClip> out = new java.util.ArrayList<>();
+        for (PendingClip clip : Dictation.pending(context).waiting()) {
+            if (pane.equals(clip.target) && !held.contains(clip.id)) out.add(clip);
         }
         return out;
     }
 
-    /**
-     * Cells the renderer wants free beside the controls' line at the prompt,
-     * or it draws only "talk", cut to fit (gpui-rio ghost.rs, {@code place_all}).
-     */
-    static final int CONTROLS_MARGIN = 8;
-
-    /**
-     * "type ─ talk ─ send", made to fit {@code cols}: "type" is left out while
-     * the keyboard is up (its own hide key puts it away), "talk" is left out
-     * with no dictation, and "send" carries the queued count in the most
-     * pressing message's colour. {@code talks} are "talk"'s words from the
-     * fullest to the shortest, none without dictation. When the full line is
-     * too wide for the grid (the Fold's cover screen while recording), "talk"
-     * takes its short words, then "type", the count and "send" are left out
-     * in turn, and last "talk" takes its shortest words. "talk", the stop
-     * while recording, is never left out.
-     */
-    static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
-            List<Outbox.Message> queued, int cols) {
-        return controls(typing, talks, queued, cols, false, null);
+    /** Input typed while the link was down waits for it ({@code count}, 0 once it is back). */
+    void setLinkDown(int count) {
+        if (count == linkDown) return;
+        linkDown = Math.max(0, count);
+        pushGhost();
     }
 
-    static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
-            List<Outbox.Message> queued, int cols, boolean recording) {
-        return controls(typing, talks, queued, cols, recording, null);
+    /** The activity took a queued message out by the user's hand (the full list's sheet). */
+    void forgetQueued(String id) {
+        queue.forget(id);
+    }
+
+    /** Wakes up for the next undo window to close or "sent" row to fade. */
+    private void scheduleQueueRefresh() {
+        field.removeCallbacks(refreshQueue);
+        long up = android.os.SystemClock.uptimeMillis();
+        long sent = queue.nextChange(up);
+        long undo = clearing.until();
+        long delay = Long.MAX_VALUE;
+        if (sent != Long.MAX_VALUE) delay = sent - up;
+        if (undo != Long.MAX_VALUE) delay = Math.min(delay, undo - wall());
+        if (delay == Long.MAX_VALUE) return;
+        field.postDelayed(refreshQueue, Math.max(50, delay + 20));
     }
 
     /**
-     * The controls while {@code recording}: no "send", so the stop can take the
-     * bottom-right corner ({@link ControlTargets}) and no tap meant for it
-     * sends. Enter on the keyboard still stops and sends. {@code clear}
-     * ("clear" with a draft, "undo" just after one was cleared, else null)
-     * goes left of "talk", and gives way first on a narrow grid, after "type".
+     * The clear's first act (item 74): a dictation still recording or transcribing ends at once,
+     * its audio discarded, and nothing it would still say (a partial, the desktop's or the phone's
+     * final, a queued clip) lands in the draft afterwards; an Enter waiting on it is dropped.
      */
-    static java.util.List<GhostText.Control> controls(boolean typing, List<GhostText.Control> talks,
-            List<Outbox.Message> queued, int cols, boolean recording, GhostText.Control clear) {
-        GhostText.Control lead = typing ? null : new GhostText.Control("type", "type", "dim");
-        String count = queued.isEmpty() ? "" : "·" + QueuedMessages.badge(queued.size());
-        String countStyle;
-        switch (QueuedMessages.urgency(queued)) {
-            case GONE: countStyle = "danger"; break;
-            case WAITING: countStyle = "warn"; break;
-            default: countStyle = "info";
+    private boolean cancelDictationForClear() {
+        // One engine for the process (#30): only the session this window started is cancelled;
+        // another window's recording is its own.
+        return routing.cancelForClear(dictation, dictating() && Dictation.owns(this));
+    }
+
+    private void tapClear(boolean longPress) {
+        long now = wall();
+        boolean draftClearable = !drafts.text().trim().isEmpty() || dictating();
+        if (longPress) clearing.longPress(drafts.pane(), now);
+        else clearing.tap(drafts.pane(), draftClearable, now);
+        selectedRow = null;
+        pushGhost();
+        scheduleQueueRefresh();
+    }
+
+    /**
+     * A tap on a drawn row: {@code echo-<row id>}. Rows are found by their own id, so a tap on a
+     * row from a frame that has since changed acts on that row or on nothing, never on another.
+     */
+    private void tapRow(String echoId) {
+        QueueView.Row r = row(echoId.substring("echo-".length()));
+        if (r == null) return;
+        if (r.kind == QueueView.Kind.MORE) {
+            host.showQueue(allRows(), queuedMessages);
+            return;
         }
-        GhostText.Control send = recording ? null
-                : new GhostText.Control("send", "send", "bright", count, countStyle);
-        GhostText.Control bareSend = recording ? null : new GhostText.Control("send", "send", "bright");
-        GhostText.Control talk = talks.isEmpty() ? null : talks.get(0);
-        GhostText.Control shorter = talks.isEmpty() ? null : talks.get(Math.min(1, talks.size() - 1));
-        GhostText.Control shortest = talks.isEmpty() ? null : talks.get(talks.size() - 1);
-        java.util.List<java.util.List<GhostText.Control>> ladder = java.util.Arrays.asList(
-                line(lead, clear, talk, send),
-                line(lead, clear, shorter, send),
-                line(null, clear, shorter, send),
-                line(null, clear, shorter, bareSend),
-                line(lead, talk, send),
-                line(lead, shorter, send),
-                line(null, shorter, send),
-                line(null, shorter, bareSend),
-                line(null, shorter, null),
-                line(null, shortest, null));
-        java.util.List<GhostText.Control> barest = null;
-        for (java.util.List<GhostText.Control> line : ladder) {
-            if (line.isEmpty()) continue;
-            if (lineWidth(line) + CONTROLS_MARGIN <= cols) return line;
-            barest = line;
+        if (!queueOpen) {
+            queueOpen = true;
+        } else if (r.actionable) {
+            selectedRow = r.id.equals(selectedRow) ? null : r.id;
         }
-        return barest == null ? java.util.Collections.emptyList() : barest;
+        pushGhost();
     }
 
-    private static java.util.List<GhostText.Control> line(GhostText.Control... controls) {
-        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
-        for (GhostText.Control control : controls) if (control != null) out.add(control);
-        return out;
+    /** Every row of the pane's queue, none hidden behind "+N more". */
+    private List<QueueView.Row> allRows() {
+        return queue.all(drafts.pane(), queuedMessages, looseClips(), parkedHere(), linkDown,
+                layout == null ? Integer.MAX_VALUE : layout.cols, android.os.SystemClock.uptimeMillis());
+    }
+
+    /**
+     * A row's action from the full list ({@link Host#showQueue}): "edit", "drop", "again" or
+     * "retry" on the row with {@code id}.
+     */
+    void queueCommand(String id, String action) {
+        QueueView.Row r = null;
+        for (QueueView.Row row : allRows()) if (row.id.equals(id)) r = row;
+        if (r == null) return;
+        selectedRow = id;
+        shownRowsExtra = r;
+        rowAction("row-" + action);
+        shownRowsExtra = null;
+    }
+
+    /** A row from the full list, acted on though it is not drawn. */
+    private QueueView.Row shownRowsExtra;
+
+    private void rowAction(String action) {
+        QueueView.Row r = selectedRow == null ? null : row(selectedRow);
+        if (r == null && shownRowsExtra != null && shownRowsExtra.id.equals(selectedRow)) r = shownRowsExtra;
+        selectedRow = null;
+        if (r == null) {
+            pushGhost();
+            return;
+        }
+        long now = wall();
+        switch (action) {
+            case "row-again":
+                host.resendQueued(r.id);
+                break;
+            case "row-retry":
+                Dictation.pending(context).retry(r.id);
+                host.notice("Sending the recording to the desktop again");
+                break;
+            case "row-edit": {
+                queue.forget(r.id);
+                String text = host.takeQueued(r.id);
+                if (text != null) takeBack(text);
+                break;
+            }
+            case "row-drop":
+                if (r.kind == QueueView.Kind.CLIP || r.kind == QueueView.Kind.PARKED) {
+                    clearing.dropped(drafts.pane(), null, r.id, now);
+                } else if (r.kind == QueueView.Kind.MESSAGE) {
+                    clearing.dropped(drafts.pane(), r.id, null, now);
+                }
+                break;
+            default:
+        }
+        pushGhost();
+        scheduleQueueRefresh();
+    }
+
+    /** Cells the renderer wants free beside the controls' line (see {@link ControlLine#MARGIN}). */
+    static final int CONTROLS_MARGIN = ControlLine.MARGIN;
+
+    /** The line's state; see {@link ControlLine}. */
+    static final class Line extends ControlLine.State { }
+
+    static java.util.List<GhostText.Control> controls(Line in, int cols) {
+        return ControlLine.controls(in, cols);
+    }
+
+    static String queueStyle(List<Outbox.Message> queued, int clips, int linkDown) {
+        return ControlLine.queueStyle(queued, clips, linkDown);
+    }
+
+    static java.util.List<GhostText.Control> rowActions(QueueView.Row row) {
+        return ControlLine.rowActions(row);
     }
 
     /** Cells the renderer's line takes for {@code controls}: " a ─ b ─ c ──". */
     static int lineWidth(List<GhostText.Control> controls) {
-        if (controls.isEmpty()) return 0;
-        int width = 1 + 3 * (controls.size() - 1) + 3;
-        for (GhostText.Control control : controls) {
-            for (int i = 0; i + 1 < control.spans.length; i += 2) {
-                width += control.spans[i].codePointCount(0, control.spans[i].length());
-            }
-        }
-        return width;
+        return ControlLine.width(controls);
     }
 
     /** How many words "talk" may take: all of them, a narrow grid's, or a tiny grid's. */
@@ -1015,64 +1229,12 @@ final class ComposerBar {
                 return new GhostText.Control("talk", text, "warn");
             }
             default:
+                // "Nothing heard" (#31) stays; waiting recordings are counted by the queue control.
                 String said = nothingHeard == null || words == Words.TINY ? ""
                         : " " + nothingHeardWords(nothingHeard, words == Words.FULL);
                 return new GhostText.Control("talk", "talk", "dim",
-                        (transcribedOnPhone ? " offline" : "") + said + (waiting > 0 ? "·" + waiting : ""), "warn");
+                        (transcribedOnPhone ? " offline" : "") + said, "warn");
         }
-    }
-
-    /** How long "undo" stands in for "clear" after a clear. */
-    static final long UNDO_MS = 6000;
-    /** The draft "clear" took, while "undo" can bring it back; null otherwise. */
-    private String cleared;
-    /** The pane {@link #cleared} was taken from: undo never lands in another. */
-    private String clearedPane;
-
-    private final Runnable forgetCleared = () -> {
-        cleared = null;
-        pushGhost();
-    };
-
-    /**
-     * "clear" while there is a draft and no dictation runs (its words are on
-     * their way into the draft), "undo" for a moment after a clear, else none.
-     */
-    private GhostText.Control clearControl() {
-        return clearControl(drafts.text(), dictating(), cleared != null && drafts.pane().equals(clearedPane));
-    }
-
-    static GhostText.Control clearControl(String draft, boolean dictating, boolean undoable) {
-        if (dictating) return null;
-        if (draft != null && !draft.trim().isEmpty()) return new GhostText.Control("clear", "clear", "dim");
-        return undoable ? new GhostText.Control("undo", "undo", "info") : null;
-    }
-
-    /** "clear": the draft goes, saved at once; "undo" brings it back for a moment. */
-    private void clearDraft() {
-        if (dictating()) return;
-        String text = typing ? field.getText().toString() : drafts.text();
-        if (text.trim().isEmpty()) return;
-        cleared = text;
-        clearedPane = drafts.pane();
-        drafts.edit("");
-        showText("");
-        persistNow();
-        field.removeCallbacks(forgetCleared);
-        field.postDelayed(forgetCleared, UNDO_MS);
-    }
-
-    private void undoClear() {
-        field.removeCallbacks(forgetCleared);
-        String text = cleared;
-        cleared = null;
-        if (text == null || !drafts.pane().equals(clearedPane) || !drafts.text().isEmpty()) {
-            pushGhost();
-            return;
-        }
-        drafts.edit(text);
-        showText(text);
-        persistNow();
     }
 
     /** Hands the renderer the pane's draft, queued messages and controls, unless unchanged. */
@@ -1097,8 +1259,13 @@ final class ComposerBar {
             } else {
                 marks = GhostText.Marks.NONE;
             }
+            List<PendingClip> loose = looseClips();
+            int cols = layout == null ? Integer.MAX_VALUE : layout.cols;
+            long now = android.os.SystemClock.uptimeMillis();
+            shownRows = queue.rows(drafts.pane(), queuedMessages, loose, parkedHere(), linkDown, cols, queueOpen,
+                    selectedRow, now);
             json = GhostText.json(GhostText.kind(kind), draft, marks, clipLengths, parkedIds(),
-                    queuedMessages, drafts.pane(), controls(), GhostText.Colors.of(chrome));
+                    shownRows, queueOpen, selectedRow, cols, controls(loose), GhostText.Colors.of(chrome));
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;
@@ -1286,6 +1453,7 @@ final class ComposerBar {
         transcribedOnPhone = false;
         nothingHeard = null;
         desktopError = false;
+        clearing.commit();
         final String pane = drafts.pane();
         routing.forget();
         Dictation.own(this);

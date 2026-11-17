@@ -50,6 +50,9 @@ final class DictationRouting {
         default boolean persistNow() {
             return true;
         }
+
+        /** A cleared session's recording was kept for later anyway: hold it, never place it. */
+        default void abandonedClip(PendingClip clip) { }
     }
 
     /** What the composer's Enter does in a dictation state ({@link #onEnter}). */
@@ -79,6 +82,8 @@ final class DictationRouting {
     private final Bar bar;
     /** The pane an Enter was pressed in while a session was finishing; null for none. */
     private String enterPane;
+    /** Bumped by {@link #abandon}: listeners made before it say nothing more. */
+    private int generation;
 
     DictationRouting(ComposerDrafts drafts, Bar bar) {
         this.drafts = drafts;
@@ -100,10 +105,42 @@ final class DictationRouting {
         enterPane = null;
     }
 
+    /**
+     * The user cleared the session (item 76): whatever its listener still hears, a partial, a
+     * final from the desktop or the phone, a queued clip, lands nowhere (item 74), and no Enter
+     * waits on it.
+     */
+    void abandon() {
+        generation++;
+        enterPane = null;
+    }
+
+    /**
+     * The composer's clear (items 74, 76): a session still recording or transcribing
+     * ({@code dictating}) is cancelled, its audio discarded, its partial withdrawn from the draft,
+     * and nothing it would still say lands anywhere; an Enter waiting on it is dropped. True when
+     * a session was cancelled.
+     */
+    boolean cancelForClear(DictationEngine engine, boolean dictating) {
+        abandon();
+        if (!dictating) return false;
+        engine.cancel();
+        drafts.dictationCancelled();
+        bar.setDictationState(DictationEngine.State.IDLE);
+        return true;
+    }
+
     /** The callbacks of a session started in {@code pane}. */
     DictationEngine.Listener listener(String pane) {
+        final int born = generation;
         return new DictationEngine.Listener() {
+            /** Abandoned: nothing of this session reaches the draft or the screen any more. */
+            private boolean gone() {
+                return born != generation;
+            }
+
             @Override public void onPartial(String text) {
+                if (gone()) return;
                 if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPartial(text));
             }
 
@@ -119,6 +156,7 @@ final class DictationRouting {
             }
 
             @Override public void onFinal(String text, boolean onDevice) {
+                if (gone()) return;
                 if (onDevice) {
                     bar.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
                 }
@@ -136,6 +174,11 @@ final class DictationRouting {
             }
 
             @Override public void onPending(PendingClip clip) {
+                if (gone()) {
+                    // Cleared while it was saving: the recording is held, never placed.
+                    bar.abandonedClip(clip);
+                    return;
+                }
                 bar.clipLength(clip.id, clip.durationMs);
                 // Elsewhere its chip is already in its pane's draft; the text finds it later.
                 if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPending(clip.id));
@@ -148,6 +191,7 @@ final class DictationRouting {
             }
 
             @Override public void onState(DictationEngine.State state) {
+                if (gone()) return;
                 bar.setDictationState(state);
             }
 
@@ -156,6 +200,7 @@ final class DictationRouting {
             }
 
             @Override public void onError(DictationException error) {
+                if (gone()) return;
                 forget();
                 bar.setDictationState(DictationEngine.State.IDLE);
                 if (pane.equals(drafts.pane())) bar.showText(drafts.dictationEnded());

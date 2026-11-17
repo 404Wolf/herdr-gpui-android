@@ -301,6 +301,100 @@ public final class OutboxTest {
         assertEquals("see the words", reopened().shown("h", "t1", 2).get(0).text);
     }
 
+    @Test public void clearMarksThePanesQueueButNeverAMessageBeingSentAndUndoPutsItBackInOrder() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1", "t2"));
+        Outbox.Message going = outbox.add("h", "t1", "going", 1);
+        Outbox.Message a = outbox.add("h", "t1", "a", 2);
+        Outbox.Message b = outbox.add("h", "t1", "b", 3);
+        Outbox.Message other = outbox.add("h", "t2", "other pane", 4);
+        assertTrue(outbox.sending(going.id));
+        long until = System.currentTimeMillis() + 60_000;
+        List<String> cleared = outbox.clearAll("h", "t1", until, 5);
+        assertEquals(Arrays.asList(a.id, b.id), cleared);
+        assertEquals(Arrays.asList(going.id), ids(outbox.shown("h", "t1", 5)));
+        assertEquals(Arrays.asList(other.id), ids(outbox.shown("h", "t2", 5)));
+        assertEquals("cleared ones are not counted", 2, outbox.waiting("h"));
+        // Never sent while cleared, even when the one being sent is done.
+        outbox.settle(going.id, Outbox.Outcome.SENT, 6);
+        Outbox.Message next = outbox.next("h", 6);
+        assertEquals(other.id, next.id);
+        // Typed after the clear, then undone: the cleared ones are back in their place.
+        Outbox.Message later = outbox.add("h", "t1", "later", 7);
+        assertTrue(outbox.unclear(cleared));
+        assertEquals(Arrays.asList(a.id, b.id, later.id), ids(outbox.shown("h", "t1", 8)));
+        // A second undo changes nothing.
+        assertFalse(outbox.unclear(cleared));
+    }
+
+    @Test public void aMessagePickedForSendingBeforeItWasClearedIsRefusedAtDispatch() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        Outbox.Message m = outbox.add("h", "t1", "must not send", 1);
+        Outbox.Message picked = outbox.next("h", 2);
+        assertEquals(m.id, picked.id);
+        outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 3);
+        assertFalse(outbox.sending(picked.id));
+        assertEquals(Outbox.State.QUEUED, outbox.cleared(Arrays.asList(m.id), 4).get(0).state);
+        // Undone, it goes as usual.
+        outbox.unclear(Arrays.asList(m.id));
+        assertTrue(outbox.sending(m.id));
+    }
+
+    @Test public void aClearedMessageStaysClearedAcrossARestartAndCanStillBeUndone() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        Outbox.Message a = outbox.add("h", "t1", "keep me recoverable", 1);
+        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 2);
+        assertTrue(outbox.save());
+        Outbox after = reopened();
+        after.ready("h", "b1", panes("t1"));
+        assertTrue("not shown after a restart", after.shown("h", "t1", 3).isEmpty());
+        assertNull("never sent after a restart", after.next("h", 3));
+        assertEquals("but still there for the undo", 1, after.cleared(cleared, 3).size());
+        assertTrue(after.unclear(cleared));
+        assertEquals(Arrays.asList(a.id), ids(after.shown("h", "t1", 4)));
+    }
+
+    @Test public void aClearedMessageWhoseWindowPassedStaysHiddenAfterARestartUntilPurged() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        outbox.add("h", "t1", "an undo may still want me", 1);
+        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() - 1, 2);
+        assertTrue(outbox.save());
+        Outbox after = reopened();
+        after.ready("h", "b1", panes("t1"));
+        assertTrue(after.shown("h", "t1", 3).isEmpty());
+        assertNull(after.next("h", 3));
+        assertEquals(0, after.waiting("h"));
+        assertEquals("kept for an undo accepted before the restart", 1, after.cleared(cleared, 3).size());
+        assertTrue(after.purgeCleared(cleared));
+        assertTrue(after.cleared(cleared, 3).isEmpty());
+    }
+
+    @Test public void theWindowClosingPurgesTheClearedMessages() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        outbox.add("h", "t1", "x", 1);
+        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 2);
+        assertTrue(outbox.purgeCleared(cleared));
+        assertFalse(outbox.unclear(cleared));
+        assertTrue(outbox.cleared(cleared, 3).isEmpty());
+    }
+
+    @Test public void anUnsureMessageComesBackUnsure() {
+        Outbox outbox = fresh();
+        outbox.ready("h", "b1", panes("t1"));
+        Outbox.Message u = outbox.add("h", "t1", "maybe", 1);
+        assertTrue(outbox.sending(u.id));
+        outbox.settle(u.id, Outbox.Outcome.UNSURE, 2);
+        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 3);
+        assertEquals(1, cleared.size());
+        outbox.unclear(cleared);
+        assertEquals(Outbox.State.UNSURE, outbox.shown("h", "t1", 5).get(0).state);
+        assertNull("still never resent on its own", outbox.next("h", 5));
+    }
+
     private static List<String> ids(List<Outbox.Message> messages) {
         List<String> out = new ArrayList<>();
         for (Outbox.Message m : messages) out.add(m.id);

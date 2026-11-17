@@ -184,6 +184,30 @@ On 15 November 2026 one 124.6 s clip was uploaded four times in two minutes. Eac
 - **After stop the desktop may say** `{"type":"status","state":"finishing","tail_s":12.3}`. `talk` then reads `finishing…`, and the final follows; it is not an error.
 - Tests: `NoLostAudioTest` covers a kill mid-session, an orphan, a full disk, a failed final store, and a crash while storing. `CourierDegradedTest` covers the 124.6 s replay (3 sends at most, growing gaps, one final, audio deleted only after it), sessions on the CPU never cutting the wait short, resuming on the GPU, a manual retry, and the upload protocol against a fake desktop.
 
+## Clearing a dictation (items 74, 76)
+
+The prompt line's `✕` clears the draft. While a dictation is recording or transcribing, it also cancels the dictation for good:
+- the engine is cancelled and the routing listener abandoned, so no partial, final (desktop or phone) or queued clip of that session lands afterwards;
+- an Enter waiting on it is dropped;
+- the draft returns to what it was before the dictation began.
+
+Recordings whose place is cleared are held. That covers chips in the draft or in cleared queued messages, and, when the queue is cleared, the pane's loose waiting and parked recordings. Held recordings are quarantined like rescue audio: never sent or placed. The courier checks the hold again when it is about to send each clip (`ClipStore.charge` refuses a held or parked clip). A pass that began before the clear therefore never uploads one.
+
+`undo` brings the draft, the messages and the recordings back as they were (parked ones stay parked). It lasts 5 s, or 8 s after clearing the queue too.
+
+A clear survives being killed at any step. Each write that makes the next step safe lands first, and `ClearUndo.reconcile` (after the outbox is read, on every outbox change, and soon after a failed write) puts right whatever a crash between steps left:
+
+- **A queue clear or a drop** first saves its intent in the record: the message and recording ids it is about to take. After a crash, reconcile finishes the step if its messages were cleared on disk (any pane's, GONE rows too). Otherwise it gives the recordings back, loose ones included.
+- **Clearing** holds the recordings first (one index write for all of them, all or none). Then it marks the messages cleared in the outbox (`clearedUntil`: kept, never sent, shown or counted). Last comes the undo record (`composer_clear`: pane, deadline, draft text, ids), written together with the emptied draft in one preferences commit.
+  - Killed after the holds: the draft and messages still have their chips, and reconcile lets those recordings go.
+  - Killed after the messages: they are cleared on disk with no record. Reconcile adopts them into the window, so undo still brings them back.
+- **Undo** writes the record, marked undone, together with the restored draft. If that write fails, the undo fails, says so, and stays on offer. Then the messages and recordings come back. Until those are saved too, the record stays, and reconcile finishes it (soon, or after a restart). A new clear waits until it is done.
+- **Always:** a recording a live draft or message holds is never held, so a refused or interrupted clear never strands a chip on held audio.
+- **A message the sender picked before the clear** is refused at dispatch: `Outbox.sending` checks `clearedUntil`.
+- **After a restart** the first pane shown is no pane switch: a resumed undo stays on offer. Past its window, the clear is finished. Expired cleared messages are dropped by reconcile, after any accepted undo was applied, not when the outbox is read.
+
+The queue UI and its gestures are described in the PR (#20) and `QueueView`/`ClearUndo`.
+
 ## Why this design: measurements (11 November 2026)
 
 Clips: 73 LibriSpeech dev-clean utterances (8 min, 6.6 s mean); 3 of the same

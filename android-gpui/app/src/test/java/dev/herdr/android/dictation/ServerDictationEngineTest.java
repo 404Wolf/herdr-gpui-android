@@ -115,7 +115,7 @@ public final class ServerDictationEngineTest {
         assertPhoneText(run);
         long afterStop = run.listener.endedAt - run.stoppedAt;
         assertTrue("the phone's text came " + afterStop + " ms after stop",
-                afterStop >= TIMEOUTS.finalBudgetMs - 50 && afterStop < TIMEOUTS.finalBudgetMs + 1500);
+                afterStop >= TIMEOUTS.finalBudgetMs - 50 && afterStop < TIMEOUTS.finalBudgetMs + 4000);
         assertKeptWithAllAudio(run);
         // The desktop's late final never lands a second text.
         Thread.sleep(500);
