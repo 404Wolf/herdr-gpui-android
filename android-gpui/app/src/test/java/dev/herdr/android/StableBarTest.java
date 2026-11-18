@@ -400,4 +400,52 @@ public final class StableBarTest {
             }
         }
     }
+
+    @Test public void wolfAsks1And4_theDraftAndTheOpenQueueBothKeepTheirCells() {
+        // #34 and #35 together, the renderer's layouts on the 46 x 23 cover screen: Claude busy, so
+        // the draft is at the host's own prompt on row 20 (a rule on 19), the queue open above it
+        // with a row selected on 18 (its actions at its right end) and an older one on 17, the
+        // controls on 21. Recording, the stop grows up past the draft's rows towards the queue;
+        // "✕" pads up into the draft's row. Every target gives up both: the draft's cells (ask 1)
+        // and the queue's rows (ask 4).
+        List<ControlTargets.Cells> bar = cells("clear 21 15 16; queue 21 19 22; type 21 25 29; talk 21 32 36;"
+                + " gap-send 21 39 43");
+        List<ControlTargets.Cells> echoes = cells("echo-old 17 0 9; echo-m 18 0 27");
+        List<ControlTargets.Cells> actions = cells("row-edit 18 28 32; row-drop 18 35 39; row-back 18 42 46");
+        List<ControlTargets.Cells> queueRows = new ArrayList<>(echoes);
+        queueRows.addAll(actions);
+        int[][] draft = {{20, 0, 14}};
+        float cw = 5.9f, left = 3.25f, top = 1.75f;
+        int cols = 46, rows = 23, topRow = 20;
+        boolean draftMatters = false, rowsMatter = false;
+        for (float ch : new float[] {14, 18, 22, 28}) {
+            for (boolean recording : new boolean[] {true, false}) {
+                String what = ch + " dp rows" + (recording ? ", recording" : "");
+                float bottom = top + rows * ch, right = left + cols * cw;
+                List<ControlTargets.Rect> rowTargets = ControlTargets.rows(echoes, actions, left, top, cw, ch, cols);
+                ControlTargets.Rect draftCells = new ControlTargets.Rect("draft", left + draft[0][1] * cw,
+                        top + draft[0][0] * ch, left + draft[0][2] * cw, top + (draft[0][0] + 1) * ch, 0, 0);
+                for (ControlTargets.Rect b : ControlTargets.layout(bar, left, top, cw, ch, topRow, bottom, right,
+                        recording, draft, queueRows)) {
+                    assertFalse(what + ": " + b.id + " covers the draft", overlap(b, draftCells));
+                    for (ControlTargets.Rect r : rowTargets) {
+                        assertFalse(what + ": " + b.id + " overlaps " + r.id, overlap(r, b));
+                    }
+                    assertTrue(what + ": " + b.id + " keeps its words", b.left <= b.labelLeft
+                            && b.right >= b.labelRight && b.top <= top + 21 * ch && b.bottom >= top + 22 * ch);
+                }
+                // Neither exclusion stands in for the other: with only one, the other is crossed.
+                for (ControlTargets.Rect b : ControlTargets.layout(bar, left, top, cw, ch, topRow, bottom, right,
+                        recording, draft)) {
+                    for (ControlTargets.Rect r : rowTargets) rowsMatter |= overlap(r, b);
+                }
+                for (ControlTargets.Rect b : ControlTargets.layout(bar, left, top, cw, ch, topRow, bottom, right,
+                        recording, queueRows)) {
+                    draftMatters |= overlap(b, draftCells);
+                }
+            }
+        }
+        assertTrue("without the queue's rows the stop would take a row's tap", rowsMatter);
+        assertTrue("without the draft's spans a control would take the draft's tap", draftMatters);
+    }
 }
