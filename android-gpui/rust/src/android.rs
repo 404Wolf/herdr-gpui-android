@@ -561,6 +561,18 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeHold(
     model::mailbox().hold(generation);
 }
 
+/// A reconnect to the pane already on screen: as `nativeHold`, and that
+/// frame's links still open under the new generation.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeHoldSamePane(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    generation: jlong,
+) {
+    model::mailbox().hold_same_pane(generation);
+}
+
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeRequestKeyboard(

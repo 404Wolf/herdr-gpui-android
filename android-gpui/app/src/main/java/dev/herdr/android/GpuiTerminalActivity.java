@@ -2042,7 +2042,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
             // A saved pane on screen stays, like a resumed frame, until this one paints.
             if (next.resumed || host.id.equals(savedShownHost)) {
-                nativeHold(next.generation);
+                // The same pane's frame keeps its links tappable; another pane's opens nothing.
+                if (next.resumed && pane != null && pane.equals(previous.paneId)) nativeHoldSamePane(next.generation);
+                else nativeHold(next.generation);
                 if (imeSession > 0) nativeSetImeSession(next.generation, imeSession);
             } else nativeSetActive(next.generation, false);
             publish(next, "Connecting to " + host.name + "…");
@@ -6834,6 +6836,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native String nativeCopyText(long generation);
     private static native void nativeSetActive(long generation, boolean active);
     private static native void nativeHold(long generation);
+    private static native void nativeHoldSamePane(long generation);
     private static native void nativeSetFollow(long generation, boolean follow);
     private static native void nativeShowKeyboard(long generation);
     private static native String nativeTakeCommand(long generation);

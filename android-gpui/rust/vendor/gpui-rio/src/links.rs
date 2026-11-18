@@ -195,7 +195,11 @@ pub fn link_at(rows: &[Row], row: usize, col: usize) -> Option<Found> {
 
 /// The link at index `at` of a logical line, mapped back to row spans.
 fn found_in(text: &[char], origin: &[(usize, usize)], at: usize) -> Option<Found> {
-    let (range, link) = markdown_in(text, at).or_else(|| link_in(text, at))?;
+    let (range, link) = markdown_in(text, at)
+        .or_else(|| link_in(text, at).map(|found| cut_at_closing_edge(text, origin, found)))?;
+    if !range.contains(&at) {
+        return None;
+    }
     let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
     for &(r, c) in &origin[range] {
         match spans.last_mut() {
@@ -204,6 +208,40 @@ fn found_in(text: &[char], origin: &[(usize, usize)], at: usize) -> Option<Found
         }
     }
     Some(Found { link, spans })
+}
+
+/// A URL read across rows ends at a row's last character when that is a
+/// bracket closing one the URL never opened: a markdown link's `)` (or a
+/// parenthesised URL's) at the edge, with prose going on below. Brackets the
+/// URL opened itself (`…_(b)` at the edge, `/tail` below) are its own.
+fn cut_at_closing_edge(
+    text: &[char],
+    origin: &[(usize, usize)],
+    (range, link): (Range<usize>, Link),
+) -> (Range<usize>, Link) {
+    if !matches!(link, Link::Web(_)) {
+        return (range, link);
+    }
+    let mut depth = [0usize; 3];
+    for i in range.clone() {
+        let kind = match text[i] {
+            '(' | ')' => 0,
+            '[' | ']' => 1,
+            '{' | '}' => 2,
+            _ => continue,
+        };
+        if matches!(text[i], '(' | '[' | '{') {
+            depth[kind] += 1;
+        } else if depth[kind] > 0 {
+            depth[kind] -= 1;
+        } else if i + 1 < range.end && origin[i].0 != origin[i + 1].0 {
+            let head: String = text[range.start..i].iter().collect();
+            let url = trim_url(&head);
+            let end = range.start + url.chars().count();
+            return (range.start..end, Link::Web(url.to_owned()));
+        }
+    }
+    (range, link)
 }
 
 /// How row `a` continues onto row `b`, if it does.
@@ -243,11 +281,6 @@ fn joins(a: &Row, b: &Row) -> Option<Join> {
         return None;
     }
     let word: String = chars[word_start..end].iter().collect();
-    // A closing bracket at the edge ends a link (a markdown link's `)`, a
-    // parenthesised URL): the next row is prose again.
-    if matches!(chars[end - 1], ')' | ']' | '}') {
-        return None;
-    }
     let margin = chars[..word_start]
         .iter()
         .all(|c| c.is_whitespace() || BORDERS.contains(c));
@@ -263,20 +296,25 @@ fn joins(a: &Row, b: &Row) -> Option<Join> {
         return None;
     }
     // A row that is one word (a continuation itself), or a word that starts a
-    // URL or a path, or one whose scheme the break split (`[text](http` then
-    // `s://…`); prose that happens to reach the edge never joins.
-    let split_scheme = || {
+    // URL or a path, or one the break split inside a scheme (`[text](http`
+    // then `s://…`) or a markdown link's `](` (`[the docs]` then `(https…`);
+    // prose that happens to reach the edge never joins.
+    let split = || {
         let joined: String = word
             .chars()
             .chain(b.chars[next_start..next_end].iter().copied())
             .collect();
         SCHEMES.iter().any(|scheme| {
-            joined
-                .match_indices(scheme)
-                .any(|(at, _)| at < word.len() && at + scheme.len() > word.len())
+            [scheme.to_string(), format!("]({scheme}")]
+                .iter()
+                .any(|marker| {
+                    joined
+                        .match_indices(marker.as_str())
+                        .any(|(at, _)| at < word.len() && at + marker.len() > word.len())
+                })
         })
     };
-    if !(margin || word.contains("://") || word.contains('/') || split_scheme()) {
+    if !(margin || word.contains("://") || word.contains('/') || split()) {
         return None;
     }
     Some(Join { end, next_start })
@@ -985,6 +1023,57 @@ mod wolf_ask_links {
         // Prose beside it is not a link.
         assert_eq!(at(&session, 1, 2), None);
         assert_eq!(at(&session, 1, 16), None);
+    }
+
+    /// `text` padded with spaces to the 48 columns of the captured grid.
+    fn row48(text: &str) -> Row {
+        Row::new(&format!("{text:<48}"), false)
+    }
+
+    #[test]
+    fn wolf_ask_links_a_url_whose_own_brackets_end_a_row_goes_on_below() {
+        // Review of #39: a row-final `)` the URL opened itself is not its end
+        // (phone-feedback read this right; the first cut of #39 dropped /tail).
+        let first = format!("  https://x.dev/{}_(b)", "a".repeat(28));
+        assert_eq!(first.chars().count(), 48);
+        let rows = [row48(&first), row48("  /tail next")];
+        let url = Link::Web(format!("https://x.dev/{}_(b)/tail", "a".repeat(28)));
+        for (row, col) in [(0, 2), (0, 30), (0, 47), (1, 2), (1, 6)] {
+            assert_eq!(
+                link_at(&rows, row, col).map(|f| f.link),
+                Some(url.clone()),
+                "row {row} column {col}"
+            );
+        }
+        assert_eq!(link_at(&rows, 1, 9), None, "the prose after it");
+    }
+
+    #[test]
+    fn wolf_ask_links_a_markdown_link_split_at_its_brackets_opens_from_both_rows() {
+        let url = Link::Web("https://x.dev/a_(b)".into());
+        // `[the docs]` ends a row, `(https://…)` starts the next.
+        let label = format!("{}see [the docs]", " ".repeat(34));
+        let rows = [row48(&label), row48("  (https://x.dev/a_(b)) next")];
+        for (row, col) in [(0, 38), (0, 39), (0, 43), (0, 47), (1, 2), (1, 10), (1, 22)] {
+            assert_eq!(
+                link_at(&rows, row, col).map(|f| f.link),
+                Some(url.clone()),
+                "row {row} column {col}"
+            );
+        }
+        assert_eq!(link_at(&rows, 0, 35), None, "the prose before it");
+        assert_eq!(link_at(&rows, 1, 25), None, "the prose after it");
+        // `[the docs](` ends a row, the URL starts the next.
+        let label = format!("{}see [the docs](", " ".repeat(33));
+        let rows = [row48(&label), row48("  https://x.dev/a_(b)) next")];
+        for (row, col) in [(0, 38), (0, 47), (1, 2), (1, 21)] {
+            assert_eq!(
+                link_at(&rows, row, col).map(|f| f.link),
+                Some(url.clone()),
+                "row {row} column {col}"
+            );
+        }
+        assert_eq!(link_at(&rows, 1, 24), None);
     }
 
     #[test]
