@@ -3491,14 +3491,15 @@ mod connection_tests {
 
     /// What herdr-core sends a viewer to repaint a pane (ghostty-vt
     /// `Terminal::paint`): a reset ending in ESC[H ESC[2J, then (on a first
-    /// paint) the history pushed up with newlines and erased, then the scroll
-    /// region and the screen rows from the top.
+    /// paint) the history pushed up with a CRLF and `rows - 1` newlines (exactly
+    /// off the top, home-manager-conf #103) and erased, then the scroll region
+    /// and the screen rows from the top.
     pub(super) fn core_paint(history: &[String], screen: &[String], rows: usize) -> Vec<u8> {
         let mut out = String::from("\x1b[!p\x1b[?2026l\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J");
         if !history.is_empty() {
             out.push_str(&history.join("\r\n"));
             out.push_str("\x1b[0m\r\n");
-            out.push_str(&"\n".repeat(rows));
+            out.push_str(&"\n".repeat(rows.saturating_sub(1)));
             out.push_str("\x1b[H\x1b[2J");
         }
         out.push_str(&format!("\x1b[1;{rows}r\x1b[H"));
@@ -3530,7 +3531,8 @@ mod connection_tests {
     /// Item 77 (A): scrolling back showed the screen again, as if the rows
     /// had rotated. Each core repaint (first paint, a RESIZE, showing the
     /// viewer again) starts with ESC[2J, which copied the screen into the
-    /// phone's scrollback. The scrollback is the pane's history, once.
+    /// phone's scrollback. The scrollback is the pane's history, once, and
+    /// meets the screen with no blank row between (rev-pr38's seam).
     #[test]
     fn core_repaints_never_copy_the_screen_into_the_scrollback() {
         let line = |name: &str, n: usize| format!("{name} {n}");
@@ -3540,9 +3542,10 @@ mod connection_tests {
         let first = core_paint(&history, &screen, 10);
         let again = core_paint(&[], &screen, 10);
         let pane = painted(20, 10, vec![first, again.clone(), again]);
-        let shown: Vec<String> = all_rows(&pane).into_iter().filter(|r| !r.is_empty()).collect();
+        // Every row counts, blank ones too.
         let expected: Vec<String> = history.iter().chain(&screen).cloned().collect();
-        assert_eq!(shown, expected);
+        assert_eq!(all_rows(&pane), expected);
+        assert_eq!(pane.grid().lock().history_size(), history.len());
         // Every offset shows rows in order, newest at the bottom.
         let history_rows = pane.grid().lock().history_size();
         let top = rows_back(&pane, history_rows as i32);
