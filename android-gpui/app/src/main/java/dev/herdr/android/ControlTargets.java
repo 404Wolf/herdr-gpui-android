@@ -79,13 +79,14 @@ final class ControlTargets {
     }
 
     /**
-     * As above, never over the draft's own cells ({@code draftRuns}: {row, col, cells, ...} as
-     * the renderer drew them, at Claude's prompt or its own): a tap on the draft's words puts
-     * the caret there, never "send" or "✕" (Wolf's ask 1). A target that would reach a draft
-     * cell above its row stops below that row; one beside it on its own row stops after it.
+     * As above, never over the draft's own cells ({@code draftSpans}: {row, first, past last},
+     * one per row, as the renderer drew them at Claude's prompt or its own): a tap on the
+     * draft's words puts the caret there, never "send" or "✕" (Wolf's ask 1). Every target
+     * gives up every draft cell, whichever way it lies: one above its row stops it below that
+     * row, one below stops it above, one beside it on its own row stops it at the draft's end.
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
-            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftRuns) {
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans) {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
@@ -109,16 +110,24 @@ final class ControlTargets {
                 l = Math.min(l, maxRight - STOP_MIN_WIDTH_DP);
                 t = Math.max(top, Math.min(t, b - STOP_MIN_HEIGHT_DP));
             }
-            if (draftRuns != null) {
-                for (int[] run : draftRuns) {
-                    if (run == null || run.length < 3 || run[2] <= 0) continue;
-                    float runLeft = left + run[1] * cellWidth, runRight = left + (run[1] + run[2]) * cellWidth;
-                    if (runRight <= l || runLeft >= r) continue;
-                    float runTop = top + run[0] * cellHeight, runBottom = runTop + cellHeight;
-                    if (run[0] < c.row) {
-                        if (runBottom > t) t = runBottom;
-                    } else if (run[0] == c.row && runRight <= labelLeft) {
-                        l = Math.max(l, runRight);
+            if (draftSpans != null) {
+                // Beside it first (its own row), then above and below.
+                for (int pass = 0; pass < 2; pass++) {
+                    for (int[] span : draftSpans) {
+                        if (span == null || span.length < 3 || span[2] <= span[1]) continue;
+                        if ((span[0] == c.row) != (pass == 0)) continue;
+                        float spanLeft = left + span[1] * cellWidth, spanRight = left + span[2] * cellWidth;
+                        float spanTop = top + span[0] * cellHeight, spanBottom = spanTop + cellHeight;
+                        if (spanRight <= l || spanLeft >= r || spanBottom <= t || spanTop >= b) continue;
+                        if (span[0] < c.row) {
+                            t = spanBottom;
+                        } else if (span[0] > c.row) {
+                            b = spanTop;
+                        } else if (spanRight <= labelLeft) {
+                            l = spanRight;
+                        } else if (spanLeft >= labelRight) {
+                            r = spanLeft;
+                        }
                     }
                 }
             }

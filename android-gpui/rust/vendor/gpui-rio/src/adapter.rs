@@ -724,6 +724,7 @@ macro_rules! __bind_gpui {
                             targets_top: layout.targets_top,
                             draft_shown: layout.draft_shown,
                             draft_runs: $crate::ghost::draft_runs(placed),
+                            draft_spans: $crate::ghost::draft_spans(placed),
                         };
                         let mut busy = $crate::ghost::busy_columns(&screen, anchor, placed);
                         busy.drain(..hint.busy_from.min(busy.len()));

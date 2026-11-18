@@ -835,7 +835,7 @@ final class ComposerBar {
         float right = layout.left + layout.cols * layout.cellWidth;
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
                 layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
-                recording(dictationState), layout.draftRuns));
+                recording(dictationState), layout.draftSpans));
         // The queue's rows above the prompt, while it is open: one target per row, its full width.
         if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.left, layout.top, layout.cellWidth,
                 layout.cellHeight, layout.cols));

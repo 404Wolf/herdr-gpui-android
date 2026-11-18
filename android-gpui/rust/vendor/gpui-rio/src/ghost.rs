@@ -172,6 +172,9 @@ pub struct LayoutHint {
     /// The draft's runs as drawn at the prompt, so a tap on its words puts
     /// the host's cursor there ([`draft_runs`]).
     pub draft_runs: Vec<DraftRun>,
+    /// Every row's drawn draft cells, `[row, first, past last]`, one per row ([`draft_spans`]):
+    /// the host keeps its control targets off all of them, above, beside or below.
+    pub draft_spans: Vec<[usize; 3]>,
 }
 
 /// The program's input caret, in the rows as drawn.
@@ -247,6 +250,29 @@ pub struct DraftRun {
     pub source: usize,
     /// The draft characters it shows: `len` but for a wide or combined cluster.
     pub chars: usize,
+    /// One indivisible cluster (wide, combined, a flag, an emoji sequence, or past
+    /// [`MAX_DRAFT_RUNS`] a whole row): a tap on it goes to an edge, never inside it.
+    pub cluster: bool,
+}
+
+/// The most draft runs a layout hint carries; the host takes as many (ClusterPlacement).
+/// Past it every row's draft is one cluster run instead, so nothing drawn goes unreported.
+pub const MAX_DRAFT_RUNS: usize = 4096;
+
+/// The rows' drawn draft cells among `placed`: `[row, first, past last]`, one per row, at most
+/// one per grid row.
+pub fn draft_spans(placed: &[Placed]) -> Vec<[usize; 3]> {
+    let mut rows: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
+    for p in placed {
+        if p.source.is_none() || p.style == GhostStyle::Caret || p.text.is_empty() {
+            continue;
+        }
+        let end = p.col + cells(&p.text);
+        let span = rows.entry(p.row).or_insert((p.col, end));
+        span.0 = span.0.min(p.col);
+        span.1 = span.1.max(end);
+    }
+    rows.into_iter().map(|(row, (from, to))| [row, from, to]).collect()
 }
 
 /// The draft's drawn runs among `placed`, for the host's taps.
@@ -273,6 +299,7 @@ pub fn draft_runs(placed: &[Placed]) -> Vec<DraftRun> {
                             len: 1,
                             source: at,
                             chars: 1,
+                            cluster: false,
                         })
                     }
                 }
@@ -284,6 +311,7 @@ pub fn draft_runs(placed: &[Placed]) -> Vec<DraftRun> {
                     len: w,
                     source: at,
                     chars: n,
+                    cluster: true,
                 });
             }
             col += w;
@@ -291,7 +319,21 @@ pub fn draft_runs(placed: &[Placed]) -> Vec<DraftRun> {
         }
         out.extend(simple.take());
     }
-    out
+    if out.len() <= MAX_DRAFT_RUNS {
+        return out;
+    }
+    // Past the bound: each row's draft is one cluster, so every drawn cell is still reported.
+    let mut rows: Vec<DraftRun> = Vec::new();
+    for run in out {
+        match rows.last_mut() {
+            Some(last) if last.row == run.row => {
+                last.len = run.col + run.len - last.col;
+                last.chars = run.source + run.chars - last.source;
+            }
+            _ => rows.push(DraftRun { cluster: true, ..run }),
+        }
+    }
+    rows
 }
 
 /// A span with the draft character its text starts at.
@@ -693,7 +735,16 @@ pub fn place_all(
                     run.text = clip(&run.text, room);
                     Some(run)
                 });
-            let draft: Vec<Placed> = draft.collect();
+            let mut draft: Vec<Placed> = draft.collect();
+            // Queue rows only on blank rows, the newest just above the prompt's frame, never
+            // over a cell the program drew (a dialog, Claude's own words): from the first row
+            // that is not blank up, none (review of #34).
+            let blank = |r: usize| screen[r].iter().all(|c| c.is_whitespace());
+            let mut free_from = anchor.prompt_row.saturating_sub(1).min(rows);
+            while free_from > 0 && blank(free_from - 1) {
+                free_from -= 1;
+            }
+            draft.retain(|p| p.source.is_some() || p.row >= free_from);
             layout.echoes = echo_marks(ghost, anchor, &draft);
             // Shown only if some of its words were placed: with no free cells
             // at the caret (the controls fill its row) nothing is, and the host
@@ -719,6 +770,13 @@ pub fn place_all(
     if has_draft && !layout.draft_shown {
         let controls_from = if layout.controls.is_empty() { cols } else { cols - len };
         ghost_prompt(ghost, &mut layout, controls_row, controls_from, screen);
+    }
+    // A draft that ends a row exactly puts its caret past the grid's edge: it is drawn in the
+    // row's last cell instead, where it shows.
+    for p in &mut layout.placed {
+        if p.style == GhostStyle::Caret && p.col >= cols {
+            p.col = cols - 1;
+        }
     }
     layout
 }
@@ -987,12 +1045,25 @@ fn drop_front_located(spans: &[Located], mut n: usize) -> Vec<Located> {
             n = 0;
             continue;
         }
+        // Never inside a cluster: the cut moves on to the next whole one (a heart's variation
+        // selector, a flag's second half and a combining mark go with their base).
+        let mut skip = 0;
+        for g in span.text.graphemes(true) {
+            if skip >= n {
+                break;
+            }
+            skip += g.chars().count();
+        }
+        if skip >= len {
+            n = skip - len;
+            continue;
+        }
         out.push((
             GhostSpan {
-                text: span.text.chars().skip(n).collect(),
+                text: span.text.chars().skip(skip).collect(),
                 style: span.style,
             },
-            at + n,
+            at + skip,
         ));
         n = 0;
     }
@@ -1481,7 +1552,8 @@ mod tests {
             .find(|p| p.text.contains("four"))
             .expect("four drawn");
         assert_eq!(caret.row, four.row);
-        assert_eq!(caret.col, four.col + four.text.trim_end().chars().count());
+        // "four" ends the 20-cell row: the caret is drawn in its last cell, inside the grid.
+        assert_eq!(caret.col, (four.col + four.text.trim_end().chars().count()).min(19));
     }
 
     /// Wolf's ask 1: the draft is drawn in the terminal in every state, at Claude's prompt
@@ -2375,7 +2447,10 @@ mod tests {
 
     #[test]
     fn each_drawn_queue_row_is_reported_for_its_touch_target() {
-        let rows = screen(CLAUDE, 40);
+        // Claude's last words scrolled up: rows 0 and 1 above the prompt's rule are blank.
+        let mut lines = CLAUDE.to_vec();
+        lines[0] = "";
+        let rows = screen(&lines, 40);
         let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
         let mut g = ghost(Vec::new());
         g.echoes = vec![
@@ -2419,6 +2494,11 @@ mod tests {
         let layout = place_all(&g, anchor, &rows, None);
         let ids: Vec<&str> = layout.echoes.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["echo-m-one", "echo-m-two"]);
+        // With Claude's words on row 0, only the blank row 1 takes a queue row (review of #34).
+        let written = screen(CLAUDE, 40);
+        let layout = place_all(&g, locate(&written, Some((3, 2)), PromptKind::Claude), &written, None);
+        let ids: Vec<&str> = layout.echoes.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["echo-m-two"]);
     }
 
     #[test]
@@ -2538,5 +2618,144 @@ mod tests {
             source: None,
         }];
         assert_eq!(busy_columns(&rows, anchor, &placed)[6], 5);
+    }
+
+    /// The controls and draft every review-of-#34 probe uses.
+    fn probe_ghost(draft: &str) -> Ghost {
+        let mut g = ghost(vec![text(draft), styled("", GhostStyle::Caret)]);
+        g.controls = vec![control("type", "type"), control("talk", "talk"), control("clear", "✕"),
+            control("send", "send")];
+        g
+    }
+
+    /// Review of #34 (r2, P1#1): a draft wrapped below Claude's lower rule (the controls'
+    /// row) is reported row by row, below the controls too, so no target covers it.
+    #[test]
+    fn wolf_ask1_every_drawn_draft_row_is_reported_above_beside_and_below_the_controls() {
+        let rule = "─".repeat(60);
+        let rows = screen(&["output", "", &rule, "❯ ", &rule, "", "", ""], 60);
+        let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+        let layout = place_all(&probe_ghost(&"a".repeat(220)), anchor, &rows, None);
+        let controls_row = layout.controls[0].row;
+        let spans = draft_spans(&layout.placed);
+        assert!(spans.iter().any(|s| s[0] > controls_row), "{spans:?}");
+        // Every drawn draft cell is in its row's span; one span per row.
+        for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty()) {
+            let s = spans.iter().find(|s| s[0] == p.row).expect("row reported");
+            assert!(s[1] <= p.col && p.col + cells(&p.text) <= s[2], "{p:?} {s:?}");
+        }
+        let mut seen: Vec<usize> = spans.iter().map(|s| s[0]).collect();
+        seen.dedup();
+        assert_eq!(seen.len(), spans.len());
+    }
+
+    /// Review of #34 (r2, P1#2): 320 combined clusters are 320 runs, under the bound the host
+    /// shares; past the bound, every row is one cluster run and nothing drawn goes unreported.
+    #[test]
+    fn wolf_ask1_every_drawn_cluster_is_reported_within_the_shared_bound() {
+        let rows = screen(&["Claude busy", "", "", "", "", ""], 110);
+        let layout = place_all(&probe_ghost(&"e\u{301}".repeat(320)), None, &rows, None);
+        let runs = super::draft_runs(&layout.placed);
+        assert_eq!(runs.len(), 320);
+        assert!(runs.len() <= MAX_DRAFT_RUNS && runs.iter().all(|r| r.cluster && r.len == 1 && r.chars == 2));
+        // Past the bound (a made-up placement of 5000 clusters over three rows).
+        let placed: Vec<Placed> = (0..3)
+            .map(|row| Placed {
+                row,
+                col: 0,
+                text: "e\u{301}".repeat(2000),
+                style: GhostStyle::Text,
+                source: Some(row * 4000),
+            })
+            .collect();
+        let runs = super::draft_runs(&placed);
+        assert_eq!(runs.len(), 3);
+        assert!(runs.iter().all(|r| r.cluster && r.len == 2000 && r.chars == 4000));
+    }
+
+    /// Review of #34 (r2, P2#3): a flag and a heart (as many characters as cells) are clusters
+    /// too, flagged so, never split by a tap.
+    #[test]
+    fn wolf_ask1_a_flag_or_a_heart_is_one_cluster() {
+        let rows = screen(&["Claude busy", "", "", "", "", ""], 110);
+        for (draft, chars) in [("🇺🇸", 2), ("❤\u{fe0f}", 2), ("👨\u{200d}👩\u{200d}👧", 5)] {
+            let layout = place_all(&probe_ghost(draft), None, &rows, None);
+            let runs = super::draft_runs(&layout.placed);
+            assert_eq!(runs.len(), 1, "{draft}");
+            assert!(runs[0].cluster && runs[0].chars == chars, "{draft}: {:?}", runs[0]);
+        }
+        let layout = place_all(&probe_ghost("ab"), None, &rows, None);
+        assert!(super::draft_runs(&layout.placed).iter().all(|r| !r.cluster));
+    }
+
+    /// Review of #34 (r2, P2#4): a long draft's caret end starts on a whole cluster, never on
+    /// a heart's variation selector.
+    #[test]
+    fn wolf_ask1_a_long_drafts_tail_starts_on_a_whole_cluster() {
+        for n in 60..85 {
+            let original = "❤\u{fe0f}".repeat(n);
+            let rows = screen(&["Claude busy", "", "", "", "", ""], 40);
+            let layout = place_all(&probe_ghost(&original), None, &rows, None);
+            let boundaries: Vec<usize> = original
+                .graphemes(true)
+                .scan(0, |at, g| {
+                    let here = *at;
+                    *at += g.chars().count();
+                    Some(here)
+                })
+                .collect();
+            for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty() && p.text != "…") {
+                assert!(boundaries.contains(&p.source.unwrap()), "n={n}, starts inside a cluster: {p:?}");
+                assert!(!p.text.starts_with('\u{fe0f}'), "n={n}: {p:?}");
+            }
+        }
+    }
+
+    /// Review of #34 (r2, P3): a draft filling its row exactly keeps its caret inside the grid.
+    #[test]
+    fn wolf_ask1_the_caret_of_a_full_row_stays_inside_the_grid() {
+        let rows = screen(&["Claude busy", "", "", "", "", ""], 60);
+        let layout = place_all(&probe_ghost(&"a".repeat(58)), None, &rows, None);
+        let caret = layout.placed.iter().find(|p| p.style == GhostStyle::Caret).expect("caret");
+        assert!(caret.col < 60, "{caret:?}");
+    }
+
+    /// Review of #34 (r2, P2#5): at Claude's own prompt too, a queue row never covers a cell
+    /// the program drew (a permission dialog's choices), and only drawn rows get a target.
+    #[test]
+    fn wolf_ask1_queue_rows_at_claudes_prompt_keep_the_programs_cells() {
+        let rule = "─".repeat(60);
+        let rows = screen(&["│ Permission dialog │", "│ 1. Yes            │", "│ 2. No             │", &rule,
+            "❯ ", &rule, "status"], 60);
+        let mut g = probe_ghost("wait");
+        g.echoes = vec![vec![styled("❯ queued instruction", GhostStyle::Echo)]];
+        let anchor = locate(&rows, Some((4, 2)), PromptKind::Claude);
+        let layout = place_all(&g, anchor, &rows, None);
+        for p in layout.placed.iter().filter(|p| p.source.is_none()) {
+            let cells_under = &rows[p.row][p.col..(p.col + cells(&p.text)).min(60)];
+            assert!(
+                p.row >= 3 || cells_under.iter().all(|c| c.is_whitespace()),
+                "covers the program: {p:?}"
+            );
+        }
+        assert!(layout.echoes.is_empty());
+        // With a blank row above the frame, the newest queue row goes there.
+        let rows = screen(&["│ 1. Yes │", "", "", &rule, "❯ ", &rule, "status"], 60);
+        let layout = place_all(&g, locate(&rows, Some((4, 2)), PromptKind::Claude), &rows, None);
+        assert_eq!(layout.echoes.len(), 1);
+        assert_eq!(layout.echoes[0].row, 2);
+    }
+
+    /// Review of #34 (r2, the round-1 word-wrap fix): three 30-character words at 60 columns
+    /// keep all three rows of the host's prompt, from the draft's start.
+    #[test]
+    fn wolf_ask1_three_words_keep_their_three_rows() {
+        let rows = screen(&["Claude busy", "", "", "", "", ""], 60);
+        let t = ["a".repeat(30), "b".repeat(30), "c".repeat(30)].join(" ");
+        let layout = place_all(&probe_ghost(&t), None, &rows, None);
+        let runs = super::draft_runs(&layout.placed);
+        let drawn: std::collections::BTreeSet<usize> = runs.iter().map(|r| r.row).collect();
+        assert_eq!(drawn.len(), 3);
+        assert_eq!(runs.first().map(|r| r.source), Some(0));
     }
 }

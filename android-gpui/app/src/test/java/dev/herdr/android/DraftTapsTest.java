@@ -67,11 +67,12 @@ public final class DraftTapsTest {
                 + "\"cellHeight\":16,\"cols\":40,\"rows\":2,\"busy\":[0,0],\"busyFrom\":0,"
                 + "\"draft\":[[1,2,5,0]]}");
         // An older renderer's four fields: one character per cell.
-        assertArrayEquals(new int[] {1, 2, 5, 0, 5}, hint.draftRuns[0]);
+        assertArrayEquals(new int[] {1, 2, 5, 0, 5, 0}, hint.draftRuns[0]);
+        assertArrayEquals(new int[] {1, 2, 7}, hint.draftSpans[0]);
         ClusterPlacement.Hint wide = ClusterPlacement.Hint.parse("{\"left\":0,\"top\":0,\"cellWidth\":8,"
                 + "\"cellHeight\":16,\"cols\":40,\"rows\":2,\"busy\":[0,0],\"busyFrom\":0,"
                 + "\"draft\":[[1,2,2,0,1]]}");
-        assertArrayEquals(new int[] {1, 2, 2, 0, 1}, wide.draftRuns[0]);
+        assertArrayEquals(new int[] {1, 2, 2, 0, 1, 1}, wide.draftRuns[0]);
         assertEquals(null, ClusterPlacement.Hint.parse("{\"left\":0,\"top\":0,\"cellWidth\":8,"
                 + "\"cellHeight\":16,\"cols\":40,\"rows\":2,\"busy\":[0,0],\"draft\":[[1,2]]}"));
     }
