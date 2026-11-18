@@ -1018,6 +1018,8 @@ fn ghost_prompt(
     placed.retain(|p| p.source.is_some() || (keep_echoes && p.row < first && blank(p.row)));
     if keep_echoes {
         layout.echoes = echo_marks(ghost, anchor, &placed);
+        // A selected row drawn here keeps its actions on it, as at Claude's prompt.
+        layout.row_actions = row_actions(ghost, cols, &mut layout.echoes, &mut placed);
     }
     layout.draft_shown = placed.iter().any(|p| p.source.is_some());
     layout.placed.extend(placed);
@@ -2774,6 +2776,50 @@ mod tests {
             assert!(ids.contains(&"clear") && ids.contains(&"queue"), "{cols}: {ids:?}");
             let send = layout.controls.iter().find(|c| c.id == "send").unwrap();
             assert_eq!(send.end, cols - 3, "{cols}");
+        }
+    }
+
+    /// #34 and #35 together: with Claude busy (no prompt on screen) the draft and the queue go
+    /// to the host's own prompt, and a selected row drawn there still gets its actions on it,
+    /// clear of its words, never over a cell the program drew (Wolf's asks 1 and 4).
+    #[test]
+    fn wolf_ask4_a_selected_row_at_the_hosts_prompt_keeps_its_actions() {
+        let cols = 46;
+        let busy = screen(
+            &["● Reading src/main.rs", "  ⎿ 120 lines", "✻ Brewing… (12s · esc to interrupt)", "", "", "", "", "", "", "", "", ""],
+            cols,
+        );
+        for (kind, rungs) in row_kinds() {
+            let mut g = ghost(vec![text("fix the stop "), styled("", GhostStyle::Caret)]);
+            g.controls = bar_ladder()[0].clone();
+            g.rungs = bar_ladder();
+            g.echoes = vec![
+                vec![GhostSpan { text: "❯ an older one".into(), style: GhostStyle::Echo }],
+                vec![GhostSpan { text: "❯ fix the failing build and push it".into(), style: GhostStyle::Bright }],
+            ];
+            g.echo_ids = vec!["m-0".into(), "m-1".into()];
+            g.selected = Some("m-1".into());
+            g.row_rungs = rungs.clone();
+            let layout = place_all(&g, None, &busy, None);
+            assert!(layout.draft_shown, "{kind}");
+            let echo = layout.echoes.iter().find(|e| e.id == "echo-m-1").expect("row drawn");
+            assert!(echo.row > 2, "{kind}: below the program's rows");
+            let ids: Vec<&str> = layout.row_actions.iter().map(|c| c.id.as_str()).collect();
+            assert!(!ids.is_empty(), "{kind}: no actions on the selected row");
+            let mut end = echo.end;
+            for a in &layout.row_actions {
+                assert_eq!(a.row, echo.row, "{kind}");
+                assert!(a.start > end && a.end <= cols, "{kind}: {ids:?} {echo:?}");
+                end = a.end;
+            }
+            let mut taken = vec![false; cols];
+            for p in layout.placed.iter().filter(|p| p.row == echo.row) {
+                for c in p.col..p.col + p.text.chars().count() {
+                    assert!(!taken[c], "{kind}: cell {c} drawn twice");
+                    taken[c] = true;
+                }
+            }
+            assert!(layout.placed.iter().all(|p| p.row > 2), "{kind}: drew over the program");
         }
     }
 
