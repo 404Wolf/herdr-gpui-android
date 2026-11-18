@@ -305,14 +305,14 @@ mod tests {
                 r#"{{"kind":"claude",{COLORS},"echoes":[{echoes}],"echoIds":{ids}}}"#
             ))
         };
-        let ok = with(r#"["6f1c2a9e-0000-4000-8000-000000000001","link"]"#, 2).unwrap();
+        let ok = with(r#"["6f1c2a9e-0000-4000-8000-000000000001","link"]"#, 2).expect("two plain ids");
         assert_eq!(ok.echo_ids, vec!["6f1c2a9e-0000-4000-8000-000000000001", "link"]);
         assert!(with(r#"["a"]"#, 2).is_err(), "one id per echo");
         assert!(with(r#"["a b","c"]"#, 2).is_err(), "plain characters only");
         assert!(with(r#"["","c"]"#, 2).is_err());
         assert!(with(&format!(r#"["{}","c"]"#, "x".repeat(49)), 2).is_err());
         // None given: echoes are reported by index, as before.
-        assert!(with("[]", 2).unwrap().echo_ids.is_empty());
+        assert!(with("[]", 2).expect("no ids").echo_ids.is_empty());
     }
 
     #[test]
