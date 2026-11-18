@@ -382,6 +382,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         terminalSurface = surface;
         surface.setFocusable(true);
         surface.setFocusableInTouchMode(true);
+        // Focus comes back to the terminal when the keyboard's hidden input
+        // proxy lets it go (a shell ending, a link lost after typing), out of
+        // touch mode: Android's default focus highlight then washes the whole
+        // terminal grey. Wolf's ask: offline is never a grayed screen. Focus
+        // and input stay as they are; only that highlight goes.
+        surface.setDefaultFocusHighlightEnabled(false);
         surface.setSaveEnabled(false);
         surface.getHolder().addCallback(this);
         surface.setOnTouchListener((view, event) -> forwardTouch(event));
@@ -2357,8 +2363,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private TextView linkPrimary, linkHosts;
     /** Whether those actions show (LinkActions). Main thread. */
     private final LinkActions linkActions = new LinkActions();
-    /** The control a touch began on (linkTouch), until it ends. Main thread. */
-    private View linkTouchTarget;
+    /** The touch sequence on the indicator's controls (linkTouch), until it ends. Main thread. */
+    private final LinkActions.Press linkPress = new LinkActions.Press();
     /** How the raw shell ended, or null while it runs. Main thread. */
     private LinkBadge.ShellEnd shellEnd;
     /** The tab row's More button; a raw shell has none. */
@@ -6612,13 +6618,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Opens or closes the in-place actions; they close by themselves a few seconds later. Main thread. */
     private void toggleLinkActions() {
         if (destroyed || isFinishing()) return;
-        if (linkActions.tap(linkLook.shown)) {
-            int at = linkActions.generation();
-            main.postDelayed(() -> {
-                if (linkActions.timeout(at)) renderLinkActions();
-            }, LinkActions.COLLAPSE_MS);
-        }
+        if (linkActions.tap(linkLook.shown)) postLinkCollapse(linkActions.generation());
         renderLinkActions();
+    }
+
+    /**
+     * Closes the actions opened at {@code at} after the time the user gives
+     * controls (at least LinkActions.COLLAPSE_MS), and never while TalkBack
+     * is on one of them: then it waits again. Main thread.
+     */
+    private void postLinkCollapse(int at) {
+        android.view.accessibility.AccessibilityManager access =
+                (android.view.accessibility.AccessibilityManager) getSystemService(ACCESSIBILITY_SERVICE);
+        long recommended = access == null ? LinkActions.COLLAPSE_MS : access.getRecommendedTimeoutMillis(
+                (int) LinkActions.COLLAPSE_MS,
+                android.view.accessibility.AccessibilityManager.FLAG_CONTENT_CONTROLS
+                        | android.view.accessibility.AccessibilityManager.FLAG_CONTENT_TEXT);
+        main.postDelayed(() -> {
+            if (destroyed) return;
+            if (linkActions.timeout(at, linkAccessibilityFocused())) renderLinkActions();
+            else if (linkActions.waiting(at)) postLinkCollapse(at);
+        }, LinkActions.collapseAfter(recommended));
+    }
+
+    /** Whether TalkBack (or another accessibility service) is on the indicator or one of its actions. */
+    private boolean linkAccessibilityFocused() {
+        for (View view : new View[] {linkBadge, linkPrimary, linkHosts}) {
+            if (view != null && view.isAccessibilityFocused()) return true;
+        }
+        return false;
     }
 
     /** One in-place action was used: they close, then it runs. Main thread. */
@@ -6642,33 +6670,67 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /**
      * Every touch passes here first (dispatchTouchEvent). While the indicator
      * shows, each of its controls takes touches in a region at least 48 dp
-     * square around it, though drawn small; a touch anywhere else closes the
-     * in-place actions and still reaches what it touched (never consumed).
-     * True when the touch was the indicator's.
+     * square around it, though drawn small. LinkActions.Press decides each
+     * event: a press begun in the row is the control's; one begun under it,
+     * where the region reaches into the terminal, also goes on to the
+     * terminal and is a click only if it stays a tap (the terminal then gets a
+     * cancel); a drag, a second finger or a cancel is never a click; a touch
+     * anywhere else closes the in-place actions and reaches what it touched.
+     * True when the indicator keeps the event.
      */
     private boolean linkTouch(MotionEvent event) {
         if (linkBox == null || linkBox.getVisibility() != View.VISIBLE) {
-            linkTouchTarget = null;
+            linkPress.cancel();
             return false;
         }
-        int action = event.getActionMasked();
-        if (action == MotionEvent.ACTION_DOWN) {
-            View[] targets = {linkBadge, linkPrimary, linkHosts};
-            int picked = LinkActions.pick(linkRegions(targets), event.getRawX(), event.getRawY());
-            linkTouchTarget = picked < 0 ? null : targets[picked];
-            if (linkTouchTarget == null && linkActions.collapse()) renderLinkActions();
-            return linkTouchTarget != null;
+        View[] targets = {linkBadge, linkPrimary, linkHosts};
+        float x = event.getRawX();
+        float y = event.getRawY();
+        int verdict;
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                verdict = linkPress.down(linkRegions(targets), linkRowBottom(), x, y);
+                if (linkPress.target() < 0 && linkActions.collapse()) renderLinkActions();
+                break;
+            case MotionEvent.ACTION_MOVE:
+            case MotionEvent.ACTION_POINTER_DOWN:
+            case MotionEvent.ACTION_POINTER_UP:
+                // A second finger down (POINTER_DOWN counts it) ends any press.
+                verdict = linkPress.move(x, y, event.getPointerCount(), linkTouchSlop());
+                break;
+            case MotionEvent.ACTION_UP: {
+                int pressed = linkPress.target();
+                verdict = linkPress.up(x, y, pressed >= 0 && targets[pressed].isShown(), linkTouchSlop());
+                break;
+            }
+            case MotionEvent.ACTION_CANCEL:
+                verdict = linkPress.cancel();
+                break;
+            default:
+                verdict = LinkActions.Press.PASS;
         }
-        if (linkTouchTarget == null) return false;
-        if (action == MotionEvent.ACTION_UP) {
-            View target = linkTouchTarget;
-            linkTouchTarget = null;
-            int[][] regions = linkRegions(new View[] {target});
-            if (LinkActions.pick(regions, event.getRawX(), event.getRawY()) == 0) target.performClick();
-        } else if (action == MotionEvent.ACTION_CANCEL) {
-            linkTouchTarget = null;
+        if (verdict == LinkActions.Press.CANCEL_THEN_KEEP) {
+            // The terminal saw this tap begin: it ends there as a cancel, not a tap.
+            MotionEvent cancel = MotionEvent.obtain(event);
+            cancel.setAction(MotionEvent.ACTION_CANCEL);
+            super.dispatchTouchEvent(cancel);
+            cancel.recycle();
         }
-        return true;
+        int click = linkPress.takeClick();
+        if (click >= 0) targets[click].performClick();
+        return verdict != LinkActions.Press.PASS;
+    }
+
+    /** Where the indicator's row ends on screen: below it is content (the crumb, the terminal). */
+    private int linkRowBottom() {
+        View row = (View) linkBox.getParent();
+        int[] at = new int[2];
+        row.getLocationOnScreen(at);
+        return at[1] + row.getHeight();
+    }
+
+    private float linkTouchSlop() {
+        return android.view.ViewConfiguration.get(this).getScaledTouchSlop();
     }
 
     /** The shown controls' touch regions on screen, each grown to 48 dp; null for a hidden one. */

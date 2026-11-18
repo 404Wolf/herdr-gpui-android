@@ -82,7 +82,8 @@ public final class OfflineNeverDimsTest {
     private static final List<String> LINK_PATH = Arrays.asList(
             "fail", "showLinkProblem", "showShellEnd", "clearLinkProblem", "showLinkDown", "showLinkUp",
             "autoReconnect", "updateLinkBadge", "toggleLinkActions", "useLinkAction", "renderLinkActions",
-            "linkTouch", "linkRegions", "pumpShell");
+            "linkTouch", "linkRegions", "linkRowBottom", "postLinkCollapse", "linkAccessibilityFocused",
+            "pumpShell");
 
     /**
      * What the link path may never do: open a dialog, sheet or pop-up, put a
@@ -98,7 +99,7 @@ public final class OfflineNeverDimsTest {
     /** The body of the activity's method {@code name}, braces matched outside literals and comments. */
     static String body(String source, String name) {
         Matcher declared = Pattern.compile(
-                "\\n    (?:private |static |final |synchronized )*[\\w.<>\\[\\]]+ " + name + "\\([^)]*\\)[^{;]*\\{")
+                "\\n    (?:@Override |public |protected |private |static |final |synchronized )*[\\w.<>\\[\\]]+ " + name + "\\([^)]*\\)[^{;]*\\{")
                 .matcher(source);
         assertTrue("the link path still has " + name + "()", declared.find());
         int start = declared.end() - 1, depth = 0;
@@ -170,11 +171,86 @@ public final class OfflineNeverDimsTest {
         assertTrue(!shellBranch.contains("pendingInput") && !shellBranch.contains("holdUnsent"));
     }
 
+    /** {@code code} without comments: what runs. */
+    private static String code(String source) {
+        return source.replaceAll("(?s)/\\*.*?\\*/", "").replaceAll("//[^\n]*", "");
+    }
+
+    private static int count(String text, String part) {
+        int n = 0;
+        for (int at = text.indexOf(part); at >= 0; at = text.indexOf(part, at + 1)) n++;
+        return n;
+    }
+
     @Test public void wolfAskOfflineNeverDims_aHeldFramesScrollReachesTheHeldFrame() throws IOException {
         // The routing is HeldScroll's (HeldScrollTest); the drag and the fling use it, and
         // its held side scrolls the phone's own rows.
-        String scroll = body(terminal(), "requestScroll");
+        String terminal = terminal();
+        String scroll = code(body(terminal, "requestScroll"));
         assertTrue(scroll.contains("return HeldScroll.scroll("));
         assertTrue(scroll.contains("public boolean held(int step) { return scrollHeld(step, false); }"));
+        // The entry decides nothing itself: no early return or branch can refuse a held
+        // frame before HeldScroll routes it (one return in the method; the sinks' own two).
+        String entry = scroll.substring(0, scroll.indexOf("return HeldScroll.scroll("));
+        assertEquals("requestScroll returns only HeldScroll's answer:\n" + entry, 0, count(entry, "return"));
+        for (String branch : new String[] {"if (", "if(", "switch", "while", "throw", "? false", "?false"}) {
+            assertTrue("requestScroll may not branch before HeldScroll: " + branch, !entry.contains(branch));
+        }
+        assertEquals(3, count(scroll, "return "));
+        // The drag and the fling reach it with every step.
+        assertTrue(terminal.contains("boolean atEdge = step != 0 && !requestScroll(step);"));
+    }
+
+    @Test public void wolfAskOfflineNeverDims_theTerminalSurfaceDrawsNoFocusWash() throws IOException {
+        // When the keyboard's input proxy lets focus go (a shell ends, the link drops after
+        // typing), focus returns to the terminal out of touch mode and Android's default focus
+        // highlight would wash the whole terminal grey (#2d3138). The surface keeps its focus
+        // and input; only that highlight is off, and nothing turns it back on.
+        String terminal = terminal();
+        String create = code(body(terminal, "createSurface"));
+        int surface = create.indexOf("SurfaceView surface = new SurfaceView(this);");
+        assertTrue(surface >= 0);
+        String setup = create.substring(surface, create.indexOf("surface.getHolder().addCallback(this);"));
+        assertTrue(setup.contains("surface.setDefaultFocusHighlightEnabled(false);"));
+        assertTrue(setup.contains("surface.setFocusable(true);"));
+        assertTrue(setup.contains("surface.setFocusableInTouchMode(true);"));
+        assertTrue(!code(terminal).contains("setDefaultFocusHighlightEnabled(true)"));
+    }
+
+    @Test public void wolfAskOfflineNeverDims_theIndicatorsTouchesAreDecidedByItsPress() throws IOException {
+        // LinkActions.Press decides every event (LinkActionsTest): a press begun under the
+        // row goes on to the terminal, a drag is never a click. The activity only does what
+        // it says: it clicks only the control Press names and keeps an event only when told.
+        String terminal = terminal();
+        assertTrue(code(body(terminal, "dispatchTouchEvent")).contains("if (linkTouch(event)) return true;"));
+        String touch = code(body(terminal, "linkTouch"));
+        assertTrue(touch.contains("linkPress.down(linkRegions(targets), linkRowBottom(), x, y)"));
+        assertTrue(touch.contains("linkPress.move(x, y, event.getPointerCount(), linkTouchSlop())"));
+        assertTrue(touch.contains("case MotionEvent.ACTION_POINTER_DOWN:"));
+        assertTrue(touch.contains("linkPress.up(x, y, pressed >= 0 && targets[pressed].isShown(), linkTouchSlop())"));
+        assertTrue(touch.contains("verdict = linkPress.cancel();"));
+        assertTrue(touch.contains("if (verdict == LinkActions.Press.CANCEL_THEN_KEEP) {"));
+        assertTrue(touch.contains("cancel.setAction(MotionEvent.ACTION_CANCEL);\n            super.dispatchTouchEvent(cancel);"));
+        assertTrue(touch.contains("int click = linkPress.takeClick();\n        if (click >= 0) targets[click].performClick();"));
+        assertEquals(1, count(touch, "performClick"));
+        assertEquals(2, count(touch, "return "));
+        assertTrue(touch.contains("return verdict != LinkActions.Press.PASS;"));
+        // The row's own bottom, not the grown regions, is where the terminal begins.
+        assertTrue(code(body(terminal, "linkRowBottom")).contains("(View) linkBox.getParent()"));
+    }
+
+    @Test public void wolfAskOfflineNeverDims_theActionsStayAsLongAsTheUserGivesControls() throws IOException {
+        // Six seconds by default; the user's "Time to take action" when longer; never while
+        // TalkBack is on one of them (LinkActionsTest has the rules).
+        String terminal = terminal();
+        assertTrue(code(body(terminal, "toggleLinkActions")).contains("postLinkCollapse(linkActions.generation());"));
+        String collapse = code(body(terminal, "postLinkCollapse"));
+        assertTrue(collapse.contains(".getRecommendedTimeoutMillis("));
+        assertTrue(collapse.contains("AccessibilityManager.FLAG_CONTENT_CONTROLS"));
+        assertTrue(collapse.contains("AccessibilityManager.FLAG_CONTENT_TEXT"));
+        assertTrue(collapse.contains("}, LinkActions.collapseAfter(recommended));"));
+        assertTrue(collapse.contains("linkActions.timeout(at, linkAccessibilityFocused())"));
+        assertTrue(collapse.contains("else if (linkActions.waiting(at)) postLinkCollapse(at);"));
+        assertTrue(code(body(terminal, "linkAccessibilityFocused")).contains("view.isAccessibilityFocused()"));
     }
 }

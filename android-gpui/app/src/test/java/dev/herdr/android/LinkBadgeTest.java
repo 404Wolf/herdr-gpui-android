@@ -110,4 +110,15 @@ public final class LinkBadgeTest {
             assertTrue(LinkBadge.shell(end, "x").text.length() <= LinkBadge.MAX_CHARS);
         }
     }
+
+    @Test public void wolfAskOfflineIndicator_aShellsFailureEndsAsASentenceBeforeTheNext() {
+        LinkBadge.Look look = LinkBadge.shell(LinkBadge.ShellEnd.LOST,
+                "Could not open a shell on alpha: the SSH server rejected the command");
+        assertTrue(look.description, look.description.contains("rejected the command. Nothing typed is sent again."));
+        assertTrue(LinkBadge.shell(LinkBadge.ShellEnd.LOST, "Lost.").description.contains("Lost. Nothing typed"));
+        assertTrue(LinkBadge.shell(LinkBadge.ShellEnd.LOST, "  ").description.contains(
+                "The shell's connection was lost. Nothing typed"));
+        assertEquals("Why?", LinkBadge.sentence("Why?"));
+        assertEquals("", LinkBadge.sentence(""));
+    }
 }

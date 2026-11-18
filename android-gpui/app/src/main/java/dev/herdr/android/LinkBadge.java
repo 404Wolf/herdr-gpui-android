@@ -115,10 +115,17 @@ final class LinkBadge {
             return new Look(true, "exited", "The shell exited. Tap to open a new shell or the hosts.",
                     Tone.QUIET, "The shell exited.", NEW_SHELL);
         }
-        String why = problem == null || problem.isEmpty() ? "The shell's connection was lost." : problem;
-        return new Look(true, "offline", "Offline. " + why
+        String why = problem == null || problem.trim().isEmpty() ? "The shell's connection was lost." : problem.trim();
+        return new Look(true, "offline", "Offline. " + sentence(why)
                 + " Nothing typed is sent again. Tap to open a new shell or the hosts.",
                 Tone.WARN, why, RECONNECT);
+    }
+
+    /** Ends {@code text} as a sentence, so the next one never runs into it. */
+    static String sentence(String text) {
+        if (text.isEmpty()) return text;
+        char last = text.charAt(text.length() - 1);
+        return last == '.' || last == '!' || last == '?' || last == '…' ? text : text + ".";
     }
 
     private static String join(String word, String age, String queued) {
