@@ -54,16 +54,20 @@ public final class DictationFakes {
     /** The main thread's Handler, on a single-thread executor. */
     /**
      * The engine's main thread. By default its timers run on the wall clock. {@link #manual}
-     * holds them instead: a timer runs only when the test fires it ({@link #fire}), so no
-     * timeout can beat a reply from the fake desktop or recognizer on a loaded machine, and a
-     * test that wants a timeout says which one and when.
+     * gives it a virtual clock instead: time passes only when the test advances it
+     * ({@link #advance}), and then every timer that falls due runs, in deadline order, as it
+     * would have. A cleared timer never runs. So no timeout can beat a reply from the fake
+     * desktop or recognizer on a loaded machine, and a test says which timers it expects
+     * ({@link #live}) and how much time passes.
      */
     public static final class TestMain implements ServerDictationEngine.Main {
         private final ScheduledExecutorService exec;
         private final boolean manual;
         private final Map<Runnable, List<ScheduledFuture<?>>> delayed = new ConcurrentHashMap<>();
-        /** Held timers (manual): each runnable with the delay it was posted with, in order. */
-        private final List<Object[]> held = new ArrayList<>();
+        /** Virtual timers (manual): {runnable, delay, deadline, order}, guarded by itself. */
+        private final List<Object[]> timers = new ArrayList<>();
+        private long now;
+        private long order;
         /** Every delay the engine asked for, in order: its timeouts, checked without a clock. */
         public final List<Long> delays = Collections.synchronizedList(new ArrayList<>());
 
@@ -76,7 +80,7 @@ public final class DictationFakes {
             this.manual = manual;
         }
 
-        /** A main thread whose timers run only when the test fires them. */
+        /** A main thread on a virtual clock the test advances. */
         static TestMain manual(ScheduledExecutorService exec) {
             return new TestMain(exec, true);
         }
@@ -88,9 +92,8 @@ public final class DictationFakes {
         @Override public void postDelayed(Runnable r, long delayMs) {
             delays.add(delayMs);
             if (manual) {
-                synchronized (held) {
-                    held.add(new Object[] {r, delayMs});
-                    held.notifyAll();
+                synchronized (timers) {
+                    timers.add(new Object[] {r, delayMs, now + delayMs, order++});
                 }
                 return;
             }
@@ -99,53 +102,65 @@ public final class DictationFakes {
         }
 
         @Override public void remove(Runnable r) {
-            synchronized (held) {
-                held.removeIf(t -> t[0] == r);
+            synchronized (timers) {
+                timers.removeIf(t -> t[0] == r);
             }
             List<ScheduledFuture<?>> futures = delayed.remove(r);
             if (futures != null) for (ScheduledFuture<?> f : futures) f.cancel(false);
         }
 
         /**
-         * Manual: waits (10 s at most) until the engine holds a timer of {@code delayMs}, then
-         * runs it on the main thread, as if that much time had passed, and waits for it.
+         * Manual: lets {@code ms} of virtual time pass. Each timer due by then runs on the main
+         * thread, earliest deadline first (in the order set, on a tie), with the clock at its
+         * deadline, so one it sets in turn runs too if due; one cleared before its turn never
+         * runs. Waits for them.
          */
-        public void fire(long delayMs) throws Exception {
-            long deadline = System.currentTimeMillis() + 10_000;
-            while (true) {
-                synchronized (held) {
-                    while (!holds(delayMs)) {
-                        long left = deadline - System.currentTimeMillis();
-                        if (left <= 0) throw new AssertionError("no " + delayMs + " ms timer was set: " + delays);
-                        held.wait(left);
-                    }
-                }
-                // Taken and run on the main thread, where the engine sets and clears its timers:
-                // one it cleared meanwhile (its reply came first) is never run.
-                boolean ran = exec.submit(() -> {
-                    Runnable due = null;
-                    synchronized (held) {
-                        for (Object[] t : held) {
-                            if ((Long) t[1] == delayMs) {
-                                due = (Runnable) t[0];
-                                held.remove(t);
-                                break;
-                            }
+        public void advance(long ms) throws Exception {
+            long target;
+            synchronized (timers) {
+                target = now + ms;
+            }
+            while (exec.submit(() -> {
+                Object[] due = null;
+                synchronized (timers) {
+                    for (Object[] t : timers) {
+                        if ((Long) t[2] > target) continue;
+                        if (due == null || (Long) t[2] < (Long) due[2]
+                                || ((Long) t[2]).equals(due[2]) && (Long) t[3] < (Long) due[3]) {
+                            due = t;
                         }
                     }
-                    if (due != null) due.run();
-                    return due != null;
-                }).get(10, TimeUnit.SECONDS);
-                if (ran) return;
+                    if (due == null) return false;
+                    timers.remove(due);
+                    now = (Long) due[2];
+                }
+                ((Runnable) due[0]).run();
+                return true;
+            }).get(60, TimeUnit.SECONDS)) {
+                // the next one due
             }
+            exec.submit(() -> {
+                synchronized (timers) {
+                    now = Math.max(now, target);
+                }
+            }).get(60, TimeUnit.SECONDS);
         }
 
-        /** Manual: whether a timer of {@code delayMs} is set and has not run. */
-        public boolean holds(long delayMs) {
-            synchronized (held) {
-                for (Object[] t : held) if ((Long) t[1] == delayMs) return true;
-                return false;
-            }
+        /**
+         * Manual: the live timers' lengths, earliest deadline first, read on the main thread
+         * (after everything already posted to it).
+         */
+        public List<Long> live() throws Exception {
+            return exec.submit(() -> {
+                List<Object[]> sorted;
+                synchronized (timers) {
+                    sorted = new ArrayList<>(timers);
+                }
+                sorted.sort((a, b) -> Long.compare((Long) a[2], (Long) b[2]));
+                List<Long> out = new ArrayList<>();
+                for (Object[] t : sorted) out.add((Long) t[1]);
+                return out;
+            }).get(60, TimeUnit.SECONDS);
         }
     }
 
@@ -408,8 +423,13 @@ public final class DictationFakes {
                             heard = true;
                             if (behaviour.errorOnAudio != null) {
                                 send(out, behaviour.errorOnAudio);
-                                s.close();
-                                return;
+                                // Held open until the phone hangs up: the error is what ends
+                                // the session, never a write failing on a socket closed under
+                                // the microphone first.
+                                while (true) {
+                                    WebSocketFrames.Message after = reader.next();
+                                    if (after.opcode == WebSocketFrames.TEXT) texts.add(after.text());
+                                }
                             }
                             if (behaviour.dropOnAudio) {
                                 s.close();
@@ -526,14 +546,21 @@ public final class DictationFakes {
             return store.untranscribed().size();
         }
 
-        /** Runs {@code work} on the engine's main thread and waits for it. */
+        /**
+         * Runs {@code work} on the engine's main thread and waits for it: a barrier, bounded
+         * only against a hang (a loaded host can keep the main thread from running for seconds;
+         * a 10 s bound once failed a passing test).
+         */
         public <T> T onMain(Callable<T> work) throws Exception {
-            return main.submit(work).get(10, TimeUnit.SECONDS);
+            return main.submit(work).get(ON_MAIN_BOUND_S, TimeUnit.SECONDS);
         }
 
         public void onMain(Runnable work) throws Exception {
-            main.submit(work).get(10, TimeUnit.SECONDS);
+            main.submit(work).get(ON_MAIN_BOUND_S, TimeUnit.SECONDS);
         }
+
+        /** How long {@link #onMain} waits before calling the main thread hung. */
+        static final long ON_MAIN_BOUND_S = 120;
 
         /** Waits until everything already posted to the main thread has run, {@code ms} from now. */
         public void settle(long ms) throws Exception {

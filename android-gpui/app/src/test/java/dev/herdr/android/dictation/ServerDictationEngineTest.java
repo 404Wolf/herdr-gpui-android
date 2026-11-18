@@ -117,15 +117,16 @@ public final class ServerDictationEngineTest {
         java.util.concurrent.CountDownLatch phoneLanded = new java.util.concurrent.CountDownLatch(1);
         server = new FakeServer(Behaviour.fast(READY_GPU).finalWhen(phoneLanded, 30_000));
         FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 100);
-        Run run = dictate(server.uri(), phone, 300);
-        // The wait for the desktop is the budget, read from the engine's own timer, not a clock.
-        assertTrue("stop waits the budget for the desktop: " + run.main.delays,
-                run.main.delays.contains(TIMEOUTS.finalBudgetMs));
-        // Not before the budget: the phone's words are in, and still nothing lands.
+        Run run = talkUntilListening(server.uri(), phone);
+        // The phone's words are in; the one wait left is the budget for the desktop (ready's
+        // timer is cleared), and nothing has landed.
         assertTrue("the phone answered", waitFor(() -> phone.answered));
-        mainThread.submit(() -> { }).get();
+        assertLive(run, Collections.singletonList(TIMEOUTS.finalBudgetMs));
         assertEquals("nothing before the budget", 0, run.listener.finals);
-        run.main.fire(TIMEOUTS.finalBudgetMs);
+        // Not a moment before it: just short of the budget, still nothing.
+        run.main.advance(TIMEOUTS.finalBudgetMs - 1);
+        assertEquals("nothing before the budget", 0, run.listener.finals);
+        run.main.advance(1);
         run.awaitEnd();
         assertPhoneText(run);
         // The phone's text came while the desktop's final was still held: the engine did not
@@ -152,8 +153,10 @@ public final class ServerDictationEngineTest {
         server = new FakeServer(Behaviour.silent());
         Run run = new Run();
         // While talking, the wait for "ready" runs out.
-        dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300, run, null,
-                () -> run.main.fire(TIMEOUTS.readyMs));
+        dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 50), 300, run, null, () -> {
+            assertLive(run, Collections.singletonList(TIMEOUTS.readyMs));
+            run.main.advance(TIMEOUTS.readyMs);
+        });
         run.awaitEnd();
         assertPhoneText(run);
         assertTrue(run.listener.states.contains(DictationEngine.State.ON_DEVICE));
@@ -254,7 +257,9 @@ public final class ServerDictationEngineTest {
         // Never ready, no recognizer: the session records for later, under the id it started with.
         server = new FakeServer(Behaviour.silent());
         Run run = dictate(server.uri(), null, 300);
-        run.main.fire(TIMEOUTS.readyAloneMs);
+        // Stopped while waiting for "ready", alone: that wait, then the long one for a final.
+        assertLive(run, java.util.Arrays.asList(TIMEOUTS.readyAloneMs, TIMEOUTS.finalMs));
+        run.main.advance(TIMEOUTS.readyAloneMs);
         run.awaitEnd();
         assertNotNull(run.listener.pendingClip);
         JSONObject start = server.starts.get(0);
@@ -350,8 +355,16 @@ public final class ServerDictationEngineTest {
     }
 
     @Test public void withoutARecognizerASlowDesktopIsWaitedForLonger() throws Exception {
-        server = new FakeServer(Behaviour.fast(READY_GPU).finalAfter(1200));
-        Run run = dictate(server.uri(), null, 300);
+        java.util.concurrent.CountDownLatch answer = new java.util.concurrent.CountDownLatch(1);
+        server = new FakeServer(Behaviour.fast(READY_GPU).finalWhen(answer, 30_000));
+        Run run = talkUntilListening(server.uri(), null);
+        // The long wait for the final, and nothing else (ready's timer is cleared).
+        assertLive(run, Collections.singletonList(TIMEOUTS.finalMs));
+        // Past the budget and the wait for ready: still waiting for the desktop.
+        run.main.advance(TIMEOUTS.finalBudgetMs + TIMEOUTS.readyMs);
+        assertEquals(0, run.listener.finals);
+        assertLive(run, Collections.singletonList(TIMEOUTS.finalMs));
+        answer.countDown();
         run.awaitEnd();
         assertEquals(DESKTOP_WORDS, run.listener.finalText);
         assertFalse(run.listener.onDevice);
@@ -376,19 +389,28 @@ public final class ServerDictationEngineTest {
 
     @Test public void aRecognizerThatNeverFinishesFallsBackToTheQueue() throws Exception {
         Run run = dictate(closedPort(), new FakeRecognizer(PHONE_WORDS, 60_000), 300);
-        run.main.fire(TIMEOUTS.onDeviceFinalMs);
+        assertLive(run, Collections.singletonList(TIMEOUTS.onDeviceFinalMs));
+        run.main.advance(TIMEOUTS.onDeviceFinalMs);
         run.awaitEnd();
         assertNotNull(run.listener.pendingClip);
         assertEquals(1, store.untranscribed().size());
     }
 
     @Test public void aRecognizerFailingWhileTheDesktopIsFineChangesNothing() throws Exception {
-        server = new FakeServer(Behaviour.fast(READY_GPU).finalAfter(1200));
+        java.util.concurrent.CountDownLatch answer = new java.util.concurrent.CountDownLatch(1);
+        server = new FakeServer(Behaviour.fast(READY_GPU).finalWhen(answer, 30_000));
         FakeRecognizer phone = new FakeRecognizer(null, 0);
         phone.failOnFirstAudio = true;
-        Run run = dictate(server.uri(), phone, 300);
+        Run run = new Run();
+        dictate(server.uri(), phone, 300, run, () -> run.listener.states.contains(DictationEngine.State.LISTENING)
+                && log.stream().anyMatch(l -> l.contains("the phone's recognizer failed")));
+        // No phone text to fall back on: the long wait applies, past the budget and ready's.
+        assertLive(run, Collections.singletonList(TIMEOUTS.finalMs));
+        run.main.advance(TIMEOUTS.finalBudgetMs + TIMEOUTS.readyMs);
+        assertEquals(0, run.listener.finals);
+        answer.countDown();
         run.awaitEnd();
-        // No phone text to fall back on: the long wait applies, and the desktop is in time.
+        // And the desktop is in time.
         assertEquals(DESKTOP_WORDS, run.listener.finalText);
     }
 
@@ -425,7 +447,9 @@ public final class ServerDictationEngineTest {
     @Test public void anErrorWithAKnownFinalCodeIsFinalToo() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU).errorOnAudio(
                 "{\"type\":\"error\",\"code\":\"silent_audio\",\"message\":\"silence\"}"));
-        Run run = dictate(server.uri(), null, 300);
+        // The desktop's error, after it heard audio, ends the session: stopped only after that.
+        Run run = new Run();
+        talkUntilItEndsItself(server.uri(), null, run);
         run.awaitEnd();
         assertEquals(DictationException.Reason.SILENT_AUDIO, run.listener.error.reason());
         assertEquals(null, run.listener.pendingClip);
@@ -435,7 +459,9 @@ public final class ServerDictationEngineTest {
 
     @Test public void anErrorWithoutACodeIsADesktopErrorAndTheAudioIsKept() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU).errorOnAudio("{\"type\":\"error\",\"message\":\"x\"}"));
-        Run run = dictate(server.uri(), null, 300);
+        // Stopped once the desktop's error is in (it comes after the desktop heard audio).
+        Run run = new Run();
+        dictate(server.uri(), null, 300, run, () -> run.listener.desktopErrors > 0);
         run.awaitEnd();
         assertEquals(1, run.listener.desktopErrors);
         assertTrue(run.listener.states.contains(DictationEngine.State.OFFLINE_RECORDING));
@@ -486,10 +512,11 @@ public final class ServerDictationEngineTest {
     @Test public void aCancelTellsTheDesktopWhy() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_GPU));
         Run run = new Run();
-        ServerDictationEngine engine = new ServerDictationEngine(server.uri(), pending, new TestMain(mainThread),
-                run.mic, () -> true, null, TIMEOUTS, log::add);
+        ServerDictationEngine engine = new ServerDictationEngine(server.uri(), pending,
+                TestMain.manual(mainThread), run.mic, () -> true, null, TIMEOUTS, log::add);
         mainThread.submit(() -> engine.start("host/pane", run.listener)).get();
-        Thread.sleep(300);
+        // Cancelled once the desktop is listening, so there is a desktop to tell.
+        assertTrue("listening", waitFor(() -> run.listener.states.contains(DictationEngine.State.LISTENING)));
         mainThread.submit(engine::cancel).get();
         assertTrue(server.texts.toString(), waitFor(
                 () -> server.texts.contains("{\"type\":\"cancel\",\"reason\":\"cancelled\"}")));
@@ -579,10 +606,37 @@ public final class ServerDictationEngineTest {
         return run;
     }
 
-    /** Talks 300 ms at least, and on until the phone has taken over (10 s at most). */
+    /**
+     * Talks 300 ms at least, and on until the desktop's error is in and the phone has taken over
+     * (10 s at most). The fake desktop holds its socket open after the error, so the take-over
+     * is the error's, never a failed write's.
+     */
     private Run talkUntilThePhoneTakesOver(URI uri, FakeRecognizer phone) throws Exception {
         Run run = new Run();
-        dictate(uri, phone, 300, run, () -> run.listener.states.contains(DictationEngine.State.ON_DEVICE));
+        dictate(uri, phone, 300, run, () -> run.listener.desktopErrors > 0
+                && run.listener.states.contains(DictationEngine.State.ON_DEVICE));
+        return run;
+    }
+
+    /**
+     * The engine's live timers are {@code expected} (their lengths, earliest first): waits for
+     * timers the engine sets from another thread (ready's, once the microphone is open), 10 s
+     * at most.
+     */
+    private static void assertLive(Run run, List<Long> expected) throws Exception {
+        List<Long> live = run.main.live();
+        for (int i = 0; i < 500 && !live.equals(expected); i++) {
+            Thread.sleep(20);
+            live = run.main.live();
+        }
+        assertEquals("the engine's live timers", expected, live);
+    }
+
+    /** Talks 300 ms at least, and on until the desktop is listening (10 s at most). */
+    private Run talkUntilListening(URI uri, FakeRecognizer phone) throws Exception {
+        Run run = new Run();
+        dictate(uri, phone, 300, run, () -> run.listener.states.contains(DictationEngine.State.LISTENING));
+        assertTrue("the desktop is listening", run.listener.states.contains(DictationEngine.State.LISTENING));
         return run;
     }
 
