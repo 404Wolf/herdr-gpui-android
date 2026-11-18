@@ -1,0 +1,2 @@
+11-18 10:57:20.181  4543  4853 W herdr-link: DIAG gpuiOpenLink gen=9 url=https://docs.example.com/herdr/phone-links
+11-18 10:57:20.326  1380  4332 I ActivityTaskManager: START u0 {act=android.intent.action.VIEW dat=https://docs.example.com/... flg=0x10000000 cmp=org.chromium.webview_shell/.WebViewBrowserActivity} with LAUNCH_MULTIPLE from uid 10147 (BAL_ALLOW_VISIBLE_WINDOW
