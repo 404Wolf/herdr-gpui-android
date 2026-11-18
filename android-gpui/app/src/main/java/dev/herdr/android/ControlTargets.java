@@ -90,6 +90,8 @@ final class ControlTargets {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
+            // A reserved slot's rule and the status words take no taps (ControlLine.tappable).
+            if (!ControlLine.tappable(c.id)) continue;
             boolean talk = "talk".equals(c.id);
             float pad = talk ? TALK_PAD_DP : PAD_DP;
             float minWidth = talk ? TALK_MIN_DP : MIN_DP;

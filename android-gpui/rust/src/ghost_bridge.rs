@@ -15,10 +15,13 @@ use serde::Deserialize;
 
 /// The most text a ghost may carry; the composer's own bound is lower.
 const MAX_TEXT_BYTES: usize = 65_536;
-const MAX_SPANS: usize = 128;
+const MAX_SPANS: usize = 512;
 const MAX_ECHOES: usize = 8;
-/// type, clear, undo, talk, send, queue (items 75, 76; "type" is left out while typing).
-const MAX_CONTROLS: usize = 6;
+/// ✕, undo, the queue, the status words and three slots (type, talk, send), or a selected
+/// row's actions (up to four) with the queue, the status words and the slots (Wolf's ask 4).
+const MAX_CONTROLS: usize = 10;
+/// The host's ladder of lines, widest first.
+const MAX_RUNGS: usize = 8;
 const MAX_CONTROL_ID: usize = 16;
 /// A queue row's id (a message's or a recording's UUID).
 const MAX_ECHO_ID: usize = 48;
@@ -44,6 +47,9 @@ struct Wire {
     echo_ids: Vec<String>,
     #[serde(default)]
     controls: Vec<WireControl>,
+    /// Every line the controls may take, widest first (see `Ghost::rungs`).
+    #[serde(default)]
+    rungs: Vec<Vec<WireControl>>,
 }
 
 #[derive(Deserialize)]
@@ -119,17 +125,25 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         "other" => PromptKind::Other,
         _ => return Err(Error::InvalidCommand),
     };
-    let control_spans = wire.controls.iter().map(|c| c.spans.len()).sum::<usize>();
+    let control_spans = wire
+        .controls
+        .iter()
+        .chain(wire.rungs.iter().flatten())
+        .map(|c| c.spans.len())
+        .sum::<usize>();
     let spans = wire.draft.len() + wire.echoes.iter().map(Vec::len).sum::<usize>() + control_spans;
     let bytes = wire
         .draft
         .iter()
         .chain(wire.echoes.iter().flatten())
         .chain(wire.controls.iter().flat_map(|c| c.spans.iter()))
+        .chain(wire.rungs.iter().flatten().flat_map(|c| c.spans.iter()))
         .map(|s| s.t.len())
         .sum::<usize>();
     if wire.controls.len() > MAX_CONTROLS
-        || wire.controls.iter().any(|c| {
+        || wire.rungs.len() > MAX_RUNGS
+        || wire.rungs.iter().any(|r| r.len() > MAX_CONTROLS)
+        || wire.controls.iter().chain(wire.rungs.iter().flatten()).any(|c| {
             c.id.is_empty()
                 || c.id.len() > MAX_CONTROL_ID
                 || !c
@@ -183,6 +197,20 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         GhostStyle::Info,
         GhostStyle::Warn,
     ];
+    let controls_of = |line: Vec<WireControl>| -> Result<Vec<Control>> {
+        line.into_iter()
+            .map(|c| {
+                Ok(Control {
+                    id: c.id,
+                    spans: c
+                        .spans
+                        .into_iter()
+                        .map(|s| span(s, &control_styles))
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect()
+    };
     Ok(Ghost {
         kind,
         draft: wire
@@ -200,17 +228,12 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
             })
             .collect::<Result<_>>()?,
         echo_ids: wire.echo_ids,
-        controls: wire
-            .controls
+        controls: controls_of(wire.controls)?,
+        rungs: wire
+            .rungs
             .into_iter()
-            .map(|c| {
-                Ok(Control {
-                    id: c.id,
-                    spans: c
-                        .spans
-                        .into_iter()
-                        .map(|s| span(s, &control_styles))
-                        .collect::<Result<_>>()?,
+            .map(controls_of)
+            .collect::<Result<_>>()?,
                 })
             })
             .collect::<Result<_>>()?,
@@ -343,6 +366,21 @@ mod tests {
             .is_err()
         );
         assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn the_hosts_ladder_of_lines_is_kept_widest_first() {
+        let json = format!(
+            r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}],"rungs":[[{{"id":"clear","spans":[{{"t":"✕","s":"dim"}}]}},{{"id":"gap-type","spans":[{{"t":"────","s":"dim"}}]}},{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}],[{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}]]}}"#
+        );
+        let ghost = parse(&json).expect("rungs");
+        assert_eq!(ghost.rungs.len(), 2);
+        assert_eq!(ghost.rungs[0][1].id, "gap-type");
+        // A rung is a line of controls: draft styles are refused there, as in controls.
+        let bad = format!(
+            r#"{{"kind":"claude",{COLORS},"rungs":[[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]]}}"#
+        );
+        assert!(parse(&bad).is_err());
     }
 
     #[test]

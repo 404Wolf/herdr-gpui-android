@@ -133,6 +133,10 @@ pub struct Ghost {
     pub echo_ids: Vec<String>,
     /// The host's controls, right to left in reading order (drawn left to right).
     pub controls: Vec<Control>,
+    /// Every line the controls may take, widest first (the host's ladder): when `controls`
+    /// was picked for another width (a fold or a zoom the host has not seen yet), the first
+    /// of these that fits is drawn in the same frame instead (Wolf's ask 4: no blink).
+    pub rungs: Vec<Vec<Control>>,
     /// Columns kept clear on the right, where the host floats its controls,
     /// on drawn rows from `reserve_from` down.
     pub reserve: usize,
@@ -681,7 +685,21 @@ pub fn place_all(
     let (mut line, mut marks) = control_line(&ghost.controls);
     let mut len = width(&line);
     // At the prompt the draft needs room beside the controls.
-    let roomy = len + if anchor.is_some() { 8 } else { 0 } <= cols;
+    let margin = if anchor.is_some() { 8 } else { 0 };
+    let mut roomy = len + margin <= cols;
+    if len > 0 && !roomy {
+        // The host's words are for another width: the widest of its own lines that fits.
+        if let Some((l, m)) = ghost
+            .rungs
+            .iter()
+            .map(|rung| control_line(rung.as_slice()))
+            .find(|(l, _)| width(l) + margin <= cols)
+        {
+            (line, marks) = (l, m);
+            len = width(&line);
+            roomy = true;
+        }
+    }
     if len > 0 && !roomy {
         // The host's words are for a wider grid (it picks them from the last
         // layout hint, which lags a fold or a zoom): see [`narrow_line`].
@@ -1399,6 +1417,7 @@ mod tests {
             draft,
             echoes: Vec::new(),
             echo_ids: Vec::new(),
+            rungs: Vec::new(),
             controls: Vec::new(),
             reserve: 0,
             reserve_from: 0,
@@ -2481,6 +2500,62 @@ mod tests {
 
     /// The Java ladder's line at every width from 5 to 140 (`ControlLineTest` writes the same
     /// table and fails if it differs), drawn by this renderer: ✕, the queue and talk always.
+    /// Wolf's ask 4: a fold or a zoom the host has not seen yet draws one of the host's own
+    /// lines that fits, with its fixed slots, in that very frame; never a line for the old
+    /// width cut down, nor "talk" alone.
+    #[test]
+    fn wolf_ask4_a_fold_draws_a_line_from_the_hosts_ladder_never_talk_alone() {
+        let control = |id: &str, t: &str| Control {
+            id: id.into(),
+            spans: vec![GhostSpan {
+                text: t.into(),
+                style: GhostStyle::Dim,
+            }],
+        };
+        let slots = || {
+            vec![
+                control("type", "type"),
+                control("talk", " talk "),
+                control("send", "send"),
+            ]
+        };
+        let line = |left: Vec<Control>| {
+            let mut l = left;
+            l.extend(slots());
+            l
+        };
+        let wide = line(vec![
+            control("clear", "✕"),
+            control("undo", "cleared · undo"),
+            control("queue", "3 queued"),
+            control("status", "rec 0:05"),
+        ]);
+        let narrow = line(vec![control("clear", "✕"), control("queue", "≡3")]);
+        let mut g = ghost(Vec::new());
+        g.controls = wide.clone();
+        g.rungs = vec![wide.clone(), narrow.clone()];
+        // Picked for the unfolded grid; the first frame after folding to the cover screen.
+        let cols = 46;
+        let blank = vec![vec![' '; cols]; 10];
+        let anchor = Some(Anchor {
+            prompt_row: 5,
+            row: 6,
+            col: 2,
+            indent: 2,
+        });
+        let layout = place_all(&g, anchor, &blank, None);
+        let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["clear", "queue", "type", "talk", "send"]);
+        // The slots end the line at the right edge, as the host laid them out.
+        let send = layout.controls.iter().find(|c| c.id == "send").unwrap();
+        assert_eq!(send.end, cols - 3);
+        // Without the ladder (an old host) the renderer still keeps ✕, the queue and the stop.
+        g.rungs.clear();
+        let layout = place_all(&g, anchor, &blank, None);
+        let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"talk") && ids.contains(&"clear") && ids.contains(&"queue"), "{ids:?}");
+    }
+
     #[test]
     fn the_hosts_line_at_every_width_keeps_clear_the_queue_and_talk() {
         let table = include_str!("testdata/control_widths.tsv");

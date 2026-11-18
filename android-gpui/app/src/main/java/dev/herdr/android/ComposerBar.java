@@ -1005,7 +1005,7 @@ final class ComposerBar {
         Line in = new Line();
         in.typing = typing;
         in.talks = dictates
-                ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
+                ? talks()
                 : java.util.Collections.emptyList();
         in.recording = recording(dictationState);
         in.queued = QueueView.count(queuedMessages, loose, parkedHere(), linkDown);
@@ -1018,8 +1018,12 @@ final class ComposerBar {
         }
         QueueView.Row selected = selectedRow == null ? null : row(selectedRow);
         if (queueOpen && selected != null) in.rowActions = rowActions(selected);
+        ladder = ControlLine.ladder(in);
         return controls(in, cols);
     }
+
+    /** Every line the controls may take, widest first, for the renderer to pick from (ask 4). */
+    private List<List<GhostText.Control>> ladder = Collections.emptyList();
 
     /** The shown row with {@code id}, or null. */
     private QueueView.Row row(String id) {
@@ -1189,57 +1193,68 @@ final class ComposerBar {
         return ControlLine.width(controls);
     }
 
-    /** How many words "talk" may take: all of them, a narrow grid's, or a tiny grid's. */
-    private enum Words { FULL, SHORT, TINY }
-
-    /** "talk", or what the dictation is doing, as TUI-style words. */
-    private GhostText.Control talk(Words words) {
+    /**
+     * "talk"'s words for {@link ControlLine}: what the dictation is doing, fullest first, as
+     * status words left of the slots ("rec 0:05", "transcribing…", "offline", "mic silenced";
+     * none when there is nothing to say), and last the slot's own word ("talk", "● stop", "…").
+     */
+    private List<GhostText.Control> talks() {
         long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
-        String clock = DraftChips.clock(elapsed);
-        switch (dictationState) {
+        return talks(dictationState, DraftChips.clock(elapsed), finishing, desktopError, transcribedOnPhone,
+                nothingHeard);
+    }
+
+    static List<GhostText.Control> talks(DictationEngine.State state, String clock, boolean finishing,
+            boolean desktopError, boolean transcribedOnPhone,
+            dev.herdr.android.dictation.DictationException.Reason nothingHeard) {
+        List<GhostText.Control> out = new java.util.ArrayList<>();
+        switch (state) {
             case CONNECTING:
-                return new GhostText.Control("talk", words == Words.TINY ? "…" : "connecting…", "info");
-            case LISTENING: {
-                String text;
-                switch (words) {
-                    case FULL: text = "● rec " + clock + " · tap to stop"; break;
-                    case SHORT: text = "● " + clock + " stop"; break;
-                    default: text = "● stop";
-                }
-                return new GhostText.Control("talk", text, "danger");
-            }
+                out.add(new GhostText.Control("talk", "connecting…", "info"));
+                out.add(new GhostText.Control("talk", "…", "info"));
+                break;
+            case LISTENING:
+                out.add(new GhostText.Control("talk", "rec " + clock, "danger"));
+                out.add(new GhostText.Control("talk", clock, "danger"));
+                out.add(new GhostText.Control("talk", "● stop", "danger"));
+                break;
             case TRANSCRIBING:
-                return new GhostText.Control("talk", words == Words.TINY ? "…"
-                        : finishing ? "finishing…" : "transcribing…", "info");
+                out.add(new GhostText.Control("talk", finishing ? "finishing…" : "transcribing…", "info"));
+                out.add(new GhostText.Control("talk", "…", "info"));
+                break;
             case ON_DEVICE: {
                 // The phone transcribes: the warning colour says offline when the words cannot.
-                String why = desktopError ? "desktop error" : "offline";
-                String text;
-                switch (words) {
-                    case FULL: text = "● " + why + " · rec " + clock + " · tap to stop"; break;
-                    case SHORT: text = "● " + (desktopError ? "error" : "offline") + " " + clock + " stop"; break;
-                    default: text = "● stop";
-                }
-                return new GhostText.Control("talk", text, "warn");
+                out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline") + " · rec " + clock,
+                        "warn"));
+                out.add(new GhostText.Control("talk", (desktopError ? "error " : "offline ") + clock, "warn"));
+                out.add(new GhostText.Control("talk", "● stop", "warn"));
+                break;
             }
-            case OFFLINE_RECORDING: {
+            case OFFLINE_RECORDING:
                 // No recognizer on the phone: the recording waits for the desktop.
-                String text;
-                switch (words) {
-                    case FULL: text = (desktopError ? "desktop error" : "offline") + " · queued · rec " + clock
-                            + " · tap to stop"; break;
-                    case SHORT: text = "● queued " + clock + " stop"; break;
-                    default: text = "● stop";
-                }
-                return new GhostText.Control("talk", text, "warn");
+                out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline")
+                        + " · queued · rec " + clock, "warn"));
+                out.add(new GhostText.Control("talk", "queued " + clock, "warn"));
+                out.add(new GhostText.Control("talk", "● stop", "warn"));
+                break;
+            default: {
+                // "Nothing heard" (#31) and "offline" stay as status words; waiting recordings are
+                // counted by the queue control.
+                String full = join(transcribedOnPhone ? "offline" : null,
+                        nothingHeard == null ? null : nothingHeardWords(nothingHeard, true));
+                String brief = join(transcribedOnPhone ? "offline" : null,
+                        nothingHeard == null ? null : nothingHeardWords(nothingHeard, false));
+                if (!full.isEmpty()) out.add(new GhostText.Control("talk", full, "warn"));
+                if (!brief.isEmpty() && !brief.equals(full)) out.add(new GhostText.Control("talk", brief, "warn"));
+                out.add(new GhostText.Control("talk", "talk", "dim"));
             }
-            default:
-                // "Nothing heard" (#31) stays; waiting recordings are counted by the queue control.
-                String said = nothingHeard == null || words == Words.TINY ? ""
-                        : " " + nothingHeardWords(nothingHeard, words == Words.FULL);
-                return new GhostText.Control("talk", "talk", "dim",
-                        (transcribedOnPhone ? " offline" : "") + said, "warn");
         }
+        return out;
+    }
+
+    private static String join(String a, String b) {
+        if (a == null) return b == null ? "" : b;
+        return b == null ? a : a + " · " + b;
     }
 
     /** Hands the renderer the pane's draft, queued messages and controls, unless unchanged. */
@@ -1271,6 +1286,7 @@ final class ComposerBar {
                     selectedRow, now);
             json = GhostText.json(GhostText.kind(kind), draft, marks, drafts.cuts(), clipLengths, parkedIds(),
                     shownRows, queueOpen, selectedRow, cols, controls(loose), GhostText.Colors.of(chrome));
+            json = GhostText.withRungs(json, ladder);
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;

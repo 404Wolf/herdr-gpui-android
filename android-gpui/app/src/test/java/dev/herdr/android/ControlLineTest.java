@@ -46,49 +46,56 @@ public final class ControlLineTest {
         return null;
     }
 
-    @Test public void whileTheKeyboardIsUpTypeIsLeftOutAndNoHerdrHideIsDrawn() {
-        // #30: the keyboard's own hide key, Back or a swipe down put it away.
+    /** talk's words while recording, as ComposerBar gives them: status words, then the slot's. */
+    private static final java.util.List<GhostText.Control> LISTENING = ComposerBar.talks(
+            dev.herdr.android.dictation.DictationEngine.State.LISTENING, "0:05", false, false, false, null);
+
+    @Test public void theLineEndsInThreeFixedSlotsTypeTalkSend() {
+        // Wolf's ask 4 (11-17): the buttons keep their places; everything else is left of them.
         java.util.List<GhostText.Control> idle = controls(false, IDLE, 0, Integer.MAX_VALUE, false, false);
         assertEquals("type talk send", ids(idle));
         assertEquals("type", idle.get(0).spans[0]);
+        assertEquals(" talk ", byId(idle, "talk").spans[0]);
+        // #30: no "type" while the keyboard is up, and no Herdr hide: its slot keeps the rule.
         java.util.List<GhostText.Control> typing = controls(true, IDLE, 0, Integer.MAX_VALUE, false, false);
-        assertEquals("talk send", ids(typing));
-        assertEquals("talk clear send queue", ids(controls(true, IDLE, 2, Integer.MAX_VALUE, false, true)));
+        assertEquals("gap-type talk send", ids(typing));
+        assertEquals("────", byId(typing, "gap-type").spans[0]);
+        assertFalse(ControlLine.tappable("gap-type"));
+        // Recording: no "send" (the stop owns the corner), its slot keeps the rule.
+        java.util.List<GhostText.Control> rec = controls(false, LISTENING, 0, Integer.MAX_VALUE, true, true);
+        assertEquals("clear status type talk gap-send", ids(rec));
+        assertEquals("● stop", byId(rec, "talk").spans[0]);
+        assertEquals("rec 0:05", byId(rec, "status").spans[0]);
+        assertFalse(ControlLine.tappable("status"));
     }
 
     @Test public void clearShowsWithADraftADictationOrAQueueAndUndoStandsInItsPlace() {
         // #30's rule (a draft) and #20's (a dictation in flight, item 74; a queue, item 76).
-        assertEquals("type talk clear send", ids(controls(false, IDLE, 0, Integer.MAX_VALUE, false, true)));
+        assertEquals("clear type talk send", ids(controls(false, IDLE, 0, Integer.MAX_VALUE, false, true)));
         assertEquals("type talk send", ids(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
         assertEquals("✕", byId(controls(false, IDLE, 0, Integer.MAX_VALUE, false, true), "clear").spans[0]);
         // While recording "✕" still shows: it clears and cancels (Wolf's pick).
-        assertEquals("type clear talk", ids(controls(false, RECORDING, 0, Integer.MAX_VALUE, true, true)));
+        assertTrue(ids(controls(false, LISTENING, 0, Integer.MAX_VALUE, true, true)).startsWith("clear "));
         // Just cleared and nothing left to clear: "undo" stands in "✕"'s place (#30)...
         ControlLine.State justCleared = state(false, IDLE, 0, false, false);
         justCleared.undoWide = "cleared · undo";
         justCleared.undoNarrow = "undo";
-        assertEquals("type talk undo send", ids(ControlLine.controls(justCleared, Integer.MAX_VALUE)));
+        assertEquals("undo type talk send", ids(ControlLine.controls(justCleared, Integer.MAX_VALUE)));
         // ...while a queue is left, "✕" stays (a second tap clears it) and "undo" follows it (#20).
         ControlLine.State queueLeft = state(false, IDLE, 2, false, true);
         queueLeft.undoWide = "cleared · undo";
         queueLeft.undoNarrow = "undo";
-        assertEquals("type talk clear undo send queue", ids(ControlLine.controls(queueLeft, Integer.MAX_VALUE)));
-    }
-
-    @Test public void onANarrowGridTypeGivesWayBeforeClear() {
-        java.util.List<GhostText.Control> wide = controls(false, IDLE, 0, Integer.MAX_VALUE, false, true);
-        int width = ControlLine.width(wide);
-        assertEquals("talk clear send", ids(controls(false, IDLE, 0, width + ControlLine.MARGIN - 1, false, true)));
+        assertEquals("clear undo queue type talk send", ids(ControlLine.controls(queueLeft, Integer.MAX_VALUE)));
     }
 
     @Test public void theQueueHasItsOwnControlAndSendIsJustSend() {
         // Item 75: no longer a two-character count glued to "send".
         java.util.List<GhostText.Control> line = controls(false, IDLE, 2, Integer.MAX_VALUE, false, false);
-        assertEquals("type talk send queue", ids(line));
+        assertEquals("queue type talk send", ids(line));
         assertEquals(2, byId(line, "send").spans.length);
         assertEquals("2 queued", byId(line, "queue").spans[0]);
         // Without dictation: no talk, the rest stays.
-        assertEquals("type send queue", ids(controls(false, NONE, 2, Integer.MAX_VALUE, false, false)));
+        assertEquals("queue type send", ids(controls(false, NONE, 2, Integer.MAX_VALUE, false, false)));
         // Open, it says so; the colour is the most pressing state's.
         ControlLine.State open = state(false, IDLE, 2, false, false);
         open.expanded = true;
@@ -98,77 +105,43 @@ public final class ControlLineTest {
         assertEquals("danger", queue.spans[1]);
     }
 
-    @Test public void clearShowsOnlyWhenThereIsSomethingToClear() {
-        assertEquals("type talk send", ids(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
-        java.util.List<GhostText.Control> line = controls(false, IDLE, 0, Integer.MAX_VALUE, false, true);
-        assertEquals("type talk clear send", ids(line));
-        assertEquals("✕", byId(line, "clear").spans[0]);
-    }
-
     @Test public void theLineIsMeasuredAsTheRendererDrawsIt() {
-        // " type ─ talk ─ send ──"
-        assertEquals(22, ControlLine.width(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
-        // " type ─ talk ─ ✕ ─ send ─ 2 queued ──": the cross and rules are one cell each.
-        assertEquals(37, ControlLine.width(controls(false, IDLE, 2, Integer.MAX_VALUE, false, true)));
+        // " type ─  talk  ─ send ──": talk's slot is six cells.
+        assertEquals(24, ControlLine.width(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
+        // " ✕ ─ 2 queued ─ type ─  talk  ─ send ──": the cross and rules are one cell each.
+        assertEquals(39, ControlLine.width(controls(false, IDLE, 2, Integer.MAX_VALUE, false, true)));
     }
 
     @Test public void theCoverScreenLadderNeverDropsClearTheQueueOrTheStop() {
         for (boolean recording : new boolean[] {false, true}) {
-            java.util.List<GhostText.Control> talks = recording ? RECORDING : IDLE;
+            java.util.List<GhostText.Control> talks = recording ? LISTENING : IDLE;
             for (int cols = 5; cols <= 140; cols++) {
                 java.util.List<GhostText.Control> line = controls(false, talks, 3, cols, recording, true);
                 String at = (recording ? "recording" : "idle") + " at " + cols + ": " + ids(line);
                 assertTrue(at, ids(line).contains("clear"));
                 assertTrue(at, ids(line).contains("queue"));
                 assertTrue(at, ids(line).contains("talk"));
-                if (cols >= 30) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
+                if (cols >= 41) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
             }
         }
-        // The cover screen (~52 columns) idle: the short queue word, everything else kept.
-        java.util.List<GhostText.Control> cover = controls(false, IDLE, 3, 52, false, true);
-        assertEquals("type talk clear send queue", ids(cover));
-        // Narrower: the queue takes "≡3", then "type" goes, then send; never ✕ or the queue.
-        assertEquals("≡3", byId(controls(false, IDLE, 3, 40, false, true), "queue").spans[0]);
-        assertEquals("talk clear queue", ids(controls(false, IDLE, 3, 30, false, true)));
+        // The cover screen (~46 columns) recording: the status words shorten, then go.
+        assertEquals("0:05", byId(controls(false, LISTENING, 3, 52, true, true), "status").spans[0]);
+        assertEquals("clear queue type talk gap-send", ids(controls(false, LISTENING, 3, 44, true, true)));
+        assertEquals("≡3", byId(controls(false, IDLE, 3, 44, false, true), "queue").spans[0]);
     }
 
-    @Test public void whileRecordingSendIsNotDrawnSoTheStopOwnsTheCorner() {
-        for (int cols : new int[] {22, 50, 100}) {
-            java.util.List<GhostText.Control> line = controls(false, RECORDING, 2, cols, true, true);
-            assertFalse("send at " + cols, ids(line).contains("send"));
-            // The stop is last: the right end of the line, the bottom-right corner.
-            assertEquals("talk", line.get(line.size() - 1).id);
-        }
-        java.util.List<GhostText.Control> wide = controls(false, RECORDING, 2, 100, true, true);
-        assertEquals("type clear queue talk", ids(wide));
-        assertEquals("● rec 0:05 · tap to stop", byId(wide, "talk").spans[0]);
-        java.util.List<GhostText.Control> cover = controls(false, RECORDING, 2, 40, true, true);
-        assertEquals("● 0:05 stop", byId(cover, "talk").spans[0]);
-        assertEquals("≡2", byId(cover, "queue").spans[0]);
-    }
-
-    @Test public void typingNarrowGridsKeepTheStopAndNeverDrawAHide() {
-        for (int cols : new int[] {100, 50, 38, 30, 22}) {
-            java.util.List<GhostText.Control> line = controls(true, RECORDING, 3, cols, true, true);
-            assertFalse("no hide at " + cols, ids(line).contains("hide"));
-            assertTrue("talk at " + cols, ids(line).contains("talk"));
-            assertEquals("the stop last at " + cols, "talk", line.get(line.size() - 1).id);
-        }
-        assertEquals("talk clear queue", ids(controls(false, RECORDING, 3, 30, false, true)));
-    }
-
-    @Test public void undoTakesItsWordsAndGivesWayLastButOne() {
+    @Test public void undoTakesItsWordsAndGivesWayBeforeClearAndTheQueue() {
         ControlLine.State in = state(false, IDLE, 2, false, true);
         in.undoWide = "cleared · undo";
         in.undoNarrow = "undo";
-        assertEquals("type talk clear undo send queue", ids(ControlLine.controls(in, 120)));
+        assertEquals("clear undo queue type talk send", ids(ControlLine.controls(in, 120)));
         assertEquals("cleared · undo", byId(ControlLine.controls(in, 120), "undo").spans[0]);
-        assertEquals("undo", byId(ControlLine.controls(in, 46), "undo").spans[0]);
+        assertEquals("undo", byId(ControlLine.controls(in, 50), "undo").spans[0]);
         // At the narrowest the undo goes before ✕ and the queue do.
-        assertEquals("talk clear queue", ids(ControlLine.controls(in, 20)));
+        assertEquals("clear queue type talk send", ids(ControlLine.controls(in, 20)));
     }
 
-    @Test public void aSelectedRowsActionsKeepTheQueueControlAndTalk() {
+    @Test public void aSelectedRowsActionsKeepTheQueueControlAndTheSlots() {
         QueueView.Row unsure = new QueueView.Row("m", QueueView.Kind.MESSAGE, "❯ x", "?", "warn", true,
                 Outbox.State.UNSURE);
         assertEquals("row-again row-edit row-drop row-back", ids(ControlLine.rowActions(unsure)));
@@ -181,20 +154,34 @@ public final class ControlLineTest {
         assertEquals("row-retry row-drop row-back", ids(ControlLine.rowActions(parked)));
         ControlLine.State in = state(false, IDLE, 1, false, true);
         in.rowActions = ControlLine.rowActions(queued);
-        assertEquals("row-edit row-drop row-back queue talk", ids(ControlLine.controls(in, 200)));
-        // Recording: the stop stays, last, beside the row's actions, at every width the grid has.
+        assertEquals("row-edit row-drop row-back queue type talk send", ids(ControlLine.controls(in, 200)));
+        // Recording: the slots stay, the stop last-but-the-reserved-send, at every width.
         java.util.List<java.util.List<GhostText.Control>> recordings = java.util.Arrays.asList(
                 ControlLine.rowActions(unsure), ControlLine.rowActions(queued), ControlLine.rowActions(parked));
         for (java.util.List<GhostText.Control> acts : recordings) {
             for (int cols = 20; cols <= 200; cols++) {
-                ControlLine.State rec = state(false, RECORDING, 3, true, true);
+                ControlLine.State rec = state(false, LISTENING, 3, true, true);
                 rec.rowActions = acts;
                 java.util.List<GhostText.Control> line = ControlLine.controls(rec, cols);
-                assertTrue(cols + ": " + ids(line), line.size() <= 6);
-                assertTrue(cols + ": " + ids(line), line.get(line.size() - 1).id.equals("talk"));
+                assertTrue(cols + ": " + ids(line), line.size() <= 10);
+                assertTrue(cols + ": " + ids(line), ids(line).endsWith("type talk gap-send"));
                 assertTrue(cols + ": the queue control stays", byId(line, "queue") != null);
                 assertTrue(cols + ": " + ids(line), byId(line, "row-drop") != null);
             }
+        }
+    }
+
+    @Test public void everyLineOfTheLadderEndsInTheSameSlots() {
+        ControlLine.State in = state(false, LISTENING, 3, true, true);
+        in.undoWide = "cleared · undo";
+        in.undoNarrow = "undo";
+        java.util.List<java.util.List<GhostText.Control>> ladder = ControlLine.ladder(in);
+        assertTrue(ladder.size() >= 3);
+        int last = Integer.MAX_VALUE;
+        for (java.util.List<GhostText.Control> line : ladder) {
+            assertTrue(ids(line), ids(line).endsWith("type talk gap-send"));
+            assertTrue("widest first", ControlLine.width(line) <= last);
+            last = ControlLine.width(line);
         }
     }
 
@@ -204,7 +191,7 @@ public final class ControlLineTest {
         for (String state : new String[] {"idle", "recording"}) {
             for (int cols = 5; cols <= 140; cols++) {
                 boolean rec = state.equals("recording");
-                java.util.List<GhostText.Control> line = controls(false, rec ? RECORDING : IDLE, 2, cols, rec, true);
+                java.util.List<GhostText.Control> line = controls(false, rec ? LISTENING : IDLE, 2, cols, rec, true);
                 out.append(cols).append('\t').append(state);
                 for (GhostText.Control c : line) {
                     StringBuilder text = new StringBuilder();
@@ -238,10 +225,10 @@ public final class ControlLineTest {
         }
     }
 
-    @Test public void theRendererTakesSixControls() {
-        ControlLine.State in = state(false, IDLE, 2, false, true);
+    @Test public void theRendererTakesTenControls() {
+        ControlLine.State in = state(false, LISTENING, 2, true, true);
         in.undoWide = in.undoNarrow = "undo";
-        assertTrue(ControlLine.controls(in, 200).size() <= 6);
+        assertTrue(ControlLine.controls(in, 200).size() <= 10);
     }
 
     @Test public void everyControlIsDrawnByThePhonesFontNeverAsABox() {

@@ -150,9 +150,12 @@ public final class ControlTargetsTest {
                             in.undoNarrow = "undo";
                             List<GhostText.Control> line = ControlLine.controls(in, cols);
                             if (ControlLine.width(line) > cols) continue; // the renderer's own fallback
-                            List<ControlTargets.Cells> cells = drawn(line, cols, 41);
-                            List<ControlTargets.Rect> rects = ControlTargets.layout(cells, 0, 0, cw, 26f,
+                            List<ControlTargets.Cells> all = drawn(line, cols, 41);
+                            List<ControlTargets.Rect> rects = ControlTargets.layout(all, 0, 0, cw, 26f,
                                     40, 43 * 26f, maxRight, recording);
+                            // Reserved slots and the status words take no taps (ask 4).
+                            List<ControlTargets.Cells> cells = new java.util.ArrayList<>();
+                            for (ControlTargets.Cells c : all) if (ControlLine.tappable(c.id)) cells.add(c);
                             String where = cw + "dp " + cols + " cols " + talks + " typing=" + typing
                                     + " recording=" + recording;
                             assertEquals(where, cells.size(), rects.size());
@@ -192,14 +195,14 @@ public final class ControlTargetsTest {
         List<GhostText.Control> line = ControlLine.controls(in, cols);
         List<ControlTargets.Cells> cells = drawn(line, cols, 17);
         List<ControlTargets.Rect> rects = ControlTargets.layout(cells, 0, 0, cw, 26f, 17, 20 * 26f, cols * cw, true);
-        ControlTargets.Cells typeCells = cells.get(0);
-        assertEquals("type", typeCells.id);
+        ControlTargets.Cells typeCells = null;
+        for (ControlTargets.Cells c : cells) if (c.id.equals("type")) typeCells = c;
+        assertTrue("type is drawn", typeCells != null);
         ControlTargets.Rect type = find(rects, "type"), stop = find(rects, "talk");
-        // The whole of "type" (x 132 to 184.8) opens the keyboard; the stop starts after it.
-        assertEquals(132f, typeCells.start * cw, 0.01f);
-        assertEquals(184.8f, typeCells.end * cw, 0.01f);
-        assertTrue(type.right >= 184.8f - 0.01f);
-        assertTrue(stop.left >= 184.8f - 0.01f);
+        // The whole of "type" opens the keyboard; the stop starts after it.
+        assertTrue(type.left <= typeCells.start * cw + 0.01f);
+        assertTrue(type.right >= typeCells.end * cw - 0.01f);
+        assertTrue(stop.left >= typeCells.end * cw - 0.01f);
         assertEquals(cols * cw, stop.right, 0.01f);
     }
 
