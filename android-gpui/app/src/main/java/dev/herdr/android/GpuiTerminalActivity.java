@@ -333,7 +333,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         applySystemBars();
         styleRail();
         rebuildShortcutBar();
-        if (banner != null) styleBanner();
         updateLinkBadge();
         // Reused rail rows carry the old colors; rebuild them once for the change.
         if (sidebarRows != null) {
@@ -416,10 +415,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabRow.setOrientation(LinearLayout.HORIZONTAL);
         tabRow.setOnPull(this::showMachines);
         tabRow.addView(tabScroll, new LinearLayout.LayoutParams(0, -1, 1));
-        ImageButton tabMenu = iconButton(R.drawable.ic_bar_more, "More", "Panes, hosts and terminal actions",
+        tabMenu = iconButton(R.drawable.ic_bar_more, "More", "Panes, hosts and terminal actions",
                 view -> showMoreActions(view, true));
-        // Offline, reconnecting or a cached pane: one small indicator at the top
-        // right (LinkBadge), never a dimmed screen, a banner or a status line.
+        // Offline, reconnecting, a cached pane or a shell's end: one small
+        // indicator at the top right (LinkBadge), never a dimmed screen, a
+        // banner or a status line. A tap opens Reconnect and Hosts beside it,
+        // in this row (LinkActions): no dialog, nothing over the terminal.
+        linkBox = new LinearLayout(this);
+        linkBox.setOrientation(LinearLayout.HORIZONTAL);
+        linkBox.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        linkBox.setVisibility(View.GONE);
         linkBadge = new TextView(this);
         linkBadge.setTextSize(LinkBadge.TEXT_SP);
         linkBadge.setSingleLine(true);
@@ -427,11 +432,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         linkBadge.setMaxWidth(dp(LinkBadge.MAX_WIDTH_DP));
         linkBadge.setGravity(android.view.Gravity.CENTER_VERTICAL);
         linkBadge.setPadding(dp(6), 0, dp(2), 0);
-        linkBadge.setVisibility(View.GONE);
-        linkBadge.setOnClickListener(v -> showLinkActions());
+        linkBadge.setOnClickListener(v -> toggleLinkActions());
+        linkBox.addView(linkBadge, new LinearLayout.LayoutParams(-2, -1));
+        linkPrimary = linkAction(v -> useLinkAction(this::reconnectCurrentHost));
+        linkBox.addView(linkPrimary, linkActionParams());
+        linkHosts = linkAction(v -> useLinkAction(() -> startActivity(new android.content.Intent(this,
+                RemoteHostsActivity.class).putExtra("skip_reopen", true))));
+        linkHosts.setText(LinkBadge.HOSTS);
+        linkBox.addView(linkHosts, linkActionParams());
         LinearLayout.LayoutParams badgeAt = new LinearLayout.LayoutParams(-2, -1);
         badgeAt.gravity = LinkBadge.GRAVITY;
-        tabRow.addView(linkBadge, badgeAt);
+        tabRow.addView(linkBox, badgeAt);
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
         // Where this window is: machine › repo › worktree › window, and why
@@ -731,66 +742,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
 
     private LinearLayout terminalContent;
-    private LinearLayout banner;
-    private TextView bannerText;
 
-    /** Explains a dead connection and offers the one action that can fix it. */
-    private void showReconnectBanner(String message) {
+    /**
+     * A failure the link can not recover from by itself: the top corner's
+     * indicator says it, and its in-place actions offer Reconnect and Hosts.
+     * Nothing is inserted above the bar or over the terminal. In a raw shell
+     * it is a lost connection (an exit is {@link #showShellEnd}). Any thread.
+     */
+    private void showLinkProblem(String message) {
         // fail() runs on the poll worker; Android views may only be touched on
         // the main thread, so marshal first instead of throwing silently there.
         if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
-            runOnUiThread(() -> showReconnectBanner(message));
+            runOnUiThread(() -> showLinkProblem(message));
             return;
         }
         if (terminalRoot == null) return;
-        if (!shellMode()) {
-            // A Herdr pane: the failure is the top corner's indicator, whose tap
-            // offers Hosts and Reconnect; nothing is inserted above the bar.
-            linkProblem = BannerCopy.human(message);
-            updateLinkBadge();
+        linkProblem = BannerCopy.human(message);
+        if (shellMode() && shellEnd == null) shellEnd = LinkBadge.ShellEnd.LOST;
+        updateLinkBadge();
+    }
+
+    /** A raw shell ended: it exited, or its connection was lost. Any thread. */
+    private void showShellEnd(LinkBadge.ShellEnd end, String message) {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            runOnUiThread(() -> showShellEnd(end, message));
             return;
         }
-        if (banner == null) {
-            banner = new LinearLayout(this);
-            banner.setOrientation(LinearLayout.HORIZONTAL);
-            banner.setGravity(android.view.Gravity.CENTER_VERTICAL);
-            banner.setPadding(dp(16), dp(4), dp(8), dp(4));
-            bannerText = new TextView(this);
-            bannerText.setTextSize(13);
-            LinearLayout.LayoutParams textParams =
-                    new LinearLayout.LayoutParams(0, -2, 1f);
-            banner.addView(bannerText, textParams);
-            Button hosts = keycap("Hosts");
-            hosts.setOnClickListener(view -> startActivity(new android.content.Intent(this,
-                    RemoteHostsActivity.class).putExtra("skip_reopen", true)));
-            banner.addView(hosts, keycapParams());
-            Button retry = keycap("Reconnect");
-            retry.setOnClickListener(view -> reconnectCurrentHost());
-            banner.addView(retry, keycapParams());
-            banner.setVisibility(View.GONE);
-            // Directly above the toolbar: closest to the surface it explains.
-            int barIndex = terminalContent.getChildCount() - 1;
-            terminalContent.addView(banner, barIndex);
-            styleBanner();
-        }
-        bannerText.setText(BannerCopy.human(message));
-        banner.setVisibility(View.VISIBLE);
+        shellEnd = end;
+        showLinkProblem(message);
     }
-
-    /** The failure is the danger color on the bar's own surface, where it stays legible. */
-    private void styleBanner() {
-        banner.setBackgroundColor(chrome.surface);
-        bannerText.setTextColor(chrome.danger);
-        for (int i = 0; i < banner.getChildCount(); i++) {
-            View child = banner.getChildAt(i);
-            if (!(child instanceof Button)) continue;
-            ((Button) child).setTextColor(chrome.onSurface);
-            child.setBackground(controlBackground(false, chrome.control, 10, dp(4)));
-        }
-    }
-
-
-    /** Transport wording is for logs; the banner says what happened and what to do. */
 
     /** One description for a host row: name, workspace count, then its state. */
     private String hostDescription(RailHostRow holder) {
@@ -803,10 +783,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
 
-    private void hideReconnectBanner() {
-        if (banner != null) banner.setVisibility(View.GONE);
-        if (linkProblem != null) {
+    /** The failure is over (a reconnect began, a shell opened). Main thread. */
+    private void clearLinkProblem() {
+        if (linkProblem != null || shellEnd != null) {
             linkProblem = null;
+            shellEnd = null;
             updateLinkBadge();
         }
     }
@@ -833,7 +814,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void reconnectCurrentHost() {
         if (shellMode()) {
             // A shell has no state to resume: reconnecting opens a fresh one.
-            hideReconnectBanner();
+            clearLinkProblem();
             stopConnection();
             startShell();
             return;
@@ -842,7 +823,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         reconnectRunning = true;
         final String id = currentHostId;
         final int epoch = hostEpoch.now();
-        hideReconnectBanner();
+        clearLinkProblem();
         publishCurrent("Reconnecting…");
         worker.execute(() -> {
             SavedRemoteHost host = null;
@@ -866,7 +847,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                     if (monitor != null) monitor.succeeded();
                     showLinkUp();
-                    showReconnectBanner("Open the host list to reconnect");
+                    showLinkProblem("Open the host list to reconnect");
                 });
                 return;
             }
@@ -905,7 +886,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         retryCurrentHost();
                         return;
                     }
-                    hideReconnectBanner();
+                    clearLinkProblem();
                     adoptHost(readyHost, readyHandle, readyPane);
                     // A pane picked offline after the session chose where to land.
                     String picked = rememberedHostPane(readyHost.id);
@@ -933,7 +914,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         // Keep trying, quickly, while the terminal is on screen.
                         monitor.failed();
                         showLinkDown();
-                    } else showReconnectBanner("Reconnect failed. Check the host and network.");
+                    } else showLinkProblem("Reconnect failed. Check the host and network.");
                 });
             }
         });
@@ -1310,8 +1291,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean requestScroll(int lines) {
         final Connection target;
         synchronized (stateLock) { target = connection; }
-        if (heldFrame(target)) return scrollHeld(lines, false);
-        if (target.remoteHandle <= 0) return false;
+        return HeldScroll.scroll(shellMode(), target != null, target != null && target.isClosed(),
+                target == null ? 0 : target.remoteHandle, target != null && target.ready, lines,
+                new HeldScroll.Sink() {
+                    @Override public boolean held(int step) { return scrollHeld(step, false); }
+                    @Override public boolean live(int step) { return scrollLive(target, step); }
+                });
+    }
+
+    /** A live Herdr pane scrolls its own buffered rows; the daemon backfills gaps. */
+    private boolean scrollLive(Connection target, int lines) {
         if (lines > 0 && lastFollowSent) {
             lastFollowSent = false;
             nativeSetFollow(target.generation, false);
@@ -1374,8 +1363,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * count as held: there is nothing live to scroll.
      */
     private boolean heldFrame(Connection target) {
-        if (shellMode()) return false;
-        return target == null || target.isClosed() || (target.remoteHandle > 0 && !target.ready);
+        return HeldScroll.held(shellMode(), target != null, target != null && target.isClosed(),
+                target == null ? 0 : target.remoteHandle, target != null && target.ready);
     }
 
     /**
@@ -2362,6 +2351,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String crumbText = "";
     /** The top corner's link indicator (LinkBadge); the crumb keeps saying where this is. */
     private TextView linkBadge;
+    /** The indicator and its in-place actions, in the tab row. */
+    private LinearLayout linkBox;
+    /** The in-place actions: Reconnect (or New shell) and Hosts. */
+    private TextView linkPrimary, linkHosts;
+    /** Whether those actions show (LinkActions). Main thread. */
+    private final LinkActions linkActions = new LinkActions();
+    /** The control a touch began on (linkTouch), until it ends. Main thread. */
+    private View linkTouchTarget;
+    /** How the raw shell ended, or null while it runs. Main thread. */
+    private LinkBadge.ShellEnd shellEnd;
+    /** The tab row's More button; a raw shell has none. */
+    private ImageButton tabMenu;
     /** What the indicator shows now. Main thread. */
     private LinkBadge.Look linkLook = LinkBadge.HIDDEN;
     /** A failure the indicator explains on tap (the old banner's text), or null. Main thread. */
@@ -2426,7 +2427,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
         // The menu stays wherever the bar is gone, tabs or not.
         if (tabRow != null) {
-            tabRow.setVisibility((current != null || linkLook.shown) && !shellMode() ? View.VISIBLE : View.GONE);
+            // A raw shell has no tabs or menu here; only its end's indicator shows.
+            tabRow.setVisibility((current != null && !shellMode()) || linkLook.shown ? View.VISIBLE : View.GONE);
+            tabMenu.setVisibility(shellMode() ? View.GONE : View.VISIBLE);
         }
         if (!show) {
             if (barNeedYou != 0) {
@@ -5747,6 +5750,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override public boolean dispatchTouchEvent(MotionEvent event) {
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN) markUsed();
+        if (linkTouch(event)) return true;
         return super.dispatchTouchEvent(event);
     }
 
@@ -6311,7 +6315,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             } else {
                 nativeSetActive(failed.generation, false);
                 publish(failed, message);
-                showReconnectBanner(message);
+                showLinkProblem(message);
             }
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -6543,26 +6547,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void updateLinkBadge() {
         if (linkBadge == null || destroyed) return;
+        LinkBadge.Look look;
         if (shellMode()) {
-            // A raw shell keeps its banner: its end is not a lost link.
-            linkLook = LinkBadge.HIDDEN;
-            linkBadge.setVisibility(View.GONE);
-            return;
+            // A raw shell's end, in the same corner: exited, or its connection lost.
+            look = LinkBadge.shell(shellEnd, linkProblem);
+        } else {
+            int waiting;
+            synchronized (stateLock) {
+                waiting = pendingInput.size();
+                String hostId = connection == null ? currentHostId : connection.hostId;
+                if (hostId != null && outbox != null) waiting += outbox.outbox().waiting(hostId);
+            }
+            String cachedHost = savedShownHost;
+            long savedAt = savedShownAt;
+            String when = cachedHost != null && savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
+                    java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
+                    java.util.Locale.getDefault()) : null;
+            boolean down = monitor != null && monitor.reconnecting();
+            boolean noNetwork = monitor != null && monitor.offline();
+            look = LinkBadge.look(down, noNetwork, linkProblem, cachedHost != null, when, waiting);
         }
-        int waiting;
-        synchronized (stateLock) {
-            waiting = pendingInput.size();
-            String hostId = connection == null ? currentHostId : connection.hostId;
-            if (hostId != null && outbox != null) waiting += outbox.outbox().waiting(hostId);
-        }
-        String cachedHost = savedShownHost;
-        long savedAt = savedShownAt;
-        String when = cachedHost != null && savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
-                java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
-                java.util.Locale.getDefault()) : null;
-        boolean down = monitor != null && monitor.reconnecting();
-        boolean noNetwork = monitor != null && monitor.offline();
-        LinkBadge.Look look = LinkBadge.look(down, noNetwork, linkProblem, cachedHost != null, when, waiting);
         boolean changed = look.shown != linkLook.shown;
         linkLook = look;
         if (look.shown) {
@@ -6573,19 +6577,113 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             linkBadge.setTextColor(chrome.onSurfaceVariant);
             linkBadge.setText(text);
             linkBadge.setContentDescription(look.description);
+            linkPrimary.setText(look.primary);
+            linkPrimary.setContentDescription(look.title + " " + look.primary);
+            linkHosts.setContentDescription(look.title + " " + LinkBadge.HOSTS);
+        } else {
+            linkActions.collapse();
         }
-        linkBadge.setVisibility(look.shown ? View.VISIBLE : View.GONE);
+        renderLinkActions();
+        linkBox.setVisibility(look.shown ? View.VISIBLE : View.GONE);
         if (changed) refreshTabStrip();
     }
 
-    /** The indicator was tapped: what the old banner offered, Reconnect and Hosts. Main thread. */
-    private void showLinkActions() {
+    /** One small in-place action beside the indicator: drawn small, touched in 48 dp (linkTouch). */
+    private TextView linkAction(View.OnClickListener action) {
+        TextView button = new TextView(this);
+        button.setTextSize(LinkBadge.TEXT_SP);
+        button.setSingleLine(true);
+        button.setGravity(android.view.Gravity.CENTER);
+        button.setPadding(dp(8), 0, dp(8), 0);
+        button.setMinWidth(dp(LinkActions.TOUCH_DP));
+        button.setVisibility(View.GONE);
+        button.setFocusable(false);
+        button.setOnClickListener(action);
+        return button;
+    }
+
+    private LinearLayout.LayoutParams linkActionParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
+        params.leftMargin = dp(4);
+        params.gravity = android.view.Gravity.CENTER_VERTICAL;
+        return params;
+    }
+
+    /** Opens or closes the in-place actions; they close by themselves a few seconds later. Main thread. */
+    private void toggleLinkActions() {
+        if (destroyed || isFinishing()) return;
+        if (linkActions.tap(linkLook.shown)) {
+            int at = linkActions.generation();
+            main.postDelayed(() -> {
+                if (linkActions.timeout(at)) renderLinkActions();
+            }, LinkActions.COLLAPSE_MS);
+        }
+        renderLinkActions();
+    }
+
+    /** One in-place action was used: they close, then it runs. Main thread. */
+    private void useLinkAction(Runnable action) {
+        if (linkActions.collapse()) renderLinkActions();
         if (destroyed || isFinishing() || !linkLook.shown) return;
-        new ActionSheet(this, chrome, linkLook.title)
-                .add("Reconnect", this::reconnectCurrentHost)
-                .add("Hosts", () -> startActivity(new android.content.Intent(this,
-                        RemoteHostsActivity.class).putExtra("skip_reopen", true)))
-                .show();
+        action.run();
+    }
+
+    /** Draws the in-place actions as LinkActions says: beside the indicator, in its row. Main thread. */
+    private void renderLinkActions() {
+        if (linkPrimary == null) return;
+        int shown = linkActions.expanded() ? View.VISIBLE : View.GONE;
+        for (TextView button : new TextView[] {linkPrimary, linkHosts}) {
+            button.setVisibility(shown);
+            button.setTextColor(chrome.onSurface);
+            button.setBackground(controlBackground(false, chrome.control, 8, 0));
+        }
+    }
+
+    /**
+     * Every touch passes here first (dispatchTouchEvent). While the indicator
+     * shows, each of its controls takes touches in a region at least 48 dp
+     * square around it, though drawn small; a touch anywhere else closes the
+     * in-place actions and still reaches what it touched (never consumed).
+     * True when the touch was the indicator's.
+     */
+    private boolean linkTouch(MotionEvent event) {
+        if (linkBox == null || linkBox.getVisibility() != View.VISIBLE) {
+            linkTouchTarget = null;
+            return false;
+        }
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            View[] targets = {linkBadge, linkPrimary, linkHosts};
+            int picked = LinkActions.pick(linkRegions(targets), event.getRawX(), event.getRawY());
+            linkTouchTarget = picked < 0 ? null : targets[picked];
+            if (linkTouchTarget == null && linkActions.collapse()) renderLinkActions();
+            return linkTouchTarget != null;
+        }
+        if (linkTouchTarget == null) return false;
+        if (action == MotionEvent.ACTION_UP) {
+            View target = linkTouchTarget;
+            linkTouchTarget = null;
+            int[][] regions = linkRegions(new View[] {target});
+            if (LinkActions.pick(regions, event.getRawX(), event.getRawY()) == 0) target.performClick();
+        } else if (action == MotionEvent.ACTION_CANCEL) {
+            linkTouchTarget = null;
+        }
+        return true;
+    }
+
+    /** The shown controls' touch regions on screen, each grown to 48 dp; null for a hidden one. */
+    private int[][] linkRegions(View[] targets) {
+        android.util.DisplayMetrics screen = getResources().getDisplayMetrics();
+        int[][] regions = new int[targets.length][];
+        int[] at = new int[2];
+        for (int i = 0; i < targets.length; i++) {
+            View view = targets[i];
+            if (view == null || !view.isShown() || view.getWidth() == 0) continue;
+            view.getLocationOnScreen(at);
+            regions[i] = LinkActions.grow(at[0], at[1], at[0] + view.getWidth(), at[1] + view.getHeight(),
+                    dp(LinkActions.TOUCH_DP), screen.widthPixels, screen.heightPixels);
+        }
+        return regions;
     }
 
     /** A short note in the crumb's own slot, in place of any pop-up; null while none shows. */
@@ -6676,7 +6774,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 nativeSetActive(next.generation, true);
                 publish(next, "Shell");
             }
-            runOnUiThread(this::hideReconnectBanner);
+            runOnUiThread(this::clearLinkProblem);
         } catch (Exception | LinkageError failure) {
             String reason = failure.getMessage();
             fail(next, "Could not open a shell on " + host.name
@@ -6692,15 +6790,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (handle == 0 || !current.ready) return;
         try {
             if (!RemoteNative.shellAlive(handle)) {
+                boolean exited;
                 synchronized (stateLock) {
                     if (!current(current)) return;
                     // The last screen stays readable and copyable until the user leaves.
                     current.ready = false;
                     nativeSetActive(current.generation, false);
                     if (current.poll != null) current.poll.cancel(false);
-                    publish(current, BannerCopy.SHELL_EXITED);
+                    // The host ended it (an exit), or its connection was lost:
+                    // the corner says which. Nothing typed is replayed either way.
+                    exited = RemoteNative.shellExited(handle);
+                    publish(current, exited ? BannerCopy.SHELL_EXITED : "Connection lost");
                 }
-                showReconnectBanner(BannerCopy.SHELL_EXITED);
+                showShellEnd(exited ? LinkBadge.ShellEnd.EXITED : LinkBadge.ShellEnd.LOST,
+                        exited ? BannerCopy.SHELL_EXITED : "The shell's connection was lost.");
                 return;
             }
             for (int i = 0; i < 16; i++) {

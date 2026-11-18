@@ -78,7 +78,36 @@ public final class LinkBadgeTest {
         assertEquals("offline", look.text);
         assertEquals(LinkBadge.Tone.WARN, look.tone);
         assertEquals(why, look.title);
-        // With no failure, the tap sheet is titled with what the indicator means.
+        // With no failure, the in-place actions say what the indicator means.
         assertEquals("Offline. Showing the copy from 14:32.", LinkBadge.look(true, true, null, true, "14:32", 0).title);
+        assertEquals(LinkBadge.RECONNECT, look.primary);
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_aRunningShellShowsNothing() {
+        assertFalse(LinkBadge.shell(null, null).shown);
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_aShellsLostConnectionIsTheSameSmallOffline() {
+        LinkBadge.Look look = LinkBadge.shell(LinkBadge.ShellEnd.LOST, "Connection lost · the host timed out");
+        assertTrue(look.shown);
+        assertEquals("offline", look.text);
+        assertEquals(LinkBadge.Tone.WARN, look.tone);
+        assertEquals("Connection lost · the host timed out", look.title);
+        // A new connection opens a new shell; nothing typed before is sent again.
+        assertEquals(LinkBadge.RECONNECT, look.primary);
+        assertTrue(look.description, look.description.contains("Nothing typed is sent again."));
+        assertEquals("The shell's connection was lost.", LinkBadge.shell(LinkBadge.ShellEnd.LOST, null).title);
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_aShellThatExitedIsNotALostLink() {
+        LinkBadge.Look look = LinkBadge.shell(LinkBadge.ShellEnd.EXITED, "The shell exited");
+        assertTrue(look.shown);
+        assertEquals("exited", look.text);
+        assertEquals(LinkBadge.Tone.QUIET, look.tone);
+        assertEquals(LinkBadge.NEW_SHELL, look.primary);
+        assertFalse(look.description, look.description.toLowerCase(java.util.Locale.ROOT).contains("offline"));
+        for (LinkBadge.ShellEnd end : LinkBadge.ShellEnd.values()) {
+            assertTrue(LinkBadge.shell(end, "x").text.length() <= LinkBadge.MAX_CHARS);
+        }
     }
 }

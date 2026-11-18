@@ -6,7 +6,7 @@ use crate::{
     remote::{self, Error, Result},
 };
 use gpui_rio::{KeyPress, Session, TerminalColor, TerminalTheme};
-use herdr_remote_transport::{BridgeGuard, CancellationToken};
+use herdr_remote_transport::{BridgeGuard, CancellationToken, ShellExit};
 use std::{
     collections::HashMap,
     sync::{
@@ -25,6 +25,8 @@ const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 struct Shell {
     session: Arc<Session>,
+    /// Set when the host ended the shell, not when the connection was lost.
+    exit: ShellExit,
     guard: BridgeGuard,
     runtime: tokio::runtime::Runtime,
 }
@@ -68,6 +70,7 @@ pub fn open(config: &str, credentials: &str, columns: u16, rows: u16) -> Result<
         CancellationToken::new(),
     ))?;
     let shell = runtime.block_on(ssh.into_shell(TERM, u32::from(columns), u32::from(rows)))?;
+    let exit = shell.exit();
     let (socket, size, guard) = shell.into_parts();
     let started = (|| -> Result<Arc<Session>> {
         socket.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -99,6 +102,7 @@ pub fn open(config: &str, credentials: &str, columns: u16, rows: u16) -> Result<
         id,
         Shell {
             session,
+            exit,
             guard,
             runtime,
         },
@@ -121,6 +125,13 @@ pub fn input(id: u64, raw: &str) -> Result<bool> {
 /// Whether the remote shell is still running.
 pub fn alive(id: u64) -> bool {
     session(id).is_some_and(|session| session.is_alive())
+}
+
+/// Whether the host ended the shell (it exited) rather than its connection
+/// being lost: once `alive` is false, the phone says "exited" for the one and
+/// offers a new shell for the other. Never replays anything either way.
+pub fn exited(id: u64) -> bool {
+    shells().get(&id).is_some_and(|shell| shell.exit.exited())
 }
 
 /// The rows on screen, for copying.

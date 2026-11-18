@@ -525,6 +525,17 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_shellAlive(
     u8::from(shell::alive(handle as u64))
 }
 
+/// Whether the host ended the shell (it exited), not a lost connection.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_shellExited(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+) -> jboolean {
+    u8::from(shell::exited(handle as u64))
+}
+
 /// The shell's screen text for copying, or null once it is closed.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]

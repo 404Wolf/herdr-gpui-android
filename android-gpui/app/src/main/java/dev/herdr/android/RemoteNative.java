@@ -77,6 +77,8 @@ final class RemoteNative {
     /** Sends one mailbox command; false when the shell's input queue is full. */
     static native boolean shellInput(long handle, String commandJson);
     static native boolean shellAlive(long handle);
+    /** After shellAlive turns false: the host ended the shell (it exited), not a lost connection. */
+    static native boolean shellExited(long handle);
     /** The shell's screen text for copying, or null once it is closed. */
     static native String shellText(long handle);
     /** Never blocks: the SSH connection ends on a native background thread. */

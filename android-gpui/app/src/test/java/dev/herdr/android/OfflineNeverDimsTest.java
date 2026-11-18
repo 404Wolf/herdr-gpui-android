@@ -11,6 +11,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.junit.Test;
 
@@ -20,7 +21,9 @@ import org.junit.Test;
  * (the terminal's GPUI view, the terminal activity, Home) may not fade any
  * content: no element opacity in the GPUI view, and no setAlpha in the two
  * activities but the few listed here, none of which follows the link. The
- * banner that used to rise above the bottom bar is the corner indicator now.
+ * banner that used to rise above the bottom bar is the corner indicator now,
+ * in a raw shell too, and nothing the link runs opens a dialog, a scrim or a
+ * view over the terminal: the indicator's actions open in place.
  */
 public final class OfflineNeverDimsTest {
     private static final Path JAVA = Paths.get("src", "main", "java", "dev", "herdr", "android");
@@ -72,15 +75,106 @@ public final class OfflineNeverDimsTest {
                 + String.join("\n", found), 0, found.size());
     }
 
-    @Test public void wolfAskOfflineNeverDims_theLinkHasOneIndicatorNotABannerOrAStatusLine() throws IOException {
-        String terminal = String.join("\n", lines(JAVA.resolve("GpuiTerminalActivity.java")));
+    /**
+     * Every method the link runs when it drops, fails, comes back or ends a
+     * shell, and the indicator's own in-place actions and touch routing.
+     */
+    private static final List<String> LINK_PATH = Arrays.asList(
+            "fail", "showLinkProblem", "showShellEnd", "clearLinkProblem", "showLinkDown", "showLinkUp",
+            "autoReconnect", "updateLinkBadge", "toggleLinkActions", "useLinkAction", "renderLinkActions",
+            "linkTouch", "linkRegions", "pumpShell");
+
+    /**
+     * What the link path may never do: open a dialog, sheet or pop-up, put a
+     * view over (or a foreground, scrim or alpha on) the screen, or add any
+     * view at all (no view or layout is created there); the indicator and its
+     * actions are built once, with the tab row.
+     */
+    private static final Pattern COVERS_THE_SCREEN = Pattern.compile(
+            "Dialog|ActionSheet|PopupWindow|PopupMenu|GestureHint|WindowManager|showRailOverlay"
+            + "|setForeground|addView\\(|removeView|new [\\w.]*(View|Layout)\\("
+            + "|setAlpha\\(|ColorDrawable|setBackgroundColor\\(|setClickable\\(true|setDim|FLAG_DIM");
+
+    /** The body of the activity's method {@code name}, braces matched outside literals and comments. */
+    static String body(String source, String name) {
+        Matcher declared = Pattern.compile(
+                "\\n    (?:private |static |final |synchronized )*[\\w.<>\\[\\]]+ " + name + "\\([^)]*\\)[^{;]*\\{")
+                .matcher(source);
+        assertTrue("the link path still has " + name + "()", declared.find());
+        int start = declared.end() - 1, depth = 0;
+        for (int i = start; i < source.length(); i++) {
+            char c = source.charAt(i);
+            if (c == '"' || c == '\'') {
+                for (i++; i < source.length() && source.charAt(i) != c; i++) {
+                    if (source.charAt(i) == '\\') i++;
+                }
+            } else if (c == '/' && i + 1 < source.length() && source.charAt(i + 1) == '/') {
+                i = source.indexOf('\n', i);
+            } else if (c == '/' && i + 1 < source.length() && source.charAt(i + 1) == '*') {
+                i = source.indexOf("*/", i) + 1;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}' && --depth == 0) {
+                return source.substring(start, i + 1);
+            }
+        }
+        throw new AssertionError(name + "() never closes");
+    }
+
+    private static String terminal() throws IOException {
+        return String.join("\n", lines(JAVA.resolve("GpuiTerminalActivity.java")));
+    }
+
+    @Test public void wolfAskOfflineNeverDims_theLinkPathOpensNoDialogScrimOrOverlay() throws IOException {
+        String terminal = terminal();
+        List<String> found = new ArrayList<>();
+        for (String name : LINK_PATH) {
+            String[] code = body(terminal, name).split("\n");
+            for (String line : code) {
+                String trimmed = line.trim();
+                if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
+                if (COVERS_THE_SCREEN.matcher(trimmed).find()) found.add(name + "(): " + trimmed);
+            }
+        }
+        assertEquals("Offline is only the corner indicator: no dialog, scrim, overlay or new view:\n"
+                + String.join("\n", found), 0, found.size());
+    }
+
+    @Test public void wolfAskOfflineNeverDims_theIndicatorAndItsActionsLiveInTheTabRowOnly() throws IOException {
+        String terminal = terminal();
+        // Built once, in the top row beside More: never over the terminal or above the bar.
+        assertTrue(terminal.contains("tabRow.addView(linkBox, badgeAt);"));
+        assertTrue(terminal.contains("linkBox.addView(linkPrimary, linkActionParams());"));
+        assertTrue(terminal.contains("linkBox.addView(linkHosts, linkActionParams());"));
+        // No banner left to build, in a Herdr pane or a raw shell.
+        assertTrue(!Pattern.compile("\\bbanner\\s*[=.;]").matcher(terminal).find());
         // The crumb keeps saying where this is: no link text replaces it.
         assertTrue(!terminal.contains("OfflineSwitch.label("));
         assertTrue(!terminal.contains("Reconnecting to "));
-        // A Herdr pane's failure goes to the indicator before any banner is built.
-        int banner = terminal.indexOf("private void showReconnectBanner(String message)");
-        int routed = terminal.indexOf("linkProblem = BannerCopy.human(message);", banner);
-        int built = terminal.indexOf("banner = new LinearLayout(this);", banner);
-        assertTrue("showReconnectBanner routes to the indicator", banner >= 0 && routed > banner && routed < built);
+        // A tap on the indicator opens its actions in place.
+        assertTrue(body(terminal, "toggleLinkActions").contains("linkActions.tap(linkLook.shown)"));
+    }
+
+    @Test public void wolfAskOfflineNeverDims_aRawShellsEndIsTheSameIndicator() throws IOException {
+        String terminal = terminal();
+        assertTrue(body(terminal, "updateLinkBadge").contains("LinkBadge.shell(shellEnd, linkProblem)"));
+        // Exited and lost stay apart, from what the host said.
+        String pump = body(terminal, "pumpShell");
+        assertTrue(pump.contains("RemoteNative.shellExited(handle)"));
+        assertTrue(pump.contains("LinkBadge.ShellEnd.EXITED") && pump.contains("LinkBadge.ShellEnd.LOST"));
+        // A shell never holds or replays input: only a Herdr pane is resumable.
+        assertTrue(body(terminal, "resumable").contains("!shellMode()"));
+        String reconnect = body(terminal, "reconnectCurrentHost");
+        String shellBranch = reconnect.substring(0, reconnect.indexOf("if (reconnectRunning) return;"));
+        assertTrue(shellBranch.contains("startShell();"));
+        assertTrue(!shellBranch.contains("pendingInput") && !shellBranch.contains("holdUnsent"));
+    }
+
+    @Test public void wolfAskOfflineNeverDims_aHeldFramesScrollReachesTheHeldFrame() throws IOException {
+        // The routing is HeldScroll's (HeldScrollTest); the drag and the fling use it, and
+        // its held side scrolls the phone's own rows.
+        String scroll = body(terminal(), "requestScroll");
+        assertTrue(scroll.contains("return HeldScroll.scroll("));
+        assertTrue(scroll.contains("public boolean held(int step) { return scrollHeld(step, false); }"));
     }
 }
