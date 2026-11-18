@@ -11,6 +11,9 @@ publish = false
 [dependencies]
 rio-vt = { workspace = true }
 thiserror = { workspace = true }
+# Display cells of the host's ghost text (wide and combined characters), as the grid draws them.
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
 
 [lints.rust]
 unsafe_code = "deny"

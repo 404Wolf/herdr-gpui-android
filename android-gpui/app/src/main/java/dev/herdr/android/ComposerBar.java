@@ -60,6 +60,8 @@ final class ComposerBar {
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
         void hideKeyboard();
+        /** Scrolls the pane back to its live bottom, if it is scrolled into history. */
+        default void toLive() { }
         /** A short status for the user; the connection stays as it is. */
         void notice(String message);
         /**
@@ -239,11 +241,6 @@ final class ComposerBar {
     private long recordingSince;
     /** In the keys' overlay: the keyboard typing straight into the program. */
     private final ImageView raw;
-    /**
-     * The draft, above the controls, when the renderer finds no prompt to draw
-     * it at (a dialog, an unknown program): ghost text never covers the program.
-     */
-    private final android.widget.TextView fallback;
     /** Recording lengths of clips dictated this run, for their chips. */
     private final java.util.Map<String, Long> clipLengths = new java.util.HashMap<>();
     private GpuiChrome chrome;
@@ -372,15 +369,6 @@ final class ComposerBar {
         raw.setTooltipText("Type straight into the program");
         raw.setOnClickListener(v -> host.rawKeyboard());
         keysOverlay.addView(raw, new FrameLayout.LayoutParams(dp(44), dp(48), Gravity.START));
-        fallback = new android.widget.TextView(context);
-        fallback.setTextSize(13);
-        fallback.setTypeface(android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE,
-                android.graphics.Typeface.ITALIC));
-        fallback.setMaxLines(3);
-        fallback.setEllipsize(android.text.TextUtils.TruncateAt.START);
-        fallback.setPadding(dp(8), dp(4), dp(8), dp(4));
-        fallback.setOnClickListener(v -> startTyping());
-        fallback.setVisibility(View.GONE);
         style(chrome);
     }
 
@@ -682,12 +670,6 @@ final class ComposerBar {
     private void style(GpuiChrome next) {
         chrome = next;
         keysOverlay.setBackgroundColor(chrome.surface);
-        GradientDrawable label = new GradientDrawable();
-        label.setColor(chrome.surface);
-        label.setStroke(Math.max(1, dp(1)), chrome.outline);
-        label.setCornerRadius(dp(6));
-        fallback.setBackground(label);
-        fallback.setTextColor(chrome.onSurfaceVariant);
         raw.setImageTintList(ColorStateList.valueOf(chrome.primary));
         lastGhost = "";
         pushGhost();
@@ -710,6 +692,8 @@ final class ComposerBar {
     /** Opens the keyboard into the draft, its cursor at {@code cursor} (-1: the end). */
     private void startTyping(int cursor) {
         if (!agent) return;
+        // The draft is written where Claude's prompt is: at the live bottom, not in history.
+        host.toLive();
         // Read when the keyboard connects, on the focus below.
         field.setPrivateImeOptions(privateImeOptions(drawsTalk()));
         if (!typing) {
@@ -846,14 +830,6 @@ final class ComposerBar {
         boolean showing = agent && !covered;
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
-        FrameLayout.LayoutParams anchorAt = null;
-        int anchorWidth = 0;
-        if (drawn && targets.getVisibility() == View.VISIBLE) {
-            FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) targets.getLayoutParams();
-            anchorAt = t;
-            anchorWidth = t.width;
-        }
-        placeFallback(frame, showing ? anchorAt : null, anchorWidth);
         if (keysOverlay.getVisibility() == View.VISIBLE) {
             float guardTop = top + (layout.top + layout.guard * layout.cellHeight) * density;
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(48), Gravity.TOP | Gravity.START);
@@ -873,7 +849,7 @@ final class ComposerBar {
         float right = layout.left + layout.cols * layout.cellWidth;
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
                 layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
-                recording(dictationState)));
+                recording(dictationState), layout.draftSpans));
         // The queue's rows above the prompt, while it is open: one target per row, its full width.
         if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.left, layout.top, layout.cellWidth,
                 layout.cellHeight, layout.cols));
@@ -1000,33 +976,6 @@ final class ComposerBar {
             case "row-back": return "Back";
             default: return id;
         }
-    }
-
-    /** The draft beside the controls when the renderer could not draw it (no prompt, no room). */
-    private void placeFallback(ViewGroup frame, FrameLayout.LayoutParams nearAt, int nearWidth) {
-        String draft = drafts.text();
-        boolean show = nearAt != null && layout != null && !layout.draftShown && !draft.trim().isEmpty();
-        if (!show) {
-            fallback.setVisibility(View.GONE);
-            return;
-        }
-        if (fallback.getParent() != frame) {
-            detach(fallback);
-            frame.addView(fallback);
-        }
-        android.text.SpannableString text = new android.text.SpannableString(draft.replace('\n', ' '));
-        DraftChips.apply(text, chip());
-        fallback.setText(text);
-        fallback.setVisibility(View.VISIBLE);
-        int width = Math.max(dp(80), frame.getWidth() - dp(16));
-        fallback.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.AT_MOST),
-                View.MeasureSpec.UNSPECIFIED);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
-        params.width = fallback.getMeasuredWidth();
-        int right = nearAt.leftMargin + nearWidth;
-        params.leftMargin = Math.max(dp(8), right - fallback.getMeasuredWidth());
-        params.topMargin = Math.max(0, nearAt.topMargin - fallback.getMeasuredHeight() - dp(4));
-        fallback.setLayoutParams(params);
     }
 
     /** Recordings the desktop gave up on (after {@code ClipStore.MAX_ATTEMPTS} uploads). */
@@ -1569,7 +1518,7 @@ final class ComposerBar {
         if (layout != null && !layout.anchored) place();
     }
 
-    /** How a waiting dictation's token reads in the field and the fallback. */
+    /** How a waiting dictation's token reads in the field. */
     private DraftChips.Style chip() {
         return new DraftChips.Style(chrome.warning, density, clipLengths, parkedIds(),
                 context.getDrawable(R.drawable.ic_bar_schedule));

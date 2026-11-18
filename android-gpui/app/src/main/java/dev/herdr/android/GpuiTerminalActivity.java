@@ -212,6 +212,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         scrollVelocity = 0f;
         flingRemainder = 0f;
     }
+
+    /**
+     * Bumped when something takes the viewport (typing jumps to the live bottom): scroll steps
+     * already handed to {@link #scrollWorker} for an older one are dropped, not run after it.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger scrollEpoch = new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Typing takes the viewport (the draft is written at Claude's prompt, at the live bottom):
+     * a fling still running stops, its scroll steps not yet run are dropped, and the pane goes
+     * back to its live bottom if it is (or was being flung) into history. Also on a held frame.
+     */
+    private void takeViewportForTyping() {
+        boolean wasFlinging = flinging;
+        stopFling();
+        if (terminalSurface != null) terminalSurface.removeCallbacks(flingStep);
+        scrollEpoch.incrementAndGet();
+        if (!shownScrolledBack && !wasFlinging) return;
+        jumpToLive();
+        showLatest(false);
+    }
     private boolean scrolling;
     /** The current drag left the slop sideways: the renderer pans it to its end. */
     private boolean panning;
@@ -1270,8 +1291,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             nativeSetFollow(target.generation, false);
         }
         target.fastUntil = SystemClock.uptimeMillis() + 1200;
+        final int epoch = scrollEpoch.get();
         try {
             scrollWorker.execute(() -> {
+                // The viewport was taken since (typing went to the live bottom): drop it.
+                if (epoch != scrollEpoch.get()) return;
                 try {
                     JSONObject answer = new JSONObject(RemoteNative.scrollLocal(target.remoteHandle, lines,
                             target.generation, target.title, target.status, shortcutJson));
@@ -1432,7 +1456,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             nativeSetFollow(target.generation, true);
         }
         try {
-            worker.execute(() -> {
+            // On the scroll worker: after any scroll step already running, never before it.
+            scrollWorker.execute(() -> {
                 try { RemoteNative.scrollTo(target.remoteHandle, 0); }
                 catch (RuntimeException | LinkageError ignored) { }
             });
@@ -4622,6 +4647,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void enterKey() {
                 queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
+            }
+
+            @Override public void toLive() {
+                takeViewportForTyping();
             }
 
             @Override public void hideKeyboard() {

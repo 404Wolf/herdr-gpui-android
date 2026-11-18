@@ -26,8 +26,16 @@ final class ClusterPlacement {
         int targetsTop;
         /** Whether the renderer drew the draft; when not, the composer shows it. */
         boolean draftShown;
-        /** The draft's drawn runs: {row, col, cells, first drawn character} ({@link DraftTaps}). */
+        /**
+         * The draft's drawn runs: {row, col, cells, first drawn character, characters, cluster}
+         * ({@link DraftTaps}).
+         */
         int[][] draftRuns = new int[0][];
+        /**
+         * Every row's drawn draft cells, {row, first, past last}, one per row: no control target
+         * covers any of them ({@link ControlTargets}).
+         */
+        int[][] draftSpans = new int[0][];
 
         Hint(float left, float top, float cellWidth, float cellHeight, int cols, int rows,
                 boolean anchored, int[] busy, int guard) {
@@ -41,6 +49,9 @@ final class ClusterPlacement {
             this.busy = busy;
             this.guard = Math.max(0, Math.min(rows, guard));
         }
+
+        /** The most draft runs a hint carries: ghost.rs {@code MAX_DRAFT_RUNS}, the same bound. */
+        static final int MAX_DRAFT_RUNS = 4096;
 
         /** The renderer's JSON, or null when it is malformed. */
         static Hint parse(String json) {
@@ -87,15 +98,52 @@ final class ClusterPlacement {
                 hint.targetsTop = Math.max(0, Math.min(rows, o.optInt("targetsTop", rows)));
                 hint.draftShown = o.optBoolean("draftShown");
                 JSONArray runs = o.optJSONArray("draft");
+                // Rows past the shared bound (never sent by this renderer) are kept whole from
+                // the controls: nothing drawn is ever open to them.
+                java.util.TreeMap<Integer, int[]> rowsOf = new java.util.TreeMap<>();
                 if (runs != null) {
-                    int n = Math.min(runs.length(), 256);
+                    int n = Math.min(runs.length(), MAX_DRAFT_RUNS);
                     hint.draftRuns = new int[n][];
-                    for (int i = 0; i < n; i++) {
+                    for (int i = 0; i < runs.length(); i++) {
                         JSONArray r = runs.getJSONArray(i);
-                        if (r.length() != 4) return null;
-                        hint.draftRuns[i] = new int[] {r.getInt(0), r.getInt(1), r.getInt(2), r.getInt(3)};
+                        if (r.length() < 4 || r.length() > 6) return null;
+                        int row = r.getInt(0), col = r.getInt(1), len = r.getInt(2);
+                        if (row < 0 || row >= rows || col < 0 || len < 0) return null;
+                        int[] span = rowsOf.get(row);
+                        if (i >= n) {
+                            rowsOf.put(row, new int[] {row, 0, cols});
+                            continue;
+                        }
+                        // [row, col, cells, first character, characters shown, 1 for a cluster]
+                        // (the last two absent from an older renderer: one cell per character).
+                        int chars = r.optInt(4, len);
+                        hint.draftRuns[i] = new int[] {row, col, len, r.getInt(3), chars,
+                                r.optInt(5, chars != len ? 1 : 0)};
+                        if (span == null) rowsOf.put(row, new int[] {row, col, col + len});
+                        else {
+                            span[1] = Math.min(span[1], col);
+                            span[2] = Math.max(span[2], col + len);
+                        }
                     }
                 }
+                JSONArray spans = o.optJSONArray("draftSpans");
+                if (spans != null) {
+                    // One per row: bounded by the grid's rows, never cut.
+                    if (spans.length() > rows) return null;
+                    for (int i = 0; i < spans.length(); i++) {
+                        JSONArray s = spans.getJSONArray(i);
+                        if (s.length() != 3) return null;
+                        int row = s.getInt(0), first = s.getInt(1), to = s.getInt(2);
+                        if (row < 0 || row >= rows || first < 0 || to < first) return null;
+                        int[] known = rowsOf.get(row);
+                        if (known == null) rowsOf.put(row, new int[] {row, first, to});
+                        else {
+                            known[1] = Math.min(known[1], first);
+                            known[2] = Math.max(known[2], to);
+                        }
+                    }
+                }
+                hint.draftSpans = rowsOf.values().toArray(new int[0][]);
                 return hint;
             } catch (JSONException malformed) {
                 return null;
