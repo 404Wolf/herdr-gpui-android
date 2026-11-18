@@ -855,9 +855,15 @@ final class ComposerBar {
             return;
         }
         float right = layout.left + layout.cols * layout.cellWidth;
+        // The queue's rows with targets of their own (while it is open): no control's reaches them.
+        java.util.List<ControlTargets.Cells> rowCells = new java.util.ArrayList<>();
+        if (queueOpen) {
+            rowCells.addAll(layout.echoes);
+            rowCells.addAll(layout.rowActions);
+        }
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
                 layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
-                recording(dictationState), layout.draftSpans));
+                recording(dictationState), layout.draftSpans, rowCells));
         // The queue's rows above the prompt, while it is open: one target per row, its full width,
         // and the selected row's actions on its right end.
         if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.left, layout.top,

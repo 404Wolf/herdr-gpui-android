@@ -75,18 +75,42 @@ final class ControlTargets {
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
             int topRow, float surfaceBottom, float maxRight, boolean recording) {
-        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording, null);
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording,
+                null, java.util.Collections.<Cells>emptyList());
+    }
+
+    /** As below, with no open queue's rows. */
+    static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans) {
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording,
+                draftSpans, java.util.Collections.<Cells>emptyList());
+    }
+
+    /** As below, with no draft drawn. */
+    static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, List<Cells> rows) {
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording,
+                null, rows);
     }
 
     /**
-     * As above, never over the draft's own cells ({@code draftSpans}: {row, first, past last},
-     * one per row, as the renderer drew them at Claude's prompt or its own): a tap on the
-     * draft's words puts the caret there, never "send" or "✕" (Wolf's ask 1). Every target
-     * gives up every draft cell, whichever way it lies: one above its row stops it below that
-     * row, one below stops it above, one beside it on its own row stops it at the draft's end.
+     * As above, never over the draft's own cells nor the open queue's rows; both apply at once.
+     *
+     * <p>{@code draftSpans} ({row, first, past last}, one per row, as the renderer drew them at
+     * Claude's prompt or its own): a tap on the draft's words puts the caret there, never "send"
+     * or "✕" (Wolf's ask 1). Every target gives up every draft cell, whichever way it lies: one
+     * above its row stops it below that row, one below stops it above, one beside it on its own
+     * row stops it at the draft's end.
+     *
+     * <p>{@code rows}: the queue's rows that have targets of their own (the drawn rows and a
+     * selected row's actions, while the queue is open). Their targets span the grid's width, so
+     * a control's target that would reach one of their rows stops below it: the recording stop,
+     * which grows up into the rows above the prompt, never takes a tap meant for "drop" or
+     * "edit", nor they one meant for the stop (Wolf's ask 4, review of #35).
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
-            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans) {
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans,
+            List<Cells> rows) {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
@@ -115,6 +139,10 @@ final class ControlTargets {
                 r = maxRight;
                 l = Math.min(l, maxRight - STOP_MIN_WIDTH_DP);
                 t = Math.max(top, Math.min(t, b - STOP_MIN_HEIGHT_DP));
+            }
+            for (Cells row : rows) {
+                float rowBottom = top + (row.row + 1) * cellHeight;
+                if (row.row < c.row && rowBottom > t) t = rowBottom;
             }
             if (draftSpans != null) {
                 // Beside it first (its own row), then above and below.

@@ -330,4 +330,74 @@ public final class StableBarTest {
             }
         }
     }
+
+    /** The renderer's cells for "kind id row start end; ..." (review of #35, r3: row-layouts.tsv). */
+    private static List<ControlTargets.Cells> cells(String spec) {
+        List<ControlTargets.Cells> out = new ArrayList<>();
+        for (String one : spec.split(";")) {
+            String[] f = one.trim().split(" ");
+            out.add(new ControlTargets.Cells(f[0], Integer.parseInt(f[1]), Integer.parseInt(f[2]),
+                    Integer.parseInt(f[3])));
+        }
+        return out;
+    }
+
+    private static boolean overlap(ControlTargets.Rect a, ControlTargets.Rect b) {
+        return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    }
+
+    @Test public void wolfAsk4_theStopAndASelectedRowsActionsNeverShareATap() {
+        // Review of #35 (r3), the renderer's own layouts: recording on the 46 x 23 cover screen,
+        // Claude's prompt on row 20, the controls on 21, the queue open with a row selected on
+        // row 18 (its actions at its right end). The stop grows up into the rows above the prompt;
+        // it must never take "drop" or "edit", nor they a tap meant for the stop.
+        List<ControlTargets.Cells> bar = cells("clear 21 15 16; queue 21 19 22; type 21 25 29; talk 21 32 36;"
+                + " gap-send 21 39 43");
+        String[][] kinds = {
+            {"unsure", "echo-m 18 0 14", "row-again 18 15 25; row-edit 18 28 32; row-drop 18 35 39; row-back 18 42 46"},
+            {"ordinary", "echo-m 18 0 27", "row-edit 18 28 32; row-drop 18 35 39; row-back 18 42 46"},
+            {"parked", "echo-m 18 0 26", "row-retry 18 27 32; row-drop 18 35 39; row-back 18 42 46"},
+            {"clip", "echo-m 18 0 34", "row-drop 18 35 39; row-back 18 42 46"},
+        };
+        float cw = 5.9f, left = 3.25f, top = 1.75f;
+        int cols = 46, rows = 23, topRow = 20;
+        for (String[] kind : kinds) {
+            List<ControlTargets.Cells> echoes = cells("echo-old 17 0 9; " + kind[1]);
+            List<ControlTargets.Cells> actions = cells(kind[2]);
+            List<ControlTargets.Cells> queueRows = new ArrayList<>(echoes);
+            queueRows.addAll(actions);
+            for (float ch : new float[] {14, 18, 22, 28}) {
+                for (boolean recording : new boolean[] {true, false}) {
+                    String what = kind[0] + ", " + ch + " dp rows" + (recording ? ", recording" : "");
+                    List<ControlTargets.Rect> rowTargets = ControlTargets.rows(echoes, actions, left, top, cw, ch, cols);
+                    List<ControlTargets.Rect> barTargets = ControlTargets.layout(bar, left, top, cw, ch, topRow,
+                            top + rows * ch, left + cols * cw, recording, queueRows);
+                    for (ControlTargets.Rect r : rowTargets) {
+                        assertEquals(what + ": " + r.id + " is one row high", ch, r.height(), 0.001f);
+                        for (ControlTargets.Rect b : barTargets) {
+                            assertFalse(what + ": " + b.id + " overlaps " + r.id, overlap(r, b));
+                        }
+                    }
+                    for (ControlTargets.Rect b : barTargets) {
+                        assertTrue(what + ": " + b.id + " keeps its words", b.left <= b.labelLeft
+                                && b.right >= b.labelRight && b.top <= top + 21 * ch && b.bottom >= top + 22 * ch);
+                    }
+                }
+            }
+            // The reviewer's tap, at 22 dp rows: the stop's, never drop's.
+            float ch = 22, x = 220, y = 416;
+            ControlTargets.Rect stop = null;
+            for (ControlTargets.Rect b : ControlTargets.layout(bar, left, top, cw, ch, topRow, top + rows * ch,
+                    left + cols * cw, true, queueRows)) {
+                if (b.id.equals("talk")) stop = b;
+            }
+            assertNotNull(stop);
+            assertEquals("the stop still reaches the grid's right edge", left + cols * cw, stop.right, 0.001f);
+            boolean inStop = x >= stop.left && x < stop.right && y >= stop.top && y < stop.bottom;
+            for (ControlTargets.Rect r : ControlTargets.rows(echoes, actions, left, top, cw, ch, cols)) {
+                boolean inRow = x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+                assertFalse(kind[0] + ": the tap at (220, 416) reaches both the stop and " + r.id, inRow && inStop);
+            }
+        }
+    }
 }
