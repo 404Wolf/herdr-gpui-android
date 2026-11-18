@@ -372,13 +372,10 @@ fn whole_clusters(spans: &[GhostSpan]) -> Vec<GhostSpan> {
         if out[prev].style == GhostStyle::Chip || out[prev].text.is_empty() {
             continue;
         }
-        loop {
-            let Some(last) = out[prev].text.graphemes(true).next_back().map(str::to_owned) else {
-                break;
-            };
-            let Some(first) = out[i].text.graphemes(true).next().map(str::to_owned) else {
-                break;
-            };
+        while let (Some(last), Some(first)) = (
+            out[prev].text.graphemes(true).next_back().map(str::to_owned),
+            out[i].text.graphemes(true).next().map(str::to_owned),
+        ) {
             if format!("{last}{first}").graphemes(true).count() != 1 {
                 break;
             }
@@ -738,90 +735,87 @@ pub fn place_all(
             .collect();
     }
     let has_draft = ghost.draft.iter().any(|s| !s.text.trim().is_empty());
-    match anchor {
-        Some(anchor) => {
-            // The draft and the echoes, short of the controls on their row.
-            let width_of = |row: usize| {
-                // On the controls' row, the draft ends a cell short of them.
-                if Some(row) == controls_row && !layout.controls.is_empty() {
-                    (cols - len).saturating_sub(1)
-                } else {
-                    cols
-                }
-            };
-            // The controls win their cells: a wrapped draft line on their row
-            // (wrap never narrows a line below 8 cells) is cut short of them.
-            let controls_from = cols - len;
-            // The draft never paints over the program's text below the caret:
-            // it may use the caret's row and then only rows holding nothing of
-            // the program's, blank ones and the prompt's frame (Claude's rule),
-            // so Claude's status line under the rule stays readable. A longer
-            // draft shows its caret end, as at the view's bottom.
-            let free_below = screen[anchor.row + 1..]
-                .iter()
-                .take_while(|cells| rule(cells) || cells.iter().all(|c| c.is_whitespace()))
-                .count();
-            // Nor over the program's text on the caret's own row: Claude's own unsent words
-            // after its cursor (typed on another client, the cursor moved back). Then the draft
-            // goes to the host's prompt, on blank cells only, below; the queue rows stay.
-            let caret_row_free = screen[anchor.row]
-                .get(anchor.col.min(cols)..)
-                .is_some_and(|cells| cells.iter().all(|c| c.is_whitespace()));
-            let without_draft;
-            let source = if caret_row_free {
-                ghost
+    if let Some(anchor) = anchor {
+        // The draft and the echoes, short of the controls on their row.
+        let width_of = |row: usize| {
+            // On the controls' row, the draft ends a cell short of them.
+            if Some(row) == controls_row && !layout.controls.is_empty() {
+                (cols - len).saturating_sub(1)
             } else {
-                without_draft = Ghost {
-                    draft: Vec::new(),
-                    ..ghost.clone()
-                };
-                &without_draft
-            };
-            let draft = place_with(source, Some(anchor), rows, cols, 1 + free_below, &width_of)
-                .into_iter()
-                .filter_map(|mut run| {
-                    if Some(run.row) != controls_row || layout.controls.is_empty() {
-                        return Some(run);
-                    }
-                    let room = controls_from.saturating_sub(run.col);
-                    if room == 0 {
-                        return None;
-                    }
-                    run.text = clip(&run.text, room);
-                    Some(run)
-                });
-            let mut draft: Vec<Placed> = draft.collect();
-            // Queue rows only on blank rows, the newest just above the prompt's frame, never
-            // over a cell the program drew (a dialog, Claude's own words): from the first row
-            // that is not blank up, none (review of #34).
-            let blank = |r: usize| screen[r].iter().all(|c| c.is_whitespace());
-            let mut free_from = anchor.prompt_row.saturating_sub(1).min(rows);
-            while free_from > 0 && blank(free_from - 1) {
-                free_from -= 1;
+                cols
             }
-            draft.retain(|p| p.source.is_some() || p.row >= free_from);
-            layout.echoes = echo_marks(ghost, anchor, &draft);
-            // Shown only if some of its words were placed: with no free cells
-            // at the caret (the controls fill its row) nothing is, and the host
-            // shows the draft itself instead of losing it.
-            layout.draft_shown = has_draft
-                && draft.iter().any(|p| {
-                    matches!(
-                        p.style,
-                        GhostStyle::Text
-                            | GhostStyle::Partial
-                            | GhostStyle::Chip
-                            | GhostStyle::Selected
-                    ) && !p
-                        .text
-                        .trim_matches(|c: char| c == '…' || c.is_whitespace())
-                        .is_empty()
-                });
-            layout.placed.extend(draft);
+        };
+        // The controls win their cells: a wrapped draft line on their row
+        // (wrap never narrows a line below 8 cells) is cut short of them.
+        let controls_from = cols - len;
+        // The draft never paints over the program's text below the caret:
+        // it may use the caret's row and then only rows holding nothing of
+        // the program's, blank ones and the prompt's frame (Claude's rule),
+        // so Claude's status line under the rule stays readable. A longer
+        // draft shows its caret end, as at the view's bottom.
+        let free_below = screen[anchor.row + 1..]
+            .iter()
+            .take_while(|cells| rule(cells) || cells.iter().all(|c| c.is_whitespace()))
+            .count();
+        // Nor over the program's text on the caret's own row: Claude's own unsent words
+        // after its cursor (typed on another client, the cursor moved back). Then the draft
+        // goes to the host's prompt, on blank cells only, below; the queue rows stay.
+        let caret_row_free = screen[anchor.row]
+            .get(anchor.col.min(cols)..)
+            .is_some_and(|cells| cells.iter().all(|c| c.is_whitespace()));
+        let without_draft;
+        let source = if caret_row_free {
+            ghost
+        } else {
+            without_draft = Ghost {
+                draft: Vec::new(),
+                ..ghost.clone()
+            };
+            &without_draft
+        };
+        let draft = place_with(source, Some(anchor), rows, cols, 1 + free_below, &width_of)
+            .into_iter()
+            .filter_map(|mut run| {
+                if Some(run.row) != controls_row || layout.controls.is_empty() {
+                    return Some(run);
+                }
+                let room = controls_from.saturating_sub(run.col);
+                if room == 0 {
+                    return None;
+                }
+                run.text = clip(&run.text, room);
+                Some(run)
+            });
+        let mut draft: Vec<Placed> = draft.collect();
+        // Queue rows only on blank rows, the newest just above the prompt's frame, never
+        // over a cell the program drew (a dialog, Claude's own words): from the first row
+        // that is not blank up, none (review of #34).
+        let blank = |r: usize| screen[r].iter().all(|c| c.is_whitespace());
+        let mut free_from = anchor.prompt_row.saturating_sub(1).min(rows);
+        while free_from > 0 && blank(free_from - 1) {
+            free_from -= 1;
         }
-        // Without Claude's prompt on screen the draft goes to the host's own prompt, below.
-        None => {}
+        draft.retain(|p| p.source.is_some() || p.row >= free_from);
+        layout.echoes = echo_marks(ghost, anchor, &draft);
+        // Shown only if some of its words were placed: with no free cells
+        // at the caret (the controls fill its row) nothing is, and the host
+        // shows the draft itself instead of losing it.
+        layout.draft_shown = has_draft
+            && draft.iter().any(|p| {
+                matches!(
+                    p.style,
+                    GhostStyle::Text
+                        | GhostStyle::Partial
+                        | GhostStyle::Chip
+                        | GhostStyle::Selected
+                ) && !p
+                    .text
+                    .trim_matches(|c: char| c == '…' || c.is_whitespace())
+                    .is_empty()
+            });
+        layout.placed.extend(draft);
     }
+    // Without Claude's prompt on screen the draft goes to the host's own prompt, below.
     if has_draft && !layout.draft_shown {
         let controls_from = if layout.controls.is_empty() { cols } else { cols - len };
         ghost_prompt(ghost, &mut layout, controls_row, controls_from, screen);
@@ -837,14 +831,13 @@ pub fn place_all(
         let last = layout
             .placed
             .iter()
-            .filter(|p| {
+            .rfind(|p| {
                 p.source.is_some()
                     && matches!(
                         p.style,
                         GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip | GhostStyle::Selected
                     )
             })
-            .last()
             .map(|p| (p.row, p.col + cells(&p.text), p.source.map(|s| s + p.text.chars().count())));
         if let Some((row, col, source)) = last {
             layout.placed.push(Placed {
@@ -2790,7 +2783,7 @@ mod tests {
                 })
                 .collect();
             for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty() && p.text != "…") {
-                assert!(boundaries.contains(&p.source.unwrap()), "n={n}, starts inside a cluster: {p:?}");
+                assert!(boundaries.contains(&p.source.expect("a draft run")), "n={n}, starts inside a cluster: {p:?}");
                 assert!(!p.text.starts_with('\u{fe0f}'), "n={n}: {p:?}");
             }
         }
@@ -2896,10 +2889,11 @@ mod tests {
             let runs = super::draft_runs(&layout.placed);
             assert!(runs[0].cluster && runs[0].source == 0, "{draft:?}: {runs:?}");
             let text: String = draft.iter().map(|s| s.text.as_str()).collect();
-            let first = text.graphemes(true).next().unwrap();
+            let first = text.graphemes(true).next().expect("a first cluster");
             assert_eq!(runs[0].chars, first.chars().count(), "{draft:?}: {runs:?}");
             if let Some(caret) = layout.placed.iter().find(|p| p.style == GhostStyle::Caret) {
-                assert!(caret.source.unwrap() == 0 || caret.source.unwrap() >= first.chars().count(), "{caret:?}");
+                let at = caret.source.expect("the caret's offset");
+                assert!(at == 0 || at >= first.chars().count(), "{caret:?}");
             }
         }
     }
@@ -2964,7 +2958,7 @@ mod tests {
                     })
                     .collect();
                 for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty() && p.text != "…") {
-                    assert!(bounds.contains(&p.source.unwrap()), "{grapheme} x{n}: {p:?}");
+                    assert!(bounds.contains(&p.source.expect("a draft run")), "{grapheme} x{n}: {p:?}");
                 }
             }
         }
