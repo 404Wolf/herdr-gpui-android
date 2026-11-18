@@ -343,9 +343,16 @@ pub(crate) fn request_keyboard(generation: i64) -> bool {
 }
 
 /// Opens a browser for a terminal link. Only http(s) targets within bounds are
-/// forwarded; Java rechecks the scheme before starting an intent.
-pub(crate) fn open_link(generation: i64, url: &str, found_on: &model::FrameTarget) -> bool {
-    if !model::mailbox().state().opens_links(generation) {
+/// forwarded; Java rechecks the scheme before starting an intent. `found_on`
+/// is the host and pane of the renderer the link was found on; `None` for a
+/// link in Herdr's own pane rows, which only a live session draws.
+pub(crate) fn open_link(generation: i64, url: &str, found_on: Option<&model::FrameTarget>) -> bool {
+    let state = model::mailbox().state();
+    let allowed = match found_on {
+        Some(_) => state.opens_links(generation),
+        None => state.active && state.generation == generation,
+    };
+    if !allowed {
         return false;
     }
     if url.len() > 2048
@@ -362,8 +369,21 @@ pub(crate) fn open_link(generation: i64, url: &str, found_on: &model::FrameTarge
         )
         .map_err(|e| e.to_string())?;
         let value = env.new_string(url).map_err(|e| e.to_string())?;
-        let host = env.new_string(&*found_on.host).map_err(|e| e.to_string())?;
-        let pane = env.new_string(&*found_on.pane).map_err(|e| e.to_string())?;
+        // Null when the link carries no renderer: Java then wants a live session.
+        let (host, pane) = match found_on {
+            Some(target) => (
+                jni_mobile::objects::JObject::from(
+                    env.new_string(&*target.host).map_err(|e| e.to_string())?,
+                ),
+                jni_mobile::objects::JObject::from(
+                    env.new_string(&*target.pane).map_err(|e| e.to_string())?,
+                ),
+            ),
+            None => (
+                jni_mobile::objects::JObject::null(),
+                jni_mobile::objects::JObject::null(),
+            ),
+        };
         env.call_method(
             &activity,
             name,

@@ -194,7 +194,7 @@ impl TerminalView {
                         let generation = model::mailbox().state().generation;
                         match (link, action) {
                             (Link::Web(url), LinkAction::Open) => {
-                                crate::android::open_link(generation, &url, target);
+                                crate::android::open_link(generation, &url, Some(target));
                             }
                             (Link::File { path, line }, LinkAction::Open) => {
                                 crate::android::open_file(generation, &path, line);
@@ -521,8 +521,9 @@ impl GridRow {
                 let Some(url) = url else {
                     return;
                 };
+                // Herdr's own pane rows: only a live session draws them.
                 #[cfg(target_os = "android")]
-                crate::android::open_link(generation, &url);
+                crate::android::open_link(generation, &url, None);
                 #[cfg(not(target_os = "android"))]
                 {
                     let state = model::mailbox().state();

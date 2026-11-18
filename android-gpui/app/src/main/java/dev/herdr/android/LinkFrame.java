@@ -22,4 +22,14 @@ final class LinkFrame {
         return foundOnHost != null && foundOnPane != null
                 && foundOnHost.equals(part(selectedHost)) && foundOnPane.equals(part(selectedPane));
     }
+
+    /**
+     * {@link #selected} for a link found on a renderer; a link that carries none (Herdr's own
+     * pane rows, drawn only by a live session) acts only while the session is {@code live}.
+     */
+    static boolean opens(String foundOnHost, String foundOnPane, String selectedHost, String selectedPane,
+            boolean live) {
+        if (foundOnHost == null && foundOnPane == null) return live;
+        return selected(foundOnHost, foundOnPane, selectedHost, selectedPane);
+    }
 }

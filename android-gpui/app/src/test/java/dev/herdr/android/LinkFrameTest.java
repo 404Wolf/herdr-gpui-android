@@ -44,4 +44,12 @@ public final class LinkFrameTest {
         assertFalse(LinkFrame.selected(null, null, "A", "p1"));
         assertFalse(LinkFrame.selected("", "", "A", "p1"));
     }
+
+    @Test public void wolfAskLinksHerdrsOwnPaneRowsOpenOnlyOnALiveSession() {
+        // Rows Herdr draws itself carry no renderer: live only, as before.
+        assertTrue(LinkFrame.opens(null, null, "A", "p1", true));
+        assertFalse(LinkFrame.opens(null, null, "A", "p1", false));
+        assertFalse(LinkFrame.opens("A", "p1", "A", "p2", true));
+        assertTrue(LinkFrame.opens("A", "p1", "A", "p1", false));
+    }
 }

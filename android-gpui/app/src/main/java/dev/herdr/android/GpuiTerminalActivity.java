@@ -5551,7 +5551,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             synchronized (stateLock) {
                 if (destroyed || isFinishing() || connection == null
                         || connection.generation != expectedGeneration
-                        || !LinkFrame.selected(foundOnHost, foundOnPane, connection.hostId, connection.paneId)) return;
+                        || !LinkFrame.opens(foundOnHost, foundOnPane, connection.hostId, connection.paneId,
+                                connection.ready)) return;
             }
             if (url == null || url.length() > 2048) return;
             String lower = url.toLowerCase(java.util.Locale.ROOT);
