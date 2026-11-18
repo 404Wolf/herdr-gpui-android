@@ -2646,7 +2646,7 @@ mod tests {
         let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["clear", "queue", "type", "talk", "send"]);
         // The slots end the line at the right edge, as the host laid them out.
-        let send = layout.controls.iter().find(|c| c.id == "send").unwrap();
+        let send = layout.controls.iter().find(|c| c.id == "send").expect("send drawn");
         assert_eq!(send.end, cols - 3);
         // Without the ladder (an old host) the renderer still keeps ✕, the queue and the stop.
         g.rungs.clear();
@@ -2745,9 +2745,11 @@ mod tests {
                     // Nothing drawn twice on the row: its words stop short of the actions.
                     let mut taken = vec![false; cols];
                     for p in layout.placed.iter().filter(|p| p.row == echo.row) {
-                        for c in p.col..p.col + p.text.chars().count() {
-                            assert!(!taken[c], "{what}: cell {c} drawn twice");
-                            taken[c] = true;
+                        let n = p.text.chars().count();
+                        assert!(p.col + n <= cols, "{what}: {p:?} past the grid");
+                        for (c, cell) in taken.iter_mut().enumerate().skip(p.col).take(n) {
+                            assert!(!*cell, "{what}: cell {c} drawn twice");
+                            *cell = true;
                         }
                     }
                     // The other row keeps its whole mark; nothing selected, nothing drawn.
@@ -2774,7 +2776,7 @@ mod tests {
             let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
             assert!(ids.ends_with(&["type", "talk", "send"]), "{cols}: {ids:?}");
             assert!(ids.contains(&"clear") && ids.contains(&"queue"), "{cols}: {ids:?}");
-            let send = layout.controls.iter().find(|c| c.id == "send").unwrap();
+            let send = layout.controls.iter().find(|c| c.id == "send").expect("send drawn");
             assert_eq!(send.end, cols - 3, "{cols}");
         }
     }
@@ -2814,9 +2816,11 @@ mod tests {
             }
             let mut taken = vec![false; cols];
             for p in layout.placed.iter().filter(|p| p.row == echo.row) {
-                for c in p.col..p.col + p.text.chars().count() {
-                    assert!(!taken[c], "{kind}: cell {c} drawn twice");
-                    taken[c] = true;
+                let n = p.text.chars().count();
+                assert!(p.col + n <= cols, "{kind}: {p:?} past the grid");
+                for (c, cell) in taken.iter_mut().enumerate().skip(p.col).take(n) {
+                    assert!(!*cell, "{kind}: cell {c} drawn twice");
+                    *cell = true;
                 }
             }
             assert!(layout.placed.iter().all(|p| p.row > 2), "{kind}: drew over the program");
