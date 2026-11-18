@@ -52,14 +52,33 @@ public final class DictationFakes {
 
 
     /** The main thread's Handler, on a single-thread executor. */
+    /**
+     * The engine's main thread. By default its timers run on the wall clock. {@link #manual}
+     * holds them instead: a timer runs only when the test fires it ({@link #fire}), so no
+     * timeout can beat a reply from the fake desktop or recognizer on a loaded machine, and a
+     * test that wants a timeout says which one and when.
+     */
     public static final class TestMain implements ServerDictationEngine.Main {
         private final ScheduledExecutorService exec;
+        private final boolean manual;
         private final Map<Runnable, List<ScheduledFuture<?>>> delayed = new ConcurrentHashMap<>();
+        /** Held timers (manual): each runnable with the delay it was posted with, in order. */
+        private final List<Object[]> held = new ArrayList<>();
         /** Every delay the engine asked for, in order: its timeouts, checked without a clock. */
         public final List<Long> delays = Collections.synchronizedList(new ArrayList<>());
 
         TestMain(ScheduledExecutorService exec) {
+            this(exec, false);
+        }
+
+        private TestMain(ScheduledExecutorService exec, boolean manual) {
             this.exec = exec;
+            this.manual = manual;
+        }
+
+        /** A main thread whose timers run only when the test fires them. */
+        static TestMain manual(ScheduledExecutorService exec) {
+            return new TestMain(exec, true);
         }
 
         @Override public void post(Runnable r) {
@@ -68,13 +87,65 @@ public final class DictationFakes {
 
         @Override public void postDelayed(Runnable r, long delayMs) {
             delays.add(delayMs);
+            if (manual) {
+                synchronized (held) {
+                    held.add(new Object[] {r, delayMs});
+                    held.notifyAll();
+                }
+                return;
+            }
             delayed.computeIfAbsent(r, k -> Collections.synchronizedList(new ArrayList<>()))
                     .add(exec.schedule(r, delayMs, TimeUnit.MILLISECONDS));
         }
 
         @Override public void remove(Runnable r) {
+            synchronized (held) {
+                held.removeIf(t -> t[0] == r);
+            }
             List<ScheduledFuture<?>> futures = delayed.remove(r);
             if (futures != null) for (ScheduledFuture<?> f : futures) f.cancel(false);
+        }
+
+        /**
+         * Manual: waits (10 s at most) until the engine holds a timer of {@code delayMs}, then
+         * runs it on the main thread, as if that much time had passed, and waits for it.
+         */
+        public void fire(long delayMs) throws Exception {
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (true) {
+                synchronized (held) {
+                    while (!holds(delayMs)) {
+                        long left = deadline - System.currentTimeMillis();
+                        if (left <= 0) throw new AssertionError("no " + delayMs + " ms timer was set: " + delays);
+                        held.wait(left);
+                    }
+                }
+                // Taken and run on the main thread, where the engine sets and clears its timers:
+                // one it cleared meanwhile (its reply came first) is never run.
+                boolean ran = exec.submit(() -> {
+                    Runnable due = null;
+                    synchronized (held) {
+                        for (Object[] t : held) {
+                            if ((Long) t[1] == delayMs) {
+                                due = (Runnable) t[0];
+                                held.remove(t);
+                                break;
+                            }
+                        }
+                    }
+                    if (due != null) due.run();
+                    return due != null;
+                }).get(10, TimeUnit.SECONDS);
+                if (ran) return;
+            }
+        }
+
+        /** Manual: whether a timer of {@code delayMs} is set and has not run. */
+        public boolean holds(long delayMs) {
+            synchronized (held) {
+                for (Object[] t : held) if ((Long) t[1] == delayMs) return true;
+                return false;
+            }
         }
     }
 
@@ -87,6 +158,8 @@ public final class DictationFakes {
         /** From this chunk on, exact zeros (a silenced microphone); -1 never. */
         volatile int zerosFrom = -1;
         volatile boolean androidSilenced;
+        /** Gives nothing until this holds (null: from the start): e.g. until the desktop is ready. */
+        volatile BooleanSupplier holdUntil;
 
         @Override public AudioInput open() throws Microphone.Failure {
             if (failToOpen) throw new Microphone.Failure(Microphone.Failure.Cause.IN_USE, "in use");
@@ -100,6 +173,15 @@ public final class DictationFakes {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return 0;
+            }
+            BooleanSupplier hold = holdUntil;
+            while (hold != null && !hold.getAsBoolean() && !stop.getAsBoolean()) {
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return 0;
+                }
             }
             if (stop.getAsBoolean()) return 0;
             index++;
@@ -140,6 +222,8 @@ public final class DictationFakes {
         volatile boolean started;
         volatile boolean cancelled;
         volatile boolean ended;
+        /** Its final (or failure) has been handed to the engine. */
+        volatile boolean answered;
         private Callback callback;
 
         public FakeRecognizer(String text, long finalDelayMs) {
@@ -172,6 +256,7 @@ public final class DictationFakes {
                 if (cancelled) return;
                 if (text == null) callback.onError("scripted failure");
                 else callback.onFinal(text);
+                answered = true;
             });
             t.setDaemon(true);
             t.start();
