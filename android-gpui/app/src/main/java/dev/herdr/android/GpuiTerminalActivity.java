@@ -4607,6 +4607,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
             }
 
+            @Override public void toLive() {
+                if (!shownScrolledBack) return;
+                jumpToLive();
+                showLatest(false);
+            }
+
             @Override public void hideKeyboard() {
                 allowNextKeyboardShow = false;
                 GpuiTerminalActivity.super.gpuiHideKeyboard(imeSession);

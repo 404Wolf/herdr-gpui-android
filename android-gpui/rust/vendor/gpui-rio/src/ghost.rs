@@ -664,41 +664,87 @@ pub fn place_all(
                 });
             layout.placed.extend(draft);
         }
-        None => {
-            // One line on the row above the controls, only on its blank end.
-            if let Some(row) = controls_row
-                .and_then(|r| r.checked_sub(1))
-                .filter(|_| has_draft)
-            {
-                let room = free_tail(&screen[row]).saturating_sub(1).min(cols / 2);
-                if room >= 12 {
-                    let text: String = ghost
-                        .draft
-                        .iter()
-                        .map(|s| s.text.replace(['\n', '\r', '\t'], " "))
-                        .collect();
-                    let text = text.trim();
-                    let count = text.chars().count();
-                    let shown: String = if count <= room {
-                        text.to_owned()
-                    } else {
-                        let tail: String = text.chars().skip(count - (room - 1)).collect();
-                        format!("…{tail}")
-                    };
-                    let n = shown.chars().count();
-                    layout.placed.push(Placed {
-                        row,
-                        col: cols - n - 1,
-                        text: shown,
-                        style: GhostStyle::Text,
-                        source: None,
-                    });
-                    layout.draft_shown = true;
-                }
-            }
-        }
+        // Without Claude's prompt on screen the draft goes to the host's own prompt, below.
+        None => {}
+    }
+    if has_draft && !layout.draft_shown {
+        ghost_prompt(ghost, &mut layout, controls_row, screen);
     }
     layout
+}
+
+/// How many rows the host's own prompt gives a draft (more shows its caret end).
+pub const GHOST_PROMPT_ROWS: usize = 3;
+
+/// The draft never leaves the terminal and is never lost from view: when Claude's prompt
+/// cannot take it (busy or streaming, a dialog, no room at its caret, scrolled away), it is
+/// drawn at the bottom, just above the controls' row, as a prompt of the host's own in the
+/// terminal's font and Claude's style: a rule, then `❯ ` and the draft, wrapping onto the
+/// rows below with its caret, chips and marks, and its runs reported for taps as at
+/// Claude's prompt. Its rows are painted over whatever the program drew there; its rule
+/// only over a blank row or a rule, so a dialog's last line above stays readable.
+fn ghost_prompt(ghost: &Ghost, layout: &mut Layout, controls_row: Option<usize>, screen: &[Vec<char>]) {
+    let rows = screen.len();
+    let cols = screen.first().map_or(0, Vec::len);
+    if cols < 8 {
+        return;
+    }
+    // The rows just above the controls, or the screen's last rows without them.
+    let bottom = controls_row.unwrap_or(rows);
+    let cells: usize = ghost.draft.iter().map(|s| s.text.chars().count()).sum();
+    let width = cols - 2;
+    // One cell more for the caret at the end.
+    let needed = (cells + 1).div_ceil(width);
+    let lines = needed.clamp(1, GHOST_PROMPT_ROWS).min(bottom);
+    if lines == 0 {
+        return;
+    }
+    let top = bottom - lines;
+    let rule_row = top
+        .checked_sub(1)
+        .filter(|&r| rule(&screen[r]) || screen[r].iter().all(|c| c.is_whitespace()));
+    // The prompt's rows first, blank on the program's background, so nothing shows through.
+    for row in rule_row.unwrap_or(top)..bottom {
+        layout.placed.push(Placed {
+            row,
+            col: 0,
+            text: " ".repeat(cols),
+            style: GhostStyle::Text,
+            source: None,
+        });
+    }
+    if let Some(row) = rule_row {
+        layout.placed.push(Placed {
+            row,
+            col: 0,
+            text: "─".repeat(cols),
+            style: GhostStyle::Dim,
+            source: None,
+        });
+    }
+    layout.placed.push(Placed {
+        row: top,
+        col: 0,
+        text: "❯".to_owned(),
+        style: GhostStyle::Text,
+        source: None,
+    });
+    let anchor = Anchor {
+        prompt_row: top,
+        row: top,
+        col: 2,
+        indent: 2,
+    };
+    let full = |_: usize| cols;
+    let mut placed = place_with(ghost, Some(anchor), rows, cols, lines, &full);
+    if layout.echoes.is_empty() {
+        layout.echoes = echo_marks(ghost, anchor, &placed);
+    } else {
+        // Claude's prompt is on screen and its queue rows are drawn above it already.
+        placed.retain(|p| p.source.is_some());
+    }
+    layout.draft_shown = placed.iter().any(|p| p.source.is_some());
+    layout.placed.extend(placed);
 }
 
 /// Where each shown queue row went: the rows above the prompt's frame (`place_with` puts the
@@ -1309,6 +1355,80 @@ mod tests {
         assert_eq!(caret.col, four.col + four.text.trim_end().chars().count());
     }
 
+    /// Wolf's ask 1: the draft is drawn in the terminal in every state, at Claude's prompt
+    /// when it can take it, else at the host's own prompt above the controls; never only in
+    /// an Android view (the composer has none any more).
+    #[test]
+    fn wolf_ask1_the_draft_is_drawn_in_the_terminal_in_every_state() {
+        let g = || {
+            controls(ghost(vec![
+                text("fix the stop "),
+                styled("", GhostStyle::Caret),
+                text("button"),
+            ]))
+        };
+        let shown = |layout: &Layout, what: &str| {
+            assert!(layout.draft_shown, "{what}: {layout:?}");
+            let runs = draft_runs(&layout.placed);
+            assert!(!runs.is_empty(), "{what}: no draft runs");
+            assert!(
+                layout.placed.iter().any(|p| p.style == GhostStyle::Caret),
+                "{what}: the caret is kept"
+            );
+            assert!(
+                layout.placed.iter().any(|p| p.text.contains("button")),
+                "{what}: {layout:?}"
+            );
+        };
+        // At Claude's prompt.
+        let (rows, anchor) = claude_status_screen(60);
+        shown(&place_all(&g(), anchor, &rows, None), "at Claude's prompt");
+        // Claude busy, streaming output: no prompt on screen.
+        let busy = screen(
+            &[
+                "● Reading src/main.rs",
+                "  ⎿ 120 lines",
+                "✻ Brewing… (12s · esc to interrupt)",
+                "",
+                "",
+                "",
+            ],
+            60,
+        );
+        let layout = place_all(&g(), None, &busy, None);
+        shown(&layout, "Claude busy");
+        let row = layout.controls[0].row;
+        assert!(drawn(&layout, row - 1, 60).starts_with("❯ fix the stop button"));
+        // A dialog over the prompt, every row of the screen written.
+        let full = screen(&["x".repeat(60).as_str(); 6], 60);
+        shown(&place_all(&g(), None, &full, None), "a full screen");
+        // Scrolled into history: the controls keep their row, the draft goes above it.
+        let layout = place_all(
+            &g(),
+            None,
+            &busy,
+            Some(Previous {
+                row: 4,
+                scrolled: true,
+            }),
+        );
+        shown(&layout, "scrolled");
+        assert!(draft_runs(&layout.placed).iter().all(|r| r.row < 4));
+        // A narrow cover screen with the full recording line.
+        let mut rec = full_line(OFFLINE);
+        rec.draft = g().draft;
+        let narrow = screen(&["", "", "", "", "", ""], 30);
+        shown(&place_all(&rec, None, &narrow, None), "cover screen, recording");
+        // A long draft shows its caret end in at most GHOST_PROMPT_ROWS rows.
+        let mut long = g();
+        long.draft = vec![text(&format!("{} END", "word ".repeat(80))), styled("", GhostStyle::Caret)];
+        let layout = place_all(&long, None, &busy, None);
+        let draft_rows: std::collections::BTreeSet<usize> =
+            draft_runs(&layout.placed).iter().map(|r| r.row).collect();
+        assert!(draft_rows.len() <= GHOST_PROMPT_ROWS, "{draft_rows:?}");
+        assert!(layout.placed.iter().any(|p| p.text.contains("END")));
+    }
+
     #[test]
     fn with_a_dialog_the_controls_and_draft_take_free_cells_only() {
         let rows = screen(
@@ -1331,17 +1451,21 @@ mod tests {
         let row = layout.controls[0].row;
         assert_eq!(row, 5);
         assert!(drawn(&layout, 5, 60).ends_with("send ──"));
-        assert!(drawn(&layout, 4, 60).ends_with("no wait, keep the build dir"));
-        // Nothing over the dialog's rows.
+        // The draft in the host's own prompt, just above the controls (Wolf's ask 1: the
+        // only input is the draft drawn in the terminal, never an Android box).
+        assert_eq!(drawn(&layout, 4, 60), "❯ no wait, keep the build dir");
+        assert!(layout.draft_shown);
+        // Nothing over the dialog's rows, not even the prompt's rule.
         assert!(layout.placed.iter().all(|p| p.row >= 4));
-        // A screen whose bottom rows are all text has no free cells: the
-        // controls still cover the bottom row's end, the draft is not drawn.
+        // A screen whose bottom rows are all text: the controls still cover the bottom
+        // row's end, and the draft takes the row above it, painted over the program's.
         let full = screen(&["x".repeat(60).as_str(); 4], 60);
         let layout = place_all(&controls(ghost(vec![text("hi")])), None, &full, None);
         assert_eq!(layout.controls.len(), 3);
         assert!(layout.controls.iter().all(|c| c.row == 3));
         assert!(drawn(&layout, 3, 60).ends_with(" type ─ talk ─ send ──"));
-        assert!(!layout.draft_shown);
+        assert!(layout.draft_shown);
+        assert!(drawn(&layout, 2, 60).starts_with("❯ hi"));
         assert_eq!(layout.targets_top, 3);
     }
 
@@ -1614,10 +1738,11 @@ mod tests {
     }
 
     #[test]
-    fn with_no_free_cells_at_the_caret_the_host_shows_the_draft() {
+    fn with_no_free_cells_at_the_caret_the_draft_goes_to_the_hosts_own_prompt() {
         // Codex at 22 cols with the full offline controls on its caret row and
-        // its hint right below: no cell is free for the draft, so none is
-        // placed and draft_shown is false, and the host's own draft view shows.
+        // its hint right below: no cell is free at the caret, so the draft goes
+        // to the host's own prompt above the controls (Wolf's ask 1: never an
+        // Android view), its caret end shown.
         let cols = 22;
         let rows = screen(&["", "", "› ", "  ? for shortcuts", "", ""], cols);
         let anchor = locate(&rows, Some((2, 2)), PromptKind::Codex);
@@ -1631,13 +1756,11 @@ mod tests {
             "{:?}",
             layout.placed
         );
-        let placed = layout.placed.iter().any(|p| {
-            matches!(
-                p.style,
-                GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip
-            )
-        });
-        assert!(!placed && !layout.draft_shown, "{layout:?}");
+        let row = layout.controls[0].row;
+        assert!(layout.draft_shown, "{layout:?}");
+        let runs = draft_runs(&layout.placed);
+        assert!(!runs.is_empty() && runs.iter().all(|r| r.row < row), "{runs:?}");
+        assert!(layout.placed.iter().any(|p| p.text.contains("END")), "the caret end shows");
         // With room, the same draft is placed and reported shown.
         let (rows, anchor) = claude_status_screen(40);
         let layout = place_all(&g, anchor, &rows, None);

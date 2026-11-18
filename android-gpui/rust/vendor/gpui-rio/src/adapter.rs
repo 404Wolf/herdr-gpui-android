@@ -341,13 +341,12 @@ macro_rules! __bind_gpui {
                 }
 
                 /// Paints placed ghost runs over the grid on the program's background,
-                /// with a thin caret after the draft when it sits at the prompt.
+                /// with a thin caret in the draft, at Claude's prompt or the host's own.
                 #[allow(clippy::too_many_arguments)]
                 fn paint_ghost(
                     &self,
                     ghost: &$crate::ghost::Ghost,
                     placed: &[$crate::ghost::Placed],
-                    anchor: Option<$crate::ghost::Anchor>,
                     origin: Point<Pixels>,
                     font: &Font,
                     font_size: Pixels,
@@ -363,8 +362,9 @@ macro_rules! __bind_gpui {
                     for run in placed {
                         let len = run.text.chars().count();
                         let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
+                        // A run of the draft (at Claude's prompt or the host's own) carries its source.
                         if run.style == GhostStyle::Caret {
-                            if anchor.is_some_and(|a| run.row >= a.row) {
+                            if run.source.is_some() {
                                 explicit = Some(at);
                             }
                             continue;
@@ -414,7 +414,7 @@ macro_rules! __bind_gpui {
                                 x += px(4.);
                             }
                         }
-                        if anchor.is_some_and(|a| run.row >= a.row)
+                        if run.source.is_some()
                             && matches!(
                                 run.style,
                                 GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip | GhostStyle::Selected
@@ -673,7 +673,7 @@ macro_rules! __bind_gpui {
                         .unwrap_or_default();
                     let placed = &layout.placed;
                     if let Some(ghost) = self.ghost.clone() {
-                        self.paint_ghost(&ghost, placed, anchor, bounds.origin, &font, font_size, window, cx);
+                        self.paint_ghost(&ghost, placed, bounds.origin, &font, font_size, window, cx);
                     }
                     if let Some(listener) = self.layout_listener.clone() {
                         let hint = $crate::ghost::LayoutHint {
