@@ -105,4 +105,46 @@ public final class NativeInputTest {
             assertTrue("at most one talk in " + line.size() + " controls", talks <= 1);
         }
     }
+
+    @Test public void wolfAsk1_tappingTheDrawnDraftNeverHitsAControl() {
+        // Review of #34: a 60-column, 6-row screen with no prompt, a 55-character draft drawn
+        // by the renderer on row 4, the controls on row 5. Draft character 52 is under "send".
+        List<ControlTargets.Cells> cells = Arrays.asList(
+                new ControlTargets.Cells("type", 5, 35, 39),
+                new ControlTargets.Cells("talk", 5, 42, 46),
+                new ControlTargets.Cells("clear", 5, 49, 50),
+                new ControlTargets.Cells("send", 5, 53, 57));
+        int[][] draft = {{4, 2, 55, 0, 55}};
+        assertEquals(52, DraftTaps.drawnAt(draft, 4, 54));
+        for (boolean recording : new boolean[] {false, true}) {
+            List<ControlTargets.Rect> rects = ControlTargets.layout(cells, 0, 0, 8, 16, 5, 96, 480, recording, draft);
+            for (int col = 2; col < 57; col++) {
+                float x = col * 8 + 4, y = 4 * 16 + 8;
+                for (ControlTargets.Rect r : rects) {
+                    assertFalse((recording ? "recording: " : "") + "draft cell " + col + " is under " + r.id,
+                            x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+                }
+            }
+            // The controls keep their own words.
+            for (ControlTargets.Rect r : rects) assertTrue(r.id, r.top <= 5 * 16 && r.bottom >= 6 * 16);
+        }
+        // On the controls' own row (a dialog down to them): the draft left of them stays the draft's.
+        int[][] beside = {{5, 2, 30, 0, 30}};
+        for (ControlTargets.Rect r : ControlTargets.layout(cells, 0, 0, 8, 16, 5, 96, 480, false, beside)) {
+            assertTrue(r.id + " starts after the draft", r.left >= 32 * 8);
+        }
+    }
+
+    @Test public void wolfAsk1_aTapOnAWideOrCombinedCharacterGoesToItsEdges() {
+        // 界 at cells 2-3 is draft character 0; a ZWJ family (5 code points) at 4-5 is 1..5.
+        int[][] runs = {{0, 2, 2, 0, 1}, {0, 4, 2, 1, 5}, {0, 6, 3, 6, 3}};
+        assertEquals(0, DraftTaps.drawnAt(runs, 0, 2.4f));
+        assertEquals(1, DraftTaps.drawnAt(runs, 0, 3.2f));
+        assertEquals(1, DraftTaps.drawnAt(runs, 0, 4.5f));
+        assertEquals(6, DraftTaps.drawnAt(runs, 0, 5.5f));
+        // Plain characters still one cell each.
+        assertEquals(7, DraftTaps.drawnAt(runs, 0, 7.2f));
+        // An older renderer's four-field runs: one cell per character, as before.
+        assertEquals(3, DraftTaps.drawnAt(new int[][] {{0, 0, 5, 0}}, 0, 3.2f));
+    }
 }

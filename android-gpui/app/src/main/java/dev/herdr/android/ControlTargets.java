@@ -75,6 +75,17 @@ final class ControlTargets {
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
             int topRow, float surfaceBottom, float maxRight, boolean recording) {
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording, null);
+    }
+
+    /**
+     * As above, never over the draft's own cells ({@code draftRuns}: {row, col, cells, ...} as
+     * the renderer drew them, at Claude's prompt or its own): a tap on the draft's words puts
+     * the caret there, never "send" or "✕" (Wolf's ask 1). A target that would reach a draft
+     * cell above its row stops below that row; one beside it on its own row stops after it.
+     */
+    static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftRuns) {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
@@ -97,6 +108,19 @@ final class ControlTargets {
                 r = maxRight;
                 l = Math.min(l, maxRight - STOP_MIN_WIDTH_DP);
                 t = Math.max(top, Math.min(t, b - STOP_MIN_HEIGHT_DP));
+            }
+            if (draftRuns != null) {
+                for (int[] run : draftRuns) {
+                    if (run == null || run.length < 3 || run[2] <= 0) continue;
+                    float runLeft = left + run[1] * cellWidth, runRight = left + (run[1] + run[2]) * cellWidth;
+                    if (runRight <= l || runLeft >= r) continue;
+                    float runTop = top + run[0] * cellHeight, runBottom = runTop + cellHeight;
+                    if (run[0] < c.row) {
+                        if (runBottom > t) t = runBottom;
+                    } else if (run[0] == c.row && runRight <= labelLeft) {
+                        l = Math.max(l, runRight);
+                    }
+                }
             }
             out.add(new Rect(c.id, Math.max(left, l), t, Math.min(maxRight, r), b, labelLeft, labelRight));
         }

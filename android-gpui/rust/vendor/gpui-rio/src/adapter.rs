@@ -255,6 +255,29 @@ macro_rules! __bind_gpui {
                 /// The screen cell (column, row) under `point`, counted as the
                 /// program counts them: only on the live screen, not in history,
                 /// and not in the letterbox beside a smaller grid.
+                /// Whether `point` is on the draft as last drawn (at Claude's prompt or the host's
+                /// own): its words and its row from the prompt glyph on. Such a tap is the host's
+                /// (the caret goes there): it never reaches the program as a click, nor a link.
+                fn on_draft(&self, point: Point<Pixels>) -> bool {
+                    if !self.bounds.contains(&point) {
+                        return false;
+                    }
+                    let Some(hint) = self.last_hint.as_ref() else { return false };
+                    let x = f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width);
+                    let y = f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height);
+                    if x < 0. || y < 0. {
+                        return false;
+                    }
+                    let (col, row) = (x as usize, y as usize);
+                    let from = hint
+                        .draft_runs
+                        .iter()
+                        .filter(|r| r.row == row)
+                        .map(|r| r.col)
+                        .min();
+                    from.is_some_and(|from| col + 2 >= from)
+                }
+
                 fn screen_cell(&self, point: Point<Pixels>) -> Option<(usize, usize)> {
                     if !self.bounds.contains(&point) {
                         return None;
@@ -360,7 +383,8 @@ macro_rules! __bind_gpui {
                     // The keyboard's cursor, when the host says where it is in the draft.
                     let mut explicit: Option<Point<Pixels>> = None;
                     for run in placed {
-                        let len = run.text.chars().count();
+                        // Cells, as the grid draws them: wide and combined characters too.
+                        let len = $crate::ghost::cells(&run.text);
                         let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
                         // A run of the draft (at Claude's prompt or the host's own) carries its source.
                         if run.style == GhostStyle::Caret {
@@ -384,13 +408,21 @@ macro_rules! __bind_gpui {
                             GhostStyle::Danger => colors.danger,
                             GhostStyle::Info => colors.info,
                         };
-                        // One glyph per cell, in the terminal's own face (it has
-                        // no italic, and a fallback face would not keep the grid).
-                        for (i, c) in run.text.chars().enumerate() {
-                            if c == ' ' {
+                        // One glyph per cluster, in the terminal's own face (it has no
+                        // italic, and a fallback face would not keep the grid), each over
+                        // the cells the grid gives it: two for a wide character.
+                        let mut cell = 0usize;
+                        for g in $crate::ghost::graphemes(&run.text) {
+                            let i = cell;
+                            cell += $crate::ghost::grapheme_cells(g);
+                            if g == " " {
                                 continue;
                             }
-                            let glyph = $crate::glyphs::stand_in(c).to_string();
+                            let mut one = g.chars();
+                            let glyph = match (one.next(), one.next()) {
+                                (Some(c), None) => $crate::glyphs::stand_in(c).to_string(),
+                                _ => g.to_owned(),
+                            };
                             let text_run = TextRun {
                                 len: glyph.len(),
                                 font: font.clone(),
@@ -784,7 +816,7 @@ macro_rules! __bind_gpui {
                                 }
                                 let pos = this.position(event.position);
                                 this.press = Some(event.position);
-                                this.pressed_link = if this.link_handler.is_some() {
+                                this.pressed_link = if this.link_handler.is_some() && !this.on_draft(event.position) {
                                     this.link_at(pos)
                                 } else {
                                     None
@@ -836,7 +868,11 @@ macro_rules! __bind_gpui {
                                 // A program that asked for mouse events (Claude Code's
                                 // fullscreen view, other TUIs) gets an owned tap as a
                                 // click, press and release on the cell it went down on.
-                                let cell = pressed_at.and_then(|at| this.screen_cell(at));
+                                // Not on the draft: a tap there is the host's (its caret), never the
+                                // program's, even with mouse reporting on (fullscreen Claude).
+                                let cell = pressed_at
+                                    .filter(|at| !this.on_draft(*at))
+                                    .and_then(|at| this.screen_cell(at));
                                 let tapped = match $crate::tap::lift_on(&this.session, press, owned, cell) {
                                     $crate::tap::Lifted::OpenLink => {
                                         // A tap on a link opens it and selects nothing.

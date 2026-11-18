@@ -18,6 +18,25 @@
 //! dropped: with no free cells they cover the end of the bottom row.
 //! The host puts its touch targets on the cells reported for them.
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+/// The cells one grapheme cluster takes in the grid: two for a wide character (CJK, most
+/// emoji), else one; a combining mark or a ZWJ sequence goes with its base, never alone.
+pub fn grapheme_cells(g: &str) -> usize {
+    g.width().clamp(1, 2)
+}
+
+/// `text`'s grapheme clusters: what one glyph is drawn for.
+pub fn graphemes(text: &str) -> impl Iterator<Item = &str> {
+    text.graphemes(true)
+}
+
+/// The cells `text` takes in the grid, cluster by cluster ([`grapheme_cells`]).
+pub fn cells(text: &str) -> usize {
+    text.graphemes(true).map(grapheme_cells).sum()
+}
+
 /// Whose prompt the screen shows, as the host knows from the pane's agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptKind {
@@ -226,23 +245,53 @@ pub struct DraftRun {
     pub col: usize,
     pub len: usize,
     pub source: usize,
+    /// The draft characters it shows: `len` but for a wide or combined cluster.
+    pub chars: usize,
 }
 
 /// The draft's drawn runs among `placed`, for the host's taps.
 pub fn draft_runs(placed: &[Placed]) -> Vec<DraftRun> {
-    placed
-        .iter()
-        .filter(|p| p.style != GhostStyle::Caret)
-        .filter_map(|p| {
-            p.source.map(|source| DraftRun {
-                row: p.row,
-                col: p.col,
-                len: p.text.chars().count(),
-                source,
-            })
-        })
-        .filter(|run| run.len > 0)
-        .collect()
+    let mut out = Vec::new();
+    for p in placed.iter().filter(|p| p.style != GhostStyle::Caret) {
+        let Some(source) = p.source else { continue };
+        // One cell per character where that holds; a wide or combined cluster is a run of
+        // its own, so a tap maps to its edges, never inside it.
+        let (mut col, mut at) = (p.col, source);
+        let mut simple: Option<DraftRun> = None;
+        for g in p.text.graphemes(true) {
+            let (w, n) = (grapheme_cells(g), g.chars().count());
+            if w == 1 && n == 1 {
+                match simple.as_mut() {
+                    Some(run) => {
+                        run.len += 1;
+                        run.chars += 1;
+                    }
+                    None => {
+                        simple = Some(DraftRun {
+                            row: p.row,
+                            col,
+                            len: 1,
+                            source: at,
+                            chars: 1,
+                        })
+                    }
+                }
+            } else {
+                out.extend(simple.take());
+                out.push(DraftRun {
+                    row: p.row,
+                    col,
+                    len: w,
+                    source: at,
+                    chars: n,
+                });
+            }
+            col += w;
+            at += n;
+        }
+        out.extend(simple.take());
+    }
+    out
 }
 
 /// A span with the draft character its text starts at.
@@ -320,7 +369,7 @@ fn place_with(
                     anchor.indent
                 };
                 for (span, source) in line {
-                    let len = span.text.chars().count();
+                    let len = cells(&span.text);
                     out.push(Placed {
                         row: anchor.row + i,
                         col,
@@ -349,7 +398,7 @@ fn place_with(
                 break;
             }
             let text = clip(&span.text, room);
-            let len = text.chars().count();
+            let len = cells(&text);
             out.push(Placed {
                 row,
                 col,
@@ -396,7 +445,7 @@ fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, us
             text: text.to_owned(),
             style,
         });
-        *col += text.chars().count();
+        *col += cells(text);
     };
     for (i, control) in controls.iter().enumerate() {
         push(
@@ -423,7 +472,7 @@ fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, us
 /// then "talk" is cut, to one cell at the least; then the queue's count ("≡12" to "≡"). Only on
 /// a grid too narrow even for `✕≡●` does the clear give way, then the queue; "talk" never.
 fn narrow_line(controls: &[Control], cols: usize) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
-    let width = |c: &Control| -> usize { c.spans.iter().map(|s| s.text.chars().count()).sum() };
+    let width = |c: &Control| -> usize { c.spans.iter().map(|s| cells(&s.text)).sum() };
     let Some(main) = controls
         .iter()
         .find(|c| c.id == "talk")
@@ -507,7 +556,7 @@ fn bare_line(controls: &[Control], gap: usize) -> (Vec<GhostSpan>, Vec<(String, 
         }
         let start = col;
         for span in &control.spans {
-            col += span.text.chars().count();
+            col += cells(&span.text);
             spans.push(span.clone());
         }
         marks.push((control.id.clone(), start, col));
@@ -550,7 +599,7 @@ pub fn place_all(
     if rows == 0 || cols == 0 {
         return Layout::default();
     }
-    let width = |line: &[GhostSpan]| -> usize { line.iter().map(|s| s.text.chars().count()).sum() };
+    let width = |line: &[GhostSpan]| -> usize { line.iter().map(|s| cells(&s.text)).sum() };
     let (mut line, mut marks) = control_line(&ghost.controls);
     let mut len = width(&line);
     // At the prompt the draft needs room beside the controls.
@@ -587,7 +636,7 @@ pub fn place_all(
     if let Some(row) = controls_row {
         let mut col = cols - len;
         for span in &line {
-            let n = span.text.chars().count();
+            let n = cells(&span.text);
             layout.placed.push(Placed {
                 row,
                 col,
@@ -668,7 +717,8 @@ pub fn place_all(
         None => {}
     }
     if has_draft && !layout.draft_shown {
-        ghost_prompt(ghost, &mut layout, controls_row, screen);
+        let controls_from = if layout.controls.is_empty() { cols } else { cols - len };
+        ghost_prompt(ghost, &mut layout, controls_row, controls_from, screen);
     }
     layout
 }
@@ -678,33 +728,87 @@ pub const GHOST_PROMPT_ROWS: usize = 3;
 
 /// The draft never leaves the terminal and is never lost from view: when Claude's prompt
 /// cannot take it (busy or streaming, a dialog, no room at its caret, scrolled away), it is
-/// drawn at the bottom, just above the controls' row, as a prompt of the host's own in the
-/// terminal's font and Claude's style: a rule, then `❯ ` and the draft, wrapping onto the
-/// rows below with its caret, chips and marks, and its runs reported for taps as at
-/// Claude's prompt. Its rows are painted over whatever the program drew there; its rule
-/// only over a blank row or a rule, so a dialog's last line above stays readable.
-fn ghost_prompt(ghost: &Ghost, layout: &mut Layout, controls_row: Option<usize>, screen: &[Vec<char>]) {
+/// drawn as a prompt of the host's own, in the terminal's font and Claude's style: `❯ ` and
+/// the draft, with its caret, chips and marks, its runs reported for taps as at Claude's
+/// prompt. It never paints over a cell the program drew (Wolf's ask 1, review of #34):
+/// - on the blank rows right above the controls, up to [`GHOST_PROMPT_ROWS`] of them, with a
+///   rule above when one more is blank; fewer rows show the draft's caret end behind "…";
+/// - with no blank row there (a dialog reaching down to the controls), as one line on the
+///   blank cells left of the controls on their own row, again its caret end.
+///
+/// Queue rows go only on blank rows above it.
+fn ghost_prompt(
+    ghost: &Ghost,
+    layout: &mut Layout,
+    controls_row: Option<usize>,
+    controls_from: usize,
+    screen: &[Vec<char>],
+) {
     let rows = screen.len();
     let cols = screen.first().map_or(0, Vec::len);
     if cols < 8 {
         return;
     }
-    // The rows just above the controls, or the screen's last rows without them.
+    let blank = |r: usize| screen[r].iter().all(|c| c.is_whitespace());
     let bottom = controls_row.unwrap_or(rows);
-    let cells: usize = ghost.draft.iter().map(|s| s.text.chars().count()).sum();
-    let width = cols - 2;
-    // One cell more for the caret at the end.
-    let needed = (cells + 1).div_ceil(width);
-    let lines = needed.clamp(1, GHOST_PROMPT_ROWS).min(bottom);
-    if lines == 0 {
+    // The blank rows right above the controls (or the screen's bottom), one more for a rule.
+    let mut free = 0;
+    while free < GHOST_PROMPT_ROWS + 1 && free < bottom && blank(bottom - 1 - free) {
+        free += 1;
+    }
+    let draft = located(&ghost.draft);
+    if free == 0 {
+        // No blank row: one line on the blank cells just left of the controls (on Claude's
+        // own rule, where the controls are set, its rule cells count as blank).
+        let Some(row) = controls_row else { return };
+        let ruled_row = rule(&screen[row]);
+        let free_cell = |c: char| c.is_whitespace() || (ruled_row && c == '─');
+        let end = controls_from.saturating_sub(1).min(cols);
+        let mut start = end;
+        while start > 0 && free_cell(screen[row][start - 1]) {
+            start -= 1;
+        }
+        // Keep a cell from whatever the program drew to the left.
+        let start = if start > 0 { start + 1 } else { start };
+        if end < start + 8 {
+            return;
+        }
+        layout.placed.push(Placed {
+            row,
+            col: start,
+            text: " ".repeat(end - start),
+            style: GhostStyle::Text,
+            source: None,
+        });
+        layout.placed.push(Placed {
+            row,
+            col: start,
+            text: "❯".to_owned(),
+            style: GhostStyle::Text,
+            source: None,
+        });
+        let anchor = Anchor {
+            prompt_row: row,
+            row,
+            col: start + 2,
+            indent: start + 2,
+        };
+        let width = |_: usize| end;
+        let mut placed = place_with(ghost, Some(anchor), rows, cols, 1, &width);
+        placed.retain(|p| p.source.is_some());
+        layout.draft_shown = !placed.is_empty();
+        layout.placed.extend(placed);
         return;
     }
+    let full = |_: usize| cols;
+    // The rows the draft takes as it will be drawn, before the cap.
+    let needed = wrap(&draft, 2, 2, &full).len().max(1);
+    let lines = needed.min(GHOST_PROMPT_ROWS).min(free);
+    let ruled = free > lines;
     let top = bottom - lines;
-    let rule_row = top
-        .checked_sub(1)
-        .filter(|&r| rule(&screen[r]) || screen[r].iter().all(|c| c.is_whitespace()));
-    // The prompt's rows first, blank on the program's background, so nothing shows through.
-    for row in rule_row.unwrap_or(top)..bottom {
+    let first = if ruled { top - 1 } else { top };
+    // The prompt's rows, blank on the program's background (they are blank there already).
+    for row in first..bottom {
         layout.placed.push(Placed {
             row,
             col: 0,
@@ -713,9 +817,9 @@ fn ghost_prompt(ghost: &Ghost, layout: &mut Layout, controls_row: Option<usize>,
             source: None,
         });
     }
-    if let Some(row) = rule_row {
+    if ruled {
         layout.placed.push(Placed {
-            row,
+            row: top - 1,
             col: 0,
             text: "─".repeat(cols),
             style: GhostStyle::Dim,
@@ -730,18 +834,18 @@ fn ghost_prompt(ghost: &Ghost, layout: &mut Layout, controls_row: Option<usize>,
         source: None,
     });
     let anchor = Anchor {
-        prompt_row: top,
+        prompt_row: if ruled { top } else { top + 1 },
         row: top,
         col: 2,
         indent: 2,
     };
-    let full = |_: usize| cols;
     let mut placed = place_with(ghost, Some(anchor), rows, cols, lines, &full);
-    if layout.echoes.is_empty() {
+    // Queue rows only on blank rows above the prompt, and only when Claude's prompt has not
+    // drawn them already.
+    let keep_echoes = layout.echoes.is_empty();
+    placed.retain(|p| p.source.is_some() || (keep_echoes && p.row < first && blank(p.row)));
+    if keep_echoes {
         layout.echoes = echo_marks(ghost, anchor, &placed);
-    } else {
-        // Claude's prompt is on screen and its queue rows are drawn above it already.
-        placed.retain(|p| p.source.is_some());
     }
     layout.draft_shown = placed.iter().any(|p| p.source.is_some());
     layout.placed.extend(placed);
@@ -758,7 +862,7 @@ fn echo_marks(ghost: &Ghost, anchor: Anchor, placed: &[Placed]) -> Vec<PlacedCon
             let row = bottom - shown + i;
             let runs = placed.iter().filter(|p| p.row == row);
             let start = runs.clone().map(|p| p.col).min()?;
-            let end = runs.map(|p| p.col + p.text.chars().count()).max()?;
+            let end = runs.map(|p| p.col + cells(&p.text)).max()?;
             Some(PlacedControl {
                 id: match ghost.echo_ids.get(first + i) {
                     Some(id) => format!("echo-{id}"),
@@ -897,11 +1001,19 @@ fn drop_front_located(spans: &[Located], mut n: usize) -> Vec<Located> {
 
 /// `text` cut to `room` cells, marked with an ellipsis when cut.
 fn clip(text: &str, room: usize) -> String {
-    let count = text.chars().count();
-    if count <= room {
+    if cells(text) <= room {
         return text.to_owned();
     }
-    let mut out: String = text.chars().take(room.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for g in text.graphemes(true) {
+        let w = grapheme_cells(g);
+        if used + w > room.saturating_sub(1) {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
     out.push('…');
     out
 }
@@ -946,9 +1058,10 @@ fn wrap(
         // Where the next piece starts in the draft.
         let mut at = *start;
         for piece in pieces {
-            let len = piece.chars().count();
+            // Cells on screen; `at` counts the draft's characters.
+            let len = cells(&piece);
             let piece_at = at;
-            at += len;
+            at += piece.chars().count();
             if piece.trim().is_empty() {
                 // Spaces never start a continuation line nor push one.
                 if col > indent && col + len <= width {
@@ -964,22 +1077,38 @@ fn wrap(
                 col = indent;
                 width = width_of(lines.len() - 1);
             }
-            // A word longer than a line breaks where the line ends.
-            let mut rest: Vec<char> = piece.chars().collect();
+            // A word longer than a line breaks where the line ends, between clusters.
+            let mut rest: Vec<&str> = piece.graphemes(true).collect();
             let mut head_at = piece_at;
             while !rest.is_empty() {
                 let room = width.saturating_sub(col);
-                if room == 0 {
-                    lines.push(Vec::new());
-                    col = indent;
-                    width = width_of(lines.len() - 1);
-                    continue;
+                // How many clusters fit (a wide one never straddles the edge).
+                let mut take = 0;
+                let mut used = 0;
+                for g in &rest {
+                    let w = grapheme_cells(g);
+                    if used + w > room {
+                        break;
+                    }
+                    used += w;
+                    take += 1;
                 }
-                let take = room.min(rest.len());
+                if take == 0 {
+                    if col == indent && room > 0 {
+                        // Wider than a whole line: put it alone rather than loop.
+                        take = 1;
+                        used = grapheme_cells(rest[0]);
+                    } else {
+                        lines.push(Vec::new());
+                        col = indent;
+                        width = width_of(lines.len() - 1);
+                        continue;
+                    }
+                }
                 let head: String = rest.drain(..take).collect();
                 push(lines.last_mut(), &head, span.style, head_at);
-                head_at += take;
-                col += take;
+                head_at += head.chars().count();
+                col += used;
             }
         }
     }
@@ -1010,7 +1139,7 @@ fn push(line: Option<&mut Vec<Located>>, text: &str, style: GhostStyle, at: usiz
         return;
     }
     match line.last_mut() {
-        // Merged only when it continues the run in the draft too.
+        // Merged only when it continues the run in the draft too (`at` counts characters).
         Some((last, start)) if last.style == style && *start + last.text.chars().count() == at => {
             last.text.push_str(text)
         }
@@ -1062,7 +1191,7 @@ pub fn busy_columns(rows: &[Vec<char>], anchor: Option<Anchor>, placed: &[Placed
     }
     for run in placed {
         if let Some(value) = busy.get_mut(run.row) {
-            *value = (*value).max(run.col + run.text.chars().count());
+            *value = (*value).max(run.col + cells(&run.text));
         }
     }
     busy
@@ -1215,7 +1344,7 @@ mod tests {
                 .placed
                 .iter()
                 .filter(|p| p.row == 1 && p.style == GhostStyle::Text)
-                .all(|p| p.col + p.text.chars().count() < first_control)
+                .all(|p| p.col + cells(&p.text) < first_control)
         );
     }
 
@@ -1369,7 +1498,7 @@ mod tests {
         };
         let shown = |layout: &Layout, what: &str| {
             assert!(layout.draft_shown, "{what}: {layout:?}");
-            let runs = draft_runs(&layout.placed);
+            let runs = super::draft_runs(&layout.placed);
             assert!(!runs.is_empty(), "{what}: no draft runs");
             assert!(
                 layout.placed.iter().any(|p| p.style == GhostStyle::Caret),
@@ -1399,9 +1528,21 @@ mod tests {
         shown(&layout, "Claude busy");
         let row = layout.controls[0].row;
         assert!(drawn(&layout, row - 1, 60).starts_with("❯ fix the stop button"));
-        // A dialog over the prompt, every row of the screen written.
-        let full = screen(&["x".repeat(60).as_str(); 6], 60);
-        shown(&place_all(&g(), None, &full, None), "a full screen");
+        // A dialog reaching down to the controls: one line left of them on their row.
+        let dialog = screen(
+            &[
+                "╭────────────────────────────╮",
+                "│ Do you want to make this?  │",
+                "│ ❯ 1. Yes                   │",
+                "│   2. No                    │",
+                "╰────────────────────────────╯",
+                "",
+            ],
+            60,
+        );
+        let layout = place_all(&g(), None, &dialog, None);
+        shown(&layout, "a dialog down to the controls");
+        assert!(super::draft_runs(&layout.placed).iter().all(|r| r.row == 5));
         // Scrolled into history: the controls keep their row, the draft goes above it.
         let layout = place_all(
             &g(),
@@ -1413,7 +1554,7 @@ mod tests {
             }),
         );
         shown(&layout, "scrolled");
-        assert!(draft_runs(&layout.placed).iter().all(|r| r.row < 4));
+        assert!(super::draft_runs(&layout.placed).iter().all(|r| r.row < 4));
         // A narrow cover screen with the full recording line.
         let mut rec = full_line(OFFLINE);
         rec.draft = g().draft;
@@ -1424,9 +1565,62 @@ mod tests {
         long.draft = vec![text(&format!("{} END", "word ".repeat(80))), styled("", GhostStyle::Caret)];
         let layout = place_all(&long, None, &busy, None);
         let draft_rows: std::collections::BTreeSet<usize> =
-            draft_runs(&layout.placed).iter().map(|r| r.row).collect();
+            super::draft_runs(&layout.placed).iter().map(|r| r.row).collect();
         assert!(draft_rows.len() <= GHOST_PROMPT_ROWS, "{draft_rows:?}");
         assert!(layout.placed.iter().any(|p| p.text.contains("END")));
+    }
+
+    /// Wolf's ask 1 (review of #34): the drawn prompt never paints over a cell the program
+    /// drew. A permission dialog keeps every non-blank cell, with a short draft, a long one,
+    /// queued messages, and the dialog reaching down to the bottom row but one.
+    #[test]
+    fn wolf_ask1_a_permission_dialog_keeps_every_cell_it_drew() {
+        let dialog = |rows: &[&str]| screen(rows, 60);
+        let tall = dialog(&[
+            "╭──────────────────────────────────────╮",
+            "│ Bash command                         │",
+            "│   rm -rf target                      │",
+            "│ Do you want to proceed?              │",
+            "│ ❯ 1. Yes                             │",
+            "│   2. No, and tell Claude what to do  │",
+            "╰──────────────────────────────────────╯",
+            "",
+            "",
+        ]);
+        let short_bottom = dialog(&[
+            "╭──────────────────────────────────────╮",
+            "│ Do you want to proceed?              │",
+            "│ ❯ 1. Yes                             │",
+            "│   2. No                              │",
+            "╰──────────────────────────────────────╯",
+            "",
+        ]);
+        let mut drafts = vec![
+            controls(ghost(vec![text("no wait")])),
+            controls(ghost(vec![text(&"keep the build dir ".repeat(12))])),
+        ];
+        let mut queued = controls(ghost(vec![text("and then push")]));
+        queued.echoes = vec![
+            vec![styled("❯ first queued", GhostStyle::Echo)],
+            vec![styled("❯ second queued", GhostStyle::Echo)],
+        ];
+        drafts.push(queued);
+        for rows in [&tall, &short_bottom] {
+            for g in &drafts {
+                let layout = place_all(g, None, rows, None);
+                let controls_row = layout.controls.first().map(|c| c.row);
+                for p in &layout.placed {
+                    if Some(p.row) == controls_row && p.source.is_none() && p.style != GhostStyle::Text {
+                        continue; // the controls' own words, on the row they were given
+                    }
+                    for i in 0..cells(&p.text) {
+                        let cell = rows[p.row][p.col + i];
+                        assert!(cell == ' ', "{:?} painted over {cell:?} at row {} col {}", p.text, p.row, p.col + i);
+                    }
+                }
+                assert!(layout.draft_shown, "{layout:?}");
+            }
+        }
     }
 
     #[test]
@@ -1457,15 +1651,15 @@ mod tests {
         assert!(layout.draft_shown);
         // Nothing over the dialog's rows, not even the prompt's rule.
         assert!(layout.placed.iter().all(|p| p.row >= 4));
-        // A screen whose bottom rows are all text: the controls still cover the bottom
-        // row's end, and the draft takes the row above it, painted over the program's.
+        // A screen whose rows are all text: the controls still cover the bottom row's end,
+        // and the draft is drawn nowhere, never over the program's text.
         let full = screen(&["x".repeat(60).as_str(); 4], 60);
         let layout = place_all(&controls(ghost(vec![text("hi")])), None, &full, None);
         assert_eq!(layout.controls.len(), 3);
         assert!(layout.controls.iter().all(|c| c.row == 3));
         assert!(drawn(&layout, 3, 60).ends_with(" type ─ talk ─ send ──"));
-        assert!(layout.draft_shown);
-        assert!(drawn(&layout, 2, 60).starts_with("❯ hi"));
+        assert!(!layout.draft_shown);
+        assert!(layout.placed.iter().all(|p| p.row == 3), "{:?}", layout.placed);
         assert_eq!(layout.targets_top, 3);
     }
 
@@ -1585,7 +1779,7 @@ mod tests {
                 .filter(|p| p.row == 4 && p.style == GhostStyle::Text)
             {
                 assert!(
-                    run.col + run.text.chars().count() < stop.start,
+                    run.col + super::cells(&run.text) < stop.start,
                     "{run:?} covers {stop:?}"
                 );
             }
@@ -1699,7 +1893,7 @@ mod tests {
         );
         let talk = &layout.controls[0];
         for run in runs.iter().filter(|p| p.row == talk.row) {
-            assert!(run.col + run.text.chars().count() < talk.start, "{run:?}");
+            assert!(run.col + cells(&run.text) < talk.start, "{run:?}");
         }
     }
 
@@ -1731,7 +1925,7 @@ mod tests {
             layout
                 .placed
                 .iter()
-                .all(|p| p.row == 3 && p.col + p.text.chars().count() <= 40),
+                .all(|p| p.row == 3 && p.col + cells(&p.text) <= 40),
             "{:?}",
             layout.placed
         );
@@ -1758,7 +1952,7 @@ mod tests {
         );
         let row = layout.controls[0].row;
         assert!(layout.draft_shown, "{layout:?}");
-        let runs = draft_runs(&layout.placed);
+        let runs = super::draft_runs(&layout.placed);
         assert!(!runs.is_empty() && runs.iter().all(|r| r.row < row), "{runs:?}");
         assert!(layout.placed.iter().any(|p| p.text.contains("END")), "the caret end shows");
         // With room, the same draft is placed and reported shown.
@@ -1985,7 +2179,7 @@ mod tests {
         );
         // Width is 40 - 10: no run reaches into the reserved columns.
         assert!(
-            placed.iter().all(|p| p.col + p.text.chars().count() <= 30),
+            placed.iter().all(|p| p.col + cells(&p.text) <= 30),
             "{placed:?}"
         );
         // Continuation lines start at the prompt's indent.
@@ -2257,7 +2451,7 @@ mod tests {
             placed
                 .iter()
                 .filter(|p| p.row == row)
-                .map(|p| p.col + p.text.chars().count())
+                .map(|p| p.col + cells(&p.text))
                 .max()
                 .unwrap_or(0)
         };

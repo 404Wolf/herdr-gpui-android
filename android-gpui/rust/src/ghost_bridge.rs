@@ -251,11 +251,11 @@ pub(crate) fn hint_json(hint: &gpui_rio::ghost::LayoutHint) -> String {
             .collect::<Vec<_>>(),
         "busy": hint.busy,
         "busyFrom": hint.busy_from,
-        // [row, col, cells, first character in the draft]
+        // [row, col, cells, first character in the draft, characters shown]
         "draft": hint
             .draft_runs
             .iter()
-            .map(|r| [r.row, r.col, r.len, r.source])
+            .map(|r| [r.row, r.col, r.len, r.source, r.chars])
             .collect::<Vec<_>>(),
     })
     .to_string()
@@ -450,6 +450,7 @@ mod tests {
                 col: 2,
                 len: 9,
                 source: 14,
+                chars: 9,
             }],
         };
         let value: serde_json::Value = serde_json::from_str(&hint_json(&hint)).expect("json");
@@ -461,6 +462,6 @@ mod tests {
         assert_eq!(value["controls"][0]["id"], "talk");
         assert_eq!(value["controls"][0]["start"], 60);
         assert_eq!(value["targetsTop"], 38);
-        assert_eq!(value["draft"][0], serde_json::json!([37, 2, 9, 14]));
+        assert_eq!(value["draft"][0], serde_json::json!([37, 2, 9, 14, 9]));
     }
 }

@@ -92,8 +92,11 @@ final class ClusterPlacement {
                     hint.draftRuns = new int[n][];
                     for (int i = 0; i < n; i++) {
                         JSONArray r = runs.getJSONArray(i);
-                        if (r.length() != 4) return null;
-                        hint.draftRuns[i] = new int[] {r.getInt(0), r.getInt(1), r.getInt(2), r.getInt(3)};
+                        if (r.length() != 4 && r.length() != 5) return null;
+                        // [row, col, cells, first character, characters shown] (the last
+                        // absent from an older renderer: one cell per character).
+                        hint.draftRuns[i] = new int[] {r.getInt(0), r.getInt(1), r.getInt(2), r.getInt(3),
+                                r.optInt(4, r.getInt(2))};
                     }
                 }
                 return hint;
