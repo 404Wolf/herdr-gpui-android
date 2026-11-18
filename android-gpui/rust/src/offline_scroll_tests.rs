@@ -14,13 +14,7 @@ use serde_json::Value;
 /// or a cached pane is: its stream has ended, its grid stays.
 fn offline_grid(lines: usize) -> Arc<gpui_rio::Session> {
     let bytes: String = (0..lines).map(|n| format!("line {n}\r\n")).collect();
-    let session = crate::snapshot::restore(crate::snapshot::Saved {
-        cols: 20,
-        rows: 6,
-        pane: "t1".into(),
-        bytes: bytes.into_bytes(),
-    })
-    .unwrap();
+    let session = crate::snapshot::restore(crate::snapshot::Saved::of(20, 6, "t1", bytes.into_bytes())).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while session.is_alive() {
         assert!(Instant::now() < deadline, "the rows were never parsed");
@@ -79,7 +73,7 @@ fn wolf_ask_offline_scrolling_a_cached_pane_scrolls_like_the_held_frame() {
     let path = std::env::temp_dir().join(format!("herdr-ask3-{}.snap", std::process::id()));
     let source = offline_grid(30);
     crate::snapshot::save(&source.grid().lock(), "t7", &path).unwrap();
-    let id = crate::remote::open_saved(path.to_str().unwrap()).unwrap();
+    let id = crate::remote::open_saved_file(path.to_str().unwrap()).unwrap();
     std::fs::remove_file(&path).unwrap();
     // Read back on its own reader thread; scroll once it is all parsed.
     let cached = crate::remote::renderer(id).unwrap();

@@ -281,7 +281,7 @@ public final class HomeActivity extends Activity {
         cacheRead = true;
         worker.execute(() -> {
             if (first) {
-                Map<String, HomeCache.Entry> cached = HomeCache.read(cacheFile());
+                Map<String, HomeCache.Entry> cached = HomeCache.read(this);
                 try {
                     List<SavedRemoteHost> early = store.read();
                     boolean identity = identityStore.exists();
@@ -306,11 +306,6 @@ public final class HomeActivity extends Activity {
                 applyHosts(hosts, identity, null, true);
             });
         });
-    }
-
-    /** Home's cache of last views; resolved on the worker (it may create the directory). */
-    private java.io.File cacheFile() {
-        return new java.io.File(getNoBackupFilesDir(), HomeCache.FILE_NAME);
     }
 
     /** The saved hosts as machines, each with its cached view when it has none yet; connects when asked. */
@@ -373,7 +368,7 @@ public final class HomeActivity extends Activity {
                 try {
                     String text = HomeCache.encode(entries);
                     if (text.equals(cacheWritten)) return;
-                    HomeCache.write(cacheFile(), text);
+                    HomeCache.write(this, text);
                     cacheWritten = text;
                 } catch (Exception unwritable) {
                     // A cache is a convenience: the next launch just connects first.

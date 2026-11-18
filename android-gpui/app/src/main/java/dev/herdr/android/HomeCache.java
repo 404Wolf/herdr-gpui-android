@@ -14,18 +14,23 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * Home's last view of each computer (its spaces, tabs and terminals, and the
- * git look the tree was grouped with), so a cold launch draws the Fleet at
- * once instead of a blank page that fills in. It is only ever a cached view:
- * Home dims it and offers nothing on it until the computer answers live.
- * Kept in the app's no-backup directory; files run on the worker only.
+ * The Fleet cache: the last view of each computer (its spaces, tabs and
+ * terminals, and the git look the tree was grouped with), shared by Home and
+ * the terminal (item 77, ask 2). A cold launch draws the Fleet at once
+ * instead of a blank page that fills in, and with no link the terminal's
+ * rail and strip still list every pane to switch to. Home writes every
+ * computer it shows; the terminal merges in the one it is connected to.
+ * Sealed ({@link CacheSeal}) in {@code no_backup/cache-v2/fleet.sealed}; the
+ * plain version 1 file is sealed once, then deleted. Files run on workers only.
  */
 final class HomeCache {
     private HomeCache() { }
 
     /** A cache file past this is ignored, not parsed (a tree is a few hundred KB at most). */
     static final int MAX_BYTES = 2 * 1024 * 1024;
+    /** The plain version 1 file, read once to migrate it. */
     static final String FILE_NAME = "home-view.json";
+    static final String SEALED_NAME = "fleet.sealed";
 
     /** One computer's last seen view and git look. */
     static final class Entry {
@@ -120,6 +125,74 @@ final class HomeCache {
         if (!tmp.renameTo(file)) {
             tmp.delete();
             throw new IOException("Could not replace " + file.getName());
+        }
+    }
+
+    static File sealedFile(android.content.Context context) {
+        return new File(CacheSeal.dir(context), SEALED_NAME);
+    }
+
+    private static File legacyFile(android.content.Context context) {
+        return new File(context.getApplicationContext().getNoBackupFilesDir(), FILE_NAME);
+    }
+
+    /** The app's Fleet cache (empty when it cannot be sealed). Worker only. */
+    static Map<String, Entry> read(android.content.Context context) {
+        return readSealed(sealedFile(context), legacyFile(context), CacheSeal.shared(context));
+    }
+
+    /** Replaces the app's Fleet cache with {@code text} (an {@link #encode}). Worker only. */
+    static void write(android.content.Context context, String text) throws IOException {
+        CacheSeal seal = CacheSeal.shared(context);
+        if (seal != null) writeSealed(sealedFile(context), seal, text);
+    }
+
+    /** Merges one computer's view into the app's Fleet cache, keeping its git look if {@code entry} has none. Worker only. */
+    static void merge(android.content.Context context, String host, Entry entry) throws IOException {
+        CacheSeal seal = CacheSeal.shared(context);
+        if (seal != null) merge(sealedFile(context), seal, host, entry);
+    }
+
+    /**
+     * {@code sealed}'s entries. A plain {@code legacy} file is sealed into it
+     * first (unless a sealed one exists) and deleted either way; with no seal
+     * nothing is read and no plain copy is kept.
+     */
+    static synchronized Map<String, Entry> readSealed(File sealed, File legacy, CacheSeal seal) {
+        if (legacy != null && legacy.isFile()) {
+            Map<String, Entry> plain = read(legacy);
+            try {
+                if (seal != null && !sealed.isFile() && !plain.isEmpty()) writeSealed(sealed, seal, encode(plain));
+            } catch (IOException | JSONException unwritable) {
+                // Dropped: a cache is a convenience, and plain text must not stay.
+            }
+            legacy.delete();
+        }
+        if (seal == null) return new LinkedHashMap<>();
+        byte[] bytes = seal.read(sealed, MAX_BYTES);
+        return bytes == null ? new LinkedHashMap<>() : decode(new String(bytes, StandardCharsets.UTF_8));
+    }
+
+    static synchronized void writeSealed(File sealed, CacheSeal seal, String text) throws IOException {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > MAX_BYTES) return;
+        File dir = sealed.getParentFile();
+        if (dir != null && !dir.isDirectory() && !dir.mkdirs()) throw new IOException("No cache directory");
+        seal.write(sealed, bytes);
+    }
+
+    static synchronized void merge(File sealed, CacheSeal seal, String host, Entry entry) throws IOException {
+        if (host == null || entry == null || !hasTree(entry.view)) return;
+        Map<String, Entry> all = readSealed(sealed, null, seal);
+        Entry before = all.get(host);
+        if (entry.git.isEmpty() && before != null && !before.git.isEmpty()) {
+            entry = new Entry(entry.view, before.git, before.gitTruncated);
+        }
+        all.put(host, entry);
+        try {
+            writeSealed(sealed, seal, encode(all));
+        } catch (JSONException unencodable) {
+            throw new IOException(unencodable);
         }
     }
 }

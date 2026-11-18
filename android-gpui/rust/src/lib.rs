@@ -17,6 +17,10 @@ pub mod shell;
 #[cfg(all(feature = "remote", unix))]
 mod snapshot;
 #[cfg(all(feature = "remote", unix))]
+// Its live capture runs from the UI's poll: a remote-only build has none.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+mod transcript;
+#[cfg(all(feature = "remote", unix))]
 mod ghost_bridge;
 /// Wolf's ask: scrolling keeps working offline, on held and cached panes.
 #[cfg(all(test, feature = "remote", unix))]

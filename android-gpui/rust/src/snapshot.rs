@@ -8,8 +8,14 @@
 //! program is interpreted, so Claude Code, Codex and shells all look exactly
 //! as they did. Colours keep their named/indexed form, so the theme applies.
 //!
-//! File: one JSON header line (`{"v":1,"cols":..,"rows":..,"pane":".."}`),
-//! then the bytes. Written to a temporary file and renamed over the old one.
+//! A full-screen program (Claude Code) keeps its history to itself, so its
+//! copy is the phone's own transcript of it (`transcript`) and then its
+//! screen, written as plain rows: read back, it scrolls like any history.
+//!
+//! File (version 2): one JSON header line (`{"v":2,"cols":..,"rows":..,
+//! "pane":"..","history":..,"complete":..,"full_screen":..}`), then the bytes.
+//! The phone seals the whole file before it reaches the disk (PaneSnapshots);
+//! version 1 files (no history count) are still read once, to migrate them.
 use crate::remote::{Error, Result};
 use rio_vt::crosswords::Crosswords;
 use rio_vt::crosswords::formatter::write_sgr;
@@ -17,29 +23,53 @@ use rio_vt::crosswords::pos::{Column, Line};
 use rio_vt::crosswords::style::Style;
 use rio_vt::event::EventListener;
 use serde_json::{Value, json};
-use std::{
-    fmt::Write as _,
-    fs,
-    io::{self, Read},
-    path::Path,
-    sync::Arc,
-};
+use std::{fmt::Write as _, io, sync::Arc};
+#[cfg(test)]
+use std::{fs, io::Read, path::Path};
 
-/// The most a saved pane may take; the oldest history rows give way first.
-pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
+/// The most a saved pane may take (Wolf's budget: 1 MiB a pane); the oldest
+/// history rows give way first.
+pub(crate) const MAX_BYTES: usize = crate::transcript::MAX_BYTES;
+/// The most a copy read back may be: version 1 copies were up to 4 MiB.
+const MAX_READ: usize = 4 * 1024 * 1024;
 const MAX_HEADER: usize = 4096;
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 /// The grid's history and screen as VT bytes, at most `max_bytes` (whole
 /// oldest rows are dropped to fit). Every screen row is written, blank or
 /// not, so replayed rows land on the same screen lines.
+#[cfg(test)]
 pub(crate) fn encode<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -> Vec<u8> {
+    encode_grid(grid, max_bytes).0
+}
+
+/// [`encode`], and how many history rows it kept.
+fn encode_grid<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -> (Vec<u8>, usize) {
     let (rows, cols) = (grid.screen_lines(), grid.columns());
     if rows == 0 || cols == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
-    let history = grid.history_size() as i32;
-    let mut lines: Vec<String> = (-history..rows as i32).map(|line| row(grid, line, cols)).collect();
+    let history = grid.history_size();
+    let lines: Vec<String> = (-(history as i32)..rows as i32).map(|line| row(grid, line, cols)).collect();
+    assemble(lines, history, &tail(grid), max_bytes)
+}
+
+/// A full-screen program's copy: the phone's `transcript` of it, then its
+/// screen now, as rows (oldest dropped to fit `max_bytes`); and how many
+/// history rows were kept.
+pub(crate) fn encode_transcript<U: EventListener>(
+    grid: &Crosswords<U>,
+    transcript: &crate::transcript::Transcript,
+    max_bytes: usize,
+) -> (Vec<u8>, usize) {
+    let screen = crate::transcript::screen_rows(grid);
+    let lines: Vec<String> = transcript.reader_rows(&screen).map(|r| r.vt.clone()).collect();
+    let history = lines.len() - screen.len();
+    assemble(lines, history, &tail(grid), max_bytes)
+}
+
+/// The cursor, after the rows: a reset, its place, and whether it shows.
+fn tail<U: EventListener>(grid: &Crosswords<U>) -> String {
     let mut tail = String::from("\x1b[0m");
     let cursor = grid.grid.cursor.pos;
     let _ = write!(tail, "\x1b[{};{}H", cursor.row.0.max(0) + 1, cursor.col.0 + 1);
@@ -48,12 +78,17 @@ pub(crate) fn encode<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -
     if !grid.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR) {
         tail.push_str("\x1b[?25l");
     }
-    // \r\n between rows, a reset and the cursor at the end.
-    const START: &str = "\x1b[0m";
+    tail
+}
+
+/// Rows from `\r\n` to `\r\n` between a reset and `tail`, the oldest of the
+/// first `history` dropped until it fits `max_bytes`: the bytes and the
+/// history rows kept.
+fn assemble(mut lines: Vec<String>, history: usize, tail: &str, max_bytes: usize) -> (Vec<u8>, usize) {
     let mut total = START.len() + tail.len() + lines.iter().map(|l| l.len() + 2).sum::<usize>();
     // Only history may go: the screen rows place everything else.
     let mut dropped = 0;
-    while total > max_bytes && dropped < history as usize {
+    while total > max_bytes && dropped < history {
         total -= lines[dropped].len() + 2;
         dropped += 1;
     }
@@ -67,13 +102,52 @@ pub(crate) fn encode<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -
         }
         out.push_str(line);
     }
-    out.push_str(&tail);
-    out.into_bytes()
+    out.push_str(tail);
+    (out.into_bytes(), history - dropped)
+}
+
+const START: &str = "\x1b[0m";
+
+/// The rows of a saved copy's bytes (as [`assemble`] wrote them), each with
+/// its text: a full-screen pane's transcript read back.
+pub(crate) fn saved_rows(bytes: &[u8]) -> Vec<crate::transcript::Row> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix(START).unwrap_or(&text);
+    let mut lines: Vec<&str> = text.split("\r\n").collect();
+    if let Some(last) = lines.last_mut()
+        && let Some(at) = last.rfind("\x1b[0m\x1b[")
+    {
+        *last = &last[..at];
+    }
+    lines
+        .into_iter()
+        .map(|vt| crate::transcript::Row { text: strip_sgr(vt).trim_end().to_owned(), vt: vt.to_owned() })
+        .collect()
+}
+
+/// `vt` without its SGR sequences (the only ones a row holds).
+fn strip_sgr(vt: &str) -> String {
+    let mut out = String::with_capacity(vt.len());
+    let mut chars = vt.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One row, self-contained: it starts and ends in the default style, so any
 /// prefix of history can be dropped. Trailing blanks that draw nothing are left out.
-fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize) -> String {
+pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize) -> String {
     let cells = &grid.grid[Line(line)];
     let last = (0..cols).rev().find(|&col| {
         let square = &cells[Column(col)];
@@ -114,23 +188,70 @@ pub(crate) struct Saved {
     pub rows: u16,
     pub pane: String,
     pub bytes: Vec<u8>,
+    /// How many of its rows are history (above the screen); None from a version 1 file.
+    pub history: Option<usize>,
+    /// The history reaches the program's first row.
+    pub complete: bool,
+    /// It is a full-screen program's transcript and screen.
+    pub full_screen: bool,
+    /// The core it was copied from (its boot id), "" when unknown.
+    pub boot: String,
 }
 
-pub(crate) fn header(cols: u16, rows: u16, pane: &str) -> String {
-    format!("{}\n", json!({"v":VERSION,"cols":cols,"rows":rows,"pane":pane}))
+impl Saved {
+    /// Bytes to draw on a `cols`×`rows` grid, with no history count (a note, a test).
+    pub(crate) fn of(cols: u16, rows: u16, pane: &str, bytes: Vec<u8>) -> Self {
+        Self { cols, rows, pane: pane.into(), bytes, history: None, complete: false, full_screen: false, boot: String::new() }
+    }
+}
+
+/// What a copy's header says besides its size.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Meta {
+    pub history: usize,
+    pub complete: bool,
+    pub full_screen: bool,
+}
+
+pub(crate) fn header(cols: u16, rows: u16, pane: &str, boot: &str, meta: Meta) -> String {
+    format!(
+        "{}\n",
+        json!({"v":VERSION,"cols":cols,"rows":rows,"pane":pane,"boot":boot,"history":meta.history,
+               "complete":meta.complete,"full_screen":meta.full_screen})
+    )
 }
 
 /// A saved pane's whole file, built from the grid: copied while the grid is
-/// locked, written by [`write`] after the lock is released.
-pub(crate) fn copy<U: EventListener>(grid: &Crosswords<U>, pane: &str) -> Result<Vec<u8>> {
+/// locked, sealed and written by the phone after the lock is released. A
+/// full-screen program's copy is `transcript` and its screen; anything else
+/// is the grid's own history and screen.
+pub(crate) fn copy<U: EventListener>(
+    grid: &Crosswords<U>,
+    pane: &str,
+    boot: &str,
+    transcript: Option<&crate::transcript::Transcript>,
+) -> Result<Vec<u8>> {
     let cols = u16::try_from(grid.columns()).map_err(|_| Error::Capacity)?;
     let rows = u16::try_from(grid.screen_lines()).map_err(|_| Error::Capacity)?;
-    let mut file = header(cols, rows, pane).into_bytes();
-    file.extend(encode(grid, MAX_BYTES));
+    let full_screen = grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN);
+    let (body, meta) = match transcript.filter(|_| full_screen) {
+        Some(transcript) => {
+            let (body, history) = encode_transcript(grid, transcript, MAX_BYTES);
+            let complete = transcript.complete() && history == transcript.rows();
+            (body, Meta { history, complete, full_screen })
+        }
+        None => {
+            let (body, history) = encode_grid(grid, MAX_BYTES);
+            (body, Meta { history, complete: false, full_screen })
+        }
+    };
+    let mut file = header(cols, rows, pane, boot, meta).into_bytes();
+    file.extend(body);
     Ok(file)
 }
 
 /// Writes a [`copy`] to `path`, atomically: a temporary file, synced, then renamed.
+#[cfg(test)]
 pub(crate) fn write(file: &[u8], path: &Path) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -145,21 +266,24 @@ pub(crate) fn write(file: &[u8], path: &Path) -> Result<()> {
 /// Writes `pane`'s grid to `path`, atomically.
 #[cfg(test)]
 pub(crate) fn save<U: EventListener>(grid: &Crosswords<U>, pane: &str, path: &Path) -> Result<()> {
-    write(&copy(grid, pane)?, path)
+    write(&copy(grid, pane, "", None)?, path)
 }
 
 /// Reads a saved pane, refusing anything malformed or larger than a save makes.
+#[cfg(test)]
 pub(crate) fn load(path: &Path) -> Result<Saved> {
     let mut bytes = Vec::new();
     fs::File::open(path)?
-        .take((MAX_BYTES + MAX_HEADER + 1) as u64)
+        .take((MAX_READ + MAX_HEADER + 1) as u64)
         .read_to_end(&mut bytes)?;
     parse(bytes)
 }
 
+/// Reads a copy's file (opened by the phone), version 2 or a version 1 left
+/// from before, refusing anything malformed or larger than a save made.
 pub(crate) fn parse(mut bytes: Vec<u8>) -> Result<Saved> {
     let invalid = || Error::Snapshot;
-    if bytes.len() > MAX_BYTES + MAX_HEADER {
+    if bytes.len() > MAX_READ + MAX_HEADER {
         return Err(Error::Capacity);
     }
     let end = bytes
@@ -174,15 +298,39 @@ pub(crate) fn parse(mut bytes: Vec<u8>) -> Result<Saved> {
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| *n > 0)
     };
-    let (Some(cols), Some(rows), true) = (size("cols"), size("rows"), header["v"] == VERSION) else {
+    let version = header["v"].as_u64();
+    let (Some(cols), Some(rows), Some(1 | 2)) = (size("cols"), size("rows"), version) else {
         return Err(invalid());
     };
     let pane = header["pane"].as_str().ok_or_else(invalid)?.to_owned();
+    let history = if version == Some(VERSION) {
+        Some(header["history"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(invalid)?)
+    } else {
+        None
+    };
     bytes.drain(..=end);
-    Ok(Saved { cols, rows, pane, bytes })
+    Ok(Saved {
+        cols,
+        rows,
+        pane,
+        bytes,
+        history,
+        complete: header["complete"] == true,
+        full_screen: header["full_screen"] == true,
+        boot: header["boot"].as_str().unwrap_or("").chars().take(128).collect(),
+    })
 }
 
-/// A read-only terminal showing `saved`: no transport, input goes nowhere.
+/// A full-screen pane's transcript, read back from its saved copy.
+pub(crate) fn transcript_of(saved: &Saved) -> Option<crate::transcript::Transcript> {
+    if !saved.full_screen {
+        return None;
+    }
+    let rows = saved_rows(&saved.bytes);
+    let screen = rows.len().checked_sub(saved.history?)?;
+    Some(crate::transcript::Transcript::restored(rows, screen, usize::from(saved.cols), saved.complete))
+}
+
 /// The most characters of a title or note an uncached pane shows.
 const MAX_NOTE_CHARS: usize = 200;
 
@@ -196,6 +344,7 @@ pub(crate) fn note(title: &str, line: &str) -> Vec<u8> {
     format!("\x1b[0m\x1b[1m{}\x1b[0m\r\n\x1b[2m{}\x1b[0m\x1b[?25l", clean(title), clean(line)).into_bytes()
 }
 
+/// A read-only terminal showing `saved`: no transport, input goes nowhere.
 pub(crate) fn restore(saved: Saved) -> Result<Arc<gpui_rio::Session>> {
     let session = gpui_rio::Session::start(
         io::Cursor::new(saved.bytes),
@@ -234,7 +383,7 @@ mod tests {
     }
 
     fn parsed(text: &[u8], cols: u16, rows: u16) -> Arc<gpui_rio::Session> {
-        let session = restore(Saved { cols, rows, pane: "t1".into(), bytes: text.to_vec() }).unwrap();
+        let session = restore(Saved::of(cols, rows, "t1", text.to_vec())).unwrap();
         wait_quiet(&session);
         session
     }

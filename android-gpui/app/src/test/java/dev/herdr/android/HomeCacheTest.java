@@ -71,4 +71,47 @@ public final class HomeCacheTest {
         file.delete();
         dir.delete();
     }
+
+    @Test public void ask2AColdOfflineStartListsThePanesFromTheSealedFleetCache() throws Exception {
+        File dir = Files.createTempDirectory("fleet-cache").toFile();
+        File sealed = new File(dir, HomeCache.SEALED_NAME);
+        javax.crypto.SecretKey key = CacheSeal.newKey();
+        // The terminal merges the computer it is connected to; Home's git look stays.
+        Map<String, HomeCache.Entry> home = new LinkedHashMap<>();
+        home.put("server", new HomeCache.Entry(poll(), "E\n", false));
+        HomeCache.writeSealed(sealed, new CacheSeal(key), HomeCache.encode(home));
+        JSONObject live = poll();
+        live.getJSONArray("panes").put(new JSONObject().put("pane_id", "t2").put("title", "secret-project"));
+        HomeCache.merge(sealed, new CacheSeal(key), "server", new HomeCache.Entry(live, "", false));
+        HomeCache.merge(sealed, new CacheSeal(key), "laptop", new HomeCache.Entry(poll(), "", false));
+        assertFalse(new String(Files.readAllBytes(sealed.toPath()), java.nio.charset.StandardCharsets.ISO_8859_1)
+                .contains("secret-project"));
+        // Cold start, no link: the list is there, both computers, every pane.
+        Map<String, HomeCache.Entry> back = HomeCache.readSealed(sealed, null, new CacheSeal(key));
+        assertEquals(2, back.size());
+        assertEquals(2, back.get("server").view.getJSONArray("panes").length());
+        assertEquals("E\n", back.get("server").git);
+        // Another key (data cleared): nothing, and the file is gone.
+        assertTrue(HomeCache.readSealed(sealed, null, new CacheSeal(CacheSeal.newKey())).isEmpty());
+        assertFalse(sealed.exists());
+        dir.delete();
+    }
+
+    @Test public void ask2ThePlainVersion1FleetFileIsSealedOnceThenDeleted() throws Exception {
+        File dir = Files.createTempDirectory("fleet-cache").toFile();
+        File legacy = new File(dir, HomeCache.FILE_NAME);
+        File sealed = new File(dir, "cache-v2/" + HomeCache.SEALED_NAME);
+        Map<String, HomeCache.Entry> entries = new LinkedHashMap<>();
+        entries.put("laptop", new HomeCache.Entry(poll(), "", false));
+        HomeCache.write(legacy, HomeCache.encode(entries));
+        CacheSeal seal = new CacheSeal(CacheSeal.newKey());
+        assertEquals(1, HomeCache.readSealed(sealed, legacy, seal).size());
+        assertFalse(legacy.exists());
+        assertTrue(sealed.isFile());
+        assertEquals(1, HomeCache.readSealed(sealed, legacy, seal).size());
+        // With no seal at all, no plain copy is kept either.
+        HomeCache.write(legacy, HomeCache.encode(entries));
+        assertTrue(HomeCache.readSealed(sealed, legacy, null).isEmpty());
+        assertFalse(legacy.exists());
+    }
 }

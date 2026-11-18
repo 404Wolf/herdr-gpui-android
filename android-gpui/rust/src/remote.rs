@@ -201,7 +201,44 @@ pub(crate) struct State {
     pub(crate) view: Value,
     pub(crate) terminal: Option<Arc<gpui_rio::Session>>,
     pub(crate) render_id: u64,
+    /// What the phone keeps of the pane on screen itself (item 77, ask 2).
+    pub(crate) local: Local,
 }
+
+/// The pane on screen, as the phone itself keeps it: the copy being read
+/// back instead of the live grid, and when the live grid's first paint is in.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+#[derive(Default)]
+pub(crate) struct Local {
+    /// The phone's own copy scrolled instead of the live grid (a full-screen
+    /// program's transcript, or the copy read while the link was down): its
+    /// render id and terminal. Back at its newest row the live grid returns.
+    reader: Option<(u64, Arc<gpui_rio::Session>)>,
+    /// When the pane on screen attached, and the output count then.
+    attached: Option<(std::time::Instant, u64)>,
+    /// The output count at the last look, and when it last moved.
+    output: u64,
+    moved_at: Option<std::time::Instant>,
+    /// The live grid has its first paint: until then whatever was drawn stays
+    /// (the copy read offline, or the pane switched from), never a blank grid.
+    settled: bool,
+    /// The output count when the screen was last captured.
+    captured: u64,
+}
+
+impl Local {
+    /// A pane just attached, with `output` bytes heard so far.
+    pub(crate) fn attached(output: u64) -> Self {
+        Self { attached: Some((std::time::Instant::now(), output)), output, captured: output, ..Self::default() }
+    }
+}
+
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+/// Quiet this long after its first bytes, a fresh attach is painted.
+const SETTLE_QUIET: Duration = Duration::from_millis(150);
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+/// At the latest the live grid is shown this long after its attach.
+const SETTLE_MAX: Duration = Duration::from_millis(1500);
 pub(crate) struct Session {
     /// This session's handle (the phone's id for it): a kept grid remembers
     /// which session showed it, since every core numbers its panes t1, t2…
@@ -223,6 +260,9 @@ pub(crate) struct Session {
     /// phone (a host switched to just now was just used). Tests give each
     /// session its own.
     pub(crate) uses: &'static LastUse,
+    /// A full-screen pane whose history the phone asks the core for (a
+    /// stitched `terminal.read`), set by the UI's poll, taken by the session.
+    pub(crate) seed: Mutex<Option<String>>,
 }
 
 /// The last time bytes arrived, lock-free: the socket loop marks it on every
@@ -252,6 +292,10 @@ impl Heard {
     /// Read by the UI's poll (and tests); a remote-only build has no reader.
     #[cfg(any(feature = "android-ui", test))]
     pub(crate) fn output(&self) -> u64 {
+        self.output.load(Ordering::Relaxed)
+    }
+    /// The same count, for the session's own attach.
+    pub(crate) fn output_now(&self) -> u64 {
         self.output.load(Ordering::Relaxed)
     }
     pub(crate) fn mark(&self) {
@@ -288,10 +332,20 @@ pub fn renderer(id: u64) -> Option<Arc<gpui_rio::Session>> {
     {
         return Some(terminal.clone());
     }
+    if let Some(held) = lock(held()).as_ref()
+        && held.id == id
+    {
+        return Some(held.terminal.clone());
+    }
     for owner in lock(sessions()).values() {
         let state = lock(&owner.state);
         if state.render_id == id {
             return state.terminal.clone();
+        }
+        if let Some((reader, terminal)) = &state.local.reader
+            && *reader == id
+        {
+            return Some(terminal.clone());
         }
     }
     None
@@ -328,6 +382,7 @@ pub fn connect_credentials_grid(
             view: json!({"state":"connecting","status":"Connecting to herdr-core over SSH","boot_id":"","pane_id":"","focused_pane":"","panes":[],"workspaces":[],"tabs":[],"title":"Herdr Core","token":1,"chrome_token":1,"revision":1,"fetch":null,"scroll":{"offset":0,"max":0,"rows":0}}),
             terminal: None,
             render_id: 0,
+            local: Default::default(),
         }),
         cancel: CancellationToken::new(),
         commands: tx,
@@ -335,6 +390,7 @@ pub fn connect_credentials_grid(
         heard: Heard::default(),
         visible: std::sync::atomic::AtomicBool::new(true),
         uses: &USE,
+        seed: Mutex::new(None),
     });
     let worker = owner.clone();
     std::thread::Builder::new()
@@ -426,14 +482,47 @@ pub fn close(id: u64) {
     // The phone keeps this terminal's last frame on screen while it reconnects
     // (Mailbox::hold): keep its grid too, so the conversation still scrolls.
     let mut state = lock(&owner.state);
+    let reading = state.local.reader.take();
     if let Some(terminal) = state.terminal.take() {
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+        let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
         // This grid is newer than any copy of the same pane kept on a switch.
         lock(departed()).retain(|kept| !kept.from(id, &pane));
-        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane });
-        hold(terminal);
+        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane: pane.clone(), boot: boot.clone() });
+        let shown = state.render_id;
+        drop(state);
+        match reading {
+            // Being read back already: it stays, at the same row.
+            Some((reader, copy)) => hold_as(reader, copy, Some(pane)),
+            None => match reader_for(&boot, &pane, &terminal) {
+                // A full-screen program: the phone's transcript of it, so the
+                // conversation still scrolls with no link (not one screen).
+                Some(copy) => {
+                    let reader = crate::core_session::next_render_id();
+                    hold_as(reader, copy, Some(pane));
+                    show_render(None, reader, Some(shown));
+                }
+                None => hold_as(shown, terminal, Some(pane)),
+            },
+        }
     }
 }
+/// Draws render id `id` (for `generation`, else the UI's current one), only
+/// while `instead_of` is drawn when given. It shows the same host and pane as
+/// the frame it replaces (the phone's copy of that pane, or its live grid
+/// again), so links found on it keep their target. Nothing without a UI.
+#[cfg(feature = "android-ui")]
+fn show_render(generation: Option<i64>, id: u64, instead_of: Option<u64>) {
+    let mut mailbox = model::mailbox();
+    let now = mailbox.state();
+    if instead_of.is_some_and(|old| now.shell != old) {
+        return;
+    }
+    let target = now.frame_target.clone();
+    mailbox.set_shell(generation.unwrap_or(now.generation), id, target);
+}
+#[cfg(not(feature = "android-ui"))]
+fn show_render(_generation: Option<i64>, _id: u64, _instead_of: Option<u64>) {}
 /// Most grids of switched-away panes kept at once, each until the phone saves
 /// it. A grid is at most the phone's scrollback (10,000 rows), so this bounds
 /// what a quick run of switches can keep alive to two such grids.
@@ -448,7 +537,7 @@ fn departed() -> &'static Mutex<std::collections::VecDeque<Kept>> {
 /// Session `session` is replacing `pane`'s grid with another pane's: keep it
 /// for saving. Only the grid object moves here; nothing is sent and no size
 /// changes.
-pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: String) {
+pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: String, boot: String) {
     if pane.is_empty() {
         return;
     }
@@ -461,7 +550,7 @@ pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: Strin
     }
     let mut kept = lock(departed());
     kept.retain(|other| !other.from(session, &pane));
-    kept.push_back(Kept { session, terminal, pane });
+    kept.push_back(Kept { session, terminal, pane, boot });
     while kept.len() > DEPARTED_MAX {
         kept.pop_front();
     }
@@ -480,7 +569,7 @@ pub(crate) fn departed_test_lock() -> MutexGuard<'static, ()> {
 /// attaches (the save runs on a worker, maybe after that attach).
 #[cfg(test)]
 pub(crate) fn closed_for_test(session: u64, terminal: Arc<gpui_rio::Session>, pane: &str) {
-    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into() });
+    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into(), boot: String::new() });
 }
 fn closed() -> &'static Mutex<Option<Kept>> {
     static CLOSED: OnceLock<Mutex<Option<Kept>>> = OnceLock::new();
@@ -493,18 +582,30 @@ struct Kept {
     session: u64,
     terminal: Arc<gpui_rio::Session>,
     pane: String,
+    /// The core it came from (its boot id): the transcript's key.
+    boot: String,
 }
 impl Kept {
     fn from(&self, session: u64, pane: &str) -> bool {
         self.session == session && self.pane == pane
     }
 }
+#[cfg(test)]
 pub(crate) fn hold(terminal: Arc<gpui_rio::Session>) {
-    *lock(held()) = Some(Held { terminal });
+    hold_as(crate::core_session::next_render_id(), terminal, None);
+}
+/// Makes `terminal` the held frame, drawn under render id `id`.
+fn hold_as(id: u64, terminal: Arc<gpui_rio::Session>, pane: Option<String>) {
+    *lock(held()) = Some(Held { id, terminal, pane });
 }
 /// The grid the held frame draws.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
 struct Held {
+    id: u64,
     terminal: Arc<gpui_rio::Session>,
+    /// The pane it shows, when known: a live attach of the same pane keeps
+    /// the place it was read at.
+    pane: Option<String>,
 }
 /// The terminal of the last closed session (or a saved pane read back), which
 /// the held frame draws.
@@ -539,68 +640,307 @@ fn cached() -> &'static Mutex<Cached> {
     CACHED.with(|cached| *cached)
 }
 /// A new pane attached: its live grid is the one to scroll and draw now.
+#[cfg(test)]
 pub(crate) fn release_held() {
     lock(held()).take();
     lock(cached()).take();
 }
-/// Saves `pane`'s grid, as session `id` last showed it, to `path`: the
-/// phone's copy of that conversation, for reading it later with no link. The
-/// grid is the newest that session left: its live one while it shows `pane`,
-/// else the one kept when a switch left it (freed once saved), else the one
-/// kept when it closed. Grids of other sessions never count, even for the
-/// same pane id. False when there is none. The grid is copied under its lock
-/// and written after it is released, so a slow disk never holds up painting.
-/// Disk work: never on the UI thread.
-pub fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
+
+/// The live grid of a fresh attach is shown once its first paint is in (its
+/// bytes went quiet) or SETTLE_MAX passed, never blank before. Then a held
+/// frame of the same pane that was being read back stays as the reader, at
+/// the same row (a reconnect never jumps); any other held frame lets go.
+#[cfg(any(feature = "android-ui", test))]
+pub(crate) fn settle(owner: &Session, state: &mut State) -> bool {
+    let local = &mut state.local;
+    if local.settled {
+        return true;
+    }
+    let Some((at, start)) = local.attached else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    let output = owner.heard.output();
+    if output != local.output {
+        local.output = output;
+        local.moved_at = Some(now);
+    }
+    let painted = output != start && local.moved_at.is_some_and(|moved| now - moved >= SETTLE_QUIET);
+    if !painted && now - at < SETTLE_MAX {
+        return false;
+    }
+    local.settled = true;
+    let pane = state.view["pane_id"].as_str().unwrap_or("");
+    if let Some(held) = lock(held()).take()
+        && held.pane.as_deref() == Some(pane)
+        && held.terminal.grid().lock().display_offset() > 0
+    {
+        state.local.reader = Some((held.id, held.terminal));
+    }
+    lock(cached()).take();
+    true
+}
+
+/// One full-screen pane's transcript on the phone, by core boot and pane.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+struct Transcribed {
+    boot: String,
+    pane: String,
+    transcript: crate::transcript::Transcript,
+    /// The pane's status marker when a seed was last asked for: asked once
+    /// per marker, so a refused or failed read is never retried in a loop.
+    asked: Option<String>,
+    used: u64,
+}
+impl Transcribed {
+    fn is(&self, boot: &str, pane: &str) -> bool {
+        self.boot == boot && self.pane == pane
+    }
+}
+/// Transcripts kept in memory at once (each at most transcript::MAX_BYTES).
+const TRANSCRIPTS: usize = 6;
+fn transcripts() -> &'static Mutex<Vec<Transcribed>> {
+    static KEPT: OnceLock<Mutex<Vec<Transcribed>>> = OnceLock::new();
+    KEPT.get_or_init(Mutex::default)
+}
+static USED: AtomicU64 = AtomicU64::new(1);
+/// `boot`/`pane`'s transcript, made if there is none; the least recently used goes beyond TRANSCRIPTS.
+fn transcribed<'a>(store: &'a mut Vec<Transcribed>, boot: &str, pane: &str) -> &'a mut Transcribed {
+    let used = USED.fetch_add(1, Ordering::Relaxed);
+    let at = match store.iter().position(|kept| kept.is(boot, pane)) {
+        Some(at) => at,
+        None => {
+            if store.len() >= TRANSCRIPTS
+                && let Some(oldest) = (0..store.len()).min_by_key(|i| store[*i].used)
+            {
+                store.remove(oldest);
+            }
+            store.push(Transcribed {
+                boot: boot.into(),
+                pane: pane.into(),
+                transcript: crate::transcript::Transcript::default(),
+                asked: None,
+                used,
+            });
+            store.len() - 1
+        }
+    };
+    store[at].used = used;
+    &mut store[at]
+}
+/// A transcript read back from a saved copy, unless the phone already keeps a newer one.
+fn adopt(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
+    let mut store = lock(transcripts());
+    let kept = transcribed(&mut store, boot, pane);
+    // Live capture since the attach found nothing yet: the saved copy leads,
+    // and the next screen is aligned with its last one.
+    if kept.transcript.rows() == 0 {
+        kept.transcript = transcript;
+    }
+}
+
+/// The phone's copy of a full-screen program to read back: its transcript
+/// then its screen now, in a terminal of its own at the newest row. None
+/// when `terminal` is not full screen or no history was kept yet.
+fn reader_for(boot: &str, pane: &str, terminal: &gpui_rio::Session) -> Option<Arc<gpui_rio::Session>> {
     if pane.is_empty() {
-        return Ok(false);
+        return None;
+    }
+    let (bytes, cols, rows) = {
+        let store = lock(transcripts());
+        let kept = store.iter().find(|kept| kept.is(boot, pane))?;
+        if kept.transcript.rows() == 0 {
+            return None;
+        }
+        let grid = terminal.grid().lock();
+        if !grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN) {
+            return None;
+        }
+        let (bytes, _) = crate::snapshot::encode_transcript(&grid, &kept.transcript, crate::snapshot::MAX_BYTES);
+        (bytes, u16::try_from(grid.columns()).ok()?, u16::try_from(grid.screen_lines()).ok()?)
+    };
+    let reader = crate::snapshot::restore(crate::snapshot::Saved::of(cols, rows, pane, bytes)).ok()?;
+    // Parsed on its own thread: a copy at most MAX_BYTES takes milliseconds.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while reader.is_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Some(reader)
+}
+
+/// The pane's status as the list has it, and whether it is busy (a seed is
+/// never asked for while it works or waits on a dialog).
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+fn marker(view: &Value, pane: &str) -> (String, bool) {
+    let entry = view["panes"].as_array().and_then(|panes| panes.iter().find(|p| p["id"] == pane));
+    let Some(entry) = entry else {
+        return (String::new(), true);
+    };
+    let status = entry["status"].as_str().unwrap_or("");
+    let marker = format!("{}/{}/{}", status, entry["status_ms"], entry["turn"]);
+    (marker, matches!(status, "working" | "blocked" | "error"))
+}
+
+/// Keeps the transcript of the full-screen pane on screen: each new screen
+/// is aligned with the last one and the rows that left its top are kept.
+/// Asks the session for a seed (a stitched read) when one is owed, once per
+/// status marker of the pane, never while it is busy.
+#[cfg(any(feature = "android-ui", test))]
+pub(crate) fn keep_local(owner: &Session, state: &mut State) {
+    if !state.local.settled {
+        return;
+    }
+    let Some(terminal) = state.terminal.clone() else {
+        return;
+    };
+    let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+    let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
+    if pane.is_empty() {
+        return;
+    }
+    let output = owner.heard.output();
+    let screen = {
+        let grid = terminal.grid().lock();
+        if !grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN) {
+            return;
+        }
+        (output != state.local.captured).then(|| (crate::transcript::screen_rows(&grid), grid.columns()))
+    };
+    state.local.captured = output;
+    let (marker, busy) = marker(&state.view, &pane);
+    let ask = {
+        let mut store = lock(transcripts());
+        let kept = transcribed(&mut store, &boot, &pane);
+        if let Some((rows, cols)) = screen {
+            kept.transcript.observe(rows, cols);
+        }
+        let ask = !busy && kept.transcript.wants_seed() && kept.asked.as_deref() != Some(marker.as_str());
+        if ask {
+            kept.asked = Some(marker);
+        }
+        ask
+    };
+    if ask {
+        *lock(&owner.seed) = Some(pane);
+    }
+}
+
+/// The core's stitched read of `pane` (`terminal.read`'s reply), merged into
+/// its transcript. False when it was no stitched read or could not be placed.
+pub(crate) fn seeded(boot: &str, pane: &str, reply: &Value) -> bool {
+    if reply["how"] != "stitched" {
+        return false;
+    }
+    let Some(text) = reply["text"].as_str() else {
+        return false;
+    };
+    let mut store = lock(transcripts());
+    transcribed(&mut store, boot, pane).transcript.seed(text, reply["complete"] == true)
+}
+
+#[cfg(test)]
+pub(crate) fn transcript_rows(boot: &str, pane: &str) -> Option<Vec<String>> {
+    let store = lock(transcripts());
+    let kept = store.iter().find(|kept| kept.is(boot, pane))?;
+    Some(kept.transcript.reader_rows(kept.transcript.screen()).map(|r| r.text.clone()).collect())
+}
+/// `pane`'s copy, as session `id` last showed it: the phone's copy of that
+/// conversation, for reading it later with no link (the phone seals it and
+/// writes it). The grid is the newest that session left: its live one while
+/// it shows `pane`, else the one kept when a switch left it (freed once
+/// copied), else the one kept when it closed. Grids of other sessions never
+/// count, even for the same pane id. A full-screen program's copy is the
+/// phone's transcript of it, then its screen. None when there is none. The
+/// grid is copied under its lock, never on the UI thread.
+pub fn copy_pane(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
+    if pane.is_empty() {
+        return Ok(None);
     }
     let live = lock(sessions()).get(&id).cloned().and_then(|owner| {
         let state = lock(&owner.state);
-        if state.view["pane_id"] == pane { state.terminal.clone() } else { None }
+        if state.view["pane_id"] == pane {
+            let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
+            state.terminal.clone().map(|terminal| (terminal, boot))
+        } else {
+            None
+        }
     });
     let switched = || {
         let mut kept = lock(departed());
         let at = kept.iter().position(|kept| kept.from(id, pane))?;
-        kept.remove(at).map(|kept| kept.terminal)
+        kept.remove(at).map(|kept| (kept.terminal, kept.boot))
     };
     let last_closed = || {
         lock(closed())
             .as_ref()
             .filter(|kept| kept.from(id, pane))
-            .map(|kept| kept.terminal.clone())
+            .map(|kept| (kept.terminal.clone(), kept.boot.clone()))
     };
-    let Some(terminal) = live.or_else(switched).or_else(last_closed) else {
+    let Some((terminal, boot)) = live.or_else(switched).or_else(last_closed) else {
+        return Ok(None);
+    };
+    let store = lock(transcripts());
+    let transcript = store.iter().find(|kept| kept.is(&boot, pane)).map(|kept| &kept.transcript);
+    Ok(Some(crate::snapshot::copy(&terminal.grid().lock(), pane, &boot, transcript)?))
+}
+/// Test stand-in for the phone's save: [`copy_pane`] written to `path`.
+#[cfg(test)]
+pub(crate) fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
+    let Some(copy) = copy_pane(id, pane)? else {
         return Ok(false);
     };
-    let copy = crate::snapshot::copy(&terminal.grid().lock(), pane)?;
     crate::snapshot::write(&copy, std::path::Path::new(path))?;
     Ok(true)
 }
-/// Reads a saved pane from `path` and makes it the held frame, drawn under a
-/// new render id (returned) until a live pane attaches. It scrolls like any
-/// held frame. Disk work: never on the UI thread.
-pub fn open_saved(path: &str) -> Result<u64> {
-    let saved = crate::snapshot::load(std::path::Path::new(path))?;
+/// Test stand-in for the phone's open: [`open_saved`] of `path`'s bytes.
+#[cfg(test)]
+pub(crate) fn open_saved_file(path: &str) -> Result<u64> {
+    open_saved(std::fs::read(path)?)
+}
+/// Reads a saved pane (its file's bytes, opened by the phone) and makes it
+/// the held frame, drawn under a new render id (returned) until a live pane
+/// attaches. It scrolls like any held frame. A full-screen program's
+/// transcript in it is what the phone keeps adding to once that pane is live
+/// again on the same core. Never on the UI thread.
+pub fn open_saved(bytes: Vec<u8>) -> Result<u64> {
+    let saved = crate::snapshot::parse(bytes)?;
+    if !saved.boot.is_empty()
+        && let Some(transcript) = crate::snapshot::transcript_of(&saved)
+    {
+        adopt(&saved.boot, &saved.pane, transcript);
+    }
+    let pane = saved.pane.clone();
     let terminal = crate::snapshot::restore(saved)?;
     let id = crate::core_session::next_render_id();
     *lock(cached()) = Some((id, terminal.clone()));
-    hold(terminal);
+    hold_as(id, terminal, Some(pane));
     Ok(id)
+}
+/// Keeps a full-screen pane's transcript from its saved copy (the file's
+/// bytes), drawing nothing: a live session that just switched to the pane
+/// scrolls back through it at once. A newer transcript already kept wins.
+pub fn adopt_saved(bytes: Vec<u8>) -> Result<()> {
+    let saved = crate::snapshot::parse(bytes)?;
+    if !saved.boot.is_empty()
+        && let Some(transcript) = crate::snapshot::transcript_of(&saved)
+    {
+        adopt(&saved.boot, &saved.pane, transcript);
+    }
+    Ok(())
 }
 /// Makes `pane`'s stand-in the held frame when it has no saved copy: `title`
 /// and one dim `note` line on a `cols`×`rows` grid, drawn under a new render id
 /// (returned) until a live pane attaches. Never touches a session or the disk.
 pub fn hold_note(pane: &str, title: &str, note: &str, cols: u16, rows: u16) -> Result<u64> {
-    let terminal = crate::snapshot::restore(crate::snapshot::Saved {
-        cols: cols.clamp(20, 400),
-        rows: rows.clamp(5, 200),
-        pane: pane.into(),
-        bytes: crate::snapshot::note(title, note),
-    })?;
+    let terminal = crate::snapshot::restore(crate::snapshot::Saved::of(
+        cols.clamp(20, 400),
+        rows.clamp(5, 200),
+        pane,
+        crate::snapshot::note(title, note),
+    ))?;
     let id = crate::core_session::next_render_id();
     *lock(cached()) = Some((id, terminal.clone()));
-    hold(terminal);
+    hold_as(id, terminal, None);
     Ok(id)
 }
 /// Scrolls the held frame's own history, with no link: `delta` rows back
@@ -639,24 +979,30 @@ pub fn poll_terminal(
         return Err(Error::StaleTarget);
     }
     let owner = session(id)?;
-    let state = lock(&owner.state);
+    let mut state = lock(&owner.state);
+    let settled = settle(&owner, &mut state);
+    keep_local(&owner, &mut state);
     {
         let mut mailbox = model::mailbox();
-        // Before its pane attaches, a session draws nothing: a held frame (the
-        // last one, or a saved pane) stays until there is something live.
-        // The renderer is recorded with the host and pane it was attached
-        // for, under the same lock that installs it.
-        if state.render_id != 0 || !mailbox.state().held {
+        // Before its pane attaches and paints, a session draws nothing new: a
+        // held frame (the last one, or a saved pane) or the pane switched from
+        // stays until there is something live to show (item 77: a reconnect
+        // never blanks the screen). The renderer is recorded with the host
+        // and pane it was attached for, under the same lock that installs it.
+        let attaching = state.view["state"] == "connecting";
+        if state.render_id != 0 && settled {
+            let shown = state.local.reader.as_ref().map_or(state.render_id, |(reader, _)| *reader);
             let pane = state.view["pane_id"].as_str().unwrap_or("");
-            let target = model::FrameTarget::new(host, pane);
-            mailbox.set_shell(generation, state.render_id, Some(target));
+            mailbox.set_shell(generation, shown, Some(model::FrameTarget::new(host, pane)));
+        } else if state.render_id == 0 && !attaching && !mailbox.state().held {
+            mailbox.set_shell(generation, 0, None);
         }
     }
     // How far the local history is scrolled back, for a "jump to latest" control.
-    let local_offset = state
-        .terminal
-        .as_ref()
-        .map_or(0, |terminal| terminal.grid().lock().display_offset());
+    let local_offset = match &state.local.reader {
+        Some((_, reader)) => reader.grid().lock().display_offset(),
+        None => state.terminal.as_ref().map_or(0, |terminal| terminal.grid().lock().display_offset()),
+    };
     let view = &state.view;
     if since != 0 && view["token"].as_u64() == Some(since) {
         // The phone polls ten times a second; resending (and reparsing) the
@@ -776,30 +1122,60 @@ pub struct UiPaint<'a> {
 }
 pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     let owner = session(id)?;
-    let state = lock(&owner.state);
-    if let Some(terminal) = &state.terminal {
-        let delta = delta.clamp(-1000, 1000) as i32;
-        // Full-screen agents (Claude Code, Codex) scroll themselves: they get
-        // wheel input. Plain output scrolls the attach's local history.
+    let mut state = lock(&owner.state);
+    let delta = delta.clamp(-1000, 1000) as i32;
+    let scroll = rio_vt::crosswords::grid::Scroll::Delta(delta);
+    // Being read back: the phone's own copy scrolls, nothing is sent; at its
+    // newest row the live grid is drawn again.
+    if let Some((_, reader)) = &state.local.reader {
+        let offset = {
+            let mut grid = reader.grid().lock();
+            grid.scroll_display(scroll);
+            grid.display_offset()
+        };
+        if offset == 0 && delta < 0 {
+            state.local.reader = None;
+            show_render(Some(paint.generation), state.render_id, None);
+        }
+        return Ok(json!({"queued":true,"local":true}).to_string());
+    }
+    if let Some(terminal) = state.terminal.clone() {
+        let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+        let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
+        // A full-screen program (Claude Code) keeps its history to itself:
+        // dragging back scrolls the phone's transcript of it, at once and
+        // with no round trip (item 77, ask 2). Without one yet, it gets wheel
+        // input as before; plain output scrolls the attach's local history.
+        if delta > 0
+            && let Some(reader) = reader_for(&boot, &pane, &terminal)
+        {
+            reader.grid().lock().scroll_display(scroll);
+            let shown = crate::core_session::next_render_id();
+            state.local.reader = Some((shown, reader));
+            show_render(Some(paint.generation), shown, None);
+            return Ok(json!({"queued":true,"local":true}).to_string());
+        }
         if !terminal.wheel(delta) {
-            terminal
-                .grid()
-                .lock()
-                .scroll_display(rio_vt::crosswords::grid::Scroll::Delta(delta));
+            terminal.grid().lock().scroll_display(scroll);
         }
     }
-    let _ = (paint.generation, paint.title, paint.status, paint.shortcuts);
+    let _ = (paint.title, paint.status, paint.shortcuts);
     Ok(json!({"queued":true}).to_string())
 }
 pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
     let owner = session(id)?;
-    if offset == 0
-        && let Some(terminal) = &lock(&owner.state).terminal
-    {
-        terminal
-            .grid()
-            .lock()
-            .scroll_display(rio_vt::crosswords::grid::Scroll::Bottom);
+    if offset == 0 {
+        let mut state = lock(&owner.state);
+        // Back to the newest line: the live grid, not the copy read back.
+        if state.local.reader.take().is_some() {
+            show_render(None, state.render_id, None);
+        }
+        if let Some(terminal) = &state.terminal {
+            terminal
+                .grid()
+                .lock()
+                .scroll_display(rio_vt::crosswords::grid::Scroll::Bottom);
+        }
     }
     Ok(json!({"queued":false}).to_string())
 }
@@ -840,6 +1216,25 @@ pub fn discover(id: u64) -> Result<String> {
         .map_err(|_| Error::Capacity)?;
     rx.recv_timeout(Duration::from_secs(120))
         .map_err(|_| Error::Closed)?
+}
+
+#[cfg(test)]
+pub(crate) fn register_for_test(owner: Arc<Session>) {
+    lock(sessions()).insert(owner.id, owner);
+}
+#[cfg(test)]
+pub(crate) fn held_for_test() -> Option<(u64, Arc<gpui_rio::Session>)> {
+    lock(held()).as_ref().map(|held| (held.id, held.terminal.clone()))
+}
+#[cfg(test)]
+impl Local {
+    /// A pane attached and painted long ago.
+    pub(crate) fn settled_for_test() -> Self {
+        Self { settled: true, ..Self::default() }
+    }
+    pub(crate) fn reader_for_test(&self) -> Option<(u64, Arc<gpui_rio::Session>)> {
+        self.reader.clone()
+    }
 }
 
 #[cfg(test)]

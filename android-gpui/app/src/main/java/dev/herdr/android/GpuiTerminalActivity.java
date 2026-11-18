@@ -6225,6 +6225,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
+                        queueFleetWrite(current.hostId);
+                        pinPanes(current.hostId, current.panes, current.chromePane);
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
@@ -6234,6 +6236,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     // when the attach replaced it, and is saved (and freed) now.
                     if (!current.chromePane.isEmpty() && current.hostId != null) {
                         snapshots.save(current.hostId, current.chromePane, current.remoteHandle);
+                    }
+                    // The pane switched to scrolls back at once through what
+                    // the phone kept of it, before its history is read again.
+                    if (current.hostId != null) {
+                        snapshots.adopt(current.hostId, pane);
+                        pinPanes(current.hostId, current.panes, pane);
                     }
                     if (switchAskedAt > 0) {
                         android.util.Log.w("herdr-switch", "pane " + pane + " shown "
@@ -6453,6 +6461,62 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         offline.panes = last[2];
     }
 
+    /** Computers whose live list changed since the Fleet cache was last written. */
+    private final java.util.Set<String> fleetDirty = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicBoolean fleetWriteQueued = new java.util.concurrent.atomic.AtomicBoolean();
+    private static final long FLEET_WRITE_MS = 10_000;
+
+    /**
+     * Merges this computer's live list into the shared Fleet cache (item 77):
+     * at most every FLEET_WRITE_MS, so a cold start with no link lists its
+     * panes even if Home never showed them. Never on the UI thread.
+     */
+    private void queueFleetWrite(String hostId) {
+        fleetDirty.add(hostId);
+        if (!fleetWriteQueued.compareAndSet(false, true)) return;
+        try {
+            worker.schedule(() -> {
+                fleetWriteQueued.set(false);
+                for (String host : new java.util.ArrayList<>(fleetDirty)) {
+                    fleetDirty.remove(host);
+                    JSONArray[] lists = seenLists.get(host);
+                    if (lists == null || lists[0] == null || lists[2] == null) continue;
+                    try {
+                        JSONObject view = new JSONObject().put("workspaces", lists[0])
+                                .put("tabs", lists[1] == null ? new JSONArray() : lists[1]).put("panes", lists[2]);
+                        HomeCache.merge(this, host, new HomeCache.Entry(view, "", false));
+                    } catch (Exception unwritable) {
+                        // A cache is a convenience: the next live list writes it again.
+                    }
+                }
+            }, FLEET_WRITE_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException closing) {
+            fleetWriteQueued.set(false);
+        }
+    }
+
+    /**
+     * The panes whose copies go last when the offline cache is full: the one
+     * on screen, this computer's Deacon and PMs, and panes with messages
+     * waiting to be sent.
+     */
+    private void pinPanes(String hostId, JSONArray panes, String onScreen) {
+        if (snapshots == null || hostId == null) return;
+        java.util.List<String[]> pins = new java.util.ArrayList<>();
+        if (onScreen != null && !onScreen.isEmpty()) pins.add(new String[] {hostId, onScreen});
+        Outbox box = outbox == null ? null : outbox.outbox();
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane == null) continue;
+            String id = pane.optString("id", "");
+            String role = FleetTree.role(pane.optString("role", ""));
+            if (!id.isEmpty() && (role.equals("deacon") || role.equals("pm") || box != null && box.holds(hostId, id))) {
+                pins.add(new String[] {hostId, id});
+            }
+        }
+        snapshots.pin(pins);
+    }
+
     /** {workspaces, tabs, panes} of a computer with no live list: as last seen here, else Home's cache; null if neither. */
     private JSONArray[] lastLists(String hostId) {
         if (hostId == null) return null;
@@ -6466,9 +6530,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** Reads Home's cached Fleet view off the UI thread; the rail and strip redraw with it. */
     private void loadFleetCache() {
-        final java.io.File file = new java.io.File(getNoBackupFilesDir(), HomeCache.FILE_NAME);
         worker.execute(() -> {
-            java.util.Map<String, HomeCache.Entry> read = HomeCache.read(file);
+            java.util.Map<String, HomeCache.Entry> read = HomeCache.read(this);
             main.post(() -> {
                 if (destroyed) return;
                 fleetCache = java.util.Collections.unmodifiableMap(read);

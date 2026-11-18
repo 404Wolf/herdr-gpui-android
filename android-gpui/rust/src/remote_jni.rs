@@ -3,7 +3,7 @@
 use crate::{remote, shell};
 use jni::{
     JNIEnv, JavaVM,
-    objects::{GlobalRef, JClass, JObject, JString},
+    objects::{GlobalRef, JByteArray, JClass, JObject, JString},
     sys::{jboolean, jint, jlong, jstring},
 };
 use std::sync::{Mutex, OnceLock};
@@ -324,24 +324,22 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollHeld(
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_herdr_android_RemoteNative_savePane(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_copyPane<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
     handle: jlong,
-    pane: JString<'_>,
-    path: JString<'_>,
-) -> jboolean {
+    pane: JString<'local>,
+) -> JByteArray<'local> {
+    let none = JByteArray::default();
     let Some(pane) = read(&mut env, &pane, 1024) else {
-        return 0;
+        return none;
     };
-    let Some(path) = read(&mut env, &path, 4096) else {
-        return 0;
-    };
-    match remote::save_pane(u64::try_from(handle).unwrap_or(0), &pane, &path) {
-        Ok(saved) => u8::from(saved),
+    match remote::copy_pane(u64::try_from(handle).unwrap_or(0), &pane) {
+        Ok(Some(copy)) => env.byte_array_from_slice(&copy).unwrap_or(none),
+        Ok(None) => none,
         Err(error) => {
             fail(&mut env, &error.to_string());
-            0
+            none
         }
     }
 }
@@ -372,17 +370,42 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_holdNote(
         }
     }
 }
+/// A copy handed over from Java, bounded before it is copied out.
+fn copy_bytes(env: &mut JNIEnv<'_>, bytes: &JByteArray<'_>) -> Option<Vec<u8>> {
+    if bytes.is_null() {
+        return None;
+    }
+    // A copy is at most a few MiB (snapshot::parse bounds it again).
+    match env.get_array_length(bytes) {
+        Ok(length) if (0..=8 * 1024 * 1024).contains(&length) => env.convert_byte_array(bytes).ok(),
+        _ => None,
+    }
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_adoptSaved(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    bytes: JByteArray<'_>,
+) {
+    let Some(bytes) = copy_bytes(&mut env, &bytes) else {
+        return;
+    };
+    if let Err(error) = remote::adopt_saved(bytes) {
+        fail(&mut env, &error.to_string());
+    }
+}
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_openSaved(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
-    path: JString<'_>,
+    bytes: JByteArray<'_>,
 ) -> jlong {
-    let Some(path) = read(&mut env, &path, 4096) else {
+    let Some(bytes) = copy_bytes(&mut env, &bytes) else {
         return 0;
     };
-    match remote::open_saved(&path) {
+    match remote::open_saved(bytes) {
         Ok(id) => id as jlong,
         Err(error) => {
             fail(&mut env, &error.to_string());

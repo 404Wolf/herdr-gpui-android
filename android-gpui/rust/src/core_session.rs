@@ -141,6 +141,53 @@ const RESIZE_HISTORY: usize = 1000;
 /// At most one automatic reattach of an ended stream this often.
 const REATTACH_EVERY: Duration = Duration::from_secs(5);
 
+/// History rows a stitched read asks for (the core's own cap for one).
+const STITCH_LINES: usize = 1000;
+/// How long the phone waits for a stitched read: the core's own limit is
+/// 15 s, after it waits its turn behind keys being typed.
+const STITCH_WAIT: Duration = Duration::from_secs(60);
+/// Another viewer that used its window this recently blocks a stitch.
+const STITCH_QUIET_MS: u64 = 60_000;
+
+/// One stitched read at a time from this phone, whichever computer.
+struct Stitching;
+static STITCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+impl Stitching {
+    fn take() -> Option<Self> {
+        STITCHING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok().map(|_| Self)
+    }
+}
+impl Drop for Stitching {
+    fn drop(&mut self) {
+        STITCHING.store(false, Ordering::Release);
+    }
+}
+
+/// Whether a stitched read may freeze this pane for its other viewers
+/// (`terminal.viewers`' reply; `ours`: this phone's attach channel). The
+/// read holds every viewer's output and queues a person's keys for a few
+/// seconds, so never while anyone else has the pane focused or touched it
+/// (focus, input, size or visibility) in the last minute. This phone's own
+/// viewer is the first not-observing one on its channel; anything unclear
+/// counts as someone else.
+pub(crate) fn may_stitch(viewers: &Value, ours: u32) -> bool {
+    let Some(list) = viewers["viewers"].as_array() else {
+        return false;
+    };
+    let mut skipped = false;
+    for viewer in list {
+        if !skipped && viewer["identity"]["channel"] == ours && viewer["observe"] != true {
+            skipped = true;
+            continue;
+        }
+        let recent = |key: &str| viewer[key].as_u64().is_some_and(|ms| ms < STITCH_QUIET_MS);
+        if viewer["focused"] != false || recent("focused_ms_ago") || recent("active_ms_ago") {
+            return false;
+        }
+    }
+    true
+}
+
 /// Frame kinds this viewer sends besides CREDIT (1).
 const DATA: u8 = 0;
 const DETACH: u8 = 2;
@@ -1007,6 +1054,51 @@ impl Connection<'_> {
         }
         Ok(json!({"peers":peers}).to_string())
     }
+    /// Reads the full-screen pane on screen's history from the core (a
+    /// stitched `terminal.read`: the core scrolls the program back and
+    /// forth while it holds every viewer's output, then repaints them) into
+    /// the phone's transcript of it. Only when the freeze can bother no one
+    /// ([`may_stitch`]), one at a time from this phone, and never retried: a
+    /// refusal or failure leaves the phone's own copy as it is.
+    fn seed(&mut self, pane: &str) -> Result<()> {
+        let boot = {
+            let state = lock(&self.owner.state);
+            if state.view["pane_id"] != pane || self.channel == 0 {
+                return Ok(());
+            }
+            state.view["boot_id"].as_str().unwrap_or("").to_owned()
+        };
+        // A pane on another machine is behind a relay: its viewers are not listed here.
+        if pane.contains('/') {
+            return Ok(());
+        }
+        let Some(_turn) = Stitching::take() else {
+            return Ok(());
+        };
+        let viewers = match self.call("terminal.viewers", json!({"terminal": pane})) {
+            Ok(viewers) => viewers,
+            // An older core cannot say who is watching: no stitch.
+            Err(Error::Rpc { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !may_stitch(&viewers, self.channel) {
+            #[cfg(feature = "android-ui")]
+            log::info!("stitch {pane}: another viewer is in use; the phone's copy stays");
+            return Ok(());
+        }
+        match self.call_within("terminal.read", json!({"terminal": pane, "lines": STITCH_LINES}), STITCH_WAIT) {
+            Ok(reply) => {
+                let placed = crate::remote::seeded(&boot, pane, &reply);
+                #[cfg(feature = "android-ui")]
+                log::info!("stitch {pane}: {} ({})", reply["how"], if placed { "placed" } else { "not placed" });
+                #[cfg(not(feature = "android-ui"))]
+                let _ = placed;
+                Ok(())
+            }
+            Err(Error::Rpc { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
     fn refresh(&mut self) -> Result<()> {
         // Subscribe precedes reading the app document; doc events/missed force
         // another read. Polling also handles older cores and unlabelled workers.
@@ -1044,7 +1136,8 @@ impl Connection<'_> {
             if let Some(outgoing) = state.terminal.take() {
                 let pane = state.view["pane_id"].as_str().unwrap_or("");
                 if pane != terminal {
-                    crate::remote::depart(self.owner.id, outgoing, pane.to_owned());
+                    let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
+                    crate::remote::depart(self.owner.id, outgoing, pane.to_owned(), boot);
                 }
             }
             state.render_id = 0;
@@ -1148,10 +1241,12 @@ impl Connection<'_> {
             terminal_session.set_grid(cols, rows);
         }
         *lock(&session_slot) = Arc::downgrade(&terminal_session);
-        crate::remote::release_held();
         self.channel = channel;
         self.output = Some(tx);
         let mut state = lock(&self.owner.state);
+        // Whatever is drawn (a held frame, the pane switched from) stays until
+        // this grid's first paint is in (remote::settle), never a blank grid.
+        state.local = crate::remote::Local::attached(self.owner.heard.output_now());
         state.terminal = Some(terminal_session);
         state.render_id = NEXT_RENDER.fetch_add(1, Ordering::Relaxed);
         state.view["pane_id"] = json!(terminal);
@@ -1994,6 +2089,10 @@ fn serve(
             #[cfg(not(feature = "android-ui"))]
             let _ = asked;
         }
+        let seed = lock(&owner.seed).take();
+        if let Some(pane) = seed {
+            connection.seed(&pane)?;
+        }
         if let Some(frame) = connection.read()? {
             connection.deliver(frame)?;
         }
@@ -2149,6 +2248,9 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),
             "wait_kind": terminal["status"]["kind"].as_str().unwrap_or(""),
             "status_ms": terminal["status_ms"].as_u64().unwrap_or(0),
+            // Counts the program's turns: with the status, when a full-screen
+            // pane's history is read again (item 77).
+            "turn": terminal["turn"].as_u64().unwrap_or(0),
             // Picks the canonical deacon when a computer has several candidates.
             "created_ms": terminal["created_ms"].as_u64().unwrap_or(0),
             // What runs in it now: a deacon whose claude ended is a kept shell.
@@ -2923,6 +3025,7 @@ mod connection_tests {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
                 render_id: 0,
+                local: Default::default(),
             }),
             cancel: CancellationToken::new(),
             commands,
@@ -2930,6 +3033,7 @@ mod connection_tests {
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
             uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -3024,6 +3128,7 @@ mod connection_tests {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
                 render_id: 0,
+                local: Default::default(),
             }),
             cancel: CancellationToken::new(),
             commands,
@@ -3031,6 +3136,7 @@ mod connection_tests {
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
             uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -3129,13 +3235,14 @@ mod connection_tests {
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
             id: 0,
-            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0 }),
+            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0, local: Default::default() }),
             cancel: CancellationToken::new(),
             commands: commands.clone(),
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
             uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -3349,7 +3456,7 @@ mod connection_tests {
         crate::remote::closed_for_test(0, session.clone(), "t9");
         assert!(!crate::remote::save_pane(0, "held-other", path).unwrap());
         assert!(crate::remote::save_pane(0, "t9", path).unwrap());
-        let id = crate::remote::open_saved(path).unwrap();
+        let id = crate::remote::open_saved_file(path).unwrap();
         let restored = crate::remote::renderer(id).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while restored.is_alive() {
@@ -3699,7 +3806,7 @@ mod connection_tests {
     fn restored(session: &gpui_rio::Session, max_bytes: usize) -> Arc<gpui_rio::Session> {
         let bytes = crate::snapshot::encode(&session.grid().lock(), max_bytes);
         let (cols, rows) = session.grid_size();
-        let copy = crate::snapshot::restore(crate::snapshot::Saved { cols, rows, pane: "t1".into(), bytes }).unwrap();
+        let copy = crate::snapshot::restore(crate::snapshot::Saved::of(cols, rows, "t1", bytes)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while copy.is_alive() {
             assert!(Instant::now() < deadline, "the copy was never parsed");
@@ -3762,7 +3869,7 @@ mod connection_tests {
         // switch's grid is the newer one and wins.
         crate::remote::closed_for_test(0, grid_with("old copy"), "dep-a");
         let newer = grid_with("new copy");
-        crate::remote::depart(0, newer.clone(), "dep-a".into());
+        crate::remote::depart(0, newer.clone(), "dep-a".into(), String::new());
         assert!(crate::remote::save_pane(0, "dep-a", path).unwrap());
         assert!(read_back(path).contains("new copy"));
         // Freed once saved, and the older closed copy went with the switch.
@@ -3771,14 +3878,14 @@ mod connection_tests {
         // Never more than DEPARTED_MAX grids: the oldest goes first.
         let grids: Vec<_> = (0..=crate::remote::DEPARTED_MAX).map(|n| grid_with(&format!("pane {n}"))).collect();
         for (n, grid) in grids.iter().enumerate() {
-            crate::remote::depart(0, grid.clone(), format!("dep-b{n}"));
+            crate::remote::depart(0, grid.clone(), format!("dep-b{n}"), String::new());
         }
         assert!(!crate::remote::departed_holds(&grids[0]));
         assert!(grids[1..].iter().all(crate::remote::departed_holds));
         assert!(!crate::remote::save_pane(0, "dep-b0", path).unwrap());
         // An empty pane id keeps nothing.
         let nameless = grid_with("nameless");
-        crate::remote::depart(0, nameless.clone(), String::new());
+        crate::remote::depart(0, nameless.clone(), String::new(), String::new());
         assert!(!crate::remote::departed_holds(&nameless));
         for n in 1..=crate::remote::DEPARTED_MAX {
             assert!(crate::remote::save_pane(0, &format!("dep-b{n}"), path).unwrap());
@@ -3805,8 +3912,8 @@ mod connection_tests {
             copy.screen_text()
         };
         // Session 901 (computer A) leaves its t1; then session 902 (B) leaves its t1.
-        crate::remote::depart(901, grid_with("host A data"), "t1".into());
-        crate::remote::depart(902, grid_with("host B data"), "t1".into());
+        crate::remote::depart(901, grid_with("host A data"), "t1".into(), String::new());
+        crate::remote::depart(902, grid_with("host B data"), "t1".into(), String::new());
         // A's queued save runs now: A's grid, not B's.
         assert!(crate::remote::save_pane(901, "t1", path).unwrap());
         assert!(text(path).contains("host A data"));
@@ -3815,9 +3922,9 @@ mod connection_tests {
         assert!(crate::remote::save_pane(902, "t1", path).unwrap());
         assert!(text(path).contains("host B data"));
         // Closes are kept per session too: B's close does not drop A's switch copy, nor the reverse.
-        crate::remote::depart(901, grid_with("A again"), "t1".into());
+        crate::remote::depart(901, grid_with("A again"), "t1".into(), String::new());
         crate::remote::closed_for_test(902, grid_with("B closed"), "t1");
-        crate::remote::depart(902, grid_with("B moved"), "t2".into());
+        crate::remote::depart(902, grid_with("B moved"), "t2".into(), String::new());
         assert!(crate::remote::save_pane(901, "t1", path).unwrap());
         assert!(text(path).contains("A again"));
         assert!(crate::remote::save_pane(902, "t1", path).unwrap());
@@ -3840,7 +3947,7 @@ mod connection_tests {
         let _ = std::fs::remove_file(&fifo);
         assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
         let grid = grid_with("painted");
-        crate::remote::depart(904, grid.clone(), "t1".into());
+        crate::remote::depart(904, grid.clone(), "t1".into(), String::new());
         let target = path.to_str().unwrap().to_owned();
         let saver = std::thread::spawn(move || crate::remote::save_pane(904, "t1", &target));
         // Wait until the save is blocked opening the FIFO, then the grid must be free.
@@ -4029,6 +4136,7 @@ mod claim_tests {
                     view: json!({"revision":0,"panes":[]}),
                     terminal: None,
                     render_id: 0,
+                    local: Default::default(),
                 }),
                 cancel: CancellationToken::new(),
                 commands,
@@ -4036,6 +4144,7 @@ mod claim_tests {
                 heard: crate::remote::Heard::default(),
                 visible: AtomicBool::new(visible),
                 uses,
+                seed: Mutex::new(None),
             });
             let worker = owner.clone();
             let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
@@ -4972,6 +5081,7 @@ mod focus_review_tests {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
                 render_id: 0,
+                local: Default::default(),
             }),
             cancel: CancellationToken::new(),
             commands,
@@ -4979,6 +5089,7 @@ mod focus_review_tests {
             heard: Heard::default(),
             visible: AtomicBool::new(true),
             uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
         })
     }
 
@@ -5094,5 +5205,288 @@ mod focus_review_tests {
         connection.sync_focus().unwrap();
         let frames = frames(&mut peer);
         assert_eq!(frames.last(), Some(&(2, WINDOW_FOCUS, vec![1])));
+    }
+}
+
+/// Item 77, ask 2: scrolling Claude is local and fast, also while the
+/// link comes and goes. Claude Code runs full screen, so these
+/// drive a full-screen grid the way the core's stream does.
+#[cfg(test)]
+mod cache_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::remote::{Local, State, UiPaint};
+    use herdr_remote_transport::CancellationToken;
+    use std::sync::atomic::AtomicBool;
+
+    const COLS: u16 = 40;
+    const ROWS: u16 = 13;
+    /// Claude's conversation rows above its prompt and status rows.
+    const TRANSCRIPT: usize = 10;
+
+    fn line(n: usize) -> String {
+        format!("● conversation line {n:03}")
+    }
+
+    /// Claude's full screen with the conversation ending at `newest`.
+    fn screen(newest: usize) -> Vec<String> {
+        let first = (newest + 1).saturating_sub(TRANSCRIPT);
+        let mut rows: Vec<String> = (first..=newest).map(line).collect();
+        while rows.len() < TRANSCRIPT {
+            rows.insert(0, String::new());
+        }
+        rows.extend(["────────────────".to_owned(), "❯ ".to_owned(), "  ? for shortcuts".to_owned()]);
+        rows
+    }
+
+    fn paint(newest: usize) -> Vec<u8> {
+        format!("\x1b[H\x1b[2J{}", screen(newest).join("\r\n")).into_bytes()
+    }
+
+    /// A pane on the alternate screen fed by `tx`; what it sends goes to the returned receiver.
+    fn full_screen() -> (Arc<gpui_rio::Session>, mpsc::SyncSender<Chunk>, mpsc::Receiver<Operation>) {
+        let (tx, rx) = mpsc::sync_channel(64);
+        let (commands, sent) = mpsc::sync_channel(256);
+        let slot = Arc::new(Mutex::new(Weak::new()));
+        let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
+        let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), COLS, ROWS).unwrap();
+        *lock(&slot) = Arc::downgrade(&session);
+        // Claude's full screen takes mouse wheel input.
+        tx.send(Chunk::Data(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h".to_vec())).unwrap();
+        (session, tx, sent)
+    }
+
+    fn shows(session: &gpui_rio::Session, newest: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen_text().contains(&line(newest)) {
+            assert!(Instant::now() < deadline, "line {newest} never reached the grid");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn owner(id: u64, boot: &str, terminal: Arc<gpui_rio::Session>, status: &str) -> Arc<Session> {
+        let (commands, _rx) = mpsc::sync_channel(4);
+        Arc::new(Session {
+            id,
+            state: Mutex::new(State {
+                view: json!({"state":"ready","pane_id":"t1","boot_id":boot,
+                    "panes":[{"id":"t1","status":status,"status_ms":5,"turn":3}]}),
+                terminal: Some(terminal),
+                render_id: next_render_id(),
+                local: Local::settled_for_test(),
+            }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
+            visible: AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
+        })
+    }
+
+    /// Streams Claude writing rows `from..=to`, a few at a time, letting the
+    /// phone look at each screen (its poll).
+    fn stream(owner: &Session, tx: &mpsc::SyncSender<Chunk>, from: usize, to: usize) {
+        let terminal = lock(&owner.state).terminal.clone().unwrap();
+        let mut newest = from;
+        loop {
+            tx.send(Chunk::Data(paint(newest))).unwrap();
+            shows(&terminal, newest);
+            owner.heard.printed(1);
+            crate::remote::keep_local(owner, &mut lock(&owner.state));
+            if newest == to {
+                break;
+            }
+            // One to three rows at a time.
+            newest = (newest + 1 + newest % 3).min(to);
+        }
+    }
+
+    /// Whether the pane sent the program anything (DATA, not stream credits).
+    fn sent_data(sent: &mpsc::Receiver<Operation>) -> bool {
+        std::thread::sleep(Duration::from_millis(100));
+        let mut any = false;
+        while let Ok(operation) = sent.try_recv() {
+            any |= matches!(operation, Operation::Frame(_, 0, _));
+        }
+        any
+    }
+
+    fn text_rows(session: &gpui_rio::Session) -> Vec<String> {
+        connection_tests::all_rows(session).into_iter().filter(|r| !r.is_empty()).collect()
+    }
+
+    fn whole(newest: usize) -> Vec<String> {
+        let mut rows: Vec<String> = (0..=newest).map(line).collect();
+        rows.extend(screen(newest)[TRANSCRIPT..].iter().map(|r| r.trim_end().to_owned()));
+        rows
+    }
+
+    fn paint_args(generation: i64) -> UiPaint<'static> {
+        UiPaint { generation, title: "", status: "", shortcuts: "" }
+    }
+
+    #[test]
+    fn ask2_scrolling_back_claude_never_waits_on_the_link() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7701, "boot-7701", terminal.clone(), "working");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        let _ = sent_data(&sent);
+        // The link is dead from here: nothing would ever answer a wheel.
+        let started = Instant::now();
+        crate::remote::scroll_local(7701, 12, paint_args(0)).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(600), "{:?}", started.elapsed());
+        assert!(!sent_data(&sent), "a drag back sent something to the program");
+        let (_, reader) = lock(&session.state).local.reader_for_test().expect("the phone's own copy is read back");
+        assert_eq!(reader.grid().lock().display_offset(), 12);
+        // Every row Claude wrote, in order, once: the phone's copy of its history and its screen.
+        assert_eq!(text_rows(&reader), whole(60));
+        // Back at the newest row, the live grid is drawn again.
+        crate::remote::scroll_local(7701, -12, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_none());
+        assert!(!sent_data(&sent));
+        crate::remote::close(7701);
+    }
+
+    #[test]
+    fn ask2_offline_the_cached_copy_scrolls_to_the_top_of_claudes_history() {
+        // The closed slot is shared with the departed-pane tests.
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7702, "boot-7702", terminal, "working");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 80);
+        // The link drops: the held frame is the phone's transcript, not one screen.
+        crate::remote::close(7702);
+        let (_, held) = crate::remote::held_for_test().unwrap();
+        let top = serde_json::from_str::<Value>(&crate::remote::scroll_held(1000, false)).unwrap()["local_offset"].as_u64().unwrap();
+        assert_eq!(top as usize, held.grid().lock().history_size());
+        assert!(top >= 70, "scrolled back {top} rows");
+        assert_eq!(text_rows(&held), whole(80));
+        // Saved and read back after a restart: the same rows, to the top.
+        let copy = crate::remote::copy_pane(7702, "t1").unwrap().unwrap();
+        crate::remote::release_held();
+        let id = crate::remote::open_saved(copy).unwrap();
+        let restored = crate::remote::renderer(id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while restored.is_alive() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(text_rows(&restored), whole(80));
+        crate::remote::release_held();
+    }
+
+    #[test]
+    fn ask2_a_reconnect_keeps_the_place_read_and_adds_no_row_twice() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let first = owner(7703, "boot-7703", terminal, "done");
+        crate::remote::register_for_test(first.clone());
+        stream(&first, &tx, 9, 50);
+        let copy = crate::remote::copy_pane(7703, "t1").unwrap().unwrap();
+        crate::remote::close(7703);
+        crate::remote::release_held();
+        // Offline: the saved copy is read 7 rows back.
+        let held_id = crate::remote::open_saved(copy).unwrap();
+        let held = crate::remote::renderer(held_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while held.is_alive() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = text_rows(&held);
+        assert_eq!(before, whole(50));
+        crate::remote::scroll_held(7, false);
+        // The link is back: a new session attaches the same pane and paints it.
+        let (live, tx2, _sent2) = full_screen();
+        let second = owner(7704, "boot-7703", live.clone(), "done");
+        lock(&second.state).local = Local::attached(second.heard.output_now());
+        tx2.send(Chunk::Data(paint(53))).unwrap();
+        shows(&live, 53);
+        second.heard.printed(100);
+        // Until its first paint has gone quiet, the copy read stays on screen.
+        assert!(!crate::remote::settle(&second, &mut lock(&second.state)));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(crate::remote::settle(&second, &mut lock(&second.state)));
+        let (reader_id, reader) = lock(&second.state).local.reader_for_test().expect("the place read stays");
+        assert_eq!(reader_id, held_id, "the same copy, never a blank or a jump");
+        assert_eq!(reader.grid().lock().display_offset(), 7);
+        assert_eq!(text_rows(&reader), before);
+        assert!(crate::remote::held_for_test().is_none());
+        // Live again from there: the rows written meanwhile join once.
+        crate::remote::keep_local(&second, &mut lock(&second.state));
+        let rows = crate::remote::transcript_rows("boot-7703", "t1").unwrap();
+        let rows: Vec<String> = rows.into_iter().map(|r| r.trim_end().to_owned()).filter(|r| !r.is_empty()).collect();
+        assert_eq!(rows, whole(53));
+    }
+
+    #[test]
+    fn ask2_the_core_is_asked_for_claudes_history_once_per_turn_never_while_it_works() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7705, "boot-7705", terminal, "working");
+        stream(&session, &tx, 9, 12);
+        assert!(lock(&session.seed).is_none(), "never while it works");
+        lock(&session.state).view["panes"][0]["status"] = json!("done");
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert_eq!(lock(&session.seed).take().as_deref(), Some("t1"));
+        // Refused or failed: not asked again until the pane's status moves on.
+        for _ in 0..3 {
+            session.heard.printed(1);
+            crate::remote::keep_local(&session, &mut lock(&session.state));
+        }
+        assert!(lock(&session.seed).is_none(), "asked again in a loop");
+        lock(&session.state).view["panes"][0]["turn"] = json!(4);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert_eq!(lock(&session.seed).take().as_deref(), Some("t1"));
+        // The core's stitched read fills what the phone never saw.
+        let mut text: Vec<String> = (0..=12).map(line).collect();
+        text.extend(screen(12)[TRANSCRIPT..].iter().cloned());
+        let reply = json!({"how":"stitched","complete":true,"text":text.join("\n")});
+        assert!(crate::remote::seeded("boot-7705", "t1", &reply));
+        let rows: Vec<String> = crate::remote::transcript_rows("boot-7705", "t1").unwrap().into_iter().filter(|r| !r.is_empty()).collect();
+        assert_eq!(rows, whole(12));
+        // Seeded: nothing more is owed.
+        lock(&session.state).view["panes"][0]["turn"] = json!(5);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert!(lock(&session.seed).is_none());
+        // A plain screen read (the core would not stitch) is never merged.
+        assert!(!crate::remote::seeded("boot-7705", "t1", &json!({"how":"screen","text":"x"})));
+    }
+
+    fn viewer(channel: u32, focused: bool, focused_ago: Option<u64>, active_ago: Option<u64>) -> Value {
+        json!({"identity":{"connection_id":channel as u64 * 10,"channel":channel},"origin":"local_desktop",
+               "observe":false,"focused":focused,"focused_ms_ago":focused_ago,"active_ms_ago":active_ago})
+    }
+
+    #[test]
+    fn ask2_the_freeze_guard_blocks_a_stitch_on_a_desktop_focused_pane() {
+        // This phone's own viewer (channel 4) is always busy and never counts.
+        let phone = viewer(4, false, None, Some(10));
+        let idle_desktop = viewer(2, false, Some(3_600_000), Some(3_600_000));
+        assert!(may_stitch(&json!({"viewers":[phone.clone()]}), 4));
+        assert!(may_stitch(&json!({"viewers":[phone.clone(), idle_desktop.clone()]}), 4));
+        // A desktop window focused on the pane: no stitch.
+        let focused = viewer(2, true, Some(3_600_000), Some(3_600_000));
+        assert!(!may_stitch(&json!({"viewers":[phone.clone(), focused]}), 4));
+        // Focused, typed into or resized within the last minute: no stitch.
+        assert!(!may_stitch(&json!({"viewers":[phone.clone(), viewer(2, false, Some(20_000), None)]}), 4));
+        assert!(!may_stitch(&json!({"viewers":[phone.clone(), viewer(2, false, None, Some(59_000))]}), 4));
+        // Only one viewer on this phone's channel is the phone's: another one there counts.
+        assert!(!may_stitch(&json!({"viewers":[phone.clone(), viewer(4, false, None, Some(5))]}), 4));
+        // Nothing readable: no stitch.
+        assert!(!may_stitch(&json!({}), 4));
+    }
+
+    #[test]
+    fn ask2_one_stitch_at_a_time_from_this_phone() {
+        let first = Stitching::take().expect("free");
+        assert!(Stitching::take().is_none());
+        drop(first);
+        assert!(Stitching::take().is_some());
     }
 }

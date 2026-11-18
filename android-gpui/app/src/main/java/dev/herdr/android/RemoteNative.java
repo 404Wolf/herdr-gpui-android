@@ -56,18 +56,22 @@ final class RemoteNative {
      */
     static native String scrollHeld(long deltaRows, boolean latest);
     /**
-     * Saves {@code paneId}'s grid to {@code path}: the live one when session
-     * {@code handle} (0: none) shows it, else the one kept when a switch left
-     * it, else the last closed session's. False when the phone holds none. Worker only.
+     * {@code paneId}'s copy (a file's bytes, unsealed): the live grid when
+     * session {@code handle} (0: none) shows it, else the one kept when a
+     * switch left it, else the last closed session's; a full-screen program's
+     * is the phone's transcript of it and its screen. Null when the phone
+     * holds none. The caller seals and writes it. Worker only.
      */
-    static native boolean savePane(long handle, String paneId, String path);
+    static native byte[] copyPane(long handle, String paneId);
     /**
      * Holds a stand-in for a pane with no saved copy: {@code title} and one dim
      * {@code note} line on a cols×rows grid; its render id for nativeAttachShell. Worker only.
      */
     static native long holdNote(String paneId, String title, String note, int cols, int rows);
-    /** Reads a saved pane into the held frame; its render id for nativeAttachShell. Worker only. */
-    static native long openSaved(String path);
+    /** Reads a saved pane (its unsealed bytes) into the held frame; its render id for nativeAttachShell. Worker only. */
+    static native long openSaved(byte[] copy);
+    /** Keeps a full-screen pane's transcript from its saved copy (unsealed bytes), drawing nothing. Worker only. */
+    static native void adoptSaved(byte[] copy);
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);
     static native void close(long handle);
