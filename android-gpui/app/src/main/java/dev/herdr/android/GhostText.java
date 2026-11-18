@@ -20,6 +20,13 @@ final class GhostText {
     static final int MIN_ROW_TEXT = 8;
     /** The renderer refuses more; the composer's own bound is far lower. */
     static final int MAX_CHARS = 16_000;
+    /**
+     * Drawn, dim, where the desktop cut a long dictation's audio without a verified seam: a word
+     * there may be split. Never part of the draft. The phone's terminal font draws it.
+     */
+    static final String CUT_MARK = "⁞";
+    /** The renderer takes at most 128 spans; a draft's marks stay well under that. */
+    static final int MAX_CUT_MARKS = 16;
 
     /** Colours as 0xRRGGBB, from the chrome. */
     static final class Colors {
@@ -166,6 +173,17 @@ final class GhostText {
     static String json(String kind, String draft, Marks marks, Map<String, Long> lengths,
             java.util.Set<String> parked, List<QueueView.Row> rows, boolean open, String selected, int cols,
             List<Control> controls, Colors colors) {
+        return json(kind, draft, marks, null, lengths, parked, rows, open, selected, cols, controls, colors);
+    }
+
+    /**
+     * @param cuts where the desktop cut a dictation's audio without a verified seam: offsets in
+     *     {@code draft}, in order; a dim {@link #CUT_MARK} is drawn before each (it is not in the
+     *     draft, and {@link #fieldOffsets} maps a tap on it to that offset)
+     */
+    static String json(String kind, String draft, Marks marks, int[] cuts, Map<String, Long> lengths,
+            java.util.Set<String> parked, List<QueueView.Row> rows, boolean open, String selected, int cols,
+            List<Control> controls, Colors colors) {
         try {
             JSONObject o = new JSONObject();
             o.put("kind", kind);
@@ -183,14 +201,27 @@ final class GhostText {
             }
             o.put("controls", drawn);
             String text = draft == null ? "" : draft;
+            int dropped = 0;
             if (text.length() > MAX_CHARS) {
-                marks = marks.shifted(text.length() - MAX_CHARS);
+                dropped = text.length() - MAX_CHARS;
+                marks = marks.shifted(dropped);
                 text = "…" + text.substring(text.length() - MAX_CHARS);
             }
+            List<Integer> cutAt = cutMarks(text, cuts, dropped);
             JSONArray spans = new JSONArray();
+            int at = 0, next = 0;
             for (String[] run : runs(text, marks)) {
+                int end = at + run[0].length();
+                // A mark goes before the character it stands before, and before a caret there.
+                for (; next < cutAt.size() && cutAt.get(next) < end + (run[0].isEmpty() ? 1 : 0); next++) {
+                    int cut = cutAt.get(next);
+                    if (cut > at) spans(spans, text.substring(at, cut), run[1], lengths, parked);
+                    spans.put(span(CUT_MARK, "dim"));
+                    at = Math.max(at, cut);
+                }
                 if (run[1].equals("caret")) spans.put(span("", "caret"));
-                else spans(spans, run[0], run[1], lengths, parked);
+                else if (end > at) spans(spans, text.substring(at, end), run[1], lengths, parked);
+                at = end;
             }
             o.put("draft", spans);
             JSONArray echoes = new JSONArray();
@@ -216,21 +247,34 @@ final class GhostText {
      * the end. A tap on a chip puts the cursor after it.
      */
     static int[] fieldOffsets(String draft, Map<String, Long> lengths, java.util.Set<String> parked) {
+        return fieldOffsets(draft, null, lengths, parked);
+    }
+
+    /** As {@link #fieldOffsets(String, Map, java.util.Set)}, with a cut's mark mapped to its offset. */
+    static int[] fieldOffsets(String draft, int[] cuts, Map<String, Long> lengths, java.util.Set<String> parked) {
         String text = draft == null ? "" : draft;
         int base = 0;
         java.util.ArrayList<Integer> out = new java.util.ArrayList<>();
+        java.util.Set<Integer> marked = new java.util.HashSet<>();
         if (text.length() > MAX_CHARS) {
             base = text.length() - MAX_CHARS;
             out.add(base);
+            for (int at : cutMarks("…" + text.substring(base), cuts, base)) marked.add(at - 1);
             text = text.substring(base);
+        } else {
+            marked.addAll(cutMarks(text, cuts, 0));
         }
         Matcher m = DictationToken.PATTERN.matcher(text);
         int at = 0;
         while (true) {
             boolean found = m.find();
             int plainEnd = found ? m.start() : text.length();
-            for (int i = at; i < plainEnd; i = text.offsetByCodePoints(i, 1)) out.add(base + i);
+            for (int i = at; i < plainEnd; i = text.offsetByCodePoints(i, 1)) {
+                if (marked.contains(i)) out.add(base + i);  // the cut's mark, drawn before it
+                out.add(base + i);
+            }
             if (!found) break;
+            if (marked.contains(m.start())) out.add(base + m.start());  // a mark just before a chip
             String label = "[" + DraftChips.label(lengths.get(m.group(1)), parked.contains(m.group(1))) + "]";
             for (int i = 0, n = label.codePointCount(0, label.length()); i < n; i++) out.add(base + m.end());
             at = m.end();
@@ -276,6 +320,29 @@ final class GhostText {
             for (int i = 0; i < pad; i++) gap.append(' ');
             out.put(span(gap + row.state, stateStyle));
         }
+        return out;
+    }
+
+    /**
+     * {@code cuts} (offsets in the typed draft) as offsets in the shown {@code text}, whose first
+     * {@code dropped} characters became one "…": only those inside it, never inside a dictation's
+     * chip, at most {@link #MAX_CUT_MARKS}, the latest kept, in order.
+     */
+    static List<Integer> cutMarks(String text, int[] cuts, int dropped) {
+        List<Integer> out = new java.util.ArrayList<>();
+        if (cuts == null) return out;
+        Matcher m = DictationToken.PATTERN.matcher(text);
+        List<int[]> chips = new java.util.ArrayList<>();
+        while (m.find()) chips.add(new int[] {m.start(), m.end()});
+        for (int cut : cuts) {
+            int at = dropped > 0 ? cut - dropped + 1 : cut;
+            if (at <= (dropped > 0 ? 1 : 0) || at >= text.length() || out.contains(at)) continue;
+            boolean inChip = false;
+            for (int[] chip : chips) inChip |= at > chip[0] && at < chip[1];
+            if (!inChip) out.add(at);
+        }
+        java.util.Collections.sort(out);
+        while (out.size() > MAX_CUT_MARKS) out.remove(0);
         return out;
     }
 

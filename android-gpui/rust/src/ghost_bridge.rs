@@ -3,7 +3,7 @@
 //!
 //! JSON: `{"kind":"claude"|"codex"|"other","reserve":N,"reserveFrom":ROW,
 //! "colors":{"text":RGB,"dim":RGB,"warn":RGB,"background":RGB},
-//! "draft":[{"t":"..","s":"text"|"partial"|"chip"|"selected"}, {"t":"","s":"caret"}],
+//! "draft":[{"t":"..","s":"text"|"partial"|"chip"|"selected"|"dim"}, {"t":"","s":"caret"}],
 //! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"|"chip"|"bright"|"info"|"danger"}]],
 //! "controls":[{"id":"talk","spans":[{"t":"talk","s":"dim"|"bright"|"danger"|"info"|"warn"}]}]}`.
 //! Colours also take "bright", "danger" and "info".
@@ -157,12 +157,14 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
     {
         return Err(Error::InvalidText);
     }
+    // "dim": the mark where a dictation was cut without a verified seam.
     let draft_styles = [
         GhostStyle::Text,
         GhostStyle::Partial,
         GhostStyle::Chip,
         GhostStyle::Selected,
         GhostStyle::Caret,
+        GhostStyle::Dim,
     ];
     // A queue row: its words, a selected row bright, its state in the state's colour.
     let echo_styles = [
@@ -339,6 +341,16 @@ mod tests {
             .is_err()
         );
         assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn a_draft_may_carry_the_dim_mark_of_an_unverified_cut() {
+        let json = format!(
+            r#"{{"kind":"claude",{COLORS},"draft":[{{"t":"make the stop bu","s":"text"}},{{"t":"⁞","s":"dim"}},{{"t":"tton bigger","s":"partial"}}]}}"#
+        );
+        let ghost = parse(&json).expect("a cut mark in the draft");
+        assert_eq!(ghost.draft[1].style, GhostStyle::Dim);
+        assert_eq!(ghost.draft[1].text, "⁞");
     }
 
     #[test]

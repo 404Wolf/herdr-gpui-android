@@ -331,6 +331,14 @@ public final class DictationFakes {
         /** The desktop's answer to stop, instead of its words. */
         String finalJson;
 
+        /** The desktop's "unverified_cuts" on its partial and final (a JSON list), or null. */
+        String cuts;
+
+        public Behaviour cuts(String list) {
+            cuts = list;
+            return this;
+        }
+
         public Behaviour finalJson(String json) {
             finalJson = json;
             return this;
@@ -435,7 +443,8 @@ public final class DictationFakes {
                                 s.close();
                                 return;
                             }
-                            send(out, "{\"type\":\"partial\",\"text\":\"words\"}");
+                            send(out, "{\"type\":\"partial\",\"text\":\"words\""
+                                    + (behaviour.cuts == null ? "" : ",\"unverified_cuts\":" + behaviour.cuts) + "}");
                         }
                     } else if (m.opcode == WebSocketFrames.TEXT) {
                         texts.add(m.text());
@@ -450,7 +459,8 @@ public final class DictationFakes {
                         }
                         try {
                             send(out, behaviour.finalJson != null ? behaviour.finalJson
-                                    : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\"}");
+                                    : "{\"type\":\"final\",\"text\":\"" + DESKTOP_WORDS + "\""
+                                    + (behaviour.cuts == null ? "" : ",\"unverified_cuts\":" + behaviour.cuts) + "}");
                         } finally {
                             s.close();
                             finalDone.countDown();

@@ -757,10 +757,11 @@ public final class ServerDictationEngine implements DictationEngine {
                             });
                         }
                     } else if (type.equals("partial")) {
+                        int[] cuts = UnverifiedCuts.of(e, text);
                         post(() -> {
                             if (offline) return;
                             shownPartial = !text.isEmpty();
-                            listener.onPartial(text);
+                            listener.onPartial(text, cuts);
                         });
                     } else if (type.equals("final")) {
                         String code = e.optString("code", "");
@@ -769,15 +770,17 @@ public final class ServerDictationEngine implements DictationEngine {
                             post(() -> nothing(nothing, code));
                             return;
                         }
+                        int[] cuts = UnverifiedCuts.of(e, text);
                         post(() -> {
                             if (offline) return;
+                            if (cuts.length > 0) log.accept("dictation: " + cuts.length + " unverified cut(s) in the final");
                             log.accept("dictation: desktop final " + (System.nanoTime() - stoppedAt) / 1_000_000
                                     + " ms after stop");
                             end();
                             // The text is stored first (the composer saves its draft at once);
                             // only then is the recording deleted: a crash in between keeps the
                             // audio, recovered at the next start.
-                            listener.onFinal(text, false);
+                            listener.onFinal(text, false, cuts);
                             keepAfterFinal = !listener.finalStored();
                             if (micDone) settleRecording();
                             listener.onState(State.IDLE);

@@ -94,6 +94,27 @@ public final class ServerDictationEngineTest {
         assertArrayEquals(run.mic.bytes(), server.audio());
     }
 
+    @Test public void theDesktopsUnverifiedCutsReachTheComposerAsOffsetsInItsText() throws Exception {
+        // server.py: "unverified_cuts" on a partial or final, code point offsets in its text.
+        server = new FakeServer(Behaviour.fast(READY_GPU).cuts("[8, 0, 99, 8, 2.5]"));
+        Run run = dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 0), 300);
+        run.awaitEnd();
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        // "words fr|om the desktop": the ends, past the text, repeats and fractions are dropped.
+        assertArrayEquals(new int[] {8}, run.listener.finalCuts);
+        assertFalse(run.listener.partialCuts.isEmpty());
+        // The partial "words" is 5 long: a cut at 8 is past it.
+        assertArrayEquals(new int[0], run.listener.partialCuts.get(0));
+    }
+
+    @Test public void withoutTheFieldThereAreNoCuts() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        Run run = dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 0), 300);
+        run.awaitEnd();
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertArrayEquals(new int[0], run.listener.finalCuts);
+    }
+
     @Test public void anOldServerWithoutABackendFieldCountsAsTheGpu() throws Exception {
         server = new FakeServer(Behaviour.fast(READY_OLD));
         Run run = dictate(server.uri(), new FakeRecognizer(PHONE_WORDS, 0), 300);
@@ -704,6 +725,20 @@ public final class ServerDictationEngineTest {
 
         @Override public void onPartial(String text) {
             partials.add(text);
+        }
+
+        /** The unverified cuts that came with each partial, and with the final. */
+        final List<int[]> partialCuts = Collections.synchronizedList(new ArrayList<>());
+        volatile int[] finalCuts = new int[0];
+
+        @Override public void onPartial(String text, int[] cuts) {
+            partialCuts.add(cuts);
+            onPartial(text);
+        }
+
+        @Override public void onFinal(String text, boolean onDevice, int[] cuts) {
+            finalCuts = cuts;
+            onFinal(text, onDevice);
         }
 
         volatile int finishing;

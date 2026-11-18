@@ -3,6 +3,7 @@ package dev.herdr.android;
 import dev.herdr.android.dictation.DictationEngine;
 import dev.herdr.android.dictation.DictationException;
 import dev.herdr.android.dictation.PendingClip;
+import dev.herdr.android.dictation.UnverifiedCuts;
 
 /**
  * Where a dictation session's text goes, and the Enter that waits on it. Pure (no views), so
@@ -28,6 +29,11 @@ final class DictationRouting {
 
         /** {@code text} joins the end of {@code pane}'s draft (not the one on screen). */
         void appendDictation(String pane, String text);
+
+        /** As {@link #appendDictation(String, String)}, with the desktop's unverified cuts in {@code text}. */
+        default void appendDictation(String pane, String text, int[] unverifiedCuts) {
+            appendDictation(pane, text);
+        }
 
         void clipLength(String clipId, long durationMs);
 
@@ -140,12 +146,16 @@ final class DictationRouting {
             }
 
             @Override public void onPartial(String text) {
+                onPartial(text, UnverifiedCuts.NONE);
+            }
+
+            @Override public void onPartial(String text, int[] cuts) {
                 if (gone()) return;
-                if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPartial(text));
+                if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPartial(text, cuts));
             }
 
             @Override public void onFinal(String text) {
-                onFinal(text, false);
+                onFinal(text, false, UnverifiedCuts.NONE);
             }
 
             /** Whether the last final's text reached the disk. */
@@ -156,16 +166,20 @@ final class DictationRouting {
             }
 
             @Override public void onFinal(String text, boolean onDevice) {
+                onFinal(text, onDevice, UnverifiedCuts.NONE);
+            }
+
+            @Override public void onFinal(String text, boolean onDevice, int[] cuts) {
                 if (gone()) return;
                 if (onDevice) {
                     bar.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
                 }
                 if (pane.equals(drafts.pane())) {
                     if (onDevice) bar.transcribedOnPhone();
-                    bar.showText(drafts.dictationFinal(text));
+                    bar.showText(drafts.dictationFinal(text, cuts));
                 } else if (!text.isEmpty()) {
                     // Switched away while it finished: it joins the end of its own pane's draft.
-                    bar.appendDictation(pane, text);
+                    bar.appendDictation(pane, text, cuts);
                 }
                 // Saved before the engine deletes the recording; not saved, it keeps it.
                 stored = bar.persistNow();
