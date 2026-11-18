@@ -70,6 +70,9 @@ struct Connection<'a> {
     owner: &'a Arc<Session>,
     serial: u64,
     channel: u32,
+    /// The phone's own width, as last measured and sent: a stitched read is
+    /// taken only once the core's pane and the phone's grid are this wide.
+    width: u16,
     output: Option<mpsc::SyncSender<Chunk>>,
     events: u32,
     event_carry: Vec<u8>,
@@ -163,10 +166,13 @@ impl Drop for Stitching {
     }
 }
 
-/// Whether the core's pane (`terminal.get`'s reply) is `cols` wide, the
-/// phone's grid: a stitched read is only taken at the width the phone shows.
-pub(crate) fn at_width(facts: &Value, cols: usize) -> bool {
-    facts["cols"].as_u64() == Some(cols as u64)
+/// Whether the core's pane (`terminal.get`'s reply) and the phone's grid
+/// (`grid` columns) are both the phone's own measured `width`: a stitched read
+/// is only taken at the width the phone shows. Right after an attach the grid
+/// is the program's old width until the phone's RESIZE lands, and then both
+/// agree with each other but not with the phone.
+pub(crate) fn at_width(facts: &Value, grid: usize, width: u16) -> bool {
+    grid == usize::from(width) && facts["cols"].as_u64() == Some(u64::from(width))
 }
 
 /// Whether a stitched read may freeze this pane for its other viewers
@@ -250,6 +256,7 @@ impl Connection<'_> {
         bytes.extend(rows.to_le_bytes());
         write_frame(&mut self.socket, self.channel, RESIZE, &bytes)?;
         self.claim.measured = true;
+        self.width = cols;
         Ok(())
     }
     /// Wolf left the pane (hidden, switched away, closed): WINDOW_FOCUS 0,
@@ -1090,7 +1097,7 @@ impl Connection<'_> {
             Err(Error::Rpc { .. }) => return Ok(()),
             Err(error) => return Err(error),
         };
-        if !at_width(&facts, cols) {
+        if !at_width(&facts, cols, self.width) {
             crate::remote::seed_later(&boot, pane);
             return Ok(());
         }
@@ -1971,6 +1978,7 @@ pub(crate) fn run(
         owner,
         serial: 0,
         channel: 0,
+        width: cols,
         output: None,
         events: 0,
         event_carry: Vec::new(),
@@ -2059,6 +2067,7 @@ fn serve(
                             continue;
                         }
                         connection.claim.measured = true;
+                        connection.width = cols;
                     }
                     write_frame(&mut connection.socket, channel, kind, &bytes)?
                 }
@@ -5126,6 +5135,7 @@ mod focus_review_tests {
             owner,
             serial: 1,
             channel: 2,
+            width: 90,
             output: None,
             events: 1,
             event_carry: Vec::new(),
@@ -5484,9 +5494,12 @@ mod cache_tests {
     fn ask2_claudes_history_is_read_only_at_the_width_the_phone_shows() {
         // The core still has the pane at its old width (the attach's resize
         // is on its way): no read, which would be rows of another width.
-        assert!(at_width(&json!({"cols":62,"rows":55}), 62));
-        assert!(!at_width(&json!({"cols":200,"rows":120}), 62));
-        assert!(!at_width(&json!({}), 62));
+        assert!(at_width(&json!({"cols":62,"rows":55}), 62, 62));
+        assert!(!at_width(&json!({"cols":200,"rows":120}), 62, 62));
+        assert!(!at_width(&json!({}), 62, 62));
+        // Just attached: the grid is the program's old width, as is the core's
+        // pane, until the phone's own (62) lands.
+        assert!(!at_width(&json!({"cols":200,"rows":120}), 200, 62));
         let (terminal, tx, _sent) = full_screen();
         let session = owner(7706, "boot-7706", terminal, "done");
         stream(&session, &tx, 9, 12);
