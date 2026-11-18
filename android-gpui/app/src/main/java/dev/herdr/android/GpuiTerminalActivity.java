@@ -65,6 +65,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static final long SCREEN_POLL_MS = 1000;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Object stateLock = new Object();
+    /** The host and pane the frame on screen was drawn for (under stateLock). */
+    private final LinkFrame linkFrame = new LinkFrame();
     private final Set<Integer> capturedKeys = new HashSet<>();
     /** Scroll requests ride their own thread so a poll parse never delays them. */
     private final java.util.concurrent.ExecutorService actionWorker =
@@ -2042,11 +2044,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
             // A saved pane on screen stays, like a resumed frame, until this one paints.
             if (next.resumed || host.id.equals(savedShownHost)) {
-                // The same pane's frame keeps its links tappable; another pane's opens nothing.
-                if (next.resumed && pane != null && pane.equals(previous.paneId)) nativeHoldSamePane(next.generation);
-                else nativeHold(next.generation);
+                nativeHold(next.generation);
                 if (imeSession > 0) nativeSetImeSession(next.generation, imeSession);
-            } else nativeSetActive(next.generation, false);
+            } else {
+                nativeSetActive(next.generation, false);
+                linkFrame.cleared();
+            }
             publish(next, "Connecting to " + host.name + "…");
             next.poll = worker.scheduleWithFixedDelay(() -> pump(next), 0, COMMAND_POLL_MS, TimeUnit.MILLISECONDS);
         }
@@ -5552,7 +5555,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         runOnUiThread(() -> {
             synchronized (stateLock) {
                 if (destroyed || isFinishing() || connection == null
-                        || connection.generation != expectedGeneration) return;
+                        || connection.generation != expectedGeneration
+                        || !linkFrame.opens(connection.hostId, connection.paneId, connection.ready)) return;
             }
             if (url == null || url.length() > 2048) return;
             String lower = url.toLowerCase(java.util.Locale.ROOT);
@@ -5574,7 +5578,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         runOnUiThread(() -> {
             synchronized (stateLock) {
                 if (destroyed || isFinishing() || connection == null
-                        || connection.generation != expectedGeneration) return;
+                        || connection.generation != expectedGeneration
+                        || !linkFrame.opens(connection.hostId, connection.paneId, connection.ready)) return;
             }
             if (text == null || text.isEmpty() || text.length() > 4096) return;
             ActionSheet.copy(this, "Link", text);
@@ -6150,6 +6155,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 current.remotePhase = phase;
                 current.remoteRevision = state.optLong("token", state.optLong("revision", 0));
                 current.ready = selected;
+                // The live renderer now draws the core's pane: links on it open when held later.
+                if (selected) linkFrame.attached(current.hostId, pane);
                 if (selected && !current.announced) {
                     current.announced = true;
                     main.post(() -> { if (current(current)) showLinkUp(); });
@@ -6343,6 +6350,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
             nativeHold(generation);
             nativeAttachShell(generation, renderId);
+            linkFrame.attached(host, pane);
             savedShownHost = host;
             savedShownAt = savedAt;
         }
@@ -6641,6 +6649,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 handle = 0;
                 next.ready = true;
                 nativeAttachShell(next.generation, next.shellHandle);
+                linkFrame.attached(next.hostId, next.paneId);
                 nativeSetActive(next.generation, true);
                 publish(next, "Shell");
             }
@@ -6836,7 +6845,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native String nativeCopyText(long generation);
     private static native void nativeSetActive(long generation, boolean active);
     private static native void nativeHold(long generation);
-    private static native void nativeHoldSamePane(long generation);
     private static native void nativeSetFollow(long generation, boolean follow);
     private static native void nativeShowKeyboard(long generation);
     private static native String nativeTakeCommand(long generation);

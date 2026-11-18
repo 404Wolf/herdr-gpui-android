@@ -1173,11 +1173,6 @@ pub struct Mailbox {
     shell: u64,
     /// The last frame is held, dimmed, while the connection is re-established.
     held: bool,
-    /// The generation whose host and pane `shell` was drawn for: set when a
-    /// shell is attached, or carried to a new generation that goes on with
-    /// the same pane (`hold_same_pane`). A held frame opens its links only
-    /// for that generation, never for another host or pane shown over it.
-    frame_owner: i64,
 }
 
 /// Horizontal pan requested by a wheel or drag delta, if the gesture is
@@ -1211,19 +1206,17 @@ pub struct ViewState {
     pub shell: u64,
     /// A reconnect is holding the last frame on screen; input is closed.
     pub held: bool,
-    /// The held frame was drawn for this generation's host and pane.
-    pub held_frame_links: bool,
 }
 
 impl ViewState {
     /// Whether a link drawn on the frame shown for `generation` may be opened
-    /// in the browser or copied: live, or held for this generation's own host
-    /// and pane (a reconnect to the same pane, which follows every return to
-    /// the app, and an offline or cached pane keep the last frame on screen).
-    /// Neither needs the core, only the frame Wolf sees. Another host's or
-    /// pane's frame left on screen during a switch opens nothing.
+    /// in the browser or copied: live, or held (a reconnect, which follows
+    /// every return to the app, and an offline or cached pane keep the last
+    /// frame on screen). Neither needs the core, only the frame Wolf sees.
+    /// Java opens a held frame's link only when that frame was drawn for the
+    /// host and pane now selected (`LinkFrame`).
     pub fn opens_links(&self, generation: i64) -> bool {
-        generation > 0 && generation == self.generation && (self.active || self.held_frame_links)
+        generation > 0 && generation == self.generation && (self.active || self.held)
     }
 }
 
@@ -1245,7 +1238,6 @@ impl Default for Mailbox {
             follow: true,
             shell: 0,
             held: false,
-            frame_owner: 0,
         }
     }
 }
@@ -1304,16 +1296,6 @@ impl Mailbox {
         true
     }
 
-    /// `hold` for a new generation that goes on with the pane already on
-    /// screen (a reconnect to the same host and pane): its links still open.
-    pub fn hold_same_pane(&mut self, generation: i64) -> bool {
-        let held = self.hold(generation);
-        if self.generation == generation && self.shell != 0 {
-            self.frame_owner = generation;
-        }
-        held
-    }
-
     pub fn set_display_preferences(&mut self, font_size: f32, compact: bool) -> Result<bool> {
         let scale = self.display_preferences.scale;
         self.set_display_preferences_scaled(font_size, compact, scale)
@@ -1360,12 +1342,7 @@ impl Mailbox {
 
     /// Draws `shell` (0 for none) for the current generation only.
     pub fn set_shell(&mut self, generation: i64, shell: u64) -> bool {
-        if generation <= 0 || generation != self.generation {
-            return false;
-        }
-        // Attached for this generation's host and pane, even when unchanged.
-        self.frame_owner = generation;
-        if shell == self.shell {
+        if generation <= 0 || generation != self.generation || shell == self.shell {
             return false;
         }
         self.shell = shell;
@@ -1513,7 +1490,6 @@ impl Mailbox {
             follow: self.follow,
             shell: self.shell,
             held: self.held,
-            held_frame_links: self.held && self.shell != 0 && self.frame_owner == self.generation,
         }
     }
 
@@ -1973,7 +1949,8 @@ mod tests {
         // On the emulator, a link tapped on the frame held while the app
         // reconnected (after every return from the browser) or on an offline
         // pane ("cached 10:42 · offline") was found, then dropped: opening
-        // asked for a live session.
+        // asked for a live session. Which host and pane a held frame shows
+        // is Java's to check (LinkFrame); here, only the generation.
         let mut box_ = Mailbox::default();
         assert!(!box_.state().opens_links(0), "nothing shown");
         box_.set_active(10, true);
@@ -1981,33 +1958,11 @@ mod tests {
         assert!(box_.state().opens_links(10));
         assert!(box_.hold(10));
         assert!(box_.state().opens_links(10), "reconnecting");
-        assert!(box_.hold_same_pane(11));
-        assert!(box_.state().opens_links(11), "the same pane, reconnected");
-        assert!(!box_.state().opens_links(10), "a replaced frame");
-        // An offline or cached pane drawn for its generation.
-        assert!(box_.hold(12));
-        assert!(box_.set_shell(12, 8));
-        assert!(box_.state().opens_links(12), "a saved pane");
-        box_.set_active(13, false);
-        assert!(!box_.state().opens_links(13), "a pane put away");
-    }
-
-    #[test]
-    fn wolf_ask_links_another_hosts_held_frame_opens_nothing() {
-        // Review of #39 (P2): an offline switch to host B holds B's
-        // generation over host A's last frame until B's saved pane (if any)
-        // replaces it. A's links must not open under B's generation.
-        let mut box_ = Mailbox::default();
-        box_.set_active(10, true);
-        box_.set_shell(10, 9001);
-        box_.set_active(10, false);
         assert!(box_.hold(11));
-        let state = box_.state();
-        assert_eq!((state.generation, state.shell), (11, 9001), "A's frame");
-        assert!(!state.opens_links(11), "A's links under B's generation");
-        // B's saved pane replaces it: its own links open.
-        assert!(box_.set_shell(11, 9002));
-        assert!(box_.state().opens_links(11));
+        assert!(box_.state().opens_links(11), "the next session's frame");
+        assert!(!box_.state().opens_links(10), "a replaced frame");
+        box_.set_active(12, false);
+        assert!(!box_.state().opens_links(12), "a pane put away");
     }
 
     #[test]

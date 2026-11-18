@@ -428,14 +428,23 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
         {
             continue;
         }
-        // The `[` that opens the text, on this logical line.
+        // The `[` that opens the text, on this logical line: brackets inside
+        // the text are balanced (`[outer [inner] label]`, `[[docs]]`).
         let floor = close.saturating_sub(MAX_TEXT);
-        let Some(open) = (floor..close).rev().find(|&i| text[i] == '[') else {
-            continue;
-        };
-        if text[open + 1..close].contains(&']') {
-            continue;
+        let mut depth = 0usize;
+        let mut open = None;
+        for i in (floor..close).rev() {
+            match text[i] {
+                ']' => depth += 1,
+                '[' if depth == 0 => {
+                    open = Some(i);
+                    break;
+                }
+                '[' => depth -= 1,
+                _ => {}
+            }
         }
+        let Some(open) = open else { continue };
         // The `)` that closes the URL, brackets inside it balanced.
         let mut depth = 0usize;
         let mut end = None;
@@ -1074,6 +1083,43 @@ mod wolf_ask_links {
             );
         }
         assert_eq!(link_at(&rows, 1, 24), None);
+    }
+
+    #[test]
+    fn wolf_ask_links_a_markdown_label_with_its_own_brackets_opens_from_all_of_it() {
+        // Review of #39 (round 2): the nearest `[` is not the label's opener.
+        let url = Some(Link::Web("https://x.dev/y".into()));
+        let one = [Row::new(
+            "see [outer [inner] label](https://x.dev/y) and [[docs]](https://x.dev/y) end",
+            false,
+        )];
+        for col in [4, 5, 11, 17, 20, 24, 30, 41, 47, 48, 49, 52, 54, 55, 60, 71] {
+            assert_eq!(link_at(&one, 0, col).map(|f| f.link), url, "column {col}");
+        }
+        assert_eq!(link_at(&one, 0, 1), None);
+        assert_eq!(link_at(&one, 0, 44), None, "the prose between them");
+        assert_eq!(link_at(&one, 0, 74), None);
+        // Split at `](`, both ways.
+        let label = format!("{}see [outer [inner] label]", " ".repeat(23));
+        let rows = [row48(&label), row48("  (https://x.dev/y) next")];
+        for (row, col) in [(0, 27), (0, 34), (0, 41), (0, 47), (1, 2), (1, 18)] {
+            assert_eq!(
+                link_at(&rows, row, col).map(|f| f.link),
+                url,
+                "row {row} column {col}"
+            );
+        }
+        assert_eq!(link_at(&rows, 1, 21), None);
+        let label = format!("{}see [[docs]](", " ".repeat(35));
+        let rows = [row48(&label), row48("  https://x.dev/y) next")];
+        for (row, col) in [(0, 39), (0, 40), (0, 44), (0, 47), (1, 2), (1, 17)] {
+            assert_eq!(
+                link_at(&rows, row, col).map(|f| f.link),
+                url,
+                "row {row} column {col}"
+            );
+        }
+        assert_eq!(link_at(&rows, 1, 20), None);
     }
 
     #[test]
