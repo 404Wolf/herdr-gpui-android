@@ -1,39 +1,25 @@
 package dev.herdr.android;
 
-import java.util.Objects;
-
 /**
- * Which host and pane the terminal frame on screen was drawn for, so a link tapped on a held
- * frame (a reconnect, an offline or cached pane, the app coming back) opens only while that frame
- * is the selected pane's. It is recorded wherever a frame is attached: a live session painting its
- * pane, a raw shell, a saved pane drawn. Selecting another host or pane makes it mismatch until
- * that pane's frame is attached; coming back to the same pane matches at once; a frame left over
- * from before a switch never matches. A live session's links open as before. Pure; the activity
- * keeps one under its state lock.
+ * Whether a link tapped in the terminal may open (or be copied) now. Every link carries the host
+ * and pane of the frame it was found on: the renderer records them natively when it is installed
+ * (a live session's poll, a raw shell, a saved pane), and the link takes them at the press. Java
+ * acts on it only while that is the selected host and pane, however long the link took to arrive:
+ * a link from a frame left on screen during a switch, or one queued before the new pane's frame
+ * was drawn, opens nothing; the same pane's frame (back from the browser, a reconnect) opens at
+ * once. Pure.
  */
 final class LinkFrame {
-    private String host;
-    private String pane;
+    private LinkFrame() { }
 
-    /** A frame drawn for {@code host}'s {@code pane} is on screen now. */
-    void attached(String host, String pane) {
-        this.host = host;
-        this.pane = pane == null ? "" : pane;
+    /** A host or pane id as the native side records it: null is "". */
+    static String part(String id) {
+        return id == null ? "" : id;
     }
 
-    /** No frame is on screen (a fresh session blanked it). */
-    void cleared() {
-        host = null;
-        pane = null;
-    }
-
-    /**
-     * Whether a link on the frame shown may open for the selected {@code host} and {@code pane}:
-     * always on a live session, otherwise only on a frame drawn for that very host and pane.
-     */
-    boolean opens(String host, String pane, boolean live) {
-        if (live) return true;
-        return this.host != null && this.host.equals(host)
-                && Objects.equals(this.pane, pane == null ? "" : pane);
+    /** Whether a link found on {@code foundOn*} may act while {@code selected*} is selected. */
+    static boolean selected(String foundOnHost, String foundOnPane, String selectedHost, String selectedPane) {
+        return foundOnHost != null && foundOnPane != null
+                && foundOnHost.equals(part(selectedHost)) && foundOnPane.equals(part(selectedPane));
     }
 }

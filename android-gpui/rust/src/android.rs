@@ -344,7 +344,7 @@ pub(crate) fn request_keyboard(generation: i64) -> bool {
 
 /// Opens a browser for a terminal link. Only http(s) targets within bounds are
 /// forwarded; Java rechecks the scheme before starting an intent.
-pub(crate) fn open_link(generation: i64, url: &str) -> bool {
+pub(crate) fn open_link(generation: i64, url: &str, found_on: &model::FrameTarget) -> bool {
     if !model::mailbox().state().opens_links(generation) {
         return false;
     }
@@ -357,10 +357,13 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
     gpui_mobile::android::jni::with_env(|env| {
         let activity = gpui_mobile::android::jni::activity(env)?;
         let name = jni_mobile::strings::JNIString::from("gpuiOpenLink");
-        let signature =
-            jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;)V")
-                .map_err(|e| e.to_string())?;
+        let signature = jni_mobile::signature::RuntimeMethodSignature::from_str(
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        )
+        .map_err(|e| e.to_string())?;
         let value = env.new_string(url).map_err(|e| e.to_string())?;
+        let host = env.new_string(&*found_on.host).map_err(|e| e.to_string())?;
+        let pane = env.new_string(&*found_on.pane).map_err(|e| e.to_string())?;
         env.call_method(
             &activity,
             name,
@@ -368,6 +371,8 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
             &[
                 jni_mobile::objects::JValue::Long(generation),
                 jni_mobile::objects::JValue::Object(&value),
+                jni_mobile::objects::JValue::Object(&host),
+                jni_mobile::objects::JValue::Object(&pane),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -378,7 +383,7 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
 
 /// Copies a held link's target (a URL, or a file's path) to the clipboard;
 /// Java says so in place, never in a popup.
-pub(crate) fn copy_link(generation: i64, text: &str) -> bool {
+pub(crate) fn copy_link(generation: i64, text: &str, found_on: &model::FrameTarget) -> bool {
     if !model::mailbox().state().opens_links(generation) {
         return false;
     }
@@ -388,10 +393,13 @@ pub(crate) fn copy_link(generation: i64, text: &str) -> bool {
     gpui_mobile::android::jni::with_env(|env| {
         let activity = gpui_mobile::android::jni::activity(env)?;
         let name = jni_mobile::strings::JNIString::from("gpuiCopyLink");
-        let signature =
-            jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;)V")
-                .map_err(|e| e.to_string())?;
+        let signature = jni_mobile::signature::RuntimeMethodSignature::from_str(
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        )
+        .map_err(|e| e.to_string())?;
         let value = env.new_string(text).map_err(|e| e.to_string())?;
+        let host = env.new_string(&*found_on.host).map_err(|e| e.to_string())?;
+        let pane = env.new_string(&*found_on.pane).map_err(|e| e.to_string())?;
         env.call_method(
             &activity,
             name,
@@ -399,6 +407,8 @@ pub(crate) fn copy_link(generation: i64, text: &str) -> bool {
             &[
                 jni_mobile::objects::JValue::Long(generation),
                 jni_mobile::objects::JValue::Object(&value),
+                jni_mobile::objects::JValue::Object(&host),
+                jni_mobile::objects::JValue::Object(&pane),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -596,16 +606,26 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetFoll
     model::mailbox().set_follow(generation, follow != 0);
 }
 
-/// Draws the raw shell `handle` (0 for Herdr's pane) for this generation.
+/// Draws the raw shell or saved pane `handle` (0 for Herdr's pane) for this
+/// generation, recorded as attached for `host`'s `pane`.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeAttachShell(
-    _env: JNIEnv<'_>,
+    mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     generation: jlong,
     handle: jlong,
+    host: JString<'_>,
+    pane: JString<'_>,
 ) -> jboolean {
-    u8::from(handle >= 0 && model::mailbox().set_shell(generation, handle as u64))
+    let (Ok(Some(host)), Ok(Some(pane))) = (
+        bounded_string(&mut env, &host, 4096),
+        bounded_string(&mut env, &pane, 4096),
+    ) else {
+        return 0;
+    };
+    let target = model::FrameTarget::new(&host, &pane);
+    u8::from(handle >= 0 && model::mailbox().set_shell(generation, handle as u64, Some(target)))
 }
 
 #[allow(unsafe_code)]

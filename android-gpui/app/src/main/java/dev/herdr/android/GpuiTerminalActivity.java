@@ -65,8 +65,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static final long SCREEN_POLL_MS = 1000;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Object stateLock = new Object();
-    /** The host and pane the frame on screen was drawn for (under stateLock). */
-    private final LinkFrame linkFrame = new LinkFrame();
     private final Set<Integer> capturedKeys = new HashSet<>();
     /** Scroll requests ride their own thread so a poll parse never delays them. */
     private final java.util.concurrent.ExecutorService actionWorker =
@@ -2046,10 +2044,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (next.resumed || host.id.equals(savedShownHost)) {
                 nativeHold(next.generation);
                 if (imeSession > 0) nativeSetImeSession(next.generation, imeSession);
-            } else {
-                nativeSetActive(next.generation, false);
-                linkFrame.cleared();
-            }
+            } else nativeSetActive(next.generation, false);
             publish(next, "Connecting to " + host.name + "…");
             next.poll = worker.scheduleWithFixedDelay(() -> pump(next), 0, COMMAND_POLL_MS, TimeUnit.MILLISECONDS);
         }
@@ -5551,12 +5546,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** Opens a terminal link through the platform browser; never a file or custom scheme. */
-    public void gpuiOpenLink(long expectedGeneration, String url) {
+    public void gpuiOpenLink(long expectedGeneration, String url, String foundOnHost, String foundOnPane) {
         runOnUiThread(() -> {
             synchronized (stateLock) {
                 if (destroyed || isFinishing() || connection == null
                         || connection.generation != expectedGeneration
-                        || !linkFrame.opens(connection.hostId, connection.paneId, connection.ready)) return;
+                        || !LinkFrame.selected(foundOnHost, foundOnPane, connection.hostId, connection.paneId)) return;
             }
             if (url == null || url.length() > 2048) return;
             String lower = url.toLowerCase(java.util.Locale.ROOT);
@@ -5574,12 +5569,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * A finger held on a terminal link: its URL (or a file link's path) goes to the clipboard,
      * said in place in the crumb, never in a popup.
      */
-    public void gpuiCopyLink(long expectedGeneration, String text) {
+    public void gpuiCopyLink(long expectedGeneration, String text, String foundOnHost, String foundOnPane) {
         runOnUiThread(() -> {
             synchronized (stateLock) {
                 if (destroyed || isFinishing() || connection == null
                         || connection.generation != expectedGeneration
-                        || !linkFrame.opens(connection.hostId, connection.paneId, connection.ready)) return;
+                        || !LinkFrame.selected(foundOnHost, foundOnPane, connection.hostId, connection.paneId)) return;
             }
             if (text == null || text.isEmpty() || text.length() > 4096) return;
             ActionSheet.copy(this, "Link", text);
@@ -6073,7 +6068,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (!current(current)) return;
                 String rawState = RemoteNative.pollTerminal(current.remoteHandle, current.remoteRevision,
                         current.workspaces == null ? 0 : current.chromeRevision,
-                        current.generation, current.hostName, shortcutJson);
+                        current.generation, LinkFrame.part(current.hostId), shortcutJson);
                 if (rawState == null || rawState.length() > 1024 * 1024) throw new IOException("Oversized remote state");
                 JSONObject state = new JSONObject(rawState);
                 // herdr-core answers a refresh every two seconds; silence well
@@ -6111,7 +6106,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                     // The tree did not move but the connection did: fetch the full view once.
                     rawState = RemoteNative.pollTerminal(current.remoteHandle, 0, 0, current.generation,
-                            current.hostName, shortcutJson);
+                            LinkFrame.part(current.hostId), shortcutJson);
                     if (rawState == null || rawState.length() > 1024 * 1024)
                         throw new IOException("Oversized remote state");
                     state = new JSONObject(rawState);
@@ -6155,8 +6150,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 current.remotePhase = phase;
                 current.remoteRevision = state.optLong("token", state.optLong("revision", 0));
                 current.ready = selected;
-                // The live renderer now draws the core's pane: links on it open when held later.
-                if (selected) linkFrame.attached(current.hostId, pane);
                 if (selected && !current.announced) {
                     current.announced = true;
                     main.post(() -> { if (current(current)) showLinkUp(); });
@@ -6349,8 +6342,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (now != null && !pane.equals(now.paneId)) return;
             long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
             nativeHold(generation);
-            nativeAttachShell(generation, renderId);
-            linkFrame.attached(host, pane);
+            nativeAttachShell(generation, renderId, host, pane);
             savedShownHost = host;
             savedShownAt = savedAt;
         }
@@ -6648,8 +6640,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 next.shellHandle = handle;
                 handle = 0;
                 next.ready = true;
-                nativeAttachShell(next.generation, next.shellHandle);
-                linkFrame.attached(next.hostId, next.paneId);
+                nativeAttachShell(next.generation, next.shellHandle, LinkFrame.part(next.hostId),
+                        LinkFrame.part(next.paneId));
                 nativeSetActive(next.generation, true);
                 publish(next, "Shell");
             }
@@ -6828,7 +6820,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeSetDisplayPreferences(float fontSize, boolean compact,
             float systemFontScale);
     /** Draws the raw shell {@code handle} (0 for Herdr's pane) for this generation only. */
-    private static native boolean nativeAttachShell(long generation, long handle);
+    private static native boolean nativeAttachShell(long generation, long handle, String host, String pane);
 
     /** Moves the terminal horizontally by this many logical pixels. */
     private static native void nativePan(float delta);
