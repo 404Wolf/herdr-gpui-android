@@ -334,6 +334,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         styleRail();
         rebuildShortcutBar();
         if (banner != null) styleBanner();
+        updateLinkBadge();
         // Reused rail rows carry the old colors; rebuild them once for the change.
         if (sidebarRows != null) {
             pruneRailRows(java.util.Collections.emptySet());
@@ -417,6 +418,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabRow.addView(tabScroll, new LinearLayout.LayoutParams(0, -1, 1));
         ImageButton tabMenu = iconButton(R.drawable.ic_bar_more, "More", "Panes, hosts and terminal actions",
                 view -> showMoreActions(view, true));
+        // Offline, reconnecting or a cached pane: one small indicator at the top
+        // right (LinkBadge), never a dimmed screen, a banner or a status line.
+        linkBadge = new TextView(this);
+        linkBadge.setTextSize(LinkBadge.TEXT_SP);
+        linkBadge.setSingleLine(true);
+        linkBadge.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        linkBadge.setMaxWidth(dp(LinkBadge.MAX_WIDTH_DP));
+        linkBadge.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        linkBadge.setPadding(dp(6), 0, dp(2), 0);
+        linkBadge.setVisibility(View.GONE);
+        linkBadge.setOnClickListener(v -> showLinkActions());
+        LinearLayout.LayoutParams badgeAt = new LinearLayout.LayoutParams(-2, -1);
+        badgeAt.gravity = LinkBadge.GRAVITY;
+        tabRow.addView(linkBadge, badgeAt);
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
         // Where this window is: machine › repo › worktree › window, and why
@@ -728,6 +743,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         if (terminalRoot == null) return;
+        if (!shellMode()) {
+            // A Herdr pane: the failure is the top corner's indicator, whose tap
+            // offers Hosts and Reconnect; nothing is inserted above the bar.
+            linkProblem = BannerCopy.human(message);
+            updateLinkBadge();
+            return;
+        }
         if (banner == null) {
             banner = new LinearLayout(this);
             banner.setOrientation(LinearLayout.HORIZONTAL);
@@ -783,6 +805,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void hideReconnectBanner() {
         if (banner != null) banner.setVisibility(View.GONE);
+        if (linkProblem != null) {
+            linkProblem = null;
+            updateLinkBadge();
+        }
     }
 
     /**
@@ -2334,8 +2360,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private android.widget.HorizontalScrollView tabScroll;
     private TextView crumb;
     private String crumbText = "";
-    /** Replaces the crumb while the link is down: the one status line, no overlay. */
-    private String linkStatus;
+    /** The top corner's link indicator (LinkBadge); the crumb keeps saying where this is. */
+    private TextView linkBadge;
+    /** What the indicator shows now. Main thread. */
+    private LinkBadge.Look linkLook = LinkBadge.HIDDEN;
+    /** A failure the indicator explains on tap (the old banner's text), or null. Main thread. */
+    private String linkProblem;
     /** Reconnects a dropped remote session while this terminal is on screen. */
     private ConnectionMonitor monitor;
     /** Input that never left the phone, sent once the same pane is ready again. Under stateLock. */
@@ -2350,8 +2380,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private volatile String savedShownHost;
     private volatile long savedShownAt;
-    /** The link status reads as a cached pane's label (dim), not a warning. Main thread. */
-    private boolean linkStatusDim;
     /** When to checkpoint the pane on screen. Under stateLock. */
     private final PaneCheckpoint checkpoint = new PaneCheckpoint();
     /** Each computer's lists as this terminal last saw them live: newer than Home's cache. */
@@ -2397,7 +2425,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean show = current != null && !shellMode() && current.tabs != null;
         tabScroll.setVisibility(show ? View.VISIBLE : View.GONE);
         // The menu stays wherever the bar is gone, tabs or not.
-        if (tabRow != null) tabRow.setVisibility(current != null && !shellMode() ? View.VISIBLE : View.GONE);
+        if (tabRow != null) {
+            tabRow.setVisibility((current != null || linkLook.shown) && !shellMode() ? View.VISIBLE : View.GONE);
+        }
         if (!show) {
             if (barNeedYou != 0) {
                 barNeedYou = 0;
@@ -2690,7 +2720,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void updateCrumb(Connection current, String space) {
-        if (crumb == null || linkStatus != null || crumbNote != null) return;
+        if (crumb == null || crumbNote != null) return;
         String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "", ownTitle = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -6259,7 +6289,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             failed.cancel();
             if (failed.poll != null) failed.poll.cancel(false);
             if (resumable(failed)) {
-                // The frame stays, dimmed, with the keyboard up; input not yet
+                // The frame stays, in full colour, with the keyboard up; input not yet
                 // sent waits for the same pane and the monitor reconnects.
                 failed.ready = false;
                 holdUnsent(failed);
@@ -6292,7 +6322,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /**
-     * Draws {@code pane}'s saved grid, dimmed and scrollable, while there is no
+     * Draws {@code pane}'s saved grid, in full colour and scrollable, while there is no
      * live pane: the terminal opened with no link, came back to the screen
      * before reconnecting, or switched panes or machines offline. A pane with
      * no copy shows its title and one dim line instead. The live pane replaces
@@ -6500,39 +6530,62 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void showLinkDown() {
         if (composer != null) composer.setLinkDown(linkDownInputs());
+        updateLinkBadge();
         if (monitor == null || !monitor.reconnecting() || crumb == null) return;
         // The rail's machine row says offline too.
         refreshSidebar(false);
-        String host;
-        int held;
+    }
+
+    /**
+     * The top corner's indicator follows the link: offline or connecting, the
+     * age of a cached pane on screen, what waits to be sent. The terminal itself
+     * keeps its full colour and its scrolling. Main thread.
+     */
+    private void updateLinkBadge() {
+        if (linkBadge == null || destroyed) return;
+        if (shellMode()) {
+            // A raw shell keeps its banner: its end is not a lost link.
+            linkLook = LinkBadge.HIDDEN;
+            linkBadge.setVisibility(View.GONE);
+            return;
+        }
+        int waiting;
         synchronized (stateLock) {
-            host = connection == null ? "" : connection.hostName;
-            held = pendingInput.size();
+            waiting = pendingInput.size();
             String hostId = connection == null ? currentHostId : connection.hostId;
-            if (hostId != null && outbox != null) held += outbox.outbox().waiting(hostId);
+            if (hostId != null && outbox != null) waiting += outbox.outbox().waiting(hostId);
         }
+        String cachedHost = savedShownHost;
         long savedAt = savedShownAt;
-        if (savedShownHost != null) {
-            // A cached pane on screen: its age, the link, and what waits (item 77).
-            String when = savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
-                    java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
-                    java.util.Locale.getDefault()) : null;
-            linkStatus = OfflineSwitch.label(when, monitor.offline(), held);
-            linkStatusDim = true;
-        } else {
-            StringBuilder text = new StringBuilder(monitor.offline() ? "No network · reconnecting" : "Reconnecting");
-            if (host != null && !host.isEmpty()) text.append(" to ").append(host);
-            text.append('…');
-            if (held > 0) text.append(" · ").append(held).append(held == 1 ? " input waits" : " inputs wait");
-            linkStatus = text.toString();
-            linkStatusDim = false;
+        String when = cachedHost != null && savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
+                java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
+                java.util.Locale.getDefault()) : null;
+        boolean down = monitor != null && monitor.reconnecting();
+        boolean noNetwork = monitor != null && monitor.offline();
+        LinkBadge.Look look = LinkBadge.look(down, noNetwork, linkProblem, cachedHost != null, when, waiting);
+        boolean changed = look.shown != linkLook.shown;
+        linkLook = look;
+        if (look.shown) {
+            android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(LinkBadge.DOT);
+            text.setSpan(new android.text.style.ForegroundColorSpan(
+                    look.tone == LinkBadge.Tone.WARN ? chrome.warning : chrome.onSurfaceVariant), 0, text.length(), 0);
+            text.append(' ').append(look.text);
+            linkBadge.setTextColor(chrome.onSurfaceVariant);
+            linkBadge.setText(text);
+            linkBadge.setContentDescription(look.description);
         }
-        // A note on screen keeps its moment; the link status follows it.
-        if (crumbNote != null) return;
-        crumb.setVisibility(View.VISIBLE);
-        crumb.setTextColor(linkStatusDim ? chrome.onSurfaceVariant : chrome.warning);
-        crumb.setText(linkStatus);
-        crumb.setContentDescription(linkStatus);
+        linkBadge.setVisibility(look.shown ? View.VISIBLE : View.GONE);
+        if (changed) refreshTabStrip();
+    }
+
+    /** The indicator was tapped: what the old banner offered, Reconnect and Hosts. Main thread. */
+    private void showLinkActions() {
+        if (destroyed || isFinishing() || !linkLook.shown) return;
+        new ActionSheet(this, chrome, linkLook.title)
+                .add("Reconnect", this::reconnectCurrentHost)
+                .add("Hosts", () -> startActivity(new android.content.Intent(this,
+                        RemoteHostsActivity.class).putExtra("skip_reopen", true)))
+                .show();
     }
 
     /** A short note in the crumb's own slot, in place of any pop-up; null while none shows. */
@@ -6541,11 +6594,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumbNote = null;
         crumbText = null;
         if (crumb == null) return;
-        if (linkStatus != null) {
-            crumb.setTextColor(linkStatusDim ? chrome.onSurfaceVariant : chrome.warning);
-            crumb.setText(linkStatus);
-            crumb.setContentDescription(linkStatus);
-        } else refreshTabStrip();
+        refreshTabStrip();
     };
 
     /**
@@ -6575,8 +6624,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         savedShownHost = null;
         savedShownAt = 0;
         if (monitor != null) monitor.succeeded();
-        linkStatus = null;
+        linkProblem = null;
         crumbText = null;
+        updateLinkBadge();
         // The strip and the rail's machine row (live again).
         refreshSidebar(false);
     }

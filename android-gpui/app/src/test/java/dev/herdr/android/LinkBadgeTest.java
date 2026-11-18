@@ -1,0 +1,84 @@
+package dev.herdr.android;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+import org.junit.Test;
+
+/**
+ * Wolf's ask: offline is ONE small indicator in a top corner (a dot and
+ * "offline" or the cached copy's time), never a grayed screen, a banner or a
+ * status line. What the indicator says, and that it stays small and in the
+ * corner.
+ */
+public final class LinkBadgeTest {
+    @Test public void wolfAskOfflineCornerIndicator_isHiddenWhileLive() {
+        assertFalse(LinkBadge.look(false, false, null, false, null, 0).shown);
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_saysOfflineWithNoNetwork() {
+        LinkBadge.Look look = LinkBadge.look(true, true, null, false, null, 0);
+        assertTrue(look.shown);
+        assertEquals("offline", look.text);
+        assertEquals(LinkBadge.Tone.WARN, look.tone);
+        assertTrue(look.description, look.description.startsWith("Offline."));
+        assertTrue(look.description, look.description.endsWith("Tap to reconnect or open the hosts."));
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_isQuietWhileANetworkIsBackAndItConnects() {
+        LinkBadge.Look look = LinkBadge.look(true, false, null, false, null, 0);
+        assertEquals("connecting", look.text);
+        assertEquals(LinkBadge.Tone.QUIET, look.tone);
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_givesACachedPanesTime() {
+        assertEquals("offline · 14:32", LinkBadge.look(true, true, null, true, "14:32", 0).text);
+        assertEquals("connecting · 14:32", LinkBadge.look(true, false, null, true, "14:32", 0).text);
+        assertEquals("offline · not cached", LinkBadge.look(true, true, null, true, null, 0).text);
+        // A cached copy on screen is never live, even before the monitor reconnects.
+        assertTrue(LinkBadge.look(false, false, null, true, "14:32", 0).shown);
+        assertTrue(LinkBadge.look(true, true, null, true, "14:32", 0).description
+                .contains("Showing the copy from 14:32."));
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_countsWhatWaitsForTheLink() {
+        assertEquals("offline · 14:32 · 2 queued", LinkBadge.look(true, true, null, true, "14:32", 2).text);
+        // Too long with the count: the time stays, the count is in the description (and the queue rows).
+        assertEquals("connecting · 14:32", LinkBadge.look(true, false, null, true, "14:32", 2).text);
+        assertEquals("offline · 1 queued", LinkBadge.look(true, true, null, false, null, 1).text);
+        assertTrue(LinkBadge.look(true, true, null, false, null, 1).description.contains("1 message waits"));
+        assertTrue(LinkBadge.look(true, true, null, false, null, 3).description.contains("3 messages wait"));
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_staysSmallWhateverItSays() {
+        String[] whens = {null, "14:32", "2:32 PM", "Sun 14:32", "Nov 12 11:59 PM"};
+        for (boolean noNetwork : new boolean[] {true, false}) {
+            for (String when : whens) {
+                for (int waiting : new int[] {0, 1, 12, 1234}) {
+                    String text = LinkBadge.look(true, noNetwork, null, true, when, waiting).text;
+                    assertTrue(text + " is " + text.length() + " chars", text.length() <= LinkBadge.MAX_CHARS);
+                }
+            }
+        }
+        // A long date drops the count before the time, then the time.
+        assertEquals("offline · Nov 12 11:59 PM", LinkBadge.look(true, true, null, true, "Nov 12 11:59 PM", 9).text);
+        assertEquals("connecting", LinkBadge.look(true, false, null, true, "Nov 12 11:59 PM", 0).text);
+        // The small type, a bounded width, in the top row's end (the top right corner).
+        assertTrue(LinkBadge.TEXT_SP <= 12);
+        assertTrue("under half a 360 dp phone", LinkBadge.MAX_WIDTH_DP < 180);
+        assertEquals(android.view.Gravity.TOP, LinkBadge.GRAVITY & android.view.Gravity.VERTICAL_GRAVITY_MASK);
+        assertEquals(android.view.Gravity.END, LinkBadge.GRAVITY & android.view.Gravity.RELATIVE_HORIZONTAL_GRAVITY_MASK);
+    }
+
+    @Test public void wolfAskOfflineCornerIndicator_carriesTheOldBannersFailureToItsTap() {
+        String why = BannerCopy.human("Reconnect failed. Check the host and network.");
+        LinkBadge.Look look = LinkBadge.look(false, false, why, false, null, 0);
+        assertTrue(look.shown);
+        assertEquals("offline", look.text);
+        assertEquals(LinkBadge.Tone.WARN, look.tone);
+        assertEquals(why, look.title);
+        // With no failure, the tap sheet is titled with what the indicator means.
+        assertEquals("Offline. Showing the copy from 14:32.", LinkBadge.look(true, true, null, true, "14:32", 0).title);
+    }
+}
