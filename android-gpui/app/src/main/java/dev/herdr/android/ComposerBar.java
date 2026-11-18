@@ -472,9 +472,17 @@ final class ComposerBar {
         ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json);
         if (hint == null) return;
         layout = hint;
+        // A selected row scrolled out of the drawn rows: its actions are nowhere to tap.
+        if (selectedRow != null && !drawnRow(hint, selectedRow)) selectedRow = null;
         place();
         // The grid's width picks the controls' words (a fold or unfold changes it).
         pushGhost();
+    }
+
+    /** Whether the renderer drew the queue row {@code id} (its actions go on it). */
+    static boolean drawnRow(ClusterPlacement.Hint hint, String id) {
+        for (ControlTargets.Cells c : hint.echoes) if (c.id.equals("echo-" + id)) return true;
+        return false;
     }
 
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
@@ -847,48 +855,67 @@ final class ComposerBar {
             return;
         }
         float right = layout.left + layout.cols * layout.cellWidth;
+        // The queue's rows with targets of their own (while it is open): no control's reaches them.
+        java.util.List<ControlTargets.Cells> rowCells = new java.util.ArrayList<>();
+        if (queueOpen) {
+            rowCells.addAll(layout.echoes);
+            rowCells.addAll(layout.rowActions);
+        }
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
                 layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
-                recording(dictationState), layout.draftSpans));
-        // The queue's rows above the prompt, while it is open: one target per row, its full width.
-        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.left, layout.top, layout.cellWidth,
-                layout.cellHeight, layout.cols));
+                recording(dictationState), layout.draftSpans, rowCells));
+        // The queue's rows above the prompt, while it is open: one target per row, its full width,
+        // and the selected row's actions on its right end.
+        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.left, layout.top,
+                layout.cellWidth, layout.cellHeight, layout.cols));
         tapGuard.laid(rects, android.os.SystemClock.uptimeMillis());
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
             return;
         }
-        float l = Float.MAX_VALUE, t = Float.MAX_VALUE, rr = 0, b = 0;
-        for (ControlTargets.Rect rect : rects) {
-            l = Math.min(l, rect.left);
-            t = Math.min(t, rect.top);
-            rr = Math.max(rr, rect.right);
-            b = Math.max(b, rect.bottom);
+        // Each edge rounded to a pixel once, in the frame: a target's pixels never move because
+        // the strip around it grew or shrank (review of #35).
+        int[][] px = ControlTargets.pixels(rects, left, top, density);
+        int l = Integer.MAX_VALUE, t = Integer.MAX_VALUE, rr = Integer.MIN_VALUE, b = Integer.MIN_VALUE;
+        for (int[] p : px) {
+            l = Math.min(l, p[0]);
+            t = Math.min(t, p[1]);
+            rr = Math.max(rr, p[2]);
+            b = Math.max(b, p[3]);
         }
         targets.removeAllViews();
-        for (ControlTargets.Rect rect : rects) {
+        for (int i = 0; i < rects.size(); i++) {
+            ControlTargets.Rect rect = rects.get(i);
+            int[] p = px[i];
             View target = new View(context);
             target.setTag(rect.id);
-            target.setContentDescription(describe(rect.id));
-            // One per target: each finger's gesture is decided on its own touch path.
-            GuardedTarget guarded = new GuardedTarget(rect.id, tapGuard, this::targetTapped);
-            target.setOnTouchListener(guarded);
-            target.setOnClickListener(guarded);
+            if (!ControlLine.tappable(rect.id)) {
+                // A reserved slot (Wolf's ask 4): it takes a tap and does nothing, so a finger
+                // there neither reaches a neighbour nor the program under the bar; TalkBack
+                // does not offer it.
+                target.setOnTouchListener((v, e) -> true);
+                target.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            } else {
+                target.setContentDescription(describe(rect.id));
+                // One per target: each finger's gesture is decided on its own touch path.
+                GuardedTarget guarded = new GuardedTarget(rect.id, tapGuard, this::targetTapped);
+                target.setOnTouchListener(guarded);
+                target.setOnClickListener(guarded);
+            }
             if ("send".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { setKeysOpen(!keysOpen); return true; });
             } else if ("clear".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { tapClear(true); return true; });
             }
-            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                    Math.round(rect.width() * density), Math.round(rect.height() * density), Gravity.TOP | Gravity.START);
-            params.leftMargin = Math.round((rect.left - l) * density);
-            params.topMargin = Math.round((rect.top - t) * density);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(p[2] - p[0], p[3] - p[1],
+                    Gravity.TOP | Gravity.START);
+            params.leftMargin = p[0] - l;
+            params.topMargin = p[1] - t;
             targets.addView(target, params);
         }
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                Math.round((rr - l) * density), Math.round((b - t) * density), Gravity.TOP | Gravity.START);
-        params.leftMargin = Math.round(left + l * density);
-        params.topMargin = Math.round(top + t * density);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(rr - l, b - t, Gravity.TOP | Gravity.START);
+        params.leftMargin = l;
+        params.topMargin = t;
         targets.setLayoutParams(params);
         targets.setVisibility(View.VISIBLE);
     }
@@ -1005,7 +1032,7 @@ final class ComposerBar {
         Line in = new Line();
         in.typing = typing;
         in.talks = dictates
-                ? java.util.Arrays.asList(talk(Words.FULL), talk(Words.SHORT), talk(Words.TINY))
+                ? talks()
                 : java.util.Collections.emptyList();
         in.recording = recording(dictationState);
         in.queued = QueueView.count(queuedMessages, loose, parkedHere(), linkDown);
@@ -1016,10 +1043,12 @@ final class ComposerBar {
             in.undoWide = clearing.label(false);
             in.undoNarrow = clearing.label(true);
         }
-        QueueView.Row selected = selectedRow == null ? null : row(selectedRow);
-        if (queueOpen && selected != null) in.rowActions = rowActions(selected);
+        ladder = ControlLine.ladder(in);
         return controls(in, cols);
     }
+
+    /** Every line the controls may take, widest first, for the renderer to pick from (ask 4). */
+    private List<List<GhostText.Control>> ladder = Collections.emptyList();
 
     /** The shown row with {@code id}, or null. */
     private QueueView.Row row(String id) {
@@ -1189,57 +1218,68 @@ final class ComposerBar {
         return ControlLine.width(controls);
     }
 
-    /** How many words "talk" may take: all of them, a narrow grid's, or a tiny grid's. */
-    private enum Words { FULL, SHORT, TINY }
-
-    /** "talk", or what the dictation is doing, as TUI-style words. */
-    private GhostText.Control talk(Words words) {
+    /**
+     * "talk"'s words for {@link ControlLine}: what the dictation is doing, fullest first, as
+     * status words left of the slots ("rec 0:05", "transcribing…", "offline", "mic silenced";
+     * none when there is nothing to say), and last the slot's own word ("talk", "stop", "…").
+     */
+    private List<GhostText.Control> talks() {
         long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
-        String clock = DraftChips.clock(elapsed);
-        switch (dictationState) {
+        return talks(dictationState, DraftChips.clock(elapsed), finishing, desktopError, transcribedOnPhone,
+                nothingHeard);
+    }
+
+    static List<GhostText.Control> talks(DictationEngine.State state, String clock, boolean finishing,
+            boolean desktopError, boolean transcribedOnPhone,
+            dev.herdr.android.dictation.DictationException.Reason nothingHeard) {
+        List<GhostText.Control> out = new java.util.ArrayList<>();
+        switch (state) {
             case CONNECTING:
-                return new GhostText.Control("talk", words == Words.TINY ? "…" : "connecting…", "info");
-            case LISTENING: {
-                String text;
-                switch (words) {
-                    case FULL: text = "● rec " + clock + " · tap to stop"; break;
-                    case SHORT: text = "● " + clock + " stop"; break;
-                    default: text = "● stop";
-                }
-                return new GhostText.Control("talk", text, "danger");
-            }
+                out.add(new GhostText.Control("talk", "connecting…", "info"));
+                out.add(new GhostText.Control("talk", "…", "info"));
+                break;
+            case LISTENING:
+                out.add(new GhostText.Control("talk", "rec " + clock, "danger"));
+                out.add(new GhostText.Control("talk", clock, "danger"));
+                out.add(new GhostText.Control("talk", "stop", "danger"));
+                break;
             case TRANSCRIBING:
-                return new GhostText.Control("talk", words == Words.TINY ? "…"
-                        : finishing ? "finishing…" : "transcribing…", "info");
+                out.add(new GhostText.Control("talk", finishing ? "finishing…" : "transcribing…", "info"));
+                out.add(new GhostText.Control("talk", "…", "info"));
+                break;
             case ON_DEVICE: {
                 // The phone transcribes: the warning colour says offline when the words cannot.
-                String why = desktopError ? "desktop error" : "offline";
-                String text;
-                switch (words) {
-                    case FULL: text = "● " + why + " · rec " + clock + " · tap to stop"; break;
-                    case SHORT: text = "● " + (desktopError ? "error" : "offline") + " " + clock + " stop"; break;
-                    default: text = "● stop";
-                }
-                return new GhostText.Control("talk", text, "warn");
+                out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline") + " · rec " + clock,
+                        "warn"));
+                out.add(new GhostText.Control("talk", (desktopError ? "error " : "offline ") + clock, "warn"));
+                out.add(new GhostText.Control("talk", "stop", "warn"));
+                break;
             }
-            case OFFLINE_RECORDING: {
+            case OFFLINE_RECORDING:
                 // No recognizer on the phone: the recording waits for the desktop.
-                String text;
-                switch (words) {
-                    case FULL: text = (desktopError ? "desktop error" : "offline") + " · queued · rec " + clock
-                            + " · tap to stop"; break;
-                    case SHORT: text = "● queued " + clock + " stop"; break;
-                    default: text = "● stop";
-                }
-                return new GhostText.Control("talk", text, "warn");
+                out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline")
+                        + " · queued · rec " + clock, "warn"));
+                out.add(new GhostText.Control("talk", "queued " + clock, "warn"));
+                out.add(new GhostText.Control("talk", "stop", "warn"));
+                break;
+            default: {
+                // "Nothing heard" (#31) and "offline" stay as status words; waiting recordings are
+                // counted by the queue control.
+                String full = join(transcribedOnPhone ? "offline" : null,
+                        nothingHeard == null ? null : nothingHeardWords(nothingHeard, true));
+                String brief = join(transcribedOnPhone ? "offline" : null,
+                        nothingHeard == null ? null : nothingHeardWords(nothingHeard, false));
+                if (!full.isEmpty()) out.add(new GhostText.Control("talk", full, "warn"));
+                if (!brief.isEmpty() && !brief.equals(full)) out.add(new GhostText.Control("talk", brief, "warn"));
+                out.add(new GhostText.Control("talk", "talk", "dim"));
             }
-            default:
-                // "Nothing heard" (#31) stays; waiting recordings are counted by the queue control.
-                String said = nothingHeard == null || words == Words.TINY ? ""
-                        : " " + nothingHeardWords(nothingHeard, words == Words.FULL);
-                return new GhostText.Control("talk", "talk", "dim",
-                        (transcribedOnPhone ? " offline" : "") + said, "warn");
         }
+        return out;
+    }
+
+    private static String join(String a, String b) {
+        if (a == null) return b == null ? "" : b;
+        return b == null ? a : a + " · " + b;
     }
 
     /** Hands the renderer the pane's draft, queued messages and controls, unless unchanged. */
@@ -1271,6 +1311,10 @@ final class ComposerBar {
                     selectedRow, now);
             json = GhostText.json(GhostText.kind(kind), draft, marks, drafts.cuts(), clipLengths, parkedIds(),
                     shownRows, queueOpen, selectedRow, cols, controls(loose), GhostText.Colors.of(chrome));
+            json = GhostText.withRungs(json, ladder);
+            QueueView.Row selected = queueOpen && selectedRow != null ? row(selectedRow) : null;
+            // Its actions on the row itself: selecting one never changes the controls' line.
+            if (selected != null) json = GhostText.withRowActions(json, selected.id, ControlLine.rowRungs(selected));
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;

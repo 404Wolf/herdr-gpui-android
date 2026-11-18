@@ -290,6 +290,56 @@ final class GhostText {
     }
 
     /**
+     * {@code json} with {@code rungs}: every line the controls may take, widest first, each
+     * ending in the same fixed slots (ControlLine.ladder). The renderer draws the first that
+     * fits its grid in that very frame, so a fold or a zoom never draws a line meant for the
+     * old width, nor "talk" alone (Wolf's ask 4).
+     */
+    static String withRungs(String json, List<List<Control>> rungs) {
+        if (json.isEmpty() || rungs.isEmpty()) return json;
+        try {
+            JSONObject o = new JSONObject(json);
+            JSONArray out = new JSONArray();
+            for (List<Control> line : rungs) out.put(controlsJson(line));
+            o.put("rungs", out);
+            return o.toString();
+        } catch (JSONException impossible) {
+            return json;
+        }
+    }
+
+    /**
+     * {@code json} with the selected queue row's actions: drawn by the renderer on that row
+     * ({@code selected}, its id as in "echoIds"), the first of {@code rungs} that fits it,
+     * never in the controls' line (Wolf's ask 4).
+     */
+    static String withRowActions(String json, String selected, List<List<Control>> rungs) {
+        if (json.isEmpty() || selected == null || rungs.isEmpty()) return json;
+        try {
+            JSONObject o = new JSONObject(json);
+            JSONArray out = new JSONArray();
+            for (List<Control> line : rungs) out.put(controlsJson(line));
+            o.put("selected", selected);
+            o.put("rowRungs", out);
+            return o.toString();
+        } catch (JSONException impossible) {
+            return json;
+        }
+    }
+
+    private static JSONArray controlsJson(List<Control> controls) throws JSONException {
+        JSONArray drawn = new JSONArray();
+        for (Control control : controls) {
+            JSONArray spans = new JSONArray();
+            for (int i = 0; i + 1 < control.spans.length; i += 2) {
+                if (!control.spans[i].isEmpty()) spans.put(span(control.spans[i], control.spans[i + 1]));
+            }
+            drawn.put(new JSONObject().put("id", control.id).put("spans", spans));
+        }
+        return drawn;
+    }
+
+    /**
      * One queue row: its words (chips for dictations), cut to leave its state room, then the
      * state at the right end. Closed, the row is dim; selected, bright.
      */

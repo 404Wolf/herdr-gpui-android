@@ -721,6 +721,7 @@ macro_rules! __bind_gpui {
                             busy_from: rows.saturating_sub($crate::ghost::HINT_ROWS),
                             controls: layout.controls.clone(),
                             echoes: layout.echoes.clone(),
+                            row_actions: layout.row_actions.clone(),
                             targets_top: layout.targets_top,
                             draft_shown: layout.draft_shown,
                             draft_runs: $crate::ghost::draft_runs(placed),

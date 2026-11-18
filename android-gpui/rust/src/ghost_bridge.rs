@@ -15,10 +15,15 @@ use serde::Deserialize;
 
 /// The most text a ghost may carry; the composer's own bound is lower.
 const MAX_TEXT_BYTES: usize = 65_536;
-const MAX_SPANS: usize = 128;
+const MAX_SPANS: usize = 512;
 const MAX_ECHOES: usize = 8;
-/// type, clear, undo, talk, send, queue (items 75, 76; "type" is left out while typing).
-const MAX_CONTROLS: usize = 6;
+/// ✕, undo, the queue, the status words and three slots (type, talk, send), or a selected
+/// row's actions (up to four) with the queue, the status words and the slots (Wolf's ask 4).
+const MAX_CONTROLS: usize = 10;
+/// The host's ladder of lines, widest first.
+const MAX_RUNGS: usize = 8;
+/// A selected queue row's actions: send again, retry, edit, drop, back.
+const MAX_ROW_ACTIONS: usize = 5;
 const MAX_CONTROL_ID: usize = 16;
 /// A queue row's id (a message's or a recording's UUID).
 const MAX_ECHO_ID: usize = 48;
@@ -44,6 +49,15 @@ struct Wire {
     echo_ids: Vec<String>,
     #[serde(default)]
     controls: Vec<WireControl>,
+    /// Every line the controls may take, widest first (see `Ghost::rungs`).
+    #[serde(default)]
+    rungs: Vec<Vec<WireControl>>,
+    /// The queue row whose actions show, by its id in `echoIds` (see `Ghost::selected`).
+    #[serde(default)]
+    selected: Option<String>,
+    /// That row's actions, widest first (see `Ghost::row_rungs`).
+    #[serde(default, rename = "rowRungs")]
+    row_rungs: Vec<Vec<WireControl>>,
 }
 
 #[derive(Deserialize)]
@@ -119,17 +133,34 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         "other" => PromptKind::Other,
         _ => return Err(Error::InvalidCommand),
     };
-    let control_spans = wire.controls.iter().map(|c| c.spans.len()).sum::<usize>();
+    let control_spans = wire
+        .controls
+        .iter()
+        .chain(wire.rungs.iter().flatten())
+        .chain(wire.row_rungs.iter().flatten())
+        .map(|c| c.spans.len())
+        .sum::<usize>();
     let spans = wire.draft.len() + wire.echoes.iter().map(Vec::len).sum::<usize>() + control_spans;
     let bytes = wire
         .draft
         .iter()
         .chain(wire.echoes.iter().flatten())
         .chain(wire.controls.iter().flat_map(|c| c.spans.iter()))
+        .chain(wire.rungs.iter().flatten().flat_map(|c| c.spans.iter()))
+        .chain(wire.row_rungs.iter().flatten().flat_map(|c| c.spans.iter()))
         .map(|s| s.t.len())
         .sum::<usize>();
     if wire.controls.len() > MAX_CONTROLS
-        || wire.controls.iter().any(|c| {
+        || wire.rungs.len() > MAX_RUNGS
+        || wire.rungs.iter().any(|r| r.len() > MAX_CONTROLS)
+        || wire.row_rungs.len() > MAX_RUNGS
+        || wire.row_rungs.iter().any(|r| r.len() > MAX_ROW_ACTIONS)
+        || wire
+            .controls
+            .iter()
+            .chain(wire.rungs.iter().flatten())
+            .chain(wire.row_rungs.iter().flatten())
+            .any(|c| {
             c.id.is_empty()
                 || c.id.len() > MAX_CONTROL_ID
                 || !c
@@ -148,6 +179,9 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
     if !wire.echo_ids.is_empty()
         && (wire.echo_ids.len() != wire.echoes.len() || wire.echo_ids.iter().any(bad_id))
     {
+        return Err(Error::InvalidCommand);
+    }
+    if wire.selected.as_ref().is_some_and(bad_id) {
         return Err(Error::InvalidCommand);
     }
     if spans > MAX_SPANS
@@ -183,6 +217,20 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
         GhostStyle::Info,
         GhostStyle::Warn,
     ];
+    let controls_of = |line: Vec<WireControl>| -> Result<Vec<Control>> {
+        line.into_iter()
+            .map(|c| {
+                Ok(Control {
+                    id: c.id,
+                    spans: c
+                        .spans
+                        .into_iter()
+                        .map(|s| span(s, &control_styles))
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect()
+    };
     Ok(Ghost {
         kind,
         draft: wire
@@ -200,19 +248,17 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
             })
             .collect::<Result<_>>()?,
         echo_ids: wire.echo_ids,
-        controls: wire
-            .controls
+        controls: controls_of(wire.controls)?,
+        rungs: wire
+            .rungs
             .into_iter()
-            .map(|c| {
-                Ok(Control {
-                    id: c.id,
-                    spans: c
-                        .spans
-                        .into_iter()
-                        .map(|s| span(s, &control_styles))
-                        .collect::<Result<_>>()?,
-                })
-            })
+            .map(controls_of)
+            .collect::<Result<_>>()?,
+        selected: wire.selected,
+        row_rungs: wire
+            .row_rungs
+            .into_iter()
+            .map(controls_of)
             .collect::<Result<_>>()?,
         reserve: wire.reserve,
         reserve_from: wire.reserve_from,
@@ -248,6 +294,11 @@ pub(crate) fn hint_json(hint: &gpui_rio::ghost::LayoutHint) -> String {
             .collect::<Vec<_>>(),
         "echoes": hint
             .echoes
+            .iter()
+            .map(|c| serde_json::json!({"id": c.id, "row": c.row, "start": c.start, "end": c.end}))
+            .collect::<Vec<_>>(),
+        "rowActions": hint
+            .row_actions
             .iter()
             .map(|c| serde_json::json!({"id": c.id, "row": c.row, "start": c.start, "end": c.end}))
             .collect::<Vec<_>>(),
@@ -346,6 +397,21 @@ mod tests {
     }
 
     #[test]
+    fn the_hosts_ladder_of_lines_is_kept_widest_first() {
+        let json = format!(
+            r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}],"rungs":[[{{"id":"clear","spans":[{{"t":"✕","s":"dim"}}]}},{{"id":"gap-type","spans":[{{"t":"────","s":"dim"}}]}},{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}],[{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}]]}}"#
+        );
+        let ghost = parse(&json).expect("rungs");
+        assert_eq!(ghost.rungs.len(), 2);
+        assert_eq!(ghost.rungs[0][1].id, "gap-type");
+        // A rung is a line of controls: draft styles are refused there, as in controls.
+        let bad = format!(
+            r#"{{"kind":"claude",{COLORS},"rungs":[[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]]}}"#
+        );
+        assert!(parse(&bad).is_err());
+    }
+
+    #[test]
     fn a_draft_may_carry_the_dim_mark_of_an_unverified_cut() {
         let json = format!(
             r#"{{"kind":"claude",{COLORS},"draft":[{{"t":"make the stop bu","s":"text"}},{{"t":"⁞","s":"dim"}},{{"t":"tton bigger","s":"partial"}}]}}"#
@@ -413,15 +479,26 @@ mod tests {
     }
 
     #[test]
-    fn six_controls_and_coloured_queue_rows_are_accepted() {
+    fn up_to_ten_controls_and_coloured_queue_rows_are_accepted() {
         let control = |id: &str| format!(r#"{{"id":"{id}","spans":[{{"t":"{id}","s":"dim"}}]}}"#);
         let six: Vec<String> = ["type", "talk", "clear", "undo", "send", "queue"].iter().map(|id| control(id)).collect();
         let ghost = parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{}]}}"#, six.join(",")))
             .expect("six controls");
         assert_eq!(ghost.controls.len(), 6);
         assert_eq!(ghost.controls[2].id, "clear");
-        let seven = format!("{},{}", six.join(","), control("more"));
-        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{seven}]}}"#)).is_err());
+        // Ten (the fixed slots with a selected row's actions, the queue and the status words),
+        // never eleven (Wolf's ask 4).
+        let ten: Vec<String> = [
+            "row-again", "row-edit", "row-drop", "row-back", "queue", "status", "type", "talk", "send", "gap-send",
+        ]
+        .iter()
+        .map(|id| control(id))
+        .collect();
+        let ghost = parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{}]}}"#, ten.join(",")))
+            .expect("ten controls");
+        assert_eq!(ghost.controls.len(), 10);
+        let eleven = format!("{},{}", ten.join(","), control("more"));
+        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{eleven}]}}"#)).is_err());
         let rows = format!(
             r#"{{"kind":"claude",{COLORS},"echoes":[[{{"t":"❯ hi","s":"bright"}},{{"t":"  ● sending…","s":"info"}}],[{{"t":"❯ x","s":"echo"}},{{"t":"  ✗ not sent","s":"danger"}}]]}}"#
         );
@@ -456,6 +533,12 @@ mod tests {
                 start: 0,
                 end: 40,
             }],
+            row_actions: vec![gpui_rio::ghost::PlacedControl {
+                id: "row-drop".into(),
+                row: 30,
+                start: 50,
+                end: 54,
+            }],
             targets_top: 38,
             draft_shown: false,
             guard: 1,
@@ -480,5 +563,33 @@ mod tests {
         assert_eq!(value["targetsTop"], 38);
         assert_eq!(value["draft"][0], serde_json::json!([37, 2, 9, 14, 9, 0]));
         assert_eq!(value["draftSpans"], serde_json::json!([[37, 2, 11], [38, 2, 30]]));
+        assert_eq!(value["rowActions"][0]["id"], "row-drop");
+        assert_eq!(value["rowActions"][0]["row"], 30);
+        assert_eq!(value["rowActions"][0]["start"], 50);
+    }
+
+    /// Review of #35 (r2): a selected row's actions travel apart from the controls' line, by
+    /// the row's own id, so the line's slots never make room for them (Wolf's ask 4).
+    #[test]
+    fn wolf_ask4_a_selected_rows_actions_come_with_its_id() {
+        let control = |id: &str, t: &str| format!(r#"{{"id":"{id}","spans":[{{"t":"{t}","s":"warn"}}]}}"#);
+        let wide = [control("row-again", "send again"), control("row-edit", "edit"), control("row-drop", "drop"),
+            control("row-back", "back")].join(",");
+        let narrow = [control("row-again", "again"), control("row-edit", "edit"), control("row-drop", "drop")].join(",");
+        let with = |selected: &str, rungs: &str| {
+            parse(&format!(
+                r#"{{"kind":"claude",{COLORS},"echoes":[[{{"t":"❯ x","s":"bright"}}]],"echoIds":["m-1"],"selected":{selected},"rowRungs":{rungs}}}"#
+            ))
+        };
+        let ghost = with(r#""m-1""#, &format!("[[{wide}],[{narrow}]]")).expect("row actions");
+        assert_eq!(ghost.selected.as_deref(), Some("m-1"));
+        assert_eq!(ghost.row_rungs.len(), 2);
+        assert_eq!(ghost.row_rungs[0][0].id, "row-again");
+        assert_eq!(ghost.row_rungs[1][0].spans[0].text, "again");
+        // A row id like any other: plain, short.
+        assert!(with(r#""m 1""#, "[]").is_err());
+        // At most five actions on a row.
+        let six = [wide.clone(), control("row-x", "x"), control("row-y", "y")].join(",");
+        assert!(with(r#""m-1""#, &format!("[[{six}]]")).is_err());
     }
 }

@@ -1,272 +1,272 @@
-5	idle	talk=talk	clear=✕	queue=≡2
-6	idle	talk=talk	clear=✕	queue=≡2
-7	idle	talk=talk	clear=✕	queue=≡2
-8	idle	talk=talk	clear=✕	queue=≡2
-9	idle	talk=talk	clear=✕	queue=≡2
-10	idle	talk=talk	clear=✕	queue=≡2
-11	idle	talk=talk	clear=✕	queue=≡2
-12	idle	talk=talk	clear=✕	queue=≡2
-13	idle	talk=talk	clear=✕	queue=≡2
-14	idle	talk=talk	clear=✕	queue=≡2
-15	idle	talk=talk	clear=✕	queue=≡2
-16	idle	talk=talk	clear=✕	queue=≡2
-17	idle	talk=talk	clear=✕	queue=≡2
-18	idle	talk=talk	clear=✕	queue=≡2
-19	idle	talk=talk	clear=✕	queue=≡2
-20	idle	talk=talk	clear=✕	queue=≡2
-21	idle	talk=talk	clear=✕	queue=≡2
-22	idle	talk=talk	clear=✕	queue=≡2
-23	idle	talk=talk	clear=✕	queue=≡2
-24	idle	talk=talk	clear=✕	queue=≡2
-25	idle	talk=talk	clear=✕	queue=≡2
-26	idle	talk=talk	clear=✕	queue=≡2
-27	idle	talk=talk	clear=✕	queue=≡2
-28	idle	talk=talk	clear=✕	queue=≡2
-29	idle	talk=talk	clear=✕	queue=≡2
-30	idle	talk=talk	clear=✕	queue=≡2
-31	idle	talk=talk	clear=✕	queue=≡2
-32	idle	talk=talk	clear=✕	send=send	queue=≡2
-33	idle	talk=talk	clear=✕	send=send	queue=≡2
-34	idle	talk=talk	clear=✕	send=send	queue=≡2
-35	idle	talk=talk	clear=✕	send=send	queue=≡2
-36	idle	talk=talk	clear=✕	send=send	queue=≡2
-37	idle	talk=talk	clear=✕	send=send	queue=≡2
-38	idle	talk=talk	clear=✕	send=send	queue=≡2
-39	idle	type=type	talk=talk	clear=✕	send=send	queue=≡2
-40	idle	type=type	talk=talk	clear=✕	send=send	queue=≡2
-41	idle	type=type	talk=talk	clear=✕	send=send	queue=≡2
-42	idle	type=type	talk=talk	clear=✕	send=send	queue=≡2
-43	idle	type=type	talk=talk	clear=✕	send=send	queue=≡2
-44	idle	type=type	talk=talk	clear=✕	send=send	queue=≡2
-45	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-46	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-47	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-48	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-49	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-50	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-51	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-52	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-53	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-54	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-55	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-56	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-57	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-58	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-59	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-60	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-61	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-62	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-63	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-64	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-65	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-66	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-67	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-68	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-69	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-70	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-71	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-72	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-73	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-74	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-75	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-76	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-77	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-78	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-79	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-80	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-81	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-82	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-83	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-84	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-85	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-86	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-87	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-88	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-89	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-90	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-91	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-92	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-93	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-94	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-95	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-96	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-97	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-98	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-99	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-100	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-101	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-102	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-103	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-104	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-105	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-106	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-107	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-108	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-109	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-110	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-111	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-112	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-113	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-114	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-115	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-116	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-117	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-118	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-119	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-120	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-121	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-122	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-123	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-124	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-125	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-126	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-127	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-128	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-129	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-130	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-131	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-132	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-133	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-134	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-135	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-136	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-137	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-138	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-139	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-140	idle	type=type	talk=talk	clear=✕	send=send	queue=2 queued
-5	recording	clear=✕	queue=≡2	talk=● stop
-6	recording	clear=✕	queue=≡2	talk=● stop
-7	recording	clear=✕	queue=≡2	talk=● stop
-8	recording	clear=✕	queue=≡2	talk=● stop
-9	recording	clear=✕	queue=≡2	talk=● stop
-10	recording	clear=✕	queue=≡2	talk=● stop
-11	recording	clear=✕	queue=≡2	talk=● stop
-12	recording	clear=✕	queue=≡2	talk=● stop
-13	recording	clear=✕	queue=≡2	talk=● stop
-14	recording	clear=✕	queue=≡2	talk=● stop
-15	recording	clear=✕	queue=≡2	talk=● stop
-16	recording	clear=✕	queue=≡2	talk=● stop
-17	recording	clear=✕	queue=≡2	talk=● stop
-18	recording	clear=✕	queue=≡2	talk=● stop
-19	recording	clear=✕	queue=≡2	talk=● stop
-20	recording	clear=✕	queue=≡2	talk=● stop
-21	recording	clear=✕	queue=≡2	talk=● stop
-22	recording	clear=✕	queue=≡2	talk=● stop
-23	recording	clear=✕	queue=≡2	talk=● stop
-24	recording	clear=✕	queue=≡2	talk=● stop
-25	recording	clear=✕	queue=≡2	talk=● stop
-26	recording	clear=✕	queue=≡2	talk=● stop
-27	recording	clear=✕	queue=≡2	talk=● stop
-28	recording	clear=✕	queue=≡2	talk=● stop
-29	recording	clear=✕	queue=≡2	talk=● stop
-30	recording	clear=✕	queue=≡2	talk=● stop
-31	recording	clear=✕	queue=≡2	talk=● stop
-32	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-33	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-34	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-35	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-36	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-37	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-38	recording	clear=✕	queue=≡2	talk=● 0:05 stop
-39	recording	type=type	clear=✕	queue=≡2	talk=● 0:05 stop
-40	recording	type=type	clear=✕	queue=≡2	talk=● 0:05 stop
-41	recording	type=type	clear=✕	queue=≡2	talk=● 0:05 stop
-42	recording	type=type	clear=✕	queue=≡2	talk=● 0:05 stop
-43	recording	type=type	clear=✕	queue=≡2	talk=● 0:05 stop
-44	recording	type=type	clear=✕	queue=≡2	talk=● 0:05 stop
-45	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-46	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-47	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-48	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-49	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-50	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-51	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-52	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-53	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-54	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-55	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-56	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-57	recording	type=type	clear=✕	queue=2 queued	talk=● 0:05 stop
-58	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-59	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-60	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-61	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-62	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-63	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-64	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-65	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-66	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-67	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-68	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-69	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-70	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-71	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-72	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-73	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-74	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-75	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-76	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-77	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-78	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-79	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-80	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-81	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-82	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-83	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-84	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-85	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-86	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-87	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-88	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-89	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-90	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-91	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-92	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-93	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-94	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-95	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-96	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-97	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-98	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-99	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-100	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-101	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-102	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-103	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-104	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-105	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-106	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-107	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-108	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-109	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-110	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-111	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-112	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-113	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-114	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-115	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-116	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-117	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-118	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-119	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-120	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-121	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-122	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-123	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-124	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-125	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-126	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-127	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-128	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-129	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-130	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-131	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-132	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-133	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-134	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-135	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-136	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-137	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-138	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-139	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
-140	recording	type=type	clear=✕	queue=2 queued	talk=● rec 0:05 · tap to stop
+5	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+6	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+7	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+8	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+9	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+10	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+11	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+12	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+13	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+14	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+15	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+16	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+17	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+18	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+19	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+20	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+21	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+22	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+23	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+24	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+25	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+26	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+27	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+28	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+29	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+30	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+31	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+32	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+33	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+34	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+35	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+36	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+37	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+38	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+39	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+40	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+41	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+42	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+43	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+44	idle	clear=✕	queue=≡2	type=type	talk=talk	send=send
+45	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+46	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+47	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+48	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+49	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+50	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+51	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+52	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+53	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+54	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+55	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+56	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+57	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+58	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+59	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+60	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+61	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+62	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+63	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+64	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+65	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+66	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+67	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+68	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+69	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+70	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+71	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+72	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+73	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+74	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+75	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+76	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+77	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+78	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+79	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+80	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+81	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+82	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+83	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+84	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+85	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+86	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+87	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+88	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+89	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+90	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+91	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+92	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+93	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+94	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+95	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+96	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+97	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+98	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+99	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+100	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+101	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+102	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+103	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+104	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+105	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+106	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+107	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+108	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+109	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+110	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+111	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+112	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+113	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+114	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+115	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+116	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+117	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+118	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+119	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+120	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+121	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+122	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+123	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+124	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+125	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+126	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+127	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+128	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+129	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+130	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+131	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+132	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+133	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+134	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+135	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+136	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+137	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+138	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+139	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+140	idle	clear=✕	queue=2 queued	type=type	talk=talk	send=send
+5	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+6	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+7	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+8	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+9	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+10	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+11	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+12	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+13	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+14	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+15	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+16	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+17	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+18	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+19	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+20	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+21	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+22	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+23	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+24	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+25	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+26	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+27	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+28	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+29	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+30	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+31	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+32	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+33	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+34	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+35	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+36	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+37	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+38	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+39	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+40	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+41	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+42	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+43	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+44	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+45	recording	clear=✕	queue=≡2	type=type	talk=stop	gap-send=────
+46	recording	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	gap-send=────
+47	recording	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	gap-send=────
+48	recording	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	gap-send=────
+49	recording	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	gap-send=────
+50	recording	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	gap-send=────
+51	recording	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	gap-send=────
+52	recording	clear=✕	queue=2 queued	status=0:05	type=type	talk=stop	gap-send=────
+53	recording	clear=✕	queue=2 queued	status=0:05	type=type	talk=stop	gap-send=────
+54	recording	clear=✕	queue=2 queued	status=0:05	type=type	talk=stop	gap-send=────
+55	recording	clear=✕	queue=2 queued	status=0:05	type=type	talk=stop	gap-send=────
+56	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+57	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+58	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+59	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+60	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+61	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+62	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+63	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+64	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+65	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+66	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+67	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+68	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+69	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+70	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+71	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+72	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+73	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+74	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+75	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+76	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+77	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+78	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+79	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+80	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+81	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+82	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+83	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+84	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+85	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+86	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+87	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+88	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+89	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+90	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+91	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+92	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+93	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+94	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+95	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+96	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+97	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+98	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+99	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+100	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+101	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+102	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+103	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+104	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+105	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+106	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+107	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+108	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+109	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+110	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+111	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+112	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+113	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+114	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+115	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+116	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+117	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+118	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+119	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+120	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+121	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+122	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+123	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+124	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+125	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+126	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+127	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+128	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+129	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+130	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+131	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+132	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+133	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+134	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+135	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+136	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+137	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+138	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+139	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────
+140	recording	clear=✕	queue=2 queued	status=rec 0:05	type=type	talk=stop	gap-send=────

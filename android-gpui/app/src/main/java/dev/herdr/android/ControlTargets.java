@@ -75,21 +75,51 @@ final class ControlTargets {
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
             int topRow, float surfaceBottom, float maxRight, boolean recording) {
-        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording, null);
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording,
+                null, java.util.Collections.<Cells>emptyList());
+    }
+
+    /** As below, with no open queue's rows. */
+    static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans) {
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording,
+                draftSpans, java.util.Collections.<Cells>emptyList());
+    }
+
+    /** As below, with no draft drawn. */
+    static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, List<Cells> rows) {
+        return layout(controls, left, top, cellWidth, cellHeight, topRow, surfaceBottom, maxRight, recording,
+                null, rows);
     }
 
     /**
-     * As above, never over the draft's own cells ({@code draftSpans}: {row, first, past last},
-     * one per row, as the renderer drew them at Claude's prompt or its own): a tap on the
-     * draft's words puts the caret there, never "send" or "✕" (Wolf's ask 1). Every target
-     * gives up every draft cell, whichever way it lies: one above its row stops it below that
-     * row, one below stops it above, one beside it on its own row stops it at the draft's end.
+     * As above, never over the draft's own cells nor the open queue's rows; both apply at once.
+     *
+     * <p>{@code draftSpans} ({row, first, past last}, one per row, as the renderer drew them at
+     * Claude's prompt or its own): a tap on the draft's words puts the caret there, never "send"
+     * or "✕" (Wolf's ask 1). Every target gives up every draft cell, whichever way it lies: one
+     * above its row stops it below that row, one below stops it above, one beside it on its own
+     * row stops it at the draft's end.
+     *
+     * <p>{@code rows}: the queue's rows that have targets of their own (the drawn rows and a
+     * selected row's actions, while the queue is open). Their targets span the grid's width, so
+     * a control's target that would reach one of their rows stops below it: the recording stop,
+     * which grows up into the rows above the prompt, never takes a tap meant for "drop" or
+     * "edit", nor they one meant for the stop (Wolf's ask 4, review of #35).
      */
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
-            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans) {
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans,
+            List<Cells> rows) {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
+            // The status words take no taps. A reserved slot ("gap-type", "gap-send") keeps its
+            // place in the geometry exactly as its button would, so no neighbour's target changes
+            // when it is empty; its own target takes taps and does nothing (ComposerBar).
+            if (ControlLine.STATUS.equals(c.id)) continue;
+            // While recording the stop owns the corner, the reserved send slot included.
+            if (recording && ControlLine.GAP_SEND.equals(c.id)) continue;
             boolean talk = "talk".equals(c.id);
             float pad = talk ? TALK_PAD_DP : PAD_DP;
             float minWidth = talk ? TALK_MIN_DP : MIN_DP;
@@ -109,6 +139,10 @@ final class ControlTargets {
                 r = maxRight;
                 l = Math.min(l, maxRight - STOP_MIN_WIDTH_DP);
                 t = Math.max(top, Math.min(t, b - STOP_MIN_HEIGHT_DP));
+            }
+            for (Cells row : rows) {
+                float rowBottom = top + (row.row + 1) * cellHeight;
+                if (row.row < c.row && rowBottom > t) t = rowBottom;
             }
             if (draftSpans != null) {
                 // Beside it first (its own row), then above and below.
@@ -137,10 +171,13 @@ final class ControlTargets {
         for (int i = 1; i < out.size(); i++) {
             Rect a = out.get(i - 1), b = out.get(i);
             if (a.right <= b.left) continue;
-            // The boundary stays in the gap between their words.
+            // The boundary stays in the gap between their words. The slots (type, talk, send
+            // and their reserved forms) keep their own bounds whatever comes and goes on their
+            // left (Wolf's ask 4): a left-zone control gives way to a slot.
             float wanted;
             if ("talk".equals(a.id)) wanted = a.right;
             else if ("talk".equals(b.id)) wanted = b.left;
+            else if (slot(b.id) && !slot(a.id)) wanted = b.left;
             else wanted = (a.right + b.left) / 2;
             float boundary = Math.max(a.labelRight, Math.min(b.labelLeft, wanted));
             a.right = boundary;
@@ -150,16 +187,70 @@ final class ControlTargets {
     }
 
     /**
+     * Each target's edges in the frame's pixels, {left, top, right, bottom}: the surface at
+     * ({@code originX}, {@code originY}) px, {@code density} px per dp. Every edge is rounded
+     * once, on its own, so a target keeps its pixels whatever else is laid out beside it; the
+     * views are placed from these ints (ComposerBar).
+     */
+    static int[][] pixels(List<Rect> rects, float originX, float originY, float density) {
+        int[][] out = new int[rects.size()][];
+        for (int i = 0; i < out.length; i++) {
+            Rect r = rects.get(i);
+            out[i] = new int[] {Math.round(originX + r.left * density), Math.round(originY + r.top * density),
+                    Math.round(originX + r.right * density), Math.round(originY + r.bottom * density)};
+        }
+        return out;
+    }
+
+    /** One of the line's fixed slots: type, talk, send, or a reserved one. */
+    static boolean slot(String id) {
+        return "type".equals(id) || "talk".equals(id) || "send".equals(id) || id.startsWith("gap-");
+    }
+
+    /**
      * Targets for the queue's rows drawn above the prompt ("echo-<row id>", while the queue is open): each
      * the full width of the grid and one row high, so a row is tapped anywhere along it. Rows do
      * not overlap the controls' targets, which reach up only to the prompt's rule.
      */
     static List<Rect> rows(List<Cells> rows, float left, float top, float cellWidth, float cellHeight, int cols) {
+        return rows(rows, java.util.Collections.<Cells>emptyList(), left, top, cellWidth, cellHeight, cols);
+    }
+
+    /**
+     * As {@link #rows(List, float, float, float, float, int)}, with the selected row's actions
+     * drawn on its right end ({@code actions}, "row-edit" ...): each takes its row from the
+     * middle of the gap before its words to the middle of the gap after (the last to the grid's
+     * edge), and the row's own target ends where the first action's begins. One row high, as
+     * the row is: no target reaches another row's words or the controls' line.
+     */
+    static List<Rect> rows(List<Cells> rows, List<Cells> actions, float left, float top, float cellWidth,
+            float cellHeight, int cols) {
         List<Rect> out = new ArrayList<>();
+        float edge = left + cols * cellWidth;
+        List<Cells> sorted = new ArrayList<>(actions);
+        sorted.sort((a, b) -> a.start - b.start);
         for (Cells c : rows) {
             float t = top + c.row * cellHeight;
-            out.add(new Rect(c.id, left, t, left + cols * cellWidth, t + cellHeight,
+            float right = edge;
+            for (Cells a : sorted) {
+                if (a.row == c.row) {
+                    right = Math.max(left + c.end * cellWidth, left + (a.start - 1) * cellWidth);
+                    break;
+                }
+            }
+            out.add(new Rect(c.id, left, t, right, t + cellHeight,
                     left + c.start * cellWidth, left + c.end * cellWidth));
+        }
+        for (int i = 0; i < sorted.size(); i++) {
+            Cells a = sorted.get(i);
+            float t = top + a.row * cellHeight;
+            Cells before = i > 0 && sorted.get(i - 1).row == a.row ? sorted.get(i - 1) : null;
+            Cells after = i + 1 < sorted.size() && sorted.get(i + 1).row == a.row ? sorted.get(i + 1) : null;
+            float l = before == null ? left + (a.start - 1) * cellWidth
+                    : left + (before.end + a.start) * cellWidth / 2;
+            float r = after == null ? edge : left + (a.end + after.start) * cellWidth / 2;
+            out.add(new Rect(a.id, Math.max(left, l), t, r, t + cellHeight,
+                    left + a.start * cellWidth, left + a.end * cellWidth));
         }
         return out;
     }

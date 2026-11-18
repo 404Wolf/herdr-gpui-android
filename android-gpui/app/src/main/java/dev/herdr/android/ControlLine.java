@@ -30,32 +30,66 @@ final class ControlLine {
         int queued;
         String queueStyle = "info";
         boolean expanded;
-        /** A queued row's actions: while set, they are the whole line. */
-        List<GhostText.Control> rowActions;
+    }
+
+    /** The talk slot's width in cells: its words ("talk", "stop", "…") are padded to it. */
+    static final int TALK_SLOT = 4;
+    /** The most controls a line has (the renderer's limit, ghost_bridge MAX_CONTROLS). */
+    static final int MAX_CONTROLS = 10;
+    /** Ids of the reserved, untappable cells and the status words: never touch targets. */
+    static final String GAP_TYPE = "gap-type", GAP_SEND = "gap-send", STATUS = "status";
+
+    /** Whether {@code id} is a control a tap acts on (not a reserved slot or the status words). */
+    static boolean tappable(String id) {
+        return !id.startsWith("gap-") && !STATUS.equals(id);
     }
 
     /**
-     * The controls in the program's frame, made to fit {@code cols}:
-     * {@code type ─ talk ─ ✕ ─ undo ─ send ─ N queued}, or while recording
-     * {@code type ─ ✕ ─ undo ─ N queued ─ ● stop} (the stop stays last, so it keeps the
-     * bottom-right corner, and "send" is not drawn: no tap meant for the stop sends). "type"
-     * is left out while the keyboard is up, and Herdr draws no hide of its own (the keyboard's
-     * hide key, Back or a swipe down put it away; #30); "talk" is left out with no dictation;
-     * "✕" shows when there is something to clear and "N queued" when something waits. After a
-     * clear, "undo" follows "✕", or stands in its place when nothing is left to clear. When the
-     * full line is too wide (the Fold's cover screen), "talk", "undo" and the queue take their
-     * short words ("● 0:05 stop", "undo", "≡2"), then "type" goes, then "talk" its shortest
-     * words, then "send", then "undo". "✕", the queue control and "talk" (the stop)
-     * are never left out (items 75, 76): when even the barest line is too wide for the grid, the
-     * renderer keeps exactly those three and cuts "talk" to fit (gpui-rio ghost.rs, {@code
-     * place_all}). A selected row's actions take the line's place, with the queue control and
-     * "talk" (the stop) kept.
+     * The controls in the program's frame, made to fit {@code cols} (Wolf's ask 4, 11-17: the
+     * buttons never jump). The line ends in three fixed slots, right-anchored, the same cells in
+     * every state: {@code type ─ talk ─ send ──}.
+     * <ul>
+     *   <li>"type" leaves its slot while the keyboard is up (#30: no Herdr hide), and "send"
+     *       while recording (no tap meant for the stop sends); each slot then shows the rule,
+     *       untappable, so nothing beside it moves.
+     *   <li>"talk" is its shortest words, padded to {@link #TALK_SLOT}: "talk", "stop" while
+     *       recording (the stop's target takes the bottom-right corner, {@link ControlTargets}),
+     *       "…" while connecting or transcribing.
+     * </ul>
+     * Everything that comes and goes lives left of the slots, right-aligned against them, and
+     * never moves them: "✕" (something to clear), "undo", "N queued" / "≡N", and the status words ("rec 0:05", "transcribing…", "offline", "mic silenced":
+     * talk's fuller words). When the grid is narrow, the status words shorten and then go, then
+     * the undo's and the queue's words shorten, then "undo" goes; "✕" and the queue control
+     * stay (items 75, 76). A selected queue row's actions are never here: the renderer draws
+     * them on that row ({@link #rowRungs}). On a grid narrower than the barest line, the
+     * renderer still draws that line without the draft's margin; only narrower than the line
+     * itself (32 cells with "✕" and "≡3▲"; {@link #width}) does it keep just "✕", the queue and
+     * talk (gpui-rio ghost.rs, {@code narrow_line}).
      */
     static java.util.List<GhostText.Control> controls(State in, int cols) {
-        GhostText.Control lead = in.typing ? null : new GhostText.Control("type", "type", "dim");
-        GhostText.Control talk = in.talks.isEmpty() ? null : in.talks.get(0);
-        GhostText.Control shorter = in.talks.isEmpty() ? null : in.talks.get(Math.min(1, in.talks.size() - 1));
-        GhostText.Control shortest = in.talks.isEmpty() ? null : in.talks.get(in.talks.size() - 1);
+        java.util.List<java.util.List<GhostText.Control>> ladder = ladder(in);
+        java.util.List<GhostText.Control> barest = null;
+        for (java.util.List<GhostText.Control> line : ladder) {
+            if (line.isEmpty()) continue;
+            if (width(line) + MARGIN <= cols) return line;
+            barest = line;
+        }
+        return barest == null ? java.util.Collections.emptyList() : barest;
+    }
+
+    /**
+     * Every line {@link #controls} may pick, widest first, each ending in the same slots: the
+     * renderer gets them all and picks the one that fits its grid in the same frame, so a fold
+     * or a zoom never draws a line meant for the old width (ghost.rs).
+     */
+    static java.util.List<java.util.List<GhostText.Control>> ladder(State in) {
+        java.util.List<GhostText.Control> slots = slots(in);
+        java.util.List<GhostText.Control> statuses = new java.util.ArrayList<>();
+        // talk's fuller words, fullest first: status words left of the slots.
+        for (int i = 0; i + 1 < in.talks.size(); i++) {
+            GhostText.Control t = in.talks.get(i);
+            statuses.add(new GhostText.Control(STATUS, t.spans));
+        }
         GhostText.Control clear = in.clearable ? new GhostText.Control("clear", "✕", "dim") : null;
         GhostText.Control undoWide = in.undoWide == null ? null : new GhostText.Control("undo", in.undoWide, "info");
         GhostText.Control undo = in.undoNarrow == null ? null : new GhostText.Control("undo", in.undoNarrow, "info");
@@ -65,44 +99,61 @@ final class ControlLine {
         GhostText.Control queue = in.queued <= 0 ? null
                 : new GhostText.Control("queue", "≡" + QueuedMessages.badge(in.queued) + (in.expanded ? "▲" : ""),
                         in.queueStyle);
-        GhostText.Control send = in.recording ? null : new GhostText.Control("send", "send", "bright");
-        java.util.List<java.util.List<GhostText.Control>> ladder;
-        if (in.rowActions != null && !in.rowActions.isEmpty()) {
-            // A selected row's actions, with the queue control (it closes the list) and talk (the
-            // stop while recording, still last, still the bottom-right corner) kept.
-            java.util.List<GhostText.Control> acts = in.rowActions;
-            java.util.List<GhostText.Control> noBack = new java.util.ArrayList<>();
-            for (GhostText.Control c : acts) if (!"row-back".equals(c.id)) noBack.add(c);
-            ladder = java.util.Arrays.asList(
-                    join(acts, queueWide, talk),
-                    join(acts, queue, shorter),
-                    join(noBack, queue, shorter),
-                    join(noBack, queue, shortest));
-        } else if (in.recording) {
-            ladder = java.util.Arrays.asList(
-                    line(lead, clear, undoWide, queueWide, talk),
-                    line(lead, clear, undoWide, queueWide, shorter),
-                    line(lead, clear, undo, queue, shorter),
-                    line(null, clear, undo, queue, shorter),
-                    line(null, clear, undo, queue, shortest),
-                    line(null, clear, null, queue, shortest));
-        } else {
-            ladder = java.util.Arrays.asList(
-                    line(lead, talk, clear, undoWide, send, queueWide),
-                    line(lead, shorter, clear, undoWide, send, queueWide),
-                    line(lead, shorter, clear, undo, send, queue),
-                    line(null, shorter, clear, undo, send, queue),
-                    line(null, shortest, clear, undo, send, queue),
-                    line(null, shortest, clear, undo, null, queue),
-                    line(null, shortest, clear, null, null, queue));
+        GhostText.Control fullStatus = statuses.isEmpty() ? null : statuses.get(0);
+        GhostText.Control shortStatus = statuses.isEmpty() ? null : statuses.get(statuses.size() - 1);
+        java.util.List<java.util.List<GhostText.Control>> left = new java.util.ArrayList<>();
+        left.add(line(clear, undoWide, queueWide, fullStatus));
+        left.add(line(clear, undoWide, queueWide, shortStatus));
+        left.add(line(clear, undo, queue, shortStatus));
+        left.add(line(clear, undo, queue, null));
+        left.add(line(clear, null, queue, null));
+        java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
+        for (java.util.List<GhostText.Control> l : left) {
+            java.util.List<GhostText.Control> full = new java.util.ArrayList<>(l);
+            full.addAll(slots);
+            if (out.isEmpty() || !ids(out.get(out.size() - 1)).equals(ids(full)) || width(out.get(out.size() - 1)) != width(full)) {
+                out.add(full);
+            }
         }
-        java.util.List<GhostText.Control> barest = null;
-        for (java.util.List<GhostText.Control> line : ladder) {
-            if (line.isEmpty()) continue;
-            if (width(line) + MARGIN <= cols) return line;
-            barest = line;
+        return out;
+    }
+
+    /** The three fixed slots: "type" (or its reserved rule), "talk", "send" (or its rule). */
+    static java.util.List<GhostText.Control> slots(State in) {
+        java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
+        out.add(in.typing ? new GhostText.Control(GAP_TYPE, "────", "dim") : new GhostText.Control("type", "type", "dim"));
+        if (!in.talks.isEmpty()) {
+            GhostText.Control t = in.talks.get(in.talks.size() - 1);
+            out.add(new GhostText.Control("talk", padded(t.spans, TALK_SLOT)));
         }
-        return barest == null ? java.util.Collections.emptyList() : barest;
+        out.add(in.recording ? new GhostText.Control(GAP_SEND, "────", "dim")
+                : new GhostText.Control("send", "send", "bright"));
+        return out;
+    }
+
+    /** {@code spans} ((text, style) pairs) centred in {@code cells} with spaces, cut if longer. */
+    static String[] padded(String[] spans, int cells) {
+        int n = 0;
+        for (int i = 0; i + 1 < spans.length; i += 2) n += spans[i].codePointCount(0, spans[i].length());
+        if (n >= cells) return spans;
+        int before = (cells - n) / 2, after = cells - n - before;
+        String[] out = spans.clone();
+        out[0] = spaces(before) + out[0];
+        out[out.length - 2] = out[out.length - 2] + spaces(after);
+        return out;
+    }
+
+    /** {@code n} spaces (String.repeat needs API 33; the app runs from 29). */
+    static String spaces(int n) {
+        char[] out = new char[Math.max(0, n)];
+        java.util.Arrays.fill(out, ' ');
+        return new String(out);
+    }
+
+    private static String ids(java.util.List<GhostText.Control> line) {
+        StringBuilder out = new StringBuilder();
+        for (GhostText.Control c : line) out.append(c.id).append(' ');
+        return out.toString();
     }
 
     /** The queue control's colour: the most pressing of what waits. */
@@ -114,7 +165,7 @@ final class ControlLine {
         }
     }
 
-    /** A queued row's actions, the whole line while its row is selected. */
+    /** A queued row's actions, drawn on the row while it is selected ({@link #rowRungs}). */
     static java.util.List<GhostText.Control> rowActions(QueueView.Row row) {
         java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
         if (row.kind == QueueView.Kind.MESSAGE && row.messageState == Outbox.State.UNSURE) {
@@ -127,10 +178,26 @@ final class ControlLine {
         return out;
     }
 
-    private static java.util.List<GhostText.Control> join(java.util.List<GhostText.Control> first,
-            GhostText.Control... rest) {
-        java.util.List<GhostText.Control> out = new java.util.ArrayList<>(first);
-        for (GhostText.Control control : rest) if (control != null) out.add(control);
+    /**
+     * A selected row's actions as the renderer may draw them on the row's right end, widest
+     * first (Wolf's ask 4, review of #35): all of them; without "back" (a tap on the row closes
+     * it too); for an unsure message, "send again" as "again". The renderer draws the first that
+     * leaves the row some of its words, so every row kind keeps every action on the cover
+     * screen, and the controls' line never makes room for them.
+     */
+    static java.util.List<java.util.List<GhostText.Control>> rowRungs(QueueView.Row row) {
+        java.util.List<GhostText.Control> all = rowActions(row);
+        java.util.List<GhostText.Control> noBack = new java.util.ArrayList<>();
+        java.util.List<GhostText.Control> shortest = new java.util.ArrayList<>();
+        for (GhostText.Control c : all) {
+            if ("row-back".equals(c.id)) continue;
+            noBack.add(c);
+            shortest.add("row-again".equals(c.id) ? new GhostText.Control(c.id, "again", "warn") : c);
+        }
+        java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
+        out.add(all);
+        out.add(noBack);
+        if (width(shortest) < width(noBack)) out.add(shortest);
         return out;
     }
 

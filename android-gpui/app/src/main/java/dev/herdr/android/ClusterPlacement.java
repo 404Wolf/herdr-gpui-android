@@ -22,6 +22,8 @@ final class ClusterPlacement {
         java.util.List<ControlTargets.Cells> controls = java.util.Collections.emptyList();
         /** The queue's rows as the renderer drew them above the prompt ("echo-<row id>"), oldest first. */
         java.util.List<ControlTargets.Cells> echoes = java.util.Collections.emptyList();
+        /** The selected row's actions as drawn on its row ("row-edit", ...). */
+        java.util.List<ControlTargets.Cells> rowActions = java.util.Collections.emptyList();
         /** The first row touch targets may cover (the prompt's caret row). */
         int targetsTop;
         /** Whether the renderer drew the draft; when not, the composer shows it. */
@@ -76,7 +78,9 @@ final class ClusterPlacement {
                 JSONArray drawn = o.optJSONArray("controls");
                 if (drawn != null) {
                     java.util.List<ControlTargets.Cells> controls = new java.util.ArrayList<>();
-                    for (int i = 0; i < drawn.length() && i < 8; i++) {
+                    // As many as the renderer draws (ControlLine.MAX_CONTROLS): every drawn control
+                        // gets its target and accessibility node.
+                    for (int i = 0; i < drawn.length() && i < ControlLine.MAX_CONTROLS; i++) {
                         JSONObject c = drawn.getJSONObject(i);
                         int row = c.getInt("row"), start = c.getInt("start"), end = c.getInt("end");
                         if (row < 0 || row >= rows || start < 0 || end < start || end > cols) return null;
@@ -94,6 +98,17 @@ final class ClusterPlacement {
                         echoes.add(new ControlTargets.Cells(c.getString("id"), row, start, end));
                     }
                     hint.echoes = echoes;
+                }
+                JSONArray actions = o.optJSONArray("rowActions");
+                if (actions != null) {
+                    java.util.List<ControlTargets.Cells> drawnActions = new java.util.ArrayList<>();
+                    for (int i = 0; i < actions.length() && i < 5; i++) {
+                        JSONObject c = actions.getJSONObject(i);
+                        int row = c.getInt("row"), start = c.getInt("start"), end = c.getInt("end");
+                        if (row < 0 || row >= rows || start < 0 || end < start || end > cols) return null;
+                        drawnActions.add(new ControlTargets.Cells(c.getString("id"), row, start, end));
+                    }
+                    hint.rowActions = drawnActions;
                 }
                 hint.targetsTop = Math.max(0, Math.min(rows, o.optInt("targetsTop", rows)));
                 hint.draftShown = o.optBoolean("draftShown");

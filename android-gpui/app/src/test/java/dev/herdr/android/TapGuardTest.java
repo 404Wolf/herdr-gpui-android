@@ -60,33 +60,15 @@ public final class TapGuardTest {
     }
 
     @Test public void aTapAimedAtUndoAsItsWindowEndsActsOnNothing() {
-        // The real line and targets: the cover screen, a draft just cleared, a message still queued.
-        int cols = 46;
+        // The real line and targets, a draft just cleared and a message still queued, at every
+        // width from the cover screen to the inner screen. With the fixed slots (Wolf's ask 4)
+        // the buttons never slide into undo's place; whatever does (the queue's words, say) is
+        // still not tapped by a finger meant for undo.
         ControlLine.State in = new ControlLine.State();
         in.talks = java.util.Collections.singletonList(new GhostText.Control("talk", "talk", "dim"));
         in.clearable = true;
         in.queued = 1;
-        in.undoWide = "cleared · undo";
-        in.undoNarrow = "undo";
-        List<ControlTargets.Rect> withUndo = laidOut(in, cols);
-        ControlTargets.Rect undo = null;
-        for (ControlTargets.Rect r : withUndo) if (r.id.equals("undo")) undo = r;
-        float x = (undo.labelLeft + undo.labelRight) / 2, y = (undo.top + undo.bottom) / 2;
-        // The window ends: undo goes, and the right-aligned line slides right under the finger
-        // (on the emulator it was talk, starting a recording; here it is send, sending).
-        in.undoWide = null;
-        in.undoNarrow = null;
-        List<ControlTargets.Rect> after = laidOut(in, cols);
-        String under = hit(after, x, y);
-        assertTrue("the hazard: another control is under the finger now, " + under,
-                "talk".equals(under) || "send".equals(under));
-
-        TapGuard guard = new TapGuard();
-        guard.laid(withUndo, 0);
-        guard.laid(after, 6_000);
-        assertFalse(under + " does not act on a tap meant for undo", guard.accepts(under, 6_050));
-        assertTrue("a deliberate tap once it settled works", guard.accepts(under, 6_000 + TapGuard.SETTLE_MS));
-        // The same for every width the cover screen and the inner screen give.
+        int checked = 0;
         for (int c = 30; c <= 120; c++) {
             in.undoWide = "cleared · undo";
             in.undoNarrow = "undo";
@@ -98,12 +80,16 @@ public final class TapGuardTest {
             in.undoNarrow = null;
             List<ControlTargets.Rect> later = laidOut(in, c);
             String now = hit(later, (u.labelLeft + u.labelRight) / 2, (u.top + u.bottom) / 2);
+            checked++;
+            assertFalse(c + " cols: " + now + " slid into undo's place",
+                    "type".equals(now) || "talk".equals(now) || "send".equals(now));
             if (now == null) continue;
             TapGuard g = new TapGuard();
             g.laid(before, 0);
             g.laid(later, 6_000);
             assertFalse(c + " cols: " + now, g.accepts(now, 6_000 + TapGuard.SETTLE_MS - 1));
         }
+        assertTrue("undo shows at some width", checked > 20);
     }
 
     @Test public void aControlThatJustAppearedWaitsAndOneThatStayedDoesNot() {
