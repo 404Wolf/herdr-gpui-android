@@ -308,6 +308,25 @@ final class GhostText {
         }
     }
 
+    /**
+     * {@code json} with the selected queue row's actions: drawn by the renderer on that row
+     * ({@code selected}, its id as in "echoIds"), the first of {@code rungs} that fits it,
+     * never in the controls' line (Wolf's ask 4).
+     */
+    static String withRowActions(String json, String selected, List<List<Control>> rungs) {
+        if (json.isEmpty() || selected == null || rungs.isEmpty()) return json;
+        try {
+            JSONObject o = new JSONObject(json);
+            JSONArray out = new JSONArray();
+            for (List<Control> line : rungs) out.put(controlsJson(line));
+            o.put("selected", selected);
+            o.put("rowRungs", out);
+            return o.toString();
+        } catch (JSONException impossible) {
+            return json;
+        }
+    }
+
     private static JSONArray controlsJson(List<Control> controls) throws JSONException {
         JSONArray drawn = new JSONArray();
         for (Control control : controls) {

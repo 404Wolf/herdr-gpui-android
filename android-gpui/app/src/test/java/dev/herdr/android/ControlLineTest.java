@@ -143,7 +143,7 @@ public final class ControlLineTest {
         assertEquals("clear queue type talk send", ids(ControlLine.controls(in, 20)));
     }
 
-    @Test public void aSelectedRowsActionsKeepTheQueueControlAndTheSlots() {
+    @Test public void wolfAsk4_aSelectedRowsActionsGoOnItsRowNeverInTheLine() {
         QueueView.Row unsure = new QueueView.Row("m", QueueView.Kind.MESSAGE, "❯ x", "?", "warn", true,
                 Outbox.State.UNSURE);
         assertEquals("row-again row-edit row-drop row-back", ids(ControlLine.rowActions(unsure)));
@@ -154,35 +154,24 @@ public final class ControlLineTest {
         assertEquals("row-drop row-back", ids(ControlLine.rowActions(clip)));
         QueueView.Row parked = new QueueView.Row("p", QueueView.Kind.PARKED, "⟦dictation p⟧", "✗", "warn", true, null);
         assertEquals("row-retry row-drop row-back", ids(ControlLine.rowActions(parked)));
-        ControlLine.State in = state(false, IDLE, 1, false, true);
-        in.rowActions = ControlLine.rowActions(queued);
-        assertEquals("row-edit row-drop row-back queue type talk send", ids(ControlLine.controls(in, 200)));
-        // The cover screen (46 columns): the row's actions and the slots still fit (review of #35).
-        for (java.util.List<GhostText.Control> acts : java.util.Arrays.asList(ControlLine.rowActions(queued),
-                ControlLine.rowActions(parked), ControlLine.rowActions(clip))) {
-            ControlLine.State cover = state(false, IDLE, 1, false, true);
-            cover.expanded = true;
-            cover.rowActions = acts;
-            java.util.List<GhostText.Control> line = ControlLine.controls(cover, 46);
-            assertTrue(ids(line), ControlLine.width(line) + ControlLine.MARGIN <= 46);
-            assertTrue(ids(line), ids(line).endsWith("type talk send"));
-            assertTrue(ids(line), byId(line, "row-drop") != null);
-            if (acts.size() > 2) assertTrue(ids(line), byId(line, acts.get(0).id) != null);
+        // The rungs the renderer picks from on the row: all, then without "back", then (an
+        // unsure message) "again" for "send again"; every action but "back" in every rung.
+        java.util.List<java.util.List<GhostText.Control>> u = ControlLine.rowRungs(unsure);
+        assertEquals(3, u.size());
+        assertEquals("row-again row-edit row-drop", ids(u.get(1)));
+        assertEquals("again", byId(u.get(2), "row-again").spans[0]);
+        for (QueueView.Row row : new QueueView.Row[] {queued, clip, parked}) {
+            java.util.List<java.util.List<GhostText.Control>> r = ControlLine.rowRungs(row);
+            assertEquals(2, r.size());
+            assertEquals(ids(ControlLine.rowActions(row)).replace(" row-back", ""), ids(r.get(1)));
         }
-        // Recording: the slots stay, the stop last-but-the-reserved-send, at every width.
-        java.util.List<java.util.List<GhostText.Control>> recordings = java.util.Arrays.asList(
-                ControlLine.rowActions(unsure), ControlLine.rowActions(queued), ControlLine.rowActions(parked));
-        for (java.util.List<GhostText.Control> acts : recordings) {
-            for (int cols = 20; cols <= 200; cols++) {
-                ControlLine.State rec = state(false, LISTENING, 3, true, true);
-                rec.rowActions = acts;
-                java.util.List<GhostText.Control> line = ControlLine.controls(rec, cols);
-                assertTrue(cols + ": " + ids(line), line.size() <= 10);
-                assertTrue(cols + ": " + ids(line), ids(line).endsWith("type talk gap-send"));
-                // The queue control stays where it fits beside them (not on the cover screen).
-                if (cols >= 80) assertTrue(cols + ": the queue control stays", byId(line, "queue") != null);
-                assertTrue(cols + ": " + ids(line), byId(line, "row-drop") != null);
-            }
+        // The narrowest fits beside a few of the row's words on the narrowest cover screen.
+        assertTrue(ControlLine.width(u.get(2)) - 3 + 8 <= 39);
+        // No line of the controls carries a row's action, whatever the state.
+        ControlLine.State in = state(false, LISTENING, 3, true, true);
+        in.expanded = true;
+        for (java.util.List<GhostText.Control> line : ControlLine.ladder(in)) {
+            assertFalse(ids(line), ids(line).contains("row-"));
         }
     }
 

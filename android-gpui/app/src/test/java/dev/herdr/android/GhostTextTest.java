@@ -184,4 +184,20 @@ public final class GhostTextTest {
         assertEquals(61, marks.caret);
         assertEquals(1, GhostText.Marks.of(3, 3, -1, -1).shifted(40).caret);
     }
+
+    @Test public void wolfAsk4_aSelectedRowsActionsTravelWithItsId() throws Exception {
+        QueueView.Row unsure = new QueueView.Row("m-1", QueueView.Kind.MESSAGE, "❯ x", "?", "warn", true,
+                Outbox.State.UNSURE);
+        String json = GhostText.withRowActions("{\"kind\":\"claude\"}", "m-1", ControlLine.rowRungs(unsure));
+        JSONObject o = new JSONObject(json);
+        assertEquals("m-1", o.getString("selected"));
+        JSONArray rungs = o.getJSONArray("rowRungs");
+        assertEquals(3, rungs.length());
+        assertEquals("row-again", rungs.getJSONArray(0).getJSONObject(0).getString("id"));
+        assertEquals("again", rungs.getJSONArray(2).getJSONObject(0).getJSONArray("spans").getJSONObject(0)
+                .getString("t"));
+        // Nothing selected: the JSON is untouched.
+        assertEquals("{\"kind\":\"claude\"}", GhostText.withRowActions("{\"kind\":\"claude\"}", null,
+                ControlLine.rowRungs(unsure)));
+    }
 }

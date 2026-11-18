@@ -472,9 +472,17 @@ final class ComposerBar {
         ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json);
         if (hint == null) return;
         layout = hint;
+        // A selected row scrolled out of the drawn rows: its actions are nowhere to tap.
+        if (selectedRow != null && !drawnRow(hint, selectedRow)) selectedRow = null;
         place();
         // The grid's width picks the controls' words (a fold or unfold changes it).
         pushGhost();
+    }
+
+    /** Whether the renderer drew the queue row {@code id} (its actions go on it). */
+    static boolean drawnRow(ClusterPlacement.Hint hint, String id) {
+        for (ControlTargets.Cells c : hint.echoes) if (c.id.equals("echo-" + id)) return true;
+        return false;
     }
 
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
@@ -850,23 +858,29 @@ final class ComposerBar {
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
                 layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
                 recording(dictationState), layout.draftSpans));
-        // The queue's rows above the prompt, while it is open: one target per row, its full width.
-        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.left, layout.top, layout.cellWidth,
-                layout.cellHeight, layout.cols));
+        // The queue's rows above the prompt, while it is open: one target per row, its full width,
+        // and the selected row's actions on its right end.
+        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.left, layout.top,
+                layout.cellWidth, layout.cellHeight, layout.cols));
         tapGuard.laid(rects, android.os.SystemClock.uptimeMillis());
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
             return;
         }
-        float l = Float.MAX_VALUE, t = Float.MAX_VALUE, rr = 0, b = 0;
-        for (ControlTargets.Rect rect : rects) {
-            l = Math.min(l, rect.left);
-            t = Math.min(t, rect.top);
-            rr = Math.max(rr, rect.right);
-            b = Math.max(b, rect.bottom);
+        // Each edge rounded to a pixel once, in the frame: a target's pixels never move because
+        // the strip around it grew or shrank (review of #35).
+        int[][] px = ControlTargets.pixels(rects, left, top, density);
+        int l = Integer.MAX_VALUE, t = Integer.MAX_VALUE, rr = Integer.MIN_VALUE, b = Integer.MIN_VALUE;
+        for (int[] p : px) {
+            l = Math.min(l, p[0]);
+            t = Math.min(t, p[1]);
+            rr = Math.max(rr, p[2]);
+            b = Math.max(b, p[3]);
         }
         targets.removeAllViews();
-        for (ControlTargets.Rect rect : rects) {
+        for (int i = 0; i < rects.size(); i++) {
+            ControlTargets.Rect rect = rects.get(i);
+            int[] p = px[i];
             View target = new View(context);
             target.setTag(rect.id);
             if (!ControlLine.tappable(rect.id)) {
@@ -887,16 +901,15 @@ final class ComposerBar {
             } else if ("clear".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { tapClear(true); return true; });
             }
-            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                    Math.round(rect.width() * density), Math.round(rect.height() * density), Gravity.TOP | Gravity.START);
-            params.leftMargin = Math.round((rect.left - l) * density);
-            params.topMargin = Math.round((rect.top - t) * density);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(p[2] - p[0], p[3] - p[1],
+                    Gravity.TOP | Gravity.START);
+            params.leftMargin = p[0] - l;
+            params.topMargin = p[1] - t;
             targets.addView(target, params);
         }
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                Math.round((rr - l) * density), Math.round((b - t) * density), Gravity.TOP | Gravity.START);
-        params.leftMargin = Math.round(left + l * density);
-        params.topMargin = Math.round(top + t * density);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(rr - l, b - t, Gravity.TOP | Gravity.START);
+        params.leftMargin = l;
+        params.topMargin = t;
         targets.setLayoutParams(params);
         targets.setVisibility(View.VISIBLE);
     }
@@ -1024,8 +1037,6 @@ final class ComposerBar {
             in.undoWide = clearing.label(false);
             in.undoNarrow = clearing.label(true);
         }
-        QueueView.Row selected = selectedRow == null ? null : row(selectedRow);
-        if (queueOpen && selected != null) in.rowActions = rowActions(selected);
         ladder = ControlLine.ladder(in);
         return controls(in, cols);
     }
@@ -1295,6 +1306,9 @@ final class ComposerBar {
             json = GhostText.json(GhostText.kind(kind), draft, marks, drafts.cuts(), clipLengths, parkedIds(),
                     shownRows, queueOpen, selectedRow, cols, controls(loose), GhostText.Colors.of(chrome));
             json = GhostText.withRungs(json, ladder);
+            QueueView.Row selected = queueOpen && selectedRow != null ? row(selectedRow) : null;
+            // Its actions on the row itself: selecting one never changes the controls' line.
+            if (selected != null) json = GhostText.withRowActions(json, selected.id, ControlLine.rowRungs(selected));
         }
         if (json.equals(lastGhost)) return;
         lastGhost = json;

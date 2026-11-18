@@ -137,6 +137,12 @@ pub struct Ghost {
     /// was picked for another width (a fold or a zoom the host has not seen yet), the first
     /// of these that fits is drawn in the same frame instead (Wolf's ask 4: no blink).
     pub rungs: Vec<Vec<Control>>,
+    /// The queue row whose actions show (its host id, as in `echo_ids`): they are drawn on
+    /// that row's right end, never in the controls' line, so selecting a row moves nothing
+    /// there (Wolf's ask 4).
+    pub selected: Option<String>,
+    /// The selected row's actions, widest first: the first that fits the row is drawn.
+    pub row_rungs: Vec<Vec<Control>>,
     /// Columns kept clear on the right, where the host floats its controls,
     /// on drawn rows from `reserve_from` down.
     pub reserve: usize,
@@ -168,6 +174,8 @@ pub struct LayoutHint {
     /// The queue rows as drawn above the prompt, `echo-N` for `Ghost::echoes[N]`, oldest
     /// first; the host lays touch targets on them while its queue is open.
     pub echoes: Vec<PlacedControl>,
+    /// The selected queue row's actions as drawn on its row (`Ghost::row_rungs`).
+    pub row_actions: Vec<PlacedControl>,
     /// The first row the host's touch targets may cover: the prompt's caret
     /// row (text above it is the program's, to scroll and select).
     pub targets_top: usize,
@@ -502,6 +510,8 @@ pub struct Layout {
     /// Where each queue row was drawn: `echo-<id>` with the host's `Ghost::echo_ids`, else
     /// `echo-N` for `Ghost::echoes[N]`.
     pub echoes: Vec<PlacedControl>,
+    /// The selected row's actions, on its row (`Ghost::row_rungs`).
+    pub row_actions: Vec<PlacedControl>,
     pub targets_top: usize,
     pub draft_shown: bool,
 }
@@ -688,14 +698,21 @@ pub fn place_all(
     let margin = if anchor.is_some() { 8 } else { 0 };
     let mut roomy = len + margin <= cols;
     if len > 0 && !roomy {
-        // The host's words are for another width: the widest of its own lines that fits.
-        if let Some((l, m)) = ghost
+        // The host's words are for another width: the widest of its own lines that fits,
+        // with room for the draft beside it; failing that, the widest that fits at all. Every
+        // one ends in the same fixed slots, so they never yield (Wolf's ask 4, review of #35):
+        // only a grid narrower than the host's barest line falls back to `narrow_line`.
+        let lines: Vec<_> = ghost
             .rungs
             .iter()
             .map(|rung| control_line(rung.as_slice()))
-            .find(|(l, _)| width(l) + margin <= cols)
-        {
-            (line, marks) = (l, m);
+            .collect();
+        let pick = lines
+            .iter()
+            .position(|(l, _)| width(l) + margin <= cols)
+            .or_else(|| lines.iter().position(|(l, _)| width(l) <= cols));
+        if let Some(at) = pick {
+            (line, marks) = lines[at].clone();
             len = width(&line);
             roomy = true;
         }
@@ -815,6 +832,7 @@ pub fn place_all(
         }
         draft.retain(|p| p.source.is_some() || p.row >= free_from);
         layout.echoes = echo_marks(ghost, anchor, &draft);
+        layout.row_actions = row_actions(ghost, cols, &mut layout.echoes, &mut draft);
         // Shown only if some of its words were placed: with no free cells
         // at the caret (the controls fill its row) nothing is, and the host
         // shows the draft itself instead of losing it.
@@ -1003,6 +1021,83 @@ fn ghost_prompt(
     }
     layout.draft_shown = placed.iter().any(|p| p.source.is_some());
     layout.placed.extend(placed);
+}
+
+/// Least cells a selected row keeps for its own words beside its actions, while a wider
+/// rung of them would leave fewer.
+const ROW_WORDS: usize = 8;
+
+/// The selected queue row's actions (`Ghost::row_rungs`), drawn at its row's right end:
+/// ` edit ─ drop ─ back`, the widest rung that leaves the row [`ROW_WORDS`] of its own words,
+/// else the narrowest that fits at all. The row's words are cut short of them (its mark
+/// too), so a tap on the row and a tap on an action never meet. None when the row is not
+/// drawn: the host then drops the selection.
+fn row_actions(
+    ghost: &Ghost,
+    cols: usize,
+    echoes: &mut [PlacedControl],
+    placed: &mut Vec<Placed>,
+) -> Vec<PlacedControl> {
+    let Some(selected) = ghost.selected.as_deref() else {
+        return Vec::new();
+    };
+    let id = format!("echo-{selected}");
+    let Some(echo) = echoes.iter_mut().find(|e| e.id == id) else {
+        return Vec::new();
+    };
+    let width = |line: &[GhostSpan]| -> usize { line.iter().map(|s| s.text.chars().count()).sum() };
+    let lines: Vec<_> = ghost
+        .row_rungs
+        .iter()
+        .filter(|rung| !rung.is_empty())
+        .map(|rung| {
+            let (mut spans, marks) = control_line(rung);
+            spans.pop(); // the line's closing rule: a row's actions end at the grid's edge
+            (spans, marks)
+        })
+        .collect();
+    let Some((line, marks)) = lines
+        .iter()
+        .find(|(l, _)| width(l) + ROW_WORDS <= cols)
+        .or_else(|| lines.iter().rev().find(|(l, _)| width(l) <= cols))
+    else {
+        return Vec::new();
+    };
+    let row = echo.row;
+    let from = cols - width(line);
+    placed.retain_mut(|p| {
+        if p.row != row || p.source.is_some() {
+            return true;
+        }
+        if p.col >= from {
+            return false;
+        }
+        p.text = clip(&p.text, from - p.col);
+        true
+    });
+    echo.end = echo.end.min(from);
+    echo.start = echo.start.min(echo.end);
+    let mut col = from;
+    for span in line {
+        let n = span.text.chars().count();
+        placed.push(Placed {
+            row,
+            col,
+            text: span.text.clone(),
+            style: span.style,
+            source: None,
+        });
+        col += n;
+    }
+    marks
+        .iter()
+        .map(|(id, start, end)| PlacedControl {
+            id: id.clone(),
+            row,
+            start: from + start,
+            end: from + end,
+        })
+        .collect()
 }
 
 /// Where each shown queue row went: the rows above the prompt's frame (`place_with` puts the
@@ -1418,6 +1513,8 @@ mod tests {
             echoes: Vec::new(),
             echo_ids: Vec::new(),
             rungs: Vec::new(),
+            selected: None,
+            row_rungs: Vec::new(),
             controls: Vec::new(),
             reserve: 0,
             reserve_from: 0,
@@ -2556,41 +2653,144 @@ mod tests {
         assert!(ids.contains(&"talk") && ids.contains(&"clear") && ids.contains(&"queue"), "{ids:?}");
     }
 
-    /// Review of #35: a selected queue row on the 46-column cover screen keeps its actions
-    /// and the slots, drawn by the renderer from the host's ladder (not cut to queue + talk).
-    #[test]
-    fn wolf_ask4_a_selected_row_keeps_its_actions_and_the_slots_on_the_cover_screen() {
-        let control = |id: &str, t: &str| Control {
-            id: id.into(),
-            spans: vec![GhostSpan {
-                text: t.into(),
-                style: GhostStyle::Dim,
-            }],
-        };
+    /// The host's ladder (ControlLine.ladder) for a line with ✕ and an open queue of three,
+    /// from the unfolded grid's words to the barest, each ending in the same slots.
+    fn bar_ladder() -> Vec<Vec<Control>> {
         let slots = [control("type", "type"), control("talk", "talk"), control("send", "send")];
-        for (first, word) in [("row-edit", "edit"), ("row-retry", "retry")] {
-            let line = |left: Vec<Control>| {
-                let mut l = left;
-                l.extend(slots.iter().cloned());
-                l
-            };
-            let wide = line(vec![
-                control(first, word),
-                control("row-drop", "drop"),
-                control("row-back", "back"),
-                control("queue", "1 queued ▲"),
-            ]);
-            let narrow = line(vec![control(first, word), control("row-drop", "drop")]);
-            let mut g = ghost(Vec::new());
-            g.controls = wide.clone();
-            g.rungs = vec![wide, narrow];
-            let cols = 46;
+        let line = |left: Vec<Control>| {
+            let mut l = left;
+            l.extend(slots.iter().cloned());
+            l
+        };
+        vec![
+            line(vec![control("clear", "✕"), control("undo", "cleared · undo"),
+                control("queue", "3 queued ▲"), control("status", "rec 0:05")]),
+            line(vec![control("clear", "✕"), control("undo", "undo"), control("queue", "≡3▲")]),
+            line(vec![control("clear", "✕"), control("queue", "≡3▲")]),
+        ]
+    }
+
+    /// Each queue row kind's actions as the host sends them (ControlLine.rowRungs), widest
+    /// first: (kind, rungs).
+    fn row_kinds() -> Vec<(&'static str, Vec<Vec<Control>>)> {
+        let c = control;
+        vec![
+            ("unsure", vec![
+                vec![c("row-again", "send again"), c("row-edit", "edit"), c("row-drop", "drop"), c("row-back", "back")],
+                vec![c("row-again", "send again"), c("row-edit", "edit"), c("row-drop", "drop")],
+                vec![c("row-again", "again"), c("row-edit", "edit"), c("row-drop", "drop")],
+            ]),
+            ("ordinary", vec![
+                vec![c("row-edit", "edit"), c("row-drop", "drop"), c("row-back", "back")],
+                vec![c("row-edit", "edit"), c("row-drop", "drop")],
+            ]),
+            ("parked", vec![
+                vec![c("row-retry", "retry"), c("row-drop", "drop"), c("row-back", "back")],
+                vec![c("row-retry", "retry"), c("row-drop", "drop")],
+            ]),
+            ("clip", vec![vec![c("row-drop", "drop"), c("row-back", "back")], vec![c("row-drop", "drop")]]),
+        ]
+    }
+
+    /// Review of #35 (r2): selecting a queue row of any kind, on the cover screen (39..46
+    /// columns) and in the first frame after a fold from the unfolded grid, keeps the slots in
+    /// their cells and the queue and ✕ beside them, and draws every one of the row's actions
+    /// on the row itself, clear of its words (Wolf's ask 4: the slots never yield).
+    #[test]
+    fn wolf_ask4_a_selected_row_of_every_kind_keeps_the_slots_and_its_actions() {
+        for (kind, rungs) in row_kinds() {
+            for cols in 39..=46 {
+                // Picked for this width, and picked for the unfolded grid (a fold).
+                for picked in [bar_ladder()[2].clone(), bar_ladder()[0].clone()] {
+                    let (rows, anchor) = claude_status_screen(cols);
+                    let mut g = ghost(Vec::new());
+                    g.controls = picked;
+                    g.rungs = bar_ladder();
+                    g.echoes = vec![
+                        vec![GhostSpan { text: "❯ an older one".into(), style: GhostStyle::Echo }],
+                        vec![
+                            GhostSpan { text: "❯ fix the failing build and push it".into(), style: GhostStyle::Bright },
+                            GhostSpan { text: "  ?".into(), style: GhostStyle::Warn },
+                        ],
+                    ];
+                    g.echo_ids = vec!["m-0".into(), "m-1".into()];
+                    let plain = place_all(&g, anchor, &rows, None);
+                    g.selected = Some("m-1".into());
+                    g.row_rungs = rungs.clone();
+                    let layout = place_all(&g, anchor, &rows, None);
+                    let at = |l: &Layout, id: &str| {
+                        l.controls.iter().find(|c| c.id == id).map(|c| (c.row, c.start, c.end))
+                    };
+                    let what = format!("{kind} at {cols}");
+                    // The slots: the same cells as with nothing selected, at the right edge.
+                    assert_eq!(at(&layout, "send"), Some((4, cols - 7, cols - 3)), "{what}");
+                    assert_eq!(at(&layout, "talk"), Some((4, cols - 14, cols - 10)), "{what}");
+                    assert_eq!(at(&layout, "type"), Some((4, cols - 21, cols - 17)), "{what}");
+                    assert_eq!(layout.controls, plain.controls, "{what}: selecting moved the line");
+                    assert!(at(&layout, "queue").is_some() && at(&layout, "clear").is_some(), "{what}");
+                    // Every action but "back" (the row itself toggles back) is on the row.
+                    let echo = layout.echoes.iter().find(|e| e.id == "echo-m-1").expect("row drawn");
+                    let ids: Vec<&str> = layout.row_actions.iter().map(|c| c.id.as_str()).collect();
+                    for want in rungs[0].iter().map(|c| c.id.as_str()).filter(|id| *id != "row-back") {
+                        assert!(ids.contains(&want), "{what}: {want} missing from {ids:?}");
+                    }
+                    let mut end = echo.end;
+                    for a in &layout.row_actions {
+                        assert_eq!(a.row, echo.row, "{what}");
+                        assert!(a.start > end && a.end <= cols, "{what}: {ids:?} {echo:?}");
+                        end = a.end;
+                    }
+                    // Nothing drawn twice on the row: its words stop short of the actions.
+                    let mut taken = vec![false; cols];
+                    for p in layout.placed.iter().filter(|p| p.row == echo.row) {
+                        for c in p.col..p.col + p.text.chars().count() {
+                            assert!(!taken[c], "{what}: cell {c} drawn twice");
+                            taken[c] = true;
+                        }
+                    }
+                    // The other row keeps its whole mark; nothing selected, nothing drawn.
+                    assert!(plain.row_actions.is_empty());
+                }
+            }
+        }
+    }
+
+    /// Review of #35 (r2): the barest line of the host's ladder is drawn, its slots in their
+    /// cells, on any grid it fits, even without the draft's margin beside it; only a narrower
+    /// grid falls back to `narrow_line`.
+    #[test]
+    fn wolf_ask4_the_slots_hold_down_to_the_barest_lines_width() {
+        let barest = bar_ladder()[2].clone();
+        let (spans, _) = control_line(&barest);
+        let least: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+        for cols in least..=60 {
             let (rows, anchor) = claude_status_screen(cols);
+            let mut g = ghost(Vec::new());
+            g.controls = bar_ladder()[0].clone();
+            g.rungs = bar_ladder();
             let layout = place_all(&g, anchor, &rows, None);
             let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
-            assert_eq!(ids, [first, "row-drop", "type", "talk", "send"], "{word}");
-            assert!(layout.controls.iter().all(|c| c.end <= cols && c.end > c.start));
+            assert!(ids.ends_with(&["type", "talk", "send"]), "{cols}: {ids:?}");
+            assert!(ids.contains(&"clear") && ids.contains(&"queue"), "{cols}: {ids:?}");
+            let send = layout.controls.iter().find(|c| c.id == "send").unwrap();
+            assert_eq!(send.end, cols - 3, "{cols}");
         }
+    }
+
+    /// A selected row that is not drawn (no room above the prompt) shows no actions anywhere:
+    /// the host drops the selection.
+    #[test]
+    fn a_selected_row_off_the_screen_draws_no_actions() {
+        let (rows, anchor) = claude_status_screen(60);
+        let mut g = ghost(Vec::new());
+        g.controls = bar_ladder()[0].clone();
+        g.echoes = vec![vec![text("❯ queued")]];
+        g.echo_ids = vec!["m-1".into()];
+        g.selected = Some("m-9".into());
+        g.row_rungs = row_kinds()[1].1.clone();
+        let layout = place_all(&g, anchor, &rows, None);
+        assert!(layout.row_actions.is_empty());
+        assert_eq!(layout.echoes.len(), 1);
     }
 
     #[test]

@@ -158,6 +158,22 @@ final class ControlTargets {
         return out;
     }
 
+    /**
+     * Each target's edges in the frame's pixels, {left, top, right, bottom}: the surface at
+     * ({@code originX}, {@code originY}) px, {@code density} px per dp. Every edge is rounded
+     * once, on its own, so a target keeps its pixels whatever else is laid out beside it; the
+     * views are placed from these ints (ComposerBar).
+     */
+    static int[][] pixels(List<Rect> rects, float originX, float originY, float density) {
+        int[][] out = new int[rects.size()][];
+        for (int i = 0; i < out.length; i++) {
+            Rect r = rects.get(i);
+            out[i] = new int[] {Math.round(originX + r.left * density), Math.round(originY + r.top * density),
+                    Math.round(originX + r.right * density), Math.round(originY + r.bottom * density)};
+        }
+        return out;
+    }
+
     /** One of the line's fixed slots: type, talk, send, or a reserved one. */
     static boolean slot(String id) {
         return "type".equals(id) || "talk".equals(id) || "send".equals(id) || id.startsWith("gap-");
@@ -169,11 +185,44 @@ final class ControlTargets {
      * not overlap the controls' targets, which reach up only to the prompt's rule.
      */
     static List<Rect> rows(List<Cells> rows, float left, float top, float cellWidth, float cellHeight, int cols) {
+        return rows(rows, java.util.Collections.<Cells>emptyList(), left, top, cellWidth, cellHeight, cols);
+    }
+
+    /**
+     * As {@link #rows(List, float, float, float, float, int)}, with the selected row's actions
+     * drawn on its right end ({@code actions}, "row-edit" ...): each takes its row from the
+     * middle of the gap before its words to the middle of the gap after (the last to the grid's
+     * edge), and the row's own target ends where the first action's begins. One row high, as
+     * the row is: no target reaches another row's words or the controls' line.
+     */
+    static List<Rect> rows(List<Cells> rows, List<Cells> actions, float left, float top, float cellWidth,
+            float cellHeight, int cols) {
         List<Rect> out = new ArrayList<>();
+        float edge = left + cols * cellWidth;
+        List<Cells> sorted = new ArrayList<>(actions);
+        sorted.sort((a, b) -> a.start - b.start);
         for (Cells c : rows) {
             float t = top + c.row * cellHeight;
-            out.add(new Rect(c.id, left, t, left + cols * cellWidth, t + cellHeight,
+            float right = edge;
+            for (Cells a : sorted) {
+                if (a.row == c.row) {
+                    right = Math.max(left + c.end * cellWidth, left + (a.start - 1) * cellWidth);
+                    break;
+                }
+            }
+            out.add(new Rect(c.id, left, t, right, t + cellHeight,
                     left + c.start * cellWidth, left + c.end * cellWidth));
+        }
+        for (int i = 0; i < sorted.size(); i++) {
+            Cells a = sorted.get(i);
+            float t = top + a.row * cellHeight;
+            Cells before = i > 0 && sorted.get(i - 1).row == a.row ? sorted.get(i - 1) : null;
+            Cells after = i + 1 < sorted.size() && sorted.get(i + 1).row == a.row ? sorted.get(i + 1) : null;
+            float l = before == null ? left + (a.start - 1) * cellWidth
+                    : left + (before.end + a.start) * cellWidth / 2;
+            float r = after == null ? edge : left + (a.end + after.start) * cellWidth / 2;
+            out.add(new Rect(a.id, Math.max(left, l), t, r, t + cellHeight,
+                    left + a.start * cellWidth, left + a.end * cellWidth));
         }
         return out;
     }

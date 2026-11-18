@@ -237,14 +237,14 @@ public final class StableBarTest {
         assertEquals("talk starts where the empty slot ends", gap.right, talk.left, 0.001f);
     }
 
-    @Test public void wolfAsk4_nineControlsAllGetTargetsThroughTheHint() {
-        // A selected unsure message with the offline status on the unfolded grid: nine controls.
-        ControlLine.State in = state(false, NOTHING_HEARD, false, true, 1, false, true);
-        in.rowActions = ControlLine.rowActions(new QueueView.Row("m", QueueView.Kind.MESSAGE, "❯ x", "?", "warn",
-                true, Outbox.State.UNSURE));
+    @Test public void wolfAsk4_theFullestLineAndASelectedRowAllGetTargetsThroughTheHint() {
+        // The fullest line (✕, undo, the queue, the offline status and the slots) with a selected
+        // unsure message on the unfolded grid: its actions come in the hint's own list, on its row.
+        ControlLine.State in = state(false, NOTHING_HEARD, false, true, 1, true, true);
         int cols = 98;
         List<GhostText.Control> line = ControlLine.controls(in, cols);
-        assertTrue(line.size() >= 9);
+        assertTrue(ControlLine.width(line) + ControlLine.MARGIN <= cols);
+        assertTrue(line.size() <= ControlLine.MAX_CONTROLS);
         StringBuilder json = new StringBuilder("{\"left\":0,\"top\":0,\"cellWidth\":9,\"cellHeight\":22,\"cols\":98,"
                 + "\"rows\":24,\"busy\":[],\"busyFrom\":24,\"controls\":[");
         List<ControlTargets.Cells> cells = drawn(line, cols);
@@ -253,17 +253,81 @@ public final class StableBarTest {
             json.append(i == 0 ? "" : ",").append("{\"id\":\"").append(c.id).append("\",\"row\":").append(c.row)
                     .append(",\"start\":").append(c.start).append(",\"end\":").append(c.end).append('}');
         }
-        json.append("]}");
+        // " send again ─ edit ─ drop ─ back" at the right end of row 17, the row's words before it.
+        json.append("],\"echoes\":[{\"id\":\"echo-m\",\"row\":17,\"start\":0,\"end\":66}],\"rowActions\":["
+                + "{\"id\":\"row-again\",\"row\":17,\"start\":67,\"end\":77},"
+                + "{\"id\":\"row-edit\",\"row\":17,\"start\":80,\"end\":84},"
+                + "{\"id\":\"row-drop\",\"row\":17,\"start\":87,\"end\":91},"
+                + "{\"id\":\"row-back\",\"row\":17,\"start\":94,\"end\":98}]}");
         ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json.toString());
         assertNotNull(hint);
         assertEquals("every drawn control reaches the composer", cells.size(), hint.controls.size());
-        List<ControlTargets.Rect> rects = ControlTargets.layout(hint.controls, 0, 0, 9, 22, 20, 24 * 22, 98 * 9, false);
-        ControlTargets.Rect send = null;
-        for (ControlTargets.Rect r : rects) if (r.id.equals("send")) send = r;
-        assertNotNull("send has its target", send);
-        // And a named activation (TalkBack's double tap) on it sends.
+        assertEquals("and every row action", 4, hint.rowActions.size());
+        List<ControlTargets.Rect> rects = new ArrayList<>(ControlTargets.layout(hint.controls, 0, 0, 9, 22, 20,
+                24 * 22, 98 * 9, false));
+        rects.addAll(ControlTargets.rows(hint.echoes, hint.rowActions, 0, 0, 9, 22, 98));
+        Map<String, ControlTargets.Rect> byId = new LinkedHashMap<>();
+        for (ControlTargets.Rect r : rects) byId.put(r.id, r);
+        for (String id : new String[] {"send", "talk", "type", "queue", "clear", "undo", "row-again", "row-edit",
+                "row-drop", "row-back", "echo-m"}) {
+            assertNotNull(id + " has its target", byId.get(id));
+        }
+        // On the row: the row's target ends where the first action's begins; no two overlap,
+        // and each covers its own words.
+        assertEquals(byId.get("echo-m").right, byId.get("row-again").left, 0.001f);
+        String[] row = {"echo-m", "row-again", "row-edit", "row-drop", "row-back"};
+        for (int i = 0; i < row.length; i++) {
+            ControlTargets.Rect r = byId.get(row[i]);
+            assertTrue(row[i], r.left <= r.labelLeft && r.right >= r.labelRight);
+            assertEquals(row[i], 17 * 22, r.top, 0.001f);
+            assertEquals(row[i], 18 * 22, r.bottom, 0.001f);
+            if (i > 0) assertTrue(row[i], byId.get(row[i - 1]).right <= r.left + 0.001f);
+        }
+        assertEquals("the last reaches the grid's edge", 98 * 9, byId.get("row-back").right, 0.001f);
+        // And a named activation (TalkBack's double tap) acts on each.
         List<String> acted = new ArrayList<>();
-        new ComposerBar.GuardedTarget("send", new TapGuard(), acted::add).onClick(null);
-        assertEquals("send", acted.get(0));
+        for (String id : new String[] {"send", "row-again"}) {
+            new ComposerBar.GuardedTarget(id, new TapGuard(), acted::add).onClick(null);
+        }
+        assertEquals("[send, row-again]", acted.toString());
+    }
+
+    @Test public void wolfAsk4_theButtonsPixelsNeverMoveAtAnyDensity() {
+        // Review of #35 (r2): 46 columns of 5.9 dp, the surface at an odd offset, density 2.75
+        // or 3: from an idle empty draft to a draft (✕ appears) and through every state, each
+        // slot target's pixels, as the composer places its views, stay the same.
+        for (float density : new float[] {2.75f, 3f, 2.625f}) {
+            for (float originX : new float[] {0f, 13.4f}) {
+                int cols = 46;
+                float cw = 5.9f, ch = 22f;
+                Map<String, String> first = new LinkedHashMap<>();
+                for (Map.Entry<String, ControlLine.State> e : states().entrySet()) {
+                    boolean recording = e.getValue().recording;
+                    List<GhostText.Control> line = ControlLine.controls(e.getValue(), cols);
+                    List<ControlTargets.Rect> rects = ControlTargets.layout(drawn(line, cols), 0, 0, cw, ch, 20,
+                            24 * ch, cols * cw, recording);
+                    int[][] px = ControlTargets.pixels(rects, originX, 30.3f, density);
+                    // As ComposerBar places them: the strip at the least left/top, each view inside it.
+                    int stripLeft = Integer.MAX_VALUE, stripTop = Integer.MAX_VALUE;
+                    for (int[] p : px) {
+                        stripLeft = Math.min(stripLeft, p[0]);
+                        stripTop = Math.min(stripTop, p[1]);
+                    }
+                    for (int i = 0; i < rects.size(); i++) {
+                        String slot = slotOf(rects.get(i).id);
+                        if (slot == null || (recording && !slot.equals("type"))) continue;
+                        int[] p = px[i];
+                        int left = stripLeft + (p[0] - stripLeft), top = stripTop + (p[1] - stripTop);
+                        String bounds = left + ".." + (left + p[2] - p[0]) + " x " + top + ".." + (top + p[3] - p[1]);
+                        String was = first.putIfAbsent(slot, bounds);
+                        if (was != null) {
+                            assertEquals(density + "x, " + e.getKey() + ": the " + slot + " pixels moved", was,
+                                    bounds);
+                        }
+                    }
+                }
+                assertEquals(3, first.size());
+            }
+        }
     }
 }

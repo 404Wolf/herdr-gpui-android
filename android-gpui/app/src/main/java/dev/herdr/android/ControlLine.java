@@ -30,8 +30,6 @@ final class ControlLine {
         int queued;
         String queueStyle = "info";
         boolean expanded;
-        /** A queued row's actions: while set, they are the whole line. */
-        List<GhostText.Control> rowActions;
     }
 
     /** The talk slot's width in cells: its words ("talk", "stop", "…") are padded to it. */
@@ -59,12 +57,14 @@ final class ControlLine {
      *       "…" while connecting or transcribing.
      * </ul>
      * Everything that comes and goes lives left of the slots, right-aligned against them, and
-     * never moves them: "✕" (something to clear), "undo", "N queued" / "≡N", a selected row's
-     * actions, and the status words ("rec 0:05", "transcribing…", "offline", "mic silenced":
+     * never moves them: "✕" (something to clear), "undo", "N queued" / "≡N", and the status words ("rec 0:05", "transcribing…", "offline", "mic silenced":
      * talk's fuller words). When the grid is narrow, the status words shorten and then go, then
      * the undo's and the queue's words shorten, then "undo" goes; "✕" and the queue control
-     * stay (items 75, 76). Narrower than even that, the renderer keeps "✕", the queue and the
-     * stop (gpui-rio ghost.rs, {@code narrow_line}).
+     * stay (items 75, 76). A selected queue row's actions are never here: the renderer draws
+     * them on that row ({@link #rowRungs}). On a grid narrower than the barest line, the
+     * renderer still draws that line without the draft's margin; only narrower than the line
+     * itself (32 cells with "✕" and "≡3▲"; {@link #width}) does it keep just "✕", the queue and
+     * talk (gpui-rio ghost.rs, {@code narrow_line}).
      */
     static java.util.List<GhostText.Control> controls(State in, int cols) {
         java.util.List<java.util.List<GhostText.Control>> ladder = ladder(in);
@@ -102,22 +102,11 @@ final class ControlLine {
         GhostText.Control fullStatus = statuses.isEmpty() ? null : statuses.get(0);
         GhostText.Control shortStatus = statuses.isEmpty() ? null : statuses.get(statuses.size() - 1);
         java.util.List<java.util.List<GhostText.Control>> left = new java.util.ArrayList<>();
-        if (in.rowActions != null && !in.rowActions.isEmpty()) {
-            // A selected row's actions, with the queue control (it closes the list) kept.
-            java.util.List<GhostText.Control> noBack = new java.util.ArrayList<>();
-            for (GhostText.Control c : in.rowActions) if (!"row-back".equals(c.id)) noBack.add(c);
-            left.add(join(in.rowActions, queueWide, shortStatus));
-            left.add(join(in.rowActions, queue));
-            left.add(join(noBack, queue));
-            // The cover screen: the row's actions and the slots; the queue closes from its row.
-            left.add(join(noBack));
-        } else {
-            left.add(line(clear, undoWide, queueWide, fullStatus));
-            left.add(line(clear, undoWide, queueWide, shortStatus));
-            left.add(line(clear, undo, queue, shortStatus));
-            left.add(line(clear, undo, queue, null));
-            left.add(line(clear, null, queue, null));
-        }
+        left.add(line(clear, undoWide, queueWide, fullStatus));
+        left.add(line(clear, undoWide, queueWide, shortStatus));
+        left.add(line(clear, undo, queue, shortStatus));
+        left.add(line(clear, undo, queue, null));
+        left.add(line(clear, null, queue, null));
         java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
         for (java.util.List<GhostText.Control> l : left) {
             java.util.List<GhostText.Control> full = new java.util.ArrayList<>(l);
@@ -176,7 +165,7 @@ final class ControlLine {
         }
     }
 
-    /** A queued row's actions, the whole line while its row is selected. */
+    /** A queued row's actions, drawn on the row while it is selected ({@link #rowRungs}). */
     static java.util.List<GhostText.Control> rowActions(QueueView.Row row) {
         java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
         if (row.kind == QueueView.Kind.MESSAGE && row.messageState == Outbox.State.UNSURE) {
@@ -189,10 +178,26 @@ final class ControlLine {
         return out;
     }
 
-    private static java.util.List<GhostText.Control> join(java.util.List<GhostText.Control> first,
-            GhostText.Control... rest) {
-        java.util.List<GhostText.Control> out = new java.util.ArrayList<>(first);
-        for (GhostText.Control control : rest) if (control != null) out.add(control);
+    /**
+     * A selected row's actions as the renderer may draw them on the row's right end, widest
+     * first (Wolf's ask 4, review of #35): all of them; without "back" (a tap on the row closes
+     * it too); for an unsure message, "send again" as "again". The renderer draws the first that
+     * leaves the row some of its words, so every row kind keeps every action on the cover
+     * screen, and the controls' line never makes room for them.
+     */
+    static java.util.List<java.util.List<GhostText.Control>> rowRungs(QueueView.Row row) {
+        java.util.List<GhostText.Control> all = rowActions(row);
+        java.util.List<GhostText.Control> noBack = new java.util.ArrayList<>();
+        java.util.List<GhostText.Control> shortest = new java.util.ArrayList<>();
+        for (GhostText.Control c : all) {
+            if ("row-back".equals(c.id)) continue;
+            noBack.add(c);
+            shortest.add("row-again".equals(c.id) ? new GhostText.Control(c.id, "again", "warn") : c);
+        }
+        java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
+        out.add(all);
+        out.add(noBack);
+        if (width(shortest) < width(noBack)) out.add(shortest);
         return out;
     }
 
