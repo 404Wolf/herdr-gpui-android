@@ -5161,6 +5161,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     static final String EXTRA_FOCUS_HOST = "focus_host", EXTRA_FOCUS_PANE = "focus_pane";
 
     @Override protected void onResume() {
+        if (prefetchTask == null) {
+            prefetchTask = prefetchWorker.scheduleWithFixedDelay(this::prefetchTick,
+                    Prefetch.EVERY_MS, Prefetch.EVERY_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
         super.onResume();
         if (isFinishing() || launch == null || shortcutJson == null || !hostStarted) return;
         hostResumed = true;
@@ -5221,6 +5225,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onPause() {
         hostResumed = false;
+        if (prefetchTask != null) {
+            prefetchTask.cancel(false);
+            prefetchTask = null;
+        }
         // Off screen nothing reconnects; onResume opens the session again.
         if (monitor != null) {
             monitor.stop();
@@ -5286,6 +5294,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         stopHostSampling();
         stopConnection();
         worker.shutdownNow();
+        prefetchWorker.shutdownNow();
         GpuiLaunch.release(launch);
         launch = null;
         shortcutJson = null;
@@ -5769,6 +5778,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * front, the keyboard showing and a fold or turn call it too.
      */
     private void markUsed() {
+        // Background reads into the offline cache wait until the phone is quiet.
+        lastUseAt = SystemClock.uptimeMillis();
         if (launch == null || launch.shell || !hostStarted) return;
         RemoteNative.used();
     }
@@ -6238,6 +6249,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     // when the attach replaced it, and is saved (and freed) now.
                     if (!current.chromePane.isEmpty() && current.hostId != null) {
                         snapshots.save(current.hostId, current.chromePane, current.remoteHandle);
+                        markSeen(current.hostId, current.chromePane, paneMarker(current.panes, current.chromePane));
                     }
                     // The pane switched to scrolls back at once through what
                     // the phone kept of it, before its history is read again.
@@ -6416,6 +6428,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** The agent status of {@code pane} in {@code panes}, "" when unlisted. */
+    /** {@code pane}'s status marker in {@code panes} (Prefetch.marker), or null. */
+    private static String paneMarker(JSONArray panes, String pane) {
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject item = panes.optJSONObject(i);
+            if (item != null && pane.equals(item.optString("id"))) return Prefetch.marker(item);
+        }
+        return null;
+    }
+
     private static String paneStatus(JSONArray panes, String pane) {
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject item = panes.optJSONObject(i);
@@ -6461,6 +6482,101 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         offline.workspaces = last[0];
         offline.tabs = last[1];
         offline.panes = last[2];
+    }
+
+    /**
+     * Reads panes not on screen into the offline cache (item 77, ask 2), one
+     * at a time on their own thread: a read may block for a minute.
+     */
+    private final java.util.concurrent.ScheduledThreadPoolExecutor prefetchWorker =
+            new java.util.concurrent.ScheduledThreadPoolExecutor(1, task -> {
+                Thread thread = new Thread(task, "herdr-prefetch");
+                thread.setDaemon(true);
+                thread.setPriority(Thread.MIN_PRIORITY);
+                return thread;
+            });
+    private java.util.concurrent.ScheduledFuture<?> prefetchTask;
+    /** When the person last touched the screen or a key: reads wait until it is quiet. */
+    private volatile long lastUseAt;
+    private final Prefetch.Budget prefetchBudget = new Prefetch.Budget();
+    private java.util.Map<String, String> prefetchSeen;
+
+    private SharedPreferences cachePreferences() {
+        return getSharedPreferences("offline-cache", MODE_PRIVATE);
+    }
+
+    /** File name → status marker of the copy the cache has (or last asked for). Prefetch worker only. */
+    private java.util.Map<String, String> prefetchSeen() {
+        if (prefetchSeen == null) {
+            SharedPreferences preferences = cachePreferences();
+            prefetchSeen = Prefetch.decode(preferences.getString("seen", "{}"));
+            prefetchBudget.day = preferences.getLong("day", 0);
+            prefetchBudget.used = preferences.getLong("used", 0);
+        }
+        return prefetchSeen;
+    }
+
+    /** Remembers that {@code pane}'s copy is as of {@code marker}. */
+    private void markSeen(String hostId, String pane, String marker) {
+        if (hostId == null || pane == null || pane.isEmpty() || marker == null) return;
+        try {
+            prefetchWorker.execute(() -> {
+                java.util.Map<String, String> seen = prefetchSeen();
+                seen.put(PaneSnapshots.name(hostId, pane), marker);
+                // Bounded like the cache it describes.
+                if (seen.size() > 4 * PaneSnapshots.MAX_FILES) seen.clear();
+                cachePreferences().edit().putString("seen", Prefetch.encode(seen)).apply();
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closing) {
+            // Shutting down.
+        }
+    }
+
+    /**
+     * One prefetch step: while the app is open, connected and untouched for
+     * Prefetch.QUIET_MS, read the best stale pane (Prefetch.plan) within the
+     * day's mobile-data budget. Prefetch worker only.
+     */
+    private void prefetchTick() {
+        if (!hostResumed || snapshots == null) return;
+        if (SystemClock.uptimeMillis() - lastUseAt < Prefetch.QUIET_MS) return;
+        final Connection c;
+        synchronized (stateLock) { c = connection; }
+        if (c == null || !c.ready || c.offline || c.isClosed() || c.remoteHandle <= 0 || c.hostId == null) return;
+        JSONArray panes = c.panes;
+        if (panes == null) return;
+        android.net.ConnectivityManager network = getSystemService(android.net.ConnectivityManager.class);
+        boolean metered = network == null || network.isActiveNetworkMetered();
+        long day = java.time.LocalDate.now().toEpochDay();
+        java.util.Map<String, String> seen = prefetchSeen();
+        if (!prefetchBudget.allows(day, metered)) return;
+        java.util.Map<String, String> byPane = new java.util.HashMap<>();
+        java.util.Map<String, String> markers = new java.util.HashMap<>();
+        for (int i = 0; i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane == null) continue;
+            String id = pane.optString("id", "");
+            String had = seen.get(PaneSnapshots.name(c.hostId, id));
+            if (had != null) byPane.put(id, had);
+            markers.put(id, Prefetch.marker(pane));
+        }
+        java.util.List<String> plan = Prefetch.plan(panes, c.chromePane, byPane);
+        if (plan.isEmpty()) return;
+        String pane = plan.get(0);
+        byte[] copy;
+        try {
+            copy = RemoteNative.prefetchPane(c.remoteHandle, pane);
+        } catch (RuntimeException | LinkageError unavailable) {
+            copy = null;
+        }
+        // Read or refused, it is not asked again until its marker moves.
+        seen.put(PaneSnapshots.name(c.hostId, pane), markers.get(pane));
+        if (copy != null) {
+            prefetchBudget.spend(day, copy.length, metered);
+            snapshots.store(c.hostId, pane, copy);
+        }
+        cachePreferences().edit().putString("seen", Prefetch.encode(seen))
+                .putLong("day", prefetchBudget.day).putLong("used", prefetchBudget.used).apply();
     }
 
     /** Computers whose live list changed since the Fleet cache was last written. */

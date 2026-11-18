@@ -383,6 +383,27 @@ fn copy_bytes(env: &mut JNIEnv<'_>, bytes: &JByteArray<'_>) -> Option<Vec<u8>> {
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_prefetchPane<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    pane: JString<'local>,
+) -> JByteArray<'local> {
+    let none = JByteArray::default();
+    let Some(pane) = read(&mut env, &pane, 1024) else {
+        return none;
+    };
+    match remote::prefetch(u64::try_from(handle).unwrap_or(0), &pane) {
+        Ok(Some(copy)) => env.byte_array_from_slice(&copy).unwrap_or(none),
+        Ok(None) => none,
+        Err(error) => {
+            fail(&mut env, &error.to_string());
+            none
+        }
+    }
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_adoptSaved(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

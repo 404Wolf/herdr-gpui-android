@@ -132,6 +132,21 @@ final class PaneSnapshots {
         });
     }
 
+    /** Keeps a copy read for the cache (unsealed bytes), sealed, as {@link #save} does. */
+    void store(String host, String pane, byte[] copy) {
+        if (host == null || pane == null || pane.isEmpty() || copy == null) return;
+        thread.execute(() -> {
+            CacheSeal sealer = seal.get();
+            if (sealer == null || !dir.isDirectory() && !dir.mkdirs()) return;
+            try {
+                sealer.write(file(host, pane), copy);
+                prune(System.currentTimeMillis());
+            } catch (IOException unsaved) {
+                // The previous copy, if any, stays.
+            }
+        });
+    }
+
     interface Missing {
         void missing();
     }

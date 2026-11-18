@@ -1128,6 +1128,54 @@ impl Connection<'_> {
             Err(error) => Err(error),
         }
     }
+    /// A copy of `pane`, not the one on screen, for the offline cache
+    /// (remote::prefetch): the same guard as a seed. None when skipped.
+    fn prefetch(&mut self, pane: &str) -> Result<Option<Vec<u8>>> {
+        let boot = {
+            let state = lock(&self.owner.state);
+            if state.view["pane_id"] == pane && self.channel != 0 {
+                return Ok(None);
+            }
+            let busy = state.view["panes"]
+                .as_array()
+                .and_then(|panes| panes.iter().find(|p| p["id"] == pane))
+                .is_none_or(|p| matches!(p["status"].as_str(), Some("working" | "blocked" | "error")));
+            if busy {
+                return Ok(None);
+            }
+            state.view["boot_id"].as_str().unwrap_or("").to_owned()
+        };
+        if pane.contains('/') {
+            return Ok(None);
+        }
+        let Some(_turn) = Stitching::take() else {
+            return Ok(None);
+        };
+        let rpc = |result: Result<Value>| match result {
+            Ok(value) => Ok(Some(value)),
+            Err(Error::Rpc { .. }) => Ok(None),
+            Err(error) => Err(error),
+        };
+        let Some(facts) = rpc(self.call("terminal.get", json!({"terminal": pane})))? else {
+            return Ok(None);
+        };
+        let size = |key: &str| facts[key].as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0);
+        let (Some(cols), Some(rows)) = (size("cols"), size("rows")) else {
+            return Ok(None);
+        };
+        let Some(viewers) = rpc(self.call("terminal.viewers", json!({"terminal": pane})))? else {
+            return Ok(None);
+        };
+        // This phone shows another pane: none of these viewers is its own.
+        if !may_stitch(&viewers, 0) {
+            return Ok(None);
+        }
+        let read = self.call_within("terminal.read", json!({"terminal": pane, "lines": STITCH_LINES}), STITCH_WAIT);
+        let Some(reply) = rpc(read)? else {
+            return Ok(None);
+        };
+        crate::remote::prefetched(&boot, pane, (cols, rows), &reply)
+    }
     fn refresh(&mut self) -> Result<()> {
         // Subscribe precedes reading the app document; doc events/missed force
         // another read. Polling also handles older cores and unlabelled workers.
@@ -2049,6 +2097,9 @@ fn serve(
             match commands.try_recv() {
                 Ok(Operation::Discover(reply)) => {
                     let _ = reply.send(connection.discover());
+                }
+                Ok(Operation::Prefetch(pane, reply)) => {
+                    let _ = reply.send(connection.prefetch(&pane));
                 }
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
@@ -5656,5 +5707,145 @@ mod cache_tests {
         assert!(Stitching::take().is_none());
         drop(first);
         assert!(Stitching::take().is_some());
+    }
+}
+
+/// Item 77, ask 2 (PR B): panes not on screen are read for the offline
+/// cache, under the same freeze guard as a seed.
+#[cfg(test)]
+mod prefetch_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::remote::State;
+    use herdr_remote_transport::CancellationToken;
+    use std::collections::HashMap;
+
+    /// Asks a mock core's session for a copy of `pane`; `answer` replies to
+    /// every RPC. The copy and the methods called.
+    fn prefetch_against(
+        pane: &str,
+        answer: impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + 'static,
+    ) -> (Result<Option<Vec<u8>>>, Vec<String>) {
+        let (phone, mut core) = UnixStream::pair().unwrap();
+        core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let (commands, rx) = mpsc::sync_channel(256);
+        let owner = Arc::new(Session {
+            id: 0,
+            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0, local: Default::default() }),
+            cancel: CancellationToken::new(),
+            commands: commands.clone(),
+            focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
+        });
+        let worker = owner.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, false, rx));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let peer = std::thread::spawn(move || {
+            let mut hello = String::new();
+            read_hello(&core, &mut hello);
+            core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"boot-pf\"},\"framed\":true}}\n").unwrap();
+            let mut decoder = Decoder::default();
+            loop {
+                let until = Instant::now() + Duration::from_secs(5);
+                let request = loop {
+                    if let Some(frame) = decoder.next().unwrap() {
+                        if frame.channel == 0 { break Some(frame); }
+                        continue;
+                    }
+                    if Instant::now() > until { break None; }
+                    let mut bytes = [0; 4096];
+                    match core.read(&mut bytes) {
+                        Ok(0) => break None,
+                        Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                        Err(_) => break None,
+                    }
+                };
+                let Some(frame) = request else { break };
+                let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                let method = request["method"].as_str().unwrap_or("").to_owned();
+                lock(&log).push(method.clone());
+                let reply = match answer(&method, &request["params"]) {
+                    Ok(result) => json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                    Err(kind) => json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":kind,"data":{"kind":kind}}}),
+                };
+                if write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        // The list must be in before the pane's status is known.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&owner.state).view["panes"].as_array().is_none_or(Vec::is_empty) {
+            assert!(Instant::now() < deadline, "the list never came");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (tx, reply) = mpsc::sync_channel(1);
+        commands.try_send(Operation::Prefetch(pane.into(), tx)).unwrap();
+        let result = reply.recv_timeout(Duration::from_secs(60)).unwrap();
+        owner.cancel.cancel();
+        let _ = runtime.join();
+        let _ = peer.join();
+        let methods = lock(&seen).clone();
+        (result, methods)
+    }
+
+    fn core(status: &'static str, viewers: Value) -> impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + 'static {
+        move |method, _| {
+            Ok(match method {
+                "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                "terminal.list" => json!({"terminals":[
+                    {"address":"t5","state":"live","status":{"state":status},"status_ms":9,"turn":2,"labels":{}}]}),
+                "doc.get" => json!({"value":{"spaces":[]},"version":1}),
+                "terminal.get" => json!({"address":"t5","cols":40,"rows":3}),
+                "terminal.viewers" => viewers.clone(),
+                "terminal.read" => json!({"how":"stitched","complete":true,
+                    "text":"● row one of claude\n● row two of claude\n● row three\n────\n❯\n  ? for shortcuts"}),
+                _ => json!({}),
+            })
+        }
+    }
+
+    #[test]
+    fn ask2_a_pane_not_on_screen_is_read_for_the_cache_and_scrolls_from_its_top() {
+        let idle_desktop = json!({"viewers":[{"identity":{"connection_id":3,"channel":2},"observe":false,
+            "focused":false,"focused_ms_ago":3_600_000,"active_ms_ago":3_600_000}]});
+        let (copy, methods) = prefetch_against("t5", core("done", idle_desktop));
+        let copy = copy.unwrap().expect("a copy");
+        assert!(methods.iter().any(|m| m == "terminal.read"));
+        let saved = crate::snapshot::parse(copy).unwrap();
+        assert_eq!((saved.cols, saved.rows, saved.history, saved.full_screen), (40, 3, Some(3), true));
+        assert_eq!(saved.boot, "boot-pf");
+        let rows: Vec<String> = crate::snapshot::saved_rows(&saved.bytes).into_iter().map(|r| r.text).collect();
+        assert_eq!(rows[0], "● row one of claude");
+        assert_eq!(rows.len(), 6);
+        let restored = crate::snapshot::restore(saved).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while restored.is_alive() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(restored.grid().lock().history_size(), 3);
+    }
+
+    #[test]
+    fn ask2_prefetch_never_freezes_a_pane_the_desktop_has_focused() {
+        let focused = json!({"viewers":[{"identity":{"connection_id":3,"channel":2},"observe":false,
+            "focused":true,"focused_ms_ago":3_600_000,"active_ms_ago":3_600_000}]});
+        let (copy, methods) = prefetch_against("t5", core("done", focused));
+        assert!(copy.unwrap().is_none());
+        assert!(!methods.iter().any(|m| m == "terminal.read"), "{methods:?}");
+    }
+
+    #[test]
+    fn ask2_prefetch_never_reads_a_pane_that_works() {
+        let (copy, methods) = prefetch_against("t5", core("working", json!({"viewers":[]})));
+        assert!(copy.unwrap().is_none());
+        let asked: HashMap<&str, ()> = methods.iter().map(|m| (m.as_str(), ())).collect();
+        assert!(!asked.contains_key("terminal.read") && !asked.contains_key("terminal.viewers"), "{methods:?}");
     }
 }

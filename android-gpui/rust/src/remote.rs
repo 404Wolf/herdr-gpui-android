@@ -310,6 +310,8 @@ impl Heard {
 }
 pub(crate) enum Operation {
     Discover(mpsc::SyncSender<Result<String>>),
+    /// A copy of a pane not on screen, read for the offline cache (item 77).
+    Prefetch(String, mpsc::SyncSender<Result<Option<Vec<u8>>>>),
     Action(String, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
 }
@@ -1286,6 +1288,41 @@ fn run(
     result
 }
 
+/// A copy of `pane` (not the one on screen) for the offline cache, read
+/// from the core with `terminal.read` (item 77, ask 2: panes Wolf may switch
+/// to with no link). Its rows are plain text, in the default colours; a
+/// full-screen program's read is the core's stitched read, which freezes the
+/// pane for its other viewers for a moment, so the same guard as a seed
+/// applies: never while it works or waits, never while anyone else has it
+/// focused or used it in the last minute, one at a time. None when skipped.
+/// Blocks the caller (the phone's prefetch worker) for up to a minute.
+pub fn prefetch(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
+    if pane.is_empty() || pane.len() > 128 {
+        return Err(Error::StaleTarget);
+    }
+    let owner = session(id)?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    owner
+        .commands
+        .try_send(Operation::Prefetch(pane.into(), tx))
+        .map_err(|_| Error::Capacity)?;
+    rx.recv_timeout(Duration::from_secs(90)).map_err(|_| Error::Closed)?
+}
+/// A pane read for the cache: its rows (history then screen) as plain text.
+pub(crate) fn prefetched(boot: &str, pane: &str, size: (u16, u16), reply: &Value) -> Result<Option<Vec<u8>>> {
+    let Some(text) = reply["text"].as_str() else {
+        return Ok(None);
+    };
+    let (cols, rows) = size;
+    let full_screen = reply["how"] != "history";
+    let complete = reply["complete"] == true;
+    let lines: Vec<crate::transcript::Row> = text.split('\n').map(crate::transcript::Row::plain).collect();
+    let screen = usize::from(rows).min(lines.len());
+    if full_screen && !boot.is_empty() {
+        adopt(boot, pane, crate::transcript::Transcript::restored(lines.clone(), screen, usize::from(cols), complete));
+    }
+    Ok(Some(crate::snapshot::copy_rows((cols, rows), pane, boot, &lines, screen, complete, full_screen)?))
+}
 /// Discovery uses the already authenticated SSH/core connection, so Android
 /// needs neither root nor access to another app's private LocalAPI socket.
 pub fn discover(id: u64) -> Result<String> {

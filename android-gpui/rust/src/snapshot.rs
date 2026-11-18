@@ -250,6 +250,28 @@ pub(crate) fn copy<U: EventListener>(
     Ok(file)
 }
 
+/// A copy from rows read as text (a pane not on screen): `rows`, the last
+/// `screen` of them its screen, on a `size` grid, with no cursor shown.
+pub(crate) fn copy_rows(
+    (cols, rows): (u16, u16),
+    pane: &str,
+    boot: &str,
+    lines: &[crate::transcript::Row],
+    screen: usize,
+    complete: bool,
+    full_screen: bool,
+) -> Result<Vec<u8>> {
+    if cols == 0 || rows == 0 {
+        return Err(Error::Snapshot);
+    }
+    let history = lines.len().saturating_sub(screen);
+    let (body, kept) = assemble(lines.iter().map(|r| r.vt.clone()).collect(), history, "\x1b[0m\x1b[?25l", MAX_BYTES);
+    let meta = Meta { history: kept, complete: complete && kept == history, full_screen };
+    let mut file = header(cols, rows, pane, boot, meta).into_bytes();
+    file.extend(body);
+    Ok(file)
+}
+
 /// Writes a [`copy`] to `path`, atomically: a temporary file, synced, then renamed.
 #[cfg(test)]
 pub(crate) fn write(file: &[u8], path: &Path) -> Result<()> {
