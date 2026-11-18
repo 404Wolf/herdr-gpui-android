@@ -264,10 +264,12 @@ pub const MAX_DRAFT_RUNS: usize = 4096;
 pub fn draft_spans(placed: &[Placed]) -> Vec<[usize; 3]> {
     let mut rows: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
     for p in placed {
-        if p.source.is_none() || p.style == GhostStyle::Caret || p.text.is_empty() {
+        // The painted caret is the draft's too: a tap on it is an edit.
+        let caret = p.style == GhostStyle::Caret;
+        if p.source.is_none() || (!caret && p.text.is_empty()) {
             continue;
         }
-        let end = p.col + cells(&p.text);
+        let end = p.col + if caret { 1 } else { cells(&p.text) };
         let span = rows.entry(p.row).or_insert((p.col, end));
         span.0 = span.0.min(p.col);
         span.1 = span.1.max(end);
@@ -342,14 +344,51 @@ type Located = (GhostSpan, usize);
 /// `spans` with where each starts in the draft.
 fn located(spans: &[GhostSpan]) -> Vec<Located> {
     let mut at = 0;
-    spans
-        .iter()
+    whole_clusters(spans)
+        .into_iter()
         .map(|span| {
             let start = at;
             at += span.text.chars().count();
-            (span.clone(), start)
+            (span, start)
         })
         .collect()
+}
+
+/// `spans` with no grapheme cluster split between two of them: a mark (an IME's composing
+/// word, a selection) that falls inside a cluster, say between an `e` and its combining accent
+/// or inside a flag, moves to the cluster's end, so the cluster is drawn, wrapped, trimmed and
+/// tapped as one. A caret between the halves goes after it. Characters keep their order, so
+/// every character's place in the draft is unchanged; a chip is never merged.
+fn whole_clusters(spans: &[GhostSpan]) -> Vec<GhostSpan> {
+    let mut out: Vec<GhostSpan> = spans.to_vec();
+    for i in 1..out.len() {
+        if out[i].style == GhostStyle::Caret || out[i].style == GhostStyle::Chip || out[i].text.is_empty() {
+            continue;
+        }
+        // The text span before it, across carets.
+        let Some(prev) = (0..i).rev().find(|&j| out[j].style != GhostStyle::Caret) else {
+            continue;
+        };
+        if out[prev].style == GhostStyle::Chip || out[prev].text.is_empty() {
+            continue;
+        }
+        loop {
+            let Some(last) = out[prev].text.graphemes(true).next_back().map(str::to_owned) else {
+                break;
+            };
+            let Some(first) = out[i].text.graphemes(true).next().map(str::to_owned) else {
+                break;
+            };
+            if format!("{last}{first}").graphemes(true).count() != 1 {
+                break;
+            }
+            out[prev].text.push_str(&first);
+            out[i].text.drain(..first.len());
+        }
+    }
+    // A span emptied into its neighbour goes; a caret between them is now after the cluster.
+    out.retain(|span| span.style == GhostStyle::Caret || !span.text.is_empty());
+    out
 }
 
 /// How many bottom rows a layout hint reports.
@@ -722,7 +761,23 @@ pub fn place_all(
                 .iter()
                 .take_while(|cells| rule(cells) || cells.iter().all(|c| c.is_whitespace()))
                 .count();
-            let draft = place_with(ghost, Some(anchor), rows, cols, 1 + free_below, &width_of)
+            // Nor over the program's text on the caret's own row: Claude's own unsent words
+            // after its cursor (typed on another client, the cursor moved back). Then the draft
+            // goes to the host's prompt, on blank cells only, below; the queue rows stay.
+            let caret_row_free = screen[anchor.row]
+                .get(anchor.col.min(cols)..)
+                .is_some_and(|cells| cells.iter().all(|c| c.is_whitespace()));
+            let without_draft;
+            let source = if caret_row_free {
+                ghost
+            } else {
+                without_draft = Ghost {
+                    draft: Vec::new(),
+                    ..ghost.clone()
+                };
+                &without_draft
+            };
+            let draft = place_with(source, Some(anchor), rows, cols, 1 + free_below, &width_of)
                 .into_iter()
                 .filter_map(|mut run| {
                     if Some(run.row) != controls_row || layout.controls.is_empty() {
@@ -770,6 +825,36 @@ pub fn place_all(
     if has_draft && !layout.draft_shown {
         let controls_from = if layout.controls.is_empty() { cols } else { cols - len };
         ghost_prompt(ghost, &mut layout, controls_row, controls_from, screen);
+    }
+    // The caret the host paints when the draft has none of its own (the keyboard not up):
+    // after the last of its words, made explicit here so it is reported and kept in the grid
+    // like any other (adapter.rs paints an explicit caret over its own guess).
+    let has_caret = layout
+        .placed
+        .iter()
+        .any(|p| p.style == GhostStyle::Caret && p.source.is_some());
+    if !has_caret {
+        let last = layout
+            .placed
+            .iter()
+            .filter(|p| {
+                p.source.is_some()
+                    && matches!(
+                        p.style,
+                        GhostStyle::Text | GhostStyle::Partial | GhostStyle::Chip | GhostStyle::Selected
+                    )
+            })
+            .last()
+            .map(|p| (p.row, p.col + cells(&p.text), p.source.map(|s| s + p.text.chars().count())));
+        if let Some((row, col, source)) = last {
+            layout.placed.push(Placed {
+                row,
+                col,
+                text: String::new(),
+                style: GhostStyle::Caret,
+                source,
+            });
+        }
     }
     // A draft that ends a row exactly puts its caret past the grid's edge: it is drawn in the
     // row's last cell instead, where it shows.
@@ -2757,5 +2842,131 @@ mod tests {
         let drawn: std::collections::BTreeSet<usize> = runs.iter().map(|r| r.row).collect();
         assert_eq!(drawn.len(), 3);
         assert_eq!(runs.first().map(|r| r.source), Some(0));
+    }
+
+    /// The keyboard down: talk, ✕ and send only (the r3 probes' line).
+    fn probe_ghost_typing(draft: &str) -> Ghost {
+        let mut g = probe_ghost(draft);
+        g.controls.remove(0);
+        g
+    }
+
+    /// Review of #34 (r3, P2#2): a draft's tail beside the controls reports its painted caret
+    /// with its words, so the host keeps talk's target off it.
+    #[test]
+    fn wolf_ask1_the_painted_caret_is_reported_with_the_draft() {
+        let rows = screen(&["Permission", "1. Yes", "2. No", "footer", "status", ""], 60);
+        let layout = place_all(&probe_ghost_typing(&"a".repeat(80)), None, &rows, None);
+        let caret = layout.placed.iter().find(|p| p.style == GhostStyle::Caret).expect("caret");
+        assert_eq!((caret.row, caret.col), (5, 40));
+        assert_eq!(draft_spans(&layout.placed), vec![[5, 2, 41]]);
+        let talk = layout.controls.iter().find(|c| c.id == "talk").expect("talk");
+        assert_eq!((talk.row, talk.start, talk.end), (5, 42, 46));
+    }
+
+    /// Review of #34 (r3, P3): without a caret of its own (the keyboard down) the draft still
+    /// gets one, reported and inside the grid on a full row.
+    #[test]
+    fn wolf_ask1_the_implicit_caret_of_a_full_row_stays_inside_the_grid() {
+        let rows = screen(&["Claude busy", "", "", "", "", ""], 60);
+        let mut g = probe_ghost(&"a".repeat(58));
+        g.draft.retain(|s| s.style != GhostStyle::Caret);
+        let layout = place_all(&g, None, &rows, None);
+        let carets: Vec<&Placed> = layout.placed.iter().filter(|p| p.style == GhostStyle::Caret).collect();
+        assert_eq!(carets.len(), 1);
+        assert!(carets[0].col < 60, "{:?}", carets[0]);
+        assert_eq!(carets[0].source, Some(58));
+        let spans = draft_spans(&layout.placed);
+        assert!(spans.iter().any(|s| s[0] == carets[0].row && s[1] <= carets[0].col && carets[0].col < s[2]));
+    }
+
+    /// Review of #34 (r3, P2#3): a style boundary inside a cluster (an IME's composing accent
+    /// after its committed base) never splits it: one cluster run, one cell, the caret after it.
+    #[test]
+    fn wolf_ask1_a_style_boundary_never_splits_a_cluster() {
+        let rows = screen(&["Claude busy", "", "", "", "", ""], 60);
+        for draft in [
+            vec![styled("e", GhostStyle::Text), styled("\u{301}", GhostStyle::Partial), styled("", GhostStyle::Caret)],
+            vec![styled("e", GhostStyle::Text), styled("", GhostStyle::Caret), styled("\u{301}x", GhostStyle::Partial)],
+            vec![styled("🇺", GhostStyle::Selected), styled("🇸 ok", GhostStyle::Text)],
+        ] {
+            let mut g = probe_ghost("");
+            g.draft = draft.clone();
+            let layout = place_all(&g, None, &rows, None);
+            let runs = super::draft_runs(&layout.placed);
+            assert!(runs[0].cluster && runs[0].source == 0, "{draft:?}: {runs:?}");
+            let text: String = draft.iter().map(|s| s.text.as_str()).collect();
+            let first = text.graphemes(true).next().unwrap();
+            assert_eq!(runs[0].chars, first.chars().count(), "{draft:?}: {runs:?}");
+            if let Some(caret) = layout.placed.iter().find(|p| p.style == GhostStyle::Caret) {
+                assert!(caret.source.unwrap() == 0 || caret.source.unwrap() >= first.chars().count(), "{caret:?}");
+            }
+        }
+    }
+
+    /// Review of #34 (r3, P2#1): Claude's own unsent words after its cursor are never covered:
+    /// the draft goes to the host's prompt on blank cells instead (here the rule beside the
+    /// controls), and the native words stay.
+    #[test]
+    fn wolf_ask1_claudes_own_words_after_its_cursor_stay_visible() {
+        let rule = "─".repeat(60);
+        let rows = screen(&["output", "", &rule, "❯ existing native text", &rule, ""], 60);
+        let anchor = locate(&rows, Some((3, 2)), PromptKind::Claude);
+        assert!(anchor.is_some());
+        let layout = place_all(&probe_ghost("phone draft"), anchor, &rows, None);
+        for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty()) {
+            let under = &rows[p.row][p.col..(p.col + cells(&p.text)).min(60)];
+            assert!(under.iter().all(|c| c.is_whitespace() || *c == '─'), "draft over the program: {p:?}");
+            assert_ne!(p.row, 3, "{p:?}");
+        }
+        assert!(layout.draft_shown, "drawn on the rule beside the controls");
+        // With the cursor at the end of Claude's words, the draft follows them at the caret.
+        let layout = place_all(&probe_ghost("phone draft"), locate(&rows, Some((3, 23)), PromptKind::Claude),
+            &rows, None);
+        assert!(layout.placed.iter().any(|p| p.row == 3 && p.col == 23 && p.text == "phone draft"));
+    }
+
+    /// Review of #34 (r3): past the bound, 1700 flags a row are one cluster run per row with
+    /// every cell and its source edges.
+    #[test]
+    fn wolf_ask1_the_whole_row_fallback_keeps_every_cell_and_its_edges() {
+        let placed: Vec<Placed> = (0..3)
+            .map(|row| Placed {
+                row,
+                col: 2,
+                text: "🇺🇸".repeat(1700),
+                style: GhostStyle::Text,
+                source: Some(row * 3400),
+            })
+            .collect();
+        let runs = super::draft_runs(&placed);
+        assert_eq!(runs.len(), 3);
+        for (row, r) in runs.iter().enumerate() {
+            assert_eq!((r.row, r.col, r.len, r.source, r.chars, r.cluster), (row, 2, 3400, row * 3400, 3400, true));
+        }
+    }
+
+    /// Review of #34 (r3): a long draft of flags, accented letters or ZWJ families keeps whole
+    /// clusters at its cut.
+    #[test]
+    fn wolf_ask1_every_kind_of_cluster_survives_the_tail() {
+        for grapheme in ["🇺🇸", "e\u{301}", "👨\u{200d}👩\u{200d}👧"] {
+            for n in 60..85 {
+                let original = grapheme.repeat(n);
+                let rows = screen(&["Claude busy", "", "", "", "", ""], 40);
+                let layout = place_all(&probe_ghost(&original), None, &rows, None);
+                let bounds: Vec<usize> = original
+                    .graphemes(true)
+                    .scan(0, |at, g| {
+                        let here = *at;
+                        *at += g.chars().count();
+                        Some(here)
+                    })
+                    .collect();
+                for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty() && p.text != "…") {
+                    assert!(bounds.contains(&p.source.unwrap()), "{grapheme} x{n}: {p:?}");
+                }
+            }
+        }
     }
 }

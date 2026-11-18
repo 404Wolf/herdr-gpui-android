@@ -243,4 +243,55 @@ public final class NativeInputTest {
         // A plain run still maps cell by cell.
         assertEquals(3, DraftTaps.drawnAt(hint.draftRuns, 4, 4.6f));
     }
+
+    @Test public void wolfAsk1_aTapOnThePaintedCaretNeverStartsTalk() {
+        // Review of #34 (r3, P2#2), the renderer's geometry (ghost.rs
+        // wolf_ask1_the_painted_caret_is_reported_with_the_draft): a dialog leaves no blank row,
+        // so an 80-character draft's tail is on the controls' row with its caret at column 40;
+        // talk's words start at 42.
+        ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse("{\"left\":0,\"top\":0,\"cellWidth\":8,"
+                + "\"cellHeight\":16,\"rows\":6,\"cols\":60,\"busy\":[0,0,0,0,0,0],\"targetsTop\":5,\"controls\":["
+                + "{\"id\":\"talk\",\"row\":5,\"start\":42,\"end\":46},{\"id\":\"clear\",\"row\":5,\"start\":49,"
+                + "\"end\":50},{\"id\":\"send\",\"row\":5,\"start\":53,\"end\":57}],\"draftSpans\":[[5,2,41]]}");
+        for (boolean recording : new boolean[] {false, true}) {
+            for (ControlTargets.Rect r : ControlTargets.layout(hint.controls, 0, 0, 8, 16, hint.targetsTop,
+                    hint.rows * 16, hint.cols * 8, recording, hint.draftSpans)) {
+                for (float x = 40 * 8; x < 41 * 8; x += 0.5f) {
+                    float y = 5 * 16 + 8;
+                    assertFalse("the caret at " + x + " is under " + r.id,
+                            x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+                }
+                assertTrue(r.id + " keeps its words", r.left <= r.labelLeft && r.right >= r.labelRight);
+            }
+        }
+    }
+
+    @Test public void wolfAsk1_anImesComposingAccentStaysWithItsLetter() {
+        // Review of #34 (r3, P2#3): "e" committed, the combining accent still composing.
+        for (String[] run : GhostText.runs("é", new GhostText.Marks(2, -1, -1, 1, 2))) {
+            assertFalse("an accent alone in style " + run[1], run[0].startsWith("́"));
+        }
+        // A selection ending inside a flag takes the whole flag.
+        List<String[]> runs = GhostText.runs("🇺🇸 ok", new GhostText.Marks(-1, 0, 2, -1, -1));
+        assertEquals("🇺🇸", runs.get(0)[0]);
+        assertEquals("selected", runs.get(0)[1]);
+    }
+
+    @Test public void wolfAsk1_aQueuedRowsPreviewKeepsAnEmojiWhole() throws Exception {
+        // Review of #34 (r3, P3): at 24 columns the preview is cut before the heart, not inside it.
+        QueueView.Row row = new QueueView.Row("m1", QueueView.Kind.MESSAGE, "❯ aaaaaaaaaaa❤️bbbbbbbbbbbbbbbbbbbb",
+                "queued", "tag", true, Outbox.State.QUEUED);
+        org.json.JSONArray drawn = GhostText.row(row, false, false, 24, java.util.Collections.<String, Long>emptyMap(),
+                java.util.Collections.<String>emptySet());
+        String text = drawn.getJSONObject(0).getString("t");
+        assertFalse(text, text.endsWith("❤…"));
+        // And the row, its words and its state, fills the 24 cells as the renderer counts them.
+        int cells = 0;
+        for (int i = 0; i < drawn.length(); i++) cells += TextCells.cells(drawn.getJSONObject(i).getString("t"));
+        assertEquals(23, cells);
+        assertEquals(2, TextCells.cells("❤️"));
+        assertEquals(1, TextCells.cells("é"));
+        assertEquals(2, TextCells.cells("🇺🇸"));
+        assertEquals(4, TextCells.cells("界界"));
+    }
 }

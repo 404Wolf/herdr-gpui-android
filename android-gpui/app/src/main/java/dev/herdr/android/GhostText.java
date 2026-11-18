@@ -143,7 +143,11 @@ final class GhostText {
         return out;
     }
 
-    /** {@code at} clamped to the text, moved out of a dictation token it falls in. */
+    /**
+     * {@code at} clamped to the text, moved out of a dictation token it falls in, and out of a
+     * grapheme cluster of the whole draft (an IME's composing word may end between an "e" and
+     * its accent, or inside a flag): to its end, so no style splits a cluster.
+     */
     private static int snap(String text, int at) {
         if (at < 0) return -1;
         at = Math.min(at, text.length());
@@ -151,7 +155,7 @@ final class GhostText {
         while (m.find()) {
             if (at > m.start() && at < m.end()) return m.end();
         }
-        return at;
+        return TextCells.clusterEnd(text, at);
     }
 
     /**
@@ -251,20 +255,29 @@ final class GhostText {
         String stateStyle = open || selected ? row.stateStyle : "tag";
         JSONArray words = new JSONArray();
         spans(words, row.text, textStyle, lengths, parked);
-        int stateWidth = row.state.isEmpty() ? 0 : row.state.codePointCount(0, row.state.length()) + 2;
+        // In the grid's cells, cluster by cluster, as the renderer draws them: a cut never splits
+        // an emoji or a letter from its accent.
+        int stateWidth = row.state.isEmpty() ? 0 : TextCells.cells(row.state) + 2;
         JSONArray out = new JSONArray();
         int room = cols == Integer.MAX_VALUE ? Integer.MAX_VALUE : Math.max(MIN_ROW_TEXT, cols - stateWidth - 1);
         int used = 0;
         for (int i = 0; i < words.length(); i++) {
             JSONObject w = words.getJSONObject(i);
             String t = w.getString("t");
-            int n = t.codePointCount(0, t.length());
+            int n = TextCells.cells(t);
             if (room != Integer.MAX_VALUE && used + n > room) {
                 int keep = Math.max(0, room - used - 1);
                 if ("chip".equals(w.getString("s"))) keep = 0; // a chip is never cut in half
-                String cut = t.substring(0, t.offsetByCodePoints(0, Math.min(keep, n)));
+                StringBuilder cut = new StringBuilder();
+                int kept = 0;
+                for (String c : TextCells.clusters(t)) {
+                    int width = TextCells.clusterCells(c);
+                    if (kept + width > keep) break;
+                    cut.append(c);
+                    kept += width;
+                }
                 out.put(span(cut + "…", textStyle));
-                used += keep + 1;
+                used += kept + 1;
                 break;
             }
             out.put(w);
