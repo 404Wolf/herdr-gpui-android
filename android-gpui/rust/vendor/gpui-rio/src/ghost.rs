@@ -2020,12 +2020,12 @@ mod tests {
         let mut failures = Vec::new();
         for row in table.lines().filter(|l| !l.is_empty()) {
             let mut parts = row.split('\t');
-            let cols: usize = parts.next().unwrap().parse().unwrap();
-            let state = parts.next().unwrap();
+            let cols: usize = parts.next().expect("a width").parse().expect("a numeric width");
+            let state = parts.next().expect("a state");
             let mut g = ghost(Vec::new());
             g.controls = parts
                 .map(|p| {
-                    let (id, text) = p.split_once('=').unwrap();
+                    let (id, text) = p.split_once('=').expect("id=text");
                     Control {
                         id: id.into(),
                         spans: vec![GhostSpan {
