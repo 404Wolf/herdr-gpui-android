@@ -218,6 +218,11 @@ pub(crate) struct Session {
     /// Whether the phone shows this session: only a visible viewer may size
     /// the pane's grid (core_session's `Claim`).
     pub(crate) visible: std::sync::atomic::AtomicBool,
+    /// Wolf's uses of the phone this session reports (item 71): the phone's
+    /// own [`USE`], which every session shares, since one person holds one
+    /// phone (a host switched to just now was just used). Tests give each
+    /// session its own.
+    pub(crate) uses: &'static LastUse,
 }
 
 /// The last time bytes arrived, lock-free: the socket loop marks it on every
@@ -329,6 +334,7 @@ pub fn connect_credentials_grid(
         focus: Mutex::new(None),
         heard: Heard::default(),
         visible: std::sync::atomic::AtomicBool::new(true),
+        uses: &USE,
     });
     let worker = owner.clone();
     std::thread::Builder::new()
@@ -359,6 +365,59 @@ pub fn set_visible(id: u64, visible: bool) -> Result<()> {
         .store(visible, Ordering::Relaxed);
     Ok(())
 }
+/// Wolf just used the phone (item 71, latest-touched device wins): a touch
+/// anywhere in Herdr, a key, Herdr coming to the front, the keyboard showing,
+/// a fold or unfold. The session on screen tells its core at once (at most
+/// once a second), and the next attach says how long ago this was.
+pub fn used() {
+    USE.mark();
+}
+/// The phone's last use, process-wide: whatever Wolf touched, the pane on
+/// screen is the one he chose.
+pub(crate) struct LastUse {
+    born: OnceLock<std::time::Instant>,
+    /// Milliseconds after `born` of the last use, plus one (0: never).
+    at_ms: AtomicU64,
+    /// Uses so far: a session sees a new one by a change.
+    count: AtomicU64,
+}
+impl LastUse {
+    pub(crate) const fn new() -> Self {
+        Self {
+            born: OnceLock::new(),
+            at_ms: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        let born = self.born.get_or_init(std::time::Instant::now);
+        u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+    pub(crate) fn mark(&self) {
+        let now = self.now_ms();
+        self.at_ms.store(now.saturating_add(1), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+    /// Milliseconds since the last use, the true age however old (the core
+    /// orders devices by it); [`NEVER_USED_MS`] when there was none: the
+    /// attach's `idle_ms`.
+    pub(crate) fn idle_ms(&self) -> u64 {
+        let now = self.now_ms();
+        match self.at_ms.load(Ordering::Relaxed) {
+            0 => NEVER_USED_MS,
+            at => now.saturating_sub(at - 1),
+        }
+    }
+}
+/// `idle_ms` for a phone never used since Herdr started: older than any
+/// core's uptime, so the core gives it no focus history (t1x1), and older
+/// than any real age, so it never sorts ahead of one. i64::MAX, so it reads
+/// the same as a signed or an unsigned number.
+pub(crate) const NEVER_USED_MS: u64 = i64::MAX as u64;
+pub(crate) static USE: LastUse = LastUse::new();
 pub fn close(id: u64) {
     let Some(owner) = lock(sessions()).remove(&id) else {
         return;
@@ -777,4 +836,32 @@ pub fn discover(id: u64) -> Result<String> {
         .map_err(|_| Error::Capacity)?;
     rx.recv_timeout(Duration::from_secs(120))
         .map_err(|_| Error::Closed)?
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod last_use_tests {
+    use super::*;
+
+    /// t217's probe on fc3d430: a one-day cap made a phone last used two days
+    /// ago look newer than a desktop idle for a day and a half.
+    #[test]
+    fn a_reconnect_after_two_days_keeps_two_days_of_idle_age() {
+        let uses = LastUse::new();
+        uses.born
+            .set(std::time::Instant::now().checked_sub(Duration::from_secs(172_800)).unwrap())
+            .unwrap();
+        uses.at_ms.store(1, Ordering::Relaxed);
+        uses.count.store(1, Ordering::Relaxed);
+        let age = uses.idle_ms();
+        assert!(age >= 172_800_000, "a two-day-old use must not become a one-day-old use on reconnect: {age}");
+        assert!(age < NEVER_USED_MS, "a real age always sorts ahead of never");
+    }
+
+    #[test]
+    fn never_used_is_older_than_any_real_age_and_reads_as_a_signed_number() {
+        let uses = LastUse::new();
+        assert_eq!(uses.idle_ms(), NEVER_USED_MS);
+        assert_eq!(json!(uses.idle_ms()).as_i64(), Some(i64::MAX));
+    }
 }

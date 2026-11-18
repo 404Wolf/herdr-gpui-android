@@ -89,6 +89,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String shortcutJson;
     private List<Shortcut> shortcuts = Collections.emptyList();
     private boolean hostStarted;
+    /** The keyboard was showing at the last insets; its showing is a use (item 71). */
+    private boolean imeShown;
+    /** The window's size in dp when last configured: a fold or turn changes it (item 71). */
+    private final int[] screenDp = new int[2];
     private volatile boolean hostResumed;
     private boolean destroyed;
     private long imeSession;
@@ -271,6 +275,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
             });
             hostStarted = true;
+            screenDp[0] = getResources().getConfiguration().screenWidthDp;
+            screenDp[1] = getResources().getConfiguration().screenHeightDp;
             createSurface();
         } catch (IllegalArgumentException invalid) {
             android.util.Log.w("herdr-gpui", "Check this host's shortcut settings");
@@ -339,7 +345,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 android.graphics.Insets bounds = insets.getInsets(WindowInsets.Type.systemBars()
                         | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
                 view.setPadding(bounds.left, bounds.top, bounds.right, bounds.bottom);
-                if (composer != null) composer.imeVisible(insets.isVisible(WindowInsets.Type.ime()));
+                boolean ime = insets.isVisible(WindowInsets.Type.ime());
+                if (ime && !imeShown) markUsed();
+                imeShown = ime;
+                if (composer != null) composer.imeVisible(ime);
             } else {
                 // Pre-R edge-to-edge uses adjustResize for IME and stable bars for our padding.
                 view.setPadding(insets.getStableInsetLeft(), insets.getStableInsetTop(),
@@ -1547,6 +1556,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     @Override public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
         clearControl();
+        // Folded, unfolded or turned: someone has the phone in hand (item 71).
+        if (configuration.screenWidthDp != screenDp[0] || configuration.screenHeightDp != screenDp[1]) {
+            if (screenDp[0] != 0) markUsed();
+            screenDp[0] = configuration.screenWidthDp;
+            screenDp[1] = configuration.screenHeightDp;
+        }
         if (terminalRoot != null) terminalRoot.post(() -> {
             // Folding to the cover crosses 600 dp: the bar swaps inline actions
             // for its overflow menu and the rail becomes a drawer, or back.
@@ -4603,6 +4618,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public boolean send(String text) { return sendComposerMessage(text); }
 
+            @Override public void typed() { markUsed(); }
+
             @Override public void enterKey() {
                 queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
             }
@@ -5082,6 +5099,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean firstOpen = !openedOnce;
         openedOnce = true;
         nativeResumed();
+        // Herdr in front is Wolf looking at it (item 71): the attach that follows says so.
+        markUsed();
         if (monitor == null && !launch.shell) {
             monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown);
         }
@@ -5169,7 +5188,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         super.onStart();
         // Postures arrive while the activity is visible, as Jetpack delivers them.
         if (foldWatcher == null) {
+            // A fold into or out of tabletop may keep the window's size: the
+            // posture change itself is the use (item 71), not its first report.
+            FoldPosture.Uses folds = new FoldPosture.Uses();
             foldWatcher = FoldPosture.Watcher.start(this, update -> main.post(() -> {
+                if (folds.isUse(posture, update)) markUsed();
                 if (update.equals(posture)) return;
                 posture = update;
                 applyPosture();
@@ -5651,7 +5674,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 && !event.isShiftPressed() && !event.isMetaPressed();
     }
 
+    /**
+     * Item 71, latest-touched device wins: Wolf is using this phone. herdr-core
+     * hears it from the session on screen (at most once a second) and from the
+     * next attach's idle time. Touches reach here before any view; the
+     * keyboard's own window does not, so typing, keys, Herdr coming to the
+     * front, the keyboard showing and a fold or turn call it too.
+     */
+    private void markUsed() {
+        if (launch == null || launch.shell || !hostStarted) return;
+        RemoteNative.used();
+    }
+
+    @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        if (event.getActionMasked() == MotionEvent.ACTION_DOWN) markUsed();
+        return super.dispatchTouchEvent(event);
+    }
+
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) markUsed();
         if (displayDialog != null && displayDialog.isShowing()) return super.dispatchKeyEvent(event);
         // Enter while typing into the composer is its send, whichever view has
         // focus: it must never reach the terminal as a bare Enter instead.

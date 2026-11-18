@@ -101,6 +101,36 @@ struct Connection<'a> {
     /// or a person picking it again) is `resumed` where the path confirmed
     /// `resize_history`, so the owner owes one whole history replacement.
     ended: Option<String>,
+    /// The core's hello advertised `automatic_input`: the terminal's own
+    /// answers to the program's queries go as AUTOMATIC_INPUT, which the
+    /// core never counts as someone using the pane (item 71).
+    automatic_input: bool,
+    /// What this viewer told the core about Wolf using it (item 71).
+    focus: Focus,
+}
+
+/// Item 71, latest-touched device wins: with a core whose hello offers
+/// `viewer_focus` and `focus_by_use`, the attach says whether Herdr is in
+/// front showing the pane (`focused`) and how long ago Wolf last used the
+/// phone (`idle_ms`); then, while the pane is shown, every use (a touch, a
+/// key, Herdr coming to the front) is a WINDOW_FOCUS 1, at most one a second,
+/// and hiding or leaving the pane a WINDOW_FOCUS 0 before VISIBILITY 0 or
+/// DETACH. Anything older gets none of it.
+#[derive(Default)]
+struct Focus {
+    /// The first hop's hello offered `viewer_focus` and `focus_by_use`.
+    offered: bool,
+    /// The current attach confirmed `focus_updates` and `focus_by_use`.
+    frames: bool,
+    /// The core was last told this viewer is focused (by the attach or a 1).
+    on: bool,
+    /// When the last WINDOW_FOCUS 1 went.
+    sent_at: Option<Instant>,
+    /// The phone's use count (`Session::uses`) last looked at.
+    uses: u64,
+    /// The attached terminal's typed inputs last looked at: typing (a key,
+    /// the raw keyboard, a paste) is a use too.
+    typed: u64,
 }
 
 /// History rows asked for in the repaint after a RESIZE: the attach's own
@@ -111,11 +141,19 @@ const RESIZE_HISTORY: usize = 1000;
 /// At most one automatic reattach of an ended stream this often.
 const REATTACH_EVERY: Duration = Duration::from_secs(5);
 
-/// Frame kinds this viewer sends besides DATA (0) and CREDIT (1).
+/// Frame kinds this viewer sends besides CREDIT (1).
+const DATA: u8 = 0;
 const DETACH: u8 = 2;
 const RESIZE: u8 = 3;
+/// Bytes for the program that nobody typed: the terminal's answers.
+const AUTOMATIC_INPUT: u8 = 6;
 /// herdr-core's viewer VISIBILITY frame: one byte, 0 hidden or 1 visible.
 const VISIBILITY: u8 = 7;
+/// herdr-core's viewer WINDOW_FOCUS frame: one byte, 1 Wolf is using this
+/// viewer (again), 0 he left it.
+const WINDOW_FOCUS: u8 = 8;
+/// WINDOW_FOCUS 1 goes on a use's leading edge, at most this often.
+const FOCUS_EVERY: Duration = Duration::from_secs(1);
 /// How long a fresh attach waits for the terminal's own measured RESIZE
 /// before offering the size it attached with and showing itself.
 const MEASURE_WAIT: Duration = Duration::from_secs(1);
@@ -161,7 +199,58 @@ impl Connection<'_> {
         self.claim.measured = true;
         Ok(())
     }
+    /// Wolf left the pane (hidden, switched away, closed): WINDOW_FOCUS 0,
+    /// before whatever hides or detaches it.
+    fn unfocus(&mut self) -> Result<()> {
+        if self.focus.frames && self.focus.on && self.channel != 0 {
+            write_frame(&mut self.socket, self.channel, WINDOW_FOCUS, &[0])?;
+        }
+        self.focus.on = false;
+        Ok(())
+    }
+    /// While the pane is shown: WINDOW_FOCUS 1 when it becomes shown without
+    /// being focused, and for each new use, at most one a second (leading edge).
+    /// A use while the pane waits to be shown (its measured RESIZE) is kept
+    /// and sent once it is; a use while hidden is not Wolf using this pane.
+    /// Hidden before ever being shown, a focused attach is unfocused.
+    fn sync_focus(&mut self) -> Result<()> {
+        // Only a session with a core that has the rule reports or records uses.
+        if !self.focus.offered {
+            return Ok(());
+        }
+        let typed = lock(&self.owner.state).terminal.as_ref().map(|t| t.inputs());
+        if let Some(typed) = typed.filter(|typed| *typed != self.focus.typed) {
+            self.focus.typed = typed;
+            self.owner.uses.mark();
+        }
+        if !self.focus.frames || self.channel == 0 {
+            return Ok(());
+        }
+        let uses = self.owner.uses.count();
+        if !self.wants_visible() {
+            self.focus.uses = uses;
+            // VISIBILITY 0 unfocuses a shown pane (sync_claim); this one never was.
+            return self.unfocus();
+        }
+        if self.claim.frames && !self.claim.shown {
+            // Measuring before showing: any use waits for the show.
+            return Ok(());
+        }
+        let used = uses != self.focus.uses;
+        self.focus.uses = uses;
+        let due = self
+            .focus
+            .sent_at
+            .is_none_or(|at| at.elapsed() >= FOCUS_EVERY);
+        if !self.focus.on || used && due {
+            write_frame(&mut self.socket, self.channel, WINDOW_FOCUS, &[1])?;
+            self.focus.on = true;
+            self.focus.sent_at = Some(Instant::now());
+        }
+        Ok(())
+    }
     fn detach(&mut self) -> Result<()> {
+        self.unfocus()?;
         if self.channel != 0 {
             write_frame(&mut self.socket, self.channel, DETACH, &[])?;
         }
@@ -188,6 +277,7 @@ impl Connection<'_> {
                 write_frame(&mut self.socket, self.channel, VISIBILITY, &[1])?;
                 self.claim.shown = true;
             } else if !want && self.claim.shown {
+                self.unfocus()?;
                 write_frame(&mut self.socket, self.channel, VISIBILITY, &[0])?;
                 self.claim.shown = false;
                 // Showing again offers a fresh size first.
@@ -219,6 +309,7 @@ impl Connection<'_> {
         if self.channel == 0 {
             return;
         }
+        let _ = self.unfocus();
         if self.claim.frames && self.claim.shown {
             let _ = write_frame(&mut self.socket, self.channel, VISIBILITY, &[0]);
         }
@@ -332,6 +423,10 @@ impl Connection<'_> {
                 }
                 2 => {
                     self.output = None;
+                    // That stream is gone: no focus frame goes on it. The
+                    // reattach (or a pick) negotiates focus again.
+                    self.focus.frames = false;
+                    self.focus.on = false;
                     let mut state = lock(&self.owner.state);
                     let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
                     if !pane.is_empty() {
@@ -956,7 +1051,13 @@ impl Connection<'_> {
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
         }
-        let mut params = attach_params(terminal, cols, rows, self.claim.offered);
+        // Herdr in front showing it, and how long ago Wolf last used the phone.
+        let focus = self
+            .focus
+            .offered
+            .then(|| (self.wants_visible(), self.owner.uses.idle_ms()));
+        let uses = self.owner.uses.count();
+        let mut params = attach_params(terminal, cols, rows, self.claim.offered, focus);
         if self.history_on_resize {
             params["resize_history"] = json!(RESIZE_HISTORY);
         }
@@ -979,6 +1080,15 @@ impl Connection<'_> {
         if self.history_on_resize && reply["resize_history"].as_u64().unwrap_or(0) == 0 {
             self.history_on_resize = false;
         }
+        // Uses before this attach are in its idle_ms, not a WINDOW_FOCUS of their own.
+        // Frames only where the pane's owner applies the rule through every hop:
+        // the reply says focus_by_use as well as focus_updates.
+        self.focus.frames =
+            self.focus.offered && reply["focus_updates"] == true && reply["focus_by_use"] == true;
+        self.focus.on = self.focus.frames && focus.is_some_and(|(focused, _)| focused);
+        self.focus.sent_at = None;
+        self.focus.uses = uses;
+        self.focus.typed = 0;
         // A core (and path) that will send RESIZE before repainting says so;
         // an older one does not, and the phone's own size stays the grid.
         self.negotiated = reply["resize_notifications"] == true;
@@ -997,6 +1107,18 @@ impl Connection<'_> {
         let input = StreamWrite {
             commands: commands.clone(),
             channel,
+            kind: DATA,
+        };
+        // Answers the core left to this viewer (a cursor report, device
+        // attributes): AUTOMATIC_INPUT where the core knows it, else DATA as before.
+        let answers = StreamWrite {
+            commands: commands.clone(),
+            channel,
+            kind: if self.automatic_input {
+                AUTOMATIC_INPUT
+            } else {
+                DATA
+            },
         };
         let session_slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead {
@@ -1006,9 +1128,10 @@ impl Connection<'_> {
             channel,
             session: session_slot.clone(),
         };
-        let terminal_session = gpui_rio::Session::start(
+        let terminal_session = gpui_rio::Session::start_with_replies(
             output,
             input,
+            answers,
             move |cols, rows| {
                 let mut bytes = Vec::from(cols.to_le_bytes());
                 bytes.extend(rows.to_le_bytes());
@@ -1409,13 +1532,26 @@ $c
 done"#;
 /// terminal.attach's parameters: the pane's size is an offer; the phone asks
 /// for RESIZE frames so it can follow the PTY's authoritative grid.
-fn attach_params(terminal: &str, cols: u16, rows: u16, visibility: bool) -> Value {
+fn attach_params(
+    terminal: &str,
+    cols: u16,
+    rows: u16,
+    visibility: bool,
+    focus: Option<(bool, u64)>,
+) -> Value {
     let mut params = json!({"terminal":terminal,"cols":cols,"rows":rows,"history":1000,"display":display(),"resize_notifications":true});
     if visibility {
         // Hidden until a measured RESIZE: the attach-time size is only the
         // phone's estimate and must not lead the grid.
         params["visibility_updates"] = json!(true);
         params["visible"] = json!(false);
+    }
+    if let Some((focused, idle_ms)) = focus {
+        // Item 71: whether Herdr is in front showing this pane, and how long
+        // ago Wolf last used the phone (an attach he caused: just now).
+        params["focus_updates"] = json!(true);
+        params["focused"] = json!(focused);
+        params["idle_ms"] = json!(idle_ms);
     }
     params
 }
@@ -1639,11 +1775,13 @@ impl Read for StreamRead {
 struct StreamWrite {
     commands: mpsc::SyncSender<Operation>,
     channel: u32,
+    /// DATA, or AUTOMATIC_INPUT for the terminal's own answers.
+    kind: u8,
 }
 impl Write for StreamWrite {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.commands
-            .try_send(Operation::Frame(self.channel, 0, bytes.to_vec()))
+            .try_send(Operation::Frame(self.channel, self.kind, bytes.to_vec()))
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         Ok(bytes.len())
     }
@@ -1729,6 +1867,11 @@ pub(crate) fn run(
         reattach: None,
         reattached_at: None,
         ended: None,
+        automatic_input: offers(&hello, "automatic_input"),
+        focus: Focus {
+            offered: offers(&hello, "viewer_focus") && offers(&hello, "focus_by_use"),
+            ..Focus::default()
+        },
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -1807,6 +1950,7 @@ fn serve(
             }
         }
         connection.sync_claim(cols, rows)?;
+        connection.sync_focus()?;
         let mut switch = lock(&owner.focus).take();
         if !connection.may_attach() {
             // Hidden without VISIBILITY frames: remember the pick, claim nothing.
@@ -2157,7 +2301,7 @@ mod tests {
     }
     #[test]
     fn attach_asks_for_resize_frames_and_reads_them() {
-        let params = attach_params("t3", 120, 40, false);
+        let params = attach_params("t3", 120, 40, false, None);
         assert_eq!(params["resize_notifications"], true);
         assert_eq!((params["cols"].as_u64(), params["rows"].as_u64()), (Some(120), Some(40)));
         let mut bytes = Vec::from(80u16.to_le_bytes());
@@ -2740,7 +2884,6 @@ mod connection_tests {
     use crate::remote::State;
     use herdr_remote_transport::CancellationToken;
     use std::collections::HashMap;
-    use std::io::BufRead;
     use std::sync::Mutex;
 
     fn frame(socket: &mut UnixStream, decoder: &mut Decoder) -> Frame {
@@ -2781,15 +2924,14 @@ mod connection_tests {
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
         let (observed, events) = mpsc::sync_channel(2);
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
-            io::BufReader::new(core.try_clone().unwrap())
-                .read_line(&mut hello)
-                .unwrap();
+            read_hello(&core, &mut hello);
             let hello: Value = serde_json::from_str(&hello).unwrap();
             assert_eq!(hello["method"], "hello");
             assert_eq!(hello["params"], json!({"framed":true,"generation":1}));
@@ -2883,6 +3025,7 @@ mod connection_tests {
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -2987,6 +3130,7 @@ mod connection_tests {
             focus: Mutex::new(None),
             heard: crate::remote::Heard::default(),
             visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
         });
         let worker = owner.clone();
         let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
@@ -3175,7 +3319,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         let lines: String = (0..30).map(|n| format!("line {n}\r\n")).collect();
@@ -3222,7 +3366,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         tx.send(Chunk::Data(text.as_bytes().to_vec())).unwrap();
@@ -3244,7 +3388,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), start.0, start.1).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         session.set_grid(grid.0, grid.1);
@@ -3368,7 +3512,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&session);
         for chunk in chunks {
@@ -3426,7 +3570,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(4096);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let pane = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), cols, rows).unwrap();
         *lock(&slot) = Arc::downgrade(&pane);
         pane.set_grid(cols, rows);
@@ -3712,7 +3856,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
         *lock(&slot) = Arc::downgrade(&session);
@@ -3741,7 +3885,7 @@ mod connection_tests {
         let (commands, _credits) = mpsc::sync_channel(64);
         let slot = Arc::new(Mutex::new(Weak::new()));
         let output = StreamRead { rx, chunks: VecDeque::new(), commands: commands.clone(), channel: 9, session: slot.clone() };
-        let input = StreamWrite { commands, channel: 9 };
+        let input = StreamWrite { commands, channel: 9, kind: DATA };
         let session = gpui_rio::Session::start(output, input, |_, _| {}, crate::shell::theme(&crate::model::palette()), 20, 4).unwrap();
         assert!(session.set_grid(20, 4));
         // As attach does: the slot is set before the stream's first item.
@@ -3850,10 +3994,24 @@ mod claim_tests {
         /// `features` is what hello advertises; `confirm` is whether the
         /// attach reply confirms VISIBILITY frames when asked for them.
         fn start(features: Value, confirm: bool, visible: bool, active: bool) -> Self {
-            Self::scripted(features, confirm, visible, active, Script::default())
+            Self::start_with(features, confirm, visible, active, false)
+        }
+
+        /// As `start`; `used`: Wolf used the phone just before the session began.
+        fn start_with(features: Value, confirm: bool, visible: bool, active: bool, used: bool) -> Self {
+            Self::begin(features, confirm, visible, active, Script::default(), used)
         }
 
         fn scripted(features: Value, confirm: bool, visible: bool, active: bool, script: Script) -> Self {
+            Self::begin(features, confirm, visible, active, script, false)
+        }
+
+        /// Each mock session reads its own record of use, so no test sees another's typing.
+        fn begin(features: Value, confirm: bool, visible: bool, active: bool, script: Script, used: bool) -> Self {
+            let uses: &'static crate::remote::LastUse = Box::leak(Box::new(crate::remote::LastUse::new()));
+            if used {
+                uses.mark();
+            }
             let (phone, mut core) = UnixStream::pair().unwrap();
             core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
             let (commands, rx) = mpsc::sync_channel(256);
@@ -3869,11 +4027,14 @@ mod claim_tests {
                 focus: Mutex::new(None),
                 heard: crate::remote::Heard::default(),
                 visible: AtomicBool::new(visible),
+                uses,
             });
             let worker = owner.clone();
             let session = std::thread::spawn(move || run(&worker, phone, 90, 40, active, rx));
             let (tx, seen) = mpsc::channel();
             let (push, pushed) = mpsc::channel::<(u32, u8, Vec<u8>)>();
+            // The owner applies the focus rule (attach replies say focus_by_use).
+            let rule = !features.as_array().is_some_and(|f| f.iter().any(|f| f == "no_rule"));
             let peer = std::thread::spawn(move || {
                 let mut attaches = 0;
                 let mut killed = false;
@@ -3897,7 +4058,7 @@ mod claim_tests {
                     }
                     while let Some(frame) = decoder.next().unwrap() {
                         if frame.channel != 0 {
-                            if matches!(frame.kind, DETACH | RESIZE | VISIBILITY) {
+                            if matches!(frame.kind, DATA | AUTOMATIC_INPUT | DETACH | RESIZE | VISIBILITY | WINDOW_FOCUS) {
                                 let _ = tx.send(Seen::Frame(frame.channel, frame.kind, frame.bytes));
                             }
                             continue;
@@ -3928,8 +4089,13 @@ mod claim_tests {
                                     continue;
                                 }
                                 next_channel += 1;
+                                let focus = request["params"]["focus_updates"] == true;
                                 let mut result = json!({"channel":next_channel - 1,"resize_notifications":script.resizes,"terminal":{"cols":90,"rows":40},
-                                       "visibility_updates": asked && confirm});
+                                       "visibility_updates": asked && confirm,
+                                       "focus_updates": focus && confirm});
+                                if focus && confirm && rule {
+                                    result["focus_by_use"] = json!(true);
+                                }
                                 if script.echo && script.echo_until.is_none_or(|n| attaches <= n) && request["params"].get("resize_history").is_some() {
                                     result["resize_history"] = request["params"]["resize_history"].clone();
                                 }
@@ -3958,6 +4124,18 @@ mod claim_tests {
 
         fn set_visible(&self, visible: bool) {
             self.owner.visible.store(visible, Ordering::Relaxed);
+        }
+
+        /// The attached terminal, as the phone's view types into it.
+        fn terminal(&self) -> Arc<gpui_rio::Session> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(terminal) = lock(&self.owner.state).terminal.clone() {
+                    return terminal;
+                }
+                assert!(Instant::now() < deadline, "no terminal attached");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         /// What the phone's terminal does when its view is laid out.
@@ -4040,6 +4218,233 @@ mod claim_tests {
         assert_eq!(core.close(), vec![Seen::Frame(3, DETACH, Vec::new())]);
     }
 
+    /// The program asks for a cursor report (DSR 6) and device attributes (DA)
+    /// and the phone types: what core sees as the terminal's answers and as typing.
+    fn answers_and_typing(features: Value) -> Vec<Seen> {
+        let core = Mock::start(features, true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        let terminal = core.terminal();
+        core.push.send((2, DATA, b"\x1b[6n".to_vec())).unwrap();
+        let mut seen = vec![core.next()];
+        core.push.send((2, DATA, b"\x1b[c".to_vec())).unwrap();
+        seen.push(core.next());
+        assert!(terminal.type_text("ls"));
+        seen.push(core.next());
+        // A core without the focus rule: typing is no use this session records.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(core.owner.uses.count(), 0, "uses recorded without focus_by_use");
+        core.close();
+        seen
+    }
+
+    #[test]
+    fn a_query_from_the_program_is_answered_as_automatic_input_not_typing() {
+        let seen = answers_and_typing(json!(["viewer_visibility", "automatic_input"]));
+        assert_eq!(seen[0], Seen::Frame(2, AUTOMATIC_INPUT, b"\x1b[1;1R".to_vec()));
+        let Seen::Frame(2, AUTOMATIC_INPUT, ref attributes) = seen[1] else { panic!("DA: {:?}", seen[1]) };
+        assert!(attributes.starts_with(b"\x1b[?"));
+        assert_eq!(seen[2], Seen::Frame(2, DATA, b"ls".to_vec()), "typing stays DATA");
+    }
+
+    #[test]
+    fn an_older_core_gets_the_answers_as_data_as_before() {
+        let seen = answers_and_typing(json!(["viewer_visibility"]));
+        assert_eq!(seen[0], Seen::Frame(2, DATA, b"\x1b[1;1R".to_vec()));
+        assert!(matches!(seen[1], Seen::Frame(2, DATA, _)));
+        assert_eq!(seen[2], Seen::Frame(2, DATA, b"ls".to_vec()));
+    }
+
+    const FOCUS_CORE: [&str; 3] = ["viewer_visibility", "viewer_focus", "focus_by_use"];
+
+    #[test]
+    fn a_focus_core_hears_each_use_at_most_once_a_second_and_a_zero_before_hiding() {
+        // Wolf used the phone just before the attach.
+        let core = Mock::start_with(json!(FOCUS_CORE), true, true, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["focus_updates"], true);
+        assert_eq!(params["focused"], true, "Herdr in front, showing the pane");
+        let idle = params["idle_ms"].as_u64().unwrap();
+        assert!(idle < 5_000, "Wolf used the phone just now: {idle} ms");
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        // The attach said it all: no WINDOW_FOCUS until Wolf does something.
+        core.quiet(Duration::from_millis(300));
+
+        core.owner.uses.mark();
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
+        // Leading edge: more uses within the second add nothing.
+        core.owner.uses.mark();
+        core.owner.uses.mark();
+        core.quiet(Duration::from_millis(400));
+        std::thread::sleep(FOCUS_EVERY);
+        core.owner.uses.mark();
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
+
+        // Hidden: 0 first, then VISIBILITY 0; uses while hidden say nothing.
+        core.set_visible(false);
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![0]));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![0]));
+        core.owner.uses.mark();
+        core.quiet(Duration::from_millis(300));
+
+        // Shown again (a resume): sized, visible, then focused.
+        core.set_visible(true);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
+
+        assert_eq!(
+            core.close(),
+            vec![
+                Seen::Frame(2, WINDOW_FOCUS, vec![0]),
+                Seen::Frame(2, VISIBILITY, vec![0]),
+                Seen::Frame(2, DETACH, Vec::new())
+            ]
+        );
+    }
+
+    /// #27 attaches a pane again by itself when the core ends its stream.
+    /// That stream is gone: no focus frame goes on it, and the new attach
+    /// carries the focus (Herdr still shows the pane) and the true idle time.
+    #[test]
+    fn a_stream_the_core_ended_gets_no_focus_frames_and_its_reattach_is_focused() {
+        let core = Mock::start_with(json!(FOCUS_CORE), true, true, true, true);
+        let Seen::Attach(_) = core.next() else { panic!("attach first") };
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        core.owner.uses.mark();
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![1]));
+        // The core ends the stream, and Wolf keeps using the phone.
+        core.push.send((2, DETACH, Vec::new())).unwrap();
+        std::thread::sleep(FOCUS_EVERY);
+        core.owner.uses.mark();
+        let mut before = Vec::new();
+        let again = loop {
+            match core.next() {
+                Seen::Attach(params) => break params,
+                seen => before.push(seen),
+            }
+        };
+        assert!(
+            !before.iter().any(|seen| matches!(seen, Seen::Frame(2, WINDOW_FOCUS, _))),
+            "a focus frame on the ended stream: {before:?}"
+        );
+        assert_eq!(again["terminal"], "t1");
+        assert_eq!(again["focus_updates"], true);
+        assert_eq!(again["focused"], true, "Herdr still shows the pane");
+        assert!(again["idle_ms"].as_u64().unwrap() < 5_000);
+        assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(3, VISIBILITY, vec![1]));
+        core.close();
+    }
+
+    #[test]
+    fn an_unfocused_attach_still_says_how_long_ago_the_phone_was_used() {
+        // t1x1 (core #94): idle_ms dates an unfocused attach's history too.
+        let core = Mock::start_with(json!(FOCUS_CORE), true, false, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["focus_updates"], true);
+        assert_eq!(params["focused"], false, "Herdr is not showing it");
+        assert!(params["idle_ms"].as_u64().unwrap() < 5_000);
+        core.owner.uses.mark();
+        core.quiet(Duration::from_millis(300));
+        core.close();
+    }
+
+    #[test]
+    fn typing_on_a_focus_core_is_a_use_and_says_so() {
+        let core = Mock::start(json!(FOCUS_CORE), true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        assert!(core.terminal().type_text("ls"));
+        let mut seen = vec![core.next(), core.next()];
+        seen.sort_by_key(|seen| matches!(seen, Seen::Frame(_, WINDOW_FOCUS, _)));
+        assert_eq!(
+            seen,
+            vec![Seen::Frame(2, DATA, b"ls".to_vec()), Seen::Frame(2, WINDOW_FOCUS, vec![1])]
+        );
+        assert_eq!(core.owner.uses.count(), 1);
+        core.close();
+    }
+
+    #[test]
+    fn leaving_a_pane_for_another_unfocuses_it_first() {
+        let _departed = crate::remote::departed_test_lock();
+        let core = Mock::start(json!(FOCUS_CORE), true, true, true);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
+        assert_eq!(core.next(), Seen::Frame(2, WINDOW_FOCUS, vec![0]));
+        assert_eq!(core.next(), Seen::Frame(2, DETACH, Vec::new()));
+        let Seen::Attach(params) = core.next() else { panic!("attach the pick") };
+        assert_eq!(params["terminal"], "t2");
+        assert_eq!(params["focused"], true);
+        core.close();
+    }
+
+    #[test]
+    fn a_core_without_focus_by_use_is_never_asked_or_told() {
+        for features in [json!(["viewer_visibility", "viewer_focus"]), json!(["viewer_visibility"])] {
+            let core = Mock::start(features, true, true, true);
+            let Seen::Attach(params) = core.next() else { panic!("attach first") };
+            for key in ["focus_updates", "focused", "idle_ms"] {
+                assert!(params.get(key).is_none(), "{key} asked of an older core");
+            }
+            assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+            assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+            core.owner.uses.mark();
+            core.quiet(Duration::from_millis(300));
+            assert_eq!(
+                core.close(),
+                vec![Seen::Frame(2, VISIBILITY, vec![0]), Seen::Frame(2, DETACH, Vec::new())]
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_that_does_not_confirm_focus_gets_no_focus_frames() {
+        // Asked, not confirmed (an older relay on the way): nothing is sent.
+        let core = Mock::start(json!(FOCUS_CORE), false, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["focus_updates"], true);
+        core.owner.uses.mark();
+        core.quiet(Duration::from_millis(1300));
+        assert!(core.close().iter().all(|seen| !matches!(seen, Seen::Frame(_, WINDOW_FOCUS, _))));
+    }
+
+    #[test]
+    fn an_owner_that_does_not_apply_the_rule_gets_no_focus_frames() {
+        // focus_updates confirmed, focus_by_use absent from the reply (an owner
+        // or hop without the rule; "no_rule" makes the mock leave it out).
+        let core = Mock::start(json!(["viewer_visibility", "viewer_focus", "focus_by_use", "no_rule"]), true, true, true);
+        let Seen::Attach(params) = core.next() else { panic!("attach first") };
+        assert_eq!(params["focus_updates"], true);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(90, 40)));
+        assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
+        core.owner.uses.mark();
+        core.quiet(Duration::from_millis(300));
+        assert_eq!(
+            core.close(),
+            vec![Seen::Frame(2, VISIBILITY, vec![0]), Seen::Frame(2, DETACH, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn idle_is_the_time_since_the_phones_last_use() {
+        let uses = crate::remote::LastUse::new();
+        assert_eq!(uses.idle_ms(), crate::remote::NEVER_USED_MS, "never used");
+        assert_eq!(uses.count(), 0);
+        uses.mark();
+        assert!(uses.idle_ms() < 1_000);
+        assert_eq!(uses.count(), 1);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(uses.idle_ms() >= 30);
+    }
+
     #[test]
     fn a_relay_that_drops_visibility_falls_back_to_detaching() {
         let core = Mock::start(json!(["viewer_visibility"]), false, true, true);
@@ -4072,7 +4477,7 @@ mod claim_tests {
         let _serial = crate::remote::departed_test_lock();
         let core = Mock::start(json!(["viewer_visibility"]), true, true, true);
         let Seen::Attach(first) = core.next() else { panic!("attach first") };
-        assert_eq!(first, attach_params("t1", 90, 40, true));
+        assert_eq!(first, attach_params("t1", 90, 40, true, None));
         core.measured(2, 100, 30);
         assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 30)));
         assert_eq!(core.next(), Seen::Frame(2, VISIBILITY, vec![1]));
@@ -4081,7 +4486,7 @@ mod claim_tests {
         *lock(&core.owner.focus) = Some(("t2".into(), Instant::now()));
         assert_eq!(core.next(), Seen::Frame(2, DETACH, Vec::new()));
         let Seen::Attach(second) = core.next() else { panic!("attach the pick") };
-        assert_eq!(second, attach_params("t2", 100, 30, true), "the attach starts at the measured size");
+        assert_eq!(second, attach_params("t2", 100, 30, true, None), "the attach starts at the measured size");
         core.measured(3, 100, 30);
         assert_eq!(core.next(), Seen::Frame(3, RESIZE, size(100, 30)));
         assert_eq!(core.next(), Seen::Frame(3, VISIBILITY, vec![1]));
@@ -4106,7 +4511,7 @@ mod claim_tests {
         assert_eq!(params["resize_history"], 1000);
         let mut without = params.clone();
         without.as_object_mut().unwrap().remove("resize_history");
-        assert_eq!(without, attach_params("t1", 90, 40, true), "nothing else changes");
+        assert_eq!(without, attach_params("t1", 90, 40, true, None), "nothing else changes");
         *lock(&echoing.owner.focus) = Some(("t2".into(), Instant::now()));
         let second = loop {
             if let Seen::Attach(params) = echoing.next() { break params }
@@ -4128,7 +4533,7 @@ mod claim_tests {
         let older = Mock::start(json!(["viewer_visibility"]), true, true, true);
         let Seen::Attach(params) = older.next() else { panic!("attach first") };
         assert!(params.get("resize_history").is_none());
-        assert_eq!(params, attach_params("t1", 90, 40, true));
+        assert_eq!(params, attach_params("t1", 90, 40, true, None));
         older.close();
     }
 
@@ -4538,5 +4943,148 @@ mod claim_tests {
         let got: Vec<String> = connection_tests::all_rows(&pane).into_iter().filter(|s| !s.is_empty()).collect();
         core.close();
         assert_eq!(got, all, "path A fallback to the previous pane still owes its repair");
+    }
+}
+
+/// t217's review probes on fc3d430 (PR #29), kept: explicit state
+/// transitions, frames captured on a socket pair, no timing guesses.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod focus_review_tests {
+    use super::*;
+    use crate::remote::{Heard, State};
+    use herdr_remote_transport::CancellationToken;
+    use std::sync::{Mutex, atomic::AtomicBool};
+
+    fn owner() -> Arc<Session> {
+        let (commands, _) = mpsc::sync_channel(256);
+        Arc::new(Session {
+            id: 0,
+            state: Mutex::new(State {
+                view: json!({"revision":0,"panes":[]}),
+                terminal: None,
+                render_id: 0,
+            }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(None),
+            heard: Heard::default(),
+            visible: AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+        })
+    }
+
+    /// After an automatic reconnect attached with an old idle_ms: focused,
+    /// not yet visible, waiting for the view's measured RESIZE.
+    fn awaiting_measurement(owner: &Arc<Session>) -> (Connection<'_>, UnixStream) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let connection = Connection {
+            socket,
+            decoder: Decoder::default(),
+            owner,
+            serial: 1,
+            channel: 2,
+            output: None,
+            events: 1,
+            event_carry: Vec::new(),
+            dirty: false,
+            negotiated: false,
+            claim: Claim {
+                offered: true,
+                frames: true,
+                attached_at: Some(Instant::now()),
+                ..Claim::default()
+            },
+            history_on_resize: false,
+            reattach: None,
+            reattached_at: None,
+            ended: None,
+            automatic_input: true,
+            focus: Focus {
+                offered: true,
+                frames: true,
+                on: true,
+                uses: owner.uses.count(),
+                ..Focus::default()
+            },
+        };
+        (connection, peer)
+    }
+
+    fn frames(peer: &mut UnixStream) -> Vec<(u32, u8, Vec<u8>)> {
+        let mut bytes = Vec::new();
+        let result = peer.read_to_end(&mut bytes);
+        assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        let mut decoder = Decoder { bytes };
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.next().unwrap() {
+            frames.push((frame.channel, frame.kind, frame.bytes));
+        }
+        frames
+    }
+
+    #[test]
+    fn a_touch_while_waiting_for_size_is_reported_when_the_pane_is_shown() {
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        owner.uses.mark();
+        connection.sync_focus().unwrap();
+        assert!(frames(&mut peer).is_empty());
+        connection.resize(90, 40).unwrap();
+        connection.sync_claim(90, 40).unwrap();
+        connection.sync_focus().unwrap();
+        let kinds: Vec<_> = frames(&mut peer).into_iter().map(|(_, kind, _)| kind).collect();
+        assert_eq!(
+            kinds,
+            [RESIZE, VISIBILITY, WINDOW_FOCUS],
+            "the touch after attach must refresh the old attach idle_ms when shown"
+        );
+    }
+
+    #[test]
+    fn an_untouched_reconnect_is_shown_without_a_focus_frame() {
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        connection.resize(90, 40).unwrap();
+        connection.sync_claim(90, 40).unwrap();
+        connection.sync_focus().unwrap();
+        let kinds: Vec<_> = frames(&mut peer).into_iter().map(|(_, kind, _)| kind).collect();
+        assert_eq!(kinds, [RESIZE, VISIBILITY], "its attach's idle_ms stands");
+    }
+
+    #[test]
+    fn hiding_before_first_measurement_unfocuses_the_focused_attach() {
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        owner.visible.store(false, Ordering::Relaxed);
+        connection.sync_claim(90, 40).unwrap();
+        connection.sync_focus().unwrap();
+        assert_eq!(
+            frames(&mut peer),
+            [(2, WINDOW_FOCUS, vec![0])],
+            "the focused attach must receive 0 even though VISIBILITY is already 0"
+        );
+    }
+
+    #[test]
+    fn first_use_after_hide_bypasses_the_existing_rate_limit() {
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        connection.claim.shown = true;
+        connection.focus.sent_at = Some(Instant::now());
+        owner.visible.store(false, Ordering::Relaxed);
+        connection.sync_claim(90, 40).unwrap();
+        assert_eq!(
+            frames(&mut peer),
+            [(2, WINDOW_FOCUS, vec![0]), (2, VISIBILITY, vec![0])]
+        );
+        owner.visible.store(true, Ordering::Relaxed);
+        connection.resize(90, 40).unwrap();
+        connection.sync_claim(90, 40).unwrap();
+        owner.uses.mark();
+        connection.sync_focus().unwrap();
+        let frames = frames(&mut peer);
+        assert_eq!(frames.last(), Some(&(2, WINDOW_FOCUS, vec![1])));
     }
 }

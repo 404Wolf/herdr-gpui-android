@@ -100,6 +100,8 @@ final class ComposerBar {
         View surface();
         /** Shows the keyboard typing straight into the program (its menus, y/n). */
         void rawKeyboard();
+        /** Wolf typed into the draft: he is using the phone (item 71). */
+        default void typed() { }
     }
 
     private static final String PREFS = "terminal-display";
@@ -1362,6 +1364,7 @@ final class ComposerBar {
             }
             @Override public void afterTextChanged(Editable s) {
                 if (updatingField) return;
+                host.typed();
                 // A keyboard that types "\n" for Enter: send, as the button does.
                 String withoutNewline = insertingNewline ? null
                         : EnterPaths.withoutTypedNewline(s, changeStart, changeBefore, changeCount);

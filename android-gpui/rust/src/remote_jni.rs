@@ -456,6 +456,16 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_close(
     remote::close(handle as u64);
 }
 
+/// Wolf used the phone (item 71): see [`remote::used`]. Cheap: an atomic store.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_used(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    remote::used();
+}
+
 /// Opens a raw login shell. Blocks for the SSH handshake: Java's worker only.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
