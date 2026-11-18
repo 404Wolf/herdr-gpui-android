@@ -869,11 +869,19 @@ final class ComposerBar {
         for (ControlTargets.Rect rect : rects) {
             View target = new View(context);
             target.setTag(rect.id);
-            target.setContentDescription(describe(rect.id));
-            // One per target: each finger's gesture is decided on its own touch path.
-            GuardedTarget guarded = new GuardedTarget(rect.id, tapGuard, this::targetTapped);
-            target.setOnTouchListener(guarded);
-            target.setOnClickListener(guarded);
+            if (!ControlLine.tappable(rect.id)) {
+                // A reserved slot (Wolf's ask 4): it takes a tap and does nothing, so a finger
+                // there neither reaches a neighbour nor the program under the bar; TalkBack
+                // does not offer it.
+                target.setOnTouchListener((v, e) -> true);
+                target.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            } else {
+                target.setContentDescription(describe(rect.id));
+                // One per target: each finger's gesture is decided on its own touch path.
+                GuardedTarget guarded = new GuardedTarget(rect.id, tapGuard, this::targetTapped);
+                target.setOnTouchListener(guarded);
+                target.setOnClickListener(guarded);
+            }
             if ("send".equals(rect.id)) {
                 target.setOnLongClickListener(v -> { setKeysOpen(!keysOpen); return true; });
             } else if ("clear".equals(rect.id)) {
@@ -1196,7 +1204,7 @@ final class ComposerBar {
     /**
      * "talk"'s words for {@link ControlLine}: what the dictation is doing, fullest first, as
      * status words left of the slots ("rec 0:05", "transcribing…", "offline", "mic silenced";
-     * none when there is nothing to say), and last the slot's own word ("talk", "● stop", "…").
+     * none when there is nothing to say), and last the slot's own word ("talk", "stop", "…").
      */
     private List<GhostText.Control> talks() {
         long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
@@ -1216,7 +1224,7 @@ final class ComposerBar {
             case LISTENING:
                 out.add(new GhostText.Control("talk", "rec " + clock, "danger"));
                 out.add(new GhostText.Control("talk", clock, "danger"));
-                out.add(new GhostText.Control("talk", "● stop", "danger"));
+                out.add(new GhostText.Control("talk", "stop", "danger"));
                 break;
             case TRANSCRIBING:
                 out.add(new GhostText.Control("talk", finishing ? "finishing…" : "transcribing…", "info"));
@@ -1227,7 +1235,7 @@ final class ComposerBar {
                 out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline") + " · rec " + clock,
                         "warn"));
                 out.add(new GhostText.Control("talk", (desktopError ? "error " : "offline ") + clock, "warn"));
-                out.add(new GhostText.Control("talk", "● stop", "warn"));
+                out.add(new GhostText.Control("talk", "stop", "warn"));
                 break;
             }
             case OFFLINE_RECORDING:
@@ -1235,7 +1243,7 @@ final class ComposerBar {
                 out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline")
                         + " · queued · rec " + clock, "warn"));
                 out.add(new GhostText.Control("talk", "queued " + clock, "warn"));
-                out.add(new GhostText.Control("talk", "● stop", "warn"));
+                out.add(new GhostText.Control("talk", "stop", "warn"));
                 break;
             default: {
                 // "Nothing heard" (#31) and "offline" stay as status words; waiting recordings are

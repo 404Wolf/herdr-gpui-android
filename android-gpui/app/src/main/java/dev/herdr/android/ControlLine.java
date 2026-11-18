@@ -34,8 +34,10 @@ final class ControlLine {
         List<GhostText.Control> rowActions;
     }
 
-    /** The talk slot's width in cells: its words ("talk", "● stop", "…") are padded to it. */
-    static final int TALK_SLOT = 6;
+    /** The talk slot's width in cells: its words ("talk", "stop", "…") are padded to it. */
+    static final int TALK_SLOT = 4;
+    /** The most controls a line has (the renderer's limit, ghost_bridge MAX_CONTROLS). */
+    static final int MAX_CONTROLS = 10;
     /** Ids of the reserved, untappable cells and the status words: never touch targets. */
     static final String GAP_TYPE = "gap-type", GAP_SEND = "gap-send", STATUS = "status";
 
@@ -52,7 +54,7 @@ final class ControlLine {
      *   <li>"type" leaves its slot while the keyboard is up (#30: no Herdr hide), and "send"
      *       while recording (no tap meant for the stop sends); each slot then shows the rule,
      *       untappable, so nothing beside it moves.
-     *   <li>"talk" is its shortest words, padded to {@link #TALK_SLOT}: "talk", "● stop" while
+     *   <li>"talk" is its shortest words, padded to {@link #TALK_SLOT}: "talk", "stop" while
      *       recording (the stop's target takes the bottom-right corner, {@link ControlTargets}),
      *       "…" while connecting or transcribing.
      * </ul>
@@ -107,6 +109,8 @@ final class ControlLine {
             left.add(join(in.rowActions, queueWide, shortStatus));
             left.add(join(in.rowActions, queue));
             left.add(join(noBack, queue));
+            // The cover screen: the row's actions and the slots; the queue closes from its row.
+            left.add(join(noBack));
         } else {
             left.add(line(clear, undoWide, queueWide, fullStatus));
             left.add(line(clear, undoWide, queueWide, shortStatus));
@@ -145,9 +149,16 @@ final class ControlLine {
         if (n >= cells) return spans;
         int before = (cells - n) / 2, after = cells - n - before;
         String[] out = spans.clone();
-        out[0] = " ".repeat(before) + out[0];
-        out[out.length - 2] = out[out.length - 2] + " ".repeat(after);
+        out[0] = spaces(before) + out[0];
+        out[out.length - 2] = out[out.length - 2] + spaces(after);
         return out;
+    }
+
+    /** {@code n} spaces (String.repeat needs API 33; the app runs from 29). */
+    static String spaces(int n) {
+        char[] out = new char[Math.max(0, n)];
+        java.util.Arrays.fill(out, ' ');
+        return new String(out);
     }
 
     private static String ids(java.util.List<GhostText.Control> line) {

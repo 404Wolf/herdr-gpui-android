@@ -153,9 +153,14 @@ public final class ControlTargetsTest {
                             List<ControlTargets.Cells> all = drawn(line, cols, 41);
                             List<ControlTargets.Rect> rects = ControlTargets.layout(all, 0, 0, cw, 26f,
                                     40, 43 * 26f, maxRight, recording);
-                            // Reserved slots and the status words take no taps (ask 4).
+                            // The status words take no target; a reserved slot has one that does
+                            // nothing, in its place (ask 4), and the stop covers the reserved send.
                             List<ControlTargets.Cells> cells = new java.util.ArrayList<>();
-                            for (ControlTargets.Cells c : all) if (ControlLine.tappable(c.id)) cells.add(c);
+                            for (ControlTargets.Cells c : all) {
+                                if (ControlLine.STATUS.equals(c.id)) continue;
+                                if (recording && ControlLine.GAP_SEND.equals(c.id)) continue;
+                                cells.add(c);
+                            }
                             String where = cw + "dp " + cols + " cols " + talks + " typing=" + typing
                                     + " recording=" + recording;
                             assertEquals(where, cells.size(), rects.size());

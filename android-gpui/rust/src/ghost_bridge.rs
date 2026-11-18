@@ -234,9 +234,6 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
             .into_iter()
             .map(controls_of)
             .collect::<Result<_>>()?,
-                })
-            })
-            .collect::<Result<_>>()?,
         reserve: wire.reserve,
         reserve_from: wire.reserve_from,
         colors: GhostColors {
@@ -451,15 +448,26 @@ mod tests {
     }
 
     #[test]
-    fn six_controls_and_coloured_queue_rows_are_accepted() {
+    fn up_to_ten_controls_and_coloured_queue_rows_are_accepted() {
         let control = |id: &str| format!(r#"{{"id":"{id}","spans":[{{"t":"{id}","s":"dim"}}]}}"#);
         let six: Vec<String> = ["type", "talk", "clear", "undo", "send", "queue"].iter().map(|id| control(id)).collect();
         let ghost = parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{}]}}"#, six.join(",")))
             .expect("six controls");
         assert_eq!(ghost.controls.len(), 6);
         assert_eq!(ghost.controls[2].id, "clear");
-        let seven = format!("{},{}", six.join(","), control("more"));
-        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{seven}]}}"#)).is_err());
+        // Ten (the fixed slots with a selected row's actions, the queue and the status words),
+        // never eleven (Wolf's ask 4).
+        let ten: Vec<String> = [
+            "row-again", "row-edit", "row-drop", "row-back", "queue", "status", "type", "talk", "send", "gap-send",
+        ]
+        .iter()
+        .map(|id| control(id))
+        .collect();
+        let ghost = parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{}]}}"#, ten.join(",")))
+            .expect("ten controls");
+        assert_eq!(ghost.controls.len(), 10);
+        let eleven = format!("{},{}", ten.join(","), control("more"));
+        assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{eleven}]}}"#)).is_err());
         let rows = format!(
             r#"{{"kind":"claude",{COLORS},"echoes":[[{{"t":"❯ hi","s":"bright"}},{{"t":"  ● sending…","s":"info"}}],[{{"t":"❯ x","s":"echo"}},{{"t":"  ✗ not sent","s":"danger"}}]]}}"#
         );

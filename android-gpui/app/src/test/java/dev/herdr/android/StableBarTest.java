@@ -1,7 +1,9 @@
 package dev.herdr.android;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 import dev.herdr.android.dictation.DictationEngine;
 import dev.herdr.android.dictation.DictationException;
@@ -28,12 +30,12 @@ public final class StableBarTest {
 
     private static final List<GhostText.Control> IDLE = talks("dim", "talk");
     private static final List<GhostText.Control> CONNECTING = talks("info", "connecting…", "…");
-    private static final List<GhostText.Control> RECORDING = talks("danger", "rec 0:05", "0:05", "● stop");
+    private static final List<GhostText.Control> RECORDING = talks("danger", "rec 0:05", "0:05", "stop");
     private static final List<GhostText.Control> TRANSCRIBING = talks("info", "transcribing…", "…");
     private static final List<GhostText.Control> ON_PHONE = talks("warn", "offline · rec 0:05", "offline 0:05",
-            "● stop");
+            "stop");
     private static final List<GhostText.Control> FOR_LATER = talks("warn", "desktop error · queued · rec 0:05",
-            "queued 0:05", "● stop");
+            "queued 0:05", "stop");
     private static final List<GhostText.Control> NOTHING_HEARD = talks("warn", "offline · mic sent silence",
             "offline · silence", "talk");
 
@@ -165,32 +167,103 @@ public final class StableBarTest {
         }
     }
 
-    @Test public void wolfAsk4_theTouchTargetsOfTypeAndSendNeverMoveWhileShown() {
-        // The finger's bounds, not only the words: the targets the composer lays over them.
-        int cols = 46;
-        float cw = 9f, ch = 22f;
-        Map<String, String> first = new LinkedHashMap<>();
-        for (Map.Entry<String, ControlLine.State> e : states().entrySet()) {
-            List<GhostText.Control> line = ControlLine.controls(e.getValue(), cols);
-            List<ControlTargets.Cells> cells = new ArrayList<>();
-            int col = cols - ControlLine.width(line);
-            for (int i = 0; i < line.size(); i++) {
-                col += i == 0 ? 1 : 3;
-                int start = col;
-                GhostText.Control c = line.get(i);
-                for (int s = 0; s + 1 < c.spans.length; s += 2) {
-                    col += c.spans[s].codePointCount(0, c.spans[s].length());
+    /** The line's cells on row 20 as the renderer draws them, right-aligned on {@code cols}. */
+    private static List<ControlTargets.Cells> drawn(List<GhostText.Control> line, int cols) {
+        List<ControlTargets.Cells> cells = new ArrayList<>();
+        int col = cols - ControlLine.width(line);
+        for (int i = 0; i < line.size(); i++) {
+            col += i == 0 ? 1 : 3;
+            int start = col;
+            GhostText.Control c = line.get(i);
+            for (int s = 0; s + 1 < c.spans.length; s += 2) col += c.spans[s].codePointCount(0, c.spans[s].length());
+            cells.add(new ControlTargets.Cells(c.id, 20, start, col));
+        }
+        return cells;
+    }
+
+    /** The slot a target is ("type" for "gap-type", "send" for "gap-send"), or null. */
+    private static String slotOf(String id) {
+        if (id.equals("type") || id.equals("gap-type")) return "type";
+        if (id.equals("send") || id.equals("gap-send")) return "send";
+        return id.equals("talk") ? "talk" : null;
+    }
+
+    @Test public void wolfAsk4_theButtonsTouchBoundsNeverMoveAtCompactAndWideCells() {
+        // The finger's bounds, not only the words: the targets the composer lays over them, an
+        // empty slot's included, at the compact 5.9 dp cell and a wide 9 dp one. While recording
+        // the stop owns the corner (its own, larger, bounds): that is the one exception.
+        for (float cw : new float[] {5.9f, 9f}) {
+            for (int cols : new int[] {46, 98}) {
+                float ch = 22f;
+                Map<String, String> first = new LinkedHashMap<>();
+                for (Map.Entry<String, ControlLine.State> e : states().entrySet()) {
+                    boolean recording = e.getValue().recording;
+                    List<GhostText.Control> line = ControlLine.controls(e.getValue(), cols);
+                    for (ControlTargets.Rect r : ControlTargets.layout(drawn(line, cols), 0, 0, cw, ch, 20, 24 * ch,
+                            cols * cw, recording)) {
+                        String slot = slotOf(r.id);
+                        if (slot == null || (recording && !slot.equals("type"))) continue;
+                        String bounds = r.left + ".." + r.right + " x " + r.top + ".." + r.bottom;
+                        String was = first.putIfAbsent(slot, bounds);
+                        if (was != null) {
+                            assertEquals(cw + " dp, " + cols + " cols, " + e.getKey() + ": the " + slot
+                                    + " target moved", was, bounds);
+                        }
+                    }
                 }
-                cells.add(new ControlTargets.Cells(c.id, 20, start, col));
-            }
-            boolean recording = e.getValue().recording;
-            for (ControlTargets.Rect r : ControlTargets.layout(cells, 0, 0, cw, ch, 20, 24 * ch, cols * cw,
-                    recording)) {
-                if (!r.id.equals("type") && !r.id.equals("send")) continue;
-                String bounds = r.left + ".." + r.right + " x " + r.top + ".." + r.bottom;
-                String was = first.putIfAbsent(r.id, bounds);
-                if (was != null) assertEquals(e.getKey() + ": the " + r.id + " target moved", was, bounds);
+                assertEquals(cw + " dp " + cols + " cols", 3, first.size());
             }
         }
+    }
+
+    @Test public void wolfAsk4_anEmptySlotTakesItsWholePlaceAndNoNeighbourGrowsIntoIt() {
+        float cw = 5.9f, ch = 22f;
+        int cols = 46;
+        ControlLine.State typing = states().get("keyboard shown");
+        List<ControlTargets.Rect> rects = ControlTargets.layout(drawn(ControlLine.controls(typing, cols), cols), 0, 0,
+                cw, ch, 20, 24 * ch, cols * cw, false);
+        ControlTargets.Rect gap = null, talk = null;
+        for (ControlTargets.Rect r : rects) {
+            if (r.id.equals("gap-type")) gap = r;
+            if (r.id.equals("talk")) talk = r;
+        }
+        assertNotNull("the empty type slot has a target", gap);
+        assertFalse("it does nothing and is no button", ControlLine.tappable(gap.id));
+        // Every point of the slot's words is in it, none in talk's.
+        for (float x = gap.labelLeft; x < gap.labelRight; x += 0.5f) {
+            assertTrue(x >= gap.left && x < gap.right);
+            assertFalse(x >= talk.left && x < talk.right);
+        }
+        assertEquals("talk starts where the empty slot ends", gap.right, talk.left, 0.001f);
+    }
+
+    @Test public void wolfAsk4_nineControlsAllGetTargetsThroughTheHint() {
+        // A selected unsure message with the offline status on the unfolded grid: nine controls.
+        ControlLine.State in = state(false, NOTHING_HEARD, false, true, 1, false, true);
+        in.rowActions = ControlLine.rowActions(new QueueView.Row("m", QueueView.Kind.MESSAGE, "❯ x", "?", "warn",
+                true, Outbox.State.UNSURE));
+        int cols = 98;
+        List<GhostText.Control> line = ControlLine.controls(in, cols);
+        assertTrue(line.size() >= 9);
+        StringBuilder json = new StringBuilder("{\"left\":0,\"top\":0,\"cellWidth\":9,\"cellHeight\":22,\"cols\":98,"
+                + "\"rows\":24,\"busy\":[],\"busyFrom\":24,\"controls\":[");
+        List<ControlTargets.Cells> cells = drawn(line, cols);
+        for (int i = 0; i < cells.size(); i++) {
+            ControlTargets.Cells c = cells.get(i);
+            json.append(i == 0 ? "" : ",").append("{\"id\":\"").append(c.id).append("\",\"row\":").append(c.row)
+                    .append(",\"start\":").append(c.start).append(",\"end\":").append(c.end).append('}');
+        }
+        json.append("]}");
+        ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json.toString());
+        assertNotNull(hint);
+        assertEquals("every drawn control reaches the composer", cells.size(), hint.controls.size());
+        List<ControlTargets.Rect> rects = ControlTargets.layout(hint.controls, 0, 0, 9, 22, 20, 24 * 22, 98 * 9, false);
+        ControlTargets.Rect send = null;
+        for (ControlTargets.Rect r : rects) if (r.id.equals("send")) send = r;
+        assertNotNull("send has its target", send);
+        // And a named activation (TalkBack's double tap) on it sends.
+        List<String> acted = new ArrayList<>();
+        new ComposerBar.GuardedTarget("send", new TapGuard(), acted::add).onClick(null);
+        assertEquals("send", acted.get(0));
     }
 }

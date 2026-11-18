@@ -55,7 +55,7 @@ public final class ControlLineTest {
         java.util.List<GhostText.Control> idle = controls(false, IDLE, 0, Integer.MAX_VALUE, false, false);
         assertEquals("type talk send", ids(idle));
         assertEquals("type", idle.get(0).spans[0]);
-        assertEquals(" talk ", byId(idle, "talk").spans[0]);
+        assertEquals("talk", byId(idle, "talk").spans[0]);
         // #30: no "type" while the keyboard is up, and no Herdr hide: its slot keeps the rule.
         java.util.List<GhostText.Control> typing = controls(true, IDLE, 0, Integer.MAX_VALUE, false, false);
         assertEquals("gap-type talk send", ids(typing));
@@ -64,7 +64,7 @@ public final class ControlLineTest {
         // Recording: no "send" (the stop owns the corner), its slot keeps the rule.
         java.util.List<GhostText.Control> rec = controls(false, LISTENING, 0, Integer.MAX_VALUE, true, true);
         assertEquals("clear status type talk gap-send", ids(rec));
-        assertEquals("● stop", byId(rec, "talk").spans[0]);
+        assertEquals("stop", byId(rec, "talk").spans[0]);
         assertEquals("rec 0:05", byId(rec, "status").spans[0]);
         assertFalse(ControlLine.tappable("status"));
     }
@@ -106,10 +106,12 @@ public final class ControlLineTest {
     }
 
     @Test public void theLineIsMeasuredAsTheRendererDrawsIt() {
-        // " type ─  talk  ─ send ──": talk's slot is six cells.
-        assertEquals(24, ControlLine.width(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
-        // " ✕ ─ 2 queued ─ type ─  talk  ─ send ──": the cross and rules are one cell each.
-        assertEquals(39, ControlLine.width(controls(false, IDLE, 2, Integer.MAX_VALUE, false, true)));
+        // " type ─ talk ─ send ──": talk's slot is four cells.
+        assertEquals(22, ControlLine.width(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
+        // " ✕ ─ 2 queued ─ type ─ talk ─ send ──": the cross and rules are one cell each.
+        assertEquals(37, ControlLine.width(controls(false, IDLE, 2, Integer.MAX_VALUE, false, true)));
+        // A padded word: "…" in the middle of talk's four cells.
+        assertEquals(" …  ", ControlLine.padded(new String[] {"…", "info"}, ControlLine.TALK_SLOT)[0]);
     }
 
     @Test public void theCoverScreenLadderNeverDropsClearTheQueueOrTheStop() {
@@ -121,13 +123,13 @@ public final class ControlLineTest {
                 assertTrue(at, ids(line).contains("clear"));
                 assertTrue(at, ids(line).contains("queue"));
                 assertTrue(at, ids(line).contains("talk"));
-                if (cols >= 41) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
+                if (cols >= 39) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
             }
         }
         // The cover screen (~46 columns) recording: the status words shorten, then go.
         assertEquals("0:05", byId(controls(false, LISTENING, 3, 52, true, true), "status").spans[0]);
-        assertEquals("clear queue type talk gap-send", ids(controls(false, LISTENING, 3, 44, true, true)));
-        assertEquals("≡3", byId(controls(false, IDLE, 3, 44, false, true), "queue").spans[0]);
+        assertEquals("clear queue type talk gap-send", ids(controls(false, LISTENING, 3, 41, true, true)));
+        assertEquals("≡3", byId(controls(false, IDLE, 3, 41, false, true), "queue").spans[0]);
     }
 
     @Test public void undoTakesItsWordsAndGivesWayBeforeClearAndTheQueue() {
@@ -155,6 +157,18 @@ public final class ControlLineTest {
         ControlLine.State in = state(false, IDLE, 1, false, true);
         in.rowActions = ControlLine.rowActions(queued);
         assertEquals("row-edit row-drop row-back queue type talk send", ids(ControlLine.controls(in, 200)));
+        // The cover screen (46 columns): the row's actions and the slots still fit (review of #35).
+        for (java.util.List<GhostText.Control> acts : java.util.Arrays.asList(ControlLine.rowActions(queued),
+                ControlLine.rowActions(parked), ControlLine.rowActions(clip))) {
+            ControlLine.State cover = state(false, IDLE, 1, false, true);
+            cover.expanded = true;
+            cover.rowActions = acts;
+            java.util.List<GhostText.Control> line = ControlLine.controls(cover, 46);
+            assertTrue(ids(line), ControlLine.width(line) + ControlLine.MARGIN <= 46);
+            assertTrue(ids(line), ids(line).endsWith("type talk send"));
+            assertTrue(ids(line), byId(line, "row-drop") != null);
+            if (acts.size() > 2) assertTrue(ids(line), byId(line, acts.get(0).id) != null);
+        }
         // Recording: the slots stay, the stop last-but-the-reserved-send, at every width.
         java.util.List<java.util.List<GhostText.Control>> recordings = java.util.Arrays.asList(
                 ControlLine.rowActions(unsure), ControlLine.rowActions(queued), ControlLine.rowActions(parked));
@@ -165,7 +179,8 @@ public final class ControlLineTest {
                 java.util.List<GhostText.Control> line = ControlLine.controls(rec, cols);
                 assertTrue(cols + ": " + ids(line), line.size() <= 10);
                 assertTrue(cols + ": " + ids(line), ids(line).endsWith("type talk gap-send"));
-                assertTrue(cols + ": the queue control stays", byId(line, "queue") != null);
+                // The queue control stays where it fits beside them (not on the cover screen).
+                if (cols >= 80) assertTrue(cols + ": the queue control stays", byId(line, "queue") != null);
                 assertTrue(cols + ": " + ids(line), byId(line, "row-drop") != null);
             }
         }

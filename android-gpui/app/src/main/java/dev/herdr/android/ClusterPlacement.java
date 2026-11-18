@@ -76,7 +76,9 @@ final class ClusterPlacement {
                 JSONArray drawn = o.optJSONArray("controls");
                 if (drawn != null) {
                     java.util.List<ControlTargets.Cells> controls = new java.util.ArrayList<>();
-                    for (int i = 0; i < drawn.length() && i < 8; i++) {
+                    // As many as the renderer draws (ControlLine.MAX_CONTROLS): every drawn control
+                        // gets its target and accessibility node.
+                    for (int i = 0; i < drawn.length() && i < ControlLine.MAX_CONTROLS; i++) {
                         JSONObject c = drawn.getJSONObject(i);
                         int row = c.getInt("row"), start = c.getInt("start"), end = c.getInt("end");
                         if (row < 0 || row >= rows || start < 0 || end < start || end > cols) return null;

@@ -2556,6 +2556,43 @@ mod tests {
         assert!(ids.contains(&"talk") && ids.contains(&"clear") && ids.contains(&"queue"), "{ids:?}");
     }
 
+    /// Review of #35: a selected queue row on the 46-column cover screen keeps its actions
+    /// and the slots, drawn by the renderer from the host's ladder (not cut to queue + talk).
+    #[test]
+    fn wolf_ask4_a_selected_row_keeps_its_actions_and_the_slots_on_the_cover_screen() {
+        let control = |id: &str, t: &str| Control {
+            id: id.into(),
+            spans: vec![GhostSpan {
+                text: t.into(),
+                style: GhostStyle::Dim,
+            }],
+        };
+        let slots = [control("type", "type"), control("talk", "talk"), control("send", "send")];
+        for (first, word) in [("row-edit", "edit"), ("row-retry", "retry")] {
+            let line = |left: Vec<Control>| {
+                let mut l = left;
+                l.extend(slots.iter().cloned());
+                l
+            };
+            let wide = line(vec![
+                control(first, word),
+                control("row-drop", "drop"),
+                control("row-back", "back"),
+                control("queue", "1 queued ▲"),
+            ]);
+            let narrow = line(vec![control(first, word), control("row-drop", "drop")]);
+            let mut g = ghost(Vec::new());
+            g.controls = wide.clone();
+            g.rungs = vec![wide, narrow];
+            let cols = 46;
+            let (rows, anchor) = claude_status_screen(cols);
+            let layout = place_all(&g, anchor, &rows, None);
+            let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, [first, "row-drop", "type", "talk", "send"], "{word}");
+            assert!(layout.controls.iter().all(|c| c.end <= cols && c.end > c.start));
+        }
+    }
+
     #[test]
     fn the_hosts_line_at_every_width_keeps_clear_the_queue_and_talk() {
         let table = include_str!("testdata/control_widths.tsv");

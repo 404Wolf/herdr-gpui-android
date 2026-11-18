@@ -90,8 +90,12 @@ final class ControlTargets {
         List<Rect> out = new ArrayList<>();
         float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
         for (Cells c : controls) {
-            // A reserved slot's rule and the status words take no taps (ControlLine.tappable).
-            if (!ControlLine.tappable(c.id)) continue;
+            // The status words take no taps. A reserved slot ("gap-type", "gap-send") keeps its
+            // place in the geometry exactly as its button would, so no neighbour's target changes
+            // when it is empty; its own target takes taps and does nothing (ComposerBar).
+            if (ControlLine.STATUS.equals(c.id)) continue;
+            // While recording the stop owns the corner, the reserved send slot included.
+            if (recording && ControlLine.GAP_SEND.equals(c.id)) continue;
             boolean talk = "talk".equals(c.id);
             float pad = talk ? TALK_PAD_DP : PAD_DP;
             float minWidth = talk ? TALK_MIN_DP : MIN_DP;
@@ -139,16 +143,24 @@ final class ControlTargets {
         for (int i = 1; i < out.size(); i++) {
             Rect a = out.get(i - 1), b = out.get(i);
             if (a.right <= b.left) continue;
-            // The boundary stays in the gap between their words.
+            // The boundary stays in the gap between their words. The slots (type, talk, send
+            // and their reserved forms) keep their own bounds whatever comes and goes on their
+            // left (Wolf's ask 4): a left-zone control gives way to a slot.
             float wanted;
             if ("talk".equals(a.id)) wanted = a.right;
             else if ("talk".equals(b.id)) wanted = b.left;
+            else if (slot(b.id) && !slot(a.id)) wanted = b.left;
             else wanted = (a.right + b.left) / 2;
             float boundary = Math.max(a.labelRight, Math.min(b.labelLeft, wanted));
             a.right = boundary;
             b.left = boundary;
         }
         return out;
+    }
+
+    /** One of the line's fixed slots: type, talk, send, or a reserved one. */
+    static boolean slot(String id) {
+        return "type".equals(id) || "talk".equals(id) || "send".equals(id) || id.startsWith("gap-");
     }
 
     /**
