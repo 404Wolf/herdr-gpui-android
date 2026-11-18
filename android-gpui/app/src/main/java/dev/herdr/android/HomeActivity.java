@@ -438,7 +438,7 @@ public final class HomeActivity extends Activity {
                 String state = view.optString("state", "connecting");
                 // A poll without the terminal list (an early one) keeps the
                 // last tree, so Home never blanks out and then refills.
-                if (HomeCache.hasTree(view)) {
+                if (HomeCache.listed(view)) {
                     machine.view = view;
                     machine.liveHandle = handle;
                 }

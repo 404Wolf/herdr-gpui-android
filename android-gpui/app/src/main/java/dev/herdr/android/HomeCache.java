@@ -60,6 +60,19 @@ final class HomeCache {
         return view != null && view.optJSONArray("panes") != null && view.optJSONArray("workspaces") != null;
     }
 
+    /**
+     * Whether a session's poll is a list the core gave, to show and keep in
+     * place of the cached one. A session that has not reached its core yet
+     * (connecting, or failed: offline) polls empty lists, which are not the
+     * computer's terminals: taking them blanked Home on a cold start offline.
+     * A list with panes in it, or any list once the session is ready, is real.
+     */
+    static boolean listed(JSONObject view) {
+        if (!hasTree(view)) return false;
+        JSONArray panes = view.optJSONArray("panes");
+        return panes.length() > 0 || "ready".equals(view.optString("state"));
+    }
+
     /** The tree part of a poll, without anything else it carried. */
     static JSONObject treeOf(JSONObject view) throws JSONException {
         JSONObject out = new JSONObject();

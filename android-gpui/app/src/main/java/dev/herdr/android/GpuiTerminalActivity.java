@@ -6223,7 +6223,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.panes = state.optJSONArray("panes");
                     current.projectsOrder = state.optJSONObject("projects_order");
                     current.title = state.optString("title", current.hostName);
-                    if (current.hostId != null && current.panes != null && current.workspaces != null) {
+                    // Only a list the core gave: a session still connecting (or
+                    // offline) has empty lists, which would replace the cached one.
+                    if (current.hostId != null && HomeCache.listed(state)) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
                         queueFleetWrite(current.hostId);
                         pinPanes(current.hostId, current.panes, current.chromePane);

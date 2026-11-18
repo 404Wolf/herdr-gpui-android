@@ -97,6 +97,21 @@ public final class HomeCacheTest {
         dir.delete();
     }
 
+    @Test public void ask2AnOfflineSessionsEmptyListsNeverReplaceTheCachedOne() throws Exception {
+        // What a session polls before it reaches its core, and still after it
+        // failed (offline): the lists are there, and empty.
+        JSONObject offline = new JSONObject().put("state", "connecting").put("status", "transport I/O failed")
+                .put("workspaces", new JSONArray()).put("tabs", new JSONArray()).put("panes", new JSONArray());
+        assertTrue(HomeCache.hasTree(offline));
+        assertFalse(HomeCache.listed(offline));
+        assertFalse(HomeCache.listed(new JSONObject(offline.toString()).put("state", "closed")));
+        // The core's list: one with terminals, or an empty one from a session that reached it.
+        assertTrue(HomeCache.listed(poll()));
+        assertTrue(HomeCache.listed(new JSONObject(poll().toString()).put("state", "connecting")));
+        assertTrue(HomeCache.listed(new JSONObject(offline.toString()).put("state", "ready")));
+        assertFalse(HomeCache.listed(null));
+    }
+
     @Test public void ask2ThePlainVersion1FleetFileIsSealedOnceThenDeleted() throws Exception {
         File dir = Files.createTempDirectory("fleet-cache").toFile();
         File legacy = new File(dir, HomeCache.FILE_NAME);
