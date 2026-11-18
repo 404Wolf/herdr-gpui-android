@@ -853,8 +853,15 @@ pub fn place_all(
     }
     // Without Claude's prompt on screen the draft goes to the host's own prompt, below.
     if has_draft && !layout.draft_shown {
+        // What Claude's prompt drew of it ("…" and a caret at most) goes: only the host's
+        // prompt is drawn, with one caret. It stays when the host's prompt has no room either.
+        let tried: Vec<Placed> = layout.placed.iter().filter(|p| p.source.is_some()).cloned().collect();
+        layout.placed.retain(|p| p.source.is_none());
         let controls_from = if layout.controls.is_empty() { cols } else { cols - len };
         ghost_prompt(ghost, &mut layout, controls_row, controls_from, screen);
+        if !layout.draft_shown {
+            layout.placed.extend(tried);
+        }
     }
     // The caret the host paints when the draft has none of its own (the keyboard not up):
     // after the last of its words, made explicit here so it is reported and kept in the grid
@@ -2841,6 +2848,103 @@ mod tests {
         let layout = place_all(&g, anchor, &rows, None);
         assert!(layout.row_actions.is_empty());
         assert_eq!(layout.echoes.len(), 1);
+    }
+
+    /// Claude's screen on a `cols` x `rows` grid: its frame (rule, `❯ `, rule) and status line
+    /// at the bottom, the caret after the glyph.
+    fn claude_frame(cols: usize, rows: usize) -> (Vec<Vec<char>>, (usize, usize)) {
+        let mut lines: Vec<String> = vec![
+            "● Fake Claude".into(),
+            String::new(),
+            "> Make the stop control stay put while I type.".into(),
+            "● Done.".into(),
+        ];
+        while lines.len() < rows - 4 {
+            lines.push(String::new());
+        }
+        lines.push("─".repeat(cols));
+        lines.push("❯ ".into());
+        lines.push("─".repeat(cols));
+        lines.push("  ⏵⏵ bypass permissions on (shift+tab to cycle)".into());
+        let all: Vec<&str> = lines.iter().map(String::as_str).collect();
+        (screen(&all, cols), (rows - 3, 2))
+    }
+
+    /// The part of `grid` a pane of `pane_rows` draws, as the adapter picks it, and the caret
+    /// in it.
+    fn in_view(grid: &[Vec<char>], pane_rows: usize, caret: (usize, usize)) -> (Vec<Vec<char>>, (usize, usize)) {
+        let size = |n: usize| u16::try_from(n).expect("a small grid");
+        let cols = grid[0].len();
+        let (row_off, _) =
+            crate::viewport_origin((size(cols), size(grid.len())), (size(cols), size(pane_rows)), (caret.0 as i32, caret.1));
+        let from = usize::try_from(row_off).expect("never above the grid");
+        let rows = grid[from..(from + pane_rows).min(grid.len())].to_vec();
+        assert!(caret.0 >= from && caret.0 < from + rows.len(), "the caret is in view");
+        (rows, (caret.0 - from, caret.1))
+    }
+
+    fn draft_with_a_recording() -> Ghost {
+        let mut g = ghost(vec![
+            text("and the stop "),
+            GhostSpan { text: "0:05 waiting for desktop".into(), style: GhostStyle::Chip },
+            styled("", GhostStyle::Caret),
+        ]);
+        g.controls = bar_ladder()[0].clone();
+        g.rungs = bar_ladder();
+        g
+    }
+
+    /// Wolf's asks 1 and 3: offline, a cached pane keeps the grid it was saved with (here the
+    /// cover screen's 46 x 23), and the unfolded grid's bigger type or the keyboard leaves it
+    /// taller than the pane. A live pane is the same while the keyboard is up and the desktop
+    /// has not yet repainted at the new size. The view keeps Claude's frame under the caret, so
+    /// the draft (a word and an offline recording) is drawn in full at Claude's prompt, the
+    /// controls in its lower rule, with one caret: never just "❯ …".
+    #[test]
+    fn wolf_ask1_offline_a_cached_pane_taller_than_the_view_keeps_the_draft_at_claudes_prompt() {
+        for (what, cols, rows, panes) in [
+            ("cached cover grid, unfolded or keyboard up", 46, 23, vec![23, 19, 12, 8, 6]),
+            ("live unfolded grid, keyboard up before the repaint", 72, 30, vec![30, 14, 9]),
+        ] {
+            let (grid, caret) = claude_frame(cols, rows);
+            for pane in panes {
+                let what = format!("{what}, {pane} rows");
+                let (screen, caret) = in_view(&grid, pane, caret);
+                let anchor = locate(&screen, Some(caret), PromptKind::Claude);
+                assert!(anchor.is_some(), "{what}: Claude's prompt is found");
+                let layout = place_all(&draft_with_a_recording(), anchor, &screen, None);
+                assert_eq!(layout.controls.first().map(|c| c.row), Some(caret.0 + 1), "{what}: controls in the rule");
+                let drawn: Vec<&Placed> = layout.placed.iter().filter(|p| p.source.is_some()).collect();
+                assert!(drawn.iter().any(|p| p.text.contains("and the stop")), "{what}: {drawn:?}");
+                assert!(drawn.iter().any(|p| p.text == "0:05 waiting for desktop"), "{what}: {drawn:?}");
+                assert!(drawn.iter().all(|p| !p.text.contains('…')), "{what}: {drawn:?}");
+                let carets = layout.placed.iter().filter(|p| p.style == GhostStyle::Caret).count();
+                assert_eq!(carets, 1, "{what}: {drawn:?}");
+            }
+        }
+    }
+
+    /// When Claude's prompt cannot hold the draft and the host's own prompt draws it instead,
+    /// only the host's prompt is drawn: nothing of the first try (its "…", its caret) stays
+    /// under it.
+    #[test]
+    fn the_hosts_prompt_replaces_a_draft_claudes_prompt_could_not_hold() {
+        // Claude's prompt on the last row, no rule under it: the controls take its row.
+        let (grid, caret) = claude_frame(46, 23);
+        let screen = grid[..21].to_vec();
+        let anchor = locate(&screen, Some(caret), PromptKind::Claude);
+        let layout = place_all(&draft_with_a_recording(), anchor, &screen, None);
+        let carets = layout.placed.iter().filter(|p| p.style == GhostStyle::Caret).count();
+        assert_eq!(carets, 1, "{:?}", layout.placed);
+        let mut taken = vec![vec![false; 46]; 21];
+        // A blank run only clears its cells under the host's prompt; every other cell is drawn once.
+        for p in layout.placed.iter().filter(|p| !p.text.trim().is_empty()) {
+            let n = cells(&p.text);
+            for (c, cell) in taken[p.row].iter_mut().enumerate().skip(p.col).take(n) {
+                assert!(!*cell, "cell ({}, {c}) drawn twice: {:?}", p.row, layout.placed);
+                *cell = true;
+            }
+        }
     }
 
     #[test]

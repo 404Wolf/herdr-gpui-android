@@ -621,17 +621,27 @@ impl Reader {
     }
 }
 
+/// Rows under the caret a grid taller than the pane keeps in view when it has them: Claude's
+/// lower rule and its status line, so the prompt keeps its frame and the controls their row.
+/// Such a grid is a cached pane's, kept at the size it was saved with, or a live one while the
+/// keyboard is up and the remote side has not repainted at the new size (Wolf's asks 1 and 3).
+pub const ROWS_UNDER_CARET: i32 = 2;
+
 #[doc(hidden)]
 /// Which part of a grid larger than the pane is drawn: the top-left cell
 /// (row, column) of the pane's window into the grid. Policy: the window starts
 /// at the top-left and moves only as far as needed to keep the caret on
-/// screen (it follows the caret); a grid that fits is drawn whole from (0, 0),
+/// screen (it follows the caret), and with it the [`ROWS_UNDER_CARET`] rows
+/// under it that the grid has; a grid that fits is drawn whole from (0, 0),
 /// with the rest of the pane left empty (letterboxed).
 pub fn viewport_origin(grid: (u16, u16), pane: (u16, u16), cursor: (i32, usize)) -> (i32, usize) {
     let (grid_cols, grid_rows) = (usize::from(grid.0), i32::from(grid.1));
     let (pane_cols, pane_rows) = (usize::from(pane.0.max(1)), i32::from(pane.1.max(1)));
     let row = if grid_rows > pane_rows {
-        (cursor.0 - pane_rows + 1).clamp(0, grid_rows - pane_rows)
+        // The caret's rows under it first; a pane too short for them still shows the caret.
+        (cursor.0 + ROWS_UNDER_CARET - pane_rows + 1)
+            .clamp(0, grid_rows - pane_rows)
+            .min(cursor.0.max(0))
     } else {
         0
     };
@@ -1254,11 +1264,35 @@ mod tests {
         assert_eq!(viewport_origin((40, 10), (80, 24), (9, 39)), (0, 0));
         // Larger, caret in view: no movement.
         assert_eq!(viewport_origin((120, 40), (80, 24), (5, 10)), (0, 0));
-        // Caret below and right of the pane: just far enough to show it.
-        assert_eq!(viewport_origin((120, 40), (80, 24), (30, 100)), (7, 21));
+        // Caret below and right of the pane: just far enough to show it and the two rows
+        // under it (Claude's lower rule and status line).
+        assert_eq!(viewport_origin((120, 40), (80, 24), (30, 100)), (9, 21));
         // Never past the grid's end.
         assert_eq!(viewport_origin((120, 40), (80, 24), (39, 119)), (16, 40));
         assert_eq!(viewport_origin((120, 40), (80, 24), (60, 500)), (16, 40));
+    }
+
+    /// Wolf's asks 1 and 3: a grid taller than the pane (a cached pane's saved grid, or a live
+    /// one while the keyboard is up) keeps up to two rows under the caret in view, Claude's
+    /// lower rule and status line, and never hides the caret, down to a one-row pane.
+    #[test]
+    fn the_view_keeps_claudes_frame_under_the_caret_and_never_hides_it() {
+        use super::viewport_origin;
+        // The cover screen's 46 x 23 in a 19-row pane, caret on row 20: rows 4..=22.
+        assert_eq!(viewport_origin((46, 23), (46, 19), (20, 2)), (4, 0));
+        for grid in 1..=30u16 {
+            for pane in 1..=grid {
+                for caret in 0..i32::from(grid) {
+                    let (row, _) = viewport_origin((46, grid), (46, pane), (caret, 2));
+                    let (last, end) = (row + i32::from(pane) - 1, i32::from(grid) - 1);
+                    assert!(row >= 0 && last <= end, "{grid}/{pane}/{caret}: inside the grid");
+                    assert!(row <= caret && caret <= last, "{grid}/{pane}/{caret}: the caret shown");
+                    if pane >= 3 {
+                        assert!(last >= (caret + 2).min(end), "{grid}/{pane}/{caret}: two rows under it");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1267,7 +1301,7 @@ mod tests {
         // Unpanned: the caret is followed live; history starts top-left.
         assert_eq!(
             view_origin((120, 40), (80, 24), (30, 100), false, None),
-            (7, 21)
+            (9, 21)
         );
         assert_eq!(
             view_origin((120, 40), (80, 24), (30, 100), true, None),
@@ -1276,7 +1310,7 @@ mod tests {
         // Panned: that column, live or scrolled back; rows as before.
         assert_eq!(
             view_origin((120, 40), (80, 24), (30, 100), false, Some(5)),
-            (7, 5)
+            (9, 5)
         );
         assert_eq!(
             view_origin((120, 40), (80, 24), (30, 100), true, Some(33)),
