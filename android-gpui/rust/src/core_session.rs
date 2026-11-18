@@ -163,6 +163,12 @@ impl Drop for Stitching {
     }
 }
 
+/// Whether the core's pane (`terminal.get`'s reply) is `cols` wide, the
+/// phone's grid: a stitched read is only taken at the width the phone shows.
+pub(crate) fn at_width(facts: &Value, cols: usize) -> bool {
+    facts["cols"].as_u64() == Some(cols as u64)
+}
+
 /// Whether a stitched read may freeze this pane for its other viewers
 /// (`terminal.viewers`' reply; `ours`: this phone's attach channel). The
 /// read holds every viewer's output and queues a person's keys for a few
@@ -1061,15 +1067,31 @@ impl Connection<'_> {
     /// ([`may_stitch`]), one at a time from this phone, and never retried: a
     /// refusal or failure leaves the phone's own copy as it is.
     fn seed(&mut self, pane: &str) -> Result<()> {
-        let boot = {
+        let (boot, cols) = {
             let state = lock(&self.owner.state);
             if state.view["pane_id"] != pane || self.channel == 0 {
                 return Ok(());
             }
-            state.view["boot_id"].as_str().unwrap_or("").to_owned()
+            let Some(terminal) = state.terminal.as_ref() else {
+                return Ok(());
+            };
+            let cols = terminal.grid().lock().columns();
+            (state.view["boot_id"].as_str().unwrap_or("").to_owned(), cols)
         };
         // A pane on another machine is behind a relay: its viewers are not listed here.
         if pane.contains('/') {
+            return Ok(());
+        }
+        // The app redraws at the core's width while it is read: until the
+        // core has taken the phone's (an attach's resize can still be on its
+        // way), the rows would be another width's, wrapped on the phone.
+        let facts = match self.call("terminal.get", json!({"terminal": pane})) {
+            Ok(facts) => facts,
+            Err(Error::Rpc { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !at_width(&facts, cols) {
+            crate::remote::seed_later(&boot, pane);
             return Ok(());
         }
         let Some(_turn) = Stitching::take() else {
@@ -5456,6 +5478,40 @@ mod cache_tests {
         assert!(lock(&session.seed).is_none());
         // A plain screen read (the core would not stitch) is never merged.
         assert!(!crate::remote::seeded("boot-7705", "t1", &json!({"how":"screen","text":"x"})));
+    }
+
+    #[test]
+    fn ask2_claudes_history_is_read_only_at_the_width_the_phone_shows() {
+        // The core still has the pane at its old width (the attach's resize
+        // is on its way): no read, which would be rows of another width.
+        assert!(at_width(&json!({"cols":62,"rows":55}), 62));
+        assert!(!at_width(&json!({"cols":200,"rows":120}), 62));
+        assert!(!at_width(&json!({}), 62));
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7706, "boot-7706", terminal, "done");
+        stream(&session, &tx, 9, 12);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert_eq!(lock(&session.seed).take().as_deref(), Some("t1"));
+        // Not at the phone's width: asked again a moment later, not at once.
+        crate::remote::seed_later("boot-7706", "t1");
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert!(lock(&session.seed).is_none(), "asked again at once");
+        let mut asks = 1;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(30));
+            session.heard.printed(1);
+            crate::remote::keep_local(&session, &mut lock(&session.state));
+            if lock(&session.seed).take().is_some() {
+                asks += 1;
+                crate::remote::seed_later("boot-7706", "t1");
+            }
+        }
+        // A few tries for one status, then none until the pane's status moves on.
+        assert_eq!(asks, 5);
+        lock(&session.state).view["panes"][0]["turn"] = json!(9);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert_eq!(lock(&session.seed).take().as_deref(), Some("t1"));
     }
 
     fn viewer(channel: u32, focused: bool, focused_ago: Option<u64>, active_ago: Option<u64>) -> Value {

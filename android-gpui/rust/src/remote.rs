@@ -690,6 +690,11 @@ struct Transcribed {
     /// The pane's status marker when a seed was last asked for: asked once
     /// per marker, so a refused or failed read is never retried in a loop.
     asked: Option<String>,
+    /// The marker whose read waited for the core to take the phone's width,
+    /// and how many times it waited (at most SEED_TRIES).
+    waited: Option<(String, u8)>,
+    /// When a read that waited may be asked for again.
+    not_before: Option<std::time::Instant>,
     used: u64,
 }
 impl Transcribed {
@@ -720,6 +725,8 @@ fn transcribed<'a>(store: &'a mut Vec<Transcribed>, boot: &str, pane: &str) -> &
                 pane: pane.into(),
                 transcript: crate::transcript::Transcript::default(),
                 asked: None,
+                waited: None,
+                not_before: None,
                 used,
             });
             store.len() - 1
@@ -814,7 +821,10 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
         if let Some((rows, cols)) = screen {
             kept.transcript.observe(rows, cols);
         }
-        let ask = !busy && kept.transcript.wants_seed() && kept.asked.as_deref() != Some(marker.as_str());
+        let ask = !busy
+            && kept.transcript.wants_seed()
+            && kept.asked.as_deref() != Some(marker.as_str())
+            && kept.not_before.is_none_or(|at| std::time::Instant::now() >= at);
         if ask {
             kept.asked = Some(marker);
         }
@@ -822,6 +832,39 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
     };
     if ask {
         *lock(&owner.seed) = Some(pane);
+    }
+}
+
+/// How many times one marker's read waits for the core to take the phone's
+/// width, and how long each wait is.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+const SEED_TRIES: u8 = 5;
+#[cfg(not(test))]
+#[cfg_attr(not(feature = "android-ui"), allow(dead_code))]
+const SEED_RETRY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const SEED_RETRY: Duration = Duration::from_millis(20);
+
+/// `pane`'s read was not made: the core's pane is not at the phone's width
+/// yet (an attach's resize is still on its way), and a read now would be rows
+/// of another width, wrapped on the phone. Asked again after SEED_RETRY, at
+/// most SEED_TRIES times for the same marker; then, as for any refused read,
+/// not before the pane's status moves on.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+pub(crate) fn seed_later(boot: &str, pane: &str) {
+    let mut store = lock(transcripts());
+    let kept = transcribed(&mut store, boot, pane);
+    let Some(marker) = kept.asked.clone() else {
+        return;
+    };
+    let tries = match &kept.waited {
+        Some((waited, tries)) if *waited == marker => tries + 1,
+        _ => 1,
+    };
+    kept.waited = Some((marker, tries));
+    if tries < SEED_TRIES {
+        kept.asked = None;
+        kept.not_before = Some(std::time::Instant::now() + SEED_RETRY);
     }
 }
 
