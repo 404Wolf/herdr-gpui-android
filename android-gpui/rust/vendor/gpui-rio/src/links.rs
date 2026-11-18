@@ -1,6 +1,11 @@
 //! Links on terminal rows, for tap-to-open: http(s) URLs and file paths in
 //! the text, including ones the terminal or the program wrapped onto further
 //! rows. OSC 8 hyperlinks are the grid's own and only classified here.
+use rio_vt::crosswords::{
+    Crosswords,
+    pos::{Column, Line, Pos},
+};
+use rio_vt::event::EventListener;
 use std::ops::Range;
 
 const SCHEMES: [&str; 2] = ["https://", "http://"];
@@ -190,7 +195,7 @@ pub fn link_at(rows: &[Row], row: usize, col: usize) -> Option<Found> {
 
 /// The link at index `at` of a logical line, mapped back to row spans.
 fn found_in(text: &[char], origin: &[(usize, usize)], at: usize) -> Option<Found> {
-    let (range, link) = link_in(text, at)?;
+    let (range, link) = markdown_in(text, at).or_else(|| link_in(text, at))?;
     let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
     for &(r, c) in &origin[range] {
         match spans.last_mut() {
@@ -238,14 +243,14 @@ fn joins(a: &Row, b: &Row) -> Option<Join> {
         return None;
     }
     let word: String = chars[word_start..end].iter().collect();
+    // A closing bracket at the edge ends a link (a markdown link's `)`, a
+    // parenthesised URL): the next row is prose again.
+    if matches!(chars[end - 1], ')' | ']' | '}') {
+        return None;
+    }
     let margin = chars[..word_start]
         .iter()
         .all(|c| c.is_whitespace() || BORDERS.contains(c));
-    // A row that is one word (a continuation itself), or a word that starts a
-    // URL or a path; prose that happens to reach the edge never joins.
-    if !(margin || word.contains("://") || word.contains('/')) {
-        return None;
-    }
     let next_start = b
         .chars
         .iter()
@@ -255,6 +260,23 @@ fn joins(a: &Row, b: &Row) -> Option<Join> {
         .position(|c| !part_of_link(*c))
         .map_or(b.chars.len(), |i| next_start + i);
     if next_end == next_start {
+        return None;
+    }
+    // A row that is one word (a continuation itself), or a word that starts a
+    // URL or a path, or one whose scheme the break split (`[text](http` then
+    // `s://…`); prose that happens to reach the edge never joins.
+    let split_scheme = || {
+        let joined: String = word
+            .chars()
+            .chain(b.chars[next_start..next_end].iter().copied())
+            .collect();
+        SCHEMES.iter().any(|scheme| {
+            joined
+                .match_indices(scheme)
+                .any(|(at, _)| at < word.len() && at + scheme.len() > word.len())
+        })
+    };
+    if !(margin || word.contains("://") || word.contains('/') || split_scheme()) {
         return None;
     }
     Some(Join { end, next_start })
@@ -346,6 +368,59 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
             },
         )
     })
+}
+
+/// The markdown link `[text](http…)` covering index `at` of `text`: a tap
+/// on its text or its URL opens the URL. The whole link is washed.
+fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
+    /// A link's text this long or longer is not looked back over.
+    const MAX_TEXT: usize = 512;
+    let mut from = 0;
+    while let Some(close) =
+        (from..text.len().saturating_sub(1)).find(|&i| text[i] == ']' && text[i + 1] == '(')
+    {
+        from = close + 1;
+        let url_start = close + 2;
+        let rest: String = text[url_start..text.len().min(url_start + 8)]
+            .iter()
+            .collect();
+        if !SCHEMES
+            .iter()
+            .any(|scheme| rest.to_ascii_lowercase().starts_with(scheme))
+        {
+            continue;
+        }
+        // The `[` that opens the text, on this logical line.
+        let floor = close.saturating_sub(MAX_TEXT);
+        let Some(open) = (floor..close).rev().find(|&i| text[i] == '[') else {
+            continue;
+        };
+        if text[open + 1..close].contains(&']') {
+            continue;
+        }
+        // The `)` that closes the URL, brackets inside it balanced.
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in text.iter().enumerate().skip(url_start) {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => {
+                    end = Some(i);
+                    break;
+                }
+                ')' => depth -= 1,
+                c if !part_of_link(*c) => break,
+                _ => {}
+            }
+        }
+        let Some(end) = end else { continue };
+        if !(open..=end).contains(&at) {
+            continue;
+        }
+        let url: String = text[url_start..end].iter().collect();
+        return Some((open..end + 1, Link::Web(url)));
+    }
+    None
 }
 
 /// Drops sentence punctuation and an unbalanced closing bracket from the end.
@@ -440,6 +515,126 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out)
         .ok()
         .filter(|s| !s.chars().any(char::is_control))
+}
+
+/// A link found on the grid: the columns it covers on each line, and its target.
+pub type GridLink = (Vec<(Line, Range<usize>)>, Link);
+
+/// What a press on a link does when it lifts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkAction {
+    /// A tap: open it (the browser, or the file page).
+    Open,
+    /// A long press: copy its target (the URL, or the file's path).
+    Copy,
+}
+
+/// The link under `pos` on a terminal grid, with the columns it covers on
+/// each line, for the pressed highlight. An OSC 8 hyperlink (Claude Code
+/// prints every link and every row of a wrapped URL as one) wins and is
+/// washed on every neighbouring row that carries the same target; otherwise
+/// the text is read: an http(s) URL, a file path or a markdown
+/// `[text](url)`, joined across the rows the terminal or the program wrapped
+/// it onto.
+pub fn grid_link_at<U: EventListener>(grid: &Crosswords<U>, pos: Pos) -> Option<GridLink> {
+    let line = pos.row;
+    let columns = grid.columns();
+    let top = Line(-(grid.history_size() as i32)).max(line - MAX_ROWS as i32);
+    let bottom = Line(grid.screen_lines() as i32 - 1).min(line + MAX_ROWS as i32);
+    if pos.col.0 >= columns || line < top || line > bottom {
+        return None;
+    }
+    if let Some(link) = grid.cell_hyperlink(line, pos.col) {
+        let uri = link.uri().to_owned();
+        let target = Link::from_uri(&uri)?;
+        let same = |row: Line, col: usize| {
+            grid.cell_hyperlink(row, Column(col))
+                .is_some_and(|other| other.uri() == uri)
+        };
+        // The run under the press on its own row.
+        let mut start = pos.col.0;
+        while start > 0 && same(line, start - 1) {
+            start -= 1;
+        }
+        let mut end = pos.col.0 + 1;
+        while end < columns && same(line, end) {
+            end += 1;
+        }
+        let mut spans = vec![(line, start..end)];
+        // The rows above and below a wrapped link: each holds one run of the
+        // same target, and the run continues where the one before ended.
+        let run_on = |row: Line| -> Option<Range<usize>> {
+            let first = (0..columns).find(|c| same(row, *c))?;
+            let last = (first..columns).take_while(|c| same(row, *c)).last()?;
+            Some(first..last + 1)
+        };
+        let mut row = line;
+        let mut reaches_start = start;
+        while row > top && reaches_start <= first_text(grid, row, columns) {
+            let Some(run) = run_on(row - 1) else { break };
+            if run.end < last_text(grid, row - 1, columns) {
+                break;
+            }
+            row -= 1;
+            reaches_start = run.start;
+            spans.insert(0, (row, run));
+        }
+        let mut row = line;
+        let mut reaches_end = end;
+        while row < bottom && reaches_end >= last_text(grid, row, columns) {
+            let Some(run) = run_on(row + 1) else { break };
+            if run.start > first_text(grid, row + 1, columns) {
+                break;
+            }
+            row += 1;
+            reaches_end = run.end;
+            spans.push((row, run));
+        }
+        return Some((spans, target));
+    }
+    // The tapped row and the rows a wrapped link could span.
+    let rows: Vec<Row> = (top.0..=bottom.0)
+        .map(|row| {
+            let cells = &grid.grid[Line(row)];
+            Row {
+                chars: (0..columns)
+                    .map(|col| cells[Column(col)].c())
+                    .map(|c| if c == '\0' { ' ' } else { c })
+                    .collect(),
+                wrapped: columns > 0 && cells[Column(columns - 1)].wrapline(),
+            }
+        })
+        .collect();
+    let found = link_at(&rows, (line.0 - top.0) as usize, pos.col.0)?;
+    let spans = found
+        .spans
+        .into_iter()
+        .map(|(row, columns)| (Line(top.0 + row as i32), columns))
+        .collect();
+    Some((spans, found.link))
+}
+
+/// The first column of `row` holding text (not blank, not a box border).
+fn first_text<U: EventListener>(grid: &Crosswords<U>, row: Line, columns: usize) -> usize {
+    let cells = &grid.grid[row];
+    (0..columns)
+        .find(|c| {
+            let ch = cells[Column(*c)].c();
+            !(ch == '\0' || ch.is_whitespace() || BORDERS.contains(&ch))
+        })
+        .unwrap_or(columns)
+}
+
+/// One past the last column of `row` holding text (not blank, not a border).
+fn last_text<U: EventListener>(grid: &Crosswords<U>, row: Line, columns: usize) -> usize {
+    let cells = &grid.grid[row];
+    (0..columns)
+        .rev()
+        .find(|c| {
+            let ch = cells[Column(*c)].c();
+            !(ch == '\0' || ch.is_whitespace() || BORDERS.contains(&ch))
+        })
+        .map_or(0, |c| c + 1)
 }
 
 /// The http(s) URL covering column `col` of a single row, with its columns.
@@ -633,5 +828,209 @@ mod tests {
         // Other rows, and the unpanned window, as before.
         assert!(!pressed(&spans, &4, 10, 30));
         assert!(pressed(&spans, &3, 45, 0));
+    }
+}
+
+/// Wolf's ask (11-18): links in an agent's output open on a tap, from any
+/// column of any row they cover, wrapped or not, and copy on a long press.
+/// The bytes are Claude Code 2.1's own, as captured at 48 columns: live (each
+/// link and every row of a wrapped URL in OSC 8) and as herdr-core repaints
+/// them for a viewer that attaches later (plain text, no OSC 8).
+#[cfg(test)]
+mod wolf_ask_links {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::{Session, TerminalColor, TerminalTheme};
+    use std::{
+        io::Write,
+        os::unix::net::UnixStream,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    const COLUMNS: u16 = 48;
+    /// A long Linear issue URL like the one Wolf tapped: three rows at 48 columns.
+    const ISSUE: &str = "https://linear.app/herdr/issue/INS-3115/make-links-tappable-in-the-agent-session-view-on-the-phone";
+    const DOCS: &str = "https://docs.example.com/herdr/links";
+
+    /// A grid fed `bytes`, once the parser has drawn `until` on it.
+    fn grid(bytes: &[u8], until: &str) -> (Arc<Session>, UnixStream) {
+        let fg = TerminalColor {
+            r: 230,
+            g: 230,
+            b: 230,
+        };
+        let theme = TerminalTheme::new(
+            TerminalColor {
+                r: 20,
+                g: 20,
+                b: 20,
+            },
+            fg,
+            [fg; 16],
+        );
+        let (local, mut remote) = UnixStream::pair().unwrap();
+        local
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let session = Session::start(
+            local.try_clone().unwrap(),
+            local,
+            |_, _| {},
+            theme,
+            COLUMNS,
+            12,
+        )
+        .unwrap();
+        remote.write_all(bytes).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.screen_text().contains(until) {
+            assert!(
+                Instant::now() < deadline,
+                "the bytes never reached the grid"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (session, remote)
+    }
+
+    /// The URL's rows as Claude Code breaks it: the rest of the width, after
+    /// its two-column indent.
+    fn chunks(url: &str) -> Vec<String> {
+        let chars: Vec<char> = url.chars().collect();
+        chars
+            .chunks(usize::from(COLUMNS) - 2)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
+    }
+
+    /// Claude Code's own output for "Read [the docs](DOCS) now. Also see ISSUE",
+    /// live: the markdown link's text in OSC 8, the URL broken at the edge with
+    /// every row in OSC 8 of the same id (bytes as captured, URLs swapped).
+    fn live() -> Vec<u8> {
+        let mut out = format!(
+            "\x1b[H\x1b[2J\x1b[2;1H\x1b[38;2;255;255;255m\u{25cf}\x1b[3G\x1b[39mRead\x1b[8G\x1b]8;id=sg4g0w;{DOCS}\x07\x1b[94mthe docs\x1b[17G\x1b]8;;\x07\x1b[39mnow.\x1b[22GAlso\x1b[27Gsee"
+        );
+        for chunk in chunks(ISSUE) {
+            out += &format!(
+                "\r\x1b[2C\x1b[1B\x1b]8;id=1ckm1tu;{ISSUE}\x07\x1b[94m{chunk}\x1b]8;;\x07"
+            );
+        }
+        out += "\r\n\r\n\x1b[39m\u{273b} Baked for 5s";
+        out.into_bytes()
+    }
+
+    /// The same screen as herdr-core repaints it for a viewer that attaches
+    /// after it was printed: text and colours only.
+    fn repainted() -> Vec<u8> {
+        let mut out = String::from(
+            "\x18\x1b[!p\x1b[H\x1b[2J\x1b[1;12r\r\n\x1b[0m\x1b[38;2;255;255;255m\u{25cf} \x1b[0mRead \x1b[0m\x1b[38;5;12mthe docs \x1b[0mnow. Also see\r\n",
+        );
+        for chunk in chunks(ISSUE) {
+            out += &format!("  \x1b[0m\x1b[38;5;12m{chunk}\x1b[0m\r\n");
+        }
+        out += "\r\n\x1b[0m\u{273b} Baked for 5s";
+        out.into_bytes()
+    }
+
+    fn at(session: &Session, row: i32, col: usize) -> Option<GridLink> {
+        grid_link_at(&session.grid().lock(), Pos::new(Line(row), Column(col)))
+    }
+
+    /// Every column the URL is drawn in, on its rows 2.. (below the line
+    /// that introduces it), opens the whole URL and washes all its rows.
+    fn assert_issue_opens_everywhere(session: &Session) {
+        let rows = chunks(ISSUE);
+        let washed: Vec<(Line, Range<usize>)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| (Line(2 + i as i32), 2..2 + chunk.chars().count()))
+            .collect();
+        assert!(rows.len() >= 3, "the URL wraps onto continuation rows");
+        for (i, chunk) in rows.iter().enumerate() {
+            let row = 2 + i as i32;
+            for col in 2..2 + chunk.chars().count() {
+                let (spans, link) = at(session, row, col)
+                    .unwrap_or_else(|| panic!("no link at row {row} column {col}"));
+                assert_eq!(link, Link::Web(ISSUE.into()), "row {row} column {col}");
+                assert_eq!(spans, washed, "row {row} column {col}");
+            }
+            // The indent is not the link.
+            assert_eq!(at(session, row, 0), None);
+            assert_eq!(at(session, row, 1), None);
+        }
+    }
+
+    #[test]
+    fn wolf_ask_links_a_long_wrapped_url_opens_from_its_first_and_continuation_rows_live() {
+        let (session, _remote) = grid(&live(), "Baked");
+        assert_issue_opens_everywhere(&session);
+    }
+
+    #[test]
+    fn wolf_ask_links_a_long_wrapped_url_opens_from_its_first_and_continuation_rows_repainted() {
+        let (session, _remote) = grid(&repainted(), "Baked");
+        assert_issue_opens_everywhere(&session);
+    }
+
+    #[test]
+    fn wolf_ask_links_a_markdown_link_opens_from_any_column_of_its_text() {
+        let (session, _remote) = grid(&live(), "Baked");
+        // "the docs" is drawn at columns 7..15 of row 1.
+        for col in 7..15 {
+            let (spans, link) = at(&session, 1, col).unwrap();
+            assert_eq!(link, Link::Web(DOCS.into()));
+            assert_eq!(spans, vec![(Line(1), 7..15)]);
+        }
+        // Prose beside it is not a link.
+        assert_eq!(at(&session, 1, 2), None);
+        assert_eq!(at(&session, 1, 16), None);
+    }
+
+    #[test]
+    fn wolf_ask_links_a_raw_markdown_link_opens_from_its_text_and_its_url_even_split_in_its_scheme()
+    {
+        // As Claude Code echoes a prompt holding a markdown link: broken at
+        // the edge inside "https", the rest indented.
+        let rows = [
+            Row::new("  not use tools: Read [the INS-3115 issue](http", false),
+            Row::new("  s://linear.app/acme/issue/INS-3115/make-markd", false),
+            Row::new("  own-links-tappable-in-the-agent-session-view)", false),
+            Row::new("  now. Also see", false),
+        ];
+        let url = Link::Web(
+            "https://linear.app/acme/issue/INS-3115/make-markdown-links-tappable-in-the-agent-session-view"
+                .into(),
+        );
+        // The text ("the INS-3115 issue"), the brackets and every URL row.
+        for (row, col) in [
+            (0, 22),
+            (0, 23),
+            (0, 30),
+            (0, 41),
+            (0, 44),
+            (1, 2),
+            (1, 30),
+            (2, 2),
+            (2, 46),
+        ] {
+            assert_eq!(
+                link_at(&rows, row, col).map(|f| f.link),
+                Some(url.clone()),
+                "row {row} column {col}"
+            );
+        }
+        // Prose before it, and the row after its closing bracket, are not.
+        assert_eq!(link_at(&rows, 0, 5), None);
+        assert_eq!(link_at(&rows, 3, 3), None);
+        // On one row: the text opens the URL too.
+        let one = [Row::new("See [the docs](https://x.dev/a_(b)) now.", false)];
+        for col in [4, 6, 12, 20] {
+            assert_eq!(
+                link_at(&one, 0, col).map(|f| f.link),
+                Some(Link::Web("https://x.dev/a_(b)".into()))
+            );
+        }
+        assert_eq!(link_at(&one, 0, 37), None);
     }
 }

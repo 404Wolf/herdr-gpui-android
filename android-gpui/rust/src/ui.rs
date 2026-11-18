@@ -174,14 +174,21 @@ impl TerminalView {
                     #[cfg(target_os = "android")]
                     terminal.set_touch_presses(true);
                     #[cfg(target_os = "android")]
-                    terminal.set_link_handler(|link| {
+                    terminal.set_link_handler(|link, action| {
+                        use gpui_rio::links::{Link, LinkAction};
                         let generation = model::mailbox().state().generation;
-                        match link {
-                            gpui_rio::links::Link::Web(url) => {
+                        match (link, action) {
+                            (Link::Web(url), LinkAction::Open) => {
                                 crate::android::open_link(generation, &url);
                             }
-                            gpui_rio::links::Link::File { path, line } => {
+                            (Link::File { path, line }, LinkAction::Open) => {
                                 crate::android::open_file(generation, &path, line);
+                            }
+                            (Link::Web(url), LinkAction::Copy) => {
+                                crate::android::copy_link(generation, &url);
+                            }
+                            (Link::File { path, .. }, LinkAction::Copy) => {
+                                crate::android::copy_link(generation, &path);
                             }
                         }
                     });

@@ -345,8 +345,7 @@ pub(crate) fn request_keyboard(generation: i64) -> bool {
 /// Opens a browser for a terminal link. Only http(s) targets within bounds are
 /// forwarded; Java rechecks the scheme before starting an intent.
 pub(crate) fn open_link(generation: i64, url: &str) -> bool {
-    let state = model::mailbox().state();
-    if state.generation != generation || !state.active {
+    if !model::mailbox().state().opens_links(generation) {
         return false;
     }
     if url.len() > 2048
@@ -362,6 +361,37 @@ pub(crate) fn open_link(generation: i64, url: &str) -> bool {
             jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;)V")
                 .map_err(|e| e.to_string())?;
         let value = env.new_string(url).map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            name,
+            signature.method_signature(),
+            &[
+                jni_mobile::objects::JValue::Long(generation),
+                jni_mobile::objects::JValue::Object(&value),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .is_ok()
+}
+
+/// Copies a held link's target (a URL, or a file's path) to the clipboard;
+/// Java says so in place, never in a popup.
+pub(crate) fn copy_link(generation: i64, text: &str) -> bool {
+    if !model::mailbox().state().opens_links(generation) {
+        return false;
+    }
+    if text.is_empty() || text.len() > 4096 || text.chars().any(char::is_control) {
+        return false;
+    }
+    gpui_mobile::android::jni::with_env(|env| {
+        let activity = gpui_mobile::android::jni::activity(env)?;
+        let name = jni_mobile::strings::JNIString::from("gpuiCopyLink");
+        let signature =
+            jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;)V")
+                .map_err(|e| e.to_string())?;
+        let value = env.new_string(text).map_err(|e| e.to_string())?;
         env.call_method(
             &activity,
             name,

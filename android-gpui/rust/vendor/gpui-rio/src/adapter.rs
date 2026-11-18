@@ -48,8 +48,8 @@ macro_rules! __bind_gpui {
                 scroll_delta: f32,
                 marked: String,
                 host_input: bool,
-                /// Opens a tapped link; without one, links are plain text.
-                link_handler: Option<std::rc::Rc<dyn Fn($crate::links::Link)>>,
+                /// Opens a tapped link and copies a held one; without one, links are plain text.
+                link_handler: Option<std::rc::Rc<dyn Fn($crate::links::Link, $crate::links::LinkAction)>>,
                 /// Told what each lifted press did, so the host can act on taps.
                 /// Presses come from touch: one is acted on only when this view saw
                 /// its touch begin (see `tap::owns`).
@@ -159,9 +159,13 @@ macro_rules! __bind_gpui {
                 pub fn set_host_input(&mut self, host_input: bool) {
                     self.host_input = host_input;
                 }
-                /// Tapping a link (OSC 8, an http(s) URL or a file path in the text,
-                /// wrapped or not) calls `handler`.
-                pub fn set_link_handler(&mut self, handler: impl Fn($crate::links::Link) + 'static) {
+                /// Tapping a link (OSC 8, an http(s) URL, a markdown `[text](url)` or a
+                /// file path in the text, wrapped or not) calls `handler` to open it;
+                /// a finger held on one calls it to copy it.
+                pub fn set_link_handler(
+                    &mut self,
+                    handler: impl Fn($crate::links::Link, $crate::links::LinkAction) + 'static,
+                ) {
                     self.link_handler = Some(std::rc::Rc::new(handler));
                 }
                 /// Told what every lifted press did, once it was done: `Clicked` only
@@ -212,45 +216,7 @@ macro_rules! __bind_gpui {
                 }
                 /// The link at `pos` on screen, with the columns it covers per row.
                 fn link_at(&self, pos: Pos) -> Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)> {
-                    let grid = self.session.grid().lock();
-                    let line = pos.row;
-                    let columns = grid.columns();
-                    if let Some(link) = grid.cell_hyperlink(line, pos.col) {
-                        let id = grid.cell_hyperlink_id(line, pos.col);
-                        let mut start = pos.col.0;
-                        while start > 0 && grid.cell_hyperlink_id(line, Column(start - 1)) == id {
-                            start -= 1;
-                        }
-                        let mut end = pos.col.0 + 1;
-                        while end < columns && grid.cell_hyperlink_id(line, Column(end)) == id {
-                            end += 1;
-                        }
-                        let link = $crate::links::Link::from_uri(link.uri())?;
-                        return Some((vec![(line, start..end)], link));
-                    }
-                    // The tapped row and the rows a wrapped link could span.
-                    const AROUND: i32 = 12;
-                    let top = Line(-(grid.history_size() as i32)).max(line - AROUND);
-                    let bottom = Line(grid.screen_lines() as i32 - 1).min(line + AROUND);
-                    let rows: Vec<$crate::links::Row> = (top.0..=bottom.0)
-                        .map(|row| {
-                            let cells = &grid.grid[Line(row)];
-                            $crate::links::Row {
-                                chars: (0..columns)
-                                    .map(|col| cells[Column(col)].c())
-                                    .map(|c| if c == '\0' { ' ' } else { c })
-                                    .collect(),
-                                wrapped: columns > 0 && cells[Column(columns - 1)].wrapline(),
-                            }
-                        })
-                        .collect();
-                    let found = $crate::links::link_at(&rows, (line.0 - top.0) as usize, pos.col.0)?;
-                    let spans = found
-                        .spans
-                        .into_iter()
-                        .map(|(row, columns)| (Line(top.0 + row as i32), columns))
-                        .collect();
-                    Some((spans, found.link))
+                    $crate::links::grid_link_at(&self.session.grid().lock(), pos)
                 }
                 /// The screen cell (column, row) under `point`, counted as the
                 /// program counts them: only on the live screen, not in history,
@@ -880,10 +846,19 @@ macro_rules! __bind_gpui {
                                         // A tap on a link opens it and selects nothing.
                                         this.session.grid().lock().selection = None;
                                         if let (Some((_, url)), Some(handler)) = (link, this.link_handler.clone()) {
-                                            handler(url);
+                                            handler(url, $crate::links::LinkAction::Open);
                                         }
                                         cx.notify();
                                         $crate::tap::Tapped::Plain
+                                    }
+                                    $crate::tap::Lifted::CopyLink => {
+                                        // A finger held on a link copies it; no keyboard opens.
+                                        this.session.grid().lock().selection = None;
+                                        if let (Some((_, url)), Some(handler)) = (link, this.link_handler.clone()) {
+                                            handler(url, $crate::links::LinkAction::Copy);
+                                        }
+                                        cx.notify();
+                                        $crate::tap::Tapped::Ignored
                                     }
                                     // The program, not a local selection, owns the cell.
                                     $crate::tap::Lifted::Clicked => {

@@ -1208,6 +1208,16 @@ pub struct ViewState {
     pub held: bool,
 }
 
+impl ViewState {
+    /// Whether a link drawn on the frame shown for `generation` may be opened
+    /// in the browser or copied: live, or held (a reconnect, which follows
+    /// every return to the app, and an offline or cached pane keep the last
+    /// frame on screen). Neither needs the core, only the frame Wolf sees.
+    pub fn opens_links(&self, generation: i64) -> bool {
+        generation > 0 && generation == self.generation && (self.active || self.held)
+    }
+}
+
 impl Default for Mailbox {
     fn default() -> Self {
         Self {
@@ -1930,6 +1940,25 @@ mod tests {
         assert_eq!(state.snapshot.widest_line_chars, original.widest_line_chars);
         assert!(!state.follow);
         assert_eq!(state.pan, 80.);
+    }
+
+    #[test]
+    fn wolf_ask_links_a_held_or_offline_frame_still_opens_its_links() {
+        // On the emulator, a link tapped on the frame held while the app
+        // reconnected (after every return from the browser) or on an offline
+        // pane ("cached 10:42 · offline") was found, then dropped: opening
+        // asked for a live session.
+        let mut box_ = Mailbox::default();
+        assert!(!box_.state().opens_links(0), "nothing shown");
+        box_.set_active(10, true);
+        assert!(box_.state().opens_links(10));
+        assert!(box_.hold(10));
+        assert!(box_.state().opens_links(10), "reconnecting");
+        assert!(box_.hold(11));
+        assert!(box_.state().opens_links(11), "an inherited frame");
+        assert!(!box_.state().opens_links(10), "a replaced frame");
+        box_.set_active(12, false);
+        assert!(!box_.state().opens_links(12), "a pane put away");
     }
 
     #[test]

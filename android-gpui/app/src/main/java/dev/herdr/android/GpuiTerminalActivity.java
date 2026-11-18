@@ -5564,6 +5564,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
     }
 
+    /**
+     * A finger held on a terminal link: its URL (or a file link's path) goes to the clipboard,
+     * said in place in the crumb, never in a popup.
+     */
+    public void gpuiCopyLink(long expectedGeneration, String text) {
+        runOnUiThread(() -> {
+            synchronized (stateLock) {
+                if (destroyed || isFinishing() || connection == null
+                        || connection.generation != expectedGeneration) return;
+            }
+            if (text == null || text.isEmpty() || text.length() > 4096) return;
+            ActionSheet.copy(this, "Link", text);
+            note("Link copied");
+        });
+    }
+
     /** A tapped file path (or OSC 8 file link): shown in the file page, read from the pane's machine. */
     public void gpuiOpenFile(long expectedGeneration, String path, int line) {
         runOnUiThread(() -> {

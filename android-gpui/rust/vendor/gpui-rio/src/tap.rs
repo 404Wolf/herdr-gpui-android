@@ -12,6 +12,8 @@
 pub enum Lift {
     /// Open the link under it.
     OpenLink,
+    /// Copy the link under it: a finger held on a link.
+    CopyLink,
     /// Offer the program a click on the cell under it. The session sends one
     /// only when the program asked for mouse events.
     Click,
@@ -30,11 +32,14 @@ pub struct Press {
     pub held: bool,
 }
 
-/// What lifting `press` does. A link keeps opening as it always has, held or
-/// not. Otherwise a press that stayed in place and was not held is a click.
+/// What lifting `press` does. A tap on a link opens it and a finger held on
+/// one copies it. Otherwise a press that stayed in place and was not held is
+/// a click, and a held one does nothing.
 pub fn lift(press: Press) -> Lift {
     if press.travelled {
         Lift::Nothing
+    } else if press.on_link && press.held {
+        Lift::CopyLink
     } else if press.on_link {
         Lift::OpenLink
     } else if press.held {
@@ -50,6 +55,8 @@ pub fn lift(press: Press) -> Lift {
 pub enum Lifted {
     /// The press was on a link: the view opens it.
     OpenLink,
+    /// The finger was held on a link: the view copies it.
+    CopyLink,
     /// The program was sent a click on the cell.
     Clicked,
     /// A tap the program did not take.
@@ -75,6 +82,7 @@ pub fn lift_on(
     }
     match lift(press) {
         Lift::OpenLink => Lifted::OpenLink,
+        Lift::CopyLink => Lifted::CopyLink,
         Lift::Click => match cell {
             Some((column, row)) if session.click(column, row) => Lifted::Clicked,
             _ => Lifted::Plain,
@@ -336,15 +344,30 @@ mod tests {
     }
 
     #[test]
-    fn a_link_opens_as_before_held_or_not() {
-        for held in [false, true] {
-            let press = Press {
-                on_link: true,
-                held,
+    fn wolf_ask_links_a_tap_on_a_link_opens_it_and_a_held_finger_copies_it() {
+        let tap = Press {
+            on_link: true,
+            ..Press::default()
+        };
+        assert_eq!(lift(tap), Lift::OpenLink);
+        let held = Press { held: true, ..tap };
+        assert_eq!(lift(held), Lift::CopyLink);
+        // Held off a link: nothing, as before.
+        assert_eq!(
+            lift(Press {
+                held: true,
                 ..Press::default()
-            };
-            assert_eq!(lift(press), Lift::OpenLink);
-        }
+            }),
+            Lift::Nothing
+        );
+        // A held link that travelled is a scroll: neither opened nor copied.
+        assert_eq!(
+            lift(Press {
+                travelled: true,
+                ..held
+            }),
+            Lift::Nothing
+        );
     }
 
     #[test]
