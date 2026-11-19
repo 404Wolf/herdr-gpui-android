@@ -947,7 +947,8 @@ public final class HomeActivity extends Activity {
         }
         FleetTree.Fleet fleet = FleetTree.build(all, machine.git);
         FleetTree.PmTree tree = FleetTree.pmTree(fleet);
-        // A cached view is drawn as it was, dimmed; it is live only once this session lists terminals.
+        // A cached view is drawn as it was, in full colour (the machine row says
+        // offline); it is live only once this session lists terminals.
         boolean ready = live(machine);
         if (fleet.deacon != null && deaconGuard(machine) > 0 && machine.deaconPending.isEmpty()) clearDeaconGuard(machine);
         // Claude runs there again (Wolf started it): the failure no longer applies.
@@ -1022,8 +1023,8 @@ public final class HomeActivity extends Activity {
         deaconRows(machine, tree, ready);
 
         LinearLayout rows = column();
-        // Offline: what was last seen stays, dimmed; nothing can be started there.
-        if (!ready) rows.setAlpha(0.5f);
+        // Offline: what was last seen stays, in full colour (Wolf: never gray the
+        // screen offline); the machine row says offline, nothing can be started there.
         for (Row top : bodyRows(machine, tree, ready)) emit(rows, top, "", true, 0);
         body.addView(rows);
     }

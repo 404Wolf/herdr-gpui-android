@@ -620,6 +620,8 @@ impl Session {
             }
         };
         let (size, mut resized) = tokio::sync::watch::channel((columns, rows));
+        let exit = ShellExit::default();
+        let ended = exit.clone();
         let token = self.guard.0.clone();
         let cancel = token.clone();
         let iroh_close = self.guard.1.take();
@@ -641,7 +643,17 @@ impl Session {
                                 break;
                             }
                         }
-                        Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                        // The host ended the shell (it exited, or the server closed
+                        // its channel): said before the bytes stop, so a reader that
+                        // sees the end can tell it from a connection that was lost.
+                        Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. }) => {
+                            ended.mark();
+                        }
+                        Some(ChannelMsg::Eof | ChannelMsg::Close) => {
+                            ended.mark();
+                            break;
+                        }
+                        None => break,
                         Some(_) => {}
                     },
                     read = from_app.read(&mut buffer) => match read {
@@ -669,6 +681,7 @@ impl Session {
         Ok(Shell {
             socket,
             size: ShellSize(size),
+            exit,
             guard: BridgeGuard {
                 token,
                 task,
@@ -706,12 +719,34 @@ impl Bridge {
 pub struct Shell {
     socket: std::os::unix::net::UnixStream,
     size: ShellSize,
+    exit: ShellExit,
     guard: BridgeGuard,
 }
 #[cfg(unix)]
 impl Shell {
+    /// Whether the host ended this shell; take it before [`Shell::into_parts`].
+    pub fn exit(&self) -> ShellExit {
+        self.exit.clone()
+    }
     pub fn into_parts(self) -> (std::os::unix::net::UnixStream, ShellSize, BridgeGuard) {
         (self.socket, self.size, self.guard)
+    }
+}
+
+/// Whether the host ended a shell: it exited or its channel was closed by the
+/// server. False while it runs, and when its bytes stopped because the
+/// connection was lost or the phone closed it, so a client can say "exited"
+/// for the one and offer a new connection for the other.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+pub struct ShellExit(Arc<std::sync::atomic::AtomicBool>);
+#[cfg(unix)]
+impl ShellExit {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn exited(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

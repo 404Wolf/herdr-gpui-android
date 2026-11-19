@@ -1171,7 +1171,7 @@ pub struct Mailbox {
     pub follow: bool,
     /// Raw SSH shell drawn instead of a Herdr pane, or 0.
     shell: u64,
-    /// The last frame is held, dimmed, while the connection is re-established.
+    /// The last frame is held, in full colour, while the connection is re-established.
     held: bool,
 }
 
@@ -1262,7 +1262,7 @@ impl Mailbox {
     }
 
     /// Closes input for `generation` but keeps the last frame and shell on
-    /// screen, dimmed, while a reconnect replaces the session: unlike
+    /// screen, in full colour, while a reconnect replaces the session: unlike
     /// `set_active(_, false)` nothing is blanked and the keyboard stays up.
     /// A newer generation inherits the frame until its own shell attaches.
     pub fn hold(&mut self, generation: i64) -> bool {

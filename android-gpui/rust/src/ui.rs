@@ -753,10 +753,15 @@ impl Render for TerminalView {
         let active = self.state.active;
         let held = self.state.held;
         let generation = self.state.generation;
-        let status = self
-            .error
-            .clone()
-            .unwrap_or_else(|| snapshot.status.clone());
+        // While a frame is held, the link's state is the top corner's small
+        // indicator (Java), not a second status word in the pane header.
+        let status = self.error.clone().unwrap_or_else(|| {
+            if held {
+                String::new()
+            } else {
+                snapshot.status.clone()
+            }
+        });
         let viewport = window.viewport_size();
         #[cfg(unix)]
         let shell = self.shell_element(viewport.width, cx);
@@ -952,9 +957,9 @@ impl Render for TerminalView {
                     body.items_center().justify_center()
                 })
                 .when_some(shell, |body, shell| body.child(shell))
-                // A reconnect keeps the last frame readable, dimmed so it is
-                // not mistaken for a live pane.
-                .when(held, |body| body.opacity(0.55))
+                // A held frame (offline, reconnecting, a cached pane) keeps its
+                // full colour: Wolf's ask, never gray the screen offline. The
+                // small indicator in the top corner says it is not live.
                 .when(pan > 0. && !shell_mode, |body| {
                     // A panned pane has no visible left edge; mark it so a cut
                     // line is never mistaken for a broken render.

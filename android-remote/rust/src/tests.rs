@@ -222,6 +222,13 @@ impl server::Handler for TestServer {
         data: &[u8],
         session: &mut server::Session,
     ) -> std::result::Result<(), Self::Error> {
+        if self.echo && self.pty.is_some() && data == b"exit\r" {
+            // The login shell's own exit: its status, then the channel ends.
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
         if self.echo {
             session.data(channel, data.to_vec())?;
         }
@@ -482,6 +489,60 @@ async fn shell_runs_on_a_pty_forwards_bytes_and_window_changes() {
     tokio::time::timeout(Duration::from_secs(2), fixture.disconnected.notified())
         .await
         .unwrap();
+    fixture.finish().await;
+}
+
+#[cfg(unix)]
+async fn read_to_end(socket: std::os::unix::net::UnixStream) -> Vec<u8> {
+    socket.set_nonblocking(true).unwrap();
+    let mut socket = tokio::net::UnixStream::from_std(socket).unwrap();
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut seen))
+        .await
+        .unwrap()
+        .unwrap();
+    seen
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shell_the_host_ended_says_it_exited() {
+    let fixture = Fixture::new().await;
+    let shell = fixture
+        .session()
+        .await
+        .into_shell("xterm-256color", 80, 24)
+        .await
+        .unwrap();
+    let exit = shell.exit();
+    let (socket, _size, guard) = shell.into_parts();
+    assert!(!exit.exited(), "a running shell has not exited");
+    std::io::Write::write_all(&mut socket.try_clone().unwrap(), b"exit\r").unwrap();
+    let seen = read_to_end(socket).await;
+    assert!(String::from_utf8_lossy(&seen).starts_with("shell on"));
+    // Its bytes ended because the host ended it: never a lost connection.
+    assert!(exit.exited());
+    guard.shutdown().await;
+    fixture.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shell_whose_connection_dropped_never_says_it_exited() {
+    let fixture = Fixture::new().await;
+    let shell = fixture
+        .session()
+        .await
+        .into_shell("xterm-256color", 80, 24)
+        .await
+        .unwrap();
+    let exit = shell.exit();
+    let (socket, _size, guard) = shell.into_parts();
+    // The server goes away under the shell (no exit status, no channel close).
+    fixture.stop.cancel();
+    read_to_end(socket).await;
+    assert!(!exit.exited(), "a dropped connection is not the shell's exit");
+    guard.shutdown().await;
     fixture.finish().await;
 }
 
