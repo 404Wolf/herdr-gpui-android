@@ -137,9 +137,13 @@
           packages = [
             (toolchainFor pkgs)
             pkgs.pkg-config
+            # Tests drive real repositories and worktrees.
+            pkgs.git
           ];
           nativeBuildInputs = [ (rustPlatformFor pkgs).bindgenHook ];
           buildInputs = buildLibrariesFor pkgs;
+          # Tests that need git fail here instead of skipping themselves.
+          HERDR_TESTS_REQUIRE_GIT = "1";
         };
       });
       overlays.default = final: _prev: {
