@@ -70,6 +70,15 @@ final class PaneSnapshots {
                 return worker;
             });
             shared = new PaneSnapshots(dir, thread, () -> CacheSeal.shared(app), NATIVE);
+            PaneSnapshots made = shared;
+            // Before any save or open on this thread: which revision each saved computer is at.
+            thread.execute(() -> {
+                try {
+                    made.hosts(new RemoteHostStore(app).read());
+                } catch (Exception unreadable) {
+                    // Copies are keyed by profile alone until the hosts are read.
+                }
+            });
             shared.migrate(old);
         }
         return shared;
@@ -195,15 +204,36 @@ final class PaneSnapshots {
         });
     }
 
-    /** Each saved computer's connection revision (round 2 tests: not used yet). */
+    /**
+     * Each saved computer's connection revision. A copy belongs to the
+     * profile and the revision it was saved under: editing a profile to point
+     * at another computer keeps its id but changes its revision, and the old
+     * computer's copies are never shown as the new one's.
+     */
     void revisions(java.util.Map<String, String> byHost) {
+        revisions = Collections.unmodifiableMap(new java.util.HashMap<>(byHost));
+    }
+
+    private volatile java.util.Map<String, String> revisions = Collections.emptyMap();
+
+    /** {@link #revisions} of the saved computers {@code hosts}. */
+    void hosts(List<SavedRemoteHost> hosts) {
+        java.util.Map<String, String> byHost = new java.util.HashMap<>();
+        for (SavedRemoteHost host : hosts) byHost.put(host.id, host.connectionRevision);
+        revisions(byHost);
+    }
+
+    /** A computer as the cache keys it: its profile id and connection revision. */
+    private String key(String host) {
+        String revision = revisions.get(host);
+        return revision == null ? host : host + "\u0000" + revision;
     }
 
     /** {@code (host, pane)} pairs kept last when the cache is over its bounds. */
     void pin(List<String[]> panes) {
         Set<String> names = new HashSet<>();
         for (String[] pane : panes) {
-            if (pane.length == 2 && pane[0] != null && pane[1] != null) names.add(name(pane[0], pane[1]));
+            if (pane.length == 2 && pane[0] != null && pane[1] != null) names.add(name(key(pane[0]), pane[1]));
         }
         pinned = Collections.unmodifiableSet(names);
     }
@@ -216,7 +246,7 @@ final class PaneSnapshots {
     }
 
     File file(String host, String pane) {
-        return new File(dir, name(host, pane));
+        return new File(dir, name(key(host), pane));
     }
 
     /** A fixed-length name for a computer and pane: ids may hold any character. */

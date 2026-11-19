@@ -79,12 +79,14 @@ final class CacheSeal {
             SecretKey key = null;
             if (wrapped.isFile()) {
                 try {
+                    if (wrapped.length() > 256) throw new DamagedKey("the wrapped key file is too large");
                     key = unwrap(master, readBytes(wrapped, 256));
-                } catch (javax.crypto.AEADBadTagException | DamagedKey | IOException lost) {
+                } catch (javax.crypto.AEADBadTagException | DamagedKey lost) {
                     // A key that no longer opens (a new Keystore key, or a
                     // damaged file): everything sealed with it is unreadable.
-                    // Any other Keystore error may pass: nothing is cached this
-                    // time (below), and nothing is wiped.
+                    // Any other error (a Keystore hiccup, a failed read) may
+                    // pass: nothing is cached this time (below), and nothing
+                    // is wiped.
                     key = null;
                 }
             }

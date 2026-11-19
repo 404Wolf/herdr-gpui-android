@@ -55,17 +55,23 @@ fn encode_grid<U: EventListener>(grid: &Crosswords<U>, max_bytes: usize) -> (Vec
 }
 
 /// A full-screen program's copy: the phone's `transcript` of it, then its
-/// screen now, as rows (oldest dropped to fit `max_bytes`); and how many
-/// history rows were kept.
+/// screen now, as rows (oldest dropped to fit `max_bytes`); how many history
+/// rows were kept; and which of them mark rows that were missed.
 pub(crate) fn encode_transcript<U: EventListener>(
     grid: &Crosswords<U>,
     transcript: &crate::transcript::Transcript,
     max_bytes: usize,
-) -> (Vec<u8>, usize) {
+) -> (Vec<u8>, usize, Vec<usize>) {
     let screen = crate::transcript::screen_rows(grid);
-    let lines: Vec<String> = transcript.reader_rows(&screen).map(|r| r.vt.clone()).collect();
+    let rows: Vec<&crate::transcript::Row> = transcript.reader_rows(&screen).collect();
+    let marks: Vec<usize> =
+        rows.iter().enumerate().filter(|(_, row)| crate::transcript::is_mark(row)).map(|(i, _)| i).collect();
+    let lines: Vec<String> = rows.iter().map(|r| r.vt.clone()).collect();
     let history = lines.len() - screen.len();
-    assemble(lines, history, &tail(grid), max_bytes)
+    let (bytes, kept) = assemble(lines, history, &tail(grid), max_bytes);
+    let dropped = history - kept;
+    let marks = marks.into_iter().filter_map(|m| m.checked_sub(dropped)).collect();
+    (bytes, kept, marks)
 }
 
 /// The cursor, after the rows: a reset, its place, and whether it shows.
@@ -125,18 +131,29 @@ pub(crate) fn saved_rows(bytes: &[u8]) -> Vec<crate::transcript::Row> {
         .collect()
 }
 
-/// `vt` without its SGR sequences (the only ones a row holds).
+/// `vt` without its SGR and OSC 8 sequences (the only ones a row holds).
 fn strip_sgr(vt: &str) -> String {
     let mut out = String::with_capacity(vt.len());
-    let mut chars = vt.chars();
+    let mut chars = vt.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
+            match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
                     }
                 }
+                // An OSC (a link), to BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -159,12 +176,24 @@ pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize
         return out;
     };
     let mut current = Style::default();
+    // The OSC 8 link the cells written so far are in (its id and target).
+    let mut linked: Option<(String, String)> = None;
     let mut col = 0;
     while col <= last {
         let square = &cells[Column(col)];
         if square.is_spacer() {
             col += 1;
             continue;
+        }
+        let link = grid.cell_hyperlink(Line(line), Column(col)).map(|l| (clean_osc(l.id()), clean_osc(l.uri())));
+        if link != linked {
+            match &link {
+                Some((id, uri)) => {
+                    let _ = write!(out, "\x1b]8;{};{}\x1b\\", if id.is_empty() { String::new() } else { format!("id={id}") }, uri);
+                }
+                None => out.push_str("\x1b]8;;\x1b\\"),
+            }
+            linked = link;
         }
         let style = grid.grid.style_of(square);
         if style != current {
@@ -175,10 +204,19 @@ pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize
         out.push(if c == '\0' { ' ' } else { c });
         col += if square.is_wide() { 2 } else { 1 };
     }
+    if linked.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
+    }
     if current != Style::default() {
         out.push_str("\x1b[0m");
     }
     out
+}
+
+/// A link's id or target as it may stand in an OSC 8: no control characters
+/// (they would end or break the sequence), and no `;` in the id.
+fn clean_osc(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(2048).collect()
 }
 
 /// A saved pane read back: its grid size and the bytes that redraw it.
@@ -196,28 +234,53 @@ pub(crate) struct Saved {
     pub full_screen: bool,
     /// The core it was copied from (its boot id), "" when unknown.
     pub boot: String,
+    /// The terminal's incarnation (its `created_ms`) and the program it ran
+    /// when copied: with the core and pane, which terminal this is.
+    pub born: u64,
+    pub program: String,
+    /// History rows that mark rows missed (see [`crate::transcript::GAP_TEXT`]).
+    pub gaps: Vec<usize>,
 }
 
 impl Saved {
     /// Bytes to draw on a `cols`×`rows` grid, with no history count (a note, a test).
     pub(crate) fn of(cols: u16, rows: u16, pane: &str, bytes: Vec<u8>) -> Self {
-        Self { cols, rows, pane: pane.into(), bytes, history: None, complete: false, full_screen: false, boot: String::new() }
+        Self {
+            cols,
+            rows,
+            pane: pane.into(),
+            bytes,
+            history: None,
+            complete: false,
+            full_screen: false,
+            boot: String::new(),
+            born: 0,
+            program: String::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// Which terminal this copy is of.
+    pub(crate) fn ident(&self) -> crate::remote::Ident {
+        crate::remote::Ident { boot: self.boot.clone(), pane: self.pane.clone(), born: self.born, program: self.program.clone() }
     }
 }
 
 /// What a copy's header says besides its size.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Meta {
     pub history: usize,
     pub complete: bool,
     pub full_screen: bool,
+    pub gaps: Vec<usize>,
 }
 
-pub(crate) fn header(cols: u16, rows: u16, pane: &str, boot: &str, meta: Meta) -> String {
+pub(crate) fn header(cols: u16, rows: u16, ident: &crate::remote::Ident, meta: Meta) -> String {
     format!(
         "{}\n",
-        json!({"v":VERSION,"cols":cols,"rows":rows,"pane":pane,"boot":boot,"history":meta.history,
-               "complete":meta.complete,"full_screen":meta.full_screen})
+        json!({"v":VERSION,"cols":cols,"rows":rows,"pane":ident.pane,"boot":ident.boot,"born":ident.born,
+               "program":ident.program,"history":meta.history,"complete":meta.complete,
+               "full_screen":meta.full_screen,"gaps":meta.gaps})
     )
 }
 
@@ -225,10 +288,21 @@ pub(crate) fn header(cols: u16, rows: u16, pane: &str, boot: &str, meta: Meta) -
 /// locked, sealed and written by the phone after the lock is released. A
 /// full-screen program's copy is `transcript` and its screen; anything else
 /// is the grid's own history and screen.
+#[cfg(test)]
 pub(crate) fn copy<U: EventListener>(
     grid: &Crosswords<U>,
     pane: &str,
     boot: &str,
+    transcript: Option<&crate::transcript::Transcript>,
+) -> Result<Vec<u8>> {
+    let ident = crate::remote::Ident { boot: boot.into(), pane: pane.into(), ..Default::default() };
+    copy_of(grid, &ident, transcript)
+}
+
+/// [`copy`] of the terminal `ident` names.
+pub(crate) fn copy_of<U: EventListener>(
+    grid: &Crosswords<U>,
+    ident: &crate::remote::Ident,
     transcript: Option<&crate::transcript::Transcript>,
 ) -> Result<Vec<u8>> {
     let cols = u16::try_from(grid.columns()).map_err(|_| Error::Capacity)?;
@@ -236,16 +310,16 @@ pub(crate) fn copy<U: EventListener>(
     let full_screen = grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN);
     let (body, meta) = match transcript.filter(|_| full_screen) {
         Some(transcript) => {
-            let (body, history) = encode_transcript(grid, transcript, MAX_BYTES);
+            let (body, history, gaps) = encode_transcript(grid, transcript, MAX_BYTES);
             let complete = transcript.complete() && history == transcript.rows();
-            (body, Meta { history, complete, full_screen })
+            (body, Meta { history, complete, full_screen, gaps })
         }
         None => {
             let (body, history) = encode_grid(grid, MAX_BYTES);
-            (body, Meta { history, complete: false, full_screen })
+            (body, Meta { history, complete: false, full_screen, gaps: Vec::new() })
         }
     };
-    let mut file = header(cols, rows, pane, boot, meta).into_bytes();
+    let mut file = header(cols, rows, ident, meta).into_bytes();
     file.extend(body);
     Ok(file)
 }
@@ -308,6 +382,18 @@ pub(crate) fn parse(mut bytes: Vec<u8>) -> Result<Saved> {
     } else {
         None
     };
+    // Where the copy marks rows missed: history rows, ascending, bounded.
+    let gaps: Vec<usize> = match (history, header["gaps"].as_array()) {
+        (Some(history), Some(gaps)) if gaps.len() <= 4096 => {
+            let gaps: Vec<usize> =
+                gaps.iter().filter_map(|g| g.as_u64().and_then(|n| usize::try_from(n).ok())).filter(|g| *g < history).collect();
+            if gaps.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(invalid());
+            }
+            gaps
+        }
+        _ => Vec::new(),
+    };
     bytes.drain(..=end);
     Ok(Saved {
         cols,
@@ -318,6 +404,9 @@ pub(crate) fn parse(mut bytes: Vec<u8>) -> Result<Saved> {
         complete: header["complete"] == true,
         full_screen: header["full_screen"] == true,
         boot: header["boot"].as_str().unwrap_or("").chars().take(128).collect(),
+        born: header["born"].as_u64().unwrap_or(0),
+        program: header["program"].as_str().unwrap_or("").chars().take(64).collect(),
+        gaps,
     })
 }
 
@@ -326,9 +415,18 @@ pub(crate) fn transcript_of(saved: &Saved) -> Option<crate::transcript::Transcri
     if !saved.full_screen {
         return None;
     }
-    let rows = saved_rows(&saved.bytes);
-    let screen = rows.len().checked_sub(saved.history?)?;
-    Some(crate::transcript::Transcript::restored(rows, screen, usize::from(saved.cols), saved.complete))
+    let mut rows = saved_rows(&saved.bytes);
+    let history = saved.history?;
+    let screen = rows.len().checked_sub(history)?;
+    // The mark rows go; where they stood, rows were missed.
+    let mut gaps = Vec::with_capacity(saved.gaps.len());
+    for (taken, mark) in saved.gaps.iter().enumerate() {
+        gaps.push(mark - taken);
+    }
+    for mark in saved.gaps.iter().rev() {
+        rows.remove(*mark);
+    }
+    Some(crate::transcript::Transcript::restored_with_gaps(rows, screen, usize::from(saved.cols), saved.complete, &gaps))
 }
 
 /// The most characters of a title or note an uncached pane shows.
@@ -421,16 +519,20 @@ mod tests {
     #[test]
     fn ask2_a_saved_copy_keeps_the_mark_where_rows_were_missed() {
         let rows = |texts: &[&str]| texts.iter().map(|t| crate::transcript::Row::plain(t)).collect::<Vec<_>>();
-        let restored = crate::transcript::Transcript::restored(
-            rows(&["before the gap", crate::transcript::GAP_TEXT, "after the gap", "on screen"]),
+        let restored = crate::transcript::Transcript::restored_with_gaps(
+            rows(&["before the gap", "after the gap", "on screen"]),
             1,
             30,
             false,
+            &[1],
         );
         assert!(restored.wants_seed());
         let screen = rows(&["on screen"]);
         let all: Vec<String> = restored.reader_rows(&screen).map(|r| r.text.clone()).collect();
         assert_eq!(all, ["before the gap", crate::transcript::GAP_TEXT, "after the gap", "on screen"]);
+        // Output that happens to read like the mark is output, never a gap.
+        let plain = crate::transcript::Transcript::restored(rows(&["a row", crate::transcript::GAP_TEXT, "on screen"]), 1, 30, false);
+        assert_eq!(plain.rows(), 2);
     }
 
     fn parsed(text: &[u8], cols: u16, rows: u16) -> Arc<gpui_rio::Session> {

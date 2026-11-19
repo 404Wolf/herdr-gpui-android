@@ -358,7 +358,9 @@ public final class HomeActivity extends Activity {
         cacheQueuedAt = at;
         Map<String, HomeCache.Entry> entries = new LinkedHashMap<>();
         for (Machine machine : machines.values()) {
-            if (HomeCache.hasTree(machine.view)) {
+            // Only a view a session of this process listed: one read back from
+            // the cache may be older than what the terminal merged since.
+            if (machine.liveHandle != 0 && HomeCache.hasTree(machine.view)) {
                 entries.put(machine.host.id, new HomeCache.Entry(machine.view, machine.gitText, machine.gitTruncated));
             }
         }

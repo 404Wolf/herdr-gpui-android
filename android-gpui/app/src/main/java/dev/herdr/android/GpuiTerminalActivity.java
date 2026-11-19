@@ -290,6 +290,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             worker.execute(() -> {
                 try {
                     java.util.List<SavedRemoteHost> hosts = new RemoteHostStore(this).read();
+                    if (snapshots != null) snapshots.hosts(hosts);
                     runOnUiThread(() -> { savedHosts = hosts; updateHostSampling(); refreshSidebar(true); });
                 } catch (Exception ignored) {
                     // An unreadable store leaves the rail without host rows.
@@ -1702,6 +1703,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             worker.execute(() -> {
                 try {
                     java.util.List<SavedRemoteHost> hosts = new RemoteHostStore(this).read();
+                    if (snapshots != null) snapshots.hosts(hosts);
                     runOnUiThread(() -> { savedHosts = hosts; refreshSidebar(true); });
                 } catch (Exception ignored) {
                     // An unreadable store leaves the rail without host rows.

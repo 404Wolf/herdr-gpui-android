@@ -110,7 +110,30 @@ struct Connection<'a> {
     automatic_input: bool,
     /// What this viewer told the core about Wolf using it (item 71).
     focus: Focus,
+    /// The stitched read of the pane on screen, sent and not answered yet:
+    /// its reply is awaited by the session's loop (keys, credit, switches go
+    /// on meanwhile), never in a blocking call.
+    pending: Option<PendingSeed>,
+    /// Requests given up on and when: a reply to one that comes late is
+    /// dropped, never taken for the answer to a later call. Kept for a long
+    /// while (a reply can lag a slow link by minutes), bounded in number.
+    abandoned: VecDeque<(u64, Instant)>,
 }
+
+/// A stitched read on its way: whose transcript its reply joins.
+struct PendingSeed {
+    id: u64,
+    ident: crate::remote::Ident,
+    deadline: Instant,
+    /// One stitched read at a time from this phone, until the reply.
+    _turn: Stitching,
+}
+/// How long a request given up on is remembered, and how many at most.
+const ABANDONED_FOR: Duration = Duration::from_secs(600);
+const ABANDONED_MAX: usize = 4096;
+/// How long the small questions before a stitched read (size, viewers) may
+/// hold the loop: on a link that slow, no read is made this time.
+const SEED_ASK_WAIT: Duration = Duration::from_secs(3);
 
 /// Item 71, latest-touched device wins: with a core whose hello offers
 /// `viewer_focus` and `focus_by_use`, the attach says whether Herdr is in
@@ -425,9 +448,10 @@ impl Connection<'_> {
         )?;
         let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
+            self.expire_pending();
             let Some(frame) = self.read()? else { continue };
             if frame.channel == 0 && frame.kind == 0 {
-                let reply: Value = serde_json::from_slice(&frame.bytes)?;
+                let Some(reply) = self.route(&frame.bytes)? else { continue };
                 if reply["id"] != id {
                     return Err(Error::Protocol("uncorrelated RPC reply".into()));
                 }
@@ -444,7 +468,49 @@ impl Connection<'_> {
             }
             self.deliver(frame)?;
         }
+        // Its reply may still come: dropped then, never taken for a later call's.
+        self.abandon(id);
         Err(Error::Protocol(format!("{method} timed out")))
+    }
+    fn abandon(&mut self, id: u64) {
+        let now = Instant::now();
+        while self.abandoned.front().is_some_and(|(_, at)| now.duration_since(*at) > ABANDONED_FOR)
+            || self.abandoned.len() >= ABANDONED_MAX
+        {
+            self.abandoned.pop_front();
+        }
+        self.abandoned.push_back((id, now));
+    }
+    /// An RPC reply that arrived: the pending stitched read's (merged into
+    /// its transcript), one given up on (dropped), or the reply to the call
+    /// now waiting (returned).
+    fn route(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
+        let reply: Value = serde_json::from_slice(bytes)?;
+        let id = reply["id"].as_u64();
+        if let Some(at) = id.and_then(|id| self.abandoned.iter().position(|(old, _)| *old == id)) {
+            self.abandoned.remove(at);
+            return Ok(None);
+        }
+        if self.pending.as_ref().is_some_and(|read| Some(read.id) == id) {
+            if let Some(read) = self.pending.take() {
+                let placed = reply.get("error").is_none() && crate::remote::seeded_of(&read.ident, &reply["result"]);
+                #[cfg(feature = "android-ui")]
+                log::info!("stitch {}: {}", read.ident.pane, if placed { "placed" } else { "not placed" });
+                #[cfg(not(feature = "android-ui"))]
+                let _ = placed;
+            }
+            return Ok(None);
+        }
+        Ok(Some(reply))
+    }
+    /// A stitched read past its time is given up: its late reply is dropped,
+    /// and the phone's copy stays as it is until the pane's status moves.
+    fn expire_pending(&mut self) {
+        if self.pending.as_ref().is_some_and(|read| Instant::now() >= read.deadline)
+            && let Some(read) = self.pending.take()
+        {
+            self.abandon(read.id);
+        }
     }
     fn deliver(&mut self, frame: Frame) -> Result<()> {
         if frame.channel == self.events && frame.kind == 0 {
@@ -1082,7 +1148,12 @@ impl Connection<'_> {
     /// ([`may_stitch`]), one at a time from this phone, and never retried: a
     /// refusal or failure leaves the phone's own copy as it is.
     fn seed(&mut self, pane: &str) -> Result<()> {
-        let (boot, cols) = {
+        // Checked again now, not only when it was asked for: the phone may be
+        // in use by now, the pane busy, or another read still on its way.
+        if self.pending.is_some() {
+            return Ok(());
+        }
+        let (agent, cols) = {
             let state = lock(&self.owner.state);
             if state.view["pane_id"] != pane || self.channel == 0 {
                 return Ok(());
@@ -1090,9 +1161,24 @@ impl Connection<'_> {
             let Some(terminal) = state.terminal.as_ref() else {
                 return Ok(());
             };
+            let Some(agent) = crate::remote::agent_ident(&state.view, pane) else {
+                return Ok(());
+            };
+            let busy = state.view["panes"]
+                .as_array()
+                .and_then(|panes| panes.iter().find(|p| p["id"] == pane))
+                .is_none_or(|p| matches!(p["status"].as_str(), Some("working" | "blocked" | "error")));
+            if busy {
+                return Ok(());
+            }
             let cols = terminal.grid().lock().columns();
-            (state.view["boot_id"].as_str().unwrap_or("").to_owned(), cols)
+            (agent, cols)
         };
+        if self.owner.uses.idle_ms() < crate::remote::SEED_QUIET_MS {
+            // The read would hold this phone's keys: asked again once it is quiet.
+            crate::remote::seed_put_off(&agent);
+            return Ok(());
+        }
         // A pane on another machine is behind a relay: its viewers are not listed here.
         if pane.contains('/') {
             return Ok(());
@@ -1100,22 +1186,22 @@ impl Connection<'_> {
         // The app redraws at the core's width while it is read: until the
         // core has taken the phone's (an attach's resize can still be on its
         // way), the rows would be another width's, wrapped on the phone.
-        let facts = match self.call("terminal.get", json!({"terminal": pane})) {
+        let facts = match self.call_within("terminal.get", json!({"terminal": pane}), SEED_ASK_WAIT) {
             Ok(facts) => facts,
-            Err(Error::Rpc { .. }) => return Ok(()),
+            Err(Error::Rpc { .. } | Error::Protocol(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
         if !at_width(&facts, cols, self.width) {
-            crate::remote::seed_later(&boot, pane);
+            crate::remote::seed_later_of(&agent);
             return Ok(());
         }
-        let Some(_turn) = Stitching::take() else {
+        let Some(turn) = Stitching::take() else {
             return Ok(());
         };
-        let viewers = match self.call("terminal.viewers", json!({"terminal": pane})) {
+        let viewers = match self.call_within("terminal.viewers", json!({"terminal": pane}), SEED_ASK_WAIT) {
             Ok(viewers) => viewers,
             // An older core cannot say who is watching: no stitch.
-            Err(Error::Rpc { .. }) => return Ok(()),
+            Err(Error::Rpc { .. } | Error::Protocol(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
         if !may_stitch(&viewers, self.channel) {
@@ -1123,18 +1209,22 @@ impl Connection<'_> {
             log::info!("stitch {pane}: another viewer is in use; the phone's copy stays");
             return Ok(());
         }
-        match self.call_within("terminal.read", json!({"terminal": pane, "lines": STITCH_LINES}), STITCH_WAIT) {
-            Ok(reply) => {
-                let placed = crate::remote::seeded(&boot, pane, &reply);
-                #[cfg(feature = "android-ui")]
-                log::info!("stitch {pane}: {} ({})", reply["how"], if placed { "placed" } else { "not placed" });
-                #[cfg(not(feature = "android-ui"))]
-                let _ = placed;
-                Ok(())
-            }
-            Err(Error::Rpc { .. }) => Ok(()),
-            Err(error) => Err(error),
+        if self.owner.uses.idle_ms() < crate::remote::SEED_QUIET_MS {
+            crate::remote::seed_put_off(&agent);
+            return Ok(());
         }
+        // Sent, and answered through the loop (route): the loop goes on.
+        self.serial += 1;
+        let id = self.serial;
+        write_frame(
+            &mut self.socket,
+            0,
+            0,
+            &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":"terminal.read",
+                "params":{"terminal": pane, "lines": STITCH_LINES}}))?,
+        )?;
+        self.pending = Some(PendingSeed { id, ident: agent, deadline: Instant::now() + STITCH_WAIT, _turn: turn });
+        Ok(())
     }
     fn refresh(&mut self) -> Result<()> {
         // Subscribe precedes reading the app document; doc events/missed force
@@ -1173,8 +1263,9 @@ impl Connection<'_> {
             if let Some(outgoing) = state.terminal.take() {
                 let pane = state.view["pane_id"].as_str().unwrap_or("");
                 if pane != terminal {
-                    let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
-                    crate::remote::depart(self.owner.id, outgoing, pane.to_owned(), boot);
+                    let ident = crate::remote::ident(&state.view, pane);
+                    let agent = crate::remote::agent_ident(&state.view, pane);
+                    crate::remote::depart_as(self.owner.id, outgoing, pane.to_owned(), ident, agent);
                 }
             }
             state.render_id = 0;
@@ -2005,6 +2096,8 @@ pub(crate) fn run(
             offered: offers(&hello, "viewer_focus") && offers(&hello, "focus_by_use"),
             ..Focus::default()
         },
+        pending: None,
+        abandoned: VecDeque::new(),
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -2133,8 +2226,15 @@ fn serve(
             connection.seed(&pane)?;
         }
         if let Some(frame) = connection.read()? {
-            connection.deliver(frame)?;
+            if frame.channel == 0 && frame.kind == 0 {
+                // No call is waiting: the pending stitched read's reply, or a
+                // late one given up on.
+                connection.route(&frame.bytes)?;
+            } else {
+                connection.deliver(frame)?;
+            }
         }
+        connection.expire_pending();
         if connection.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY)
             && let Some(pane) = connection.reattach.take()
             // A newer pick (also one parked while hidden) wins over the old pane.
@@ -5167,6 +5267,8 @@ mod focus_review_tests {
                 uses: owner.uses.count(),
                 ..Focus::default()
             },
+            pending: None,
+            abandoned: VecDeque::new(),
         };
         (connection, peer)
     }
@@ -5824,6 +5926,8 @@ mod cache_tests {
             ended: None,
             automatic_input: true,
             focus: Focus::default(),
+            pending: None,
+            abandoned: VecDeque::new(),
         };
         (connection, peer)
     }
@@ -5907,8 +6011,13 @@ mod cache_tests {
         let started = Instant::now();
         connection.seed("t1").unwrap();
         let took = started.elapsed();
-        assert!(lock(&asked).iter().any(|m| m == "terminal.read"), "no read was asked: {:?}", lock(&asked));
         assert!(took < Duration::from_millis(1000), "the loop waited {took:?} for the read");
+        // The read was sent all the same (the core takes it off the socket a moment later).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !lock(&asked).iter().any(|m| m == "terminal.read") {
+            assert!(Instant::now() < deadline, "no read was asked: {:?}", lock(&asked));
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Review round 2 P2-7: keys never go to a pane that is not drawn yet

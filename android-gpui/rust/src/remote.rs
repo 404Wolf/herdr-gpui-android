@@ -224,6 +224,12 @@ pub(crate) struct Local {
     settled: bool,
     /// The output count when the screen was last captured.
     captured: u64,
+    /// A first drag is building the phone's copy (outside the session's
+    /// lock): the rows dragged meanwhile, applied when it is shown.
+    building: Option<i32>,
+    /// The computer the UI shows this session as (the poll's host): the
+    /// phone's copy of a pane carries it with the pane, for its links.
+    host: String,
 }
 
 impl Local {
@@ -485,27 +491,33 @@ pub fn close(id: u64) {
     let reading = state.local.reader.take();
     if let Some(terminal) = state.terminal.take() {
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-        let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
+        let me = ident(&state.view, &pane);
+        let agent = agent_ident(&state.view, &pane);
         // This grid is newer than any copy of the same pane kept on a switch.
         lock(departed()).retain(|kept| !kept.from(id, &pane));
-        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane: pane.clone(), boot: boot.clone() });
+        *lock(closed()) = Some(Kept {
+            session: id,
+            terminal: terminal.clone(),
+            pane: pane.clone(),
+            ident: me.clone(),
+            agent: agent.clone(),
+        });
         let shown = state.render_id;
-        let agent = agent_pane(&state.view, &pane);
         drop(state);
-        let key = Some((boot.clone(), pane.clone()));
+        let key = Some(me);
         match reading {
             // Being read back already: it stays, at the same row.
             Some((reader, copy)) => hold_as(reader, copy, key),
             None => {
                 // The live grid at once; this runs on the UI thread.
                 hold_as(shown, terminal.clone(), key.clone());
-                if agent {
+                if let Some(agent) = agent {
                     // An agent's full screen: the phone's transcript of it
                     // replaces that frame once it is built, so the conversation
                     // still scrolls with no link (not one screen).
                     let slot = held();
                     std::thread::spawn(move || {
-                        let Some(copy) = reader_for(&boot, &pane, &terminal) else {
+                        let Some(copy) = reader_for(&agent, &terminal) else {
                             return;
                         };
                         let mut held = lock(slot);
@@ -513,7 +525,7 @@ pub fn close(id: u64) {
                             let reader = crate::core_session::next_render_id();
                             *held = Some(Held { id: reader, terminal: copy, key });
                             drop(held);
-                            show_render(None, reader, Some(shown));
+                            show_render(None, reader, Some(shown), None);
                         }
                     });
                 }
@@ -521,32 +533,91 @@ pub fn close(id: u64) {
         }
     }
 }
-/// Whether `pane` runs an agent (it reports a status: Claude Code, Codex):
-/// only an agent's full screen is a conversation the phone keeps and reads
-/// back itself. Any other full-screen program (vim, less, htop) scrolls
-/// itself, with the drag as wheel input.
-fn agent_pane(view: &Value, pane: &str) -> bool {
-    view["panes"]
-        .as_array()
-        .and_then(|panes| panes.iter().find(|p| p["id"] == pane))
-        .is_some_and(|entry| entry["status"].as_str().is_some_and(|status| !status.is_empty()))
+/// Which terminal a pane is: the core (its boot id), the pane, the
+/// terminal's incarnation (`created_ms`: a registry restored or rolled back
+/// can number a new terminal t1 again) and the program it runs. A copy is
+/// only ever joined to the terminal it was made of.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Ident {
+    pub boot: String,
+    pub pane: String,
+    pub born: u64,
+    pub program: String,
+}
+
+fn pane_entry<'a>(view: &'a Value, pane: &str) -> Option<&'a Value> {
+    view["panes"].as_array().and_then(|panes| panes.iter().find(|p| p["id"] == pane))
+}
+
+/// `pane` of the session whose view this is.
+pub(crate) fn ident(view: &Value, pane: &str) -> Ident {
+    let entry = pane_entry(view, pane);
+    Ident {
+        boot: view["boot_id"].as_str().unwrap_or("").to_owned(),
+        pane: pane.to_owned(),
+        born: entry.and_then(|e| e["created_ms"].as_u64()).unwrap_or(0),
+        program: entry.and_then(|e| e["program"].as_str()).unwrap_or("").to_owned(),
+    }
+}
+
+/// The program an agent was seen running as, per terminal, with the status
+/// marker it had then: a status reported again (a new marker) shows the
+/// agent is what runs now; the same marker with another program is that
+/// program (a pager after the agent left) under the agent's old status.
+type Agents = HashMap<(String, String, u64), (String, String)>;
+fn agents() -> &'static Mutex<Agents> {
+    static AGENTS: OnceLock<Mutex<Agents>> = OnceLock::new();
+    AGENTS.get_or_init(Mutex::default)
+}
+const AGENTS_MAX: usize = 256;
+
+/// `pane`, when it runs an agent (Claude Code, Codex): one that reports its
+/// status, or that Herdr labelled an agent, and is still the program that
+/// did. Only an agent's full screen is a conversation the phone keeps and
+/// reads back itself; any other full-screen program (vim, less, htop)
+/// scrolls itself, with the drag as wheel input.
+pub(crate) fn agent_ident(view: &Value, pane: &str) -> Option<Ident> {
+    let entry = pane_entry(view, pane)?;
+    let reports = entry["status"].as_str().is_some_and(|s| !s.is_empty());
+    let labelled = entry["kind"].as_str().is_some_and(|k| !k.is_empty());
+    if !reports && !labelled {
+        return None;
+    }
+    let me = ident(view, pane);
+    let (marker, _) = marker(view, pane);
+    let mut seen = lock(agents());
+    let key = (me.boot.clone(), me.pane.clone(), me.born);
+    match seen.get(&key) {
+        Some((at, program)) if *at == marker && *program != me.program => return None,
+        Some((at, _)) if *at == marker => {}
+        _ => {
+            if seen.len() >= AGENTS_MAX {
+                seen.clear();
+            }
+            seen.insert(key, (marker, me.program.clone()));
+        }
+    }
+    Some(me)
 }
 /// Draws render id `id` (for `generation`, else the UI's current one), only
-/// while `instead_of` is drawn when given. It shows the same host and pane as
-/// the frame it replaces (the phone's copy of that pane, or its live grid
-/// again), so links found on it keep their target. Nothing without a UI.
+/// while `instead_of` is drawn when given. It shows `target` (host, pane);
+/// with none, the same as the frame it replaces (the phone's copy of that
+/// pane), so links found on it keep their target. Nothing without a UI.
 #[cfg(feature = "android-ui")]
-fn show_render(generation: Option<i64>, id: u64, instead_of: Option<u64>) {
+fn show_render(generation: Option<i64>, id: u64, instead_of: Option<u64>, target: Option<(&str, &str)>) {
     let mut mailbox = model::mailbox();
     let now = mailbox.state();
     if instead_of.is_some_and(|old| now.shell != old) {
         return;
     }
-    let target = now.frame_target.clone();
+    let target = match target {
+        Some((host, pane)) => Some(model::FrameTarget::new(host, pane)),
+        None => now.frame_target.clone(),
+    };
     mailbox.set_shell(generation.unwrap_or(now.generation), id, target);
 }
 #[cfg(not(feature = "android-ui"))]
-fn show_render(_generation: Option<i64>, _id: u64, _instead_of: Option<u64>) {}
+fn show_render(_generation: Option<i64>, _id: u64, _instead_of: Option<u64>, _target: Option<(&str, &str)>) {}
 /// Most grids of switched-away panes kept at once, each until the phone saves
 /// it. A grid is at most the phone's scrollback (10,000 rows), so this bounds
 /// what a quick run of switches can keep alive to two such grids.
@@ -561,7 +632,20 @@ fn departed() -> &'static Mutex<std::collections::VecDeque<Kept>> {
 /// Session `session` is replacing `pane`'s grid with another pane's: keep it
 /// for saving. Only the grid object moves here; nothing is sent and no size
 /// changes.
+#[cfg(test)]
 pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: String, boot: String) {
+    let ident = Ident { boot, pane: pane.clone(), ..Ident::default() };
+    depart_as(session, terminal, pane, ident, None);
+}
+/// [`depart`] of the terminal `ident`, which ran `agent` if any (its
+/// transcript is its copy).
+pub(crate) fn depart_as(
+    session: u64,
+    terminal: Arc<gpui_rio::Session>,
+    pane: String,
+    ident: Ident,
+    agent: Option<Ident>,
+) {
     if pane.is_empty() {
         return;
     }
@@ -574,7 +658,7 @@ pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: Strin
     }
     let mut kept = lock(departed());
     kept.retain(|other| !other.from(session, &pane));
-    kept.push_back(Kept { session, terminal, pane, boot });
+    kept.push_back(Kept { session, terminal, pane, ident, agent });
     while kept.len() > DEPARTED_MAX {
         kept.pop_front();
     }
@@ -593,7 +677,7 @@ pub(crate) fn departed_test_lock() -> MutexGuard<'static, ()> {
 /// attaches (the save runs on a worker, maybe after that attach).
 #[cfg(test)]
 pub(crate) fn closed_for_test(session: u64, terminal: Arc<gpui_rio::Session>, pane: &str) {
-    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into(), boot: String::new() });
+    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into(), ident: Ident::default(), agent: None });
 }
 fn closed() -> &'static Mutex<Option<Kept>> {
     static CLOSED: OnceLock<Mutex<Option<Kept>>> = OnceLock::new();
@@ -606,8 +690,10 @@ struct Kept {
     session: u64,
     terminal: Arc<gpui_rio::Session>,
     pane: String,
-    /// The core it came from (its boot id): the transcript's key.
-    boot: String,
+    /// The terminal it is (its copy says so), and the agent it ran when
+    /// kept, if it ran one: whose transcript is its copy.
+    ident: Ident,
+    agent: Option<Ident>,
 }
 impl Kept {
     fn from(&self, session: u64, pane: &str) -> bool {
@@ -619,7 +705,7 @@ pub(crate) fn hold(terminal: Arc<gpui_rio::Session>) {
     hold_as(crate::core_session::next_render_id(), terminal, None);
 }
 /// Makes `terminal` the held frame, drawn under render id `id`.
-fn hold_as(id: u64, terminal: Arc<gpui_rio::Session>, key: Option<(String, String)>) {
+fn hold_as(id: u64, terminal: Arc<gpui_rio::Session>, key: Option<Ident>) {
     *lock(held()) = Some(Held { id, terminal, key });
 }
 /// The grid the held frame draws.
@@ -627,11 +713,11 @@ fn hold_as(id: u64, terminal: Arc<gpui_rio::Session>, key: Option<(String, Strin
 struct Held {
     id: u64,
     terminal: Arc<gpui_rio::Session>,
-    /// The core (its boot id) and pane it shows, when known: a live attach of
-    /// the same pane on the same core keeps the place it was read at. Pane
-    /// ids repeat across computers (every core has a t1) and after a core
-    /// restart, so the pane alone is never enough.
-    key: Option<(String, String)>,
+    /// The terminal it shows, when known: a live attach of the same terminal
+    /// keeps the place it was read at. Pane ids repeat across computers
+    /// (every core has a t1) and within one core whose registry was restored,
+    /// so the pane alone is never enough.
+    key: Option<Ident>,
 }
 /// The terminal of the last closed session (or a saved pane read back), which
 /// the held frame draws.
@@ -697,10 +783,10 @@ pub(crate) fn settle(owner: &Session, state: &mut State) -> bool {
     }
     local.settled = true;
     let pane = state.view["pane_id"].as_str().unwrap_or("");
-    let boot = state.view["boot_id"].as_str().unwrap_or("");
+    let me = ident(&state.view, pane);
     if let Some(held) = lock(held()).take()
-        && !boot.is_empty()
-        && held.key.as_ref().is_some_and(|(b, p)| b == boot && p == pane)
+        && !me.boot.is_empty()
+        && held.key.as_ref() == Some(&me)
         && held.terminal.grid().lock().display_offset() > 0
     {
         state.local.reader = Some((held.id, held.terminal));
@@ -712,8 +798,7 @@ pub(crate) fn settle(owner: &Session, state: &mut State) -> bool {
 /// One full-screen pane's transcript on the phone, by core boot and pane.
 #[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
 struct Transcribed {
-    boot: String,
-    pane: String,
+    ident: Ident,
     transcript: crate::transcript::Transcript,
     /// The pane's status marker when a seed was last asked for: asked once
     /// per marker, so a refused or failed read is never retried in a loop.
@@ -726,8 +811,8 @@ struct Transcribed {
     used: u64,
 }
 impl Transcribed {
-    fn is(&self, boot: &str, pane: &str) -> bool {
-        self.boot == boot && self.pane == pane
+    fn is(&self, ident: &Ident) -> bool {
+        self.ident == *ident
     }
 }
 /// Transcripts kept in memory at once (each at most transcript::MAX_BYTES).
@@ -737,10 +822,10 @@ fn transcripts() -> &'static Mutex<Vec<Transcribed>> {
     KEPT.get_or_init(Mutex::default)
 }
 static USED: AtomicU64 = AtomicU64::new(1);
-/// `boot`/`pane`'s transcript, made if there is none; the least recently used goes beyond TRANSCRIPTS.
-fn transcribed<'a>(store: &'a mut Vec<Transcribed>, boot: &str, pane: &str) -> &'a mut Transcribed {
+/// `ident`'s transcript, made if there is none; the least recently used goes beyond TRANSCRIPTS.
+fn transcribed<'a>(store: &'a mut Vec<Transcribed>, ident: &Ident) -> &'a mut Transcribed {
     let used = USED.fetch_add(1, Ordering::Relaxed);
-    let at = match store.iter().position(|kept| kept.is(boot, pane)) {
+    let at = match store.iter().position(|kept| kept.is(ident)) {
         Some(at) => at,
         None => {
             if store.len() >= TRANSCRIPTS
@@ -749,8 +834,7 @@ fn transcribed<'a>(store: &'a mut Vec<Transcribed>, boot: &str, pane: &str) -> &
                 store.remove(oldest);
             }
             store.push(Transcribed {
-                boot: boot.into(),
-                pane: pane.into(),
+                ident: ident.clone(),
                 transcript: crate::transcript::Transcript::default(),
                 asked: None,
                 waited: None,
@@ -763,10 +847,15 @@ fn transcribed<'a>(store: &'a mut Vec<Transcribed>, boot: &str, pane: &str) -> &
     store[at].used = used;
     &mut store[at]
 }
-/// A transcript read back from a saved copy, unless the phone already keeps a newer one.
-fn adopt(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
+/// A transcript read back from a saved copy of the terminal `ident` names,
+/// unless the phone already keeps a newer one. A copy with no identity (an
+/// older file) is never joined to a live pane.
+fn adopt(ident: &Ident, transcript: crate::transcript::Transcript) {
+    if ident.boot.is_empty() {
+        return;
+    }
     let mut store = lock(transcripts());
-    let kept = transcribed(&mut store, boot, pane);
+    let kept = transcribed(&mut store, ident);
     // Live capture since the attach found nothing yet: the saved copy leads,
     // and the next screen is aligned with its last one.
     if kept.transcript.rows() == 0 {
@@ -775,15 +864,17 @@ fn adopt(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
 }
 
 /// The phone's copy of a full-screen program to read back: its transcript
-/// then its screen now, in a terminal of its own at the newest row. None
-/// when `terminal` is not full screen or no history was kept yet.
-fn reader_for(boot: &str, pane: &str, terminal: &gpui_rio::Session) -> Option<Arc<gpui_rio::Session>> {
-    if pane.is_empty() {
+/// then its screen now, in a terminal of its own at the newest row. The
+/// transcript first looks at that very screen, so the two join without a
+/// row missed or doubled. None when `terminal` is not full screen or no
+/// history was kept yet. Encodes and parses: never under the session's lock.
+fn reader_for(ident: &Ident, terminal: &gpui_rio::Session) -> Option<Arc<gpui_rio::Session>> {
+    if ident.pane.is_empty() {
         return None;
     }
     let (bytes, cols, rows) = {
-        let store = lock(transcripts());
-        let kept = store.iter().find(|kept| kept.is(boot, pane))?;
+        let mut store = lock(transcripts());
+        let kept = store.iter_mut().find(|kept| kept.is(ident))?;
         if kept.transcript.rows() == 0 {
             return None;
         }
@@ -791,12 +882,13 @@ fn reader_for(boot: &str, pane: &str, terminal: &gpui_rio::Session) -> Option<Ar
         if !grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN) {
             return None;
         }
-        let (bytes, _) = crate::snapshot::encode_transcript(&grid, &kept.transcript, crate::snapshot::MAX_BYTES);
+        kept.transcript.observe(crate::transcript::screen_rows(&grid), grid.columns());
+        let (bytes, _, _) = crate::snapshot::encode_transcript(&grid, &kept.transcript, crate::snapshot::MAX_BYTES);
         (bytes, u16::try_from(grid.columns()).ok()?, u16::try_from(grid.screen_lines()).ok()?)
     };
-    let reader = crate::snapshot::restore(crate::snapshot::Saved::of(cols, rows, pane, bytes)).ok()?;
-    // Parsed on its own thread: a copy at most MAX_BYTES takes milliseconds.
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let reader = crate::snapshot::restore(crate::snapshot::Saved::of(cols, rows, &ident.pane, bytes)).ok()?;
+    // Parsed on its own thread: the first drag scrolls a whole copy.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while reader.is_alive() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -829,11 +921,10 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
         return;
     };
     let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-    let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
-    // Only an agent's conversation is kept (see agent_pane).
-    if pane.is_empty() || !agent_pane(&state.view, &pane) {
+    // Only an agent's conversation is kept (see agent_ident).
+    let Some(agent) = (!pane.is_empty()).then(|| agent_ident(&state.view, &pane)).flatten() else {
         return;
-    }
+    };
     let output = owner.heard.output();
     let screen = {
         let grid = terminal.grid().lock();
@@ -846,7 +937,7 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
     let (marker, busy) = marker(&state.view, &pane);
     let ask = {
         let mut store = lock(transcripts());
-        let kept = transcribed(&mut store, &boot, &pane);
+        let kept = transcribed(&mut store, &agent);
         if let Some((rows, cols)) = screen {
             kept.transcript.observe(rows, cols);
         }
@@ -864,14 +955,14 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
         ask
     };
     if ask {
-        *lock(&owner.seed) = Some(pane);
+        *lock(&owner.seed) = Some(agent.pane);
     }
 }
 
 /// The phone must have been left alone this long before a stitched read is
 /// asked for: the read holds the phone's own keys as well as the desk's.
 #[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
-const SEED_QUIET_MS: u64 = 3_000;
+pub(crate) const SEED_QUIET_MS: u64 = 3_000;
 /// How many times one marker's read waits for the core to take the phone's
 /// width, and how long each wait is.
 #[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
@@ -887,10 +978,14 @@ const SEED_RETRY: Duration = Duration::from_millis(20);
 /// of another width, wrapped on the phone. Asked again after SEED_RETRY, at
 /// most SEED_TRIES times for the same marker; then, as for any refused read,
 /// not before the pane's status moves on.
-#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn seed_later(boot: &str, pane: &str) {
+    seed_later_of(&Ident { boot: boot.into(), pane: pane.into(), ..Ident::default() });
+}
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+pub(crate) fn seed_later_of(ident: &Ident) {
     let mut store = lock(transcripts());
-    let kept = transcribed(&mut store, boot, pane);
+    let kept = transcribed(&mut store, ident);
     let Some(marker) = kept.asked.clone() else {
         return;
     };
@@ -905,9 +1000,24 @@ pub(crate) fn seed_later(boot: &str, pane: &str) {
     }
 }
 
-/// The core's stitched read of `pane` (`terminal.read`'s reply), merged into
-/// its transcript. False when it was no stitched read or could not be placed.
+/// The phone was used after the read was asked for: put it off (not counted
+/// as a refusal), asked again once the phone is quiet.
+#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
+pub(crate) fn seed_put_off(ident: &Ident) {
+    let mut store = lock(transcripts());
+    let kept = transcribed(&mut store, ident);
+    kept.asked = None;
+    kept.not_before = Some(std::time::Instant::now() + SEED_RETRY);
+}
+
+#[cfg(test)]
 pub(crate) fn seeded(boot: &str, pane: &str, reply: &Value) -> bool {
+    seeded_of(&Ident { boot: boot.into(), pane: pane.into(), ..Ident::default() }, reply)
+}
+/// The core's stitched read of the terminal `ident` names (`terminal.read`'s
+/// reply), merged into its transcript. False when it was no stitched read or
+/// could not be placed.
+pub(crate) fn seeded_of(ident: &Ident, reply: &Value) -> bool {
     if reply["how"] != "stitched" {
         return false;
     }
@@ -915,13 +1025,14 @@ pub(crate) fn seeded(boot: &str, pane: &str, reply: &Value) -> bool {
         return false;
     };
     let mut store = lock(transcripts());
-    transcribed(&mut store, boot, pane).transcript.seed(text, reply["complete"] == true)
+    transcribed(&mut store, ident).transcript.seed(text, reply["complete"] == true)
 }
 
 #[cfg(test)]
 pub(crate) fn transcript_rows(boot: &str, pane: &str) -> Option<Vec<String>> {
     let store = lock(transcripts());
-    let kept = store.iter().find(|kept| kept.is(boot, pane))?;
+    let ident = Ident { boot: boot.into(), pane: pane.into(), ..Ident::default() };
+    let kept = store.iter().find(|kept| kept.is(&ident))?;
     Some(kept.transcript.reader_rows(kept.transcript.screen()).map(|r| r.text.clone()).collect())
 }
 /// `pane`'s copy, as session `id` last showed it: the phone's copy of that
@@ -939,8 +1050,9 @@ pub fn copy_pane(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
     let live = lock(sessions()).get(&id).cloned().and_then(|owner| {
         let state = lock(&owner.state);
         if state.view["pane_id"] == pane {
-            let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
-            state.terminal.clone().map(|terminal| (terminal, boot))
+            let me = ident(&state.view, pane);
+            let agent = agent_ident(&state.view, pane);
+            state.terminal.clone().map(|terminal| (terminal, me, agent))
         } else {
             None
         }
@@ -948,20 +1060,32 @@ pub fn copy_pane(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
     let switched = || {
         let mut kept = lock(departed());
         let at = kept.iter().position(|kept| kept.from(id, pane))?;
-        kept.remove(at).map(|kept| (kept.terminal, kept.boot))
+        kept.remove(at).map(|kept| (kept.terminal, kept.ident, kept.agent))
     };
     let last_closed = || {
         lock(closed())
             .as_ref()
             .filter(|kept| kept.from(id, pane))
-            .map(|kept| (kept.terminal.clone(), kept.boot.clone()))
+            .map(|kept| (kept.terminal.clone(), kept.ident.clone(), kept.agent.clone()))
     };
-    let Some((terminal, boot)) = live.or_else(switched).or_else(last_closed) else {
+    let Some((terminal, mut me, agent)) = live.or_else(switched).or_else(last_closed) else {
         return Ok(None);
     };
-    let store = lock(transcripts());
-    let transcript = store.iter().find(|kept| kept.is(&boot, pane)).map(|kept| &kept.transcript);
-    Ok(Some(crate::snapshot::copy(&terminal.grid().lock(), pane, &boot, transcript)?))
+    if me.pane.is_empty() {
+        me.pane = pane.to_owned();
+    }
+    // Only the transcript of the agent this grid ran is its copy: never
+    // another terminal's, nor an agent's under the pager that followed it.
+    let mut store = lock(transcripts());
+    let grid = terminal.grid().lock();
+    let transcript = agent.and_then(|agent| store.iter_mut().find(|kept| kept.is(&agent))).map(|kept| {
+        if grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN) {
+            // The very screen copied, so history and screen join exactly.
+            kept.transcript.observe(crate::transcript::screen_rows(&grid), grid.columns());
+        }
+        &kept.transcript
+    });
+    Ok(Some(crate::snapshot::copy_of(&grid, &me, transcript)?))
 }
 /// Test stand-in for the phone's save: [`copy_pane`] written to `path`.
 #[cfg(test)]
@@ -984,12 +1108,11 @@ pub(crate) fn open_saved_file(path: &str) -> Result<u64> {
 /// again on the same core. Never on the UI thread.
 pub fn open_saved(bytes: Vec<u8>) -> Result<u64> {
     let saved = crate::snapshot::parse(bytes)?;
-    if !saved.boot.is_empty()
-        && let Some(transcript) = crate::snapshot::transcript_of(&saved)
-    {
-        adopt(&saved.boot, &saved.pane, transcript);
+    let ident = saved.ident();
+    if let Some(transcript) = crate::snapshot::transcript_of(&saved) {
+        adopt(&ident, transcript);
     }
-    let key = (!saved.boot.is_empty()).then(|| (saved.boot.clone(), saved.pane.clone()));
+    let key = (!ident.boot.is_empty()).then_some(ident);
     let terminal = crate::snapshot::restore(saved)?;
     let id = crate::core_session::next_render_id();
     *lock(cached()) = Some((id, terminal.clone()));
@@ -1001,10 +1124,8 @@ pub fn open_saved(bytes: Vec<u8>) -> Result<u64> {
 /// scrolls back through it at once. A newer transcript already kept wins.
 pub fn adopt_saved(bytes: Vec<u8>) -> Result<()> {
     let saved = crate::snapshot::parse(bytes)?;
-    if !saved.boot.is_empty()
-        && let Some(transcript) = crate::snapshot::transcript_of(&saved)
-    {
-        adopt(&saved.boot, &saved.pane, transcript);
+    if let Some(transcript) = crate::snapshot::transcript_of(&saved) {
+        adopt(&saved.ident(), transcript);
     }
     Ok(())
 }
@@ -1060,6 +1181,9 @@ pub fn poll_terminal(
     }
     let owner = session(id)?;
     let mut state = lock(&owner.state);
+    if state.local.host != host {
+        state.local.host = host.to_owned();
+    }
     let settled = settle(&owner, &mut state);
     keep_local(&owner, &mut state);
     {
@@ -1138,7 +1262,9 @@ fn focus_group(id: u64, field: &str, value: &str) -> Result<String> {
 pub fn input(id: u64, terminal: &str, raw: &str) -> Result<String> {
     let owner = session(id)?;
     let state = lock(&owner.state);
-    if state.view["pane_id"] != terminal || state.view["state"] != "ready" {
+    // Not before the pane's own frame is drawn: until then the screen still
+    // shows the pane switched from, and keys meant for it must not go here.
+    if state.view["pane_id"] != terminal || state.view["state"] != "ready" || !state.local.settled {
         return Err(Error::StaleTarget);
     }
     let terminal = state.terminal.as_ref().ok_or(Error::StaleTarget)?;
@@ -1202,45 +1328,66 @@ pub struct UiPaint<'a> {
 }
 pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     let owner = session(id)?;
-    let mut state = lock(&owner.state);
     let delta = delta.clamp(-1000, 1000) as i32;
     let scroll = rio_vt::crosswords::grid::Scroll::Delta(delta);
-    // Being read back: the phone's own copy scrolls, nothing is sent; at its
-    // newest row the live grid is drawn again.
-    if let Some((_, reader)) = &state.local.reader {
-        let offset = {
-            let mut grid = reader.grid().lock();
-            grid.scroll_display(scroll);
-            grid.display_offset()
-        };
-        if offset == 0 && delta < 0 {
-            state.local.reader = None;
-            show_render(Some(paint.generation), state.render_id, None);
+    let _ = (paint.title, paint.status, paint.shortcuts);
+    let (terminal, agent, render_id) = {
+        let mut state = lock(&owner.state);
+        // Being read back: the phone's own copy scrolls, nothing is sent; at
+        // its newest row the live grid is drawn again.
+        if let Some((_, reader)) = &state.local.reader {
+            let offset = {
+                let mut grid = reader.grid().lock();
+                grid.scroll_display(scroll);
+                grid.display_offset()
+            };
+            if offset == 0 && delta < 0 {
+                state.local.reader = None;
+                show_render(Some(paint.generation), state.render_id, None, None);
+            }
+            return Ok(json!({"queued":true,"local":true}).to_string());
         }
-        return Ok(json!({"queued":true,"local":true}).to_string());
-    }
-    if let Some(terminal) = state.terminal.clone() {
+        // The copy is being built: these rows are applied when it is shown.
+        if let Some(pending) = &mut state.local.building {
+            *pending = pending.saturating_add(delta);
+            return Ok(json!({"queued":true,"local":true}).to_string());
+        }
+        let Some(terminal) = state.terminal.clone() else {
+            return Ok(json!({"queued":true}).to_string());
+        };
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-        let boot = state.view["boot_id"].as_str().unwrap_or("").to_owned();
-        // A full-screen program (Claude Code) keeps its history to itself:
+        // A full-screen agent (Claude Code) keeps its history to itself:
         // dragging back scrolls the phone's transcript of it, at once and
         // with no round trip (item 77, ask 2). Without one yet, it gets wheel
         // input as before; plain output scrolls the attach's local history.
-        if delta > 0
-            && agent_pane(&state.view, &pane)
-            && let Some(reader) = reader_for(&boot, &pane, &terminal)
-        {
-            reader.grid().lock().scroll_display(scroll);
+        let agent = (delta > 0).then(|| agent_ident(&state.view, &pane)).flatten();
+        if agent.is_some() {
+            state.local.building = Some(0);
+        }
+        (terminal, agent, state.render_id)
+    };
+    if let Some(agent) = agent {
+        // Built with the session's lock released: the poll (and the UI
+        // waiting on it) never waits for the copy to be encoded and parsed.
+        let built = reader_for(&agent, &terminal);
+        let mut state = lock(&owner.state);
+        let pending = state.local.building.take().unwrap_or(0);
+        let same = state.render_id == render_id && state.local.reader.is_none() && state.terminal.is_some();
+        if let (Some(reader), true) = (built, same) {
+            reader.grid().lock().scroll_display(rio_vt::crosswords::grid::Scroll::Delta(delta.saturating_add(pending)));
             let shown = crate::core_session::next_render_id();
+            let host = state.local.host.clone();
             state.local.reader = Some((shown, reader));
-            show_render(Some(paint.generation), shown, None);
+            show_render(Some(paint.generation), shown, None, Some((&host, &agent.pane)));
             return Ok(json!({"queued":true,"local":true}).to_string());
         }
-        if !terminal.wheel(delta) {
-            terminal.grid().lock().scroll_display(scroll);
+        if !same {
+            return Ok(json!({"queued":true,"local":true}).to_string());
         }
     }
-    let _ = (paint.title, paint.status, paint.shortcuts);
+    if !terminal.wheel(delta) {
+        terminal.grid().lock().scroll_display(scroll);
+    }
     Ok(json!({"queued":true}).to_string())
 }
 pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
@@ -1249,7 +1396,7 @@ pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
         let mut state = lock(&owner.state);
         // Back to the newest line: the live grid, not the copy read back.
         if state.local.reader.take().is_some() {
-            show_render(None, state.render_id, None);
+            show_render(None, state.render_id, None, None);
         }
         if let Some(terminal) = &state.terminal {
             terminal
@@ -1305,7 +1452,7 @@ pub(crate) fn register_for_test(owner: Arc<Session>) {
 }
 #[cfg(test)]
 pub(crate) fn adopt_for_test(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
-    adopt(boot, pane, transcript);
+    adopt(&Ident { boot: boot.into(), pane: pane.into(), ..Ident::default() }, transcript);
 }
 #[cfg(test)]
 pub(crate) fn held_for_test() -> Option<(u64, Arc<gpui_rio::Session>)> {
