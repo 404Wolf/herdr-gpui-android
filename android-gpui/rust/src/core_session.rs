@@ -2394,7 +2394,12 @@ mod tests {
         std::fs::create_dir_all(&main).ok();
         let m = main.to_string_lossy().into_owned();
         if !run(&["-C", &m, "init", "-q", "-b", "main"]) {
-            return; // no git on this host
+            // A host without git skips this test; the CI shell sets HERDR_TESTS_REQUIRE_GIT.
+            assert!(
+                std::env::var_os("HERDR_TESTS_REQUIRE_GIT").is_none(),
+                "`git init` failed, and HERDR_TESTS_REQUIRE_GIT is set"
+            );
+            return;
         }
         assert!(run(&["-C", &m, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]));
         assert!(run(&["-C", &m, "branch", "--no-track", "upstream"]));
