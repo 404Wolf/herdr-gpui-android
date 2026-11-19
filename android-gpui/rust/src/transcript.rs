@@ -317,7 +317,7 @@ impl Transcript {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     /// A Claude-like full screen: `transcript` rows of the conversation
@@ -470,6 +470,68 @@ mod tests {
         assert!(t.bytes <= MAX_BYTES);
         assert!(t.history.back().unwrap().text.starts_with("399 "));
         assert!(!t.history.front().unwrap().text.starts_with("0 "));
+    }
+
+    /// Review P2-2: the desktop scrolls Claude back further than the phone holds.
+    #[test]
+    fn ask2_a_view_scrolled_back_past_the_phones_history_adds_no_row_twice() {
+        let mut t = Transcript::default();
+        t.observe(claude(59, 30, "done"), 80);
+        t.observe(claude(64, 30, "done"), 80);
+        assert_eq!(t.rows(), 5);
+        assert_eq!(t.observe(claude(54, 30, "done"), 80), Moved::Down(10));
+        assert_eq!(t.observe(claude(64, 30, "done"), 80), Moved::Up(10));
+        let screen = claude(64, 30, "done");
+        let all: Vec<String> = texts(t.reader_rows(&screen)).into_iter().filter(|r| !r.is_empty()).collect();
+        let mut want: Vec<String> = (25..=64).map(line).filter(|r| !r.is_empty()).collect();
+        want.extend(texts(screen[30..].iter()).into_iter().filter(|r| !r.is_empty()));
+        assert_eq!(all, want);
+    }
+
+    /// Review P2-3: a seed that starts after the gap must not clear it.
+    #[test]
+    fn ask2_a_seed_that_starts_after_a_gap_leaves_it_owed() {
+        let mut t = Transcript::default();
+        t.observe(claude(29, 30, "· working"), 80);
+        t.observe(claude(40, 30, "· working"), 80);
+        assert_eq!(t.observe(claude(140, 30, "· working"), 80), Moved::Lost);
+        for n in (141..=199).step_by(2) {
+            t.observe(claude(n, 30, "· working"), 80);
+        }
+        // The core's read reaches back only to row 150, after the gap.
+        let mut text: Vec<String> = (150..=200).map(line).collect();
+        text.extend(texts(claude(200, 30, "done")[30..].iter()));
+        let placed = t.seed(&text.join("\n"), false);
+        assert!(!placed || t.wants_seed(), "the gap was cleared without being filled");
+    }
+
+    /// Review P2-4: rows never seen are shown as such, never silently joined.
+    #[test]
+    fn ask2_rows_lost_to_a_gap_are_marked_in_the_reader() {
+        let mut t = Transcript::default();
+        t.observe(claude(29, 30, "· working"), 80);
+        t.observe(claude(40, 30, "· working"), 80);
+        assert_eq!(t.observe(claude(140, 30, "· working"), 80), Moved::Lost);
+        t.observe(claude(143, 30, "· working"), 80);
+        let screen = claude(143, 30, "· working");
+        let all = texts(t.reader_rows(&screen));
+        let at = all.iter().position(|r| r == "· rows not seen ·").expect("a marker where rows were missed");
+        // Everything before it was captured before the gap, everything after it since.
+        assert_eq!(all[at - 2..at], [line(9), line(10)]);
+        assert_eq!(all[at + 1], line(111));
+    }
+
+    /// Review P3-1: a rule that repeats every `d` rows is no fixed header.
+    #[test]
+    fn ask2_a_rule_repeating_with_the_move_is_kept_in_its_place() {
+        let rule = "────────────────";
+        let rows = |first: usize| -> Vec<Row> {
+            (first..first + 20).map(|n| Row::plain(&if n % 4 == 0 { rule.to_owned() } else { format!("row {n:03}") })).collect()
+        };
+        let mut t = Transcript::default();
+        t.observe(rows(0), 80);
+        assert_eq!(t.observe(rows(4), 80), Moved::Up(4));
+        assert_eq!(texts(t.history.iter()), vec![rule.to_owned(), "row 001".into(), "row 002".into(), "row 003".into()]);
     }
 
     #[test]

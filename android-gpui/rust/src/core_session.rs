@@ -5551,6 +5551,81 @@ mod cache_tests {
         assert!(!may_stitch(&json!({}), 4));
     }
 
+    /// Review P1-1: pane ids repeat across computers (every core has a t1).
+    #[test]
+    fn ask2_a_copy_read_on_one_computer_never_shows_in_another_computers_pane() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let a = owner(7791, "boot-A", terminal, "done");
+        crate::remote::register_for_test(a.clone());
+        stream(&a, &tx, 9, 60);
+        // Read back 12 rows on computer A, then another computer is picked.
+        crate::remote::scroll_local(7791, 12, paint_args(0)).unwrap();
+        crate::remote::close(7791);
+        let (live, tx2, _sent2) = full_screen();
+        let b = owner(7792, "boot-B", live.clone(), "done");
+        lock(&b.state).local = Local::attached(b.heard.output_now());
+        tx2.send(Chunk::Data(b"\x1b[H\x1b[2Jcomputer B only".to_vec())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !live.screen_text().contains("computer B only") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        b.heard.printed(100);
+        let _ = crate::remote::settle(&b, &mut lock(&b.state));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(crate::remote::settle(&b, &mut lock(&b.state)));
+        assert!(lock(&b.state).local.reader_for_test().is_none(), "computer A's copy is drawn in computer B's pane");
+        crate::remote::release_held();
+    }
+
+    /// Review P2-1: `close` runs on the UI thread; building the reader of a
+    /// long transcript must not happen there.
+    #[test]
+    fn ask2_closing_a_long_claude_pane_never_blocks_the_ui_thread() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7793, "boot-7793", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        tx.send(Chunk::Data(paint(9))).unwrap();
+        shows(&terminal, 9);
+        // About 1 MiB of history kept for it.
+        let rows: Vec<crate::transcript::Row> = (0..30_000).map(|n| crate::transcript::Row::plain(&line(n))).collect();
+        crate::remote::adopt_for_test("boot-7793", "t1", crate::transcript::Transcript::restored(rows, 0, COLS.into(), false));
+        let started = Instant::now();
+        crate::remote::close(7793);
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(20), "close took {took:?}");
+        // The held frame becomes the phone's copy soon after, on another thread.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let history = crate::remote::held_for_test().map(|(_, held)| held.grid().lock().history_size()).unwrap_or(0);
+            if history > 1000 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the held frame never became the transcript copy");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        crate::remote::release_held();
+    }
+
+    /// Review P2-5: only an agent's full-screen pane is read back from the
+    /// phone's copy; any other full-screen program (vim, less, htop) still
+    /// gets the drag as wheel input.
+    #[test]
+    fn ask2_a_drag_back_on_a_full_screen_program_that_is_no_agent_goes_to_it() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7794, "boot-7794", terminal, "");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        let _ = sent_data(&sent);
+        crate::remote::scroll_local(7794, 3, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_none(), "the phone's copy took the drag");
+        assert!(sent_data(&sent), "the program got no wheel input");
+        crate::remote::close(7794);
+        crate::remote::release_held();
+    }
+
     #[test]
     fn ask2_one_stitch_at_a_time_from_this_phone() {
         let first = Stitching::take().expect("free");

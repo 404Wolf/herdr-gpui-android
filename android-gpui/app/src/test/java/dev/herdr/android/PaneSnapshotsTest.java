@@ -77,6 +77,24 @@ public final class PaneSnapshotsTest {
         assertFalse(saved.exists());
     }
 
+    /** Review P2-6: opening a copy must not change the time it says it was saved. */
+    @Test public void ask2AnOfflineCopyKeepsItsSaveTimeOverEveryOpen() throws Exception {
+        File folder = dir.newFolder("panes");
+        SecretKey key = CacheSeal.newKey();
+        FakeNative natives = new FakeNative();
+        natives.copies.put("t1", TRANSCRIPT);
+        PaneSnapshots snapshots = snapshots(folder, key, natives);
+        snapshots.save("server", "t1", 7);
+        long t0 = System.currentTimeMillis() - 26L * 60 * 60 * 1000;
+        assertTrue(snapshots.file("server", "t1").setLastModified(t0));
+        List<Long> savedAt = new ArrayList<>();
+        snapshots.open("server", "t1", s -> savedAt.add(s.savedAt));
+        snapshots.open("server", "t1", s -> savedAt.add(s.savedAt));
+        assertEquals(2, savedAt.size());
+        assertEquals(t0 / 1000, savedAt.get(0) / 1000);
+        assertEquals(t0 / 1000, savedAt.get(1) / 1000);
+    }
+
     @Test public void ask2TheCapIsEnforcedOldestOutPinnedPanesLastNothingPastTwoWeeks() throws Exception {
         long now = 100L * 24 * 60 * 60 * 1000;
         List<File> files = new ArrayList<>();

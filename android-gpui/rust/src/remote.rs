@@ -1266,6 +1266,10 @@ pub(crate) fn register_for_test(owner: Arc<Session>) {
     lock(sessions()).insert(owner.id, owner);
 }
 #[cfg(test)]
+pub(crate) fn adopt_for_test(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
+    adopt(boot, pane, transcript);
+}
+#[cfg(test)]
 pub(crate) fn held_for_test() -> Option<(u64, Arc<gpui_rio::Session>)> {
     lock(held()).as_ref().map(|held| (held.id, held.terminal.clone()))
 }
