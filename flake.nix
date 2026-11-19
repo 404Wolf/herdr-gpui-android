@@ -36,19 +36,38 @@
             }
           )
         );
+      # The pinned toolchain (with clippy and rustfmt) and the native libraries
+      # GPUI's Linux backend builds against, shared by the package and the CI shell.
+      toolchainFor = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      rustPlatformFor =
+        pkgs:
+        let
+          toolchain = toolchainFor pkgs;
+        in
+        pkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
+      # Loaded with dlopen at runtime, so the linker never records them.
+      runtimeLibrariesFor = pkgs: [
+        pkgs.vulkan-loader
+        pkgs.wayland
+      ];
+      buildLibrariesFor =
+        pkgs:
+        [
+          pkgs.alsa-lib
+          pkgs.fontconfig
+          pkgs.freetype
+          pkgs.libxkbcommon
+          pkgs.libxcb
+        ]
+        ++ runtimeLibrariesFor pkgs;
       package =
         pkgs:
         let
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = toolchain;
-            rustc = toolchain;
-          };
-          # Loaded with dlopen at runtime, so the linker never records them.
-          runtimeLibraries = [
-            pkgs.vulkan-loader
-            pkgs.wayland
-          ];
+          rustPlatform = rustPlatformFor pkgs;
+          runtimeLibraries = runtimeLibrariesFor pkgs;
         in
         rustPlatform.buildRustPackage {
           pname = "herdr-gpui";
@@ -83,14 +102,7 @@
             pkgs.pkg-config
             rustPlatform.bindgenHook
           ];
-          buildInputs = [
-            pkgs.alsa-lib
-            pkgs.fontconfig
-            pkgs.freetype
-            pkgs.libxkbcommon
-            pkgs.libxcb
-          ]
-          ++ runtimeLibraries;
+          buildInputs = buildLibrariesFor pkgs;
           # No updater key is embedded, so this build never replaces itself;
           # Nix owns the store path and upgrades come from the flake.
           postInstall = ''
@@ -115,6 +127,24 @@
       packages = forAllSystems (pkgs: {
         default = package pkgs;
         herdr-gpui = package pkgs;
+      });
+      # Host-side Rust only, for jobs run off this machine (lease-run/jobrun use
+      # `nix develop .#ci`): clippy and the tests of the android-gpui and
+      # android-remote workspaces. No Android SDK, NDK or JDK, and no secrets.
+      devShells = forAllSystems (pkgs: {
+        ci = pkgs.mkShell {
+          name = "herdr-gpui-android-ci";
+          packages = [
+            (toolchainFor pkgs)
+            pkgs.pkg-config
+            # Tests drive real repositories and worktrees.
+            pkgs.git
+          ];
+          nativeBuildInputs = [ (rustPlatformFor pkgs).bindgenHook ];
+          buildInputs = buildLibrariesFor pkgs;
+          # Tests that need git fail here instead of skipping themselves.
+          HERDR_TESTS_REQUIRE_GIT = "1";
+        };
       });
       overlays.default = final: _prev: {
         herdr-gpui = self.packages.${final.stdenv.hostPlatform.system}.default;
