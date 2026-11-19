@@ -165,6 +165,13 @@ impl Drop for Stitching {
         STITCHING.store(false, Ordering::Release);
     }
 }
+/// Serializes the tests that take the phone-wide stitch: run side by side,
+/// one test's read would refuse another's.
+#[cfg(test)]
+pub(crate) fn stitch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Whether the core's pane (`terminal.get`'s reply) and the phone's grid
 /// (`grid` columns) are both the phone's own measured `width`: a stitched read
@@ -5703,6 +5710,7 @@ mod cache_tests {
 
     #[test]
     fn ask2_one_stitch_at_a_time_from_this_phone() {
+        let _serial = stitch_test_lock();
         let first = Stitching::take().expect("free");
         assert!(Stitching::take().is_none());
         drop(first);
@@ -5726,6 +5734,7 @@ mod prefetch_tests {
         pane: &str,
         answer: impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + 'static,
     ) -> (Result<Option<Vec<u8>>>, Vec<String>) {
+        let _serial = stitch_test_lock();
         let (phone, mut core) = UnixStream::pair().unwrap();
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
@@ -5794,7 +5803,7 @@ mod prefetch_tests {
         (result, methods)
     }
 
-    fn core(status: &'static str, viewers: Value) -> impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + 'static {
+    fn core(status: &'static str, viewers: Value) -> impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + Sync + 'static {
         move |method, _| {
             Ok(match method {
                 "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
@@ -5808,6 +5817,164 @@ mod prefetch_tests {
                 _ => json!({}),
             })
         }
+    }
+
+    /// A mock core that answers each request on its own thread, after
+    /// `delay(method)`, so a slow read does not hold the replies to others.
+    /// Logs (method, when asked).
+    fn concurrent_peer(
+        core: UnixStream,
+        answer: impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + Sync + 'static,
+        delay: impl Fn(&str) -> Duration + Send + Sync + 'static,
+        log: Arc<Mutex<Vec<(String, Instant)>>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut hello = String::new();
+            read_hello(&core, &mut hello);
+            let writer = Arc::new(Mutex::new(core.try_clone().unwrap()));
+            lock(&writer)
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"boot-pf\"},\"framed\":true}}\n")
+                .unwrap();
+            let (answer, delay) = (Arc::new(answer), Arc::new(delay));
+            let mut core = core;
+            let mut decoder = Decoder::default();
+            let mut idle_since = Instant::now();
+            loop {
+                if let Some(frame) = decoder.next().unwrap() {
+                    if frame.channel != 0 {
+                        continue;
+                    }
+                    idle_since = Instant::now();
+                    let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                    let method = request["method"].as_str().unwrap_or("").to_owned();
+                    lock(&log).push((method.clone(), Instant::now()));
+                    let (writer, answer, delay) = (writer.clone(), answer.clone(), delay.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(delay(&method));
+                        let reply = match answer(&method, &request["params"]) {
+                            Ok(result) => json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                            Err(kind) => json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":kind,"data":{"kind":kind}}}),
+                        };
+                        let _ = write_frame(&mut *lock(&writer), 0, 0, &serde_json::to_vec(&reply).unwrap());
+                    });
+                    continue;
+                }
+                if idle_since.elapsed() > Duration::from_secs(90) {
+                    break;
+                }
+                let mut bytes = [0; 4096];
+                match core.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
+    fn quiet_session() -> (Arc<Session>, mpsc::SyncSender<Operation>, mpsc::Receiver<Operation>) {
+        let (commands, rx) = mpsc::sync_channel(256);
+        let owner = Arc::new(Session {
+            id: 0,
+            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0, local: Default::default() }),
+            cancel: CancellationToken::new(),
+            commands: commands.clone(),
+            focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
+        });
+        (owner, commands, rx)
+    }
+
+    fn idle_viewers() -> Value {
+        json!({"viewers":[{"identity":{"connection_id":3,"channel":2},"observe":false,
+            "focused":false,"focused_ms_ago":3_600_000,"active_ms_ago":3_600_000}]})
+    }
+
+    fn wait_list(owner: &Session) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&owner.state).view["panes"].as_array().is_none_or(Vec::is_empty) {
+            assert!(Instant::now() < deadline, "the list never came");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Review #44 P1-1: the read must not hold the live pane's session loop
+    /// (keys, output credit, switches, actions all go through it).
+    #[test]
+    fn ask2_a_prefetch_never_holds_the_live_pane() {
+        let (phone, core_end) = UnixStream::pair().unwrap();
+        core_end.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let _serial = stitch_test_lock();
+        let (owner, commands, rx) = quiet_session();
+        let worker = owner.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, false, rx));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let peer = concurrent_peer(
+            core_end,
+            core("done", idle_viewers()),
+            |m| if m == "terminal.read" { Duration::from_secs(3) } else { Duration::ZERO },
+            log.clone(),
+        );
+        wait_list(&owner);
+        let (tx, reply) = mpsc::sync_channel(1);
+        commands.try_send(Operation::Prefetch("t5".into(), tx)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !lock(&log).iter().any(|(m, _)| m == "terminal.read") {
+            assert!(Instant::now() < deadline, "no terminal.read");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Any other operation (Discover stands for keys, acks, switches) goes on meanwhile.
+        let queued = Instant::now();
+        let (dtx, drx) = mpsc::sync_channel(1);
+        commands.try_send(Operation::Discover(dtx)).unwrap();
+        let _ = drx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let waited = queued.elapsed();
+        assert!(waited < Duration::from_millis(500), "waited {waited:?} behind the read");
+        let _ = reply.recv_timeout(Duration::from_secs(30));
+        owner.cancel.cancel();
+        let _ = runtime.join();
+        let _ = peer.join();
+    }
+
+    /// Review #44 P1-2: a read slower than the phone waits must not end the
+    /// session when its reply comes after all.
+    #[test]
+    fn ask2_a_slow_prefetch_read_never_ends_the_session() {
+        let (phone, core_end) = UnixStream::pair().unwrap();
+        core_end.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let _serial = stitch_test_lock();
+        let (owner, commands, rx) = quiet_session();
+        let worker = owner.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, false, rx));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let peer = concurrent_peer(
+            core_end,
+            core("done", idle_viewers()),
+            // A slow list keeps a call waiting most of the time (herdr-core
+            // answers calls side by side), so the late read reply lands while
+            // one waits, as on a slow link.
+            |m| match m {
+                "terminal.read" => STITCH_WAIT + Duration::from_secs(2),
+                "terminal.list" => Duration::from_secs(3),
+                _ => Duration::ZERO,
+            },
+            log.clone(),
+        );
+        wait_list(&owner);
+        let (tx, reply) = mpsc::sync_channel(1);
+        commands.try_send(Operation::Prefetch("t5".into(), tx)).unwrap();
+        let _ = reply.recv_timeout(Duration::from_secs(120)).unwrap();
+        assert!(lock(&log).iter().any(|(m, _)| m == "terminal.read"), "the pane was never read");
+        // The late reply lands meanwhile.
+        std::thread::sleep(Duration::from_secs(10));
+        assert!(!runtime.is_finished(), "the session ended on the late reply");
+        owner.cancel.cancel();
+        let _ = runtime.join();
+        let _ = peer.join();
     }
 
     #[test]

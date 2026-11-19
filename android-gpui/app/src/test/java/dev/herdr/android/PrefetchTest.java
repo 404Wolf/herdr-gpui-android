@@ -67,4 +67,20 @@ public final class PrefetchTest {
         assertEquals(1, budget.used);
         assertEquals(20L * 1024 * 1024, Prefetch.METERED_DAY_BYTES);
     }
+
+    /** Review #44 P2-1: a read may not start when it could pass the cap. */
+    @Test public void ask2AReadNeverStartsWhenItCouldPassTheCap() {
+        Prefetch.Budget budget = new Prefetch.Budget();
+        budget.spend(20_000, Prefetch.METERED_DAY_BYTES - 1, true);
+        assertFalse(budget.allows(20_000, true));
+    }
+
+    /** Review #44 P2-2: only a later day starts a new budget. */
+    @Test public void ask2TheClockGoingBackNeverResetsTheBudget() {
+        Prefetch.Budget budget = new Prefetch.Budget();
+        budget.spend(20_000, Prefetch.METERED_DAY_BYTES, true);
+        assertFalse(budget.allows(19_999, true));
+        budget.spend(19_999, 1, true);
+        assertFalse(budget.allows(20_000, true));
+    }
 }
