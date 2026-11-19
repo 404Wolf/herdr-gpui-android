@@ -394,8 +394,15 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_prefetchPane<'local>(
         return none;
     };
     match remote::prefetch(u64::try_from(handle).unwrap_or(0), &pane) {
-        Ok(Some(copy)) => env.byte_array_from_slice(&copy).unwrap_or(none),
-        Ok(None) => none,
+        // One byte (1: refused), the bytes received (8, big-endian), the copy.
+        Ok(done) => {
+            let copy = done.copy.unwrap_or_default();
+            let mut out = Vec::with_capacity(9 + copy.len());
+            out.push(u8::from(done.refused));
+            out.extend_from_slice(&(done.received as u64).to_be_bytes());
+            out.extend_from_slice(&copy);
+            env.byte_array_from_slice(&out).unwrap_or(none)
+        }
         Err(error) => {
             fail(&mut env, &error.to_string());
             none

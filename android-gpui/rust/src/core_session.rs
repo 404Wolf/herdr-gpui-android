@@ -110,7 +110,32 @@ struct Connection<'a> {
     automatic_input: bool,
     /// What this viewer told the core about Wolf using it (item 71).
     focus: Focus,
+    /// A pane being read for the offline cache: its reply is awaited while
+    /// the loop goes on (keys, credit, switches), never in a blocking call.
+    pending: Option<PendingRead>,
+    /// Requests given up on (timed out): a reply to one that comes late is
+    /// dropped, never taken for the answer to a later call.
+    abandoned: VecDeque<u64>,
 }
+
+/// The `terminal.read` of a prefetch, sent and not answered yet.
+struct PendingRead {
+    id: u64,
+    pane: String,
+    boot: String,
+    size: (u16, u16),
+    /// Bytes received for this prefetch so far (its replies' frames).
+    received: usize,
+    deadline: Instant,
+    reply: mpsc::SyncSender<Result<crate::remote::Prefetched>>,
+    /// One stitched read at a time from this phone, until the reply.
+    _turn: Stitching,
+}
+/// Most abandoned request ids remembered.
+const ABANDONED_MAX: usize = 32;
+/// How long a prefetch's small questions (size, viewers) may take: they hold
+/// the loop, unlike its read.
+const PREFETCH_ASK_WAIT: Duration = Duration::from_secs(3);
 
 /// Item 71, latest-touched device wins: with a core whose hello offers
 /// `viewer_focus` and `focus_by_use`, the attach says whether Herdr is in
@@ -426,7 +451,7 @@ impl Connection<'_> {
         while Instant::now() < deadline {
             let Some(frame) = self.read()? else { continue };
             if frame.channel == 0 && frame.kind == 0 {
-                let reply: Value = serde_json::from_slice(&frame.bytes)?;
+                let Some(reply) = self.route(&frame.bytes)? else { continue };
                 if reply["id"] != id {
                     return Err(Error::Protocol("uncorrelated RPC reply".into()));
                 }
@@ -443,7 +468,49 @@ impl Connection<'_> {
             }
             self.deliver(frame)?;
         }
+        // Its reply may still come: dropped then, never taken for a later call's.
+        self.abandon(id);
         Err(Error::Protocol(format!("{method} timed out")))
+    }
+    fn abandon(&mut self, id: u64) {
+        self.abandoned.push_back(id);
+        while self.abandoned.len() > ABANDONED_MAX {
+            self.abandoned.pop_front();
+        }
+    }
+    /// An RPC reply that arrived: the pending prefetch read's answer (its
+    /// copy goes back to whoever asked), one given up on (dropped), or the
+    /// reply to the call now waiting (returned).
+    fn route(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
+        let reply: Value = serde_json::from_slice(bytes)?;
+        let id = reply["id"].as_u64();
+        if let Some(at) = id.and_then(|id| self.abandoned.iter().position(|old| *old == id)) {
+            self.abandoned.remove(at);
+            return Ok(None);
+        }
+        if self.pending.as_ref().is_some_and(|read| Some(read.id) == id) {
+            let Some(mut read) = self.pending.take() else { return Ok(None) };
+            read.received += bytes.len();
+            let done = match reply.get("error") {
+                Some(_) => Ok(crate::remote::Prefetched { copy: None, received: read.received, refused: true }),
+                None => crate::remote::prefetched(&read.boot, &read.pane, read.size, &reply["result"]).map(|copy| {
+                    crate::remote::Prefetched { refused: copy.is_none(), copy, received: read.received }
+                }),
+            };
+            let _ = read.reply.send(done);
+            return Ok(None);
+        }
+        Ok(Some(reply))
+    }
+    /// A pending prefetch read past its time: given up (its late reply is
+    /// dropped); the reservation it was charged stays charged.
+    fn expire_pending(&mut self) {
+        if self.pending.as_ref().is_some_and(|read| Instant::now() >= read.deadline)
+            && let Some(read) = self.pending.take()
+        {
+            self.abandon(read.id);
+            let _ = read.reply.send(Err(Error::Protocol("terminal.read timed out".into())));
+        }
     }
     fn deliver(&mut self, frame: Frame) -> Result<()> {
         if frame.channel == self.events && frame.kind == 0 {
@@ -1137,51 +1204,92 @@ impl Connection<'_> {
     }
     /// A copy of `pane`, not the one on screen, for the offline cache
     /// (remote::prefetch): the same guard as a seed. None when skipped.
-    fn prefetch(&mut self, pane: &str) -> Result<Option<Vec<u8>>> {
+    /// Reads `pane` (not the one on screen) into the offline cache: its size
+    /// and viewers are asked at once (briefly), then its `terminal.read` is
+    /// sent and its reply awaited by the loop ([`Connection::route`]), so the
+    /// live pane's keys, credit and switches never wait on it. `reply` gets
+    /// the copy, or why there is none: `refused` when the pane or the core
+    /// said no (asked again only once its status moves), else a passing
+    /// reason (another read under way, a timeout).
+    fn prefetch(&mut self, pane: &str, reply: mpsc::SyncSender<Result<crate::remote::Prefetched>>) -> Result<()> {
+        let done = |reply: mpsc::SyncSender<Result<crate::remote::Prefetched>>, refused: bool, received: usize| -> Result<()> {
+            let _ = reply.send(Ok(crate::remote::Prefetched { copy: None, received, refused }));
+            Ok(())
+        };
         let boot = {
             let state = lock(&self.owner.state);
             if state.view["pane_id"] == pane && self.channel != 0 {
-                return Ok(None);
+                return done(reply, true, 0);
             }
             let busy = state.view["panes"]
                 .as_array()
                 .and_then(|panes| panes.iter().find(|p| p["id"] == pane))
                 .is_none_or(|p| matches!(p["status"].as_str(), Some("working" | "blocked" | "error")));
             if busy {
-                return Ok(None);
+                return done(reply, true, 0);
             }
             state.view["boot_id"].as_str().unwrap_or("").to_owned()
         };
         if pane.contains('/') {
-            return Ok(None);
+            return done(reply, true, 0);
         }
-        let Some(_turn) = Stitching::take() else {
-            return Ok(None);
+        let Some(turn) = Stitching::take() else {
+            return done(reply, false, 0);
         };
-        let rpc = |result: Result<Value>| match result {
+        let mut received = 0;
+        // Ok(Some): the answer; Ok(None): the core refused; Err(None): it took too long.
+        let ask = |connection: &mut Self, method: &str| match connection.call_within(method, json!({"terminal": pane}), PREFETCH_ASK_WAIT) {
             Ok(value) => Ok(Some(value)),
             Err(Error::Rpc { .. }) => Ok(None),
-            Err(error) => Err(error),
+            Err(Error::Protocol(_)) => Err(None),
+            Err(error) => Err(Some(error)),
         };
-        let Some(facts) = rpc(self.call("terminal.get", json!({"terminal": pane})))? else {
-            return Ok(None);
+        let facts = match ask(self, "terminal.get") {
+            Ok(Some(facts)) => {
+                received += facts.to_string().len();
+                facts
+            }
+            Ok(None) => return done(reply, true, received),
+            Err(None) => return done(reply, false, received),
+            Err(Some(error)) => return Err(error),
         };
         let size = |key: &str| facts[key].as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0);
         let (Some(cols), Some(rows)) = (size("cols"), size("rows")) else {
-            return Ok(None);
+            return done(reply, true, received);
         };
-        let Some(viewers) = rpc(self.call("terminal.viewers", json!({"terminal": pane})))? else {
-            return Ok(None);
+        let viewers = match ask(self, "terminal.viewers") {
+            Ok(Some(viewers)) => {
+                received += viewers.to_string().len();
+                viewers
+            }
+            Ok(None) => return done(reply, true, received),
+            Err(None) => return done(reply, false, received),
+            Err(Some(error)) => return Err(error),
         };
         // This phone shows another pane: none of these viewers is its own.
         if !may_stitch(&viewers, 0) {
-            return Ok(None);
+            return done(reply, true, received);
         }
-        let read = self.call_within("terminal.read", json!({"terminal": pane, "lines": STITCH_LINES}), STITCH_WAIT);
-        let Some(reply) = rpc(read)? else {
-            return Ok(None);
-        };
-        crate::remote::prefetched(&boot, pane, (cols, rows), &reply)
+        self.serial += 1;
+        let id = self.serial;
+        write_frame(
+            &mut self.socket,
+            0,
+            0,
+            &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":"terminal.read",
+                "params":{"terminal": pane, "lines": STITCH_LINES}}))?,
+        )?;
+        self.pending = Some(PendingRead {
+            id,
+            pane: pane.to_owned(),
+            boot,
+            size: (cols, rows),
+            received,
+            deadline: Instant::now() + STITCH_WAIT,
+            reply,
+            _turn: turn,
+        });
+        Ok(())
     }
     fn refresh(&mut self) -> Result<()> {
         // Subscribe precedes reading the app document; doc events/missed force
@@ -2052,6 +2160,8 @@ pub(crate) fn run(
             offered: offers(&hello, "viewer_focus") && offers(&hello, "focus_by_use"),
             ..Focus::default()
         },
+        pending: None,
+        abandoned: VecDeque::new(),
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -2106,7 +2216,12 @@ fn serve(
                     let _ = reply.send(connection.discover());
                 }
                 Ok(Operation::Prefetch(pane, reply)) => {
-                    let _ = reply.send(connection.prefetch(&pane));
+                    if connection.pending.is_some() {
+                        // One read at a time: this one waits for the next quiet tick.
+                        let _ = reply.send(Ok(crate::remote::Prefetched { copy: None, received: 0, refused: false }));
+                    } else {
+                        connection.prefetch(&pane, reply)?;
+                    }
                 }
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
@@ -2183,8 +2298,15 @@ fn serve(
             connection.seed(&pane)?;
         }
         if let Some(frame) = connection.read()? {
-            connection.deliver(frame)?;
+            if frame.channel == 0 && frame.kind == 0 {
+                // No call is waiting: the pending prefetch read's reply, or a
+                // late one given up on.
+                connection.route(&frame.bytes)?;
+            } else {
+                connection.deliver(frame)?;
+            }
         }
+        connection.expire_pending();
         if connection.reattached_at.is_none_or(|at| at.elapsed() >= REATTACH_EVERY)
             && let Some(pane) = connection.reattach.take()
             // A newer pick (also one parked while hidden) wins over the old pane.
@@ -5217,6 +5339,8 @@ mod focus_review_tests {
                 uses: owner.uses.count(),
                 ..Focus::default()
             },
+            pending: None,
+            abandoned: VecDeque::new(),
         };
         (connection, peer)
     }
@@ -5733,7 +5857,7 @@ mod prefetch_tests {
     fn prefetch_against(
         pane: &str,
         answer: impl Fn(&str, &Value) -> std::result::Result<Value, &'static str> + Send + 'static,
-    ) -> (Result<Option<Vec<u8>>>, Vec<String>) {
+    ) -> (Result<crate::remote::Prefetched>, Vec<String>) {
         let _serial = stitch_test_lock();
         let (phone, mut core) = UnixStream::pair().unwrap();
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
@@ -5982,7 +6106,7 @@ mod prefetch_tests {
         let idle_desktop = json!({"viewers":[{"identity":{"connection_id":3,"channel":2},"observe":false,
             "focused":false,"focused_ms_ago":3_600_000,"active_ms_ago":3_600_000}]});
         let (copy, methods) = prefetch_against("t5", core("done", idle_desktop));
-        let copy = copy.unwrap().expect("a copy");
+        let copy = copy.unwrap().copy.expect("a copy");
         assert!(methods.iter().any(|m| m == "terminal.read"));
         let saved = crate::snapshot::parse(copy).unwrap();
         assert_eq!((saved.cols, saved.rows, saved.history, saved.full_screen), (40, 3, Some(3), true));
@@ -6004,14 +6128,15 @@ mod prefetch_tests {
         let focused = json!({"viewers":[{"identity":{"connection_id":3,"channel":2},"observe":false,
             "focused":true,"focused_ms_ago":3_600_000,"active_ms_ago":3_600_000}]});
         let (copy, methods) = prefetch_against("t5", core("done", focused));
-        assert!(copy.unwrap().is_none());
+        let copy = copy.unwrap();
+        assert!(copy.copy.is_none() && copy.refused);
         assert!(!methods.iter().any(|m| m == "terminal.read"), "{methods:?}");
     }
 
     #[test]
     fn ask2_prefetch_never_reads_a_pane_that_works() {
         let (copy, methods) = prefetch_against("t5", core("working", json!({"viewers":[]})));
-        assert!(copy.unwrap().is_none());
+        assert!(copy.unwrap().copy.is_none());
         let asked: HashMap<&str, ()> = methods.iter().map(|m| (m.as_str(), ())).collect();
         assert!(!asked.contains_key("terminal.read") && !asked.contains_key("terminal.viewers"), "{methods:?}");
     }

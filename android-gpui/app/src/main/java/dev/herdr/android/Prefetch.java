@@ -11,7 +11,7 @@ import org.json.JSONObject;
 
 /**
  * Which panes the phone reads into its offline cache while the app is open
- * and connected (item 77, Wolf's ask 2), so a switch with no link has
+ * and connected (item 77, ask 2), so a switch with no link has
  * something to show. Pure: the terminal activity runs one read at a time,
  * only after the person stopped touching the screen for {@link #QUIET_MS}.
  *
@@ -74,25 +74,145 @@ final class Prefetch {
         return first;
     }
 
-    /** The day's data spent on reads, against the mobile-data budget. */
+    /**
+     * The most one read may take on the link (a stitched read of 1000 lines,
+     * up to a 1 MiB copy, plus the reply's framing and the small questions
+     * before it): reserved before a read on mobile data, so a read never
+     * starts when it could pass the cap.
+     */
+    static final long RESERVE_BYTES = 2L * 1024 * 1024;
+
+    /**
+     * The day's data spent on reads, against the mobile-data budget. Only a
+     * later day starts a new budget: a clock or time zone moving back keeps
+     * what was spent.
+     */
     static final class Budget {
         long day;
         long used;
 
-        /** Whether another read may start on {@code day} (local epoch day). */
-        boolean allows(long day, boolean metered) {
-            if (!metered) return true;
-            return (day != this.day ? 0 : used) < METERED_DAY_BYTES;
+        private long spent(long day) {
+            return day > this.day ? 0 : used;
         }
 
-        /** A read of {@code bytes} on {@code day}; only mobile data counts. */
-        void spend(long day, long bytes, boolean metered) {
-            if (day != this.day) {
+        private void roll(long day) {
+            if (day > this.day) {
                 this.day = day;
                 used = 0;
             }
+        }
+
+        /** Whether a read may start on {@code day} (local epoch day): one more reservation fits. */
+        boolean allows(long day, boolean metered) {
+            return !metered || spent(day) + RESERVE_BYTES <= METERED_DAY_BYTES;
+        }
+
+        /** {@code bytes} taken on {@code day}; only mobile data counts. */
+        void spend(long day, long bytes, boolean metered) {
+            roll(day);
             if (metered) used += Math.max(0, bytes);
         }
+
+        /** Starts a read: false when it could pass the cap; else, on mobile data, its reservation is spent. */
+        boolean reserve(long day, boolean metered) {
+            if (!allows(day, metered)) return false;
+            spend(day, metered ? RESERVE_BYTES : 0, metered);
+            return true;
+        }
+
+        /**
+         * A read that ended with {@code received} bytes on the link: they
+         * replace its reservation. Mobile data at its start or at its end
+         * counts. A read that failed or timed out never comes here: its
+         * reservation stays spent.
+         */
+        void settle(long received, boolean meteredAtStart, boolean meteredAtEnd) {
+            if (meteredAtStart) used += Math.max(0, received) - RESERVE_BYTES;
+            else if (meteredAtEnd) used += Math.max(0, received);
+            used = Math.max(0, used);
+        }
+    }
+
+    /** What the native read of one pane gave (see RemoteNative.prefetchPane). */
+    static final class Read {
+        final boolean refused;
+        final long received;
+        /** The copy (unsealed), or null. */
+        final byte[] copy;
+
+        Read(boolean refused, long received, byte[] copy) {
+            this.refused = refused;
+            this.received = received;
+            this.copy = copy;
+        }
+
+        /** One byte (1: refused), the bytes received (8, big-endian), then the copy. */
+        static Read parse(byte[] bytes) {
+            if (bytes == null || bytes.length < 9) throw new IllegalArgumentException("not a prefetch result");
+            long received = java.nio.ByteBuffer.wrap(bytes, 1, 8).getLong();
+            byte[] copy = bytes.length > 9 ? java.util.Arrays.copyOfRange(bytes, 9, bytes.length) : null;
+            return new Read(bytes[0] == 1, received, copy);
+        }
+    }
+
+    interface Reader {
+        /** Reads one pane; throws when the read failed or timed out. */
+        Read read(String pane) throws Exception;
+    }
+
+    /**
+     * One prefetch read of {@code pane} (its cache file {@code key}) within {@code budget}: reserved
+     * before (none when it could pass the cap), charged what it received
+     * after, the reservation kept when it failed. A pane read, or refused by
+     * the pane or the core, is marked {@code seen} at {@code marker} (not
+     * asked again until it moves); a passing failure leaves it to the next
+     * tick. Returns the copy to store, or null.
+     */
+    static byte[] step(Budget budget, Map<String, String> seen, String key, String pane, String marker, long day,
+            java.util.function.BooleanSupplier metered, Reader reader) {
+        boolean atStart = metered.getAsBoolean();
+        if (!budget.reserve(day, atStart)) return null;
+        Read read;
+        try {
+            read = reader.read(pane);
+        } catch (Exception | LinkageError failed) {
+            return null;
+        }
+        budget.settle(read.received, atStart, metered.getAsBoolean());
+        if (read.copy != null || read.refused) seen.put(key, marker);
+        return read.copy;
+    }
+
+    /** What the budget and the panes read are kept in across restarts. */
+    interface Store {
+        String seen();
+        long day();
+        long used();
+        void save(String seen, long day, long used);
+    }
+
+    static Budget load(Store store, Budget into) {
+        into.day = store.day();
+        into.used = store.used();
+        return into;
+    }
+
+    static void save(Store store, Map<String, String> seen, Budget budget) {
+        store.save(encode(bounded(seen, MAX_SEEN)), budget.day, budget.used);
+    }
+
+    /** At most this many panes are remembered as read. */
+    static final int MAX_SEEN = 4 * PaneSnapshots.MAX_FILES;
+
+    /** {@code seen} cut to {@code max} entries, never wiped: the ones beyond are read again. */
+    static Map<String, String> bounded(Map<String, String> seen, int max) {
+        if (seen.size() <= max) return seen;
+        java.util.Iterator<String> it = seen.keySet().iterator();
+        while (seen.size() > max && it.hasNext()) {
+            it.next();
+            it.remove();
+        }
+        return seen;
     }
 
     /** {@code seen} as stored: a JSON object of file name → marker. */

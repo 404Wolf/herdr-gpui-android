@@ -73,10 +73,11 @@ final class RemoteNative {
     /** Keeps a full-screen pane's transcript from its saved copy (unsealed bytes), drawing nothing. Worker only. */
     static native void adoptSaved(byte[] copy);
     /**
-     * A copy (unsealed bytes) of {@code paneId}, not the pane on screen, read
-     * from the core for the offline cache; null when the read was skipped
-     * (busy, another viewer using it, another read running). Blocks up to a
-     * minute: prefetch worker only.
+     * {@code paneId} (not the pane on screen) read from the core for the
+     * offline cache, as {@link Prefetch.Read#parse} reads it: whether it was
+     * refused, the bytes the replies took, and the copy (unsealed), if any.
+     * Throws when the read failed or timed out. Blocks up to a minute (the
+     * session's loop goes on meanwhile): prefetch worker only.
      */
     static native byte[] prefetchPane(long handle, String paneId);
     static native String scrollLocal(long handle, long deltaRows, long generation,

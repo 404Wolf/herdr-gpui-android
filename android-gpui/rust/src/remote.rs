@@ -311,7 +311,7 @@ impl Heard {
 pub(crate) enum Operation {
     Discover(mpsc::SyncSender<Result<String>>),
     /// A copy of a pane not on screen, read for the offline cache (item 77).
-    Prefetch(String, mpsc::SyncSender<Result<Option<Vec<u8>>>>),
+    Prefetch(String, mpsc::SyncSender<Result<Prefetched>>),
     Action(String, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
 }
@@ -1296,7 +1296,17 @@ fn run(
 /// applies: never while it works or waits, never while anyone else has it
 /// focused or used it in the last minute, one at a time. None when skipped.
 /// Blocks the caller (the phone's prefetch worker) for up to a minute.
-pub fn prefetch(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
+/// What a prefetch of one pane gave: its copy, if any; the bytes its replies
+/// took on the link (what the data budget is charged); and whether the pane
+/// or the core said no (`refused`: asked again only once its status moves),
+/// rather than a passing reason (another read under way).
+#[derive(Debug)]
+pub struct Prefetched {
+    pub copy: Option<Vec<u8>>,
+    pub received: usize,
+    pub refused: bool,
+}
+pub fn prefetch(id: u64, pane: &str) -> Result<Prefetched> {
     if pane.is_empty() || pane.len() > 128 {
         return Err(Error::StaleTarget);
     }
@@ -1313,6 +1323,8 @@ pub(crate) fn prefetched(boot: &str, pane: &str, size: (u16, u16), reply: &Value
     let Some(text) = reply["text"].as_str() else {
         return Ok(None);
     };
+    // One line ending is no extra blank row.
+    let text = text.strip_suffix('\n').unwrap_or(text);
     let (cols, rows) = size;
     let full_screen = reply["how"] != "history";
     let complete = reply["complete"] == true;

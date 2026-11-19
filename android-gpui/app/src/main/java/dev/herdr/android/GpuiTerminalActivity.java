@@ -6427,7 +6427,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return pane;
     }
 
-    /** The agent status of {@code pane} in {@code panes}, "" when unlisted. */
     /** {@code pane}'s status marker in {@code panes} (Prefetch.marker), or null. */
     private static String paneMarker(JSONArray panes, String pane) {
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -6437,6 +6436,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return null;
     }
 
+    /** The agent status of {@code pane} in {@code panes}, "" when unlisted. */
     private static String paneStatus(JSONArray panes, String pane) {
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject item = panes.optJSONObject(i);
@@ -6505,13 +6505,21 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return getSharedPreferences("offline-cache", MODE_PRIVATE);
     }
 
+    /** The budget and the panes read, kept in this app's preferences. */
+    private final Prefetch.Store prefetchStore = new Prefetch.Store() {
+        @Override public String seen() { return cachePreferences().getString("seen", "{}"); }
+        @Override public long day() { return cachePreferences().getLong("day", 0); }
+        @Override public long used() { return cachePreferences().getLong("used", 0); }
+        @Override public void save(String seen, long day, long used) {
+            cachePreferences().edit().putString("seen", seen).putLong("day", day).putLong("used", used).apply();
+        }
+    };
+
     /** File name → status marker of the copy the cache has (or last asked for). Prefetch worker only. */
     private java.util.Map<String, String> prefetchSeen() {
         if (prefetchSeen == null) {
-            SharedPreferences preferences = cachePreferences();
-            prefetchSeen = Prefetch.decode(preferences.getString("seen", "{}"));
-            prefetchBudget.day = preferences.getLong("day", 0);
-            prefetchBudget.used = preferences.getLong("used", 0);
+            prefetchSeen = Prefetch.decode(prefetchStore.seen());
+            Prefetch.load(prefetchStore, prefetchBudget);
         }
         return prefetchSeen;
     }
@@ -6523,19 +6531,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             prefetchWorker.execute(() -> {
                 java.util.Map<String, String> seen = prefetchSeen();
                 seen.put(PaneSnapshots.name(hostId, pane), marker);
-                // Bounded like the cache it describes.
-                if (seen.size() > 4 * PaneSnapshots.MAX_FILES) seen.clear();
-                cachePreferences().edit().putString("seen", Prefetch.encode(seen)).apply();
+                Prefetch.save(prefetchStore, seen, prefetchBudget);
             });
         } catch (java.util.concurrent.RejectedExecutionException closing) {
             // Shutting down.
         }
     }
 
+    /** Whether reads now go over mobile data (the active network is metered). */
+    private boolean meteredNow() {
+        android.net.ConnectivityManager network = getSystemService(android.net.ConnectivityManager.class);
+        return network == null || network.isActiveNetworkMetered();
+    }
+
+    /** Whether the phone asks for no background data now: Data Saver, battery saver or roaming. */
+    private boolean holdBack() {
+        android.net.ConnectivityManager network = getSystemService(android.net.ConnectivityManager.class);
+        if (network == null) return true;
+        if (network.getRestrictBackgroundStatus()
+                == android.net.ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED) return true;
+        android.os.PowerManager power = getSystemService(android.os.PowerManager.class);
+        if (power != null && power.isPowerSaveMode()) return true;
+        android.net.NetworkCapabilities caps = network.getNetworkCapabilities(network.getActiveNetwork());
+        return caps == null || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING);
+    }
+
     /**
      * One prefetch step: while the app is open, connected and untouched for
      * Prefetch.QUIET_MS, read the best stale pane (Prefetch.plan) within the
-     * day's mobile-data budget. Prefetch worker only.
+     * day's mobile-data budget (Prefetch.step). Prefetch worker only.
      */
     private void prefetchTick() {
         if (!hostResumed || snapshots == null) return;
@@ -6544,12 +6568,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { c = connection; }
         if (c == null || !c.ready || c.offline || c.isClosed() || c.remoteHandle <= 0 || c.hostId == null) return;
         JSONArray panes = c.panes;
-        if (panes == null) return;
-        android.net.ConnectivityManager network = getSystemService(android.net.ConnectivityManager.class);
-        boolean metered = network == null || network.isActiveNetworkMetered();
+        if (panes == null || holdBack()) return;
         long day = java.time.LocalDate.now().toEpochDay();
         java.util.Map<String, String> seen = prefetchSeen();
-        if (!prefetchBudget.allows(day, metered)) return;
+        if (!prefetchBudget.allows(day, meteredNow())) return;
         java.util.Map<String, String> byPane = new java.util.HashMap<>();
         java.util.Map<String, String> markers = new java.util.HashMap<>();
         for (int i = 0; i < panes.length(); i++) {
@@ -6563,20 +6585,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         java.util.List<String> plan = Prefetch.plan(panes, c.chromePane, byPane);
         if (plan.isEmpty()) return;
         String pane = plan.get(0);
-        byte[] copy;
-        try {
-            copy = RemoteNative.prefetchPane(c.remoteHandle, pane);
-        } catch (RuntimeException | LinkageError unavailable) {
-            copy = null;
-        }
-        // Read or refused, it is not asked again until its marker moves.
-        seen.put(PaneSnapshots.name(c.hostId, pane), markers.get(pane));
-        if (copy != null) {
-            prefetchBudget.spend(day, copy.length, metered);
-            snapshots.store(c.hostId, pane, copy);
-        }
-        cachePreferences().edit().putString("seen", Prefetch.encode(seen))
-                .putLong("day", prefetchBudget.day).putLong("used", prefetchBudget.used).apply();
+        long started = System.currentTimeMillis();
+        long handle = c.remoteHandle;
+        byte[] copy = Prefetch.step(prefetchBudget, seen, PaneSnapshots.name(c.hostId, pane), pane, markers.get(pane), day,
+                this::meteredNow, id -> Prefetch.Read.parse(RemoteNative.prefetchPane(handle, id)));
+        if (copy != null) snapshots.store(c.hostId, pane, copy, started);
+        Prefetch.save(prefetchStore, seen, prefetchBudget);
     }
 
     /** Computers whose live list changed since the Fleet cache was last written. */

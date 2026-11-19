@@ -133,18 +133,26 @@ final class PaneSnapshots {
     }
 
     /** Keeps a copy read for the cache (unsealed bytes), sealed, as {@link #save} does. */
-    void store(String host, String pane, byte[] copy) {
+    void store(String host, String pane, byte[] copy, long readAt) {
         if (host == null || pane == null || pane.isEmpty() || copy == null) return;
-        thread.execute(() -> {
-            CacheSeal sealer = seal.get();
-            if (sealer == null || !dir.isDirectory() && !dir.mkdirs()) return;
-            try {
-                sealer.write(file(host, pane), copy);
-                prune(System.currentTimeMillis());
-            } catch (IOException unsaved) {
-                // The previous copy, if any, stays.
-            }
-        });
+        try {
+            thread.execute(() -> {
+                CacheSeal sealer = seal.get();
+                if (sealer == null || !dir.isDirectory() && !dir.mkdirs()) return;
+                File into = file(host, pane);
+                // A copy saved since the read started (the pane was shown,
+                // with its colours) is newer than this plain one: it stays.
+                if (into.isFile() && into.lastModified() >= readAt) return;
+                try {
+                    sealer.write(into, copy);
+                    prune(System.currentTimeMillis());
+                } catch (IOException | RuntimeException unsaved) {
+                    // The previous copy, if any, stays.
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closing) {
+            // The app is going away: nothing is kept from this read.
+        }
     }
 
     interface Missing {
