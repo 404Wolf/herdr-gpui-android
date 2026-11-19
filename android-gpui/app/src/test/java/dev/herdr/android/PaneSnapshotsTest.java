@@ -27,10 +27,8 @@ public final class PaneSnapshotsTest {
     private static final class FakeNative implements PaneSnapshots.Native {
         final java.util.Map<String, byte[]> copies = new java.util.HashMap<>();
         final List<byte[]> opened = new ArrayList<>();
-        final List<byte[]> adopted = new ArrayList<>();
         @Override public byte[] copy(long handle, String pane) { return copies.get(pane); }
         @Override public long open(byte[] copy) { opened.add(copy); return 40 + opened.size(); }
-        @Override public void adopt(byte[] copy) { adopted.add(copy); }
     }
 
     private static final byte[] TRANSCRIPT =
@@ -67,9 +65,6 @@ public final class PaneSnapshotsTest {
         snapshots(folder, key, after).open("server", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
         assertEquals(Collections.singletonList(41L), shown);
         assertArrayEquals(TRANSCRIPT, after.opened.get(0));
-        // The pane switched to online takes the same transcript, drawing nothing.
-        snapshots(folder, key, after).adopt("server", "t1");
-        assertArrayEquals(TRANSCRIPT, after.adopted.get(0));
         // The Keystore key is gone (app data cleared): nothing opens, the file goes.
         shown.clear();
         snapshots(folder, CacheSeal.newKey(), after).open("server", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
@@ -84,21 +79,16 @@ public final class PaneSnapshotsTest {
         FakeNative natives = new FakeNative();
         natives.copies.put("t1", TRANSCRIPT);
         PaneSnapshots snapshots = snapshots(folder, key, natives);
-        java.util.Map<String, String> revisions = new java.util.HashMap<>();
-        revisions.put("profile", "revision-a");
-        snapshots.revisions(revisions);
-        snapshots.save("profile", "t1", 7);
+        String a = PaneSnapshots.computer("profile", "revision-a");
+        String b = PaneSnapshots.computer("profile", "revision-b");
+        snapshots.save(a, "t1", 7);
         // The profile now points at computer B: same id, a new connection revision.
-        revisions.put("profile", "revision-b");
-        snapshots.revisions(revisions);
         List<Long> shown = new ArrayList<>();
-        snapshots.open("profile", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        snapshots.open(b, "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
         assertEquals(Collections.singletonList(-1L), shown);
         // Back on A's revision (the edit undone), A's copy is A's again.
-        revisions.put("profile", "revision-a");
-        snapshots.revisions(revisions);
         shown.clear();
-        snapshots.open("profile", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        snapshots.open(a, "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
         assertEquals(1, shown.size());
         assertTrue(shown.get(0) > 0);
     }
@@ -106,8 +96,8 @@ public final class PaneSnapshotsTest {
     /**
      * Review round 3 P1-1: a save queued from connection A, its profile then
      * edited to computer B before the disk thread runs, is A's copy: B never
-     * opens it. Nor does a failed read of the profiles fall back to the bare
-     * profile id.
+     * opens it. With no revision known, nothing is saved or opened (never
+     * under the bare profile id).
      */
     @Test public void ask2ASaveQueuedBeforeAnEditStaysTheOldComputersCopy() throws Exception {
         File folder = dir.newFolder("panes");
@@ -117,25 +107,27 @@ public final class PaneSnapshotsTest {
         java.util.ArrayDeque<Runnable> queued = new java.util.ArrayDeque<>();
         CacheSeal seal = new CacheSeal(key);
         PaneSnapshots snapshots = new PaneSnapshots(folder, queued::add, () -> seal, natives);
-        java.util.Map<String, String> revisions = new java.util.HashMap<>();
-        revisions.put("profile", "revision-a");
-        snapshots.revisions(revisions);
-        // Connection A's pane is saved; the disk thread has not run it yet.
-        snapshots.save("profile", "t1", 7);
-        // The profile is edited to computer B (same id, a new revision).
-        revisions.put("profile", "revision-b");
-        snapshots.revisions(revisions);
+        // Connection A's pane is saved under the computer it connected to;
+        // the disk thread has not run it yet when the profile is edited to B.
+        String a = PaneSnapshots.computer("profile", "revision-a");
+        String b = PaneSnapshots.computer("profile", "revision-b");
+        snapshots.save(a, "t1", 7);
         while (!queued.isEmpty()) queued.poll().run();
         List<Long> shown = new ArrayList<>();
-        snapshots.open("profile", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        snapshots.open(b, "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
         while (!queued.isEmpty()) queued.poll().run();
         assertEquals("computer A's copy opened as computer B's", Collections.singletonList(-1L), shown);
-        // With no revision known (the profiles could not be read), nothing is saved.
-        snapshots.revisions(Collections.emptyMap());
-        snapshots.save("profile", "t2", 7);
+        // With no revision known, nothing is saved, and an open is a miss.
+        assertEquals(null, PaneSnapshots.computer("profile", null));
         natives.copies.put("t2", TRANSCRIPT);
+        snapshots.save(PaneSnapshots.computer("profile", null), "t2", 7);
         while (!queued.isEmpty()) queued.poll().run();
         assertFalse("a copy was saved under the bare profile id", new File(folder, PaneSnapshots.name("profile", "t2")).exists());
+        assertEquals(0, folder.listFiles((d, n) -> n.endsWith(PaneSnapshots.SUFFIX)).length - 1);
+        shown.clear();
+        snapshots.open(null, "t2", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        while (!queued.isEmpty()) queued.poll().run();
+        assertEquals(Collections.singletonList(-1L), shown);
     }
 
     /** Review P2-6: opening a copy must not change the time it says it was saved. */

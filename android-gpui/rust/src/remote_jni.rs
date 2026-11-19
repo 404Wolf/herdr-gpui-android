@@ -383,20 +383,6 @@ fn copy_bytes(env: &mut JNIEnv<'_>, bytes: &JByteArray<'_>) -> Option<Vec<u8>> {
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_herdr_android_RemoteNative_adoptSaved(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    bytes: JByteArray<'_>,
-) {
-    let Some(bytes) = copy_bytes(&mut env, &bytes) else {
-        return;
-    };
-    if let Err(error) = remote::adopt_saved(bytes) {
-        fail(&mut env, &error.to_string());
-    }
-}
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_openSaved(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

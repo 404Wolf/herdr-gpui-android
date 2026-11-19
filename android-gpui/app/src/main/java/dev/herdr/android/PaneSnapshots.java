@@ -17,10 +17,17 @@ import java.util.concurrent.Executor;
  * Each pane's last terminal state on disk (see the native snapshot module),
  * so the conversation reads and scrolls with no link, even after the app was
  * killed (item 77, Wolf's ask 2). A full-screen program's copy (Claude Code)
- * is the phone's transcript of it, so it scrolls to the top of what the
+ * is what the phone watched of it, so it scrolls to the top of what the
  * phone has, not one screen. Saved whenever a session closes (a lost link,
  * leaving the screen), before every pane switch, and as a checkpoint of the
- * pane on screen (PaneCheckpoint).
+ * pane on screen (PaneCheckpoint). A copy is for reading with no link only:
+ * the live pane replaces it as soon as it paints.
+ *
+ * <p>Copies belong to a computer as {@link #computer} names it: the saved
+ * profile and its connection revision, as they were when the session was
+ * connected. Editing a profile to point at another computer keeps its id but
+ * changes its revision, so the old computer's copies are never the new one's,
+ * even for a save queued before the edit.
  *
  * <p>Every file is sealed ({@link CacheSeal}): nothing a terminal printed is
  * on disk as plain text. Files live in {@code no_backup/cache-v2/panes},
@@ -46,15 +53,25 @@ final class PaneSnapshots {
     interface Native {
         byte[] copy(long handle, String pane);
         long open(byte[] copy);
-        /** Keeps a full-screen pane's transcript from its copy, drawing nothing. */
-        void adopt(byte[] copy);
     }
 
     static final Native NATIVE = new Native() {
         @Override public byte[] copy(long handle, String pane) { return RemoteNative.copyPane(handle, pane); }
         @Override public long open(byte[] copy) { return RemoteNative.openSaved(copy); }
-        @Override public void adopt(byte[] copy) { RemoteNative.adoptSaved(copy); }
     };
+
+    /**
+     * The computer a copy belongs to: {@code host}'s profile id and connection
+     * revision. Null (nothing is saved or opened) when either is unknown.
+     */
+    static String computer(SavedRemoteHost host) {
+        return host == null ? null : computer(host.id, host.connectionRevision);
+    }
+
+    static String computer(String profile, String revision) {
+        if (profile == null || profile.isEmpty() || revision == null || revision.isEmpty()) return null;
+        return profile + "\u0000" + revision;
+    }
 
     private static PaneSnapshots shared;
 
@@ -70,15 +87,6 @@ final class PaneSnapshots {
                 return worker;
             });
             shared = new PaneSnapshots(dir, thread, () -> CacheSeal.shared(app), NATIVE);
-            PaneSnapshots made = shared;
-            // Before any save or open on this thread: which revision each saved computer is at.
-            thread.execute(() -> {
-                try {
-                    made.hosts(new RemoteHostStore(app).read());
-                } catch (Exception unreadable) {
-                    // Copies are keyed by profile alone until the hosts are read.
-                }
-            });
             shared.migrate(old);
         }
         return shared;
@@ -121,19 +129,22 @@ final class PaneSnapshots {
     /**
      * Keeps {@code pane}'s copy on disk, sealed, as session {@code handle}
      * showed it: its live grid while it shows the pane, else the copy kept
-     * when a switch or a close left it. The handle names the computer too:
+     * when a switch or a close left it. {@code computer} is the one that
+     * session was connected to ({@link #computer}, taken when it connected):
      * every core has its own t1, so a save never takes another session's
-     * grid. A failed save never truncates the previous copy.
+     * grid, and a profile edited since never gets it. A failed save never
+     * truncates the previous copy.
      */
-    void save(String host, String pane, long handle) {
-        if (host == null || pane == null || pane.isEmpty()) return;
+    void save(String computer, String pane, long handle) {
+        if (computer == null || pane == null || pane.isEmpty()) return;
+        final File into = file(computer, pane);
         thread.execute(() -> {
             CacheSeal sealer = seal.get();
             if (sealer == null || !dir.isDirectory() && !dir.mkdirs()) return;
             try {
                 byte[] copy = natives.copy(handle, pane);
                 if (copy == null) return;
-                sealer.write(file(host, pane), copy);
+                sealer.write(into, copy);
                 prune(System.currentTimeMillis());
             } catch (IOException | RuntimeException | LinkageError unsaved) {
                 // The previous copy, if any, stays.
@@ -146,8 +157,8 @@ final class PaneSnapshots {
     }
 
     /** Reads {@code pane}'s saved grid into the held frame; {@code then} runs on this thread if there was one. */
-    void open(String host, String pane, Then then) {
-        open(host, pane, then, () -> { });
+    void open(String computer, String pane, Then then) {
+        open(computer, pane, then, () -> { });
     }
 
     /**
@@ -156,10 +167,13 @@ final class PaneSnapshots {
      * asked, so the last pane picked is the one drawn. Opening counts as using
      * the copy: it is kept ahead of panes not looked at since.
      */
-    void open(String host, String pane, Then then, Missing missing) {
-        if (host == null || pane == null || pane.isEmpty()) return;
+    void open(String computer, String pane, Then then, Missing missing) {
+        if (computer == null || pane == null || pane.isEmpty()) {
+            if (pane != null && !pane.isEmpty()) thread.execute(missing::missing);
+            return;
+        }
+        final File saved = file(computer, pane);
         thread.execute(() -> {
-            File saved = file(host, pane);
             byte[] copy = read(saved);
             if (copy == null) {
                 missing.missing();
@@ -185,55 +199,11 @@ final class PaneSnapshots {
         });
     }
 
-    /**
-     * Hands {@code pane}'s saved transcript to the live session that just
-     * switched to it, so scrolling back works at once from what the phone
-     * already has, before (or without) reading the program's history again.
-     * Draws nothing.
-     */
-    void adopt(String host, String pane) {
-        if (host == null || pane == null || pane.isEmpty()) return;
-        thread.execute(() -> {
-            byte[] copy = read(file(host, pane));
-            if (copy == null) return;
-            try {
-                natives.adopt(copy);
-            } catch (RuntimeException | LinkageError ignored) {
-                // Scrolling back then waits for the phone's own capture.
-            }
-        });
-    }
-
-    /**
-     * Each saved computer's connection revision. A copy belongs to the
-     * profile and the revision it was saved under: editing a profile to point
-     * at another computer keeps its id but changes its revision, and the old
-     * computer's copies are never shown as the new one's.
-     */
-    void revisions(java.util.Map<String, String> byHost) {
-        revisions = Collections.unmodifiableMap(new java.util.HashMap<>(byHost));
-    }
-
-    private volatile java.util.Map<String, String> revisions = Collections.emptyMap();
-
-    /** {@link #revisions} of the saved computers {@code hosts}. */
-    void hosts(List<SavedRemoteHost> hosts) {
-        java.util.Map<String, String> byHost = new java.util.HashMap<>();
-        for (SavedRemoteHost host : hosts) byHost.put(host.id, host.connectionRevision);
-        revisions(byHost);
-    }
-
-    /** A computer as the cache keys it: its profile id and connection revision. */
-    private String key(String host) {
-        String revision = revisions.get(host);
-        return revision == null ? host : host + "\u0000" + revision;
-    }
-
-    /** {@code (host, pane)} pairs kept last when the cache is over its bounds. */
+    /** {@code (computer, pane)} pairs kept last when the cache is over its bounds. */
     void pin(List<String[]> panes) {
         Set<String> names = new HashSet<>();
         for (String[] pane : panes) {
-            if (pane.length == 2 && pane[0] != null && pane[1] != null) names.add(name(key(pane[0]), pane[1]));
+            if (pane.length == 2 && pane[0] != null && pane[1] != null) names.add(name(pane[0], pane[1]));
         }
         pinned = Collections.unmodifiableSet(names);
     }
@@ -245,8 +215,8 @@ final class PaneSnapshots {
         return sealer.read(saved, MAX_FILE_BYTES);
     }
 
-    File file(String host, String pane) {
-        return new File(dir, name(key(host), pane));
+    File file(String computer, String pane) {
+        return new File(dir, name(computer, pane));
     }
 
     /** A fixed-length name for a computer and pane: ids may hold any character. */

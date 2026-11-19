@@ -156,6 +156,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String sidebarSignature = "";
     private volatile java.util.List<SavedRemoteHost> savedHosts = java.util.Collections.emptyList();
     private volatile String currentHostId;
+    /**
+     * The computer {@link #currentHostId} is, for the offline cache
+     * ({@link PaneSnapshots#computer}): its profile and connection revision
+     * as picked. A copy opened for another (a profile edited since) is never drawn.
+     */
+    private volatile String currentHostKey;
     private volatile boolean switchingHost;
     /** Host currently being adopted; its sampler stays closed meanwhile. */
     private volatile String switchingTo;
@@ -277,6 +283,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         try {
             shortcuts = Shortcut.parseConfiguration(launch.shortcuts());
             currentHostId = launch.remoteHost == null ? null : launch.remoteHost.id;
+            currentHostKey = PaneSnapshots.computer(launch.remoteHost);
             // Remote-mutating controls live on the Java UI thread, never a deferred GPUI click.
             shortcutJson = "[]";
             loadDisplayOptions();
@@ -290,7 +297,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             worker.execute(() -> {
                 try {
                     java.util.List<SavedRemoteHost> hosts = new RemoteHostStore(this).read();
-                    if (snapshots != null) snapshots.hosts(hosts);
                     runOnUiThread(() -> { savedHosts = hosts; updateHostSampling(); refreshSidebar(true); });
                 } catch (Exception ignored) {
                     // An unreadable store leaves the rail without host rows.
@@ -1703,7 +1709,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             worker.execute(() -> {
                 try {
                     java.util.List<SavedRemoteHost> hosts = new RemoteHostStore(this).read();
-                    if (snapshots != null) snapshots.hosts(hosts);
                     runOnUiThread(() -> { savedHosts = hosts; refreshSidebar(true); });
                 } catch (Exception ignored) {
                     // An unreadable store leaves the rail without host rows.
@@ -2054,6 +2059,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             next.resumed = resume;
             next.hostId = host.id;
+            next.cacheKey = PaneSnapshots.computer(host);
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -2062,6 +2068,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             next.remoteBoot = null;
             connection = next;
             currentHostId = host.id;
+            currentHostKey = next.cacheKey;
             lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
             // A saved pane on screen stays, like a resumed frame, until this one paints.
             if (next.resumed || host.id.equals(savedShownHost)) {
@@ -4568,6 +4575,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void focusOffline(Connection target, String paneId) {
         String host = target.hostId != null ? target.hostId : currentHostId;
+        String key = target.hostId != null ? target.cacheKey : currentHostKey;
         rememberHostPane(host, paneId);
         synchronized (stateLock) {
             if (connection != target) return;
@@ -4575,7 +4583,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             target.pendingPane = "";
         }
         nativeResetPan();
-        showSaved(host, paneId);
+        showSaved(host, key, paneId);
         refreshSidebar(false);
         // One attempt now unless one is running; the monitor keeps trying.
         reconnectCurrentHost();
@@ -5202,8 +5210,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         String shown = rememberedHostPane(currentHostId);
                         // The strip and the rail keep the last list seen, so
                         // panes switch while the link is still down.
-                        installOffline(currentHostId, launch.name(), shown);
-                        showSaved(currentHostId, shown);
+                        installOffline(currentHostId, currentHostKey, launch.name(), shown);
+                        showSaved(currentHostId, currentHostKey, shown);
                         main.post(this::reconnectCurrentHost);
                         return;
                     }
@@ -5213,6 +5221,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 next = new Connection(GENERATIONS.incrementAndGet(), remoteHandle);
                 next.hostId = currentHostId;
+                next.cacheKey = currentHostKey;
             } else next = new Connection(GENERATIONS.incrementAndGet(), new CompanionClient(launch.host.profile));
             connection = next;
             nativeSetActive(next.generation, false);
@@ -6127,7 +6136,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (current.ready && current.hostId != null && onScreen.equals(current.chromePane)
                         && checkpoint.observe(onScreen, paneStatus(current.panes, onScreen),
                                 state.optLong("output", 0), SystemClock.uptimeMillis())) {
-                    snapshots.save(current.hostId, onScreen, current.remoteHandle);
+                    snapshots.save(current.cacheKey, onScreen, current.remoteHandle);
                 }
                 if (state.optBoolean("unchanged", false)) {
                     String quietPhase = state.optString("state", "");
@@ -6230,7 +6239,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     if (current.hostId != null && HomeCache.listed(state)) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
                         queueFleetWrite(current.hostId);
-                        pinPanes(current.hostId, current.panes, current.chromePane);
+                        pinPanes(current.hostId, current.cacheKey, current.panes, current.chromePane);
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
@@ -6239,14 +6248,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     // The pane switched away from: its grid was kept natively
                     // when the attach replaced it, and is saved (and freed) now.
                     if (!current.chromePane.isEmpty() && current.hostId != null) {
-                        snapshots.save(current.hostId, current.chromePane, current.remoteHandle);
+                        snapshots.save(current.cacheKey, current.chromePane, current.remoteHandle);
                     }
-                    // The pane switched to scrolls back at once through what
-                    // the phone kept of it, before its history is read again.
-                    if (current.hostId != null) {
-                        snapshots.adopt(current.hostId, pane);
-                        pinPanes(current.hostId, current.panes, pane);
-                    }
+                    if (current.hostId != null) pinPanes(current.hostId, current.cacheKey, current.panes, pane);
                     if (switchAskedAt > 0) {
                         android.util.Log.w("herdr-switch", "pane " + pane + " shown "
                                 + (SystemClock.uptimeMillis() - switchAskedAt) + " ms after the tap");
@@ -6340,7 +6344,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 savedShownAt = System.currentTimeMillis();
                 // A switch the core made but the poll never confirmed: the pane left is kept natively.
                 if (failed.hostId != null && !failed.chromePane.isEmpty() && !failed.chromePane.equals(failed.paneId)) {
-                    snapshots.save(failed.hostId, failed.chromePane, failed.remoteHandle);
+                    snapshots.save(failed.cacheKey, failed.chromePane, failed.remoteHandle);
                 }
                 publish(failed, message);
                 android.util.Log.i("herdr-reconnect", "link lost: " + message);
@@ -6369,12 +6373,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * no copy shows its title and one dim line instead. The live pane replaces
      * either as soon as it attaches.
      */
-    private void showSaved(String host, String pane) {
+    private void showSaved(String host, String key, String pane) {
         if (snapshots == null || host == null || pane == null || pane.isEmpty()) return;
         String title;
         synchronized (stateLock) { title = paneTitle(connection, pane); }
         int[] size = OfflineSwitch.gridSize(terminalGrid());
-        snapshots.open(host, pane, shown -> main.post(() -> drawSaved(host, pane, shown.renderId, shown.savedAt)),
+        snapshots.open(key, pane, shown -> main.post(() -> drawSaved(host, key, pane, shown.renderId, shown.savedAt)),
                 () -> {
                     long id;
                     try {
@@ -6383,15 +6387,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         id = 0;
                     }
                     final long note = id;
-                    if (note > 0) main.post(() -> drawSaved(host, pane, note, 0));
+                    if (note > 0) main.post(() -> drawSaved(host, key, pane, note, 0));
                 });
     }
 
-    /** Puts a saved pane (or an uncached pane's note) on screen, unless a later pick or the live pane won. Main thread. */
-    private void drawSaved(String host, String pane, long renderId, long savedAt) {
+    /**
+     * Puts a saved pane (or an uncached pane's note) on screen, unless a later
+     * pick, an edit of the profile since it was opened ({@code key}), or the
+     * live pane won. Main thread.
+     */
+    private void drawSaved(String host, String key, String pane, long renderId, long savedAt) {
         synchronized (stateLock) {
             Connection now = connection;
             if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
+            if (key != null && !key.equals(currentHostKey)) return;
             if (now != null && !pane.equals(now.paneId)) return;
             long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
             nativeHold(generation);
@@ -6432,7 +6441,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * view of that computer, so the strip and the rail switch panes offline.
      * Under stateLock or on the main thread.
      */
-    private void installOffline(String hostId, String hostName, String pane) {
+    private void installOffline(String hostId, String key, String hostName, String pane) {
         synchronized (stateLock) {
             Connection now = connection;
             if (now != null && hostId.equals(now.hostId)) return;
@@ -6440,6 +6449,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             offline.offline = true;
             offline.closed = true;
             offline.hostId = hostId;
+            offline.cacheKey = key;
             offline.hostName = hostName;
             offline.title = hostName;
             offline.paneId = pane == null ? "" : pane;
@@ -6504,10 +6514,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * on screen, this computer's Deacon and PMs, and panes with messages
      * waiting to be sent.
      */
-    private void pinPanes(String hostId, JSONArray panes, String onScreen) {
-        if (snapshots == null || hostId == null) return;
+    private void pinPanes(String hostId, String key, JSONArray panes, String onScreen) {
+        if (snapshots == null || hostId == null || key == null) return;
         java.util.List<String[]> pins = new java.util.ArrayList<>();
-        if (onScreen != null && !onScreen.isEmpty()) pins.add(new String[] {hostId, onScreen});
+        if (onScreen != null && !onScreen.isEmpty()) pins.add(new String[] {key, onScreen});
         Outbox box = outbox == null ? null : outbox.outbox();
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
@@ -6515,7 +6525,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String id = pane.optString("id", "");
             String role = FleetTree.role(pane.optString("role", ""));
             if (!id.isEmpty() && (role.equals("deacon") || role.equals("pm") || box != null && box.holds(hostId, id))) {
-                pins.add(new String[] {hostId, id});
+                pins.add(new String[] {key, id});
             }
         }
         snapshots.pin(pins);
@@ -6572,11 +6582,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         stopConnection();
         synchronized (stateLock) { pendingInput.discardAll(); }
         currentHostId = host.id;
+        currentHostKey = PaneSnapshots.computer(host);
         savedShownHost = null;
         savedShownAt = 0;
         if (!shown.isEmpty()) rememberHostPane(host.id, shown);
-        installOffline(host.id, host.name, shown);
-        showSaved(host.id, shown);
+        installOffline(host.id, currentHostKey, host.name, shown);
+        showSaved(host.id, currentHostKey, shown);
         sidebarSignature = "";
         refreshSidebar(true);
         if (monitor != null) monitor.lost();
@@ -7024,6 +7035,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String remoteBoot;
         /** The saved host this session belongs to, for the outbox; null for a companion or shell. */
         volatile String hostId;
+        /** That host as the offline cache names it, as it was when this session connected ({@link PaneSnapshots#computer}). */
+        volatile String cacheKey;
         volatile String paneId = launch.paneId;
         /** A pane switch asked for and not yet confirmed by the daemon, and until when to wait. */
         volatile String pendingPane = "";
@@ -7088,8 +7101,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         private void closeRemote() {
             RemoteNative.close(remoteHandle);
             // Its grid, for reading this conversation later with no link.
-            if (remoteHandle > 0 && hostId != null && remoteClosed.compareAndSet(false, true)) {
-                snapshots.save(hostId, paneId, remoteHandle);
+            if (remoteHandle > 0 && cacheKey != null && remoteClosed.compareAndSet(false, true)) {
+                snapshots.save(cacheKey, paneId, remoteHandle);
             }
         }
         /** Never blocks, so it is safe under stateLock on the UI thread. */

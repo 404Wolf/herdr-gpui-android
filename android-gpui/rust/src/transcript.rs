@@ -12,20 +12,22 @@
 //!   appended to the history, with their colours (row alignment by rows that
 //!   appear once on both screens). A move down (the program's own view was
 //!   scrolled back, or its prompt shrank) is remembered so the same rows are
-//!   not added twice when it moves up again.
-//! - **A seed from the core.** `terminal.read` reads a full-screen app's
-//!   history by scrolling it (the core's stitched read), as plain text. It
-//!   fills what live capture never saw (before the attach, or a gap when the
-//!   screen changed too much at once); rows captured live replace the plain
-//!   copy where both have them.
+//!   not added twice when it moves up again; scrolled back further than the
+//!   history reaches (the program scrolling its own view), the older rows
+//!   lead the history once it moves up again.
+//! - **Gaps.** When the screen changed by more than it holds between two
+//!   looks (or was resized), rows were missed: a mark stands there.
 //!
-//! The phone scrolls this history itself ([`Transcript::reader_rows`]) and
-//! saves it, so nothing waits on the link.
+//! Only what the phone watched, in this run of the app: nothing is read
+//! from the core (its stitched read freezes the pane on every screen) or
+//! from a saved copy. The phone scrolls this history itself
+//! ([`Transcript::reader_rows`]) and saves it, so nothing waits on the link.
 use rio_vt::crosswords::Crosswords;
 use rio_vt::crosswords::pos::{Column, Line, Pos};
 use rio_vt::crosswords::square::Wide;
 use rio_vt::event::EventListener;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// The most one pane's history may take (Wolf's budget: 1 MiB a pane); the
 /// oldest rows go first.
@@ -36,19 +38,12 @@ const MIN_ANCHOR_CHARS: usize = 3;
 /// At least this many such rows must agree on a move before it is trusted.
 const MIN_VOTES: usize = 2;
 /// Drawn in the reader (and in a saved copy) where rows were never seen: the
-/// screen changed by more than it holds between two looks, and no read from
-/// the core filled the gap yet. A saved copy records where its marks are (by
-/// position, never by this text, which a program could print too).
+/// screen changed by more than it holds between two looks.
 pub(crate) const GAP_TEXT: &str = "· rows not seen ·";
 
-/// Whether `row` is a gap's mark (from [`Transcript::reader_rows`]), not output.
-pub(crate) fn is_mark(row: &Row) -> bool {
-    std::ptr::eq(row, gap_row())
-}
-
-fn gap_row() -> &'static Row {
-    static ROW: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
-    ROW.get_or_init(|| Row { text: GAP_TEXT.to_owned(), vt: format!("\x1b[2m{GAP_TEXT}\x1b[0m") })
+fn gap_row() -> &'static Arc<Row> {
+    static ROW: std::sync::OnceLock<Arc<Row>> = std::sync::OnceLock::new();
+    ROW.get_or_init(|| Arc::new(Row { text: GAP_TEXT.to_owned(), vt: format!("\x1b[2m{GAP_TEXT}\x1b[0m") }))
 }
 
 /// One screen row: its text (trailing blanks trimmed), what it is compared
@@ -60,7 +55,8 @@ pub(crate) struct Row {
 }
 
 impl Row {
-    /// A row the core sent as text (a seed): drawn in the default colours.
+    /// A row as plain text, drawn in the default colours.
+    #[cfg(test)]
     pub(crate) fn plain(text: &str) -> Self {
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         let text = text.trim_end().to_owned();
@@ -175,8 +171,9 @@ pub(crate) fn moved(previous: &[&str], next: &[&str]) -> Moved {
 /// One full-screen pane's history on the phone.
 #[derive(Debug, Default)]
 pub(crate) struct Transcript {
-    /// Oldest first: rows above the screen.
-    history: VecDeque<Row>,
+    /// Oldest first: rows above the screen. Shared, so a copy of them (a
+    /// reader, a save) is taken without copying the rows themselves.
+    history: VecDeque<Arc<Row>>,
     bytes: usize,
     /// The screen last looked at, which the next one is aligned with.
     screen: Vec<Row>,
@@ -188,41 +185,24 @@ pub(crate) struct Transcript {
     /// screen holds this many rows older than the oldest history row. A move
     /// up gives these back first; they lead the history then.
     beyond: usize,
-    /// Where rows were missed, ascending: the rows before each index may not
-    /// join the rows after it. A seed fills what it covers; 0 means rows
-    /// before the oldest kept one were missed (a seed is owed, nothing to mark).
+    /// Where the next of those rows go: after the ones a move up already gave
+    /// back (they come oldest first, a few each move), before the rest.
+    beyond_at: usize,
+    /// Where rows were missed, ascending: the rows before each index never
+    /// join the rows after it. 0: rows before the oldest kept one (nothing to mark).
     gaps: Vec<usize>,
-    /// The history reaches the program's first row (a complete seed, never trimmed since).
-    complete: bool,
-    /// A seed was merged since the pane was first seen.
-    seeded: bool,
     /// The screen's width when last looked at: a resize redraws everything.
     cols: usize,
 }
 
 impl Transcript {
-    /// A transcript read back from a saved copy: `rows` is its history then its screen.
+    /// A transcript of `rows`: its history then its screen (tests).
     #[cfg(test)]
-    pub(crate) fn restored(rows: Vec<Row>, screen: usize, cols: usize, complete: bool) -> Self {
-        Self::restored_with_gaps(rows, screen, cols, complete, &[])
-    }
-
-    /// As [`Transcript::restored`], with rows missed before each of `gaps`
-    /// (history indexes, the marks already taken out of `rows`).
-    pub(crate) fn restored_with_gaps(mut rows: Vec<Row>, screen: usize, cols: usize, complete: bool, gaps: &[usize]) -> Self {
+    pub(crate) fn restored(mut rows: Vec<Row>, screen: usize, cols: usize) -> Self {
         let screen = rows.split_off(rows.len().saturating_sub(screen));
-        let mut out = Self { screen, cols, complete, ..Self::default() };
-        let count = rows.len();
-        let mut gaps = gaps.iter().copied().filter(|g| *g <= count).peekable();
-        for (i, row) in rows.into_iter().enumerate() {
-            while gaps.peek().is_some_and(|g| *g <= i) {
-                gaps.next();
-                out.mark_gap();
-            }
+        let mut out = Self { screen, cols, ..Self::default() };
+        for row in rows {
             out.push(row);
-        }
-        if gaps.next().is_some() {
-            out.mark_gap();
         }
         out
     }
@@ -245,41 +225,32 @@ impl Transcript {
         self.history.len()
     }
 
-    /// Whether a seed is still owed: never seeded, or rows were missed since.
-    pub(crate) fn wants_seed(&self) -> bool {
-        !self.seeded || !self.gaps.is_empty()
-    }
-
-    pub(crate) fn complete(&self) -> bool {
-        self.complete && self.gaps.is_empty()
-    }
-
-    /// Rows older than every history row, oldest first, put before them.
+    /// Rows older than the history the view moved up past, oldest first:
+    /// they go after the ones given back before them, before the rest.
     fn prepend(&mut self, rows: Vec<Row>) {
-        if self.complete {
-            // The history reached the program's first row: these were known.
-            return;
-        }
         let n = rows.len();
-        for row in rows.into_iter().rev() {
+        let at = self.beyond_at.min(self.history.len());
+        for (i, row) in rows.into_iter().enumerate() {
             self.bytes += row.bytes();
-            self.history.push_front(row);
+            self.history.insert(at + i, Arc::new(row));
         }
-        self.shift_gaps(n as isize);
+        self.beyond_at = at + n;
+        self.gaps = self.gaps.iter().map(|g| if *g >= at { g + n } else { *g }).collect();
         while self.bytes > MAX_BYTES {
             let Some(old) = self.history.pop_front() else { break };
             self.bytes -= old.bytes();
+            self.beyond_at = self.beyond_at.saturating_sub(1);
             self.shift_gaps(-1);
         }
     }
 
     fn push(&mut self, row: Row) {
         self.bytes += row.bytes();
-        self.history.push_back(row);
+        self.history.push_back(Arc::new(row));
         while self.bytes > MAX_BYTES {
             let Some(old) = self.history.pop_front() else { break };
             self.bytes -= old.bytes();
-            self.complete = false;
+            self.beyond_at = self.beyond_at.saturating_sub(1);
             self.shift_gaps(-1);
         }
     }
@@ -289,6 +260,7 @@ impl Transcript {
         self.mark_gap();
         self.back = 0;
         self.beyond = 0;
+        self.beyond_at = 0;
     }
 
     /// A new look at the program's screen; returns how it moved.
@@ -336,6 +308,8 @@ impl Transcript {
                 let total = self.back + self.beyond + d;
                 self.back = total.min(self.history.len());
                 self.beyond = total - self.back;
+                // Rows beyond the history now: older than every row kept.
+                self.beyond_at = 0;
             }
             Moved::Lost => self.lose(),
             Moved::Still => {}
@@ -344,117 +318,27 @@ impl Transcript {
         how
     }
 
-    /// Merges the core's stitched read (`text`: history then screen, plain;
-    /// `complete`: it reached the top). Rows captured live are kept where
-    /// both have them; the core's copy fills what is older or was missed.
-    /// False when the read could not be placed against this history and screen.
-    pub(crate) fn seed(&mut self, text: &str, complete: bool) -> bool {
-        let seed: Vec<Row> = text.split('\n').map(Row::plain).collect();
-        let theirs: Vec<&str> = seed.iter().map(|r| r.text.as_str()).collect();
-        let len = self.history.len();
-        // The run since the last gap is what the read is placed against.
-        let last = self.gaps.last().copied().unwrap_or(0).min(len);
-        let live = len - self.back.min(len - last);
-        let ours: Vec<&str> =
-            self.history.range(last..live).chain(self.screen.iter()).map(|r| r.text.as_str()).collect();
-        // seed[i] == ours[i - d]: ours starts at seed row d.
-        let Some(Some(d)) = winner(&votes(&theirs, &ours), None) else {
-            return false;
-        };
-        if d <= 0 {
-            if last > 0 {
-                // The read starts after the last gap: it fills none of it,
-                // and the rows on both sides must not be joined.
-                return false;
-            }
-            // Ours reach as far back as the read: nothing is older.
-            self.gaps.clear();
-            self.seeded = true;
-            return true;
-        }
-        let d = d as usize;
-        // Earlier runs (between gaps), newest first, placed in the read's
-        // rows before ours, each before the next: the gaps between them are
-        // filled. The first one that cannot be placed keeps its rows and the
-        // gap after it.
-        let mut bounds = vec![0];
-        bounds.extend(self.gaps.iter().copied().filter(|g| *g > 0 && *g < last));
-        bounds.push(last);
-        let mut placed: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, seed index)
-        let mut cur = d;
-        let mut kept_to = 0;
-        for pair in bounds.windows(2).rev() {
-            let (start, end) = (pair[0], pair[1]);
-            if start == end {
-                continue;
-            }
-            let run: Vec<&str> = self.history.range(start..end).map(|r| r.text.as_str()).collect();
-            let fits = |e: usize| e + run.len() <= cur;
-            // By the rows that stand out; a run too short to vote must match
-            // the read's rows exactly, the latest such place first.
-            let voted = match winner(&votes(&theirs[..cur], &run), None) {
-                Some(Some(e)) if e >= 0 && fits(e as usize) => Some(e as usize),
-                _ => None,
-            };
-            let telling = run.iter().any(|r| !r.trim().is_empty());
-            let at = voted.or_else(|| {
-                (0..=cur.saturating_sub(run.len()))
-                    .rev()
-                    .find(|&e| telling && fits(e) && theirs[e..e + run.len()] == run[..])
-            });
-            let Some(at) = at else {
-                kept_to = end;
-                break;
-            };
-            placed.push((start, end, at));
-            cur = at;
-        }
-        let old: Vec<Row> = self.history.drain(..).collect();
-        let old_gaps = std::mem::take(&mut self.gaps);
-        self.bytes = 0;
-        self.beyond = 0;
-        // The rows before the first run placed stay as they were, apart.
-        for (i, row) in old[..kept_to].iter().enumerate() {
-            if i > 0 && old_gaps.contains(&i) {
-                self.mark_gap();
-            }
-            self.push(row.clone());
-        }
-        if kept_to > 0 {
-            self.mark_gap();
-        }
-        // The read's rows up to ours, with the rows captured live where a run was placed.
-        // All of the read's rows before ours: with no run before them they are
-        // older rows; after rows that could not be placed, the gap's newer part.
-        let mut j = 0;
-        while j < d {
-            if let Some(&(start, end, at)) = placed.iter().find(|p| p.2 <= j && j < p.2 + (p.1 - p.0)) {
-                for row in &old[start..end] {
-                    self.push(row.clone());
-                }
-                j = at + (end - start);
-            } else {
-                self.push(seed[j].clone());
-                j += 1;
-            }
-        }
-        for row in &old[last..] {
-            self.push(row.clone());
-        }
-        if kept_to == 0 {
-            self.complete = complete;
-        }
-        self.seeded = true;
-        true
-    }
-
     /// What the phone scrolls through: the history, then `screen` (the
     /// program's screen now), each row once, with a mark where rows were
     /// never seen ([`GAP_TEXT`]).
+    #[cfg(test)]
     pub(crate) fn reader_rows<'a>(&'a self, screen: &'a [Row]) -> impl Iterator<Item = &'a Row> {
+        self.shown().into_iter().map(|row| &**row).chain(screen.iter())
+    }
+
+    /// [`Transcript::reader_rows`], shared: the history rows themselves are
+    /// not copied (taken while the transcript is locked, written out after).
+    pub(crate) fn reader_shared(&self, screen: &[Row]) -> Vec<Arc<Row>> {
+        let mut out: Vec<Arc<Row>> = self.shown().into_iter().cloned().collect();
+        out.extend(screen.iter().cloned().map(Arc::new));
+        out
+    }
+
+    /// The history rows above the program's view, with a mark at each gap.
+    fn shown(&self) -> Vec<&Arc<Row>> {
         let shown = self.history.len() - self.back.min(self.history.len());
         let mut gaps = self.gaps.iter().copied().filter(|g| *g > 0 && *g <= shown).peekable();
-        let mut out: Vec<&Row> = Vec::with_capacity(shown + screen.len() + self.gaps.len());
+        let mut out: Vec<&Arc<Row>> = Vec::with_capacity(shown + self.gaps.len());
         for (i, row) in self.history.iter().take(shown).enumerate() {
             while gaps.next_if(|g| *g <= i).is_some() {
                 out.push(gap_row());
@@ -464,8 +348,7 @@ impl Transcript {
         if gaps.next().is_some() {
             out.push(gap_row());
         }
-        out.extend(screen.iter());
-        out.into_iter()
+        out
     }
 
     /// The screen last looked at.
@@ -558,58 +441,19 @@ mod tests {
     }
 
     #[test]
-    fn ask2_too_much_output_at_once_is_a_gap_and_a_seed_fills_it() {
+    fn ask2_too_much_output_at_once_is_a_marked_gap() {
         let mut t = Transcript::default();
         t.observe(claude(29, 30, "· working"), 80);
         t.observe(claude(31, 30, "· working"), 80);
         // 80 rows at once: nothing on the new screen was on the old one.
         assert_eq!(t.observe(claude(111, 30, "· working"), 80), Moved::Lost);
-        assert!(t.wants_seed());
         t.observe(claude(113, 30, "done"), 80);
-        // The core's stitched read of everything (history then screen).
-        let mut text: Vec<String> = (0..=113).map(line).collect();
-        text.extend(texts(claude(113, 30, "done")[30..].iter()));
-        assert!(t.seed(&text.join("\n"), true));
-        assert!(!t.wants_seed() && t.complete());
         let screen = claude(113, 30, "done");
-        assert_eq!(texts(t.reader_rows(&screen)), expected(113, 30, "done"));
-    }
-
-    #[test]
-    fn ask2_a_seed_keeps_the_rows_captured_live_with_their_colours() {
-        // Live rows carry colours (their bytes differ from the plain text).
-        let coloured = |newest| {
-            let mut rows = claude(newest, 30, "· working");
-            for row in &mut rows {
-                row.vt = format!("\x1b[32m{}\x1b[0m", row.text);
-            }
-            rows
-        };
-        let mut t = Transcript::default();
-        // Attached late: the first screen starts at row 30.
-        t.observe(coloured(59), 80);
-        t.observe(coloured(63), 80);
-        let kept: Vec<String> = t.history.iter().map(|r| r.vt.clone()).collect();
-        assert_eq!(kept.len(), 4);
-        let mut text: Vec<String> = (0..=63).map(line).collect();
-        text.extend(texts(claude(63, 30, "done")[30..].iter()));
-        assert!(t.seed(&text.join("\n"), false));
-        assert_eq!(t.rows(), 34);
-        let screen = claude(63, 30, "done");
-        assert_eq!(texts(t.reader_rows(&screen)), expected(63, 30, "done"));
-        // The four rows captured live are the coloured ones, after the plain seed.
-        let now: Vec<String> = t.history.iter().map(|r| r.vt.clone()).collect();
-        assert_eq!(now[now.len() - 4..], kept[..]);
-        assert!(!now[0].contains('\x1b'));
-    }
-
-    #[test]
-    fn ask2_a_seed_that_cannot_be_placed_changes_nothing() {
-        let mut t = Transcript::default();
-        t.observe(claude(29, 30, "done"), 80);
-        assert!(!t.seed("something else\nentirely different rows\nnothing alike", true));
-        assert!(t.wants_seed());
-        assert_eq!(t.rows(), 0);
+        let all = texts(t.reader_rows(&screen));
+        let mut want: Vec<String> = vec![line(0), line(1), GAP_TEXT.to_owned()];
+        want.extend((82..=113).map(line));
+        want.extend(texts(screen[30..].iter()));
+        assert_eq!(all, want);
     }
 
     #[test]
@@ -617,7 +461,6 @@ mod tests {
         let mut t = Transcript::default();
         t.observe(claude(29, 30, "done"), 80);
         assert_eq!(t.observe(claude(29, 30, "done"), 120), Moved::Lost);
-        assert!(t.wants_seed());
     }
 
     #[test]
@@ -648,21 +491,27 @@ mod tests {
         assert_eq!(all, want);
     }
 
-    /// Review P2-3: a seed that starts after the gap must not clear it.
+    /// Round 3 (emulator): the program's own view scrolled back far beyond
+    /// the phone's history, then forward a few rows at a time: the rows it
+    /// gives back join in order, once, before the history.
     #[test]
-    fn ask2_a_seed_that_starts_after_a_gap_leaves_it_owed() {
+    fn ask2_a_view_scrolled_far_back_then_forward_in_steps_keeps_the_order() {
         let mut t = Transcript::default();
-        t.observe(claude(29, 30, "· working"), 80);
-        t.observe(claude(40, 30, "· working"), 80);
-        assert_eq!(t.observe(claude(140, 30, "· working"), 80), Moved::Lost);
-        for n in (141..=199).step_by(2) {
-            t.observe(claude(n, 30, "· working"), 80);
+        t.observe(claude(59, 30, "done"), 80);
+        t.observe(claude(64, 30, "done"), 80);
+        // Back 3 rows at a time (a wheel), 13 rows beyond the history.
+        for newest in (44..=61).rev().step_by(3) {
+            assert!(matches!(t.observe(claude(newest, 30, "done"), 80), Moved::Down(3)));
         }
-        // The core's read reaches back only to row 150, after the gap.
-        let mut text: Vec<String> = (150..=200).map(line).collect();
-        text.extend(texts(claude(200, 30, "done")[30..].iter()));
-        let placed = t.seed(&text.join("\n"), false);
-        assert!(!placed || t.wants_seed(), "the gap was cleared without being filled");
+        // Forward again, 3 at a time, to the newest.
+        for newest in (49..=64).step_by(3) {
+            assert_eq!(t.observe(claude(newest, 30, "done"), 80), Moved::Up(3));
+        }
+        let screen = claude(64, 30, "done");
+        let all: Vec<String> = texts(t.reader_rows(&screen)).into_iter().filter(|r| !r.is_empty()).collect();
+        let mut want: Vec<String> = (17..=64).map(line).filter(|r| !r.is_empty()).collect();
+        want.extend(texts(screen[30..].iter()).into_iter().filter(|r| !r.is_empty()));
+        assert_eq!(all, want);
     }
 
     /// Review P2-4: rows never seen are shown as such, never silently joined.
@@ -691,28 +540,7 @@ mod tests {
         let mut t = Transcript::default();
         t.observe(rows(0), 80);
         assert_eq!(t.observe(rows(4), 80), Moved::Up(4));
-        assert_eq!(texts(t.history.iter()), vec![rule.to_owned(), "row 001".into(), "row 002".into(), "row 003".into()]);
-    }
-
-    /// Review round 2 P2-3: a seed that starts inside a gap fills only
-    /// what it covers; the rows before the gap stay, and so does the gap.
-    #[test]
-    fn ask2_a_seed_that_starts_inside_a_gap_keeps_the_rows_before_it() {
-        let mut t = Transcript::default();
-        t.observe(claude(29, 30, "· working"), 80);
-        t.observe(claude(40, 30, "· working"), 80);
-        assert_eq!(t.observe(claude(140, 30, "· working"), 80), Moved::Lost);
-        t.observe(claude(143, 30, "· working"), 80);
-        // The core's read reaches back only to row 106: rows 11..105 stay unknown.
-        let mut text: Vec<String> = (106..=143).map(line).collect();
-        text.extend(texts(claude(143, 30, "done")[30..].iter()));
-        t.seed(&text.join("\n"), false);
-        let screen = claude(143, 30, "done");
-        let all = texts(t.reader_rows(&screen));
-        assert_eq!(all[..10], (0..10).map(line).collect::<Vec<_>>()[..], "the rows before the gap were dropped");
-        let mark = all.iter().position(|r| r == GAP_TEXT).expect("the gap is still marked");
-        assert_eq!(all[mark + 1], line(106));
-        assert!(t.wants_seed());
+        assert_eq!(texts(t.history.iter().map(|r| &**r)), vec![rule.to_owned(), "row 001".into(), "row 002".into(), "row 003".into()]);
     }
 
     /// Review round 2 P2-4: two separate bursts are two gaps, both marked.
