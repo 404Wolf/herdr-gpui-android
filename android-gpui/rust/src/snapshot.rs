@@ -382,6 +382,24 @@ mod tests {
         assert!(long.len() < 300);
     }
 
+    /// Review round 2 P2-7: an OSC 8 link keeps its target in a copy (and so
+    /// in the phone's copy read back), not only its label.
+    #[test]
+    fn ask2_a_labelled_link_keeps_its_target_in_the_copy() {
+        let session = parsed(b"see \x1b]8;;https://example.test/notes\x1b\\release notes\x1b]8;;\x1b\\ here\r\n$ ", 40, 5);
+        let bytes = copy(&session.grid().lock(), "t1", "boot", None).unwrap();
+        let back = restore(parse(bytes).unwrap()).unwrap();
+        wait_quiet(&back);
+        let grid = back.grid().lock();
+        let line = (0..grid.screen_lines() as i32)
+            .map(Line)
+            .find(|line| (0..grid.columns()).any(|c| grid.cell_hyperlink(*line, Column(c)).is_some()));
+        let link = line.and_then(|line| (0..grid.columns()).find_map(|c| grid.cell_hyperlink(line, Column(c))));
+        assert_eq!(link.map(|l| l.uri().to_owned()).as_deref(), Some("https://example.test/notes"));
+        // The row's text is still the label.
+        assert!(saved_rows(&copy(&session.grid().lock(), "t1", "boot", None).unwrap()).iter().any(|r| r.text.contains("see release notes here")));
+    }
+
     /// Review mutant M5: only a full-screen grid's copy is its transcript.
     #[test]
     fn ask2_a_plain_pane_is_saved_from_its_grid_never_from_a_transcript() {

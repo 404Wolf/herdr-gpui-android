@@ -77,6 +77,32 @@ public final class PaneSnapshotsTest {
         assertFalse(saved.exists());
     }
 
+    /** Review round 2 P1-1: a saved connection edited to another computer keeps its id, never its copies. */
+    @Test public void ask2AnEditedConnectionNeverShowsTheOldComputersCopy() throws Exception {
+        File folder = dir.newFolder("panes");
+        SecretKey key = CacheSeal.newKey();
+        FakeNative natives = new FakeNative();
+        natives.copies.put("t1", TRANSCRIPT);
+        PaneSnapshots snapshots = snapshots(folder, key, natives);
+        java.util.Map<String, String> revisions = new java.util.HashMap<>();
+        revisions.put("profile", "revision-a");
+        snapshots.revisions(revisions);
+        snapshots.save("profile", "t1", 7);
+        // The profile now points at computer B: same id, a new connection revision.
+        revisions.put("profile", "revision-b");
+        snapshots.revisions(revisions);
+        List<Long> shown = new ArrayList<>();
+        snapshots.open("profile", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        assertEquals(Collections.singletonList(-1L), shown);
+        // Back on A's revision (the edit undone), A's copy is A's again.
+        revisions.put("profile", "revision-a");
+        snapshots.revisions(revisions);
+        shown.clear();
+        snapshots.open("profile", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        assertEquals(1, shown.size());
+        assertTrue(shown.get(0) > 0);
+    }
+
     /** Review P2-6: opening a copy must not change the time it says it was saved. */
     @Test public void ask2AnOfflineCopyKeepsItsSaveTimeOverEveryOpen() throws Exception {
         File folder = dir.newFolder("panes");

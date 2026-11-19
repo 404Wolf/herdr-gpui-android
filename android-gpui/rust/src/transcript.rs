@@ -600,6 +600,42 @@ mod tests {
         assert_eq!(texts(t.history.iter()), vec![rule.to_owned(), "row 001".into(), "row 002".into(), "row 003".into()]);
     }
 
+    /// Review round 2 P2-3: a seed that starts inside a gap fills only
+    /// what it covers; the rows before the gap stay, and so does the gap.
+    #[test]
+    fn ask2_a_seed_that_starts_inside_a_gap_keeps_the_rows_before_it() {
+        let mut t = Transcript::default();
+        t.observe(claude(29, 30, "· working"), 80);
+        t.observe(claude(40, 30, "· working"), 80);
+        assert_eq!(t.observe(claude(140, 30, "· working"), 80), Moved::Lost);
+        t.observe(claude(143, 30, "· working"), 80);
+        // The core's read reaches back only to row 106: rows 11..105 stay unknown.
+        let mut text: Vec<String> = (106..=143).map(line).collect();
+        text.extend(texts(claude(143, 30, "done")[30..].iter()));
+        t.seed(&text.join("\n"), false);
+        let screen = claude(143, 30, "done");
+        let all = texts(t.reader_rows(&screen));
+        assert_eq!(all[..10], (0..10).map(line).collect::<Vec<_>>()[..], "the rows before the gap were dropped");
+        let mark = all.iter().position(|r| r == GAP_TEXT).expect("the gap is still marked");
+        assert_eq!(all[mark + 1], line(106));
+        assert!(t.wants_seed());
+    }
+
+    /// Review round 2 P2-4: two separate bursts are two gaps, both marked.
+    #[test]
+    fn ask2_two_bursts_are_two_marked_gaps() {
+        let mut t = Transcript::default();
+        t.observe(claude(29, 30, "· working"), 80);
+        t.observe(claude(40, 30, "· working"), 80);
+        assert_eq!(t.observe(claude(140, 30, "· working"), 80), Moved::Lost);
+        t.observe(claude(150, 30, "· working"), 80);
+        assert_eq!(t.observe(claude(250, 30, "· working"), 80), Moved::Lost);
+        t.observe(claude(255, 30, "· working"), 80);
+        let screen = claude(255, 30, "· working");
+        let marks = t.reader_rows(&screen).filter(|r| r.text == GAP_TEXT).count();
+        assert_eq!(marks, 2);
+    }
+
     #[test]
     fn rows_that_repeat_never_prove_a_move() {
         // Only blank and short rows changed: nothing to align by.

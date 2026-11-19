@@ -152,6 +152,14 @@ const STITCH_WAIT: Duration = Duration::from_secs(60);
 /// Another viewer that used its window this recently blocks a stitch.
 const STITCH_QUIET_MS: u64 = 60_000;
 
+/// Serializes the tests that take the phone-wide stitch: run side by side,
+/// one test's read would refuse another's.
+#[cfg(test)]
+pub(crate) fn stitch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// One stitched read at a time from this phone, whichever computer.
 struct Stitching;
 static STITCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -5565,6 +5573,358 @@ mod cache_tests {
         assert!(may_stitch(&json!({"viewers":[watcher, phone.clone()]}), 4));
     }
 
+    // ---- Review round 2 (#43, 5cb7c0b) ----
+
+    /// The pane entry of `owner`'s view gets terminal identity fields.
+    fn set_pane(owner: &Session, fields: Value) {
+        let mut state = lock(&owner.state);
+        for (key, value) in fields.as_object().unwrap() {
+            state.view["panes"][0][key] = value.clone();
+        }
+    }
+
+    /// Claude-like rows of another conversation, for a pane that is not the one read before.
+    fn other_paint(newest: usize) -> Vec<u8> {
+        let first = (newest + 1).saturating_sub(TRANSCRIPT);
+        let mut rows: Vec<String> = (first..=newest).map(|n| format!("◆ another talk {n:03}")).collect();
+        rows.extend(["────────────────".to_owned(), "❯ ".to_owned(), "  ? for shortcuts".to_owned()]);
+        format!("\x1b[H\x1b[2J{}", rows.join("\r\n")).into_bytes()
+    }
+
+    fn settle_now(owner: &Session) {
+        owner.heard.printed(100);
+        let _ = crate::remote::settle(owner, &mut lock(&owner.state));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(crate::remote::settle(owner, &mut lock(&owner.state)));
+    }
+
+    /// Review round 2 P1-1: a terminal id reused by the same core (its
+    /// registry restored or rolled back) is another terminal: the copy read
+    /// of the old one is never its reader, and the old one's saved transcript
+    /// never joins it. Also another pane of the same core never takes it.
+    #[test]
+    fn ask2_a_reused_terminal_id_never_shows_the_old_terminals_conversation() {
+        let _serial = crate::remote::departed_test_lock();
+        // The old t1 (created at 100) is read back 12 rows, then the session closes.
+        let (terminal, tx, _sent) = full_screen();
+        let old = owner(7801, "boot-R", terminal, "done");
+        set_pane(&old, json!({"created_ms": 100, "program": "claude"}));
+        crate::remote::register_for_test(old.clone());
+        stream(&old, &tx, 9, 60);
+        let copy = crate::remote::copy_pane(7801, "t1").unwrap().unwrap();
+        crate::remote::scroll_local(7801, 12, paint_args(0)).unwrap();
+        crate::remote::close(7801);
+        // The registry is restored: a new t1 (created at 200) on the same core.
+        let (live, tx2, _sent2) = full_screen();
+        let new = owner(7803, "boot-R", live.clone(), "done");
+        set_pane(&new, json!({"created_ms": 200, "program": "claude"}));
+        lock(&new.state).local = Local::attached(new.heard.output_now());
+        tx2.send(Chunk::Data(other_paint(40))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !live.screen_text().contains("another talk 040") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        settle_now(&new);
+        assert!(lock(&new.state).local.reader_for_test().is_none(), "the old t1's copy is drawn as the new t1");
+        // The old t1's saved transcript never joins the new t1 either.
+        crate::remote::adopt_saved(copy).unwrap();
+        crate::remote::register_for_test(new.clone());
+        crate::remote::scroll_local(7803, 3, paint_args(0)).unwrap();
+        if let Some((_, reader)) = lock(&new.state).local.reader_for_test() {
+            let rows = text_rows(&reader);
+            assert!(!rows.iter().any(|r| r.contains("conversation line")), "the old t1's rows joined the new t1: {rows:?}");
+        }
+        crate::remote::close(7803);
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P1-1 (mutant M3): another pane of the same core never
+    /// takes the copy read of t1.
+    #[test]
+    fn ask2_another_pane_of_the_same_core_never_takes_the_copy_read() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let old = owner(7813, "boot-S", terminal, "done");
+        crate::remote::register_for_test(old.clone());
+        stream(&old, &tx, 9, 60);
+        crate::remote::scroll_local(7813, 12, paint_args(0)).unwrap();
+        crate::remote::close(7813);
+        // Another pane of the same core (t2) never takes that reader either.
+        let (other, otx, _osent) = full_screen();
+        let t2 = owner(7802, "boot-S", other.clone(), "done");
+        {
+            let mut state = lock(&t2.state);
+            state.view["pane_id"] = json!("t2");
+            state.view["panes"][0]["id"] = json!("t2");
+            state.local = Local::attached(t2.heard.output_now());
+        }
+        otx.send(Chunk::Data(other_paint(30))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !other.screen_text().contains("another talk 030") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        settle_now(&t2);
+        assert!(lock(&t2.state).local.reader_for_test().is_none(), "t1's copy is drawn as t2");
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P2-1: building the first reader never holds the
+    /// session's lock (the 30 Hz poll and Java's state lock wait on it).
+    #[test]
+    fn ask2_the_first_drag_never_holds_the_session_lock_while_it_builds_the_copy() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7804, "boot-7804", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        tx.send(Chunk::Data(paint(9))).unwrap();
+        shows(&terminal, 9);
+        let rows: Vec<crate::transcript::Row> = (0..30_000).map(|n| crate::transcript::Row::plain(&line(n))).collect();
+        crate::remote::adopt_for_test("boot-7804", "t1", crate::transcript::Transcript::restored(rows, 0, COLS.into(), false));
+        let drag = std::thread::spawn(|| crate::remote::scroll_local(7804, 3, paint_args(0)).map(|_| ()));
+        let mut worst = Duration::ZERO;
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            let asked = Instant::now();
+            drop(lock(&session.state));
+            worst = worst.max(asked.elapsed());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drag.join().unwrap().unwrap();
+        assert!(worst < Duration::from_millis(50), "the session lock was held {worst:?} while the copy was built");
+        crate::remote::close(7804);
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P2-2: the copy read joins the history to the screen it
+    /// was captured against, never to a newer screen that skipped rows.
+    #[test]
+    fn ask2_a_drag_right_after_new_output_never_skips_rows() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7805, "boot-7805", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        // Claude writes three more rows; the drag comes before the next poll looks.
+        tx.send(Chunk::Data(paint(63))).unwrap();
+        shows(&terminal, 63);
+        crate::remote::scroll_local(7805, 1, paint_args(0)).unwrap();
+        let (_, reader) = lock(&session.state).local.reader_for_test().expect("a copy is read");
+        assert_eq!(text_rows(&reader), whole(63));
+        crate::remote::close(7805);
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P2-4: every place rows were missed is marked, also in a
+    /// copy saved and read back (the real encode, parse and restore path).
+    #[test]
+    fn ask2_two_bursts_leave_two_marks_through_the_saved_copy() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7806, "boot-7806", terminal, "working");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 30);
+        stream(&session, &tx, 130, 140);
+        stream(&session, &tx, 240, 250);
+        let copy = crate::remote::copy_pane(7806, "t1").unwrap().unwrap();
+        let saved = crate::snapshot::parse(copy).unwrap();
+        let transcript = crate::snapshot::transcript_of(&saved).expect("a transcript");
+        let marks = transcript.reader_rows(&[]).filter(|r| r.text == crate::transcript::GAP_TEXT).count();
+        assert_eq!(marks, 2, "two bursts, {marks} marks after a save and a read back");
+        crate::remote::close(7806);
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P2-5: the saved copy of a pane whose agent ended and
+    /// left a pager is the pager's screen, never the agent's conversation.
+    #[test]
+    fn ask2_a_pager_after_the_agent_is_saved_without_the_agents_conversation() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7807, "boot-7807", terminal.clone(), "done");
+        set_pane(&session, json!({"created_ms": 5, "program": "claude"}));
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        // Claude exits to the shell; the person opens a pager in the same pane.
+        set_pane(&session, json!({"status": "", "program": "less"}));
+        tx.send(Chunk::Data(b"\x1b[H\x1b[2Jpager page one\r\npager page two".to_vec())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.screen_text().contains("pager page two") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let copy = crate::remote::copy_pane(7807, "t1").unwrap().unwrap();
+        let text = String::from_utf8_lossy(&copy).into_owned();
+        assert!(text.contains("pager page two"));
+        assert!(!text.contains("conversation line"), "the pager's copy carries the agent's conversation");
+        crate::remote::close(7807);
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P2-5: an agent known by its label (no status reported
+    /// yet) is read back from the phone's copy like any agent.
+    #[test]
+    fn ask2_an_agent_known_by_its_label_is_read_back_without_a_status() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7808, "boot-7808", terminal, "");
+        set_pane(&session, json!({"kind": "claude", "program": "claude"}));
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        let _ = sent_data(&sent);
+        crate::remote::scroll_local(7808, 3, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_some(), "no copy for a labelled agent");
+        assert!(!sent_data(&sent), "the drag went to the agent");
+        crate::remote::close(7808);
+        crate::remote::release_held();
+    }
+
+    /// Review round 2 P2-5: a pager left in a pane whose agent status was kept
+    /// gets the drag itself; the agent's old copy is not its reader.
+    #[test]
+    fn ask2_a_pager_under_a_kept_agent_status_gets_the_drag() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7809, "boot-7809", terminal.clone(), "done");
+        set_pane(&session, json!({"program": "claude"}));
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        set_pane(&session, json!({"program": "less"}));
+        tx.send(Chunk::Data(b"\x1b[H\x1b[2Jpager page one\r\npager page two".to_vec())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.screen_text().contains("pager page two") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = sent_data(&sent);
+        crate::remote::scroll_local(7809, 3, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_none(), "the agent's copy took the pager's drag");
+        assert!(sent_data(&sent), "the pager got no wheel input");
+        crate::remote::close(7809);
+        crate::remote::release_held();
+    }
+
+    /// A phone connection to a scripted core, attached on channel 2 to `owner`'s pane.
+    fn scripted(owner: &Arc<Session>) -> (Connection<'_>, UnixStream) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let connection = Connection {
+            socket,
+            decoder: Decoder::default(),
+            owner,
+            serial: 1,
+            channel: 2,
+            width: COLS,
+            output: None,
+            events: 1,
+            event_carry: Vec::new(),
+            dirty: false,
+            negotiated: false,
+            claim: Claim::default(),
+            history_on_resize: false,
+            reattach: None,
+            reattached_at: None,
+            ended: None,
+            automatic_input: true,
+            focus: Focus::default(),
+        };
+        (connection, peer)
+    }
+
+    /// Answers every call on `peer` (terminal.read after `read_delay`), on
+    /// its own thread per call; returns the methods asked.
+    fn scripted_core(peer: UnixStream, read_delay: Duration) -> Arc<Mutex<Vec<String>>> {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let writer = Arc::new(Mutex::new(peer.try_clone().unwrap()));
+        peer.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        std::thread::spawn(move || {
+            let mut peer = peer;
+            let mut decoder = Decoder::default();
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(20) {
+                while let Ok(Some(frame)) = decoder.next() {
+                    if frame.channel != 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                    let method = request["method"].as_str().unwrap_or("").to_owned();
+                    lock(&log).push(method.clone());
+                    let writer = writer.clone();
+                    std::thread::spawn(move || {
+                        let result = match method.as_str() {
+                            "terminal.get" => json!({"cols": COLS, "rows": ROWS}),
+                            "terminal.viewers" => json!({"viewers":[{"identity":{"connection_id":1,"channel":2},"observe":false,"focused":true}]}),
+                            "terminal.read" => {
+                                std::thread::sleep(read_delay);
+                                json!({"how":"stitched","complete":true,"text":"● conversation line 000"})
+                            }
+                            _ => json!({}),
+                        };
+                        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        let _ = write_frame(&mut *lock(&writer), 0, 0, &serde_json::to_vec(&reply).unwrap());
+                    });
+                }
+                let mut bytes = [0; 4096];
+                match peer.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        asked
+    }
+
+    /// Review round 2 P2-6: a read asked for while the phone was quiet is
+    /// not made if the phone is in use by the time it would start.
+    #[test]
+    fn ask2_no_stitched_read_starts_once_the_phone_is_in_use_again() {
+        let _serial = stitch_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7810, "boot-7810", terminal.clone(), "done");
+        tx.send(Chunk::Data(paint(9))).unwrap();
+        shows(&terminal, 9);
+        let (mut connection, peer) = scripted(&session);
+        let asked = scripted_core(peer, Duration::ZERO);
+        // Asked while quiet; the person types before the session gets to it.
+        session.uses.mark();
+        connection.seed("t1").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let asked = lock(&asked).clone();
+        assert!(!asked.iter().any(|m| m == "terminal.read"), "a stitched read started while the phone was in use: {asked:?}");
+    }
+
+    /// Review round 2 P2-6: while a stitched read runs, the session's loop
+    /// is not held: the call returns before the read's reply.
+    #[test]
+    fn ask2_a_stitched_read_never_holds_the_session_loop() {
+        let _serial = stitch_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7811, "boot-7811", terminal.clone(), "done");
+        tx.send(Chunk::Data(paint(9))).unwrap();
+        shows(&terminal, 9);
+        let (mut connection, peer) = scripted(&session);
+        let asked = scripted_core(peer, Duration::from_secs(3));
+        let started = Instant::now();
+        connection.seed("t1").unwrap();
+        let took = started.elapsed();
+        assert!(lock(&asked).iter().any(|m| m == "terminal.read"), "no read was asked: {:?}", lock(&asked));
+        assert!(took < Duration::from_millis(1000), "the loop waited {took:?} for the read");
+    }
+
+    /// Review round 2 P2-7: keys never go to a pane that is not drawn yet
+    /// (the previous pane's frame is still on screen).
+    #[test]
+    fn ask2_keys_never_reach_a_pane_whose_frame_is_not_shown_yet() {
+        let (terminal, _tx, _sent) = full_screen();
+        let session = owner(7812, "boot-7812", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        lock(&session.state).local = Local::attached(session.heard.output_now());
+        let sent = crate::remote::input(7812, "t1", r#"{"type":"text","text":"y"}"#);
+        assert!(sent.is_err(), "keys went to t1 before its frame was shown: {sent:?}");
+        crate::remote::close(7812);
+        crate::remote::release_held();
+    }
+
     /// Review P3-6: the read holds the phone's own keys too.
     #[test]
     fn ask2_claudes_history_is_never_read_while_the_phone_is_in_use() {
@@ -5652,6 +6012,7 @@ mod cache_tests {
 
     #[test]
     fn ask2_one_stitch_at_a_time_from_this_phone() {
+        let _serial = stitch_test_lock();
         let first = Stitching::take().expect("free");
         assert!(Stitching::take().is_none());
         drop(first);

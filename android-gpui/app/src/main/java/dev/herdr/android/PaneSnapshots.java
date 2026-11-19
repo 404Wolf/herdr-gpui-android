@@ -195,6 +195,10 @@ final class PaneSnapshots {
         });
     }
 
+    /** Each saved computer's connection revision (round 2 tests: not used yet). */
+    void revisions(java.util.Map<String, String> byHost) {
+    }
+
     /** {@code (host, pane)} pairs kept last when the cache is over its bounds. */
     void pin(List<String[]> panes) {
         Set<String> names = new HashSet<>();
