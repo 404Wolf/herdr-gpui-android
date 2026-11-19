@@ -1,0 +1,27 @@
+=== 19:04:32 1 live: tap pane-a link
+top: org.chromium.webview_shell/.WebViewBrowserActivity
+=== 19:04:38 2 back from the browser, tap the same link 0.8 s later
+top: org.chromium.webview_shell/.WebViewBrowserActivity
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:04:55 3 offline: wifi and data off
+179,233	''	'Connect to links scratch (t2gn), 1 workspaces, offline'
+144,232	'offline · 0'	''
+720,188	'cached 7:04 PM · offline'	'cached 7:04 PM · offline'
+=== 19:05:18 3 offline cached pane: tap pane-a link
+top: org.chromium.webview_shell/.WebViewBrowserActivity
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:05:36 4.1 offline: pick links-b and at once tap where pane-a's link is (old frame)
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:05:40 4.1 offline: pick links-a and at once tap where pane-b's link is (old frame)
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:05:45 4.2 offline: pick links-b and at once tap where pane-a's link is (old frame)
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:05:49 4.2 offline: pick links-a and at once tap where pane-b's link is (old frame)
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:05:53 4.3 offline: pick links-b and at once tap where pane-a's link is (old frame)
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:05:57 4.3 offline: pick links-a and at once tap where pane-b's link is (old frame)
+top: dev.wolf.herdrgpui/dev.herdr.android.GpuiTerminalActivity
+=== 19:06:02 end
+=== 19:06:16 5 control: offline, pick links-b, wait for its frame, then tap its link
+top: org.chromium.webview_shell/.WebViewBrowserActivity

@@ -1,0 +1,20 @@
+11-18 19:04:32.830 I/herdr-reshoot( 2963): 1 live: tap pane-a link
+11-18 19:04:33.169 I/ActivityTaskManager(  531): START u0 {act=android.intent.action.VIEW dat=https://example.com/... flg=0x10000000 cmp=org.chromium.webview_shell/.WebViewBrowserActivity} with LAUNCH
+11-18 19:04:33.171 D/herdr-tap( 2780): report id=1 stamp=3 shown=3 outcome=PLAIN
+11-18 19:04:38.945 I/herdr-reshoot( 3308): 2 back from the browser, tap the same link 0.8 s later
+11-18 19:04:39.974 I/ActivityTaskManager(  531): START u0 {act=android.intent.action.VIEW dat=https://example.com/... flg=0x10000000 cmp=org.chromium.webview_shell/.WebViewBrowserActivity} with LAUNCH
+11-18 19:04:40.003 D/herdr-tap( 2780): report id=2 stamp=4 shown=4 outcome=PLAIN
+11-18 19:04:55.687 I/herdr-reshoot( 3668): 3 offline: wifi and data off
+11-18 19:05:18.446 I/herdr-reshoot( 4000): 3 offline cached pane: tap pane-a link
+11-18 19:05:18.486 I/ActivityTaskManager(  531): START u0 {act=android.intent.action.VIEW dat=https://example.com/... flg=0x10000000 cmp=org.chromium.webview_shell/.WebViewBrowserActivity} with LAUNCH
+11-18 19:05:18.487 D/herdr-tap( 2780): report id=3 stamp=6 shown=6 outcome=PLAIN
+11-18 19:05:36.376 D/herdr-tap( 2780): report id=4 stamp=7 shown=8 outcome=PLAIN dropped
+11-18 19:05:40.875 D/herdr-tap( 2780): report id=5 stamp=8 shown=9 outcome=PLAIN dropped
+11-18 19:05:45.308 D/herdr-tap( 2780): report id=6 stamp=10 shown=10 outcome=PLAIN
+11-18 19:05:49.533 D/herdr-tap( 2780): report id=7 stamp=10 shown=11 outcome=PLAIN dropped
+11-18 19:05:53.701 D/herdr-tap( 2780): report id=8 stamp=12 shown=12 outcome=PLAIN
+11-18 19:05:57.895 D/herdr-tap( 2780): report id=9 stamp=13 shown=13 outcome=PLAIN
+11-18 19:06:01.973 I/herdr-reshoot( 4732): end
+11-18 19:06:16.909 I/herdr-reshoot( 4795): 5 control: offline, pick links-b, wait for its frame, then tap its link
+11-18 19:06:22.297 I/ActivityTaskManager(  531): START u0 {act=android.intent.action.VIEW dat=https://example.com/... flg=0x10000000 cmp=org.chromium.webview_shell/.WebViewBrowserActivity} with LAUNCH
+11-18 19:06:22.300 D/herdr-tap( 2780): report id=10 stamp=14 shown=14 outcome=PLAIN
