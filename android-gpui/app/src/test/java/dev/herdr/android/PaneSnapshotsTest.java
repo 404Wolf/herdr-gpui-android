@@ -103,6 +103,41 @@ public final class PaneSnapshotsTest {
         assertTrue(shown.get(0) > 0);
     }
 
+    /**
+     * Review round 3 P1-1: a save queued from connection A, its profile then
+     * edited to computer B before the disk thread runs, is A's copy: B never
+     * opens it. Nor does a failed read of the profiles fall back to the bare
+     * profile id.
+     */
+    @Test public void ask2ASaveQueuedBeforeAnEditStaysTheOldComputersCopy() throws Exception {
+        File folder = dir.newFolder("panes");
+        SecretKey key = CacheSeal.newKey();
+        FakeNative natives = new FakeNative();
+        natives.copies.put("t1", TRANSCRIPT);
+        java.util.ArrayDeque<Runnable> queued = new java.util.ArrayDeque<>();
+        CacheSeal seal = new CacheSeal(key);
+        PaneSnapshots snapshots = new PaneSnapshots(folder, queued::add, () -> seal, natives);
+        java.util.Map<String, String> revisions = new java.util.HashMap<>();
+        revisions.put("profile", "revision-a");
+        snapshots.revisions(revisions);
+        // Connection A's pane is saved; the disk thread has not run it yet.
+        snapshots.save("profile", "t1", 7);
+        // The profile is edited to computer B (same id, a new revision).
+        revisions.put("profile", "revision-b");
+        snapshots.revisions(revisions);
+        while (!queued.isEmpty()) queued.poll().run();
+        List<Long> shown = new ArrayList<>();
+        snapshots.open("profile", "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        while (!queued.isEmpty()) queued.poll().run();
+        assertEquals("computer A's copy opened as computer B's", Collections.singletonList(-1L), shown);
+        // With no revision known (the profiles could not be read), nothing is saved.
+        snapshots.revisions(Collections.emptyMap());
+        snapshots.save("profile", "t2", 7);
+        natives.copies.put("t2", TRANSCRIPT);
+        while (!queued.isEmpty()) queued.poll().run();
+        assertFalse("a copy was saved under the bare profile id", new File(folder, PaneSnapshots.name("profile", "t2")).exists());
+    }
+
     /** Review P2-6: opening a copy must not change the time it says it was saved. */
     @Test public void ask2AnOfflineCopyKeepsItsSaveTimeOverEveryOpen() throws Exception {
         File folder = dir.newFolder("panes");

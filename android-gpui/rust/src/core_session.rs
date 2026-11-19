@@ -6020,17 +6020,236 @@ mod cache_tests {
         }
     }
 
-    /// Review round 2 P2-7: keys never go to a pane that is not drawn yet
-    /// (the previous pane's frame is still on screen).
+    /// Round 3 (c): keys reach the pane as soon as its attach is ready, as on
+    /// phone-feedback: nothing typed during a switch is refused or lost.
     #[test]
-    fn ask2_keys_never_reach_a_pane_whose_frame_is_not_shown_yet() {
+    fn ask2_keys_reach_a_pane_as_soon_as_it_is_ready() {
         let (terminal, _tx, _sent) = full_screen();
         let session = owner(7812, "boot-7812", terminal, "done");
         crate::remote::register_for_test(session.clone());
         lock(&session.state).local = Local::attached(session.heard.output_now());
         let sent = crate::remote::input(7812, "t1", r#"{"type":"text","text":"y"}"#);
-        assert!(sent.is_err(), "keys went to t1 before its frame was shown: {sent:?}");
+        assert!(sent.is_ok(), "keys typed during a switch were refused: {sent:?}");
         crate::remote::close(7812);
+        crate::remote::release_held();
+    }
+
+    /// Round 3 P1-2: a terminal the core respawned (kept recovery: same id,
+    /// same created_ms, a new PTY) is another terminal: what the phone watched
+    /// of the old PTY never joins it, nor is the old copy its reader.
+    #[test]
+    fn ask2_a_respawned_terminal_never_gets_the_old_ptys_history() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let old = owner(7821, "boot-K", terminal, "done");
+        set_pane(&old, json!({"created_ms": 100, "pid": 11, "program": "claude"}));
+        crate::remote::register_for_test(old.clone());
+        stream(&old, &tx, 9, 60);
+        crate::remote::scroll_local(7821, 12, paint_args(0)).unwrap();
+        crate::remote::close(7821);
+        let (live, tx2, sent2) = full_screen();
+        let new = owner(7822, "boot-K", live.clone(), "done");
+        set_pane(&new, json!({"created_ms": 100, "pid": 22, "program": "claude"}));
+        lock(&new.state).local = Local::attached(new.heard.output_now());
+        tx2.send(Chunk::Data(other_paint(40))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !live.screen_text().contains("another talk 040") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        settle_now(&new);
+        assert!(lock(&new.state).local.reader_for_test().is_none(), "the old PTY's copy is drawn as the new one");
+        crate::remote::register_for_test(new.clone());
+        let _ = sent_data(&sent2);
+        crate::remote::scroll_local(7822, 3, paint_args(0)).unwrap();
+        if let Some((_, reader)) = lock(&new.state).local.reader_for_test() {
+            let rows = text_rows(&reader);
+            assert!(!rows.iter().any(|r| r.contains("conversation line")), "the old PTY's rows joined: {rows:?}");
+        }
+        crate::remote::close(7822);
+        crate::remote::release_held();
+    }
+
+    /// Round 3 P2-1: the poll's own work (looking at the screen) never waits
+    /// while a first drag encodes the phone's copy.
+    #[test]
+    fn ask2_the_poll_never_waits_for_the_first_drags_copy() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7823, "boot-7823", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        tx.send(Chunk::Data(paint(9))).unwrap();
+        shows(&terminal, 9);
+        // A full 1 MiB of short rows: the most rows a copy can hold.
+        let rows: Vec<crate::transcript::Row> = (0..250_000).map(|n| crate::transcript::Row::plain(&format!("{}", n % 10))).collect();
+        crate::remote::adopt_for_test("boot-7823", "t1", crate::transcript::Transcript::restored(rows, 0, COLS.into(), false));
+        let drag = std::thread::spawn(|| crate::remote::scroll_local(7823, 3, paint_args(0)).map(|_| ()));
+        let mut worst = Duration::ZERO;
+        let until = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < until {
+            let asked = Instant::now();
+            session.heard.printed(1);
+            crate::remote::keep_local(&session, &mut lock(&session.state));
+            worst = worst.max(asked.elapsed());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drag.join().unwrap().unwrap();
+        assert!(worst < Duration::from_millis(15), "the poll waited {worst:?} for the copy to be encoded");
+        crate::remote::close(7823);
+        crate::remote::release_held();
+    }
+
+    /// Round 3 (b): the phone never asks the core for a stitched read of an
+    /// agent's view (it freezes the pane on every screen; deferred to the
+    /// core-assisted v2): a whole session against a core, the agent quiet
+    /// and done, the phone left alone, the poll running.
+    #[test]
+    fn ask2_no_stitched_read_is_ever_asked() {
+        let (phone, mut core) = UnixStream::pair().unwrap();
+        core.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let (commands, rx) = mpsc::sync_channel(256);
+        let session = Arc::new(Session {
+            id: 7824,
+            state: Mutex::new(State {
+                view: json!({"state":"connecting","pane_id":"","boot_id":"","panes":[],"revision":1}),
+                terminal: None,
+                render_id: 0,
+                local: Default::default(),
+            }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(Some(("t1".into(), Instant::now()))),
+            heard: crate::remote::Heard::default(),
+            visible: AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+            seed: Mutex::new(None),
+        });
+        let worker = session.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, COLS, ROWS, true, rx));
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let peer = std::thread::spawn(move || {
+            let mut hello = String::new();
+            read_hello(&core, &mut hello);
+            core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"boot-7824\"},\"framed\":true}}\n").unwrap();
+            let mut decoder = Decoder::default();
+            // When the pane attached; it is painted (again) every half second
+            // for a while, so the paint lands once the phone has the channel.
+            let mut attached: Option<Instant> = None;
+            let mut painted = 0;
+            while !done.load(Ordering::Relaxed) {
+                if let Some(at) = attached
+                    && painted < 6
+                    && at.elapsed() >= Duration::from_millis(250 + 500 * painted)
+                {
+                    painted += 1;
+                    let mut bytes = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h".to_vec();
+                    bytes.extend(paint(9));
+                    write_frame(&mut core, 2, 0, &bytes).unwrap();
+                }
+                while let Ok(Some(frame)) = decoder.next() {
+                    if frame.channel != 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                    let method = request["method"].as_str().unwrap_or("").to_owned();
+                    lock(&log).push(method.clone());
+                    let result = match method.as_str() {
+                        "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                        "terminal.list" => json!({"terminals":[{"address":"t1","state":"live","cwd":"/tmp",
+                            "labels":{"agent.kind":"claude"},"status":{"state":"done"},"status_ms":5,"turn":3,
+                            "created_ms":100,"pid":4242,"foreground":{"name":"claude"}}]}),
+                        "doc.get" => json!({"value":null,"version":0}),
+                        "terminal.attach" => json!({"channel":2}),
+                        "terminal.get" => json!({"cols":COLS,"rows":ROWS}),
+                        "terminal.viewers" => json!({"viewers":[{"identity":{"connection_id":1,"channel":2},"observe":false,"focused":true}]}),
+                        "terminal.read" => json!({"how":"stitched","complete":true,"text":"● conversation line 000"}),
+                        _ => json!({}),
+                    };
+                    write_frame(&mut core, 0, 0, &serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap()).unwrap();
+                    if method == "terminal.attach" && attached.is_none() {
+                        attached = Some(Instant::now());
+                    }
+                }
+                let mut bytes = [0; 4096];
+                match core.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        // The phone's poll, for a while: the pane settles, its screen is kept,
+        // and the phone stays untouched well past any quiet period.
+        let until = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < until {
+            {
+                let mut state = lock(&session.state);
+                if crate::remote::settle(&session, &mut state) {
+                    crate::remote::keep_local(&session, &mut state);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let asked = lock(&asked).clone();
+        assert!(asked.iter().any(|m| m == "terminal.attach"), "the pane never attached: {asked:?}");
+        assert!(lock(&session.state).terminal.as_ref().is_some_and(|t| t.screen_text().contains(&line(9))), "the pane was never painted");
+        assert!(!asked.iter().any(|m| m == "terminal.read"), "the phone asked for a stitched read: {asked:?}");
+        session.cancel.cancel();
+        stop.store(true, Ordering::Relaxed);
+        let _ = runtime.join();
+        let _ = peer.join();
+    }
+
+    /// Round 3 (a): a saved copy is for reading offline only; it never joins
+    /// the history of a live pane, even one that looks the same.
+    #[test]
+    fn ask2_a_saved_copy_is_never_joined_to_live_history() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let first = owner(7825, "boot-7825", terminal, "done");
+        crate::remote::register_for_test(first.clone());
+        stream(&first, &tx, 9, 60);
+        let copy = crate::remote::copy_pane(7825, "t1").unwrap().unwrap();
+        crate::remote::close(7825);
+        crate::remote::release_held();
+        // A new run of the app: nothing watched yet; the copy is read from disk.
+        crate::remote::forget_transcripts_for_test("boot-7825");
+        let _ = crate::remote::open_saved(copy).unwrap();
+        let (live, tx2, _sent2) = full_screen();
+        let second = owner(7826, "boot-7825", live.clone(), "done");
+        crate::remote::register_for_test(second.clone());
+        tx2.send(Chunk::Data(paint(62))).unwrap();
+        shows(&live, 62);
+        crate::remote::scroll_local(7826, 3, paint_args(0)).unwrap();
+        if let Some((_, reader)) = lock(&second.state).local.reader_for_test() {
+            let rows = text_rows(&reader);
+            assert!(!rows.contains(&line(10)), "the saved copy joined live history: {rows:?}");
+        }
+        crate::remote::close(7826);
+        crate::remote::release_held();
+    }
+
+    /// Round 3: a drag past the top of the phone's copy hands back to the
+    /// agent's own scrolling (wheel input), never a dead end.
+    #[test]
+    fn ask2_a_drag_past_the_top_of_the_copy_hands_back_to_claudes_own_scrolling() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7827, "boot-7827", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = sent_data(&sent);
+        // To the top of what the phone holds.
+        crate::remote::scroll_local(7827, 1000, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_some());
+        assert!(!sent_data(&sent), "a drag inside the copy went to the program");
+        // Further back: the agent scrolls its own view.
+        crate::remote::scroll_local(7827, 3, paint_args(0)).unwrap();
+        assert!(sent_data(&sent), "a drag past the top of the copy went nowhere");
+        assert!(lock(&session.state).local.reader_for_test().is_none(), "the copy stayed over the agent's own view");
+        crate::remote::close(7827);
         crate::remote::release_held();
     }
 

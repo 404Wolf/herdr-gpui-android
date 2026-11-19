@@ -498,6 +498,23 @@ mod tests {
         assert!(saved_rows(&copy(&session.grid().lock(), "t1", "boot", None).unwrap()).iter().any(|r| r.text.contains("see release notes here")));
     }
 
+    /// Round 3 P3: a link target as long as a live one may be (#39: 4 KiB)
+    /// is kept whole in a copy, never cut.
+    #[test]
+    fn ask2_a_long_link_target_is_kept_whole_in_the_copy() {
+        let target = format!("https://example.test/{}", "a".repeat(2500));
+        let text = format!("\x1b]8;;{target}\x1b\\notes\x1b]8;;\x1b\\\r\n$ ");
+        let session = parsed(text.as_bytes(), 40, 5);
+        let bytes = copy(&session.grid().lock(), "t1", "boot", None).unwrap();
+        let back = restore(parse(bytes).unwrap()).unwrap();
+        wait_quiet(&back);
+        let grid = back.grid().lock();
+        let link = (0..grid.screen_lines() as i32)
+            .flat_map(|l| (0..grid.columns()).map(move |c| (l, c)))
+            .find_map(|(l, c)| grid.cell_hyperlink(Line(l), Column(c)));
+        assert_eq!(link.map(|l| l.uri().len()), Some(target.len()), "the link's target was cut");
+    }
+
     /// Review mutant M5: only a full-screen grid's copy is its transcript.
     #[test]
     fn ask2_a_plain_pane_is_saved_from_its_grid_never_from_a_transcript() {

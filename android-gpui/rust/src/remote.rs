@@ -1450,6 +1450,11 @@ pub fn discover(id: u64) -> Result<String> {
 pub(crate) fn register_for_test(owner: Arc<Session>) {
     lock(sessions()).insert(owner.id, owner);
 }
+/// A new run of the app, for one core's panes: nothing watched of them.
+#[cfg(test)]
+pub(crate) fn forget_transcripts_for_test(boot: &str) {
+    lock(transcripts()).retain(|kept| kept.ident.boot != boot);
+}
 #[cfg(test)]
 pub(crate) fn adopt_for_test(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
     adopt(&Ident { boot: boot.into(), pane: pane.into(), ..Ident::default() }, transcript);
