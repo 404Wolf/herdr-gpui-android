@@ -632,7 +632,7 @@ pub fn poll_terminal(
     since: u64,
     _chrome: u64,
     generation: i64,
-    _name: &str,
+    host: &str,
     _shortcuts: &str,
 ) -> Result<String> {
     if generation <= 0 || model::mailbox().state().generation != generation {
@@ -644,8 +644,12 @@ pub fn poll_terminal(
         let mut mailbox = model::mailbox();
         // Before its pane attaches, a session draws nothing: a held frame (the
         // last one, or a saved pane) stays until there is something live.
+        // The renderer is recorded with the host and pane it was attached
+        // for, under the same lock that installs it.
         if state.render_id != 0 || !mailbox.state().held {
-            mailbox.set_shell(generation, state.render_id);
+            let pane = state.view["pane_id"].as_str().unwrap_or("");
+            let target = model::FrameTarget::new(host, pane);
+            mailbox.set_shell(generation, state.render_id, Some(target));
         }
     }
     // How far the local history is scrolled back, for a "jump to latest" control.

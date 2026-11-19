@@ -37,7 +37,7 @@ final class RemoteNative {
     static native void used();
     /** Paints the native body and returns metadata only; zero tokens refresh frame/navigation. */
     static native String pollTerminal(long handle, long sinceRevision, long sinceChromeRevision,
-            long generation, String hostName, String shortcuts);
+            long generation, String hostId, String shortcuts);
     static native String input(long handle, String paneId, String commandJson);
     static native String focus(long handle, String paneId);
     static native String focusTab(long handle, String tabId);

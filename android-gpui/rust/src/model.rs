@@ -1173,6 +1173,28 @@ pub struct Mailbox {
     shell: u64,
     /// The last frame is held, in full colour, while the connection is re-established.
     held: bool,
+    /// The host and pane `shell` was attached for, recorded with it.
+    frame_target: Option<FrameTarget>,
+}
+
+/// The host and pane a renderer was attached for. It is recorded with the
+/// renderer, at the one place each kind is installed (a live session's poll,
+/// a raw shell, a saved pane), and every link found on that renderer carries
+/// it: Java opens or copies a link only while it is the selected host and
+/// pane, however long the link took to get there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameTarget {
+    pub host: Arc<str>,
+    pub pane: Arc<str>,
+}
+
+impl FrameTarget {
+    pub fn new(host: &str, pane: &str) -> Self {
+        Self {
+            host: host.into(),
+            pane: pane.into(),
+        }
+    }
 }
 
 /// Horizontal pan requested by a wheel or drag delta, if the gesture is
@@ -1206,6 +1228,20 @@ pub struct ViewState {
     pub shell: u64,
     /// A reconnect is holding the last frame on screen; input is closed.
     pub held: bool,
+    /// The host and pane `shell` was attached for.
+    pub frame_target: Option<FrameTarget>,
+}
+
+impl ViewState {
+    /// Whether a link drawn on the frame shown for `generation` may be opened
+    /// in the browser or copied: live, or held (a reconnect, which follows
+    /// every return to the app, and an offline or cached pane keep the last
+    /// frame on screen). Neither needs the core, only the frame Wolf sees.
+    /// Java opens a link only while the frame it was found on (its
+    /// `FrameTarget`) is the host and pane now selected.
+    pub fn opens_links(&self, generation: i64) -> bool {
+        generation > 0 && generation == self.generation && (self.active || self.held)
+    }
 }
 
 impl Default for Mailbox {
@@ -1226,6 +1262,7 @@ impl Default for Mailbox {
             follow: true,
             shell: 0,
             held: false,
+            frame_target: None,
         }
     }
 }
@@ -1247,6 +1284,7 @@ impl Mailbox {
             self.pan = 0.;
             self.shell_pan = ShellPan::default();
             self.shell = 0;
+            self.frame_target = None;
         }
         if !active {
             self.commands.clear();
@@ -1329,11 +1367,14 @@ impl Mailbox {
     }
 
     /// Draws `shell` (0 for none) for the current generation only.
-    pub fn set_shell(&mut self, generation: i64, shell: u64) -> bool {
+    /// Draws renderer `shell` (0: none) for `generation`, attached for
+    /// `target`'s host and pane.
+    pub fn set_shell(&mut self, generation: i64, shell: u64, target: Option<FrameTarget>) -> bool {
         if generation <= 0 || generation != self.generation || shell == self.shell {
             return false;
         }
         self.shell = shell;
+        self.frame_target = if shell == 0 { None } else { target };
         // Steps meant for the view of another pane never move the new one.
         self.shell_pan = ShellPan::default();
         self.revision = self.revision.wrapping_add(1);
@@ -1478,6 +1519,7 @@ impl Mailbox {
             follow: self.follow,
             shell: self.shell,
             held: self.held,
+            frame_target: self.frame_target.clone(),
         }
     }
 
@@ -1933,10 +1975,58 @@ mod tests {
     }
 
     #[test]
+    fn wolf_ask_links_a_held_or_offline_frame_still_opens_its_links() {
+        // On the emulator, a link tapped on the frame held while the app
+        // reconnected (after every return from the browser) or on an offline
+        // pane ("cached 10:42 · offline") was found, then dropped: opening
+        // asked for a live session. Which host and pane a held frame shows
+        // is Java's to check (LinkFrame); here, only the generation.
+        let mut box_ = Mailbox::default();
+        assert!(!box_.state().opens_links(0), "nothing shown");
+        box_.set_active(10, true);
+        box_.set_shell(10, 7, None);
+        assert!(box_.state().opens_links(10));
+        assert!(box_.hold(10));
+        assert!(box_.state().opens_links(10), "reconnecting");
+        assert!(box_.hold(11));
+        assert!(box_.state().opens_links(11), "the next session's frame");
+        assert!(!box_.state().opens_links(10), "a replaced frame");
+        box_.set_active(12, false);
+        assert!(!box_.state().opens_links(12), "a pane put away");
+    }
+
+    #[test]
+    fn wolf_ask_links_a_renderer_carries_the_host_and_pane_it_was_installed_for() {
+        // Review of #39 (round 3): the frame's identity is recorded with the
+        // renderer, in the same call, wherever one is installed.
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        assert!(box_.set_shell(10, 9001, Some(FrameTarget::new("A", "p1"))));
+        // A link found now takes A/p1 with it (ui captures it at attach).
+        let found_on = box_.state().frame_target;
+        assert_eq!(found_on, Some(FrameTarget::new("A", "p1")));
+        // The saved p2 frame replaces it: the queued link still says A/p1.
+        assert!(box_.hold(10));
+        assert!(box_.set_shell(10, 9002, Some(FrameTarget::new("A", "p2"))));
+        assert_eq!(found_on, Some(FrameTarget::new("A", "p1")));
+        assert_eq!(box_.state().frame_target, Some(FrameTarget::new("A", "p2")));
+        // A poll that installs p2's renderer and then fails leaves p2's
+        // identity with p2's renderer, never p1's.
+        assert!(!box_.hold(10), "already held");
+        assert_eq!(box_.state().frame_target, Some(FrameTarget::new("A", "p2")));
+        // No renderer, no identity; a new generation blanks both.
+        assert!(box_.set_shell(10, 0, Some(FrameTarget::new("A", "p3"))));
+        assert_eq!(box_.state().frame_target, None);
+        assert!(box_.set_shell(10, 9003, Some(FrameTarget::new("A", "p3"))));
+        box_.set_active(11, false);
+        assert_eq!((box_.state().shell, box_.state().frame_target), (0, None));
+    }
+
+    #[test]
     fn a_held_frame_survives_a_reconnect_until_input_reopens() {
         let mut box_ = Mailbox::default();
         box_.set_active(10, true);
-        box_.set_shell(10, 7);
+        box_.set_shell(10, 7, None);
         box_.set_ime_session(10, 3);
         box_.enqueue(10, Command::Text { text: "a".into() }).unwrap();
         // The link drops: input closes, the screen stays.
@@ -1952,7 +2042,7 @@ mod tests {
         assert_eq!(box_.state().generation, 11);
         assert_eq!(box_.state().shell, 7);
         assert!(!box_.hold(10), "an old generation cannot hold again");
-        assert!(box_.set_shell(11, 8));
+        assert!(box_.set_shell(11, 8, None));
         assert!(box_.set_ime_session(11, 3));
         assert!(box_.set_active(11, true));
         let live = box_.state();
@@ -1965,10 +2055,10 @@ mod tests {
         let mut box_ = Mailbox::default();
         box_.set_active(10, true);
         // A delayed attach from a replaced terminal is ignored.
-        assert!(!box_.set_shell(9, 7));
-        assert!(box_.set_shell(10, 7));
+        assert!(!box_.set_shell(9, 7, None));
+        assert!(box_.set_shell(10, 7, None));
         assert!(
-            !box_.set_shell(10, 7),
+            !box_.set_shell(10, 7, None),
             "unchanged attach does not wake the view"
         );
         let attached = box_.state();
@@ -2096,7 +2186,7 @@ mod tests {
     fn pan_steps_queue_for_a_drawn_core_pane_and_never_carry_to_another() {
         let mut box_ = Mailbox::default();
         box_.set_active(10, true);
-        assert!(box_.set_shell(10, 7));
+        assert!(box_.set_shell(10, 7, None));
         // The snapshot has no rows to bound it; the terminal view clamps.
         let revision = box_.state().revision;
         assert!(box_.pan(96.));
@@ -2112,7 +2202,7 @@ mod tests {
         box_.reset_pan();
         assert_eq!(box_.take_shell_pan(10, 7), 0.);
         box_.pan(96.);
-        assert!(box_.set_shell(10, 8));
+        assert!(box_.set_shell(10, 8, None));
         assert_eq!(box_.take_shell_pan(10, 8), 0.);
         box_.pan(96.);
         assert!(box_.set_active(11, true));
@@ -2127,12 +2217,12 @@ mod tests {
     fn pan_steps_reach_only_the_view_of_the_pane_they_were_queued_for() {
         let mut box_ = Mailbox::default();
         box_.set_active(10, true);
-        box_.set_shell(10, 7);
+        box_.set_shell(10, 7, None);
         box_.pan(96.);
         // The view still draws pane 7 when it takes them, but read its state
         // before a switch to pane 8: it asks for 8, and 7's steps are dropped.
         let stale = box_.state();
-        assert!(box_.set_shell(10, 8));
+        assert!(box_.set_shell(10, 8, None));
         box_.shell_pan = ShellPan {
             target: (10, 7),
             delta: 96.,
@@ -2147,7 +2237,7 @@ mod tests {
         assert_eq!(box_.take_shell_pan(10, 8), 96.);
         // Nor does an older generation's view take a newer session's steps.
         assert!(box_.set_active(11, true));
-        assert!(box_.set_shell(11, 8));
+        assert!(box_.set_shell(11, 8, None));
         box_.pan(24.);
         assert_eq!(box_.take_shell_pan(10, 8), 0.);
     }

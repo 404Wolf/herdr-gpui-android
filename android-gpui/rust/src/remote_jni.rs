@@ -220,10 +220,10 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_pollTerminal(
     since: jlong,
     since_chrome: jlong,
     generation: jlong,
-    host_name: JString<'_>,
+    host_id: JString<'_>,
     shortcuts: JString<'_>,
 ) -> jstring {
-    let Some(host_name) = read(&mut env, &host_name, 1024) else {
+    let Some(host_id) = read(&mut env, &host_id, 1024) else {
         return std::ptr::null_mut();
     };
     let Some(shortcuts) = read(&mut env, &shortcuts, crate::model::MAX_SHORTCUT_JSON) else {
@@ -236,7 +236,7 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_pollTerminal(
             since as u64,
             since_chrome as u64,
             generation,
-            &host_name,
+            &host_id,
             &shortcuts,
         ),
     )

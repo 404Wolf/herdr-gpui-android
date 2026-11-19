@@ -84,7 +84,7 @@ impl TerminalView {
         // The window can open after a shell was attached, with no later change
         // to wake the view: show what the mailbox already names.
         #[cfg(unix)]
-        view.attach_shell(view.state.shell, cx);
+        view.attach_shell(view.state.shell, view.state.frame_target.clone(), cx);
         view
     }
 
@@ -94,7 +94,7 @@ impl TerminalView {
             return false;
         }
         #[cfg(unix)]
-        self.attach_shell(state.shell, cx);
+        self.attach_shell(state.shell, state.frame_target.clone(), cx);
         #[cfg(unix)]
         self.pan_shell(state.generation, cx);
         #[cfg(not(unix))]
@@ -133,7 +133,12 @@ impl TerminalView {
     /// Shows the shell `handle` names, or Herdr's pane again for 0. Input
     /// stays with this view: Java's IME bridge commits it through the mailbox.
     #[cfg(unix)]
-    fn attach_shell(&mut self, handle: u64, cx: &mut Context<Self>) {
+    fn attach_shell(
+        &mut self,
+        handle: u64,
+        target: Option<model::FrameTarget>,
+        cx: &mut Context<Self>,
+    ) {
         if self.shell.as_ref().map_or(0, |(current, _)| *current) == handle {
             return;
         }
@@ -173,15 +178,32 @@ impl TerminalView {
                     // replaced mid-tap is never this view's to click.
                     #[cfg(target_os = "android")]
                     terminal.set_touch_presses(true);
+                    // Every link found here carries the host and pane this
+                    // renderer was attached for, fixed now: Java opens it
+                    // only while that is still the selected pane.
                     #[cfg(target_os = "android")]
-                    terminal.set_link_handler(|link| {
+                    let target = target.clone();
+                    #[cfg(not(target_os = "android"))]
+                    let _ = &target;
+                    #[cfg(target_os = "android")]
+                    terminal.set_link_handler(move |link, action| {
+                        use gpui_rio::links::{Link, LinkAction};
+                        let Some(target) = target.as_ref() else {
+                            return;
+                        };
                         let generation = model::mailbox().state().generation;
-                        match link {
-                            gpui_rio::links::Link::Web(url) => {
-                                crate::android::open_link(generation, &url);
+                        match (link, action) {
+                            (Link::Web(url), LinkAction::Open) => {
+                                crate::android::open_link(generation, &url, Some(target));
                             }
-                            gpui_rio::links::Link::File { path, line } => {
+                            (Link::File { path, line }, LinkAction::Open) => {
                                 crate::android::open_file(generation, &path, line);
+                            }
+                            (Link::Web(url), LinkAction::Copy) => {
+                                crate::android::copy_link(generation, &url, target);
+                            }
+                            (Link::File { path, .. }, LinkAction::Copy) => {
+                                crate::android::copy_link(generation, &path, target);
                             }
                         }
                     });
@@ -499,8 +521,9 @@ impl GridRow {
                 let Some(url) = url else {
                     return;
                 };
+                // Herdr's own pane rows: only a live session draws them.
                 #[cfg(target_os = "android")]
-                crate::android::open_link(generation, &url);
+                crate::android::open_link(generation, &url, None);
                 #[cfg(not(target_os = "android"))]
                 {
                     let state = model::mailbox().state();
