@@ -5393,7 +5393,16 @@ mod cache_tests {
         stream(&session, &tx, 9, 80);
         // The link drops: the held frame is the phone's transcript, not one screen.
         crate::remote::close(7702);
-        let (_, held) = crate::remote::held_for_test().unwrap();
+        // The transcript copy replaces the live frame once it is built (off the UI thread).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let held = loop {
+            let (_, held) = crate::remote::held_for_test().unwrap();
+            if held.grid().lock().history_size() >= 70 {
+                break held;
+            }
+            assert!(Instant::now() < deadline, "the held frame never became the transcript copy");
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let top = serde_json::from_str::<Value>(&crate::remote::scroll_held(1000, false)).unwrap()["local_offset"].as_u64().unwrap();
         assert_eq!(top as usize, held.grid().lock().history_size());
         assert!(top >= 70, "scrolled back {top} rows");
@@ -5549,6 +5558,21 @@ mod cache_tests {
         assert!(!may_stitch(&json!({"viewers":[phone.clone(), viewer(4, false, None, Some(5))]}), 4));
         // Nothing readable: no stitch.
         assert!(!may_stitch(&json!({}), 4));
+        // A watcher that only observes on this channel is never taken for the
+        // phone's own viewer (review mutant M2).
+        let mut watcher = viewer(4, false, None, None);
+        watcher["observe"] = json!(true);
+        assert!(may_stitch(&json!({"viewers":[watcher, phone.clone()]}), 4));
+    }
+
+    /// Review P3-6: the read holds the phone's own keys too.
+    #[test]
+    fn ask2_claudes_history_is_never_read_while_the_phone_is_in_use() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7795, "boot-7795", terminal, "done");
+        session.uses.mark();
+        stream(&session, &tx, 9, 12);
+        assert!(lock(&session.seed).is_none(), "asked while the phone was in use");
     }
 
     /// Review P1-1: pane ids repeat across computers (every core has a t1).

@@ -112,6 +112,37 @@ public final class HomeCacheTest {
         assertFalse(HomeCache.listed(null));
     }
 
+    /** Review P3-5: Home's write keeps what the terminal listed for a computer Home has no view of. */
+    @Test public void ask2HomesWriteKeepsTheTerminalsListOfAnotherComputer() throws Exception {
+        File dir = Files.createTempDirectory("fleet-cache").toFile();
+        File sealed = new File(dir, HomeCache.SEALED_NAME);
+        CacheSeal seal = new CacheSeal(CacheSeal.newKey());
+        HomeCache.merge(sealed, seal, "laptop", new HomeCache.Entry(poll(), "", false));
+        Map<String, HomeCache.Entry> home = new LinkedHashMap<>();
+        home.put("server", new HomeCache.Entry(poll(), "E\n", false));
+        HomeCache.mergeAll(sealed, seal, home, new java.util.HashSet<>(java.util.Arrays.asList("server", "laptop")));
+        Map<String, HomeCache.Entry> back = HomeCache.readSealed(sealed, null, seal);
+        assertEquals(2, back.size());
+        assertEquals("E\n", back.get("server").git);
+        // A computer no longer saved goes.
+        HomeCache.mergeAll(sealed, seal, home, new java.util.HashSet<>(java.util.Collections.singletonList("server")));
+        assertEquals(java.util.Collections.singleton("server"), HomeCache.readSealed(sealed, null, seal).keySet());
+    }
+
+    /** Review mutant J3: a plain file left over never replaces a newer sealed cache. */
+    @Test public void ask2ALeftoverPlainFleetFileNeverReplacesTheSealedOne() throws Exception {
+        File dir = Files.createTempDirectory("fleet-cache").toFile();
+        File legacy = new File(dir, HomeCache.FILE_NAME);
+        File sealed = new File(dir, HomeCache.SEALED_NAME);
+        CacheSeal seal = new CacheSeal(CacheSeal.newKey());
+        HomeCache.merge(sealed, seal, "server", new HomeCache.Entry(poll(), "", false));
+        Map<String, HomeCache.Entry> old = new LinkedHashMap<>();
+        old.put("laptop", new HomeCache.Entry(poll(), "", false));
+        HomeCache.write(legacy, HomeCache.encode(old));
+        assertEquals(java.util.Collections.singleton("server"), HomeCache.readSealed(sealed, legacy, seal).keySet());
+        assertFalse(legacy.exists());
+    }
+
     @Test public void ask2ThePlainVersion1FleetFileIsSealedOnceThenDeleted() throws Exception {
         File dir = Files.createTempDirectory("fleet-cache").toFile();
         File legacy = new File(dir, HomeCache.FILE_NAME);

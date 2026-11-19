@@ -160,6 +160,36 @@ final class HomeCache {
         if (seal != null) writeSealed(sealedFile(context), seal, text);
     }
 
+    /**
+     * Home's views merged into the app's Fleet cache: each computer Home has a
+     * view of replaces its entry; a computer Home has none of keeps what the
+     * terminal merged; a computer no longer in {@code hosts} goes. Worker only.
+     */
+    static void mergeAll(android.content.Context context, Map<String, Entry> entries, java.util.Set<String> hosts)
+            throws IOException {
+        CacheSeal seal = CacheSeal.shared(context);
+        if (seal != null) mergeAll(sealedFile(context), seal, entries, hosts);
+    }
+
+    static synchronized void mergeAll(File sealed, CacheSeal seal, Map<String, Entry> entries, java.util.Set<String> hosts)
+            throws IOException {
+        Map<String, Entry> all = readSealed(sealed, null, seal);
+        all.keySet().retainAll(hosts);
+        for (Map.Entry<String, Entry> e : entries.entrySet()) {
+            Entry entry = e.getValue();
+            Entry before = all.get(e.getKey());
+            if (entry.git.isEmpty() && before != null && !before.git.isEmpty()) {
+                entry = new Entry(entry.view, before.git, before.gitTruncated);
+            }
+            if (hasTree(entry.view)) all.put(e.getKey(), entry);
+        }
+        try {
+            writeSealed(sealed, seal, encode(all));
+        } catch (JSONException unencodable) {
+            throw new IOException(unencodable);
+        }
+    }
+
     /** Merges one computer's view into the app's Fleet cache, keeping its git look if {@code entry} has none. Worker only. */
     static void merge(android.content.Context context, String host, Entry entry) throws IOException {
         CacheSeal seal = CacheSeal.shared(context);

@@ -35,6 +35,15 @@ pub(crate) const MAX_BYTES: usize = 1024 * 1024;
 const MIN_ANCHOR_CHARS: usize = 3;
 /// At least this many such rows must agree on a move before it is trusted.
 const MIN_VOTES: usize = 2;
+/// Drawn in the reader (and in a saved copy) where rows were never seen: the
+/// screen changed by more than it holds between two looks, and no read from
+/// the core filled the gap yet. Read back from a saved copy as the gap again.
+pub(crate) const GAP_TEXT: &str = "· rows not seen ·";
+
+fn gap_row() -> &'static Row {
+    static ROW: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
+    ROW.get_or_init(|| Row { text: GAP_TEXT.to_owned(), vt: format!("\x1b[2m{GAP_TEXT}\x1b[0m") })
+}
 
 /// One screen row: its text (trailing blanks trimmed), what it is compared
 /// by, and the bytes that draw it again with its colours.
@@ -169,6 +178,10 @@ pub(crate) struct Transcript {
     /// that far since): the next move up gives these rows back first, and
     /// the newest `back` history rows are on the screen right now.
     back: usize,
+    /// How far the view moved down beyond all of the history: the top of the
+    /// screen holds this many rows older than the oldest history row. A move
+    /// up gives these back first; they lead the history then.
+    beyond: usize,
     /// Rows before this index may not join the rows after it (something was
     /// missed): a seed replaces them.
     gap: Option<usize>,
@@ -186,6 +199,13 @@ impl Transcript {
         let screen = rows.split_off(rows.len().saturating_sub(screen));
         let mut out = Self { screen, cols, complete, ..Self::default() };
         for row in rows {
+            // The mark a saved copy carries where rows were missed is the gap again.
+            if row.text == GAP_TEXT {
+                if !out.history.is_empty() {
+                    out.gap = Some(out.history.len());
+                }
+                continue;
+            }
             out.push(row);
         }
         out
@@ -204,6 +224,25 @@ impl Transcript {
         self.complete && self.gap.is_none()
     }
 
+    /// Rows older than every history row, oldest first, put before them.
+    fn prepend(&mut self, rows: Vec<Row>) {
+        if self.complete {
+            // The history reached the program's first row: these were known.
+            return;
+        }
+        let n = rows.len();
+        for row in rows.into_iter().rev() {
+            self.bytes += row.bytes();
+            self.history.push_front(row);
+        }
+        self.gap = self.gap.map(|at| at + n);
+        while self.bytes > MAX_BYTES {
+            let Some(old) = self.history.pop_front() else { break };
+            self.bytes -= old.bytes();
+            self.gap = self.gap.and_then(|at| at.checked_sub(1)).filter(|at| *at > 0);
+        }
+    }
+
     fn push(&mut self, row: Row) {
         self.bytes += row.bytes();
         self.history.push_back(row);
@@ -216,8 +255,10 @@ impl Transcript {
     }
 
     fn lose(&mut self) {
-        self.gap = Some(self.history.len());
+        // Rows before an older gap are kept apart from what follows it too.
+        self.gap = Some(self.gap.map_or(self.history.len(), |at| at.min(self.history.len())));
         self.back = 0;
+        self.beyond = 0;
     }
 
     /// A new look at the program's screen; returns how it moved.
@@ -239,17 +280,33 @@ impl Transcript {
         match how {
             Moved::Up(d) => {
                 // A header that stayed put (the same row at the same place above
-                // the moved rows) is not part of the history.
-                let header = previous.iter().zip(&next).take_while(|(a, b)| a == b && anchor(a)).count();
-                let again = d.min(self.back);
-                self.back -= again;
+                // the moved rows) is not part of the history; a row that repeats
+                // with the move itself (a rule every `d` rows) is no header.
+                let header = (0..previous.len().min(next.len()))
+                    .take_while(|&i| previous[i] == next[i] && anchor(previous[i]) && previous.get(i + d) != Some(&previous[i]))
+                    .count();
                 let end = (header + d).min(self.screen.len());
-                let left: Vec<Row> = self.screen[(header + again).min(end)..end].to_vec();
+                let start = header.min(end);
+                // First the rows older than the history (the view sat above
+                // it): they lead the history, in order.
+                let older = (d.min(self.beyond)).min(end - start);
+                self.beyond -= older;
+                if older > 0 {
+                    self.prepend(self.screen[start..start + older].to_vec());
+                }
+                // Then the history rows that were on the screen: known already.
+                let again = (d - older).min(self.back).min(end - start - older);
+                self.back -= again;
+                let left: Vec<Row> = self.screen[start + older + again..end].to_vec();
                 for row in left {
                     self.push(row);
                 }
             }
-            Moved::Down(d) => self.back = (self.back + d).min(self.history.len()),
+            Moved::Down(d) => {
+                let total = self.back + self.beyond + d;
+                self.back = total.min(self.history.len());
+                self.beyond = total - self.back;
+            }
             Moved::Lost => self.lose(),
             Moved::Still => {}
         }
@@ -278,10 +335,16 @@ impl Transcript {
         let Some(Some(d)) = winner(&votes(&theirs, &ours), None) else {
             return false;
         };
+        if d <= 0 && from > 0 {
+            // The read starts after the gap: it fills none of it, and the
+            // rows on both sides must not be joined.
+            return false;
+        }
         let kept: Vec<Row> = self.history.drain(from..).collect();
         let older: Vec<Row> = self.history.drain(..).collect();
         self.bytes = 0;
         self.gap = None;
+        self.beyond = 0;
         if d > 0 {
             // The core holds rows older than ours: they lead.
             for row in seed.into_iter().take(d as usize) {
@@ -302,10 +365,13 @@ impl Transcript {
     }
 
     /// What the phone scrolls through: the history, then `screen` (the
-    /// program's screen now), each row once.
+    /// program's screen now), each row once, with a mark where rows were
+    /// never seen ([`GAP_TEXT`]).
     pub(crate) fn reader_rows<'a>(&'a self, screen: &'a [Row]) -> impl Iterator<Item = &'a Row> {
         let shown = self.history.len() - self.back.min(self.history.len());
-        self.history.iter().take(shown).chain(screen.iter())
+        let at = self.gap.filter(|at| *at > 0).map_or(shown, |at| at.min(shown));
+        let mark = self.gap.filter(|g| *g > 0 && *g <= shown).map(|_| gap_row());
+        self.history.iter().take(at).chain(mark).chain(self.history.iter().skip(at).take(shown - at)).chain(screen.iter())
     }
 
     /// The screen last looked at.

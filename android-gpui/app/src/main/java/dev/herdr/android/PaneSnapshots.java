@@ -7,7 +7,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -28,7 +27,8 @@ import java.util.concurrent.Executor;
  * named by a hash of the computer and pane, and are written and read on this
  * class's own thread. The cache keeps at most {@link #MAX_FILES} panes and
  * {@link #MAX_TOTAL_BYTES} in all, newest first by when each was last saved
- * or opened; pinned panes (the one on screen, the Deacon and PMs, panes with
+ * or opened (a copy's mtime is when it was saved; an empty {@code .used} file
+ * beside it, when it was last opened); pinned panes (the one on screen, the Deacon and PMs, panes with
  * messages waiting) go last, and nothing unpinned older than {@link
  * #MAX_AGE_MS} stays. Version 1 copies (plain, {@code no_backup/panes}) are
  * sealed into the cache once, then deleted.
@@ -166,7 +166,9 @@ final class PaneSnapshots {
                 return;
             }
             if (id > 0) {
-                saved.setLastModified(Math.max(savedAt, System.currentTimeMillis()));
+                // Opening counts as using it, for eviction; its own time stays
+                // the time it was saved, which the pane's "cached" label shows.
+                touch(used(saved), System.currentTimeMillis());
                 then.shown(new Shown(id, savedAt));
             } else {
                 missing.missing();
@@ -262,10 +264,46 @@ final class PaneSnapshots {
     }
 
     private void prune(long now) {
-        File[] files = dir.listFiles((d, n) -> n.endsWith(SUFFIX));
-        if (files == null) return;
+        File[] all = dir.listFiles();
+        if (all == null) return;
+        List<File> files = new ArrayList<>();
+        for (File file : all) {
+            String name = file.getName();
+            if (name.endsWith(SUFFIX)) {
+                files.add(file);
+            } else if (name.endsWith(".tmp")) {
+                // Every write runs on this thread and is done by now: a .tmp
+                // left over is from a write that failed or a process that died.
+                file.delete();
+            } else if (name.endsWith(USED) && !new File(dir, name.substring(0, name.length() - USED.length())).isFile()) {
+                file.delete();
+            }
+        }
         Set<String> keep = pinned;
-        for (File old : stale(Arrays.asList(files), keep, MAX_FILES, MAX_TOTAL_BYTES, now, MAX_AGE_MS)) old.delete();
+        for (File old : stale(files, keep, MAX_FILES, MAX_TOTAL_BYTES, now, MAX_AGE_MS)) {
+            old.delete();
+            used(old).delete();
+        }
+    }
+
+    /** Beside a copy, an empty file whose mtime is when the copy was last opened. */
+    private static final String USED = ".used";
+
+    static File used(File file) {
+        return new File(file.getPath() + USED);
+    }
+
+    /** When {@code file} was last saved or opened: what eviction goes by. */
+    static long recency(File file) {
+        return Math.max(file.lastModified(), used(file).lastModified());
+    }
+
+    private static void touch(File file, long at) {
+        try {
+            if (file.isFile() || file.createNewFile()) file.setLastModified(at);
+        } catch (IOException ignored) {
+            // Only eviction order is affected.
+        }
     }
 
     /**
@@ -278,7 +316,7 @@ final class PaneSnapshots {
         order.sort((a, b) -> {
             boolean pa = pinned.contains(a.getName()), pb = pinned.contains(b.getName());
             if (pa != pb) return pa ? -1 : 1;
-            return Long.compare(b.lastModified(), a.lastModified());
+            return Long.compare(recency(b), recency(a));
         });
         List<File> out = new ArrayList<>();
         long total = 0;
@@ -286,7 +324,7 @@ final class PaneSnapshots {
         for (File file : order) {
             boolean pin = pinned.contains(file.getName());
             long size = file.length();
-            boolean over = kept >= maxFiles || total + size > maxBytes || now - file.lastModified() > maxAge;
+            boolean over = kept >= maxFiles || total + size > maxBytes || now - recency(file) > maxAge;
             if (over && !pin) {
                 out.add(file);
                 continue;

@@ -80,8 +80,11 @@ final class CacheSeal {
             if (wrapped.isFile()) {
                 try {
                     key = unwrap(master, readBytes(wrapped, 256));
-                } catch (GeneralSecurityException | IOException lost) {
-                    // A key that no longer opens: everything sealed with it is unreadable.
+                } catch (javax.crypto.AEADBadTagException | DamagedKey | IOException lost) {
+                    // A key that no longer opens (a new Keystore key, or a
+                    // damaged file): everything sealed with it is unreadable.
+                    // Any other Keystore error may pass: nothing is cached this
+                    // time (below), and nothing is wiped.
                     key = null;
                 }
             }
@@ -211,9 +214,16 @@ final class CacheSeal {
         return out;
     }
 
+    /** The wrapped key file is not one this class wrote. */
+    private static final class DamagedKey extends GeneralSecurityException {
+        DamagedKey(String why) {
+            super(why);
+        }
+    }
+
     private static SecretKey unwrap(SecretKey master, byte[] wrapped) throws GeneralSecurityException {
         if (wrapped.length < 2 || wrapped[0] <= 0 || 1 + wrapped[0] >= wrapped.length) {
-            throw new GeneralSecurityException("damaged wrapped key");
+            throw new DamagedKey("damaged wrapped key");
         }
         int ivLength = wrapped[0];
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
@@ -221,7 +231,7 @@ final class CacheSeal {
         cipher.updateAAD(aad(WRAPPED));
         byte[] raw = cipher.doFinal(wrapped, 1 + ivLength, wrapped.length - 1 - ivLength);
         try {
-            if (raw.length != 32) throw new GeneralSecurityException("wrapped key has the wrong size");
+            if (raw.length != 32) throw new DamagedKey("wrapped key has the wrong size");
             return new SecretKeySpec(raw, "AES");
         } finally {
             Arrays.fill(raw, (byte) 0);

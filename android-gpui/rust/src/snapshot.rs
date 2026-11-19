@@ -382,6 +382,39 @@ mod tests {
         assert!(long.len() < 300);
     }
 
+    /// Review mutant M5: only a full-screen grid's copy is its transcript.
+    #[test]
+    fn ask2_a_plain_pane_is_saved_from_its_grid_never_from_a_transcript() {
+        let session = parsed(b"$ ls\r\nREADME.md\r\n$ ", 30, 5);
+        let transcript = crate::transcript::Transcript::restored(
+            vec![crate::transcript::Row::plain("a transcript row from elsewhere")],
+            0,
+            30,
+            false,
+        );
+        let bytes = copy(&session.grid().lock(), "t1", "boot", Some(&transcript)).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("README.md"));
+        assert!(!text.contains("a transcript row from elsewhere"));
+        assert!(!parse(bytes).unwrap().full_screen);
+    }
+
+    /// Review P2-4: a saved copy carries the gap mark, and reads it back as the gap.
+    #[test]
+    fn ask2_a_saved_copy_keeps_the_mark_where_rows_were_missed() {
+        let rows = |texts: &[&str]| texts.iter().map(|t| crate::transcript::Row::plain(t)).collect::<Vec<_>>();
+        let restored = crate::transcript::Transcript::restored(
+            rows(&["before the gap", crate::transcript::GAP_TEXT, "after the gap", "on screen"]),
+            1,
+            30,
+            false,
+        );
+        assert!(restored.wants_seed());
+        let screen = rows(&["on screen"]);
+        let all: Vec<String> = restored.reader_rows(&screen).map(|r| r.text.clone()).collect();
+        assert_eq!(all, ["before the gap", crate::transcript::GAP_TEXT, "after the gap", "on screen"]);
+    }
+
     fn parsed(text: &[u8], cols: u16, rows: u16) -> Arc<gpui_rio::Session> {
         let session = restore(Saved::of(cols, rows, "t1", text.to_vec())).unwrap();
         wait_quiet(&session);

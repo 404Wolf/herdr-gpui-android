@@ -363,12 +363,15 @@ public final class HomeActivity extends Activity {
             }
         }
         if (entries.isEmpty()) return;
+        java.util.Set<String> hosts = new java.util.HashSet<>(machines.keySet());
         try {
             worker.execute(() -> {
                 try {
                     String text = HomeCache.encode(entries);
                     if (text.equals(cacheWritten)) return;
-                    HomeCache.write(this, text);
+                    // Merged per computer: what the terminal listed for a
+                    // computer Home has no view of stays (one Fleet cache).
+                    HomeCache.mergeAll(this, entries, hosts);
                     cacheWritten = text;
                 } catch (Exception unwritable) {
                     // A cache is a convenience: the next launch just connects first.
