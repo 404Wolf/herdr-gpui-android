@@ -628,9 +628,9 @@ else
     record stop-and-send SKIP "agent-b was not the active pane"
     record cancel-z SKIP "agent-b was not the active pane"
 fi
-# the keyboard may still be up; put it away
-a shell input keyevent KEYCODE_BACK
-quiet 2
+# Put the keyboard away only if it is still up: with it already hidden, Back opens the rail over
+# the tab strip (and the offline step then taps the rail instead of the tabs).
+if ime_shown; then a shell input keyevent KEYCODE_BACK; quiet 2; fi
 
 # (c) offline: A's grid was saved when B was opened; cut the host, open A from the cache
 stop_sshd
