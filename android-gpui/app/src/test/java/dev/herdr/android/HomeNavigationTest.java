@@ -69,7 +69,7 @@ public final class HomeNavigationTest {
             assertTrue(method, body(source, method).contains("beginNavigation()"));
         }
         for (String method : Arrays.asList("private void openWorktree(", "private void openTerminal(",
-                "private void sendToDeacon(", "private void openAgent(Agent agent, long intent)")) {
+                "private void sendToDeacon(", "private void openAgent(Agent agent, long intent, boolean picked)")) {
             assertTrue(method, body(source, method).contains("completeNavigation(machine, handle, intent"));
         }
         assertTrue(body(source, "private void completeNavigation(")
@@ -80,7 +80,8 @@ public final class HomeNavigationTest {
                 .contains("machine.deaconHandle, machine.deaconNavigation"));
         // An async completion must not mint itself a newer intent and defeat the guard.
         assertFalse(body(source, "private void openTerminal(").contains("beginNavigation()"));
-        assertFalse(body(source, "private void openAgent(Agent agent, long intent)").contains("beginNavigation()"));
+        assertFalse(body(source, "private void openAgent(Agent agent, long intent, boolean picked)")
+                .contains("beginNavigation()"));
     }
 
     private static String body(String source, String declaration) {

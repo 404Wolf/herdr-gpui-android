@@ -403,12 +403,12 @@ final class FleetTree {
                 if (row.members.isEmpty()) continue;
                 nest(row, project.pm);
                 for (Member m : row.members) {
-                    if (countedAgent(m) && tallied.add(m.id)) count(project.tally, m.status);
+                    if (countedAgent(m) && tallied.add(m.id)) count(project.tally, m);
                 }
                 project.entries.add(row);
             }
             if (project.pm != null && countedAgent(project.pm) && tallied.add(project.pm.id)) {
-                count(project.tally, project.pm.status);
+                count(project.tally, project.pm);
             }
             fleet.projects.add(project);
         }
@@ -542,9 +542,12 @@ final class FleetTree {
         project.closedIncomplete = git.allTruncated || git.truncated.contains(project.repo);
     }
 
-    private static void count(int[] tally, String status) {
-        switch (status) {
-            case "blocked": case "error": tally[0]++; break;
+    private static void count(int[] tally, Member member) {
+        if (blocked(member)) {
+            tally[0]++;
+            return;
+        }
+        switch (member.status) {
             case "done": tally[1]++; break;
             case "working": tally[2]++; break;
             case "idle": tally[3]++; break;
@@ -742,7 +745,7 @@ final class FleetTree {
 
         boolean folded(String projectKey) { return !stored.contains(projectKey); }
 
-        void toggle(String projectKey) { if (!stored.remove(projectKey)) stored.add(projectKey); }
+        void toggle(String key) { if (!stored.remove(key)) stored.add(key); }
 
         /** The focused terminal, seen on a refresh: true when this reveals (opens) {@code keys}. */
         boolean focusSeen(String now, java.util.Collection<String> keys) {
@@ -751,10 +754,16 @@ final class FleetTree {
 
         /** Open the new selection's project and its repo; a manual fold survives subsequent polls. */
         boolean focusSeen(String now, java.util.Collection<String> keys, java.util.Collection<String> collapsedRepos) {
+            return focusSeen(now, keys, collapsedRepos, false);
+        }
+
+        /** An explicit pick can arrive at startup or target the currently focused pane. */
+        boolean focusSeen(String now, java.util.Collection<String> keys,
+                java.util.Collection<String> collapsedRepos, boolean picked) {
             if (now == null || now.isEmpty()) return false;
-            if (focus == null) { focus = now; return false; } // startup: record, reveal nothing
-            if (now.equals(focus)) return false;
+            boolean reveal = picked || focus != null && !now.equals(focus);
             focus = now;
+            if (!reveal) return false;
             boolean changed = stored.addAll(keys);
             return stored.removeAll(collapsedRepos) || changed;
         }
@@ -787,6 +796,14 @@ final class FleetTree {
         return fold != Fold.AGENT && fold != Fold.REPO;
     }
 
+    static final int RAIL_DEPTH_DP = 18;
+    static final int PM_CHEVRON_DP = 36;
+
+    static int railAgentPadding(int depth, boolean underPm) {
+        // A worker has no chevron of its own. Account for the PM's wider chevron before indenting it.
+        return 4 + RAIL_DEPTH_DP * depth + (underPm ? PM_CHEVRON_DP - RAIL_DEPTH_DP + 10 : 0);
+    }
+
     /** One PM row of the sidebar: a project's manager, where it works, and its workers. */
     static final class PmRow {
         final Project project;
@@ -798,7 +815,7 @@ final class FleetTree {
         final List<AgentNode> workers = new ArrayList<>();
         /** Projects whose unopened-worktree catalog this row's menu offers ("Worktrees…"). */
         final List<Project> catalogs = new ArrayList<>();
-        int subAgents;
+        int subAgents, workerRows;
         boolean hasAgents;
         Long ahead;
         PmRow(Project project) {
@@ -816,6 +833,14 @@ final class FleetTree {
         }
 
         String countsLabel() { return counts(subAgents, ahead, project.tally); }
+
+        String foldKey(String hostId) {
+            return hostId + "/fleet/" + (pm == null ? "p/" + name() : "pm/" + pm.id) + ":open";
+        }
+
+        String workerFoldKey(String hostId, String id) {
+            return workerRows > 0 && (pm == null || !pm.id.equals(id)) && contains(id) ? foldKey(hostId) : null;
+        }
 
         boolean contains(String id) {
             if (pm != null && pm.id.equals(id)) return true;
@@ -1074,7 +1099,8 @@ final class FleetTree {
     }
 
     static boolean blocked(Member m) {
-        return "blocked".equals(m.status) || "error".equals(m.status);
+        return "blocked".equals(m.status) || "error".equals(m.status)
+                || "question".equals(m.status) || "question".equals(m.waitKind);
     }
 
     /**
@@ -1140,6 +1166,7 @@ final class FleetTree {
             Set<String> counted = new HashSet<>();
             if (project.pm != null) counted.add(project.pm.id);
             for (Member member : flatten(row.workers)) {
+                row.workerRows++;
                 if (countedAgent(member)) {
                     row.hasAgents = true;
                     if (counted.add(member.id)) row.subAgents++;
