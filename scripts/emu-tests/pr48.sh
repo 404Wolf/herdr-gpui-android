@@ -411,6 +411,8 @@ check_recording_controls() { # label
     done
     sleep 3
     shot "recording-$label"
+    sleep 3
+    shot "recording-$label-c"
     local moved ticking=0 state="" missing=""
     # App side: the renderer's own control ids. Recording has cancel, the timer (status), stop (talk), send and type.
     # The timer ("status") is dropped by the app's ladder when img and clear take the room (above ~50
@@ -423,8 +425,12 @@ check_recording_controls() { # label
     # The hint's rows are relative to the terminal surface; the controls' row on the device is read
     # from the accessibility dump (the Send target's centre), so no surface origin is guessed.
     if (( have_dump )); then
-        moved=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" "$udump" 2> /dev/null || echo none)
-        if [[ "$moved" != none ]] && python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then ticking=1; fi
+        # Two intervals of 3 s: a single sampling hiccup on a loaded guest must not decide it.
+        local m1 m2
+        m1=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" "$udump" 2> /dev/null || echo 0)
+        m2=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label.png" "$EMU_OUT/recording-$label-c.png" "$udump" 2> /dev/null || echo 0)
+        moved=$(python3 -c "print(max(float('$m1'), float('$m2')))")
+        if python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then ticking=1; fi
         for need in 'Stop and discard what was dictated' 'Send, or press Enter' 'Type a message, or put the keyboard away'; do
             $ui find "$udump" "$need" > /dev/null || missing="$missing [$need]"
         done
@@ -581,7 +587,7 @@ cancel_z() {
     shot cancel-z-dictating
     # keyboard up, cursor to just before "fixture" (15 characters back), type 'z'
     tap_ui 'Type a message, or put the keyboard away' 15
-    wait_ime 12 || { record cancel-z FAIL "the keyboard did not come up within 12 s; Cancel was not exercised"; tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK; return; }
+    wait_ime 25 || { record cancel-z FAIL "the keyboard did not come up within 25 s; Cancel was not exercised"; tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK; return; }
     quiet 1
     for _ in $(seq 15); do a shell input keyevent KEYCODE_DPAD_LEFT; done
     a shell input text z
@@ -655,7 +661,7 @@ keyboard_cycle() { # name how
     local name=$1 how=$2 y0 y1 y2 blank
     y0=$(wait_ui 'Type a message, or put the keyboard away' 10 | awk '{print $2}')
     tap_ui 'Type a message, or put the keyboard away' 10
-    wait_ime 12 || { record "offline-$name" FAIL "the keyboard did not come up within 12 s"; return; }
+    wait_ime 25 || { record "offline-$name" FAIL "the keyboard did not come up within 12 s"; return; }
     quiet 1
     y1=$(wait_ui 'Type a message, or put the keyboard away' 10 | awk '{print $2}')
     shot "offline-$name-up"

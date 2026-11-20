@@ -150,10 +150,13 @@ def timer_region_change(log_path, png_a, png_b, xml=None):
         y0, y1 = max(0, hit[1] - half), min(ha, hit[1] + half)
         # Columns too from the dump when it can: the timer sits between the Cancel and Type targets
         # (the pane need not fill the display: a rail may take its left side).
+        # The a11y targets are wider than the words they sit on, so "between Cancel and Type" can
+        # miss the timer's digits: take the whole stretch from Cancel's right edge to Send's left
+        # edge (the cross, the timer, Type and Stop are in it; only the timer changes).
         cancel = find_bounds(xml, "Stop and discard what was dictated")
-        typ = find_bounds(xml, "Type a message, or put the keyboard away")
-        if cancel and typ and cancel[2] < typ[0]:
-            x0, x1 = cancel[2], min(wa, typ[0])
+        send = find_bounds(xml, "Send, or press Enter")
+        if cancel and send and cancel[2] < send[0]:
+            x0, x1 = cancel[2], min(wa, send[0])
     changed = total = 0
     for y in range(y0, y1):
         for x in range(x0, x1):
