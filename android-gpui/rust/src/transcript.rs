@@ -41,6 +41,9 @@ const MIN_VOTES: usize = 2;
 /// Drawn in the reader (and in a saved copy) where rows were never seen: the
 /// screen changed by more than it holds between two looks.
 pub(crate) const GAP_TEXT: &str = "· rows not seen ·";
+/// Drawn above the oldest row of the copy being read: a drag stops there,
+/// and a new one from there scrolls the program's own view.
+pub(crate) const TOP_TEXT: &str = "· top of the phone's copy ·";
 
 fn gap_row() -> &'static Arc<Row> {
     static ROW: std::sync::OnceLock<Arc<Row>> = std::sync::OnceLock::new();

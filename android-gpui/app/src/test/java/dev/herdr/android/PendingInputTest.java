@@ -62,4 +62,30 @@ public class PendingInputTest {
         assertTrue(pending.isEmpty());
         assertEquals(2, pending.takeDiscarded());
     }
+
+    /**
+     * Review round 6 P2-4: a held command accepted by the PTY leaves the queue
+     * by its own handle, even when the screen paused before it was marked
+     * (the pause keeps the queue): the next attach to the same PTY never
+     * types it again. A late or repeated mark removes nothing else.
+     */
+    @Test public void ask2AnAcceptedHeldCommandIsNeverSentTwice() {
+        PendingInput queue = new PendingInput();
+        assertTrue(queue.add("core/t1/9/1", "first"));
+        assertTrue(queue.add("core/t1/9/1", "second"));
+        PendingInput.Held taken = queue.take("core/t1/9/1");
+        assertEquals("first", taken.command);
+        // Accepted; the activity paused meanwhile and kept the queue: it is still marked sent.
+        queue.sent(taken);
+        assertEquals("second", queue.take("core/t1/9/1").command);
+        // Marked again (or late): "second" stays.
+        queue.sent(taken);
+        assertEquals("second", queue.take("core/t1/9/1").command);
+        // A handle from before a discard never removes what was held since.
+        PendingInput.Held stale = queue.take("core/t1/9/1");
+        queue.discardAll();
+        assertTrue(queue.add("core/t1/9/1", "third"));
+        queue.sent(stale);
+        assertEquals("third", queue.take("core/t1/9/1").command);
+    }
 }

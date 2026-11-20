@@ -190,6 +190,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean edgeClaimed;
     private float touchDownY, lastTouchY, scrollFraction;
     private float scrollVelocity, flingRemainder;
+    /** Numbers drag gestures (one per touch down, main thread); a fling is its drag's. */
+    private long scrollGesture;
     private long lastMoveAt;
     private boolean flinging;
     private SurfaceView terminalSurface;
@@ -1327,13 +1329,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         target.fastUntil = SystemClock.uptimeMillis() + 1200;
         final int epoch = scrollEpoch.get();
+        final long gesture = scrollGesture;
         try {
             scrollWorker.execute(() -> {
                 // The viewport was taken since (typing went to the live bottom): drop it.
                 if (epoch != scrollEpoch.get()) return;
                 try {
                     JSONObject answer = new JSONObject(RemoteNative.scrollLocal(target.remoteHandle, lines,
-                            target.generation, target.title, target.status, shortcutJson));
+                            target.generation, target.title, target.status, shortcutJson, gesture));
                     if (answer.optBoolean("following", false) && !lastFollowSent) {
                         lastFollowSent = true;
                         nativeSetFollow(target.generation, true);
@@ -5454,6 +5457,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (masked == MotionEvent.ACTION_DOWN) {
             stopFling();
+            // A new drag gesture: its owner (the phone's copy or the program) is decided anew.
+            scrollGesture++;
             touchDownX = edgeStartX = event.getX();
             edgeClaimed = false;
             touchDownY = lastTouchY = event.getY();
@@ -6472,28 +6477,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean mutation = false;
         try {
             // Input held across a reconnect goes first, in order, once.
-            String held = null;
+            PendingInput.Held held = null;
             String heldPane = null;
             String heldTarget = null;
             synchronized (stateLock) {
                 if (current(current) && current.ready) {
                     heldPane = current.paneId;
                     heldTarget = current.inputTarget();
-                    held = pendingInput.next(heldTarget);
+                    held = pendingInput.take(heldTarget);
                     reportDiscardedInput();
                 }
             }
             if (held != null) {
                 mutation = true;
-                JSONObject result = new JSONObject(RemoteNative.inputForAttach(current.remoteHandle, heldPane, heldTarget, held));
+                JSONObject result = new JSONObject(RemoteNative.inputForAttach(current.remoteHandle, heldPane, heldTarget, held.command));
                 synchronized (stateLock) {
+                    boolean queued = result.optBoolean("queued", false);
+                    // Accepted by that PTY: it left the phone, whatever happened
+                    // to this screen since (a pause keeps the queue), so it is
+                    // never sent again. Before any early return.
+                    if (queued) pendingInput.sent(held);
                     if (!current(current)) return;
                     if (result.optBoolean("stale_attach", false)) {
                         pendingInput.discardAll();
                         reportDiscardedInput();
                     } else {
-                        if (!result.optBoolean("queued", false)) throw new IOException("Held input was not queued");
-                        pendingInput.sent();
+                        if (!queued) throw new IOException("Held input was not queued");
                         publish(current, "Input queued over SSH");
                     }
                 }
@@ -6573,7 +6582,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                             || !quietPane.equals(current.chromePane)
                             || !state.optString("boot_id", "").equals(current.remoteBoot == null ? "" : current.remoteBoot);
                     if (!smallChange) {
-                        final boolean quietBack = state.optLong("local_offset", 0) > 0;
+                        final boolean quietBack = state.optLong("local_offset", 0) > 0
+                                || state.optBoolean("program_scroll", false);
                         if (quietBack != shownScrolledBack) main.post(() -> showLatest(quietBack));
                         JSONObject quietScroll = state.optJSONObject("scroll");
                         if (quietScroll != null) {
@@ -6700,7 +6710,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (selected && current.hostId != null) {
                     outbox.ready(current.hostId, current.remoteHandle, boot, paneIds(current.panes));
                 }
-                final boolean scrolledBack = state.optLong("local_offset", 0) > 0;
+                // Back in the phone's copy, or Claude scrolling itself: Latest brings either down.
+                final boolean scrolledBack = state.optLong("local_offset", 0) > 0
+                        || state.optBoolean("program_scroll", false);
                 main.post(() -> showLatest(scrolledBack));
                 current.renderedScroll = state.optLong("rendered_scroll", current.renderedScroll);
                 JSONObject scroll = state.optJSONObject("scroll");

@@ -77,6 +77,14 @@ impl Rows {
         Self { cols: screen.cols, lines: screen.rows.len(), rows, history, tail: screen.tail.clone(), full_screen: true }
     }
 
+    /// The same rows under a dim `text` mark, as the oldest history row.
+    pub(crate) fn with_top_mark(mut self, text: &str) -> Self {
+        let vt = format!("\x1b[2m{text}\x1b[0m");
+        self.rows.insert(0, Arc::new(crate::transcript::Row { text: text.to_owned(), vt }));
+        self.history += 1;
+        self
+    }
+
     /// A pane's copy: a full-screen program's `transcript` and its screen,
     /// anything else the grid's own history and screen.
     #[cfg(test)]

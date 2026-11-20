@@ -494,6 +494,7 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollLocal(
     title: JString<'_>,
     status: JString<'_>,
     shortcuts: JString<'_>,
+    gesture: jlong,
 ) -> jstring {
     let Some(title) = read(&mut env, &title, 1024) else {
         return std::ptr::null_mut();
@@ -506,6 +507,7 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollLocal(
     };
     let paint = remote::UiPaint {
         generation,
+        gesture: gesture as u64,
         title: &title,
         status: &status,
         shortcuts: &shortcuts,

@@ -99,13 +99,7 @@ final class PaneSnapshots {
                 return worker;
             });
             shared = new PaneSnapshots(dir, thread, () -> CacheSeal.shared(app), NATIVE);
-            shared.migrate(old, () -> {
-                Map<String, String> revisions = new LinkedHashMap<>();
-                for (SavedRemoteHost host : new RemoteHostStore(app).read()) {
-                    revisions.put(host.id, host.connectionRevision);
-                }
-                return revisions;
-            });
+            shared.migrate(old, storedProfiles(app));
         }
         return shared;
     }
@@ -306,6 +300,48 @@ final class PaneSnapshots {
         Map<String, String> revisions() throws Exception;
     }
 
+    /** Beside the version 1 copies: the profile revisions they (and the old Fleet list) are bound to. */
+    static final String LEGACY_BINDING = "pane-legacy-revisions.sealed";
+
+    /**
+     * The one-time binding of everything saved before revisions were part of
+     * the cache (pane copies, the Fleet list): the revision each profile had
+     * on the first launch with a readable profile store. Read from {@code
+     * binding}, else made from {@code profiles} and sealed there first. The
+     * same for every caller, whichever runs first.
+     */
+    static synchronized Map<String, String> legacyRevisions(File binding, CacheSeal sealer, Profiles profiles) throws Exception {
+        Map<String, String> revisions = readLegacyRevisions(binding, sealer);
+        if (revisions != null) return revisions;
+        revisions = new LinkedHashMap<>(profiles.revisions());
+        sealer.write(binding, new JSONObject(revisions).toString().getBytes(StandardCharsets.UTF_8));
+        return revisions;
+    }
+
+    /** {@code binding}'s revisions; null when there is none yet. */
+    static synchronized Map<String, String> readLegacyRevisions(File binding, CacheSeal sealer) throws Exception {
+        if (!binding.isFile()) return null;
+        byte[] sealed = CacheSeal.readBytes(binding, 8192);
+        JSONObject stored = new JSONObject(new String(sealer.open(sealed, binding.getName()), StandardCharsets.UTF_8));
+        Map<String, String> revisions = new LinkedHashMap<>();
+        for (java.util.Iterator<String> it = stored.keys(); it.hasNext();) {
+            String profile = it.next();
+            revisions.put(profile, stored.getString(profile));
+        }
+        return revisions;
+    }
+
+    /** The profile revisions in the store now. */
+    static Profiles storedProfiles(Context app) {
+        return () -> {
+            Map<String, String> revisions = new LinkedHashMap<>();
+            for (SavedRemoteHost host : new RemoteHostStore(app).read()) {
+                revisions.put(host.id, host.connectionRevision);
+            }
+            return revisions;
+        };
+    }
+
     /**
      * Persists the adoption before sealing or opening any legacy copy. A
      * process interrupted mid-migration uses the original revisions again.
@@ -315,21 +351,9 @@ final class PaneSnapshots {
         thread.execute(() -> {
             CacheSeal sealer = seal.get();
             if (sealer == null || !dir.isDirectory() && !dir.mkdirs()) return;
-            File binding = new File(old.getParentFile(), "pane-legacy-revisions.sealed");
+            File binding = new File(old.getParentFile(), LEGACY_BINDING);
             try {
-                Map<String, String> revisions = new LinkedHashMap<>();
-                if (binding.isFile()) {
-                    byte[] sealed = CacheSeal.readBytes(binding, 8192);
-                    JSONObject stored = new JSONObject(new String(sealer.open(sealed, binding.getName()), StandardCharsets.UTF_8));
-                    for (java.util.Iterator<String> it = stored.keys(); it.hasNext();) {
-                        String profile = it.next();
-                        revisions.put(profile, stored.getString(profile));
-                    }
-                } else {
-                    revisions.putAll(profiles.revisions());
-                    sealer.write(binding, new JSONObject(revisions).toString().getBytes(StandardCharsets.UTF_8));
-                }
-                legacyRevisions = revisions;
+                legacyRevisions = legacyRevisions(binding, sealer, profiles);
             } catch (Exception unavailable) {
                 return;
             }

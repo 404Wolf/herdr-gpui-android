@@ -5312,7 +5312,10 @@ mod cache_tests {
     }
 
     fn text_rows(session: &gpui_rio::Session) -> Vec<String> {
-        connection_tests::all_rows(session).into_iter().filter(|r| !r.is_empty()).collect()
+        connection_tests::all_rows(session)
+            .into_iter()
+            .filter(|r| !r.is_empty() && r.trim_end() != crate::transcript::TOP_TEXT)
+            .collect()
     }
 
     fn whole(newest: usize) -> Vec<String> {
@@ -5322,7 +5325,7 @@ mod cache_tests {
     }
 
     fn paint_args(generation: i64) -> UiPaint<'static> {
-        UiPaint { generation, title: "", status: "", shortcuts: "" }
+        UiPaint { generation, gesture: 0, title: "", status: "", shortcuts: "" }
     }
 
     #[test]
@@ -5853,8 +5856,8 @@ mod cache_tests {
         // To the top of what the phone holds.
         at_copy_top(7827, &session);
         assert!(!sent_data(&sent), "a drag inside the copy went to the program");
-        // Further back: the agent scrolls its own view.
-        crate::remote::scroll_local(7827, 3, paint_args(0)).unwrap();
+        // A new gesture further back: the agent scrolls its own view.
+        crate::remote::scroll_local(7827, 3, gesture(1)).unwrap();
         assert!(sent_data(&sent), "a drag past the top of the copy went nowhere");
         assert!(lock(&session.state).local.reader_for_test().is_none(), "the copy stayed over the agent's own view");
         crate::remote::close(7827);
@@ -5871,7 +5874,7 @@ mod cache_tests {
         stream(&session, &tx, 9, 40);
         let _ = sent_data(&sent);
         at_copy_top(7828, &session);
-        crate::remote::scroll_local(7828, 3, paint_args(0)).unwrap();
+        crate::remote::scroll_local(7828, 3, gesture(1)).unwrap();
         assert!(sent_data(&sent), "not handed back");
         let before = crate::remote::transcript_rows(&session).unwrap();
         // The agent scrolls its own view back and repaints older rows.
@@ -5880,11 +5883,11 @@ mod cache_tests {
         session.heard.printed(1);
         crate::remote::keep_local(&session, &mut lock(&session.state));
         assert_eq!(crate::remote::transcript_rows(&session).unwrap(), before);
-        // Dragged back down: the phone's copy takes the drags again.
-        crate::remote::scroll_local(7828, -3, paint_args(0)).unwrap();
+        // Latest: Claude's view comes down and the copy takes the drags again.
+        crate::remote::scroll_to(7828, 0).unwrap();
         tx.send(Chunk::Data(paint(40))).unwrap();
         shows(&terminal, 40);
-        crate::remote::scroll_local(7828, 3, paint_args(0)).unwrap();
+        crate::remote::scroll_local(7828, 3, gesture(2)).unwrap();
         assert!(lock(&session.state).local.reader_for_test().is_some(), "the copy never took the drags again");
         crate::remote::close(7828);
         crate::remote::release_held();
@@ -6068,11 +6071,11 @@ mod cache_tests {
         crate::remote::register_for_test(session.clone());
         stream(&session, &tx, 9, 40);
         at_copy_top(7922, &session);
-        crate::remote::scroll_local(7922, 3, paint_args(0)).unwrap();
+        crate::remote::scroll_local(7922, 3, gesture(1)).unwrap();
         let up = wheel_input(&sent);
         let mut sent_to_program = 0;
         for _ in 0..3 {
-            let outcome: Value = serde_json::from_str(&crate::remote::scroll_local(7922, -1, paint_args(0)).unwrap()).unwrap();
+            let outcome: Value = serde_json::from_str(&crate::remote::scroll_local(7922, -1, gesture(2)).unwrap()).unwrap();
             if outcome["local"] != true {
                 let bytes = wheel_input(&sent);
                 sent_to_program += String::from_utf8_lossy(&bytes).matches("\x1b[<65;").count();
@@ -6215,96 +6218,6 @@ mod cache_tests {
         crate::remote::release_held();
     }
 
-    /// Round 4 P2-1: a drag that crosses the top of the phone's copy carries
-    /// the rows past it to the program.
-    #[test]
-    fn ask2_a_drag_across_the_top_of_the_copy_carries_its_rest_to_the_program() {
-        let (terminal, tx, sent) = full_screen();
-        let session = owner(7905, "boot-7905", terminal, "done");
-        crate::remote::register_for_test(session.clone());
-        stream(&session, &tx, 9, 40);
-        let _ = wheels(&sent);
-        at_copy_top(7905, &session);
-        crate::remote::scroll_local(7905, -2, paint_args(0)).unwrap();
-        assert_eq!(wheels(&sent), (0, 0));
-        crate::remote::scroll_local(7905, 5, paint_args(0)).unwrap();
-        assert_eq!(wheels(&sent), (3, 0), "the rows past the copy's top never reached the program");
-        crate::remote::close(7905);
-        crate::remote::release_held();
-    }
-
-    /// Round 4 P2-1: the first drag on a pane longer than its copy carries the
-    /// rest to the program too.
-    #[test]
-    fn ask2_a_first_drag_longer_than_the_copy_carries_its_rest_to_the_program() {
-        let (terminal, tx, sent) = full_screen();
-        let session = owner(7906, "boot-7906", terminal, "done");
-        crate::remote::register_for_test(session.clone());
-        stream(&session, &tx, 9, 40);
-        let _ = wheels(&sent);
-        crate::remote::scroll_local(7906, 1000, paint_args(0)).unwrap();
-        assert!(wheels(&sent).0 > 0, "a drag past everything the phone has went nowhere");
-        crate::remote::close(7906);
-        crate::remote::release_held();
-    }
-
-    /// Round 4 P2-1: only the wheel reports really sent are counted: 40 rows
-    /// asked are 30 reports, and 30 back bring the program down again.
-    #[test]
-    fn ask2_the_drags_handed_back_are_counted_as_the_reports_sent() {
-        let (terminal, tx, sent) = full_screen();
-        let session = owner(7907, "boot-7907", terminal.clone(), "done");
-        crate::remote::register_for_test(session.clone());
-        stream(&session, &tx, 9, 40);
-        let _ = wheels(&sent);
-        at_copy_top(7907, &session);
-        crate::remote::scroll_local(7907, 40, paint_args(0)).unwrap();
-        assert_eq!(wheels(&sent), (30, 0));
-        // The program scrolled its own view back.
-        tx.send(Chunk::Data(paint(25))).unwrap();
-        shows(&terminal, 25);
-        crate::remote::scroll_local(7907, -30, paint_args(0)).unwrap();
-        assert_eq!(wheels(&sent), (0, 30));
-        // Back at its newest row: the phone's copy takes the drags again.
-        tx.send(Chunk::Data(paint(40))).unwrap();
-        shows(&terminal, 40);
-        crate::remote::scroll_local(7907, 3, paint_args(0)).unwrap();
-        assert!(lock(&session.state).local.reader_for_test().is_some(), "the drag still went to the program");
-        crate::remote::close(7907);
-        crate::remote::release_held();
-    }
-
-    /// Round 4 P2-1: a program that never scrolled (it was at its own top) is
-    /// at its newest row: a drag down gives the drags back to the phone's
-    /// copy, sending nothing.
-    #[test]
-    fn ask2_a_drag_down_at_the_programs_newest_row_returns_to_the_copy() {
-        let (terminal, tx, sent) = full_screen();
-        let session = owner(7908, "boot-7908", terminal, "done");
-        crate::remote::register_for_test(session.clone());
-        stream(&session, &tx, 9, 40);
-        let _ = wheels(&sent);
-        at_copy_top(7908, &session);
-        crate::remote::scroll_local(7908, 40, paint_args(0)).unwrap();
-        assert_eq!(wheels(&sent), (30, 0));
-        let terminal = lock(&session.state).terminal.clone().unwrap();
-        let mut repainted = paint(40);
-        repainted.extend_from_slice(b"\x1b]2;repainted\x07");
-        tx.send(Chunk::Data(repainted)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while terminal.title().as_deref() != Some("repainted") {
-            assert!(Instant::now() < deadline, "the clamped program did not repaint");
-            std::thread::yield_now();
-        }
-        drop(terminal.grid().lock());
-        crate::remote::scroll_local(7908, -30, paint_args(0)).unwrap();
-        assert_eq!(wheels(&sent), (0, 0), "reports sent to a program already at its newest row");
-        crate::remote::scroll_local(7908, 3, paint_args(0)).unwrap();
-        assert!(lock(&session.state).local.reader_for_test().is_some(), "a dead end: the drag still went to the program");
-        crate::remote::close(7908);
-        crate::remote::release_held();
-    }
-
     /// Round 4 P2-2: a save while the agent scrolls its own view keeps the
     /// newest rows the phone watched, not that older view.
     #[test]
@@ -6316,7 +6229,7 @@ mod cache_tests {
         stream(&session, &tx, 9, 40);
         let _ = wheels(&sent);
         at_copy_top(7909, &session);
-        crate::remote::scroll_local(7909, 3, paint_args(0)).unwrap();
+        crate::remote::scroll_local(7909, 3, gesture(1)).unwrap();
         assert!(wheels(&sent).0 > 0, "not handed back");
         tx.send(Chunk::Data(paint(20))).unwrap();
         shows(&terminal, 20);
@@ -6381,8 +6294,7 @@ mod cache_tests {
 
     /// A move of drag gesture `n` (a touch down starts a new one).
     fn gesture(n: u64) -> UiPaint<'static> {
-        let _ = n;
-        paint_args(0)
+        UiPaint { gesture: n, ..paint_args(0) }
     }
 
     /// Round 6 P2: nothing goes to the program before the phone's first look

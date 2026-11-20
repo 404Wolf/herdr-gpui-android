@@ -164,7 +164,19 @@ final class HomeCache {
 
     /** The app's Fleet cache (empty when it cannot be sealed). Worker only. */
     static Map<String, Entry> read(android.content.Context context) {
-        return readSealed(sealedFile(context), legacyFile(context), CacheSeal.shared(context));
+        CacheSeal seal = CacheSeal.shared(context);
+        File legacy = legacyFile(context);
+        if (seal != null) {
+            try {
+                // The binding the old pane copies are adopted under, made now
+                // if Home reads first: the old list is bound to the same one.
+                PaneSnapshots.legacyRevisions(new File(legacy.getParentFile(), PaneSnapshots.LEGACY_BINDING), seal,
+                        PaneSnapshots.storedProfiles(context.getApplicationContext()));
+            } catch (Exception unreadable) {
+                // An old list stays unbound (not shown) until a readable launch.
+            }
+        }
+        return readSealed(sealedFile(context), legacy, seal);
     }
 
     /** Replaces the app's Fleet cache with {@code text} (an {@link #encode}). Worker only. */
@@ -226,7 +238,31 @@ final class HomeCache {
         }
         if (seal == null) return new LinkedHashMap<>();
         byte[] bytes = seal.read(sealed, MAX_BYTES);
-        return bytes == null ? new LinkedHashMap<>() : decode(new String(bytes, StandardCharsets.UTF_8));
+        Map<String, Entry> entries = bytes == null ? new LinkedHashMap<>() : decode(new String(bytes, StandardCharsets.UTF_8));
+        return legacy == null ? entries : bindLegacy(entries, new File(legacy.getParentFile(), PaneSnapshots.LEGACY_BINDING), seal);
+    }
+
+    /**
+     * Entries saved before lists carried their revision (phone-feedback's
+     * list) get the same one-time revision binding the old pane copies were
+     * adopted under, so the offline route to those copies stays; with no
+     * binding they stay unbound, and Home and the rail never show them.
+     */
+    private static Map<String, Entry> bindLegacy(Map<String, Entry> entries, File binding, CacheSeal seal) {
+        Map<String, String> revisions;
+        try {
+            revisions = PaneSnapshots.readLegacyRevisions(binding, seal);
+        } catch (Exception unreadable) {
+            revisions = null;
+        }
+        if (revisions == null) return entries;
+        for (Map.Entry<String, Entry> e : entries.entrySet()) {
+            Entry entry = e.getValue();
+            if (entry.computer != null) continue;
+            String computer = PaneSnapshots.computer(e.getKey(), revisions.get(e.getKey()));
+            e.setValue(new Entry(entry.view, entry.git, entry.gitTruncated, computer));
+        }
+        return entries;
     }
 
     static synchronized void writeSealed(File sealed, CacheSeal seal, String text) throws IOException {

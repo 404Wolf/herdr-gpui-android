@@ -239,9 +239,17 @@ pub(crate) struct Local {
     /// The computer the UI shows this session as (the poll's host): the
     /// phone's copy of a pane carries it with the pane, for its links.
     host: String,
-    /// While the program owns scrolling, only a newly parsed viewport can
-    /// confirm that it is back at the newest row.
-    wheel_after: Option<u64>,
+    /// The drag gesture being handled (Java numbers one per touch down) and
+    /// who owns it: decided at its start, never changed while it lasts.
+    gesture: Option<(u64, Owner)>,
+    /// Claude scrolls its own view: every gesture goes to it as wheel input
+    /// until Latest is tapped, and nothing is captured meanwhile.
+    program: bool,
+    /// Wheel reports back, minus forward, sent while Claude scrolls itself.
+    program_back: i64,
+    /// After Latest: the output count then. Nothing is captured until a
+    /// screen parsed after it is the last one captured, or newer.
+    resume_after: Option<u64>,
     /// The terminal this stream is of, from the attach reply: its PTY's
     /// process and its created_ms. None: not reported, nothing is watched.
     incarnation: Option<Incarnation>,
@@ -279,8 +287,41 @@ impl Local {
         self.watched = None;
         self.building = None;
         self.lost = true;
-        self.wheel_after = None;
+        self.gesture = None;
+        self.program = false;
+        self.program_back = 0;
+        self.resume_after = None;
     }
+
+    /// Whether a screen may be captured now: never while Claude scrolls
+    /// itself, and after Latest only once its newest screen is back.
+    fn capturing(&mut self, terminal: &gpui_rio::Session) -> bool {
+        if self.program {
+            return false;
+        }
+        let Some(after) = self.resume_after else {
+            return true;
+        };
+        if terminal.parsed_output() == after || !newest_back(self, terminal) {
+            return false;
+        }
+        self.resume_after = None;
+        true
+    }
+}
+
+/// Who a drag gesture scrolls, decided once at its start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    /// The phone's copy of what it watched (it stops at its top).
+    Copy,
+    /// Claude's own view, as wheel input.
+    Program,
+    /// Not an agent the phone watches: as on phone-feedback (wheel input,
+    /// or the attach's own scrollback).
+    Grid,
+    /// An agent the phone has not looked at yet: nothing moves.
+    Nothing,
 }
 
 /// Which terminal an attach stream is of, from the attach reply's terminal
@@ -926,16 +967,20 @@ fn read_back(rows: crate::snapshot::Rows, pane: &str) -> Option<Arc<gpui_rio::Se
 /// row missed or doubled. None when `terminal` is not full screen or nothing
 /// was watched yet. The transcript's lock, then the grid's (only to copy
 /// the screen), in the poll's order; never under the session's lock.
-fn reader_for(watched: &Shared, terminal: &gpui_rio::Session, pane: &str) -> Option<Arc<gpui_rio::Session>> {
+fn reader_for(watched: &Shared, terminal: &gpui_rio::Session, pane: &str, look: bool) -> Option<Arc<gpui_rio::Session>> {
     let rows = {
         let mut watched = lock(watched);
         if watched.transcript.rows() == 0 {
             return None;
         }
-        let screen = crate::snapshot::Screen::of(&terminal.grid().lock())?;
-        watched.transcript.observe(screen.rows.clone(), screen.cols);
-        watched.last = Some(screen);
-        watched.rows()?
+        // Only a screen the poll could capture now (`look`) joins the copy;
+        // otherwise the copy ends with the last one captured.
+        if look {
+            let screen = crate::snapshot::Screen::of(&terminal.grid().lock())?;
+            watched.transcript.observe(screen.rows.clone(), screen.cols);
+            watched.last = Some(screen);
+        }
+        watched.rows()?.with_top_mark(crate::transcript::TOP_TEXT)
     };
     read_back(rows, pane)
 }
@@ -968,9 +1013,8 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
         return;
     }
     let output = owner.heard.output();
-    // Handed back to the program's own scrolling: its view is its history,
-    // not new rows; looked at again once it is back at its newest row.
-    if !return_from_wheel(state, &terminal) || output == state.local.captured {
+    // Claude scrolling itself shows its history, not new rows.
+    if output == state.local.captured || !state.local.capturing(&terminal) {
         return;
     }
     let shared = state.local.watched.get_or_insert_with(Shared::default).clone();
@@ -1174,6 +1218,7 @@ pub fn poll_terminal(
             "scroll": view["scroll"],
             "fetch": view["fetch"],
             "local_offset": local_offset,
+            "program_scroll": state.local.program,
             "quiet_ms": owner.heard.quiet_ms(),
             "output": owner.heard.output(),
         })
@@ -1182,6 +1227,7 @@ pub fn poll_terminal(
     let mut view = view.clone();
     view["attach_identity"] = json!(state.attach_identity());
     view["local_offset"] = json!(local_offset);
+    view["program_scroll"] = json!(state.local.program);
     view["quiet_ms"] = json!(owner.heard.quiet_ms());
     view["output"] = json!(owner.heard.output());
     Ok(view.to_string())
@@ -1303,6 +1349,8 @@ pub fn put_file(id: u64, terminal: &str, name: &str, bytes: Vec<u8>) -> Result<S
 }
 pub struct UiPaint<'a> {
     pub generation: i64,
+    /// The drag gesture this step belongs to (one per touch down).
+    pub gesture: u64,
     pub title: &'a str,
     pub status: &'a str,
     pub shortcuts: &'a str,
@@ -1314,28 +1362,44 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     let _ = (paint.title, paint.status, paint.shortcuts);
     let local = || Ok(json!({"queued":true,"local":true}).to_string());
     let wheel = || Ok(json!({"queued":true}).to_string());
-    let (terminal, watched, render_id, watch_generation, pane) = {
+    let (terminal, watched, render_id, watch_generation, pane, look) = {
         let mut state = lock(&owner.state);
-        // Being read back: the phone's own copy scrolls, nothing is sent; at
-        // its newest row the live grid is drawn again.
+        let Some(terminal) = state.terminal.clone() else {
+            return wheel();
+        };
+        let who = match state.local.gesture {
+            Some((gesture, who)) if gesture == paint.gesture => who,
+            _ => {
+                let who = start_gesture(&mut state, delta, paint.generation);
+                state.local.gesture = Some((paint.gesture, who));
+                who
+            }
+        };
+        match who {
+            Owner::Nothing => return local(),
+            Owner::Grid => {
+                if !terminal.wheel(delta) {
+                    terminal.grid().lock().scroll_display(scroll);
+                }
+                return wheel();
+            }
+            Owner::Program => {
+                state.local.program_back += wheel_reports(&terminal, delta);
+                return wheel();
+            }
+            Owner::Copy => {}
+        }
+        // The phone's copy owns this gesture: it scrolls, nothing is sent,
+        // and it stops at its top (a new gesture from there scrolls Claude).
         if let Some((_, reader)) = state.local.reader.clone() {
-            let (before, after) = {
+            let after = {
                 let mut grid = reader.grid().lock();
-                let before = grid.display_offset();
                 grid.scroll_display(scroll);
-                (before, grid.display_offset())
+                grid.display_offset()
             };
             if after == 0 && delta < 0 {
                 state.local.reader = None;
                 show_render(Some(paint.generation), state.render_id, None, None);
-            } else if delta > 0 {
-                // Past the top of what the phone has: the rest of the drag
-                // goes on in the program's own view (wheel input).
-                let rest = delta - i32::try_from(after.saturating_sub(before)).unwrap_or(delta);
-                if rest > 0 {
-                    hand_back(&mut state, rest, paint.generation);
-                    return wheel();
-                }
             }
             return local();
         }
@@ -1344,44 +1408,23 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
             *pending = pending.saturating_add(delta);
             return local();
         }
-        let Some(terminal) = state.terminal.clone() else {
-            return wheel();
-        };
-        // Reverse reports still go to the program until a new viewport
-        // confirms the program is back at the newest row.
-        let owned = state.local.wheel_after.is_some();
-        if !return_from_wheel(&mut state, &terminal) {
-            program_wheel(&mut state.local, &terminal, delta);
-            return wheel();
-        }
-        if owned && delta < 0 {
+        // At the newest row already, or nothing to read back.
+        let Some(watched) = (delta > 0).then(|| state.agent_watched()).flatten() else {
             return local();
-        }
-        // A full-screen agent (Claude Code) keeps its history to itself:
-        // dragging back scrolls the phone's copy of what it watched, at once
-        // and with no round trip (item 77, ask 2). Without one yet, it gets
-        // wheel input as before; plain output scrolls the attach's history.
-        let watched = if delta > 0 { state.agent_watched() } else { None };
-        let Some(watched) = watched else {
-            if !terminal.wheel(delta) {
-                terminal.grid().lock().scroll_display(scroll);
-            }
-            return wheel();
         };
+        let look = state.local.capturing(&terminal);
         state.local.building = Some(0);
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-        (terminal, watched, state.render_id, state.local.watch_generation, pane)
+        (terminal, watched, state.render_id, state.local.watch_generation, pane, look)
     };
     // Built with the session's lock released: the poll (and the UI
     // waiting on it) never waits for the copy to be encoded and parsed.
-    let built = reader_for(&watched, &terminal, &pane);
-    // Scrolled before the session's lock is taken again: its grid can
-    // still be busy with the copy's last bytes.
-    let rest = built.as_ref().map(|reader| {
-        let mut grid = reader.grid().lock();
-        grid.scroll_display(scroll);
-        delta - i32::try_from(grid.display_offset()).unwrap_or(delta)
-    });
+    let built = reader_for(&watched, &terminal, &pane, look);
+    // Scrolled before the session's lock is taken again (it stops at the
+    // copy's top): its grid can still be busy with the copy's last bytes.
+    if let Some(reader) = &built {
+        reader.grid().lock().scroll_display(scroll);
+    }
     let mut state = lock(&owner.state);
     // A later attach has its own Local: this build's state is not its.
     if state.render_id != render_id || state.local.watch_generation != watch_generation {
@@ -1391,76 +1434,87 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     if state.local.reader.is_some() || state.terminal.is_none() {
         return local();
     }
-    if let (Some(reader), Some(rest)) = (built, rest) {
-        if rest > 0 {
-            // Longer than the whole copy: the program's own view goes on.
-            hand_back(&mut state, rest.saturating_add(pending.max(0)), paint.generation);
-            return wheel();
-        }
+    if let Some(reader) = built {
         let shown = crate::core_session::next_render_id();
         let host = state.local.host.clone();
         state.local.reader = Some((shown, reader));
         show_render(Some(paint.generation), shown, None, Some((&host, &pane)));
         drop(state);
-        // The rows dragged while it was built.
+        // The rows dragged while it was built, in the same gesture.
         if pending != 0 {
             return scroll_local(id, i64::from(pending), paint);
         }
-        return local();
     }
-    let rows = delta.saturating_add(pending);
-    if !program_wheel(&mut state.local, &terminal, rows) {
-        terminal.grid().lock().scroll_display(rio_vt::crosswords::grid::Scroll::Delta(rows));
-    }
-    wheel()
+    local()
 }
 
-/// Leaves the phone's copy for the program's own view of the agent (the
-/// live grid), and sends it `rows` more to scroll back.
-fn hand_back(state: &mut State, rows: i32, generation: i64) {
+/// Who a new gesture scrolls (see [`Owner`]): Claude's own view once it
+/// scrolls itself; else, for an agent the phone watches, its copy, unless the
+/// gesture goes back from the copy's top (or from an empty copy): then Claude
+/// starts scrolling itself.
+fn start_gesture(state: &mut State, delta: i32, generation: i64) -> Owner {
+    if state.local.program {
+        return Owner::Program;
+    }
+    if !state.agent() {
+        return Owner::Grid;
+    }
+    let Some(watched) = state.local.watched.clone() else {
+        // Not watched on this stream at all: as on phone-feedback. Watched
+        // but not looked at yet: nothing, so no view a save copies moves.
+        let unwatched = state.local.lost || state.local.incarnation.is_none();
+        return if unwatched { Owner::Grid } else { Owner::Nothing };
+    };
+    let (looked, rows) = match watched.try_lock() {
+        Ok(watched) => (watched.last.is_some(), watched.transcript.rows()),
+        // A copy being taken: there is one.
+        Err(_) => (true, 1),
+    };
+    if !looked {
+        return Owner::Nothing;
+    }
+    if delta <= 0 {
+        return Owner::Copy;
+    }
+    let at_top = match &state.local.reader {
+        Some((_, reader)) => {
+            let grid = reader.grid().lock();
+            grid.display_offset() >= grid.history_size()
+        }
+        None => rows == 0,
+    };
+    if !at_top {
+        return Owner::Copy;
+    }
     state.local.reader = None;
     show_render(Some(generation), state.render_id, None, None);
-    if let Some(terminal) = state.terminal.clone() {
-        program_wheel(&mut state.local, &terminal, rows);
-    }
+    state.local.program = true;
+    state.local.program_back = 0;
+    state.local.resume_after = None;
+    Owner::Program
 }
 
-fn program_wheel(local: &mut Local, terminal: &gpui_rio::Session, rows: i32) -> bool {
-    let before = terminal.parsed_output();
+/// Sends `rows` of wheel input (positive: back); the reports really sent,
+/// signed (at most 30 a call), 0 when the program takes none.
+fn wheel_reports(terminal: &gpui_rio::Session, rows: i32) -> i64 {
     if rows == 0 || !terminal.wheel(rows) {
-        return false;
+        return 0;
     }
-    local.wheel_after = Some(before);
-    true
+    i64::from(rows.signum()) * i64::from(rows.unsigned_abs().min(30))
 }
 
-/// A viewport parsed before the last wheel report cannot confirm its effect.
-fn return_from_wheel(state: &mut State, terminal: &gpui_rio::Session) -> bool {
-    let Some(after) = state.local.wheel_after else {
-        return true;
-    };
-    if terminal.parsed_output() == after || !at_newest(state, terminal, after) {
-        return false;
-    }
-    state.local.wheel_after = None;
-    true
-}
-
-fn at_newest(state: &State, terminal: &gpui_rio::Session, after: u64) -> bool {
-    let Some(watched) = &state.local.watched else {
+/// Whether Claude's own screen is the last one captured, or newer (it moved
+/// up from it): its newest rows are back on screen.
+fn newest_back(local: &Local, terminal: &gpui_rio::Session) -> bool {
+    let Some(watched) = &local.watched else {
         return false;
     };
     let Ok(watched) = watched.try_lock() else {
         return false;
     };
-    let grid = terminal.grid().lock();
-    if terminal.parsed_output() == after {
+    let (Some(last), Some(now)) = (watched.last.as_ref(), crate::snapshot::Screen::of(&terminal.grid().lock())) else {
         return false;
-    }
-    let (Some(last), Some(now)) = (watched.last.as_ref(), crate::snapshot::Screen::of(&grid)) else {
-        return true;
     };
-    drop(grid);
     let last: Vec<&str> = last.rows.iter().map(|r| r.text.as_str()).collect();
     let now: Vec<&str> = now.rows.iter().map(|r| r.text.as_str()).collect();
     matches!(crate::transcript::moved(&last, &now), crate::transcript::Moved::Still | crate::transcript::Moved::Up(_))
@@ -1472,6 +1526,26 @@ pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
         // Back to the newest line: the live grid, not the copy read back.
         if state.local.reader.take().is_some() {
             show_render(None, state.render_id, None, None);
+        }
+        state.local.gesture = None;
+        // Claude scrolled itself: as many reports forward as went back, and
+        // a screen more (it stops at its newest row); the next gesture is
+        // the copy's again. Nothing is captured until that row is back.
+        if state.local.program
+            && let Some(terminal) = state.terminal.clone()
+        {
+            let after = terminal.parsed_output();
+            let mut rest = state.local.program_back.max(0) + 30;
+            while rest > 0 {
+                let step = rest.min(30);
+                if wheel_reports(&terminal, -(step as i32)) == 0 {
+                    break;
+                }
+                rest -= step;
+            }
+            state.local.program = false;
+            state.local.program_back = 0;
+            state.local.resume_after = Some(after);
         }
         if let Some(terminal) = &state.terminal {
             terminal

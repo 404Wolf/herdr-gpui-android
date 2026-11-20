@@ -57,6 +57,35 @@ final class PendingInput {
         return head == null ? null : head.command;
     }
 
+    /** A command handed out by {@link #take(String)}, still held until {@link #sent(Held)}. */
+    static final class Held {
+        final String command;
+        private final Entry entry;
+
+        private Held(Entry entry) {
+            this.entry = entry;
+            this.command = entry.command;
+        }
+    }
+
+    /** {@link #next(String)}, as a handle that only {@link #sent(Held)} of the same one removes. */
+    Held take(String target) {
+        if (next(target) == null) return null;
+        return new Held(entries.peekFirst());
+    }
+
+    /**
+     * {@code held} was accepted by the session: it leaves the queue. Only that
+     * very command: nothing else is removed if the queue changed since (it was
+     * discarded, or another command is first now), so marking it twice, or
+     * late, never drops input that was not sent.
+     */
+    void sent(Held held) {
+        if (held == null || entries.peekFirst() != held.entry) return;
+        entries.pollFirst();
+        chars -= held.command.length();
+    }
+
     /** The command {@link #next(String)} returned was accepted by the session. */
     void sent() {
         Entry head = entries.pollFirst();

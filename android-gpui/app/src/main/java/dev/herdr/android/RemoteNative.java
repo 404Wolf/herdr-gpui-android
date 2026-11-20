@@ -85,8 +85,13 @@ final class RemoteNative {
      * the pick; false when a later open replaced it. Cheap: any thread.
      */
     static native boolean showOpened(long renderId);
+    /**
+     * Scrolls the pane on screen by {@code deltaRows} (positive: back). {@code gesture}
+     * numbers the drag (one per touch down; its fling is the same gesture): who it
+     * scrolls, the phone's copy or the program, is decided at its start.
+     */
     static native String scrollLocal(long handle, long deltaRows, long generation,
-            String title, String status, String shortcuts);
+            String title, String status, String shortcuts, long gesture);
     static native void close(long handle);
 
     /** A raw login shell on a remote PTY, drawn by the Rio terminal. Blocks for SSH: worker only. */
