@@ -327,6 +327,19 @@ HH:MM · may be outdated", until the live pane attaches. A dispatched action may
 already have reached the host when the connection fails. SSH semantic input is
 reported as queued and has no daemon receipt; see the remote guide.
 
+Agents' transcripts are kept for reading offline when the computer's Herdr core
+offers the bounded read (`read-bounded`) and program incarnations
+(`incarnation`). While a direct link is up the phone reads, with one bounded
+`terminal.read` at a time (never stitched, so a full-screen program is never
+scrolled), the agent on screen at most once a minute while it prints, and the
+other agents only on an unmetered network, each at most every five minutes.
+Each transcript is kept per computer, terminal and incarnation, up to 256 KB
+each, 48 transcripts and 16 MB in all, oldest first out. Offline, a pane offers
+"transcript · as of HH:MM" only when the last list its computer gave over a
+direct link shows the same program still running there; the transcript opens
+at its newest line, scrolls back, and says it may be outdated. A core without
+those features is never read and nothing is offered: the app behaves as before.
+
 See [../android/VALIDATION.md](../android/VALIDATION.md) for the previous native
 preview's checks. GPUI-specific build and runtime evidence belongs in
 `VALIDATION.md` in this directory; the earlier Java APK's validation is not proof
