@@ -34,8 +34,8 @@ public final class ClearRecoveryTest {
     void crash(String at){if(crashAfter.equals(at))throw new Crash();}
     public boolean cancelDictation(){return false;}
     public String draftText(){return drafts.text();}
-    public void setDraft(String t){drafts.edit(t);}
-    public void restoreDraft(String t){drafts.edit(ComposerDrafts.join(t,drafts.text()));}
+    public void setDraft(String t,String revision){drafts.edit(t,revision);}
+    public void restoreDraft(String t,String revision){drafts.edit(ComposerDrafts.join(t,drafts.text()),revision);}
     public List<String> clearable(){return courier.outbox().clearable("h",drafts.pane(),now());}
     public String messageText(String id){return courier.outbox().text(id);}
     public List<String> looseClips(){

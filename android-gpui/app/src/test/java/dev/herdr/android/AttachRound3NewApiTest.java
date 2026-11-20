@@ -14,15 +14,15 @@ import org.junit.Test;
 public final class AttachRound3NewApiTest {
     @Test public void aPathCommittedForOneHostsT1NeverLoadsOrSendsUnderAnotherHostsT1() {
         ComposerDrafts drafts = new ComposerDrafts();
-        drafts.setHost("hostA");
+        drafts.setHost("hostA", "revision-a", encoded -> true);
         drafts.switchTo("t1");
-        drafts.appendAttachment("hostA", "t1", "/a/files/t1/herdr-paste-1.png ");
+        drafts.appendAttachment("hostA", "revision-a", "t1", "/a/files/t1/herdr-paste-1.png ");
         drafts.setHost("hostB");
         drafts.switchTo("t1");
         assertEquals("B's t1 has its own, empty draft", "", drafts.text());
         assertEquals(null, drafts.outgoing());
         drafts.edit("hello from B");
-        drafts.setHost("hostA");
+        drafts.setHost("hostA", "revision-a", encoded -> true);
         drafts.switchTo("t1");
         assertEquals("/a/files/t1/herdr-paste-1.png ", drafts.text());
     }
@@ -31,18 +31,18 @@ public final class AttachRound3NewApiTest {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("hostB");
         drafts.switchTo("t1");
-        drafts.appendAttachment("hostA", "t1", "/a/x.png ");
+        drafts.appendAttachment("hostA", "revision-a", "t1", "/a/x.png ");
         assertEquals("", drafts.text());
-        drafts.setHost("hostA");
+        drafts.setHost("hostA", "revision-a", encoded -> true);
         drafts.switchTo("t1");
         assertEquals("/a/x.png ", drafts.text());
     }
 
     @Test public void hostScopedDraftsSurviveProcessDeathAndStayApart() {
         ComposerDrafts first = new ComposerDrafts();
-        first.setHost("hostA");
+        first.setHost("hostA", "revision-a", encoded -> true);
         first.switchTo("t1");
-        first.appendAttachment("hostA", "t1", "/a/x.png ");
+        first.appendAttachment("hostA", "revision-a", "t1", "/a/x.png ");
         first.setHost("hostB");
         first.switchTo("t1");
         first.edit("b text");
@@ -52,7 +52,7 @@ public final class AttachRound3NewApiTest {
         second.setHost("hostB");
         second.switchTo("t1");
         assertEquals("b text", second.text());
-        second.setHost("hostA");
+        second.setHost("hostA", "revision-a", encoded -> true);
         second.switchTo("t1");
         assertEquals("/a/x.png ", second.text());
     }
@@ -62,7 +62,7 @@ public final class AttachRound3NewApiTest {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.restore("{\"t1\":\"old draft\",\"t2\":\"other\"}");
         java.util.concurrent.atomic.AtomicReference<String> saved = new java.util.concurrent.atomic.AtomicReference<>();
-        drafts.setHost("hostA", encoded -> {
+        drafts.setHost("hostA", "revision-a", encoded -> {
             saved.set(encoded);
             return true;
         });
@@ -77,7 +77,7 @@ public final class AttachRound3NewApiTest {
         next.setHost("hostB");
         next.switchTo("t1");
         assertEquals("", next.text());
-        next.setHost("hostA");
+        next.setHost("hostA", "revision-a", encoded -> true);
         next.switchTo("t2");
         assertEquals("other", next.text());
     }

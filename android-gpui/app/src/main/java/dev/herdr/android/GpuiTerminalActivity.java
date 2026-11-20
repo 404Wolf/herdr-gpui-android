@@ -4,7 +4,6 @@ import android.annotation.SuppressLint;
 
 import android.app.AlertDialog;
 import android.content.ClipData;
-import android.content.ClipDescription;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.content.res.ColorStateList;
@@ -2059,6 +2058,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             next.resumed = resume;
             next.hostId = host.id;
+            next.connectionRevision = host.connectionRevision;
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -2431,7 +2431,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
-            composer.setPane(current == null ? "" : current.hostId, current == null ? "" : current.paneId, kind);
+            composer.setPane(current == null ? "" : current.hostId,
+                    current == null ? null : current.connectionRevision,
+                    current == null ? "" : current.paneId, kind);
             // Agent and shell panes differ in whether the keyboard keeps its mic.
             refreshTerminalImeOptions();
             refreshQueued();
@@ -4791,17 +4793,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void attachImages() { showAttachSources(); }
 
-            @Override public void attachUris(java.util.List<android.net.Uri> uris) { attachFrom(uris); }
-
             @android.annotation.TargetApi(31)
-            @Override public boolean attachPasted(ContentInfo payload, java.util.function.Consumer<ContentInfo> unhandled) {
-                AttachTarget target = attachTarget();
-                try {
-                    attachWorker.execute(() -> attachPastedOnWorker(target, payload, unhandled));
-                    return true;
-                } catch (java.util.concurrent.RejectedExecutionException closed) {
-                    return false;
-                }
+            @Override public boolean attachPasted(ContentInfo payload) {
+                return queueImagePaste(payload.getClip(), payload);
             }
 
             @Override public void attachFiles(java.util.List<java.io.File> files) {
@@ -4846,10 +4840,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         final long handle;
         final String pane;
         final String host;
-        AttachTarget(long handle, String pane, String host) {
+        final String revision;
+
+        AttachTarget(long handle, String pane, String host, String revision) {
             this.handle = handle;
             this.pane = pane;
             this.host = host;
+            this.revision = revision;
+        }
+
+        boolean matches(Connection connection) {
+            return host.equals(connection.hostId) && revision.equals(connection.connectionRevision)
+                    && pane.equals(connection.paneId);
         }
     }
 
@@ -4858,24 +4860,33 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) {
             Connection c = connection;
             if (c == null || c.offline || c.shell || !c.ready || c.isClosed() || c.remoteHandle <= 0
+                    || c.hostId == null || c.connectionRevision == null
                     || c.paneId == null || c.paneId.isEmpty()) return null;
             // An image's path belongs in an agent's composer; a plain shell's Enter bypasses the draft.
             if (!ComposerBar.isAgent(agentKind(c))) return null;
-            return new AttachTarget(c.remoteHandle, c.paneId, c.hostId);
+            return new AttachTarget(c.remoteHandle, c.paneId, c.hostId, c.connectionRevision);
         }
+    }
+
+    private static boolean profileStillCurrent(AttachTarget target) {
+        return target.revision.equals(RemoteHostStore.connectionRevision(target.host));
     }
 
     /**
      * The live session for {@code target}'s pane right now. Leaving for a picker or the camera can
      * end the session and bring up a new one on return, so the handle from before is never reused:
-     * waits up to 15 s for the same pane on the same host to be live again; null when it is not.
+     * waits up to 15 s for the original profile revision and pane to be live again.
      */
-    private AttachTarget liveTarget(AttachTarget target) {
+    private AttachTarget liveTarget(AttachTarget target, java.util.function.BooleanSupplier pasteCurrent) {
         long until = SystemClock.elapsedRealtime() + 15_000;
         do {
-            AttachTarget now = attachTarget();
-            if (now != null && now.pane.equals(target.pane)
-                    && java.util.Objects.equals(now.host, target.host)) return now;
+            if (attachmentInterruption(target, pasteCurrent) != null) return null;
+            synchronized (stateLock) {
+                if (connection != null && target.matches(connection)) {
+                    AttachTarget now = attachTarget();
+                    if (now != null) return now;
+                }
+            }
             try {
                 Thread.sleep(250);
             } catch (InterruptedException interrupted) {
@@ -4942,18 +4953,47 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void pasteImage() {
         android.content.ClipboardManager clipboard =
                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        android.content.ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
-        java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
-        for (int i = 0; clip != null && i < clip.getItemCount(); i++) {
-            android.net.Uri uri = clip.getItemAt(i).getUri();
-            String type = uri == null ? null : getContentResolver().getType(uri);
-            if (type != null && type.startsWith("image/")) uris.add(uri);
-        }
-        if (uris.isEmpty()) {
+        ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+        if (clip == null) {
             note("No image on the clipboard");
             return;
         }
-        attachFrom(uris);
+        queueImagePaste(clip, null);
+    }
+
+    /** Retain the receive-content payload while its temporary grant is in use on the worker. */
+    private boolean queueImagePaste(ClipData clip, Object payload) {
+        AttachTarget target = attachTarget();
+        if (target == null || composer == null) {
+            note("Open an agent to attach an image");
+            return true;
+        }
+        ComposerBar draft = composer;
+        long stamp = draft.pasteDraftStamp();
+        java.util.function.BooleanSupplier pasteCurrent = () -> {
+            synchronized (stateLock) {
+                return stamp == draft.pasteDraftStamp()
+                        && (connection == null || target.matches(connection));
+            }
+        };
+        try {
+            attachWorker.execute(() -> {
+                try {
+                    List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                    for (int i = 0; i < clip.getItemCount() && sources.size() < ImageAttach.MAX_IMAGES; i++) {
+                        if (attachmentInterruption(target, pasteCurrent) != null) break;
+                        Uri uri = clip.getItemAt(i).getUri();
+                        if (uri != null && isImageUri(uri)) sources.add(AttachImages.uriSource(getContentResolver(), uri));
+                    }
+                    attachOnWorker(target, sources, pasteCurrent);
+                } finally {
+                    java.lang.ref.Reference.reachabilityFence(payload);
+                }
+            });
+            return true;
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            return false;
+        }
     }
 
     @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
@@ -4980,59 +5020,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    private void attachFrom(java.util.List<android.net.Uri> uris) {
-        AttachTarget target = attachTarget();
-        if (target == null) {
-            note("Connect to a computer to attach an image");
-            return;
-        }
-        attachTo(target, uris);
-    }
-
     private void attachTo(AttachTarget target, java.util.List<android.net.Uri> uris) {
         java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
         for (android.net.Uri uri : uris) sources.add(AttachImages.uriSource(getContentResolver(), uri));
         attach(target, sources, null);
     }
 
-    @android.annotation.TargetApi(31)
-    private void attachPastedOnWorker(AttachTarget target, ContentInfo payload,
-            java.util.function.Consumer<ContentInfo> unhandled) {
-        try {
-            ClipData clip = payload.getClip();
-            ClipData rest = null;
-            List<ImageAttach.Source> sources = new java.util.ArrayList<>();
-            for (int i = 0; i < clip.getItemCount(); i++) {
-                ClipData.Item item = clip.getItemAt(i);
-                if (AttachImages.isPastedUri(item) && isImageUri(item.getUri())) {
-                    if (sources.size() < ImageAttach.MAX_IMAGES) {
-                        sources.add(AttachImages.uriSource(getContentResolver(), item.getUri()));
-                    }
-                } else if (rest == null) {
-                    rest = new ClipData(new ClipDescription(clip.getDescription()), item);
-                } else {
-                    rest.addItem(item);
-                }
-            }
-            if (rest != null) {
-                ContentInfo remaining = new ContentInfo.Builder(payload).setClip(rest).build();
-                main.post(() -> {
-                    if (!destroyed) unhandled.accept(remaining);
-                });
-            }
-            if (sources.isEmpty()) return;
-            if (target == null) note("Open an agent to attach an image");
-            else attachOnWorker(target, sources);
-        } finally {
-            // A keyboard's temporary grant lasts as long as the original ContentInfo is reachable.
-            java.lang.ref.Reference.reachabilityFence(payload);
-        }
-    }
-
     private boolean isImageUri(Uri uri) {
         try {
-            String mime = getContentResolver().getType(uri);
-            return mime != null && ClipDescription.compareMimeTypes(mime, "image/*");
+            return AttachImages.isImageMime(getContentResolver().getType(uri));
         } catch (RuntimeException unavailable) {
             return false;
         }
@@ -5047,7 +5043,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         try {
             attachWorker.execute(() -> {
                 try {
-                    attachOnWorker(target, sources);
+                    attachOnWorker(target, sources, null);
                 } finally {
                     if (done != null) done.run();
                 }
@@ -5057,11 +5053,33 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    private void attachOnWorker(AttachTarget target, List<ImageAttach.Source> sources) {
-        note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
-        ImageAttach.Outcome outcome = ImageAttach.attach(sources, AttachImages.CONVERTER,
+    private static String attachmentInterruption(AttachTarget target, java.util.function.BooleanSupplier pasteCurrent) {
+        if (pasteCurrent != null && !pasteCurrent.getAsBoolean()) return "Image paste cancelled: you switched panes";
+        return profileStillCurrent(target) ? null : "Image attachment cancelled: the remote profile changed";
+    }
+
+    private static void requireAttachmentCurrent(AttachTarget target, java.util.function.BooleanSupplier pasteCurrent)
+            throws ImageAttach.AttachException {
+        String interrupted = attachmentInterruption(target, pasteCurrent);
+        if (interrupted != null) throw new ImageAttach.AttachException(interrupted);
+    }
+
+    private void attachOnWorker(AttachTarget target, List<ImageAttach.Source> sources,
+            java.util.function.BooleanSupplier pasteCurrent) {
+        if (!sources.isEmpty() && attachmentInterruption(target, pasteCurrent) == null) {
+            note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
+        }
+        List<ImageAttach.Source> guarded = new java.util.ArrayList<>();
+        for (ImageAttach.Source source : sources.subList(0, Math.min(ImageAttach.MAX_IMAGES, sources.size()))) {
+            guarded.add(() -> {
+                requireAttachmentCurrent(target, pasteCurrent);
+                return source.read();
+            });
+        }
+        ImageAttach.Outcome outcome = ImageAttach.attach(guarded, AttachImages.CONVERTER,
                 (name, bytes) -> {
-                    AttachTarget live = liveTarget(target);
+                    AttachTarget live = liveTarget(target, pasteCurrent);
+                    requireAttachmentCurrent(target, pasteCurrent);
                     if (live == null) {
                         throw new ImageAttach.AttachException("The connection is down; try the image again");
                     }
@@ -5075,22 +5093,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 },
                 () -> java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis())
                         + System.nanoTime() % 1_000_000L);
-        main.post(() -> attached(target, outcome));
+        main.post(() -> attached(target, outcome, pasteCurrent));
     }
 
-    private void attached(AttachTarget target, ImageAttach.Outcome outcome) {
+    private void attached(AttachTarget target, ImageAttach.Outcome outcome,
+            java.util.function.BooleanSupplier pasteCurrent) {
         if (destroyed) return;
+        String interrupted = attachmentInterruption(target, pasteCurrent);
+        if (interrupted != null) {
+            note(interrupted);
+            return;
+        }
         if (!outcome.paths.isEmpty()) {
-            // Drafts are kept per computer and pane, so the path goes to the draft of the pane it was
-            // put for, shown or not, and never under another computer's pane of the same id.
             boolean kept = composer != null
-                    && composer.appendAttachment(target.host, target.pane, ImageAttach.quotePaths(outcome.paths));
+                    && composer.appendAttachment(target.host, target.revision, target.pane,
+                            ImageAttach.quotePaths(outcome.paths));
             int n = outcome.paths.size();
             note(!kept ? "The image arrived but the draft could not be saved"
                     : outcome.failures.isEmpty() ? (n == 1 ? "Image attached" : n + " images attached")
                     : n + " attached, " + outcome.failures.size() + " failed: " + outcome.failures.get(0));
         } else if (!outcome.failures.isEmpty()) {
             note(outcome.failures.get(0));
+        } else if (pasteCurrent != null) {
+            note("No image on the clipboard");
         }
     }
 
@@ -5125,7 +5150,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         new ActionSheet(this, chrome, (count == 1 ? "Attach the shared image to " : "Attach " + count + " shared images to ") + where + "?")
                 .add("Attach", () -> {
                     AttachTarget live = attachTarget();
-                    if (live == null || !live.pane.equals(target.pane) || !java.util.Objects.equals(live.host, target.host)) {
+                    if (live == null || !live.pane.equals(target.pane) || !live.host.equals(target.host)
+                            || !live.revision.equals(target.revision) || !profileStillCurrent(target)) {
                         note("That agent is not on screen any more; open it and share again");
                         return;
                     }
@@ -5571,6 +5597,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 next = new Connection(GENERATIONS.incrementAndGet(), remoteHandle);
                 next.hostId = currentHostId;
+                next.connectionRevision = launch.remoteHost.connectionRevision;
             } else next = new Connection(GENERATIONS.incrementAndGet(), new CompanionClient(launch.host.profile));
             connection = next;
             nativeSetActive(next.generation, false);
@@ -6790,6 +6817,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             offline.offline = true;
             offline.closed = true;
             offline.hostId = hostId;
+            offline.connectionRevision = RemoteHostStore.connectionRevision(hostId);
             offline.hostName = hostName;
             offline.title = hostName;
             offline.paneId = pane == null ? "" : pane;
@@ -7319,6 +7347,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String remoteBoot;
         /** The saved host this session belongs to, for the outbox; null for a companion or shell. */
         volatile String hostId;
+        /** The saved revision that opened this connection, even if the profile is later edited. */
+        String connectionRevision;
         volatile String paneId = launch.paneId;
         /** A pane switch asked for and not yet confirmed by the daemon, and until when to wait. */
         volatile String pendingPane = "";

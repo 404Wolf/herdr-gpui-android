@@ -4,7 +4,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -60,40 +59,40 @@ public final class AttachRound5Test {
         assertEquals("plain text", select(restored, edited, "t2"));
         assertEquals("the old profile's saved attachment must not appear on the new computer",
                 "", select(restored, edited, "t1"));
+        assertEquals("a late completion must not put the old path back", null,
+                restored.appendAttachment(original.id, original.connectionRevision, "t1", "/old.png "));
     }
 
     @Test public void aPendingUploadChecksTheSavedConnectionRevisionBeforePutting() throws Exception {
         String activity = source("GpuiTerminalActivity");
         String upload = section("GpuiTerminalActivity", "private void attachOnWorker(", "private void attached(");
         assertTrue("a profile edit keeps its ID, so ID alone cannot authorize a queued put",
-                upload.contains("profileStillCurrent(target)") && upload.indexOf("profileStillCurrent(target)")
+                upload.contains("requireAttachmentCurrent(target, pasteCurrent)")
+                        && upload.lastIndexOf("requireAttachmentCurrent(target, pasteCurrent)")
                         < upload.indexOf("RemoteNative.putFile("));
         assertTrue("the revision must come from the saved connection that opened the session",
-                activity.contains("connectionRevision"));
+                activity.contains("RemoteHostStore.connectionRevision(target.host)")
+                        && activity.contains("next.connectionRevision = host.connectionRevision"));
     }
 
-    // Run on the baseline as well, where the equivalent entry points only accept a host ID.
-    private static String select(ComposerDrafts drafts, SavedRemoteHost host, String pane) throws Exception {
-        try {
-            Method bind = ComposerDrafts.class.getDeclaredMethod("setHost", String.class, String.class,
-                    java.util.function.Predicate.class);
-            bind.invoke(drafts, host.id, host.connectionRevision,
-                    (java.util.function.Predicate<String>) encoded -> true);
-        } catch (NoSuchMethodException baseline) {
-            drafts.setHost(host.id);
-        }
+    @Test public void anUnversionedPreviewPathIsNeverAdoptedAsPlainText() throws Exception {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.restore(new org.json.JSONObject()
+                .put(ComposerDrafts.key("host", "t1"), "look at '/state & photos/herdr-core/default/files/t1/herdr-paste-123-2.png' ")
+                .put(ComposerDrafts.key("host", "t2"), "plain text")
+                .toString());
+        drafts.setHost("host", "new-revision", encoded -> true);
+        assertEquals("", drafts.switchTo("t1"));
+        assertEquals("plain text", drafts.switchTo("t2"));
+    }
+
+    private static String select(ComposerDrafts drafts, SavedRemoteHost host, String pane) {
+        drafts.setHost(host.id, host.connectionRevision, encoded -> true);
         return drafts.switchTo(pane);
     }
 
-    private static void append(ComposerDrafts drafts, SavedRemoteHost host, String pane, String paths)
-            throws Exception {
-        try {
-            Method append = ComposerDrafts.class.getDeclaredMethod("appendAttachment", String.class,
-                    String.class, String.class, String.class);
-            append.invoke(drafts, host.id, host.connectionRevision, pane, paths);
-        } catch (NoSuchMethodException baseline) {
-            drafts.appendAttachment(host.id, pane, paths);
-        }
+    private static void append(ComposerDrafts drafts, SavedRemoteHost host, String pane, String paths) {
+        drafts.appendAttachment(host.id, host.connectionRevision, pane, paths);
     }
 
     private static String section(String name, String start, String end) throws Exception {

@@ -15,8 +15,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -32,10 +34,22 @@ final class RemoteHostStore {
     private static final int MAX_BYTES = 2 * 1024 * 1024;
     static final int MAX_PROFILES = 32;
     private static final Object LOCK = new Object();
+    /** Published under LOCK after a read or successful write, for I/O-free attachment checks. */
+    private static volatile Map<String, String> connectionRevisions = java.util.Collections.emptyMap();
     private final AtomicFile file;
 
     RemoteHostStore(Context context) {
         file = new AtomicFile(new File(context.getNoBackupFilesDir(), "remote-hosts-v1.enc"));
+    }
+
+    static String connectionRevision(String hostId) {
+        return connectionRevisions.get(hostId);
+    }
+
+    private static void publishRevisions(List<SavedRemoteHost> values) {
+        Map<String, String> revisions = new HashMap<>();
+        for (SavedRemoteHost host : values) revisions.put(host.id, host.connectionRevision);
+        connectionRevisions = revisions;
     }
 
     List<SavedRemoteHost> read() throws Exception {
@@ -227,6 +241,7 @@ final class RemoteHostStore {
             File base = file.getBaseFile();
             if (base.exists() || new File(base.getPath() + ".bak").exists()
                     || new File(base.getPath() + ".new").exists()) throw missing;
+            publishRevisions(java.util.Collections.emptyList());
             return new ArrayList<>();
         }
         if (bytes.length < 30 || bytes[0] != 1) throw new IllegalStateException("Unsupported remote profile format");
@@ -246,6 +261,7 @@ final class RemoteHostStore {
                 if (!ids.add(host.id)) throw new IllegalStateException("Duplicate remote profile identity");
                 values.add(host);
             }
+            publishRevisions(values);
             return values;
         } finally { Arrays.fill(plaintext, (byte) 0); }
     }
@@ -269,6 +285,7 @@ final class RemoteHostStore {
                 out = file.startWrite();
                 out.write(payload);
                 file.finishWrite(out);
+                publishRevisions(values);
             } catch (Exception error) {
                 if (out != null) file.failWrite(out);
                 throw error;

@@ -1,6 +1,7 @@
 package dev.herdr.android;
 
 import android.content.ClipData;
+import android.content.ClipDescription;
 import android.content.ContentResolver;
 import android.content.Intent;
 import android.graphics.Bitmap;
@@ -34,9 +35,23 @@ final class AttachImages {
 
     private AttachImages() { }
 
-    static boolean isPastedUri(ClipData.Item item) {
-        return item.getUri() != null && item.getText() == null && item.getHtmlText() == null
-                && item.getIntent() == null;
+    /** Android gives MIME types for the whole clip, so accept only an unambiguously image clip. */
+    static boolean isImageClip(ClipData clip) {
+        ClipDescription types = clip.getDescription();
+        if (types.getMimeTypeCount() == 0 || clip.getItemCount() == 0) return false;
+        for (int i = 0; i < types.getMimeTypeCount(); i++) {
+            if (!isImageMime(types.getMimeType(i))) return false;
+        }
+        for (int i = 0; i < clip.getItemCount(); i++) {
+            ClipData.Item item = clip.getItemAt(i);
+            if (item.getUri() == null || item.getText() != null || item.getHtmlText() != null
+                    || item.getIntent() != null) return false;
+        }
+        return true;
+    }
+
+    static boolean isImageMime(String type) {
+        return type != null && ClipDescription.compareMimeTypes(type, "image/*");
     }
 
     /** The system picker for images only: the photo picker on Android 13+, the document picker before. */

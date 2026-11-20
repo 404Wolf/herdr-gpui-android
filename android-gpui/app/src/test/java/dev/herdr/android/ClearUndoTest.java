@@ -96,11 +96,16 @@ public final class ClearUndoTest {
 
         @Override public String draftText() { return drafts.text(); }
 
-        @Override public void setDraft(String text) { drafts.edit(text); }
+        @Override public String draftRevision() { return drafts.draftRevision(); }
 
-        @Override public void restoreDraft(String text) {
+        @Override public String connectionRevision() { return drafts.connectionRevision(); }
+
+        @Override public void setDraft(String text, String revision) { drafts.edit(text, revision); }
+
+        @Override public void restoreDraft(String text, String revision) {
             String now = drafts.text();
-            drafts.edit(now.trim().isEmpty() ? text : text + " " + now);
+            drafts.edit(now.trim().isEmpty() ? text : text + " " + now,
+                    revision == null ? drafts.draftRevision() : revision);
         }
 
         @Override public List<String> clearable() {
@@ -349,6 +354,26 @@ public final class ClearUndoTest {
     }
 
     // ---- across a restart ----
+
+    @Test public void anAttachmentUndoSurvivesRestartOnlyForItsOriginalRevision() {
+        World w = new World();
+        w.drafts.setHost("h", "revision-a", encoded -> true);
+        w.drafts.appendAttachment("h", "revision-a", "t1", "/a.png ");
+        new ClearUndo(w).tap(T1, true, now());
+
+        Restarted r = w.restart();
+        r.w.drafts.setHost("h", "revision-b", encoded -> true);
+        assertFalse(r.c.open(T1, now()));
+        assertFalse(r.c.undo(T1, now()));
+        assertEquals("", r.w.drafts.text());
+
+        r.w.drafts.setHost("h", "revision-a", encoded -> true);
+        assertTrue(r.c.undo(T1, now()));
+        assertEquals("revision-a", r.w.drafts.draftRevision());
+        assertEquals("/a.png ", r.w.drafts.text());
+        r.w.drafts.setHost("h", "revision-b", encoded -> true);
+        assertEquals("", r.w.drafts.text());
+    }
 
     @Test public void aClearedQueueIsStillRecoverableAfterARestartWithinTheWindow() {
         World w = new World();

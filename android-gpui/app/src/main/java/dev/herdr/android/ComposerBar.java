@@ -109,16 +109,11 @@ final class ComposerBar {
         default boolean canAttach() { return false; }
         /** "img" was tapped: offer the image sources (library, camera, clipboard). */
         default void attachImages() { }
-        /** Images the keyboard or a paste handed over: put them on the computer. */
-        default void attachUris(java.util.List<android.net.Uri> uris) { }
         /** Image files already copied to the cache: put them, then delete them. */
         default void attachFiles(java.util.List<java.io.File> files) { }
-        /**
-         * Classifies the payload off the UI thread, then gives unhandled items back on the UI
-         * thread. Returns whether it took the payload.
-         */
+        /** Queues an image-only payload and returns whether it was accepted. */
         @android.annotation.TargetApi(31)
-        default boolean attachPasted(ContentInfo payload, java.util.function.Consumer<ContentInfo> unhandled) {
+        default boolean attachPasted(ContentInfo payload) {
             return false;
         }
     }
@@ -143,6 +138,8 @@ final class ComposerBar {
      * high, never seen or touched. Its text is the draft, drawn as ghost text.
      */
     private final EditText field;
+    /** A worker can compare the stamp without looking at UI-owned draft or view state. */
+    private volatile long pasteDraftStamp;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
     /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
@@ -164,16 +161,20 @@ final class ComposerBar {
 
         @Override public String draftText() { return drafts.text(); }
 
-        @Override public void setDraft(String text) {
-            drafts.edit(text);
+        @Override public String draftRevision() { return drafts.draftRevision(); }
+
+        @Override public String connectionRevision() { return drafts.connectionRevision(); }
+
+        @Override public void setDraft(String text, String revision) {
+            drafts.edit(text, revision);
             if (text.isEmpty()) transcribedOnPhone = false;
             showText(text);
         }
 
-        @Override public void restoreDraft(String text) {
+        @Override public void restoreDraft(String text, String revision) {
             String now = drafts.text();
             String joined = now.trim().isEmpty() ? text : text.replaceAll("\\s+$", "") + " " + now;
-            drafts.edit(joined);
+            drafts.edit(joined, revision == null ? drafts.draftRevision() : revision);
             showText(joined);
         }
 
@@ -480,17 +481,16 @@ final class ComposerBar {
      * after what is there, one after them, as the desktop's paste types them), saved at once.
      * Nothing is sent. False when the draft could not be saved (left as it was).
      */
-    boolean appendAttachment(String hostId, String pane, String paths) {
-        String onHost = hostId == null ? "" : hostId;
-        if (pane == null || pane.isEmpty()) pane = drafts.pane();
+    boolean appendAttachment(String hostId, String revision, String pane, String paths) {
         Object before = drafts.snapshot();
-        String draft = drafts.appendAttachment(onHost, pane, paths);
+        String draft = drafts.appendAttachment(hostId, revision, pane, paths);
+        if (draft == null) return false;
         if (!persistNow()) {
             drafts.rollback(before);
             showText(drafts.text());
             return false;
         }
-        if (onHost.equals(drafts.host()) && pane.equals(drafts.pane())) showText(draft);
+        if (hostId.equals(drafts.host()) && pane.equals(drafts.pane())) showText(drafts.text());
         return true;
     }
 
@@ -597,12 +597,13 @@ final class ComposerBar {
      * The pane on screen changed, or what it runs did. {@code paneKind} is the
      * program's kind ("claude", "codex", another agent's), or "" for a shell.
      */
-    void setPane(String hostId, String paneId, String paneKind) {
+    void setPane(String hostId, String revision, String paneId, String paneKind) {
         String previous = drafts.pane();
         String previousOwner = drafts.owner();
         String onHost = hostId == null ? "" : hostId;
         // A pane id names a terminal on one computer only: the same id on another is another pane.
-        boolean switched = !onHost.equals(drafts.host()) || !previous.equals(paneId == null ? "" : paneId);
+        boolean switched = !onHost.equals(drafts.host()) || !previous.equals(paneId == null ? "" : paneId)
+                || !java.util.Objects.equals(revision, drafts.connectionRevision());
         if (switched && keepsAcrossPaneSwitch(dictationState)) {
             // Keep the recording and its text: offline it finds its pane's draft later, by
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
@@ -616,9 +617,10 @@ final class ComposerBar {
             routing.forget();
             drafts.dictationEnded();
         }
-        if (!drafts.setHost(onHost, this::commitDrafts)) host.notice("Could not save the older drafts");
+        if (!drafts.setHost(onHost, revision, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);
         if (switched) {
+            pasteDraftStamp++;
             // An undo belongs to the pane it cleared; the rows to the pane on screen. The first
             // pane after a start is no switch: a clear resumed from before it stays on offer.
             if (clearing.endsOnPaneChange(previousOwner, drafts.owner())) clearing.commit();
@@ -1474,6 +1476,7 @@ final class ComposerBar {
             }
             @Override public void afterTextChanged(Editable s) {
                 if (updatingField) return;
+                pasteDraftStamp++;
                 host.typed();
                 // A keyboard that types "\n" for Enter: send, as the button does.
                 String withoutNewline = insertingNewline ? null
@@ -1504,29 +1507,15 @@ final class ComposerBar {
         return edit;
     }
 
-    /**
-     * An image a keyboard inserts or a paste carries is attached; everything else (text, document
-     * URIs) is handed back to the field. Even MIME lookup can start or block on a provider, so
-     * the host partitions URI-bearing clips on its worker, with the original payload's grant.
-     */
+    /** Image-only clips attach. Android's field gets the original payload for all other pastes. */
     @android.annotation.TargetApi(31)
     private void listenForImages(EditText edit) {
         edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
-            android.content.ClipData clip = payload.getClip();
-            if (!clip.getDescription().hasMimeType("image/*")) return payload;
-            for (int i = 0; i < clip.getItemCount(); i++) {
-                if (!AttachImages.isPastedUri(clip.getItemAt(i))) continue;
-                String owner = drafts.owner();
-                boolean accepted = host.attachPasted(payload, rest -> {
-                    if (edit.isAttachedToWindow() && owner.equals(drafts.owner())) {
-                        edit.onReceiveContent(rest);
-                    }
-                });
-                return accepted ? null : payload;
-            }
-            return payload;
+            return AttachImages.isImageClip(payload.getClip()) && host.attachPasted(payload) ? null : payload;
         });
     }
+
+    long pasteDraftStamp() { return pasteDraftStamp; }
 
     /**
      * A session that a pane switch stops rather than cancels: its text is the phone's or is on
@@ -1637,6 +1626,7 @@ final class ComposerBar {
     private void showText(String text) {
         saveDraftsSoon();
         if (!field.getText().toString().equals(text)) {
+            pasteDraftStamp++;
             updatingField = true;
             try {
                 field.setText(text);

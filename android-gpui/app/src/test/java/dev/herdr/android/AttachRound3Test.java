@@ -39,7 +39,7 @@ public final class AttachRound3Test {
         drafts.switchTo("t1");
         drafts.dictationStarted();
         drafts.dictationPartial("describe this");
-        drafts.appendAttachment("t1", "/run/t1/herdr-paste-1.png ");
+        drafts.appendAttachment("", null, "t1", "/run/t1/herdr-paste-1.png ");
         String partial = drafts.dictationPartial("describe this screenshot");
         assertTrue(partial, partial.contains("/run/t1/herdr-paste-1.png"));
         String done = drafts.dictationFinal("describe this screenshot please");
@@ -51,7 +51,7 @@ public final class AttachRound3Test {
         String activity = source("GpuiTerminalActivity");
         String camera = section(activity, "private void takePhoto()", "private void pasteImage()");
         assertFalse("a second shot must not erase the first, still queued", camera.contains("CaptureFiles.clear("));
-        String result = section(activity, "@Override protected void onActivityResult(", "private void attachFrom(");
+        String result = section(activity, "@Override protected void onActivityResult(", "private void attachTo(");
         assertFalse("each job deletes only its own file", result.contains("CaptureFiles.clear("));
         assertTrue(result.contains("shot.delete()"));
         assertTrue("an empty OK result is reported", result.contains("shot.length() == 0") && result.contains("no picture"));
@@ -90,7 +90,7 @@ public final class AttachRound3Test {
         assertFalse(listener.contains("copyValidated("));
         assertFalse(listener.contains("getContentResolver()"));
         assertTrue("the payload stays referenced until the worker is done", listener.contains("host.attachPasted("));
-        String worker = section(source("GpuiTerminalActivity"), "private void attachPastedOnWorker(", "private boolean isImageUri(");
+        String worker = section(source("GpuiTerminalActivity"), "private boolean queueImagePaste(", "protected void onActivityResult(");
         assertTrue("the cap applies before anything is copied", worker.contains("MAX_IMAGES"));
         assertTrue("the payload retains its grant until the worker finishes", worker.contains("reachabilityFence(payload)"));
     }
@@ -100,6 +100,6 @@ public final class AttachRound3Test {
         assertTrue(activity.contains("composer.setPane(current == null ? \"\" : current.hostId"));
         assertTrue(source("ComposerBar").contains("drafts.setHost("));
         assertTrue("the completion appends under the host that received the image",
-                activity.contains("composer.appendAttachment(target.host, target.pane"));
+                activity.contains("composer.appendAttachment(target.host, target.revision, target.pane"));
     }
 }

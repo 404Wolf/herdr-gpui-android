@@ -69,10 +69,10 @@ public final class AttachWiringTest {
 
     @Test public void attachedPathsJoinTheDraftWithASpaceAndKeepTheirTrailingSpace() {
         ComposerDrafts drafts = new ComposerDrafts();
-        assertEquals("/a/b.png ", drafts.appendAttachment("t1", "/a/b.png "));
-        assertEquals("/a/b.png /c.jpg ", drafts.appendAttachment("t1", "/c.jpg "));
+        assertEquals("/a/b.png ", drafts.appendAttachment("", null, "t1", "/a/b.png "));
+        assertEquals("/a/b.png /c.jpg ", drafts.appendAttachment("", null, "t1", "/c.jpg "));
         drafts.append("t3", "look at");
-        assertEquals("look at /d.png ", drafts.appendAttachment("t3", "/d.png "));
+        assertEquals("look at /d.png ", drafts.appendAttachment("", null, "t3", "/d.png "));
     }
 
     @Test public void aSharedImageWaitsForAnAgentAndIsForgottenAfterTenMinutes() throws Exception {
@@ -151,7 +151,7 @@ public final class AttachWiringTest {
                 .contains("ComposerBar.isAgent(agentKind(c))"));
         String done = section(activity, "private void attached(AttachTarget target", "private int askedShare");
         // Drafts are host-qualified: the path goes to the draft of the host that received the image.
-        assertTrue(done.contains("composer.appendAttachment(target.host, target.pane"));
+        assertTrue(done.contains("composer.appendAttachment(target.host, target.revision, target.pane"));
     }
 
     @Test public void theShareTargetOpensOnlyGrantedContentUrisAndChecksTheyAreImages() throws Exception {
@@ -170,16 +170,6 @@ public final class AttachWiringTest {
         String home = source("HomeActivity");
         String content = section(home, "String waitingShare = SharedImages.notice(", "if (machines.isEmpty() && !hostsLoaded)");
         assertTrue(content.contains("body.addView(card"));
-    }
-
-    @Test public void thePasteListenerHandsBackWhatIsNotAnImage() throws Exception {
-        String listener = section(source("ComposerBar"), "private void listenForImages(", "A session that a pane switch");
-        assertTrue(listener.contains("hasMimeType(\"image/*\")"));
-        String worker = section(source("GpuiTerminalActivity"), "private void attachPastedOnWorker(", "private boolean isImageUri(");
-        assertTrue("the rest keeps the original payload metadata",
-                worker.contains("ContentInfo.Builder(payload).setClip(rest)"));
-        assertTrue("the rest goes back to the field", listener.contains("edit.onReceiveContent(rest)"));
-        assertTrue("a clip with no images is a normal paste", listener.contains("return payload;"));
     }
 
     @Test public void theCameraWritesToAPrivateFileNotThePublishedMediaStore() throws Exception {

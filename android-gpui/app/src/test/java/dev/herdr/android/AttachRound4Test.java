@@ -23,19 +23,9 @@ public final class AttachRound4Test {
     @Test public void adoptingALegacyDraftSavesItBeforeTheFirstEditOrLifecycleCallback() throws Exception {
         String composer = source("ComposerBar");
         assertTrue("selecting the first host must persist the legacy draft adoption before showing it",
-                composer.contains("drafts.setHost(onHost, this::commitDrafts)"));
+                composer.contains("drafts.setHost(onHost, revision, this::commitDrafts)"));
         assertTrue("migration clears the bare key and writes the host key in a synchronous transaction",
                 composer.contains("preferences.edit().putString(DRAFTS, encoded).commit()"));
-    }
-
-    @Test public void mixedPasteClassifiesEachUriOnTheWorkerAndReturnsNonImagesToTheField() throws Exception {
-        String activity = source("GpuiTerminalActivity");
-        String paste = activity.substring(activity.indexOf("private void attachPastedOnWorker("),
-                activity.indexOf("private void attach(AttachTarget"));
-        assertTrue("the paste worker must use each item's MIME type, not the clip's image/* label",
-                paste.contains("isImageUri(item.getUri())") && paste.contains("getContentResolver().getType(uri)"));
-        assertTrue("items outside the image partition must reach the native field",
-                source("ComposerBar").contains("edit.onReceiveContent("));
     }
 
     @Test public void senderReadableShareDoesNotNeedASeparateGrantForAPublicProvider() {

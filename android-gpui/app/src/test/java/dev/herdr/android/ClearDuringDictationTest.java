@@ -80,11 +80,12 @@ public final class ClearDuringDictationTest {
 
         @Override public String draftText() { return drafts.text(); }
 
-        @Override public void setDraft(String text) { drafts.edit(text); }
+        @Override public void setDraft(String text, String revision) { drafts.edit(text, revision); }
 
-        @Override public void restoreDraft(String text) {
+        @Override public void restoreDraft(String text, String revision) {
             String now = drafts.text();
-            drafts.edit(now.trim().isEmpty() ? text : text + " " + now);
+            drafts.edit(now.trim().isEmpty() ? text : text + " " + now,
+                    revision == null ? drafts.draftRevision() : revision);
         }
 
         @Override public List<String> clearable() { return Collections.emptyList(); }

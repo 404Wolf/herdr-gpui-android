@@ -2,6 +2,7 @@ package dev.herdr.android;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * The composer's local text, one draft per pane, so switching panes never loses
@@ -27,8 +28,18 @@ final class ComposerDrafts {
     /** A draft longer than this is not saved (it still lives while the app does). */
     static final int MAX_SAVED_CHARS = 64 * 1024;
 
-    private final Map<String, String> drafts = new LinkedHashMap<String, String>(16, 0.75f, true) {
-        @Override protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+    private static final class Draft {
+        final String text;
+        final String revision;
+
+        Draft(String text, String revision) {
+            this.text = text;
+            this.revision = revision;
+        }
+    }
+
+    private final Map<String, Draft> drafts = new LinkedHashMap<String, Draft>(16, 0.75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, Draft> eldest) {
             return size() > MAX_PANES;
         }
     };
@@ -38,6 +49,7 @@ final class ComposerDrafts {
      */
     private String pane = "";
     private String host = "";
+    private String connectionRevision;
     /** The draft before the utterance in progress, or null when not dictating. */
     private String dictationBase;
     /** At most this many marks per pane; the oldest go first. */
@@ -52,6 +64,13 @@ final class ComposerDrafts {
     private java.util.List<long[]> liveMarks = new java.util.ArrayList<>();
 
     private static final char SEP = '\u0001';
+    // Preview builds saved attachment paths as bare text, without a connection revision.
+    private static final java.util.regex.Pattern UNVERSIONED_ATTACHMENT = java.util.regex.Pattern.compile(
+            "/herdr-core/[^/]+/files/[^/]+/herdr-paste-[0-9]+(?:-[0-9]+)?\\.[a-z]+(?=['\\s]|$)");
+
+    static boolean hasUnversionedAttachment(String text) {
+        return UNVERSIONED_ATTACHMENT.matcher(text).find();
+    }
 
     /** The key a draft is kept under: the computer and its pane id together. */
     static String key(String host, String pane) {
@@ -68,22 +87,29 @@ final class ComposerDrafts {
      * no host) move to the first computer that can save their adoption.
      */
     void setHost(String next) {
-        setHost(next, encoded -> true);
+        setHost(next, null, encoded -> true);
     }
 
-    boolean setHost(String next, java.util.function.Predicate<String> persistMigration) {
+    boolean setHost(String next, String revision, java.util.function.Predicate<String> persistMigration) {
         String target = next == null ? "" : next;
-        if (target.equals(host)) return true;
+        if (target.equals(host) && Objects.equals(revision, connectionRevision)) return true;
         settleCuts(true);
         dictationBase = null;
+        if (revision != null) {
+            String prefix = key(target, "");
+            drafts.entrySet().removeIf(entry -> entry.getKey().startsWith(prefix)
+                    && entry.getValue().revision != null && !revision.equals(entry.getValue().revision));
+        }
         boolean saved = target.isEmpty() || migrateLegacy(target, persistMigration);
         String raw = rawPane(pane);
         host = target;
+        connectionRevision = revision;
         pane = key(host, raw);
         return saved;
     }
 
     String host() { return host; }
+    String connectionRevision() { return connectionRevision; }
 
     private boolean migrateLegacy(String to, java.util.function.Predicate<String> persist) {
         java.util.List<String> legacy = new java.util.ArrayList<>();
@@ -91,9 +117,9 @@ final class ComposerDrafts {
         if (legacy.isEmpty()) return true;
         Object before = snapshot();
         for (String k : legacy) {
-            String text = drafts.remove(k);
+            Draft draft = drafts.remove(k);
             String moved = key(to, k);
-            if (text != null && !drafts.containsKey(moved)) drafts.put(moved, text);
+            if (draft != null) drafts.putIfAbsent(moved, draft);
             java.util.List<long[]> marks = cutMarks.remove(k);
             if (marks != null) cutMarks.putIfAbsent(moved, marks);
         }
@@ -118,18 +144,34 @@ final class ComposerDrafts {
 
     /** Every pane's draft (the dictation chips they hold must keep their recordings). */
     java.util.List<String> all() {
-        return new java.util.ArrayList<>(drafts.values());
+        java.util.List<String> texts = new java.util.ArrayList<>();
+        for (Draft draft : drafts.values()) texts.add(draft.text);
+        return texts;
     }
 
     String text() {
-        String text = drafts.get(pane);
-        return text == null ? "" : text;
+        Draft draft = visibleDraft(pane);
+        return draft == null ? "" : draft.text;
+    }
+
+    String draftRevision() {
+        Draft draft = visibleDraft(pane);
+        return draft == null ? null : draft.revision;
+    }
+
+    private Draft visibleDraft(String key) {
+        Draft draft = drafts.get(key);
+        return draft == null || draft.revision == null || draft.revision.equals(connectionRevision) ? draft : null;
     }
 
     /** The field changed under the user's fingers. */
     void edit(String text) {
+        edit(text, draftRevision());
+    }
+
+    void edit(String text, String revision) {
         if (text == null || text.isEmpty()) drafts.remove(pane);
-        else drafts.put(pane, text);
+        else drafts.put(pane, new Draft(text, revision));
     }
 
     void dictationStarted() { dictationBase = text(); }
@@ -188,17 +230,18 @@ final class ComposerDrafts {
      * deleted: the outbox, then {@link #append}, are next).
      */
     String placeDictation(String clipId, String spoken) {
-        for (Map.Entry<String, String> draft : drafts.entrySet()) {
-            String filled = DictationToken.fill(draft.getValue(), clipId, spoken);
+        for (Map.Entry<String, Draft> draft : drafts.entrySet()) {
+            String before = draft.getValue().text;
+            String filled = DictationToken.fill(before, clipId, spoken);
             if (filled == null) continue;
             String pane = draft.getKey();
-            shiftMarks(pane, draft.getValue(), draft.getValue().indexOf(DictationToken.of(clipId)), filled);
+            shiftMarks(pane, before, before.indexOf(DictationToken.of(clipId)), filled);
             if (pane.equals(this.pane) && dictationBase != null) {
                 String inBase = DictationToken.fill(dictationBase, clipId, spoken);
                 if (inBase != null) dictationBase = inBase;
             }
             if (filled.isEmpty()) drafts.remove(pane);
-            else draft.setValue(filled);
+            else draft.setValue(new Draft(filled, draft.getValue().revision));
             return rawPane(pane);
         }
         return null;
@@ -212,18 +255,14 @@ final class ComposerDrafts {
     /** As {@link #append(String, String)}, with the desktop's unverified cuts (offsets in {@code spoken}). */
     String append(String pane, String spoken, int[] cuts) {
         String key = key(host, pane);
-        String before = drafts.get(key);
+        Draft draft = visibleDraft(key);
+        String before = draft == null ? null : draft.text;
         String text = join(before, spoken);
         if (text.isEmpty()) return text;
         if (key.equals(this.pane) && dictationBase != null) dictationBase = join(dictationBase, spoken);
-        drafts.put(key, text);
+        drafts.put(key, new Draft(text, draft == null ? null : draft.revision));
         for (int at : placed(before, spoken, cuts)) mark(key, text, at);
         return text;
-    }
-
-    /** As {@link #appendAttachment(String, String, String)} for a pane of the computer on screen. */
-    String appendAttachment(String pane, String paths) {
-        return appendAttachment(host, pane, paths);
     }
 
     /**
@@ -232,11 +271,14 @@ final class ComposerDrafts {
      * sent. While a dictation is in progress the paths also join its base, so the next partial or
      * final transcript keeps them.
      */
-    String appendAttachment(String onHost, String pane, String paths) {
+    String appendAttachment(String onHost, String revision, String pane, String paths) {
+        if (host.equals(onHost) && !Objects.equals(revision, connectionRevision)) return null;
         String key = key(onHost, pane);
-        String before = drafts.get(key);
+        Draft draft = drafts.get(key);
+        if (draft != null && draft.revision != null && !draft.revision.equals(revision)) return null;
+        String before = draft == null ? null : draft.text;
         String text = joinAttachment(before, paths);
-        drafts.put(key, text);
+        drafts.put(key, new Draft(text, revision));
         if (key.equals(this.pane) && dictationBase != null) dictationBase = joinAttachment(dictationBase, paths);
         return text;
     }
@@ -389,8 +431,11 @@ final class ComposerDrafts {
     String encode() {
         org.json.JSONObject out = new org.json.JSONObject();
         try {
-            for (Map.Entry<String, String> draft : drafts.entrySet()) {
-                if (draft.getValue().length() <= MAX_SAVED_CHARS) out.put(draft.getKey(), draft.getValue());
+            for (Map.Entry<String, Draft> entry : drafts.entrySet()) {
+                Draft draft = entry.getValue();
+                if (draft.text.length() > MAX_SAVED_CHARS) continue;
+                out.put(entry.getKey(), draft.revision == null ? draft.text : new org.json.JSONObject()
+                        .put("text", draft.text).put("revision", draft.revision));
             }
         } catch (org.json.JSONException impossible) {
             return "{}";
@@ -416,7 +461,7 @@ final class ComposerDrafts {
     void rollback(Object snapshot) {
         Object[] s = (Object[]) snapshot;
         drafts.clear();
-        drafts.putAll((Map<String, String>) s[0]);
+        drafts.putAll((Map<String, Draft>) s[0]);
         dictationBase = (String) s[1];
         // Copies: a snapshot rolled back to twice must not see the first rollback's changes.
         cutMarks.clear();
@@ -434,13 +479,24 @@ final class ComposerDrafts {
 
     void restore(String saved) {
         if (saved == null || saved.isEmpty()) return;
-        Map<String, String> typed = new LinkedHashMap<>(drafts);
+        Map<String, Draft> typed = new LinkedHashMap<>(drafts);
         try {
             org.json.JSONObject in = new org.json.JSONObject(saved);
             for (java.util.Iterator<String> keys = in.keys(); keys.hasNext(); ) {
                 String key = keys.next();
-                String text = in.optString(key, "");
-                if (!key.isEmpty() && !text.isEmpty() && text.length() <= MAX_SAVED_CHARS) drafts.put(key, text);
+                Object value = in.opt(key);
+                Draft draft;
+                if (value instanceof org.json.JSONObject) {
+                    org.json.JSONObject savedDraft = (org.json.JSONObject) value;
+                    String revision = savedDraft.optString("revision", "");
+                    if (revision.isEmpty()) continue;
+                    draft = new Draft(savedDraft.optString("text", ""), revision);
+                } else if (value instanceof String && !hasUnversionedAttachment((String) value)) {
+                    draft = new Draft((String) value, null);
+                } else continue;
+                if (!key.isEmpty() && !draft.text.isEmpty() && draft.text.length() <= MAX_SAVED_CHARS) {
+                    drafts.put(key, draft);
+                }
             }
         } catch (org.json.JSONException damaged) {
             return;
