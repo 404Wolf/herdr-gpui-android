@@ -73,10 +73,9 @@ public final class KbTalkTest {
     @Test public void cancelStopsAndDiscardsWhatWasDictatedKeepingTheEarlierText() throws Exception {
         String bar = source("ComposerBar");
         String tapped = section(bar, "private void targetTapped(String id)", "private static String describe(");
-        assertTrue(tapped.contains("case \"cancel\""));
-        assertTrue(section(tapped, "case \"cancel\"", "case \"send\"").contains("cancelDictationForClear()")
-                || tapped.indexOf("cancelDictationForClear()") > tapped.indexOf("case \"cancel\""));
-        assertTrue(section(bar, "private static String describe(", "/** Recordings the desktop gave up on").contains("case \"cancel\""));
+        assertTrue(tapped.contains("case ControlLine.CANCEL: cancelDictation(); break;"));
+        assertTrue(section(bar, "private void cancelDictation()", "private void tapClear(").contains("cancelDictationForClear()"));
+        assertTrue(section(bar, "private static String describe(", "/** Recordings the desktop gave up on").contains("case ControlLine.CANCEL"));
         // The draft as it was before the dictation began.
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.switchTo("t1");
@@ -97,6 +96,7 @@ public final class KbTalkTest {
 
     @Test public void aDownwardSwipeAlsoPutsTheKeyboardAwayOnHome() throws Exception {
         String home = source("HomeActivity");
-        assertTrue(section(home, "public boolean dispatchTouchEvent(", "\n    }\n").contains("KeyboardHide."));
+        assertTrue(home.contains("new KeyboardHide.Swipe()"));
+        assertTrue(section(home, "public boolean dispatchTouchEvent(", "\n    }\n").contains("keyboardSwipe.onTouch("));
     }
 }

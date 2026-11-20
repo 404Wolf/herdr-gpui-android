@@ -1018,6 +1018,7 @@ final class ComposerBar {
         switch (id) {
             case "type": toggleTyping(); break;
             case "talk": toggleDictation(); break;
+            case ControlLine.CANCEL: cancelDictation(); break;
             case ControlLine.ATTACH: host.attachImages(); break;
             case "send": enter(); break;
             case "clear": tapClear(false); break;
@@ -1038,8 +1039,9 @@ final class ComposerBar {
     private static String describe(String id) {
         if (id.startsWith("echo-")) return "A queued message: tap for its actions";
         switch (id) {
-            case "type": return "Type a message";
+            case "type": return "Type a message, or put the keyboard away";
             case "talk": return "Dictate; tap again to stop";
+            case ControlLine.CANCEL: return "Stop and discard what was dictated; the earlier text stays";
             case ControlLine.ATTACH: return "Attach an image: photo library, camera or clipboard";
             case "row-retry": return "Send this recording to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
@@ -1088,6 +1090,7 @@ final class ComposerBar {
         in.queueStyle = queueStyle(queuedMessages, loose.size() + parkedHere().size(), linkDown);
         in.expanded = queueOpen;
         in.attach = host.canAttach();
+        in.dictating = dictating();
         in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
         if (clearing.open(drafts.owner(), wall())) {
             in.undoWide = clearing.label(false);
@@ -1155,6 +1158,12 @@ final class ComposerBar {
         // One engine for the process (#30): only the session this window started is cancelled;
         // another window's recording is its own.
         return routing.cancelForClear(dictation, dictating() && Dictation.owns(this));
+    }
+
+    /** "cancel": the dictation ends and its words leave the draft, which is as it was before it began. */
+    private void cancelDictation() {
+        if (cancelDictationForClear()) showText(drafts.text());
+        pushGhost();
     }
 
     private void tapClear(boolean longPress) {

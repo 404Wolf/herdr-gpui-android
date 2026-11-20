@@ -32,10 +32,14 @@ final class ControlLine {
         boolean expanded;
         /** The pane can take an image: "img" leads the line while the full line leaves it room. */
         boolean attach;
+        /** A dictation is on (connecting, recording, transcribing): "cancel" shows, and "send" stays. */
+        boolean dictating;
     }
 
     /** The attach control's id: it opens the image sources (library, camera, clipboard). */
     static final String ATTACH = "attach";
+    /** While a dictation is on: stop and discard it, keeping the text that was there before. */
+    static final String CANCEL = "cancel";
 
     /** The talk slot's width in cells: its words ("talk", "stop", "…") are padded to it. */
     static final int TALK_SLOT = 4;
@@ -96,6 +100,11 @@ final class ControlLine {
             statuses.add(new GhostText.Control(STATUS, t.spans));
         }
         GhostText.Control clear = in.clearable ? new GhostText.Control("clear", "✕", "dim") : null;
+        // The wide lines say "clear" in words (a lone dim cross was hard to find); the narrow ones
+        // keep the cross. While a dictation is on, "cancel" is the clearer word beside it, so the
+        // cross stays a cross there.
+        boolean dictation = in.recording || in.dictating;
+        GhostText.Control clearWord = in.clearable && !dictation ? new GhostText.Control("clear", "clear", "warn") : clear;
         GhostText.Control undoWide = in.undoWide == null ? null : new GhostText.Control("undo", in.undoWide, "info");
         GhostText.Control undo = in.undoNarrow == null ? null : new GhostText.Control("undo", in.undoNarrow, "info");
         String mark = in.expanded ? " ▲" : "";
@@ -106,12 +115,15 @@ final class ControlLine {
                         in.queueStyle);
         GhostText.Control fullStatus = statuses.isEmpty() ? null : statuses.get(0);
         GhostText.Control shortStatus = statuses.isEmpty() ? null : statuses.get(statuses.size() - 1);
+        // While a dictation is on, "cancel" leads every line: it stops and discards what was
+        // dictated, keeping the text that was there before. "send" (in the slots) stops and sends.
+        GhostText.Control cancel = in.recording || in.dictating ? new GhostText.Control(CANCEL, "cancel", "warn") : null;
         java.util.List<java.util.List<GhostText.Control>> left = new java.util.ArrayList<>();
-        left.add(line(clear, undoWide, queueWide, fullStatus));
-        left.add(line(clear, undoWide, queueWide, shortStatus));
-        left.add(line(clear, undo, queue, shortStatus));
-        left.add(line(clear, undo, queue, null));
-        left.add(line(clear, null, queue, null));
+        left.add(line(cancel, clearWord, undoWide, queueWide, fullStatus));
+        left.add(line(cancel, clearWord, undoWide, queueWide, shortStatus));
+        left.add(line(cancel, clear, undo, queue, shortStatus));
+        left.add(line(cancel, clear, undo, queue, null));
+        left.add(line(cancel, clear, null, queue, null));
         java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
         if (in.attach) {
             // Only the fullest line carries it, ahead of its words: where that line does not fit,
@@ -135,13 +147,16 @@ final class ControlLine {
     /** The three fixed slots: "type" (or its reserved rule), "talk", "send" (or its rule). */
     static java.util.List<GhostText.Control> slots(State in) {
         java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
-        out.add(in.typing ? new GhostText.Control(GAP_TYPE, "────", "dim") : new GhostText.Control("type", "type", "dim"));
+        // The keyboard up: the same slot, the same width, says "hide" and puts it away (Back and a
+        // downward swipe do too). It was an untappable rule here until asks 9 and 10.
+        out.add(in.typing ? new GhostText.Control("type", "hide", "dim") : new GhostText.Control("type", "type", "dim"));
         if (!in.talks.isEmpty()) {
             GhostText.Control t = in.talks.get(in.talks.size() - 1);
             out.add(new GhostText.Control("talk", padded(t.spans, TALK_SLOT)));
         }
-        out.add(in.recording ? new GhostText.Control(GAP_SEND, "────", "dim")
-                : new GhostText.Control("send", "send", "bright"));
+        // Always there, recording or not: while a dictation is on it stops it, waits for the final
+        // transcript and sends the draft (ComposerBar.enter).
+        out.add(new GhostText.Control("send", "send", "bright"));
         return out;
     }
 

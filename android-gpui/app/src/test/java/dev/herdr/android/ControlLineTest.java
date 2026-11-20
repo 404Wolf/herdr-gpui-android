@@ -56,14 +56,14 @@ public final class ControlLineTest {
         assertEquals("type talk send", ids(idle));
         assertEquals("type", idle.get(0).spans[0]);
         assertEquals("talk", byId(idle, "talk").spans[0]);
-        // #30: no "type" while the keyboard is up, and no Herdr hide: its slot keeps the rule.
+        // Ask 9: while the keyboard is up the same slot, the same width, says "hide" and puts it away.
         java.util.List<GhostText.Control> typing = controls(true, IDLE, 0, Integer.MAX_VALUE, false, false);
-        assertEquals("gap-type talk send", ids(typing));
-        assertEquals("────", byId(typing, "gap-type").spans[0]);
-        assertFalse(ControlLine.tappable("gap-type"));
-        // Recording: no "send" (the stop owns the corner), its slot keeps the rule.
+        assertEquals("type talk send", ids(typing));
+        assertEquals("hide", typing.get(0).spans[0]);
+        assertTrue(ControlLine.tappable("type"));
+        // Ask 10: recording keeps "send" (stop and send) and adds "cancel".
         java.util.List<GhostText.Control> rec = controls(false, LISTENING, 0, Integer.MAX_VALUE, true, true);
-        assertEquals("clear status type talk gap-send", ids(rec));
+        assertEquals("cancel clear status type talk send", ids(rec));
         assertEquals("stop", byId(rec, "talk").spans[0]);
         assertEquals("rec 0:05", byId(rec, "status").spans[0]);
         assertFalse(ControlLine.tappable("status"));
@@ -73,9 +73,11 @@ public final class ControlLineTest {
         // #30's rule (a draft) and #20's (a dictation in flight, item 74; a queue, item 76).
         assertEquals("clear type talk send", ids(controls(false, IDLE, 0, Integer.MAX_VALUE, false, true)));
         assertEquals("type talk send", ids(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
-        assertEquals("✕", byId(controls(false, IDLE, 0, Integer.MAX_VALUE, false, true), "clear").spans[0]);
-        // While recording "✕" still shows: it clears and cancels (Wolf's pick).
-        assertTrue(ids(controls(false, LISTENING, 0, Integer.MAX_VALUE, true, true)).startsWith("clear "));
+        // Ask 14: the wide line says "clear" in words; the narrow ones keep the cross.
+        assertEquals("clear", byId(controls(false, IDLE, 0, Integer.MAX_VALUE, false, true), "clear").spans[0]);
+        assertEquals("✕", byId(controls(false, IDLE, 0, 32, false, true), "clear").spans[0]);
+        // While recording "cancel" leads and "✕" stays beside it: it still clears and cancels.
+        assertTrue(ids(controls(false, LISTENING, 0, Integer.MAX_VALUE, true, true)).startsWith("cancel clear "));
         // Just cleared and nothing left to clear: "undo" stands in "✕"'s place (#30)...
         ControlLine.State justCleared = state(false, IDLE, 0, false, false);
         justCleared.undoWide = "cleared · undo";
@@ -108,8 +110,8 @@ public final class ControlLineTest {
     @Test public void theLineIsMeasuredAsTheRendererDrawsIt() {
         // " type ─ talk ─ send ──": talk's slot is four cells.
         assertEquals(22, ControlLine.width(controls(false, IDLE, 0, Integer.MAX_VALUE, false, false)));
-        // " ✕ ─ 2 queued ─ type ─ talk ─ send ──": the cross and rules are one cell each.
-        assertEquals(37, ControlLine.width(controls(false, IDLE, 2, Integer.MAX_VALUE, false, true)));
+        // " clear ─ 2 queued ─ type ─ talk ─ send ──": "clear" is five cells (the narrow lines keep ✕).
+        assertEquals(41, ControlLine.width(controls(false, IDLE, 2, Integer.MAX_VALUE, false, true)));
         // A padded word: "…" in the middle of talk's four cells.
         assertEquals(" …  ", ControlLine.padded(new String[] {"…", "info"}, ControlLine.TALK_SLOT)[0]);
     }
@@ -123,12 +125,13 @@ public final class ControlLineTest {
                 assertTrue(at, ids(line).contains("clear"));
                 assertTrue(at, ids(line).contains("queue"));
                 assertTrue(at, ids(line).contains("talk"));
-                if (cols >= 39) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
+                // Recording adds "cancel" (and keeps "send"): the barest line needs 9 cells more.
+                if (cols >= (recording ? 48 : 39)) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
             }
         }
         // The cover screen (~46 columns) recording: the status words shorten, then go.
-        assertEquals("0:05", byId(controls(false, LISTENING, 3, 52, true, true), "status").spans[0]);
-        assertEquals("clear queue type talk gap-send", ids(controls(false, LISTENING, 3, 41, true, true)));
+        assertEquals("0:05", byId(controls(false, LISTENING, 3, 62, true, true), "status").spans[0]);
+        assertEquals("cancel clear queue type talk send", ids(controls(false, LISTENING, 3, 41, true, true)));
         assertEquals("≡3", byId(controls(false, IDLE, 3, 41, false, true), "queue").spans[0]);
     }
 
@@ -183,7 +186,7 @@ public final class ControlLineTest {
         assertTrue(ladder.size() >= 3);
         int last = Integer.MAX_VALUE;
         for (java.util.List<GhostText.Control> line : ladder) {
-            assertTrue(ids(line), ids(line).endsWith("type talk gap-send"));
+            assertTrue(ids(line), ids(line).endsWith("type talk send"));
             assertTrue("widest first", ControlLine.width(line) <= last);
             last = ControlLine.width(line);
         }

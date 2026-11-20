@@ -734,8 +734,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
-        // Back puts the composer's keyboard away first.
+        // Back puts the composer's keyboard away first (and any other keyboard that is up).
         if (composer != null && composer.hideKeyboard()) return;
+        if (KeyboardHide.hideIfShown(this)) return;
         if (sidebarOpen && railAsDrawer()) {
             hideSidebar();
             return;
@@ -5471,7 +5472,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (axis == RendererTouch.AXIS_Y) {
                 scrolling = true;
                 // Dragging the conversation down while typing puts the keyboard away.
-                if (event.getY() > touchDownY && composer != null) composer.hideKeyboard();
+                if (event.getY() > touchDownY && composer != null) {
+                    if (!composer.hideKeyboard()) KeyboardHide.hideIfShown(this);
+                }
                 // The drag is ours from here: the renderer's press (a link's
                 // highlight, a selection) ends now, not at a lift it never sees.
                 claimRendererTouch();
