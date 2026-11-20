@@ -15,8 +15,13 @@ import org.junit.Test;
 public final class QueueViewTest {
     private static final int WIDE = 100, COVER = 52;
 
-    private static Outbox.Message msg(String id, String pane, String text, Outbox.State state, boolean blocked) {
-        return new Outbox.Message(id, "h", pane, "b", text, 1, state, blocked);
+    private static Outbox.Message msg(String id, String pane, String text, Outbox.State state, boolean unused) {
+        return new Outbox.Message(id, HeldFixtures.target("h", pane), text, HeldFixtures.at(1), state,
+                state == Outbox.State.NEEDS_YOU ? Outbox.Reason.UNSURE : null, false, 0, "");
+    }
+
+    private static Outbox.Message gone(String id, String pane, String text) {
+        return new Outbox.Message(id, "h", pane, text, Outbox.State.NEEDS_YOU, Outbox.Reason.GONE);
     }
 
     private static PendingClip clip(String id) throws Exception {
@@ -36,11 +41,11 @@ public final class QueueViewTest {
         QueueView view = new QueueView();
         List<Outbox.Message> messages = Arrays.asList(
                 msg("s", "t1", "going now", Outbox.State.SENDING, false),
-                msg("a", "t1", "first", Outbox.State.QUEUED, false),
-                msg("b", "t1", "second " + DictationToken.of("c9"), Outbox.State.QUEUED, false),
-                msg("d", "t1", "behind a dialog", Outbox.State.QUEUED, true),
-                msg("u", "t1", "maybe", Outbox.State.UNSURE, false),
-                msg("g", "t2", "old pane", Outbox.State.GONE, false));
+                msg("a", "t1", "first", Outbox.State.PENDING, false),
+                msg("b", "t1", "second " + DictationToken.of("c9"), Outbox.State.PENDING, false),
+                msg("d", "t1", "behind a dialog", Outbox.State.PENDING, true),
+                msg("u", "t1", "maybe", Outbox.State.NEEDS_YOU, false),
+                gone("g", "t2", "old pane"));
         view.update("t1", messages, 0);
         List<QueueView.Row> wide = view.rows("t1", messages, Collections.singletonList(clip("c1")),
                 Collections.singletonList(clip("p1")), 2, WIDE, true, null, 0);
@@ -58,11 +63,11 @@ public final class QueueViewTest {
         assertEquals(QueueView.COLLAPSED_ROWS, rows.size());
         assertEquals("✗ not transcribed yet · retry | sends when back", states(rows));
         assertEquals("● sending…", QueueView.state(messages.get(0), "t1", 0, false));
-        assertEquals("◌ queued 1st", QueueView.state(messages.get(1), "t1", 1, false));
+        assertEquals("◌ held 1st · tap Send", QueueView.state(messages.get(1), "t1", 1, false));
         assertEquals("◌ waits for desktop", QueueView.state(messages.get(2), "t1", 2, false));
-        assertEquals("◌ waits for its dialog", QueueView.state(messages.get(3), "t1", 3, false));
-        assertEquals("? may have been sent", QueueView.state(messages.get(4), "t1", 0, false));
-        assertEquals("✗ not sent · t2 gone", QueueView.state(messages.get(5), "t1", 0, false));
+        assertEquals("◌ held 3rd · tap Send", QueueView.state(messages.get(3), "t1", 3, false));
+        assertEquals("? may have been sent · needs you", QueueView.state(messages.get(4), "t1", 0, false));
+        assertEquals("✗ needs you · t2 gone", QueueView.state(messages.get(5), "t1", 0, false));
         assertEquals("●", QueueView.state(messages.get(0), "t1", 0, true));
         assertEquals("◌2", QueueView.state(messages.get(1), "t1", 2, true));
         assertEquals("?", QueueView.state(messages.get(4), "t1", 0, true));
@@ -75,9 +80,9 @@ public final class QueueViewTest {
     @Test public void theFullListHasEveryRowRecordingsAndParkedOnesTooWithNoMoreRow() throws Exception {
         QueueView view = new QueueView();
         List<Outbox.Message> messages = Arrays.asList(
-                msg("a", "t1", "1", Outbox.State.QUEUED, false), msg("b", "t1", "2", Outbox.State.QUEUED, false),
-                msg("c", "t1", "3", Outbox.State.QUEUED, false), msg("d", "t1", "4", Outbox.State.QUEUED, false),
-                msg("e", "t1", "5", Outbox.State.QUEUED, false), msg("f", "t1", "6", Outbox.State.QUEUED, false));
+                msg("a", "t1", "1", Outbox.State.PENDING, false), msg("b", "t1", "2", Outbox.State.PENDING, false),
+                msg("c", "t1", "3", Outbox.State.PENDING, false), msg("d", "t1", "4", Outbox.State.PENDING, false),
+                msg("e", "t1", "5", Outbox.State.PENDING, false), msg("f", "t1", "6", Outbox.State.PENDING, false));
         List<PendingClip> clips = Collections.singletonList(clip("c1"));
         List<PendingClip> parked = Collections.singletonList(clip("p1"));
         // On the line the oldest hide behind "+N more"...
@@ -96,7 +101,7 @@ public final class QueueViewTest {
         QueueView view = new QueueView();
         List<Outbox.Message> messages = Arrays.asList(
                 msg("s", "t1", "going", Outbox.State.SENDING, false),
-                msg("a", "t1", "next", Outbox.State.QUEUED, false));
+                msg("a", "t1", "next", Outbox.State.PENDING, false));
         view.update("t1", messages, 0);
         List<QueueView.Row> rows = view.rows("t1", messages, Collections.emptyList(), 0, WIDE, true, null, 0);
         assertFalse("never touched while it is being sent", rows.get(0).actionable);
@@ -126,7 +131,7 @@ public final class QueueViewTest {
 
     @Test public void aMessageTheUserTookOutIsNotSent() {
         QueueView view = new QueueView();
-        Outbox.Message a = msg("a", "t1", "edit me", Outbox.State.QUEUED, false);
+        Outbox.Message a = msg("a", "t1", "edit me", Outbox.State.PENDING, false);
         view.update("t1", Collections.singletonList(a), 0);
         view.forget("a");
         view.update("t1", Collections.emptyList(), 10);
@@ -135,13 +140,13 @@ public final class QueueViewTest {
 
     @Test public void aPaneSwitchIsNotASendAndNeitherIsABlankDictation() {
         QueueView view = new QueueView();
-        view.update("t1", Collections.singletonList(msg("a", "t1", "on t1", Outbox.State.QUEUED, false)), 0);
+        view.update("t1", Collections.singletonList(msg("a", "t1", "on t1", Outbox.State.PENDING, false)), 0);
         view.update("t2", Collections.emptyList(), 10);
         view.update("t1", Collections.emptyList(), 20);
         assertTrue(view.rows("t1", Collections.emptyList(), Collections.emptyList(), 0, WIDE, true, null, 30).isEmpty());
         // A message whose dictation came back empty is dropped, not sent.
         view.update("t1", Collections.singletonList(
-                msg("b", "t1", DictationToken.of("c1"), Outbox.State.QUEUED, false)), 40);
+                msg("b", "t1", DictationToken.of("c1"), Outbox.State.PENDING, false)), 40);
         view.update("t1", Collections.emptyList(), 50);
         assertTrue(view.rows("t1", Collections.emptyList(), Collections.emptyList(), 0, WIDE, true, null, 60).isEmpty());
     }
@@ -149,8 +154,8 @@ public final class QueueViewTest {
     @Test public void theCoverScreenShowsFewerRowsWithGlyphs() {
         QueueView view = new QueueView();
         List<Outbox.Message> messages = Arrays.asList(
-                msg("a", "t1", "1", Outbox.State.QUEUED, false), msg("b", "t1", "2", Outbox.State.QUEUED, false),
-                msg("c", "t1", "3", Outbox.State.QUEUED, false), msg("d", "t1", "4", Outbox.State.QUEUED, false));
+                msg("a", "t1", "1", Outbox.State.PENDING, false), msg("b", "t1", "2", Outbox.State.PENDING, false),
+                msg("c", "t1", "3", Outbox.State.PENDING, false), msg("d", "t1", "4", Outbox.State.PENDING, false));
         List<QueueView.Row> rows = view.rows("t1", messages, Collections.emptyList(), 0, COVER, true, null, 0);
         assertEquals(QueueView.MAX_ROWS_COVER, rows.size());
         assertEquals("+2 more ▲", rows.get(0).text);
@@ -188,12 +193,14 @@ public final class QueueViewTest {
     @Test public void everyKindAndStateOfRowIsDrawnByThePhonesFontNeverAsABox() throws Exception {
         // One at a time, so the shown rows' cap never hides one.
         List<Outbox.Message> each = Arrays.asList(
-                msg("q", "t1", "first", Outbox.State.QUEUED, false),
-                msg("d", "t1", "behind a dialog", Outbox.State.QUEUED, true),
-                msg("w", "t1", "waits " + DictationToken.of("c9"), Outbox.State.QUEUED, false),
+                msg("q", "t1", "first", Outbox.State.PENDING, false),
+                msg("d", "t1", "behind a dialog", Outbox.State.PENDING, true),
+                msg("w", "t1", "waits " + DictationToken.of("c9"), Outbox.State.PENDING, false),
                 msg("s", "t1", "going now", Outbox.State.SENDING, false),
-                msg("u", "t1", "maybe", Outbox.State.UNSURE, false),
-                msg("g", "t2", "old pane", Outbox.State.GONE, false));
+                msg("u", "t1", "maybe", Outbox.State.NEEDS_YOU, false),
+                gone("g", "t2", "old pane"),
+                new Outbox.Message("w2", new Outbox.Target(null, "h", "", "", "t1", null, "", ""), "written",
+                        new Outbox.Composed(1, -1, -1), Outbox.State.SENT, null, true, 5, ""));
         List<PendingClip> none = Collections.emptyList();
         for (int cols : new int[] {WIDE, COVER}) {
             for (boolean open : new boolean[] {false, true}) {
@@ -202,11 +209,11 @@ public final class QueueViewTest {
                     QueueView view = new QueueView();
                     List<Outbox.Message> one = Collections.singletonList(m);
                     view.update("t1", one, 0);
-                    drawn(at + ", " + m.state + (m.blocked ? " blocked" : ""),
+                    drawn(at + ", " + m.state + " " + m.id,
                             view.rows("t1", one, none, none, 0, cols, open, null, 0), QueueView.Kind.MESSAGE);
                 }
                 QueueView sent = new QueueView();
-                sent.update("t1", Collections.singletonList(each.get(0)), 0);
+                sent.update("t1", Collections.singletonList(each.get(3)), 0);
                 sent.update("t1", Collections.emptyList(), 10);
                 drawn(at + ", sent", sent.rows("t1", Collections.emptyList(), none, none, 0, cols, open, null, 20),
                         QueueView.Kind.SENT);
@@ -224,7 +231,7 @@ public final class QueueViewTest {
 
     @Test public void theMoreRowIsDrawnByThePhonesFont() throws Exception {
         List<Outbox.Message> many = new java.util.ArrayList<>();
-        for (int i = 0; i < 12; i++) many.add(msg("m" + i, "t1", "message " + i, Outbox.State.QUEUED, false));
+        for (int i = 0; i < 12; i++) many.add(msg("m" + i, "t1", "message " + i, Outbox.State.PENDING, false));
         for (int cols : new int[] {WIDE, COVER}) {
             QueueView view = new QueueView();
             view.update("t1", many, 0);
@@ -232,5 +239,20 @@ public final class QueueViewTest {
             drawn(cols + " cols, open", view.rows("t1", many, none, none, 0, cols, true, null, 0),
                     QueueView.Kind.MORE);
         }
+    }
+
+    /** Stage 1: a held message that was written stays "sent · check it arrived", never "delivered", and waits for no one. */
+    @Test public void aWrittenHeldMessageSaysCheckItArrivedAndIsNotCountedAsWaiting() {
+        Outbox.Message sent = new Outbox.Message("s", new Outbox.Target(null, "h", "", "", "t1", null, "", ""), "done?",
+                new Outbox.Composed(1, -1, -1), Outbox.State.SENT, null, true, 0, "");
+        String state = QueueView.state(sent, "t1", 0, false);
+        assertTrue(state, state.startsWith("✓ sent ") && state.endsWith(" · check it arrived"));
+        assertFalse(state.contains("deliver"));
+        assertEquals(0, QueueView.count(Collections.singletonList(sent), Collections.emptyList(), 0));
+        QueueView view = new QueueView();
+        view.update("t1", Collections.singletonList(msg("a", "t1", "held", Outbox.State.PENDING, false)), 0);
+        // Leaving pending without being written (taken, dropped) is never shown as sent.
+        view.update("t1", Collections.emptyList(), 10);
+        assertTrue(view.rows("t1", Collections.emptyList(), Collections.emptyList(), 0, WIDE, true, null, 20).isEmpty());
     }
 }

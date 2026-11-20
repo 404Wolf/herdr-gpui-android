@@ -65,21 +65,20 @@ public final class ClearUndoTest {
         World(File file, Clips clips) {
             this.file = file;
             this.clips = clips;
-            courier = new OutboxCourier(file, Runnable::run, (handle, pane, text) -> {
+            courier = new OutboxCourier(file, Runnable::run, (handle, attach, text) -> {
                 throw new AssertionError("nothing is sent here");
             });
-            courier.outbox().ready("h", "boot", new java.util.HashSet<>(Arrays.asList("t1", "t2")));
             drafts.setHost("h");
             drafts.switchTo("t1");
         }
 
         Outbox.Message add(String text) {
-            return courier.add("h", "t1", text);
+            return HeldFixtures.add(courier, "h", "t1", text);
         }
 
         List<String> queue() {
             List<String> out = new ArrayList<>();
-            for (Outbox.Message m : courier.outbox().shown("h", "t1", now())) out.add(m.text);
+            for (Outbox.Message m : HeldFixtures.shown(courier.outbox(), "h", "t1")) out.add(m.text);
             return out;
         }
 
@@ -236,7 +235,7 @@ public final class ClearUndoTest {
         Outbox.Message s = w.add("going");
         w.add("one");
         w.add("unsure");
-        assertTrue(w.courier.outbox().sending(s.id));
+        assertTrue(w.courier.outbox().claim(s.id, HeldFixtures.live("h", "t1"), s.text, now(), false));
         ClearUndo clear = new ClearUndo(w);
         long t = now();
         clear.tap(T1, true, t);
@@ -297,7 +296,7 @@ public final class ClearUndoTest {
         assertFalse(clear.undo(T1, t + ClearUndo.QUEUE_WINDOW_MS + 1));
         assertEquals("", w.drafts.text());
         assertTrue(w.queue().isEmpty());
-        assertEquals("the message went for good", 0, w.courier.outbox().waiting("h"));
+        assertEquals("the message went for good", 0, w.courier.outbox().waiting());
         assertTrue("quarantined, as rescue audio", w.clips.held.contains("d1"));
         // A tap after the window starts over: the draft level, not the queue.
         w.drafts.edit("new");
@@ -315,10 +314,10 @@ public final class ClearUndoTest {
         clear.tap(T1, true, t);
         w.drafts.switchTo("t2");
         w.drafts.edit("on t2");
-        w.courier.add("h", "t2", "x");
+        HeldFixtures.add(w.courier, "h", "t2", "x");
         clear.tap(T2, true, t + 100);
         assertEquals("a second tap elsewhere is not the queue's", ClearUndo.Level.DRAFT, clear.level());
-        assertEquals(1, w.courier.outbox().shown("h", "t2", now()).size());
+        assertEquals(1, HeldFixtures.shown(w.courier.outbox(), "h", "t2").size());
         assertTrue(clear.undo(T2, t + 200));
         assertEquals("on t2", w.drafts.text());
     }
@@ -385,7 +384,7 @@ public final class ClearUndoTest {
         r.w.drafts.setHost("h");
         assertTrue("the owning pane keeps the undo across restart", r.c.open(T1, now()));
         assertTrue("nothing cleared is shown", r.w.queue().isEmpty());
-        assertNull("or sent", r.w.courier.outbox().next("h", now()));
+        assertNull("or sent", r.w.courier.outbox().offer(HeldFixtures.live("h", "t1")));
         assertTrue(r.c.undo(T1, now()));
         assertEquals("my draft", r.w.drafts.text());
         assertEquals(Arrays.asList("first", "second"), r.w.queue());
@@ -411,7 +410,7 @@ public final class ClearUndoTest {
         assertFalse(r.c.open(now()));
         assertEquals("", r.w.drafts.text());
         assertTrue(r.w.queue().isEmpty());
-        assertEquals(0, r.w.courier.outbox().waiting("h"));
+        assertEquals(0, r.w.courier.outbox().waiting());
         assertEquals("", r.w.savedRecord);
     }
 
@@ -420,11 +419,11 @@ public final class ClearUndoTest {
     @Test public void aMessageTheSenderPickedBeforeTheClearIsNotSentAfterIt() {
         World w = new World();
         Outbox.Message m = w.add("must not send");
-        Outbox.Message picked = w.courier.outbox().next("h", now());
+        Outbox.Message picked = w.courier.outbox().offer(HeldFixtures.live("h", "t1"));
         assertEquals(m.id, picked.id);
         new ClearUndo(w).tap(T1, false, now());
-        assertNull(w.courier.outbox().next("h", now()));
-        assertFalse("the sender's pick is refused at dispatch", w.courier.outbox().sending(picked.id));
+        assertNull(w.courier.outbox().offer(HeldFixtures.live("h", "t1")));
+        assertFalse("the sender's pick is refused at dispatch", w.courier.outbox().claim(picked.id, HeldFixtures.live("h", "t1"), picked.text, now(), false));
     }
 
     // ---- killed in the middle (finding 3) ----
@@ -444,7 +443,7 @@ public final class ClearUndoTest {
         }
         Restarted r = w.restart();
         assertTrue("the cleared message is not shown", r.w.queue().isEmpty());
-        assertNull("or sent", r.w.courier.outbox().next("h", now()));
+        assertNull("or sent", r.w.courier.outbox().offer(HeldFixtures.live("h", "t1")));
         assertTrue("its recording stays held", r.w.clips.held.contains("q1"));
         assertTrue("the undo is on offer", r.c.open(now()));
         assertTrue(r.c.undo(T1, now()));
