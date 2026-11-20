@@ -122,6 +122,17 @@ wait_draft_cells() { # cells [seconds=20]
     done
     return 1
 }
+# Waits until the draft is at least N cells: after a typed character the keyboard may add its own
+# (an auto-space), so the exact count is judged by what the agent finally receives.
+wait_draft_at_least() { # cells [seconds=20]
+    local end=$((SECONDS + ${2:-20})) c
+    while (( SECONDS < end )); do
+        c=$(draft_cells)
+        [[ "$c" =~ ^[0-9]+$ ]] && (( c >= $1 )) && return 0
+        sleep 1
+    done
+    return 1
+}
 # The terminal screen of a named agent as the core sees it.
 agent_screen() { # name
     local addr
@@ -576,8 +587,8 @@ cancel_z() {
     a shell input text z
     quiet 1
     shot cancel-z-before
-    if ! wait_draft_cells 22 10; then
-        record cancel-z FAIL "after typing z the draft is not 22 cells (21 characters + the caret) (the app's layout says: $(layout_now)); Cancel was not exercised"
+    if ! wait_draft_at_least 22 10; then
+        record cancel-z FAIL "after typing z the draft did not grow to at least 22 cells (21 characters + the caret) (the app's layout says: $(layout_now)); Cancel was not exercised"
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
