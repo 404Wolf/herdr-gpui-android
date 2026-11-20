@@ -3,7 +3,7 @@
 use rio_vt::{
     ansi::CursorShape,
     crosswords::{
-        Crosswords,
+        Crosswords, Mode,
         pos::{Column, Line},
     },
     event::EventListener,
@@ -21,7 +21,10 @@ pub fn hidden_on_screen<U: EventListener>(
     grid: &Crosswords<U>,
     kind: PromptKind,
 ) -> Option<Range<usize>> {
-    if kind == PromptKind::Other || grid.display_offset() != 0 {
+    if kind == PromptKind::Other
+        || grid.display_offset() != 0
+        || grid.mode().contains(Mode::ALT_SCREEN)
+    {
         return None;
     }
     let cursor = grid.cursor();
