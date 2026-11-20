@@ -547,8 +547,9 @@ fn call_prefix(text: &str) -> Option<(usize, bool)> {
     }
 }
 
-/// The markdown link `[text](http…)` covering index `at` of `text`: a tap
-/// on its text or its URL opens the URL. The whole link is washed.
+/// The markdown link `[text](dest)` covering index `at` of `text`, found on
+/// the whole line before tokenizing: a tap on its text or its destination
+/// (a URL or a file) opens the destination. The whole link is washed.
 fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     /// A link's text this long or longer is not looked back over.
     const MAX_TEXT: usize = 512;
@@ -558,15 +559,6 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     {
         from = close + 1;
         let url_start = close + 2;
-        let rest: String = text[url_start..text.len().min(url_start + 8)]
-            .iter()
-            .collect();
-        if !SCHEMES
-            .iter()
-            .any(|scheme| rest.to_ascii_lowercase().starts_with(scheme))
-        {
-            continue;
-        }
         // The `[` that opens the text, on this logical line: brackets inside
         // the text are balanced (`[outer [inner] label]`, `[[docs]]`).
         let floor = close.saturating_sub(MAX_TEXT);
@@ -584,6 +576,11 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
             }
         }
         let Some(open) = open else { continue };
+        // The `[` starts a token: after a word character it is part of a URL
+        // query or a path (`?q=[abc](docs/x.md)`), not a Markdown link.
+        if open > 0 && part_of_link(text[open - 1]) && !matches!(text[open - 1], '(' | '*' | '[') {
+            continue;
+        }
         // The `)` that closes the URL, brackets inside it balanced.
         let mut depth = 0usize;
         let mut end = None;
@@ -603,8 +600,18 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
         if !(open..=end).contains(&at) {
             continue;
         }
-        let url: String = text[url_start..end].iter().collect();
-        return Some((open..end + 1, Link::Web(url)));
+        let dest: String = text[url_start..end].iter().collect();
+        // The destination is the one target, a URL or a file with its
+        // `:line`; a tap on the label (spaces, paths and all) opens it.
+        let lower = dest.to_ascii_lowercase();
+        if SCHEMES.iter().any(|scheme| lower.starts_with(scheme)) {
+            return Some((open..end + 1, Link::Web(dest)));
+        }
+        let (path, line) = split_line(&dest);
+        if looks_like_file(path) {
+            let path = path.to_owned();
+            return Some((open..end + 1, Link::File { path, line }));
+        }
     }
     None
 }
@@ -1116,6 +1123,19 @@ mod tests {
                 w("https://example.com/search?q=[abc](docs/readme.md)"),
             ),
             ("[docs/a.rs](docs/a.rs)", f("docs/a.rs", None)),
+            (
+                "[see /repo/src/parser.rs](/repo/src/parser.rs:12)",
+                f("/repo/src/parser.rs", Some(12)),
+            ),
+            (
+                "[the parser](/repo/src/parser.rs:12)",
+                f("/repo/src/parser.rs", Some(12)),
+            ),
+            ("[https://a.io/x](https://a.io/y)", w("https://a.io/y")),
+            (
+                "[the dashboard](https://grafana.example.com/d/abc?orgId=1)",
+                w("https://grafana.example.com/d/abc?orgId=1"),
+            ),
             ("[the docs](https://x.io/d)", w("https://x.io/d")),
             ("file:/home/wolf/a.rs:4", f("/home/wolf/a.rs", Some(4))),
             ("Update(src/main.rs)", f("src/main.rs", None)),
