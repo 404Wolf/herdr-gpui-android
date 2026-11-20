@@ -14,10 +14,8 @@ import org.junit.Test;
 public final class AttachRound5Test {
     @Test public void theFieldKeepsTheWholeMixedPaste() throws Exception {
         String listener = section("ComposerBar", "private void listenForImages(", "A session that a pane switch");
-        assertFalse("the listener must not consume and asynchronously reinsert part of a mixed clip",
-                listener.contains("edit.onReceiveContent("));
-        assertTrue("classification must check every advertised MIME type and reject non-URI items",
-                listener.contains("AttachImages.isImageClip("));
+        assertTrue("a clip already known to be mixed goes straight to Android",
+                listener.contains("if (!AttachImages.isImageClip(payload.getClip())) return payload;"));
     }
 
     @Test public void theExplicitPasteMenuDoesNotQueryProvidersOnTheUiThread() throws Exception {
@@ -28,12 +26,11 @@ public final class AttachRound5Test {
     }
 
     @Test public void aChangedPaneOrDraftCancelsThePasteBeforeItCanApply() throws Exception {
-        String activity = source("GpuiTerminalActivity");
-        assertTrue("a paste discarded after a pane or draft change must report the interruption",
-                activity.contains("Image paste cancelled: you switched panes"));
         String composer = source("ComposerBar");
-        assertTrue("pane switches and draft edits must invalidate the same captured stamp",
-                composer.contains("pasteDraftStamp") && composer.split("pasteDraftStamp\\+\\+", -1).length >= 3);
+        assertTrue("a paste discarded after a pane or draft change must report the interruption",
+                composer.contains("Image paste cancelled: you switched panes"));
+        assertTrue("switching panes or editing the draft must invalidate a pending paste",
+                composer.contains("paneStamp != pastePaneStamp") && composer.contains("draftStamp != pasteDraftStamp"));
     }
 
     @Test public void aRepointedProfileKeepsPlainDraftsAndHidesSavedAttachmentDrafts() throws Exception {
@@ -49,13 +46,13 @@ public final class AttachRound5Test {
 
         ComposerDrafts drafts = new ComposerDrafts();
         select(drafts, original, "t1");
-        append(drafts, original, "t1", "'/host-a/image.png' ");
+        append(drafts, original, "t1", "'/host-a/herdr-paste-1.png' ");
         select(drafts, original, "t2");
         drafts.edit("plain text");
 
         ComposerDrafts restored = new ComposerDrafts();
         restored.restore(drafts.encode());
-        assertEquals("'/host-a/image.png' ", select(restored, original, "t1"));
+        assertEquals("'/host-a/herdr-paste-1.png' ", select(restored, original, "t1"));
         assertEquals("plain text", select(restored, edited, "t2"));
         assertEquals("the old profile's saved attachment must not appear on the new computer",
                 "", select(restored, edited, "t1"));

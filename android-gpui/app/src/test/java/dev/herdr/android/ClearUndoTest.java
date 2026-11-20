@@ -358,7 +358,7 @@ public final class ClearUndoTest {
     @Test public void anAttachmentUndoSurvivesRestartOnlyForItsOriginalRevision() {
         World w = new World();
         w.drafts.setHost("h", "revision-a", encoded -> true);
-        w.drafts.appendAttachment("h", "revision-a", "t1", "/a.png ");
+        w.drafts.appendAttachment("h", "revision-a", "t1", "/herdr-paste-1.png ");
         new ClearUndo(w).tap(T1, true, now());
 
         Restarted r = w.restart();
@@ -370,7 +370,7 @@ public final class ClearUndoTest {
         r.w.drafts.setHost("h", "revision-a", encoded -> true);
         assertTrue(r.c.undo(T1, now()));
         assertEquals("revision-a", r.w.drafts.draftRevision());
-        assertEquals("/a.png ", r.w.drafts.text());
+        assertEquals("/herdr-paste-1.png ", r.w.drafts.text());
         r.w.drafts.setHost("h", "revision-b", encoded -> true);
         assertEquals("", r.w.drafts.text());
     }

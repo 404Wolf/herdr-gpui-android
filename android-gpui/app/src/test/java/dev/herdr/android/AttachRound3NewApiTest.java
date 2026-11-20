@@ -31,18 +31,18 @@ public final class AttachRound3NewApiTest {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("hostB");
         drafts.switchTo("t1");
-        drafts.appendAttachment("hostA", "revision-a", "t1", "/a/x.png ");
+        drafts.appendAttachment("hostA", "revision-a", "t1", "/a/herdr-paste-1.png ");
         assertEquals("", drafts.text());
         drafts.setHost("hostA", "revision-a", encoded -> true);
         drafts.switchTo("t1");
-        assertEquals("/a/x.png ", drafts.text());
+        assertEquals("/a/herdr-paste-1.png ", drafts.text());
     }
 
     @Test public void hostScopedDraftsSurviveProcessDeathAndStayApart() {
         ComposerDrafts first = new ComposerDrafts();
         first.setHost("hostA", "revision-a", encoded -> true);
         first.switchTo("t1");
-        first.appendAttachment("hostA", "revision-a", "t1", "/a/x.png ");
+        first.appendAttachment("hostA", "revision-a", "t1", "/a/herdr-paste-1.png ");
         first.setHost("hostB");
         first.switchTo("t1");
         first.edit("b text");
@@ -54,7 +54,7 @@ public final class AttachRound3NewApiTest {
         assertEquals("b text", second.text());
         second.setHost("hostA", "revision-a", encoded -> true);
         second.switchTo("t1");
-        assertEquals("/a/x.png ", second.text());
+        assertEquals("/a/herdr-paste-1.png ", second.text());
     }
 
     @Test public void draftsSavedBeforeThisChangeMigrateToTheHostOnScreenFirst() {

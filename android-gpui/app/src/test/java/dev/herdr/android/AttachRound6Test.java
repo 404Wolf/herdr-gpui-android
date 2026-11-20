@@ -47,9 +47,10 @@ public final class AttachRound6Test {
                 activity.indexOf("@Override protected void onActivityResult("));
         assertTrue("classification must read the whole clip even if it exceeds the upload limit",
                 worker.contains("i < clip.getItemCount();"));
-        assertTrue("the native field must get the original payload on the UI thread",
+        assertTrue("the mixed branch must post native insertion and bypass the image upload",
                 worker.contains("main.post(") && worker.contains("nativePaste.run()")
-                        && source("ComposerBar").contains("onReceiveContent(payload)"));
+                        && worker.indexOf("if (mixed || target == null)") < worker.indexOf("attachOnWorker(")
+                        && source("ComposerBar").contains("edit.onReceiveContent(payload)"));
     }
 
     @Test public void anEditHasItsOwnPasteInterruptionNotice() throws Exception {

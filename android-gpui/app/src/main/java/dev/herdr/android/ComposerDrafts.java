@@ -34,7 +34,8 @@ final class ComposerDrafts {
 
         Draft(String text, String revision) {
             this.text = text;
-            this.revision = revision;
+            // Older saves can still carry a revision after the user removed the attachments.
+            this.revision = revision != null && ATTACHMENT_PATH.matcher(text).find() ? revision : null;
         }
     }
 
@@ -64,9 +65,12 @@ final class ComposerDrafts {
     private java.util.List<long[]> liveMarks = new java.util.ArrayList<>();
 
     private static final char SEP = '\u0001';
+    // The core can add a numeric suffix when the generated filename is already taken.
+    private static final String ATTACHMENT_FILENAME = "/herdr-paste-[0-9]+(?:-[0-9]+)?\\.[a-z]+(?=['\\s]|$)";
+    private static final java.util.regex.Pattern ATTACHMENT_PATH = java.util.regex.Pattern.compile(ATTACHMENT_FILENAME);
     // Preview builds saved attachment paths as bare text, without a connection revision.
     private static final java.util.regex.Pattern UNVERSIONED_ATTACHMENT = java.util.regex.Pattern.compile(
-            "/herdr-core/[^/]+/files/[^/]+/herdr-paste-[0-9]+(?:-[0-9]+)?\\.[a-z]+(?=['\\s]|$)");
+            "/herdr-core/[^/]+/files/[^/]+" + ATTACHMENT_FILENAME);
 
     static boolean hasUnversionedAttachment(String text) {
         return UNVERSIONED_ATTACHMENT.matcher(text).find();

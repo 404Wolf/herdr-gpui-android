@@ -50,6 +50,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -4794,8 +4795,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             @Override public void attachImages() { showAttachSources(); }
 
             @android.annotation.TargetApi(31)
-            @Override public boolean attachPasted(ContentInfo payload) {
-                return queueImagePaste(payload.getClip(), payload);
+            @Override public boolean attachPasted(ContentInfo payload, Runnable nativePaste) {
+                return queueImagePaste(payload.getClip(), nativePaste);
             }
 
             @Override public void attachFiles(java.util.List<java.io.File> files) {
@@ -4877,7 +4878,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * end the session and bring up a new one on return, so the handle from before is never reused:
      * waits up to 15 s for the original profile revision and pane to be live again.
      */
-    private AttachTarget liveTarget(AttachTarget target, java.util.function.BooleanSupplier pasteCurrent) {
+    private AttachTarget liveTarget(AttachTarget target, Supplier<String> pasteCurrent) {
         long until = SystemClock.elapsedRealtime() + 15_000;
         do {
             if (attachmentInterruption(target, pasteCurrent) != null) return null;
@@ -4961,33 +4962,52 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         queueImagePaste(clip, null);
     }
 
-    /** Retain the receive-content payload while its temporary grant is in use on the worker. */
-    private boolean queueImagePaste(ClipData clip, Object payload) {
+    /** The native fallback holds the receive-content payload and its temporary grant. */
+    private boolean queueImagePaste(ClipData clip, Runnable nativePaste) {
         AttachTarget target = attachTarget();
-        if (target == null || composer == null) {
+        if (composer == null || (target == null && nativePaste == null)) {
             note("Open an agent to attach an image");
             return true;
         }
-        ComposerBar draft = composer;
-        long stamp = draft.pasteDraftStamp();
-        java.util.function.BooleanSupplier pasteCurrent = () -> {
+        Supplier<String> draftInterruption = composer.capturePasteInterruption();
+        Supplier<String> pasteCurrent = () -> {
             synchronized (stateLock) {
-                return stamp == draft.pasteDraftStamp()
-                        && (connection == null || target.matches(connection));
+                if (target != null && connection != null && !target.matches(connection)) {
+                    return "Image paste cancelled: you switched panes";
+                }
+                return draftInterruption.get();
             }
         };
         try {
             attachWorker.execute(() -> {
                 try {
                     List<ImageAttach.Source> sources = new java.util.ArrayList<>();
-                    for (int i = 0; i < clip.getItemCount() && sources.size() < ImageAttach.MAX_IMAGES; i++) {
+                    int imageCount = 0;
+                    for (int i = 0; i < clip.getItemCount(); i++) {
                         if (attachmentInterruption(target, pasteCurrent) != null) break;
-                        Uri uri = clip.getItemAt(i).getUri();
-                        if (uri != null && isImageUri(uri)) sources.add(AttachImages.uriSource(getContentResolver(), uri));
+                        Uri uri = AttachImages.imageUri(clip.getItemAt(i));
+                        if (uri == null || !isImageUri(uri)) continue;
+                        imageCount++;
+                        if (sources.size() < ImageAttach.MAX_IMAGES) {
+                            sources.add(AttachImages.uriSource(getContentResolver(), uri));
+                        }
                     }
-                    attachOnWorker(target, sources, pasteCurrent);
+                    // Classify every item before uploading, including items beyond the attach limit.
+                    boolean mixed = imageCount != clip.getItemCount();
+                    if (mixed || target == null) {
+                        main.post(() -> {
+                            if (destroyed) return;
+                            String interrupted = attachmentInterruption(target, pasteCurrent);
+                            if (interrupted != null) note(interrupted);
+                            else if (mixed && nativePaste != null) nativePaste.run();
+                            else if (mixed) note("The clipboard contains non-image items");
+                            else note("Open an agent to attach an image");
+                        });
+                    } else {
+                        attachOnWorker(target, sources, pasteCurrent);
+                    }
                 } finally {
-                    java.lang.ref.Reference.reachabilityFence(payload);
+                    java.lang.ref.Reference.reachabilityFence(nativePaste);
                 }
             });
             return true;
@@ -5053,19 +5073,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    private static String attachmentInterruption(AttachTarget target, java.util.function.BooleanSupplier pasteCurrent) {
-        if (pasteCurrent != null && !pasteCurrent.getAsBoolean()) return "Image paste cancelled: you switched panes";
-        return profileStillCurrent(target) ? null : "Image attachment cancelled: the remote profile changed";
+    private static String attachmentInterruption(AttachTarget target, Supplier<String> pasteCurrent) {
+        if (target != null && !profileStillCurrent(target)) {
+            return "Image attachment cancelled: the remote profile changed";
+        }
+        return pasteCurrent == null ? null : pasteCurrent.get();
     }
 
-    private static void requireAttachmentCurrent(AttachTarget target, java.util.function.BooleanSupplier pasteCurrent)
+    private static void requireAttachmentCurrent(AttachTarget target, Supplier<String> pasteCurrent)
             throws ImageAttach.AttachException {
         String interrupted = attachmentInterruption(target, pasteCurrent);
         if (interrupted != null) throw new ImageAttach.AttachException(interrupted);
     }
 
-    private void attachOnWorker(AttachTarget target, List<ImageAttach.Source> sources,
-            java.util.function.BooleanSupplier pasteCurrent) {
+    private void attachOnWorker(AttachTarget target, List<ImageAttach.Source> sources, Supplier<String> pasteCurrent) {
         if (!sources.isEmpty() && attachmentInterruption(target, pasteCurrent) == null) {
             note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
         }
@@ -5096,8 +5117,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         main.post(() -> attached(target, outcome, pasteCurrent));
     }
 
-    private void attached(AttachTarget target, ImageAttach.Outcome outcome,
-            java.util.function.BooleanSupplier pasteCurrent) {
+    private void attached(AttachTarget target, ImageAttach.Outcome outcome, Supplier<String> pasteCurrent) {
         if (destroyed) return;
         String interrupted = attachmentInterruption(target, pasteCurrent);
         if (interrupted != null) {

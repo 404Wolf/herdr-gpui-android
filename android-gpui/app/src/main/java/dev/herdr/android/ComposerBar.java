@@ -111,9 +111,9 @@ final class ComposerBar {
         default void attachImages() { }
         /** Image files already copied to the cache: put them, then delete them. */
         default void attachFiles(java.util.List<java.io.File> files) { }
-        /** Queues an image-only payload and returns whether it was accepted. */
+        /** Queues a candidate image paste, with native insertion if any item is not an image. */
         @android.annotation.TargetApi(31)
-        default boolean attachPasted(ContentInfo payload) {
+        default boolean attachPasted(ContentInfo payload, Runnable nativePaste) {
             return false;
         }
     }
@@ -140,6 +140,7 @@ final class ComposerBar {
     private final EditText field;
     /** A worker can compare the stamp without looking at UI-owned draft or view state. */
     private volatile long pasteDraftStamp;
+    private volatile long pastePaneStamp;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
     /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
@@ -620,7 +621,7 @@ final class ComposerBar {
         if (!drafts.setHost(onHost, revision, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);
         if (switched) {
-            pasteDraftStamp++;
+            pastePaneStamp++;
             // An undo belongs to the pane it cleared; the rows to the pane on screen. The first
             // pane after a start is no switch: a clear resumed from before it stays on offer.
             if (clearing.endsOnPaneChange(previousOwner, drafts.owner())) clearing.commit();
@@ -1507,15 +1508,33 @@ final class ComposerBar {
         return edit;
     }
 
-    /** Image-only clips attach. Android's field gets the original payload for all other pastes. */
+    /** Android's field gets the original payload when either MIME check finds a mixed clip. */
     @android.annotation.TargetApi(31)
     private void listenForImages(EditText edit) {
         edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
-            return AttachImages.isImageClip(payload.getClip()) && host.attachPasted(payload) ? null : payload;
+            if (!AttachImages.isImageClip(payload.getClip())) return payload;
+            int start = edit.getSelectionStart();
+            int end = edit.getSelectionEnd();
+            return host.attachPasted(payload, () -> {
+                if (start != edit.getSelectionStart() || end != edit.getSelectionEnd()) {
+                    host.notice("Image paste cancelled: the selection changed");
+                    return;
+                }
+                // Go directly to the field's native handler, bypassing image classification.
+                edit.onReceiveContent(payload);
+            }) ? null : payload;
         });
     }
 
-    long pasteDraftStamp() { return pasteDraftStamp; }
+    java.util.function.Supplier<String> capturePasteInterruption() {
+        long paneStamp = pastePaneStamp;
+        long draftStamp = pasteDraftStamp;
+        return () -> {
+            if (paneStamp != pastePaneStamp) return "Image paste cancelled: you switched panes";
+            if (draftStamp != pasteDraftStamp) return "Image paste cancelled: you edited the draft";
+            return null;
+        };
+    }
 
     /**
      * A session that a pane switch stops rather than cancels: its text is the phone's or is on

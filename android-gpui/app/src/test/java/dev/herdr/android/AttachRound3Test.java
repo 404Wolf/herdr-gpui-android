@@ -89,10 +89,11 @@ public final class AttachRound3Test {
         String listener = section(source("ComposerBar"), "private void listenForImages(", "A session that a pane switch");
         assertFalse(listener.contains("copyValidated("));
         assertFalse(listener.contains("getContentResolver()"));
-        assertTrue("the payload stays referenced until the worker is done", listener.contains("host.attachPasted("));
+        assertTrue("the native fallback captures the original payload", listener.contains("edit.onReceiveContent(payload)"));
         String worker = section(source("GpuiTerminalActivity"), "private boolean queueImagePaste(", "protected void onActivityResult(");
         assertTrue("the cap applies before anything is copied", worker.contains("MAX_IMAGES"));
-        assertTrue("the payload retains its grant until the worker finishes", worker.contains("reachabilityFence(payload)"));
+        assertTrue("the fallback retains the payload and its grant until the worker finishes",
+                worker.contains("reachabilityFence(nativePaste)"));
     }
 
     @Test public void draftsAreScopedToTheHostThatOwnsThePane() throws Exception {

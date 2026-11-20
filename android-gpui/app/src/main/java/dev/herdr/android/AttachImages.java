@@ -43,11 +43,14 @@ final class AttachImages {
             if (!isImageMime(types.getMimeType(i))) return false;
         }
         for (int i = 0; i < clip.getItemCount(); i++) {
-            ClipData.Item item = clip.getItemAt(i);
-            if (item.getUri() == null || item.getText() != null || item.getHtmlText() != null
-                    || item.getIntent() != null) return false;
+            if (imageUri(clip.getItemAt(i)) == null) return false;
         }
         return true;
+    }
+
+    static Uri imageUri(ClipData.Item item) {
+        return item.getText() == null && item.getHtmlText() == null && item.getIntent() == null
+                ? item.getUri() : null;
     }
 
     static boolean isImageMime(String type) {
