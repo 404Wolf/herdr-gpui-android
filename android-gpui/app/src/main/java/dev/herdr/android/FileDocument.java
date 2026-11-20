@@ -73,6 +73,10 @@ final class FileDocument {
         if (error.contains("not_text")) return "Not a text file";
         if (error.contains("machine_unknown") || error.contains("unavailable")) return "That computer is not reachable";
         if (error.contains("needs_update")) return "That computer's herdr-core is too old to read files";
+        if (error.contains("Permission denied")) return "Permission denied";
+        if (error.contains("is not a regular file")) return "Not a file (a folder?)";
+        java.util.regex.Matcher over = java.util.regex.Pattern.compile("is over (\\d+) MB").matcher(error);
+        if (over.find()) return "Too large to open (over " + over.group(1) + " MB)";
         if (error.contains("io")) return "Could not read it";
         return error.isEmpty() ? "Could not read it" : error;
     }

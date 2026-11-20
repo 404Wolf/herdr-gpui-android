@@ -88,15 +88,19 @@ public final class NativeInputTest {
         return out;
     }
 
-    @Test public void wolfAsk1_noHideControlInAnyState() {
+    /**
+     * Wolf's ask 1 (#34) left the keyboard's own hide key, Back and a swipe to put it away. Ask 9
+     * supersedes it: the type slot says "hide" while the keyboard is up, and no slot is ever an empty rule.
+     */
+    @Test public void ask9_theTypeSlotSaysHideWhileTheKeyboardIsUpAndNoSlotIsAnEmptyRule() {
         for (List<GhostText.Control> line : everyLine()) {
             for (GhostText.Control c : line) {
-                assertFalse("a hide control: " + c.id, c.id.contains("hide"));
-                for (int i = 0; i < c.spans.length; i += 2) {
-                    assertFalse("the word hide: " + c.spans[i], c.spans[i].toLowerCase().contains("hide"));
-                }
+                assertFalse("an empty rule slot: " + c.id, c.id.startsWith("gap-"));
             }
         }
+        ControlLine.State typing = new ControlLine.State();
+        typing.typing = true;
+        assertEquals("hide", ControlLine.slots(typing).get(0).spans[0]);
     }
 
     @Test public void wolfAsk1_oneMicrophoneOnly_talkInTheLine() {
@@ -280,7 +284,7 @@ public final class NativeInputTest {
     @Test public void wolfAsk1_aQueuedRowsPreviewKeepsAnEmojiWhole() throws Exception {
         // Review of #34 (r3, P3): at 24 columns the preview is cut before the heart, not inside it.
         QueueView.Row row = new QueueView.Row("m1", QueueView.Kind.MESSAGE, "❯ aaaaaaaaaaa❤️bbbbbbbbbbbbbbbbbbbb",
-                "queued", "tag", true, Outbox.State.QUEUED);
+                "queued", "tag", true, Outbox.State.PENDING);
         org.json.JSONArray drawn = GhostText.row(row, false, false, 24, java.util.Collections.<String, Long>emptyMap(),
                 java.util.Collections.<String>emptySet());
         String text = drawn.getJSONObject(0).getString("t");

@@ -208,7 +208,10 @@ public final class ControlTargetsTest {
         assertTrue(type.left <= typeCells.start * cw + 0.01f);
         assertTrue(type.right >= typeCells.end * cw - 0.01f);
         assertTrue(stop.left >= typeCells.end * cw - 0.01f);
-        assertEquals(cols * cw, stop.right, 0.01f);
+        // Ask 10: "send" stays tappable while recording; the stop grows up to the gap before it.
+        ControlTargets.Rect send = find(rects, "send");
+        assertTrue(stop.right <= send.left + 0.01f);
+        assertTrue(send.right > send.left);
     }
 
     @Test public void queueRowsAreTappedAnywhereAlongThemOneRowHigh() {

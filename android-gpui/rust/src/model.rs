@@ -1162,6 +1162,7 @@ pub struct Mailbox {
     ime_session: i64,
     preedit: Arc<str>,
     display_preferences: DisplayPreferences,
+    show_agent_footer: bool,
     pan: f32,
     /// Furthest useful pan: the painted row width beyond the surface.
     pan_limit: f32,
@@ -1186,6 +1187,8 @@ pub struct Mailbox {
 pub struct FrameTarget {
     pub host: Arc<str>,
     pub pane: Arc<str>,
+    #[cfg(all(feature = "android-ui", unix))]
+    pub(crate) footer_kind: gpui_rio::ghost::PromptKind,
 }
 
 impl FrameTarget {
@@ -1193,6 +1196,8 @@ impl FrameTarget {
         Self {
             host: host.into(),
             pane: pane.into(),
+            #[cfg(all(feature = "android-ui", unix))]
+            footer_kind: Default::default(),
         }
     }
 }
@@ -1219,6 +1224,7 @@ pub struct ViewState {
     pub snapshot: Arc<Snapshot>,
     pub preedit: Arc<str>,
     pub display_preferences: DisplayPreferences,
+    pub show_agent_footer: bool,
     /// Whether new output should pull the viewport to the newest line.
     pub follow: bool,
     /// Client-local horizontal offset in logical pixels; the daemon owns the
@@ -1255,6 +1261,7 @@ impl Default for Mailbox {
             ime_session: 0,
             preedit: Arc::from(""),
             display_preferences: DisplayPreferences::default(),
+            show_agent_footer: false,
             pan: 0.,
             pan_limit: MAX_PAN,
             shell_pan: ShellPan::default(),
@@ -1347,6 +1354,13 @@ impl Mailbox {
         Ok(true)
     }
 
+    pub fn set_show_agent_footer(&mut self, show: bool) {
+        if self.show_agent_footer != show {
+            self.show_agent_footer = show;
+            self.touch();
+        }
+    }
+
     /// The Android side owns whether the pane is tailing or reading scrollback.
     pub fn set_follow(&mut self, generation: i64, follow: bool) -> bool {
         if generation <= 0 || generation < self.generation || follow == self.follow {
@@ -1357,6 +1371,12 @@ impl Mailbox {
         #[cfg(feature = "android-ui")]
         signal_change();
         true
+    }
+
+    /// The surface was attached or resized (the keyboard came or went): a frame that is held and
+    /// otherwise unchanging (offline) must be drawn into it again, or its new area stays black.
+    pub fn surface_changed(&mut self) {
+        self.touch();
     }
 
     /// Wakes the view with nothing else changed, e.g. after new ghost text.
@@ -1370,17 +1390,34 @@ impl Mailbox {
     /// Draws renderer `shell` (0: none) for `generation`, attached for
     /// `target`'s host and pane.
     pub fn set_shell(&mut self, generation: i64, shell: u64, target: Option<FrameTarget>) -> bool {
-        if generation <= 0 || generation != self.generation || shell == self.shell {
+        let target = if shell == 0 { None } else { target };
+        if generation <= 0
+            || generation != self.generation
+            || (shell == self.shell && target == self.frame_target)
+        {
             return false;
         }
-        self.shell = shell;
-        self.frame_target = if shell == 0 { None } else { target };
         // Steps meant for the view of another pane never move the new one.
-        self.shell_pan = ShellPan::default();
-        self.revision = self.revision.wrapping_add(1);
-        #[cfg(feature = "android-ui")]
-        signal_change();
+        if shell != self.shell {
+            self.shell_pan = ShellPan::default();
+        }
+        self.shell = shell;
+        self.frame_target = target;
+        self.touch();
         true
+    }
+
+    #[cfg(all(feature = "android-ui", unix))]
+    pub(crate) fn clear_footer_kind(&mut self, shell: u64) {
+        use gpui_rio::ghost::PromptKind;
+
+        if self.shell == shell
+            && let Some(target) = &mut self.frame_target
+            && target.footer_kind != PromptKind::Other
+        {
+            target.footer_kind = PromptKind::Other;
+            self.touch();
+        }
     }
 
     pub fn set_snapshot(&mut self, generation: i64, snapshot: Snapshot) -> bool {
@@ -1516,6 +1553,7 @@ impl Mailbox {
             snapshot: self.snapshot.clone(),
             preedit: self.preedit.clone(),
             display_preferences: self.display_preferences,
+            show_agent_footer: self.show_agent_footer,
             follow: self.follow,
             shell: self.shell,
             held: self.held,
@@ -2020,6 +2058,20 @@ mod tests {
         assert!(box_.set_shell(10, 9003, Some(FrameTarget::new("A", "p3"))));
         box_.set_active(11, false);
         assert_eq!((box_.state().shell, box_.state().frame_target), (0, None));
+    }
+
+    #[test]
+    fn a_new_surface_wakes_a_held_view_that_nothing_else_changes() {
+        // Offline the frame is held and nothing else moves: when the keyboard shows or hides, the
+        // surface is resized and blank until the view draws into it, so it must be woken.
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        box_.set_shell(10, 7, None);
+        assert!(box_.hold(10));
+        let before = box_.state().revision;
+        box_.surface_changed();
+        assert_ne!(box_.state().revision, before);
+        assert!(box_.state().held, "the held frame stays held");
     }
 
     #[test]

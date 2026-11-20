@@ -57,6 +57,21 @@ final class ComposerBar {
          * is up, or through the outbox when it is not. False keeps the draft.
          */
         boolean send(String text);
+        /**
+         * Step 2 of the Send handoff ({@link SendHandoff}): holds {@code text} under submission
+         * {@code id} durably, then acts on it (typed at once in the live pane, or kept). False
+         * when it was not held: the draft stays.
+         */
+        default boolean send(String text, String id) { return send(text); }
+        /**
+         * Step 4 of the Send handoff: message {@code id}, held by {@link #send(String, String)},
+         * may now be acted on (typed at once when its pane is live): its draft's clear is on disk.
+         */
+        default void act(String id) { }
+        /** Whether the held message {@code id} can be taken back for editing (not being sent). */
+        default boolean queuedEditable(String id) { return queuedText(id) != null; }
+        /** Whether submission {@code id} was ever held (it is, or it left after being held). */
+        default boolean queuedKnown(String id) { return queuedText(id) != null; }
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
@@ -317,6 +332,13 @@ final class ComposerBar {
             appendDictation(pane, text, null);
         }
 
+        @Override public void appendDictation(String hostId, String pane, String text, int[] unverifiedCuts) {
+            // A final for the computer and pane it was spoken on, whatever is on screen now.
+            String onHost = hostId == null ? "" : hostId;
+            String draft = drafts.append(onHost, pane, text, unverifiedCuts);
+            if (onHost.equals(drafts.host()) && pane.equals(drafts.pane())) showText(draft);
+        }
+
         @Override public void appendDictation(String pane, String text, int[] unverifiedCuts) {
             // A live final for another pane: it stays in memory either way; persistNow follows.
             if (pane == null || pane.isEmpty()) pane = drafts.pane();
@@ -367,7 +389,8 @@ final class ComposerBar {
         this.host = host;
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        drafts.restore(preferences.getString(DRAFTS, ""));
+        drafts.restoreOffered(preferences.getString(DRAFTS, ""));
+        handoff = SendHandoff.Record.decode(preferences.getString(SendHandoff.KEY, ""));
         // A clear made before a restart: its undo is still on offer within its window.
         clearing.resume(preferences.getString(CLEAR_RECORD, ""), wall());
         field = createField();
@@ -500,6 +523,43 @@ final class ComposerBar {
         return commitDrafts(drafts.encode());
     }
 
+    /** A Send that had not finished when the app last stopped; settled once the outbox is read. */
+    private SendHandoff.Record handoff;
+
+    /**
+     * Settles a Send the app stopped in the middle of (§3.2): its message held, the draft that
+     * still holds its text is cleared; not held, the draft stays and says so. Main thread, once
+     * the outbox has been read.
+     */
+    private void settleHandoff() {
+        SendHandoff.Record record = handoff;
+        if (record == null || !host.outboxLoaded()) return;
+        handoff = null;
+        SendHandoff.Recovery recovery = SendHandoff.reconcile(record, host::queuedKnown);
+        if (recovery == SendHandoff.Recovery.CLEAR_DRAFT && drafts.removeSent(record.owner, record.text)) {
+            showText(drafts.text());
+        } else if (recovery == SendHandoff.Recovery.OFFER_AGAIN) {
+            host.notice(SendHandoff.NOT_SENT);
+        }
+        preferences.edit().putString(DRAFTS, drafts.encode()).remove(SendHandoff.KEY).commit();
+    }
+
+    /** The draft found on disk at start for the pane on screen, offered but not loaded; or null. */
+    ComposerDrafts.Draft offeredDraft() {
+        return drafts.offered();
+    }
+
+    /** The user took the offered draft: it is in the composer now. */
+    void acceptOfferedDraft() {
+        String text = drafts.acceptOffered();
+        if (text == null) {
+            host.notice("Finish the dictation first; the earlier draft stays offered");
+            return;
+        }
+        showText(text);
+        saveDraftsSoon();
+    }
+
     private boolean commitDrafts(String encoded) {
         String previous = preferences.getString(DRAFTS, "");
         if (preferences.edit().putString(DRAFTS, encoded).commit()) return true;
@@ -529,6 +589,7 @@ final class ComposerBar {
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
     void showQueued(List<Outbox.Message> messages) {
         queuedMessages = messages;
+        settleHandoff();
         queue.update(drafts.pane(), messages, android.os.SystemClock.uptimeMillis());
         // The outbox changed (or was just read from disk): an interrupted clear or undo is put right.
         clearing.reconcile(wall());
@@ -543,11 +604,48 @@ final class ComposerBar {
         pushGhost();
     }
 
+    /**
+     * "Edit as draft" on held message {@code id}: its text joins this pane's draft, committed to
+     * disk, before the message leaves the outbox ({@link HeldEdit}). False when nothing changed.
+     */
+    boolean editHeld(String id) {
+        Object[] before = new Object[1];
+        HeldEdit.Result result = HeldEdit.run(id, new HeldEdit.Steps() {
+            @Override public String text(String which) {
+                return host.queuedEditable(which) ? host.queuedText(which) : null;
+            }
+
+            @Override public boolean fits(String text) {
+                return ComposerDrafts.fits(drafts.text(), text);
+            }
+
+            @Override public boolean commitDraft(String text) {
+                before[0] = drafts.snapshot();
+                takeBack(text);
+                return persistNow();
+            }
+
+            @Override public boolean take(String which) {
+                return host.takeQueued(which) != null;
+            }
+
+            @Override public void rollback() {
+                drafts.rollback(before[0]);
+                showText(drafts.text());
+                persistNow();
+            }
+        });
+        if (result == HeldEdit.Result.DRAFT_NOT_SAVED) host.notice("Could not save the draft; the message stays held");
+        if (result == HeldEdit.Result.TOO_LONG) {
+            host.notice("The draft is too long to take this message in; it stays held. Send or shorten the draft first");
+        }
+        return result == HeldEdit.Result.EDITED;
+    }
+
     /** A queued message taken back: its text joins the draft, on a line of its own. */
     void takeBack(String text) {
         if (text == null || text.isEmpty()) return;
-        String draft = drafts.text();
-        String joined = draft.trim().isEmpty() ? text : draft.replaceAll("\\s+$", "") + "\n" + text;
+        String joined = ComposerDrafts.joinedBack(drafts.text(), text);
         drafts.edit(joined);
         showText(joined);
     }
@@ -606,13 +704,16 @@ final class ComposerBar {
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
             // pressed in the old pane is settled with it (sent only if that pane is back).
             if (recording(dictationState)) dictation.stop();
-            drafts.dictationEnded();
+            // The partial leaves this pane's draft: its final (or, on an error, the last words
+            // heard) lands in the pane it was spoken for, once, never beside a copy of itself.
+            drafts.dictationCancelled();
         } else if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
             dictation.cancel();
             setDictationState(DictationEngine.State.IDLE);
             routing.forget();
-            drafts.dictationEnded();
+            // The listening partial leaves the draft it was spoken into (the session is cancelled).
+            drafts.dictationCancelled();
         }
         if (!drafts.setHost(onHost, revision, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);
@@ -734,7 +835,7 @@ final class ComposerBar {
     private int cursorAt(float x, float y) {
         if (layout == null || Float.isNaN(x) || Float.isNaN(y) || layout.draftRuns.length == 0) return -1;
         float col = (x / density - layout.left) / layout.cellWidth;
-        int row = (int) Math.floor((y / density - layout.top) / layout.cellHeight);
+        int row = layout.rows().draftRowAt(y / density);
         int drawn = DraftTaps.drawnAt(layout.draftRuns, row, col);
         return DraftTaps.fieldIndex(GhostText.fieldOffsets(drafts.text(), drafts.cuts(), clipLengths, parkedIds()),
                 drawn);
@@ -886,7 +987,7 @@ final class ComposerBar {
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
         if (keysOverlay.getVisibility() == View.VISIBLE) {
-            float guardTop = top + (layout.top + layout.guard * layout.cellHeight) * density;
+            float guardTop = top + layout.rows().top(layout.guard) * density;
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(48), Gravity.TOP | Gravity.START);
             params.topMargin = Math.max(Math.round(top), Math.round(guardTop) - dp(48));
             keysOverlay.setLayoutParams(params);
@@ -909,12 +1010,12 @@ final class ComposerBar {
             rowCells.addAll(layout.rowActions);
         }
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
-                layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
+                layout.rows(), layout.left, layout.cellWidth, layout.targetsTop, surfaceBottom, right,
                 recording(dictationState), layout.draftSpans, rowCells));
         // The queue's rows above the prompt, while it is open: one target per row, its full width,
         // and the selected row's actions on its right end.
-        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.left, layout.top,
-                layout.cellWidth, layout.cellHeight, layout.cols));
+        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.rows(),
+                layout.left, layout.cellWidth, layout.cols));
         tapGuard.laid(rects, android.os.SystemClock.uptimeMillis());
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
@@ -1018,6 +1119,7 @@ final class ComposerBar {
         switch (id) {
             case "type": toggleTyping(); break;
             case "talk": toggleDictation(); break;
+            case ControlLine.CANCEL: cancelDictation(); break;
             case ControlLine.ATTACH: host.attachImages(); break;
             case "send": enter(); break;
             case "clear": tapClear(false); break;
@@ -1038,8 +1140,9 @@ final class ComposerBar {
     private static String describe(String id) {
         if (id.startsWith("echo-")) return "A queued message: tap for its actions";
         switch (id) {
-            case "type": return "Type a message";
+            case "type": return "Type a message, or put the keyboard away";
             case "talk": return "Dictate; tap again to stop";
+            case ControlLine.CANCEL: return "Stop and discard what was dictated; the earlier text stays";
             case ControlLine.ATTACH: return "Attach an image: photo library, camera or clipboard";
             case "row-retry": return "Send this recording to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
@@ -1088,6 +1191,7 @@ final class ComposerBar {
         in.queueStyle = queueStyle(queuedMessages, loose.size() + parkedHere().size(), linkDown);
         in.expanded = queueOpen;
         in.attach = host.canAttach();
+        in.dictating = dictating();
         in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
         if (clearing.open(drafts.owner(), wall())) {
             in.undoWide = clearing.label(false);
@@ -1155,6 +1259,12 @@ final class ComposerBar {
         // One engine for the process (#30): only the session this window started is cancelled;
         // another window's recording is its own.
         return routing.cancelForClear(dictation, dictating() && Dictation.owns(this));
+    }
+
+    /** "cancel": the dictation ends and its words leave the draft, which is as it was before it began. */
+    private void cancelDictation() {
+        if (cancelDictationForClear()) showText(drafts.text());
+        pushGhost();
     }
 
     private void tapClear(boolean longPress) {
@@ -1226,12 +1336,10 @@ final class ComposerBar {
                 Dictation.pending(context).retry(r.id);
                 host.notice("Sending the recording to the desktop again");
                 break;
-            case "row-edit": {
+            case "row-edit":
                 queue.forget(r.id);
-                String text = host.takeQueued(r.id);
-                if (text != null) takeBack(text);
+                editHeld(r.id);
                 break;
-            }
             case "row-drop":
                 if (r.kind == QueueView.Kind.CLIP || r.kind == QueueView.Kind.PARKED) {
                     clearing.dropped(drafts.owner(), null, r.id, now);
@@ -1607,7 +1715,7 @@ final class ComposerBar {
      * queue it as one paste plus Enter; otherwise Enter goes to the program.
      */
     private void enter() {
-        switch (DictationRouting.onEnter(dictationState)) {
+        switch (routing.enterFor(dictationState)) {
             case STOP_THEN_SEND:
                 routing.sendWhenDone();
                 dictation.stop();
@@ -1629,9 +1737,42 @@ final class ComposerBar {
             host.enterKey();
             return;
         }
-        // The draft stays until the message is queued or kept, so nothing is lost.
-        if (!host.send(outgoing)) return;
-        drafts.sent();
+        // The durable handoff (§3.2): the exact text is on disk as a draft or as a held
+        // message at every moment, never both and never neither.
+        SendHandoff.Record record = new SendHandoff.Record(java.util.UUID.randomUUID().toString(),
+                drafts.owner().isEmpty() ? drafts.pane() : drafts.owner(), outgoing);
+        SendHandoff.Result result = SendHandoff.run(record, new SendHandoff.Steps() {
+            @Override public boolean commitDraft(SendHandoff.Record r) {
+                field.removeCallbacks(saveDrafts);
+                return preferences.edit().putString(DRAFTS, drafts.encode())
+                        .putString(SendHandoff.KEY, r.encode()).commit();
+            }
+
+            @Override public boolean holdMessage(SendHandoff.Record r) {
+                return host.send(r.text, r.id);
+            }
+
+            @Override public boolean clearDraft(SendHandoff.Record r) {
+                drafts.sent();
+                return preferences.edit().putString(DRAFTS, drafts.encode()).remove(SendHandoff.KEY).commit();
+            }
+
+            @Override public void forget(SendHandoff.Record r) {
+                preferences.edit().remove(SendHandoff.KEY).commit();
+            }
+
+            @Override public void act(SendHandoff.Record r) {
+                host.act(r.id);
+            }
+        });
+        if (result == SendHandoff.Result.HELD_DRAFT_STALE) {
+            host.notice("Held, but the draft could not be cleared on disk; tap Send here to type it");
+        }
+        if (result == SendHandoff.Result.DRAFT_NOT_SAVED) {
+            host.notice("Could not save the draft; nothing was sent");
+            return;
+        }
+        if (result == SendHandoff.Result.NOT_HELD) return;
         transcribedOnPhone = false;
         nothingHeard = null;
         showText("");

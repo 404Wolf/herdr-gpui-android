@@ -63,6 +63,65 @@ final class ControlTargets {
     private ControlTargets() { }
 
     /**
+     * Where each grid row's top is, in dp, when a multi-line draft is spread (the renderer's
+     * {@code RowGeometry}): the grid rows up to the draft's first are scrolled up by {@code shift}
+     * (whole rows), every row below stays put; the draft's own lines are {@code gap} further apart.
+     */
+    static final class Rows {
+        final float top, cell;
+        final int first, count;
+        final float gap, shift;
+
+        Rows(float top, float cell, int first, int count, float gap, float shift) {
+            this.top = top;
+            this.cell = cell;
+            this.first = first;
+            this.count = count < 2 ? 0 : count;
+            this.gap = this.count == 0 ? 0 : gap;
+            this.shift = this.count == 0 ? 0 : shift;
+        }
+
+        static Rows uniform(float top, float cell) {
+            return new Rows(top, cell, 0, 0, 0, 0);
+        }
+
+        /** Top of grid row {@code row}. */
+        float top(int row) {
+            float plain = top + row * cell;
+            return count >= 2 && row <= first ? plain - shift : plain;
+        }
+
+        float bottom(int row) {
+            return top(row) + cell;
+        }
+
+        /** Top of the draft line on grid row {@code row}. */
+        float draftTop(int row) {
+            if (count < 2 || row < first) return top(row);
+            return top(first) + (row - first) * (cell + gap);
+        }
+
+        /** The grid row at {@code y} dp (same origin as {@code top}); the band under the first draft row is its own. */
+        int rowAt(float y) {
+            float rel = y - top;
+            if (count < 2) return (int) Math.floor(rel / cell);
+            float edge = (first + 1) * cell;
+            if (rel < edge - shift) return (int) Math.floor((rel + shift) / cell);
+            if (rel < edge) return first;
+            return (int) Math.floor(rel / cell);
+        }
+
+        /** The draft line at {@code y} dp, or -1. */
+        int draftRowAt(float y) {
+            if (count < 2) return rowAt(y);
+            float rel = y - draftTop(first);
+            if (!(rel >= 0)) return -1;
+            int i = (int) Math.floor(rel / (cell + gap));
+            return i < count ? first + i : -1;
+        }
+    }
+
+    /**
      * The targets for {@code controls} on a grid at ({@code left}, {@code top})
      * with cells {@code cellWidth}×{@code cellHeight}, the surface ending at
      * {@code surfaceBottom}; none reaches above row {@code topRow - 1} or past
@@ -111,15 +170,24 @@ final class ControlTargets {
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
             int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans,
             List<Cells> rows) {
+        return layout(controls, Rows.uniform(top, cellHeight), left, cellWidth, topRow, surfaceBottom, maxRight,
+                recording, draftSpans, rows);
+    }
+
+    /** As above, on rows a multi-line draft may have spread ({@code geo}). */
+    static List<Rect> layout(List<Cells> controls, Rows geo, float left, float cellWidth,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans,
+            List<Cells> rows) {
+        float top = geo.top, cellHeight = geo.cell;
         List<Rect> out = new ArrayList<>();
-        float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
+        float ceiling = geo.top(Math.max(0, topRow - 1));
         for (Cells c : controls) {
             // The status words take no taps. A reserved slot ("gap-type", "gap-send") keeps its
             // place in the geometry exactly as its button would, so no neighbour's target changes
             // when it is empty; its own target takes taps and does nothing (ComposerBar).
             if (ControlLine.STATUS.equals(c.id)) continue;
-            // While recording the stop owns the corner, the reserved send slot included.
-            if (recording && ControlLine.GAP_SEND.equals(c.id)) continue;
+            // While recording "send" keeps its own target: the stop grows up to the gap before it,
+            // never over it (the boundary loop below).
             boolean talk = "talk".equals(c.id);
             float pad = talk ? TALK_PAD_DP : PAD_DP;
             float minWidth = talk ? TALK_MIN_DP : MIN_DP;
@@ -130,7 +198,7 @@ final class ControlTargets {
                 l -= grow;
                 r += grow;
             }
-            float rowTop = top + c.row * cellHeight;
+            float rowTop = geo.top(c.row);
             float b = Math.max(surfaceBottom, rowTop + cellHeight);
             float t = Math.max(ceiling, Math.min(rowTop - cellHeight, b - MIN_DP));
             if (talk && recording) {
@@ -141,7 +209,7 @@ final class ControlTargets {
                 t = Math.max(top, Math.min(t, b - STOP_MIN_HEIGHT_DP));
             }
             for (Cells row : rows) {
-                float rowBottom = top + (row.row + 1) * cellHeight;
+                float rowBottom = geo.bottom(row.row);
                 if (row.row < c.row && rowBottom > t) t = rowBottom;
             }
             if (draftSpans != null) {
@@ -151,9 +219,18 @@ final class ControlTargets {
                         if (span == null || span.length < 3 || span[2] <= span[1]) continue;
                         if ((span[0] == c.row) != (pass == 0)) continue;
                         float spanLeft = left + span[1] * cellWidth, spanRight = left + span[2] * cellWidth;
-                        float spanTop = top + span[0] * cellHeight, spanBottom = spanTop + cellHeight;
+                        float spanTop = geo.draftTop(span[0]), spanBottom = spanTop + cellHeight;
                         if (spanRight <= l || spanLeft >= r || spanBottom <= t || spanTop >= b) continue;
-                        if (span[0] < c.row) {
+                        // Touching only the target's padding (not its words): give up those columns,
+                        // not its height, so the words stay tappable along their whole box.
+                        boolean overWords = spanRight > labelLeft && spanLeft < labelRight;
+                        if (!overWords && span[0] != c.row) {
+                            if (spanRight <= labelLeft) {
+                                l = spanRight;
+                            } else {
+                                r = spanLeft;
+                            }
+                        } else if (span[0] < c.row) {
                             t = spanBottom;
                         } else if (span[0] > c.row) {
                             b = spanTop;
@@ -225,12 +302,18 @@ final class ControlTargets {
      */
     static List<Rect> rows(List<Cells> rows, List<Cells> actions, float left, float top, float cellWidth,
             float cellHeight, int cols) {
+        return rows(rows, actions, Rows.uniform(top, cellHeight), left, cellWidth, cols);
+    }
+
+    /** As above, on rows a multi-line draft may have spread. */
+    static List<Rect> rows(List<Cells> rows, List<Cells> actions, Rows geo, float left, float cellWidth, int cols) {
+        float cellHeight = geo.cell;
         List<Rect> out = new ArrayList<>();
         float edge = left + cols * cellWidth;
         List<Cells> sorted = new ArrayList<>(actions);
         sorted.sort((a, b) -> a.start - b.start);
         for (Cells c : rows) {
-            float t = top + c.row * cellHeight;
+            float t = geo.top(c.row);
             float right = edge;
             for (Cells a : sorted) {
                 if (a.row == c.row) {
@@ -243,7 +326,7 @@ final class ControlTargets {
         }
         for (int i = 0; i < sorted.size(); i++) {
             Cells a = sorted.get(i);
-            float t = top + a.row * cellHeight;
+            float t = geo.top(a.row);
             Cells before = i > 0 && sorted.get(i - 1).row == a.row ? sorted.get(i - 1) : null;
             Cells after = i + 1 < sorted.size() && sorted.get(i + 1).row == a.row ? sorted.get(i + 1) : null;
             float l = before == null ? left + (a.start - 1) * cellWidth

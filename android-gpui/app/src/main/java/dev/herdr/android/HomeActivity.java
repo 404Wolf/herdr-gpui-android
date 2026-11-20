@@ -253,6 +253,20 @@ public final class HomeActivity extends Activity {
         main.post(poll);
     }
 
+    private final KeyboardHide.Swipe keyboardSwipe = new KeyboardHide.Swipe();
+
+    @Override public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        keyboardSwipe.onTouch(this, event, android.view.ViewConfiguration.get(this).getScaledTouchSlop());
+        return super.dispatchTouchEvent(event);
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override public void onBackPressed() {
+        // The keyboard (the search box's, a form's) goes first; Back does its usual thing next.
+        if (KeyboardHide.hideIfShown(this)) return;
+        super.onBackPressed();
+    }
+
     @Override protected void onPause() {
         beginNavigation();
         resumed = false;

@@ -48,13 +48,15 @@ public final class OfflineSwitchTest {
     }
 
     @Test public void theLabelSaysCachedWhenAndWhyItIsNotLive() {
-        assertEquals("cached 14:32 · offline", OfflineSwitch.label("14:32", true, 0));
-        assertEquals("cached Tue 14:32 · offline", OfflineSwitch.label("Tue 14:32", true, 0));
-        assertEquals("cached 14:32 · connecting", OfflineSwitch.label("14:32", false, 0));
-        assertEquals("cached 14:32 · offline · 1 waits", OfflineSwitch.label("14:32", true, 1));
-        assertEquals("cached 14:32 · offline · 3 wait", OfflineSwitch.label("14:32", true, 3));
+        assertEquals("last saved screen · 14:32 · may be outdated · offline", OfflineSwitch.label("14:32", true, 0));
+        assertEquals("last saved screen · Tue 14:32 · may be outdated · offline", OfflineSwitch.label("Tue 14:32", true, 0));
+        assertEquals("last saved screen · 14:32 · may be outdated · connecting", OfflineSwitch.label("14:32", false, 0));
+        assertEquals("last saved screen · 14:32 · may be outdated · offline · 1 waits", OfflineSwitch.label("14:32", true, 1));
+        assertEquals("last saved screen · 14:32 · may be outdated · offline · 3 wait", OfflineSwitch.label("14:32", true, 3));
         assertEquals("not cached · offline", OfflineSwitch.label(null, true, 0));
         assertEquals("not cached · opens when the link is back", OfflineSwitch.NOT_CACHED);
+        // E13: a saved screen always says it is the last one saved, when, and that it may be outdated.
+        assertEquals("last saved screen · 14:02 · may be outdated", OfflineSwitch.saved("14:02"));
     }
 
     @Test public void theNoteFillsTheTerminalsGrid() {

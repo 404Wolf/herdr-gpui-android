@@ -211,6 +211,10 @@ pub struct DownStamps {
     queue: std::collections::VecDeque<u64>,
     /// The down GPUI handled last: the touch in progress.
     current: Gesture,
+    /// The phone's contact stays active when Java takes over a drag or pinch.
+    host_touch: bool,
+    /// The first contact the host forwarded to GPUI is still being handled.
+    forwarded_touch: bool,
 }
 
 impl Default for DownStamps {
@@ -228,6 +232,8 @@ impl DownStamps {
             dropped: 0,
             queue: std::collections::VecDeque::new(),
             current: Gesture::NONE,
+            host_touch: false,
+            forwarded_touch: false,
         }
     }
 
@@ -251,10 +257,25 @@ impl DownStamps {
     /// single-pointer action (`0` down, `1` up, `2` move, `3` cancel): a down
     /// takes its entry ([`Self::handled`]); the rest take nothing.
     pub fn observed(&mut self, action: u32) {
-        const DOWN: u32 = 0;
-        if action == DOWN {
-            self.handled();
+        match action {
+            0 => {
+                self.handled();
+                self.forwarded_touch = true;
+            }
+            1 | 3 => self.forwarded_touch = false,
+            _ => {}
         }
+    }
+
+    /// From the host's first physical down until its final lift or cancel.
+    pub fn set_host_touch(&mut self, touching: bool) {
+        self.host_touch = touching;
+    }
+
+    /// The foreground/layout may be ready before GPUI drains a complete tap
+    /// already queued by the host. Keep its projection until GPUI handles it.
+    pub fn touching(&self) -> bool {
+        self.host_touch || self.forwarded_touch || !self.queue.is_empty() || self.dropped != 0
     }
 
     /// GPUI handled the next queued down: its stamp is the touch in progress
@@ -615,6 +636,33 @@ mod tests {
         assert_eq!(gesture(&mut downs, CANCEL).stamp, 3);
         assert_eq!(gesture(&mut downs, UP).stamp, NO_STAMP);
         assert_eq!(downs.now().id, 4, "one gesture per observed down");
+    }
+
+    #[test]
+    fn projection_stays_frozen_until_a_queued_tap_has_reached_gpui() {
+        let mut downs = DownStamps::new();
+        downs.queued(10);
+        assert!(downs.touching());
+        downs.observed(DOWN);
+        assert!(downs.touching());
+        let first = downs.now();
+        downs.observed(UP);
+        assert!(!downs.touching());
+        // GPUI still needs the stamp when it synthesizes the click on lift.
+        assert_eq!(downs.now(), first);
+    }
+
+    #[test]
+    fn projection_stays_frozen_during_a_host_owned_drag_or_pinch() {
+        let mut downs = DownStamps::new();
+        downs.set_host_touch(true);
+        downs.queued(11);
+        downs.observed(DOWN);
+        // The Activity cancels the renderer's touch when it takes over.
+        downs.observed(CANCEL);
+        assert!(downs.touching());
+        downs.set_host_touch(false);
+        assert!(!downs.touching());
     }
 
     #[test]

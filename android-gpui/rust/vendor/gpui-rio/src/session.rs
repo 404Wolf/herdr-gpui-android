@@ -415,21 +415,38 @@ impl Session {
     /// Pasted text: escape characters removed, line breaks as carriage returns,
     /// bracketed when the program asked for bracketed paste.
     pub fn paste(&self, text: &str) -> bool {
+        let bytes = self.paste_bytes(text);
+        self.write(bytes)
+    }
+
+    /// What [`Self::paste`] would send for `text` now, without sending it:
+    /// for a caller that writes the bytes on its own ordered path. Returns
+    /// the view to the live screen, as any input does.
+    pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
         let bracketed = self.follow_input().contains(Mode::BRACKETED_PASTE);
         let text = text
             .replace('\x1b', "")
             .replace("\r\n", "\r")
             .replace('\n', "\r");
-        self.write(if bracketed {
+        if bracketed {
             format!("\x1b[200~{text}\x1b[201~").into_bytes()
         } else {
             text.into_bytes()
-        })
+        }
     }
 
     /// A non-text key. Returns false when it is not a terminal key or the
     /// input queue is full.
     pub fn key(&self, key: &KeyPress) -> bool {
+        let Some(bytes) = self.key_bytes(key) else {
+            return false;
+        };
+        self.write(bytes)
+    }
+
+    /// What [`Self::key`] would send for `key` now, without sending it;
+    /// None when it is not a terminal key.
+    pub fn key_bytes(&self, key: &KeyPress) -> Option<Vec<u8>> {
         let mode = self.grid.lock().mode();
         // Shift+Enter is a newline that does not submit, as desktop terminals
         // send it: the kitty keyboard protocol's CSI 13;2u when the program
@@ -453,11 +470,9 @@ impl Session {
         } else {
             key_bytes(key, mode.contains(Mode::APP_CURSOR))
         };
-        let Some(bytes) = bytes else {
-            return false;
-        };
+        let bytes = bytes?;
         self.follow_input();
-        self.write(bytes)
+        Some(bytes)
     }
 
     /// Input returns the view to the live screen and drops any selection.

@@ -286,6 +286,10 @@ pub(crate) fn hint_json(hint: &gpui_rio::ghost::LayoutHint) -> String {
         "anchored": hint.anchored,
         "guard": hint.guard,
         "targetsTop": hint.targets_top,
+        "blockFirst": hint.rows_geometry.first,
+        "blockRows": hint.rows_geometry.rows,
+        "rowGap": hint.rows_geometry.gap,
+        "rowShift": hint.rows_geometry.shift,
         "draftShown": hint.draft_shown,
         "controls": hint
             .controls
@@ -394,6 +398,20 @@ mod tests {
             .is_err()
         );
         assert!(parse(&format!(r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"x","s":"partial"}}]}}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn every_dictation_update_the_phone_sends_passes_the_real_bridge_limits() {
+        // The Java composer writes these through its own GhostText (rust/src/testdata/dictation_ladders.jsonl);
+        // each must parse here, with the bridge's real limit on alternatives (MAX_RUNGS).
+        let lines = include_str!("testdata/dictation_ladders.jsonl");
+        let mut failures = Vec::new();
+        for (n, line) in lines.lines().filter(|l| !l.is_empty()).enumerate() {
+            if let Err(error) = parse(line) {
+                failures.push(format!("line {}: {error}", n + 1));
+            }
+        }
+        assert!(failures.is_empty(), "{} rejected:\n{}", failures.len(), failures.join("\n"));
     }
 
     #[test]
@@ -551,6 +569,7 @@ mod tests {
                 cluster: false,
             }],
             draft_spans: vec![[37, 2, 11], [38, 2, 30]],
+            rows_geometry: gpui_rio::rows::RowGeometry::for_draft(15., Some((37, 38)), 38),
         };
         let value: serde_json::Value = serde_json::from_str(&hint_json(&hint)).expect("json");
         assert_eq!(value["echoes"][0]["id"], "echo-1");
@@ -561,6 +580,10 @@ mod tests {
         assert_eq!(value["controls"][0]["id"], "talk");
         assert_eq!(value["controls"][0]["start"], 60);
         assert_eq!(value["targetsTop"], 38);
+        assert_eq!(value["blockFirst"], 37);
+        assert_eq!(value["blockRows"], 2);
+        assert_eq!(value["rowGap"], 4.0);
+        assert_eq!(value["rowShift"], 15.0);
         assert_eq!(value["draft"][0], serde_json::json!([37, 2, 9, 14, 9, 0]));
         assert_eq!(value["draftSpans"], serde_json::json!([[37, 2, 11], [38, 2, 30]]));
         assert_eq!(value["rowActions"][0]["id"], "row-drop");

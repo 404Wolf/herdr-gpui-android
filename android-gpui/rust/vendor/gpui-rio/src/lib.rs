@@ -7,6 +7,8 @@
 
 mod adapter;
 mod error;
+#[doc(hidden)]
+pub mod footer;
 pub mod ghost;
 pub mod glyphs;
 mod keys;
@@ -14,6 +16,7 @@ mod keys;
 pub mod links;
 mod mouse;
 mod options;
+pub mod rows;
 mod session;
 #[doc(hidden)]
 pub mod tap;
