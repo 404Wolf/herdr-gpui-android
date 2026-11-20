@@ -120,6 +120,42 @@ public final class ComposerDraftsTest {
     }
 
     @Test
+    public void clearingAnAttachmentOnlyDraftLeavesRoomForAllTextDrafts() throws Exception {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.setHost("host", "original", encoded -> true);
+        drafts.switchTo("first");
+        drafts.edit("first unsent prompt");
+        drafts.switchTo("image");
+        drafts.appendAttachment("host", "original", "image", Collections.singletonList(IMAGE));
+        drafts.edit("");
+        for (int i = 1; i < ComposerDrafts.MAX_PANES; i++) {
+            drafts.switchTo("p" + i);
+            drafts.edit("prompt " + i);
+        }
+        String saved = drafts.encode();
+        assertEquals(ComposerDrafts.MAX_PANES, new org.json.JSONObject(saved).length());
+        assertEquals("first unsent prompt", drafts.switchTo("first"));
+
+        ComposerDrafts restored = new ComposerDrafts();
+        restored.restore(saved);
+        restored.setHost("host", "original", encoded -> true);
+        assertEquals("first unsent prompt", restored.switchTo("first"));
+    }
+
+    @Test
+    public void adoptingAPreAttachmentPlainDraftPreservesEveryCharacter() throws Exception {
+        String prompt = " \nCompare ('/notes and the reference " + IMAGE + "') today.\n  ";
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.restore(new org.json.JSONObject().put("t1", prompt).toString());
+        drafts.setHost("host", "original", encoded -> true);
+        assertEquals(prompt, drafts.switchTo("t1"));
+        assertNull(drafts.draftRevision());
+        org.json.JSONObject saved = new org.json.JSONObject(drafts.encode());
+        assertEquals(prompt, saved.getString(ComposerDrafts.key("host", "t1")));
+        assertFalse(saved.has("t1"));
+    }
+
+    @Test
     public void adoptingALegacyDraftKeepsItsTextAndRemovesUnownedPaths() throws Exception {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.restore(new org.json.JSONObject().put("t1",
