@@ -1,0 +1,790 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index a1a31c6..4d5485b 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -121,7 +121,15 @@ error, exited); inspect its screen.
+ 
+ `send` and these notes wait until nobody has typed for ~3 s, and never join a
+ draft a person left unsent: they wait for it to be sent or cleared, and after
+-2 minutes `send` fails with `drafting` (nothing typed). A program that reads
++2 minutes `send` fails with `drafting` (nothing typed). That wait counts from
++when the send arrives, so sends queued behind one draft give up together. A
++send still waiting when its caller goes away (its `hc` was killed, say by
++`timeout`, or its connection hung up) is dropped: nothing is typed, and the
++core logs it. (A client that only stops writing, as `hc connect` does once
++its stdin ends, is not gone: it gets its answer. Not noticed on Windows.) So never loop `hc send` or put it under a `timeout` shorter than
++2 minutes: a send that waits has not failed, and each retry only queues
++another. If one failed or was killed, `hc read` the target first and resend at
++most once. A program that reads
+ its own messages out of band runs `hc inbox --follow` in its terminal: while it
+ does, sends and notes to it are queued there, in order, as JSON lines `{id,
+ from, text, kind, ts}` (`kind` send or note), instead of typed; `hc inbox ack
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 5a56044..5b52d29 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -58,6 +58,8 @@ pub struct Call<'a> {
+     pub conn: Option<&'a Arc<crate::wire::Conn>>,
+     /// Where a plain connection receives its subscription.
+     pub plain: Option<&'a std::sync::Mutex<Option<PlainSub>>>,
++    /// Whether the caller is still there (see `input::Gone`).
++    pub gone: crate::input::Gone,
+ }
+ 
+ impl std::ops::Deref for Call<'_> {
+@@ -115,7 +117,7 @@ methods! { Ctx<'_>;
+         "Open a raw stream to a live terminal on this framed connection (see `hello` with `framed`). Loss ends the stream even when kept; reattach after the restarted event.",
+         errors ["not_found", "machine_unknown", "finished", "unavailable", "needs_framed"];
+     "terminal.send" => terminal_send, SendParams => SendResult,
+-        "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min for them to send or clear it); keys a person presses meanwhile are held, then delivered. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed.",
++        "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min, counted from when it arrives, for them to send or clear it); keys a person presses meanwhile are held, then delivered. A send still waiting when its caller goes away (its `hc` was killed, its connection hung up) is dropped: nothing is typed. A client that only stops writing, as `hc connect` does when its stdin ends, still gets its answer. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed.",
+         errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "drafting", "invalid_params", "config"];
+     "terminal.queue" => terminal_queue, QueueParams => SendResult,
+         "Queue text in a terminal's inbox when its program follows it (terminal.inbox), as terminal.send would; otherwise fail with `not_following`. Never types, so a core that predates it refuses it as an unknown method. With a `key` already queued on that terminal within `queue_keys_kept_ms` (a retry after a lost answer), it isn't queued again and the answer says `repeated`; keys are kept with the terminal, across restarts. With `key_since` (when the key was first sent) before the terminal's keys go back, it may have been queued and forgotten: refused with `key_forgotten`, never queued again. With `core`, only that core queues it (`other_core` otherwise). This machine's terminals only.",
+@@ -130,7 +132,7 @@ methods! { Ctx<'_>;
+         "Wait until the program is not working (any word but working, or it exited/was lost); already not working returns at once. A program that never reported status is working until it exits. After a send from the same caller, waits for the turn that send started. A message to the caller also ends it: ended false, reason message, from = sender. A timeout is a check-in: ended false, current status.",
+         errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config"];
+     "terminal.keys" => terminal_keys, KeysParams => KeysResult,
+-        "Press named keys, encoded for the program's current keyboard modes. Same quiet rule as send.",
++        "Press named keys, encoded for the program's current keyboard modes. Same quiet rule as send, and the same drop if its caller goes away while it waits.",
+         errors ["not_found", "machine_unknown", "finished", "unavailable", "invalid_params"];
+     "terminal.interrupt" => terminal_interrupt, InterruptParams => InterruptResult,
+         "Press the stop key (esc if it reports status, else ctrl+c), then report what was observed. Never escalates.",
+@@ -609,7 +611,10 @@ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcEr
+     let only_if = p.only_if.map(|w| word(&w));
+     let since = p.key_since.unwrap_or_else(crate::runtime::now_ms);
+     let key = p.key.as_deref().map(|key| crate::inbox::QueueKey { key, since });
+-    let sent = core.send_or_queue(id, from, &text, p.force, only_if.as_deref(), p.inbox_only, key).await?;
++    let sent = core
++        .send_or_queue(id, from, &text, p.force, only_if.as_deref(), p.inbox_only, key, &core.gone)
++        .await
++        .inspect_err(logged_if_dropped("terminal.send", &p.terminal, p.caller.as_deref()))?;
+     if let Some(child) = p.caller.as_deref().and_then(crate::terminals::parse_id) {
+         let mut st = core.lock();
+         if let Some(c) = st
+@@ -708,9 +713,21 @@ async fn terminal_put(core: Ctx<'_>, p: PutParams) -> Result<PutResult, RpcError
+     Ok(PutResult { path: path.display().to_string(), bytes: bytes.len() })
+ }
+ 
++/// A call whose caller went away while it waited types nothing, and nobody
++/// is left to hear it: the core's log says so.
++fn logged_if_dropped<'a>(method: &'a str, terminal: &'a str, caller: Option<&'a str>) -> impl Fn(&RpcError) + 'a {
++    move |e| {
++        if e.kind == "cancelled" {
++            let from = caller.filter(|c| !c.is_empty()).map(|c| format!(" from {c}")).unwrap_or_default();
++            crate::log!("core: {method} to {terminal}{from}: {}", e.message);
++        }
++    }
++}
++
+ async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysResult, RpcError> {
+     let id = resolve(core, &p.terminal)?;
+-    let (status, turn) = core.keys(id, &p.keys).await?;
++    let dropped = logged_if_dropped("terminal.keys", &p.terminal, p.caller.as_deref());
++    let (status, turn) = core.keys(id, &p.keys, &core.gone).await.inspect_err(dropped)?;
+     core.saw(p.caller.as_deref(), id);
+     let warning = core.flush_warning().await;
+     Ok(KeysResult { status, turn, warning })
+@@ -720,7 +737,8 @@ async fn terminal_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<Interru
+     use crate::input::Interrupted;
+     let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
+     let id = resolve(core, &p.terminal)?;
+-    let (outcome, key) = core.interrupt(id, timeout).await?;
++    let dropped = logged_if_dropped("terminal.interrupt", &p.terminal, None);
++    let (outcome, key) = core.interrupt(id, timeout, &core.gone).await.inspect_err(dropped)?;
+     let outcome = match outcome {
+         Interrupted::Stopped => "stopped",
+         Interrupted::Exited => "exited",
+diff --git a/crates/herdr-core/src/inbox.rs b/crates/herdr-core/src/inbox.rs
+index 5eb0e2a..17b836b 100644
+--- a/crates/herdr-core/src/inbox.rs
++++ b/crates/herdr-core/src/inbox.rs
+@@ -123,6 +123,7 @@ impl Core {
+         only_if: Option<&str>,
+         inbox_only: bool,
+         key: Option<QueueKey<'_>>,
++        gone: &crate::input::Gone,
+     ) -> Result<crate::input::Sent, RpcError> {
+         let queued = {
+             let mut st = self.lock();
+@@ -161,7 +162,7 @@ impl Core {
+                     "nothing was typed; its program doesn't read its inbox (`hc inbox --follow`)",
+                 ));
+             }
+-            return self.send(id, text, force, only_if).await;
++            return self.send(id, text, force, only_if, gone).await;
+         };
+         let started = if repeated { None } else { self.started_after(id, turn, reported).await };
+         Ok(crate::input::Sent { status, turn, started, via: "inbox", waiting: Some(waiting), repeated })
+diff --git a/crates/herdr-core/src/input.rs b/crates/herdr-core/src/input.rs
+index 3de00de..7bdfb82 100644
+--- a/crates/herdr-core/src/input.rs
++++ b/crates/herdr-core/src/input.rs
+@@ -6,6 +6,7 @@ use crate::rpc::RpcError;
+ use crate::runtime::{Core, State};
+ use crate::terminals::Terminal;
+ use std::time::{Duration, Instant};
++use tokio::sync::watch;
+ 
+ /// Pause between the paste and Enter, so the program sees them apart.
+ pub const PASTE_GAP: Duration = Duration::from_millis(200);
+@@ -20,6 +21,43 @@ const STARTUP_MS: u64 = 10_000;
+ /// The longest a send waits for a starting agent to settle.
+ const SETTLE_MAX: Duration = Duration::from_secs(5);
+ 
++/// Whether the caller of a call is still there to hear how it went. A send
++/// (or keys, or interrupt) that is still waiting for its turn, for a person
++/// who is typing or for a draft when its caller goes away (its `hc` was
++/// killed, its connection hung up) stops waiting and types nothing: nobody
++/// is left to hear that it failed, and the caller will have given it up.
++#[derive(Clone, Default)]
++pub struct Gone(Option<watch::Receiver<bool>>);
++
++impl Gone {
++    /// A caller that is here until `ended` is told otherwise (or dropped).
++    pub fn watch(ended: &watch::Sender<bool>) -> Gone {
++        Gone(Some(ended.subscribe()))
++    }
++
++    pub fn is_gone(&self) -> bool {
++        // A dropped sender ends the caller too.
++        self.0.as_ref().is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
++    }
++
++    /// Resolves once the caller is gone; never for a call with no caller to lose.
++    pub async fn ended(&self) {
++        match &self.0 {
++            Some(rx) => drop(rx.clone().wait_for(|gone| *gone).await),
++            None => std::future::pending().await,
++        }
++    }
++}
++
++/// The error of a call dropped because its caller went away (nobody hears it).
++fn dropped(arrived: Instant) -> RpcError {
++    RpcError::new(
++        "cancelled",
++        format!("its caller went away after {} s; nothing was typed", arrived.elapsed().as_secs()),
++        "",
++    )
++}
++
+ /// A person's typing, as it affects agent input to one terminal.
+ #[derive(Default)]
+ pub struct Gate {
+@@ -440,17 +478,26 @@ impl Core {
+     /// Types `steps` (built by `prepare` from the live state) into terminal `id`.
+     /// `quiet`: how long a person must have stopped typing first (zero: don't wait).
+     /// `text`: it types text, which must never join a person's draft: it waits
+-    /// for them to send or clear it, and refuses after `draft_max`.
++    /// for them to send or clear it, and refuses after `draft_max`, counted
++    /// from when the call arrived (not from its turn: calls queued behind one
++    /// draft give up together, not one every `draft_max`).
++    /// `gone`: its caller leaving ends the wait with nothing typed; once the
++    /// typing has begun it is finished (never half a paste).
+     pub async fn type_in<T>(
+         &self,
+         id: u32,
+         quiet: Duration,
+         text: bool,
++        gone: &Gone,
+         prepare: impl FnOnce(&State, &Terminal) -> Result<(T, Vec<Step>), RpcError>,
+     ) -> Result<T, RpcError> {
++        let arrived = Instant::now();
++        let give_up = arrived + draft_max();
+         let queue = self.lock().queues.entry(id).or_default().clone();
+-        let _turn = queue.lock().await;
+-        let give_up = Instant::now() + draft_max();
++        let _turn = tokio::select! {
++            turn = queue.lock() => turn,
++            () = gone.ended() => return Err(dropped(arrived)),
++        };
+         loop {
+             let (left, draft) = {
+                 let st = self.lock();
+@@ -458,9 +505,9 @@ impl Core {
+                 let left = gate.and_then(|g| g.last_human).map(|t| quiet.saturating_sub(t.elapsed()));
+                 (left, text && gate.is_some_and(|g| g.draft))
+             };
+-            match left {
+-                Some(left) if !left.is_zero() => tokio::time::sleep(left).await,
+-                _ if draft && Instant::now() < give_up => tokio::time::sleep(DRAFT_POLL).await,
++            let nap = match left {
++                Some(left) if !left.is_zero() => left,
++                _ if draft && Instant::now() < give_up => DRAFT_POLL,
+                 _ if draft => {
+                     return Err(RpcError::new(
+                         "drafting",
+@@ -469,8 +516,15 @@ impl Core {
+                     ));
+                 }
+                 _ => break,
++            };
++            tokio::select! {
++                () = tokio::time::sleep(nap) => {}
++                () = gone.ended() => return Err(dropped(arrived)),
+             }
+         }
++        if gone.is_gone() {
++            return Err(dropped(arrived));
++        }
+         let (out, steps) = {
+             let mut st = self.lock();
+             let t = st.reg.terminals.get(&id).filter(|t| t.is_live()).ok_or_else(|| {
+@@ -517,12 +571,20 @@ impl Core {
+ 
+     /// Paste + Enter, after a person has paused typing. Refuses a blocked
+     /// program (typing would answer its dialog) unless `force`.
+-    pub async fn send(&self, id: u32, text: &str, force: bool, only_if: Option<&str>) -> Result<Sent, RpcError> {
+-        self.send_message(id, text, force, only_if, false).await
++    pub async fn send(
++        &self,
++        id: u32,
++        text: &str,
++        force: bool,
++        only_if: Option<&str>,
++        gone: &Gone,
++    ) -> Result<Sent, RpcError> {
++        self.send_message(id, text, force, only_if, false, gone).await
+     }
+ 
++    /// The task a new terminal was made for: typed whether or not its starter stays.
+     pub(crate) async fn send_first_task(&self, id: u32, text: &str) -> Result<Sent, RpcError> {
+-        self.send_message(id, text, false, None, true).await
++        self.send_message(id, text, false, None, true, &Gone::default()).await
+     }
+ 
+     async fn send_message(
+@@ -532,13 +594,14 @@ impl Core {
+         force: bool,
+         only_if: Option<&str>,
+         first_task: bool,
++        gone: &Gone,
+     ) -> Result<Sent, RpcError> {
+         if let Some(t) = self.lock().reg.terminals.get(&id) {
+             t.check_program()?;
+         }
+-        self.settle(id).await?;
++        self.settle(id, gone).await?;
+         let (status, turn, reported) = self
+-            .type_in(id, quiet(), true, |st, t| {
++            .type_in(id, quiet(), true, gone, |st, t| {
+                 let word = state_word(t);
+                 if word.as_deref() == Some("blocked") && !force {
+                     return Err(RpcError::new(
+@@ -586,8 +649,9 @@ impl Core {
+     /// A starting agent can report before it is ready for a paste (Pi swaps its
+     /// input box right after its first report and drops a paste in flight):
+     /// in its first seconds, wait until its screen has been still a moment.
+-    async fn settle(&self, id: u32) -> Result<(), RpcError> {
+-        let deadline = Instant::now() + SETTLE_MAX;
++    async fn settle(&self, id: u32, gone: &Gone) -> Result<(), RpcError> {
++        let started = Instant::now();
++        let deadline = started + SETTLE_MAX;
+         loop {
+             let ready = {
+                 let st = self.lock();
+@@ -611,13 +675,16 @@ impl Core {
+                     format!("nothing was typed; check hc read {}, then retry", crate::terminals::address(id)),
+                 ));
+             }
+-            tokio::time::sleep(Duration::from_millis(50)).await;
++            tokio::select! {
++                () = tokio::time::sleep(Duration::from_millis(50)) => {}
++                () = gone.ended() => return Err(dropped(started)),
++            }
+         }
+     }
+ 
+     /// Named keys, after a person has paused typing.
+-    pub async fn keys(&self, id: u32, names: &[String]) -> Result<(Option<String>, u64), RpcError> {
+-        self.type_in(id, quiet(), false, |st, t| {
++    pub async fn keys(&self, id: u32, names: &[String], gone: &Gone) -> Result<(Option<String>, u64), RpcError> {
++        self.type_in(id, quiet(), false, gone, |st, t| {
+             let screen = st.screens.get(&id).expect("live terminal has a screen");
+             let mut steps = Vec::new();
+             for name in names {
+@@ -630,7 +697,7 @@ impl Core {
+     }
+ 
+     /// Esc for programs that report status, else ctrl+c; then watch what happens.
+-    pub async fn interrupt(&self, id: u32, timeout: Duration) -> Result<(Interrupted, String), RpcError> {
++    pub async fn interrupt(&self, id: u32, timeout: Duration, gone: &Gone) -> Result<(Interrupted, String), RpcError> {
+         let (reported, pid) = {
+             let st = self.lock();
+             let t = st.reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal removed", ""))?;
+@@ -639,7 +706,7 @@ impl Core {
+         };
+         let before = if reported { -1 } else { self.foreground(id).await };
+         let key = self
+-            .type_in(id, Duration::ZERO, false, |st, t| {
++            .type_in(id, Duration::ZERO, false, gone, |st, t| {
+                 let default = if reported { "esc" } else { "ctrl+c" };
+                 let key = t.stop.clone().unwrap_or_else(|| default.into());
+                 let screen = st.screens.get(&id).expect("live terminal has a screen");
+diff --git a/crates/herdr-core/src/notes.rs b/crates/herdr-core/src/notes.rs
+index 18ed585..4ac813f 100644
+--- a/crates/herdr-core/src/notes.rs
++++ b/crates/herdr-core/src/notes.rs
+@@ -293,7 +293,7 @@ impl Core {
+             return Ok(queued);
+         }
+         let typed = self
+-            .type_in(parent, quiet, true, |st, t| {
++            .type_in(parent, quiet, true, &crate::input::Gone::default(), |st, t| {
+                 if !can_take_note(t) {
+                     return Err(RpcError::new("busy", "the parent got busy", ""));
+                 }
+diff --git a/crates/herdr-core/src/platform/unix.rs b/crates/herdr-core/src/platform/unix.rs
+index 3cc5af7..f2d054a 100644
+--- a/crates/herdr-core/src/platform/unix.rs
++++ b/crates/herdr-core/src/platform/unix.rs
+@@ -75,6 +75,23 @@ impl AsyncListener {
+     }
+ }
+ 
++/// How often `peer_gone` looks. A call it watches waits for a person (seconds to minutes).
++const PEER_LOOK: std::time::Duration = std::time::Duration::from_millis(200);
++
++/// Resolves once the client at the other end of a connection has gone for good: closed its
++/// end entirely or reset the connection (the kernel reports the socket hung up, as for a
++/// killed process). A client that only shut down its sending side (`hc connect` does, once
++/// its stdin ends; `nc -N`) still reads its answer, so that is not gone. It reads nothing:
++/// whatever a client has pipelined behind the call stays for the protocol to parse.
++pub(crate) async fn peer_gone(read: &AsyncRead) {
++    use tokio::io::Interest;
++    // Write readiness carries the "hung up" bit, and answers at once from what the reactor
++    // has seen: looking is a cheap check, not a wait.
++    while !read.ready(Interest::WRITABLE).await.is_ok_and(|ready| ready.is_write_closed()) {
++        tokio::time::sleep(PEER_LOOK).await;
++    }
++}
++
+ pub fn remove_endpoint(path: &Path) {
+     let _ = std::fs::remove_file(path);
+ }
+diff --git a/crates/herdr-core/src/platform/windows.rs b/crates/herdr-core/src/platform/windows.rs
+index 4c7c3b4..6512842 100644
+--- a/crates/herdr-core/src/platform/windows.rs
++++ b/crates/herdr-core/src/platform/windows.rs
+@@ -298,6 +298,13 @@ impl Listener {
+ pub type AsyncRead = tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeServer>;
+ pub type AsyncWrite = tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeServer>;
+ 
++/// A pipe can't be looked at without reading it, and a call that reads what its client sent
++/// next would lose it: on Windows a caller that went away is not noticed, and its send
++/// waits for its turn as before.
++pub(crate) async fn peer_gone(_: &AsyncRead) {
++    std::future::pending().await
++}
++
+ /// The core's pipe for clients.
+ pub struct AsyncListener {
+     name: PathBuf,
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index c283495..e079958 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -615,7 +615,8 @@ async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Val
+             if let Some(caller) = params["caller"].as_str() {
+                 params["caller"] = format!("{}/{caller}", m.name).into();
+             }
+-            let call = crate::api::Call { core: &core, conn: None, plain: None };
++            // A peer's call has no connection of its own to lose here: it is the peer's to cancel.
++            let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
+             crate::api::dispatch(&call, method, params).await
+         }
+     };
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index 56b0c32..5a2343e 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -44,7 +44,8 @@ async fn keys_pressed_during_a_paste_follow_its_submit() {
+     // Ignore attach's resize frames. From here the fake holder sees only input.
+     while frames.try_recv().is_ok() {}
+     {
+-        let sending = core.send(id, "abc", false, None);
++        let gone = crate::input::Gone::default();
++        let sending = core.send(id, "abc", false, None, &gone);
+         tokio::pin!(sending);
+         poll_fn(|cx| {
+             assert!(sending.as_mut().poll(cx).is_pending(), "the paste must pause before submit");
+@@ -102,7 +103,7 @@ async fn server_stop_succeeds_even_when_the_registry_flush_times_out() {
+         Ok(())
+     })
+     .unwrap();
+-    let call = crate::api::Call { core: &core, conn: None, plain: None };
++    let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
+     let started = Instant::now();
+     let stop = crate::api::dispatch(&call, "server.stop", json!({})).await;
+     release.send(()).unwrap();
+@@ -127,7 +128,7 @@ async fn a_restart_saves_first_starts_nothing_meanwhile_and_is_taken_back_when_i
+         Err(io::Error::other("disk full"))
+     })
+     .unwrap();
+-    let call = crate::api::Call { core: &core, conn: None, plain: None };
++    let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
+     let err = {
+         let restarting = crate::api::dispatch(&call, "server.restart", json!({}));
+         tokio::pin!(restarting);
+@@ -198,7 +199,7 @@ async fn a_forced_restart_names_every_live_terminal_missing_from_the_saved_regis
+     release.send(()).unwrap();
+     assert!(core.flush_warning().await.is_some());
+     assert!(core.saving_failure().unwrap().0 > 0);
+-    let call = crate::api::Call { core: &core, conn: None, plain: None };
++    let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
+     let answer = crate::api::dispatch(&call, "server.restart", json!({"force_stale_registry": true})).await.unwrap();
+     let warning = answer["warning"].as_str().unwrap();
+     assert!(warning.contains(&first_lost) && warning.contains("disk full"), "{warning}");
+@@ -251,7 +252,7 @@ async fn label_and_kill_reply_with_the_record_observed_before_flushing() {
+             id
+         };
+         let reply = {
+-            let call = crate::api::Call { core: &core, conn: None, plain: None };
++            let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
+             let request =
+                 crate::api::dispatch(&call, method, json!({"terminal": crate::terminals::address(id), "labels": {}}));
+             tokio::pin!(request);
+@@ -319,7 +320,7 @@ async fn a_prepared_restart_survives_sigterm_and_rejects_stop() {
+     };
+     paths.create_dirs().unwrap();
+     let core = Core::start(paths, CoreInfo { id: "test".into(), name: "test".into() }).unwrap();
+-    let call = crate::api::Call { core: &core, conn: None, plain: None };
++    let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
+     crate::api::dispatch(&call, "server.restart", serde_json::json!({})).await.unwrap();
+     crate::restart::on_sigterm(&core);
+     assert!(core.paths.state.join("restart-env.json").exists(), "SIGTERM keeps the explicit restart's note");
+diff --git a/crates/herdr-core/src/server.rs b/crates/herdr-core/src/server.rs
+index ac8f329..7b70ced 100644
+--- a/crates/herdr-core/src/server.rs
++++ b/crates/herdr-core/src/server.rs
+@@ -2,6 +2,7 @@
+ //! (a named pipe on Windows).
+ 
+ use crate::api::{self, CoreInfo};
++use crate::input::Gone;
+ use crate::paths::Paths;
+ use crate::platform::{self, AsyncListener};
+ use crate::rpc::{self, RpcError};
+@@ -160,14 +161,30 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
+         if line.trim().is_empty() {
+             continue;
+         }
+-        let handling = handle(&core, None, Some(&plain), line.as_bytes());
+-        // An exec ends when its caller goes away.
+-        let handled = match is_exec(line.as_bytes()) {
+-            true => tokio::select! {
++        let (ended, _) = tokio::sync::watch::channel(false);
++        let handling = handle(&core, None, Some(&plain), Gone::watch(&ended), line.as_bytes());
++        let handled = match method_of(line.as_bytes()).as_deref() {
++            // An exec ends when its caller goes away.
++            Some("machine.exec") => tokio::select! {
+                 handled = handling => handled,
+                 () = closed(&mut read, &mut ahead) => return Ok(()),
+             },
+-            false => handling.await,
++            // So does a send, keys or interrupt still waiting for a person: it types
++            // nothing (see `input::Gone`). Its client is gone when the connection is hung up,
++            // not when it stopped writing (a client may half-close and still read its answer),
++            // and nothing is read to find out: what the client pipelined behind the call
++            // (more requests, a hello and its frames) stays in `read` for the loop below.
++            Some("terminal.send" | "terminal.queue" | "terminal.keys" | "terminal.interrupt") => {
++                tokio::pin!(handling);
++                tokio::select! {
++                    handled = &mut handling => handled,
++                    () = platform::peer_gone(read.get_ref()) => {
++                        ended.send_replace(true);
++                        handling.await
++                    }
++                }
++            }
++            _ => handling.await,
+         };
+         let wrote = match &handled.reply {
+             Some(reply) => write.write_all(format!("{reply}\n").as_bytes()).await,
+@@ -203,6 +220,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
+             Ok(())
+         }
+     };
++    conn.end();
+     core.detach(&conn, None);
+     crate::remote::conn_gone(&core, &conn);
+     crate::remote::peer_left(&core, &conn);
+@@ -210,8 +228,8 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
+     result
+ }
+ 
+-fn is_exec(message: &[u8]) -> bool {
+-    serde_json::from_slice::<Value>(message).is_ok_and(|m| m["method"] == "machine.exec")
++fn method_of(message: &[u8]) -> Option<String> {
++    serde_json::from_slice::<Value>(message).ok()?["method"].as_str().map(str::to_owned)
+ }
+ 
+ /// Returns once a plain connection is closed; what it sends meanwhile is
+@@ -333,7 +351,7 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
+                 }
+                 let (core, conn) = (core.clone(), conn.clone());
+                 let task = tokio::spawn(async move {
+-                    let handled = handle(&core, Some(&conn), None, &payload).await;
++                    let handled = handle(&core, Some(&conn), None, conn.caller(), &payload).await;
+                     if let Some(reply) = &handled.reply {
+                         conn.with(|out| {
+                             out.control(wire::encode(0, wire::DATA, reply.to_string().as_bytes()));
+@@ -414,6 +432,7 @@ async fn handle(
+     core: &Arc<Core>,
+     conn: Option<&Arc<Conn>>,
+     plain: Option<&std::sync::Mutex<Option<api::PlainSub>>>,
++    gone: Gone,
+     message: &[u8],
+ ) -> Handled {
+     let reply = |reply| Handled { reply: Some(reply), framed: false, stop: false };
+@@ -425,7 +444,7 @@ async fn handle(
+         let err = RpcError::invalid_request("missing method");
+         return reply(rpc::response(request["id"].clone(), Err(err)));
+     };
+-    let call = api::Call { core, conn, plain };
++    let call = api::Call { core, conn, plain, gone };
+     let params = crate::remote::from_peer(core, conn, request["params"].clone());
+     let result = match crate::remote::route(core, method, &params) {
+         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
+diff --git a/crates/herdr-core/src/wire.rs b/crates/herdr-core/src/wire.rs
+index c4a9b79..7e37911 100644
+--- a/crates/herdr-core/src/wire.rs
++++ b/crates/herdr-core/src/wire.rs
+@@ -132,6 +132,16 @@ pub struct Conn {
+     /// It fell too far behind (`MAX_CONTROL`): the connection must end.
+     pub overflowed: tokio::sync::Notify,
+     next_channel: std::sync::atomic::AtomicU32,
++    /// Told when the connection ends (see `end`).
++    ended: Ended,
++}
++
++struct Ended(tokio::sync::watch::Sender<bool>);
++
++impl Default for Ended {
++    fn default() -> Self {
++        Ended(tokio::sync::watch::channel(false).0)
++    }
+ }
+ 
+ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+@@ -146,6 +156,7 @@ impl Default for Conn {
+             wake: tokio::sync::Notify::new(),
+             overflowed: tokio::sync::Notify::new(),
+             next_channel: std::sync::atomic::AtomicU32::new(0),
++            ended: Ended::default(),
+         }
+     }
+ }
+@@ -155,6 +166,16 @@ impl Conn {
+         self.outbox.lock().unwrap_or_else(|p| p.into_inner())
+     }
+ 
++    /// Whether the other end of this connection is still there, for the calls it makes.
++    pub fn caller(&self) -> crate::input::Gone {
++        crate::input::Gone::watch(&self.ended.0)
++    }
++
++    /// The connection ended: calls still waiting on a person for it give up.
++    pub fn end(&self) {
++        self.ended.0.send_replace(true);
++    }
++
+     pub fn new_channel(&self) -> u32 {
+         self.next_channel.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+     }
+diff --git a/crates/herdr-core/tests/m4.rs b/crates/herdr-core/tests/m4.rs
+index 7edcc16..e3a8c79 100644
+--- a/crates/herdr-core/tests/m4.rs
++++ b/crates/herdr-core/tests/m4.rs
+@@ -2,9 +2,13 @@
+ 
+ mod common;
+ 
+-use common::framed::Viewer;
++use common::framed::{Framed, Viewer};
+ use common::*;
++use herdr_core::wire;
+ use serde_json::{Value, json};
++use std::io::{BufRead, Read, Write};
++use std::net::Shutdown;
++use std::process::Stdio;
+ use std::time::{Duration, Instant};
+ 
+ fn session() -> Session {
+@@ -194,6 +198,133 @@ fn agents_never_type_into_a_persons_unsent_draft() {
+     shows(&s, &t, "78");
+ }
+ 
++#[test]
++fn calls_queued_behind_one_draft_give_up_together() {
++    let mut s = session();
++    s.env.push(("HC_DRAFT_MAX_MS".into(), "1500".into()));
++    let t = s.json(&["run", "--bg", "sh", "-c", BYTES])["address"].as_str().unwrap().to_string();
++    let mut person = Viewer::attach(&s, &t, 80, 24, json!({}));
++    person.typed(b"hi");
++    shows(&s, &t, "69");
++
++    // The limit counts from when each send arrived: three behind one draft
++    // fail after 1.5 s, not one after another (4.5 s).
++    let started = Instant::now();
++    let senders: Vec<_> = (0..3)
++        .map(|n| {
++            let mut cmd = s.cmd();
++            cmd.args(["send", &t, &format!("m{n}")]);
++            std::thread::spawn(move || cmd.output().unwrap())
++        })
++        .collect();
++    for sender in senders {
++        let out = sender.join().unwrap();
++        assert!(String::from_utf8_lossy(&out.stderr).contains("drafting"), "{out:?}");
++    }
++    assert!(started.elapsed() < Duration::from_millis(3200), "gave up after {:?}", started.elapsed());
++    assert!(!text(&s, &t).contains("6d"), "nothing typed: {}", text(&s, &t));
++}
++
++/// A caller is gone when its connection is hung up, not when it stops writing: a client may
++/// half-close and still read its answer (`hc connect` does once its stdin ends; `nc -N`).
++#[test]
++fn a_caller_that_half_closes_still_has_its_waiting_send_typed_and_answered() {
++    let mut s = session();
++    s.env.push(("HC_QUIET_MS".into(), "1500".into()));
++    let t = s.json(&["run", "--bg", "sh", "-c", BYTES])["address"].as_str().unwrap().to_string();
++    let mut person = Viewer::attach(&s, &t, 80, 24, json!({}));
++    person.typed(b"\x1b[A"); // no draft, but the send waits for them to pause
++    let mut conn = s.connect();
++    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "terminal.send", "params": {"terminal": t, "text": "x"}});
++    writeln!(conn.writer, "{request}").unwrap();
++    conn.writer.shutdown(Shutdown::Write).unwrap();
++    let mut reply = String::new();
++    conn.reader.read_line(&mut reply).unwrap();
++    let reply: Value = serde_json::from_str(&reply).unwrap();
++    assert_eq!(reply["id"], 1, "{reply}");
++    assert!(reply.get("error").is_none() && reply["result"]["via"] == "typed", "{reply}");
++    shows(&s, &t, "78");
++}
++
++/// What a client pipelines behind a waiting call is not read away: the plain requests after
++/// it, a hello, and the frames after that are all answered.
++#[test]
++fn a_waiting_send_leaves_what_was_pipelined_behind_it() {
++    let mut s = session();
++    s.env.push(("HC_QUIET_MS".into(), "1500".into()));
++    let t = s.json(&["run", "--bg", "sh", "-c", BYTES])["address"].as_str().unwrap().to_string();
++    let mut person = Viewer::attach(&s, &t, 80, 24, json!({}));
++    person.typed(b"\x1b[A");
++    let mut conn = s.connect();
++    let call =
++        |id: u64, method: &str, params: Value| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
++    let mut batch = format!(
++        "{}\n{}\n",
++        call(1, "terminal.send", json!({"terminal": t, "text": "x"})),
++        call(2, "hello", json!({"framed": true}))
++    )
++    .into_bytes();
++    batch.extend(wire::encode(0, wire::DATA, call(3, "terminal.get", json!({"terminal": t})).to_string().as_bytes()));
++    conn.writer.write_all(&batch).unwrap(); // one batch; both directions stay open
++    let mut line = String::new();
++    for want in [1, 2] {
++        line.clear();
++        conn.reader.read_line(&mut line).unwrap();
++        let reply: Value = serde_json::from_str(&line).unwrap();
++        assert_eq!(reply["id"], want, "{reply}");
++        assert!(reply.get("error").is_none(), "{reply}");
++    }
++    let mut header = [0u8; wire::HEADER];
++    conn.reader.read_exact(&mut header).expect("the frame after the hello was answered");
++    let (_, _, len) = wire::decode_header(&header).unwrap();
++    let mut payload = vec![0; len];
++    conn.reader.read_exact(&mut payload).unwrap();
++    let reply: Value = serde_json::from_slice(&payload).unwrap();
++    assert_eq!((reply["id"].clone(), reply["result"]["address"].as_str()), (json!(3), Some(t.as_str())), "{reply}");
++}
++
++#[test]
++fn a_call_whose_caller_is_gone_types_nothing() {
++    let mut s = session();
++    s.env.push(("HC_QUIET_MS".into(), "1500".into()));
++    let t = s.json(&["run", "--bg", "sh", "-c", BYTES])["address"].as_str().unwrap().to_string();
++    let mut person = Viewer::attach(&s, &t, 80, 24, json!({}));
++    person.typed(b"hi"); // a draft, not sent
++    shows(&s, &t, "69");
++    let log = || std::fs::read_to_string(s.root.join("state/herdr-core/test/core.log")).unwrap_or_default();
++    let killed_after = |args: &[&str], wait: Duration| {
++        let mut child = s.cmd().args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
++        std::thread::sleep(wait);
++        child.kill().unwrap(); // what `timeout` does
++        child.wait().unwrap();
++    };
++
++    // A send killed while it waits for the draft.
++    killed_after(&["send", &t, "x"], Duration::from_millis(500));
++    wait_until("the core logs it", || log().contains(&format!("terminal.send to {t}")));
++    // An app on a framed connection that goes away.
++    let mut app = Framed::open(&s);
++    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "terminal.send", "params": {"terminal": t, "text": "z"}});
++    app.send(0, wire::DATA, call.to_string().as_bytes());
++    std::thread::sleep(Duration::from_millis(500));
++    drop(app);
++    wait_until("the core logs it too", || log().matches("its caller went away").count() == 2);
++    // Keys waiting for the person to pause.
++    person.typed(b"\x1b[A");
++    killed_after(&["keys", &t, "a"], Duration::from_millis(300));
++    wait_until("and the keys", || log().contains(&format!("terminal.keys to {t}")));
++
++    // They send their draft; only what is sent afterwards is typed.
++    person.typed(b"\r");
++    s.json(&["send", &t, "y"]);
++    shows(&s, &t, "79");
++    std::thread::sleep(Duration::from_millis(500));
++    let typed = text(&s, &t);
++    for dropped in ["78", "7a", "61"] {
++        assert!(!typed.contains(dropped), "a dropped call was typed ({dropped}): {typed}");
++    }
++}
++
+ #[test]
+ fn a_program_that_never_reads_its_input_stalls_nobody() {
+     let s = session();
+diff --git a/schema/README.md b/schema/README.md
+index f1ba7c4..c5bbe3e 100644
+--- a/schema/README.md
++++ b/schema/README.md
+@@ -26,7 +26,14 @@ fallbacks, and overrides. `hc connect` speaks the same protocol over
+ stdin/stdout, so `ssh box hc connect` is a remote core.
+ 
+ A connection starts in **plain mode**: JSON-RPC 2.0, one message per line.
+-Any language or `socat` works.
++Any language or `socat` works. Keep the connection open until the answer
++arrives: a `terminal.send`, `terminal.queue`, `terminal.keys` or
++`terminal.interrupt` still waiting for a person (or its turn) when its
++connection hangs up (the client closed it or was killed) is dropped and types
++nothing, and so is one on a framed connection that ends. A client that only
++shuts down its write side (`hc connect` does at the end of its stdin) still
++reads its answer, and what it pipelined behind the call is kept. Not noticed
++on Windows. `machine.exec` ends when its client closes or stops writing.
+ 
+ ```
+ → {"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{}}
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index b584424..874ffd7 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -2981,7 +2981,7 @@
+       }
+     },
+     {
+-      "description": "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min for them to send or clear it); keys a person presses meanwhile are held, then delivered. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed.",
++      "description": "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min, counted from when it arrives, for them to send or clear it); keys a person presses meanwhile are held, then delivered. A send still waiting when its caller goes away (its `hc` was killed, its connection hung up) is dropped: nothing is typed. A client that only stops writing, as `hc connect` does when its stdin ends, still gets its answer. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed.",
+       "errors": [
+         {
+           "code": -32000,
+@@ -3529,7 +3529,7 @@
+       }
+     },
+     {
+-      "description": "Press named keys, encoded for the program's current keyboard modes. Same quiet rule as send.",
++      "description": "Press named keys, encoded for the program's current keyboard modes. Same quiet rule as send, and the same drop if its caller goes away while it waits.",
+       "errors": [
+         {
+           "code": -32000,

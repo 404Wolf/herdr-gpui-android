@@ -1,0 +1,768 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 07f6e85..a77cf71 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -166,14 +166,18 @@ negotiated support ends the stream rather than sending an incompatible paint.
+ Observers never control size, and a viewer returning after a dropped line
+ does not constrain the desktop until active again. Attach placeholders are
+ ignored until a window reports geometry. Sized desktop viewers keep their
+-constraints while idle, until they detach or report a new size. The app
+-keeps background tabs attached without reporting visibility, so a hidden
+-tab can also constrain the grid and leave extra blank pane space. Exact
+-visibility needs app support. Other operating systems retain latest-active
+-sizing for local viewers, but accept forwarded desktop groups. Set
++constraints while idle, until hidden, detached or resized. Desktop apps may opt
++into `visibility_updates` on attach; `visible` defaults to true for old clients.
++The reply confirms the feature only when every relay hop supports it. Such apps
++send kind-7 VISIBILITY on compositor-visible active-workspace changes, separate
++from focus. Hidden views do not constrain the grouped grid. A hidden resumed
++view stays pending until it is shown and reports a positive physical RESIZE.
++Without negotiated support, clients stay visible/eligible as before. Other
++operating systems retain latest-active sizing for local viewers, but accept
++forwarded desktop groups. Set
+ `size_policy = "latest"` in `~/.config/herdr-core/config.toml` to restore
+ latest-active sizing on Linux too (default: `"grouped"`). No restart needed;
+-the setting applies on the next viewer activity or detach.
++the setting applies on the next viewer activity, visibility change or detach.
+ 
+ ```sh
+ hc run cargo test                  # wait, stream output, return its exit code
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 0a94cba..04309d0 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -23,6 +23,7 @@ pub const FEATURES: &[&str] = &[
+     "automatic_input",
+     "queue",
+     "queue-keyed",
++    "viewer_visibility",
+ ];
+ pub const FINISHED_LINES: usize = 1000;
+ /// A terminal's identity: fixed at start from whoever starts it.
+@@ -457,6 +458,8 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         size: (p.cols, p.rows),
+         display: p.display,
+         resumed: p.resumed,
++        visible: !p.visibility_updates || p.visible,
++        visibility_updates: p.visibility_updates,
+         desktop_group: core.desktop_group(conn, p.desktop_group.as_deref()),
+     };
+     let channel = core.attach(conn, id, req)?;
+@@ -464,6 +467,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         channel,
+         terminal: Public(record(core, id)?),
+         resize_notifications: p.resize_notifications,
++        visibility_updates: p.visibility_updates,
+         automatic_input: true,
+     })
+ }
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index a2daf89..cc881e8 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -107,7 +107,7 @@ pub struct HelloParams {
+     pub core: Option<CoreInfo>,
+     /// What that core calls this one (`rohan`), so news about `t7` reaches it as `rohan/t7`.
+     pub calls_you: Option<String>,
+-    /// Features supported by a core dialing in, including relaying size notifications.
++    /// Features supported by a core dialing in, including relaying size and viewer visibility updates.
+     #[serde(default)]
+     pub features: Vec<String>,
+ }
+@@ -392,6 +392,14 @@ pub struct AttachParams {
+     #[arg(skip)]
+     #[serde(default)]
+     pub resize_notifications: bool,
++    /// The view is visible on an active workspace and may constrain grouped desktop size.
++    #[arg(skip)]
++    #[serde(default = "visible_by_default")]
++    pub visible: bool,
++    /// The client understands the viewer-to-core VISIBILITY frame.
++    #[arg(skip)]
++    #[serde(default)]
++    pub visibility_updates: bool,
+     /// Scrollback lines to show first (main screen only).
+     #[arg(long, default_value_t = 0)]
+     #[serde(default)]
+@@ -428,10 +436,16 @@ pub struct AttachResult {
+     /// True only when the entire path sends RESIZE before replacement paints.
+     /// False or absent means the viewer must track size changes separately.
+     pub resize_notifications: bool,
++    /// True only when every core on the path accepts viewer visibility updates.
++    pub visibility_updates: bool,
+     /// The entire attach path accepts AUTOMATIC_INPUT (kind 6). Absent means use DATA.
+     pub automatic_input: bool,
+ }
+ 
++fn visible_by_default() -> bool {
++    true
++}
++
+ #[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
+ pub struct SubscribeParams {
+     /// Only this terminal.
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index f7c1800..2d293cc 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -20,12 +20,14 @@ use tokio::sync::{mpsc, oneshot};
+ /// A viewer here that a stream there goes to: its connection and channel.
+ type Sink = (Arc<Conn>, u32);
+ /// A pending reply, its stream sink and whether resize support is required.
+-type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool)>);
++type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool, bool)>);
+ 
+ mod viewers;
+ #[cfg(test)]
+ use viewers::automatic_input;
+-use viewers::{RESIZE_LOST, negotiate_resize, reattach};
++#[cfg(test)]
++use viewers::visibility_updates;
++use viewers::{RESIZE_LOST, VISIBILITY_LOST, negotiate_resize, reattach};
+ pub use viewers::{Relayed, attach, conn_gone, relay_in};
+ 
+ #[cfg(test)]
+@@ -66,13 +68,21 @@ impl Line {
+     /// A reply to one of our calls: to whoever waits for it.
+     fn take_reply(&self, mut reply: Value) {
+         let Some((waiter, sink)) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+-        if let (Some((sink, require_resize)), Some(there)) = (sink, reply["result"]["channel"].as_u64()) {
++        if let (Some((sink, require_resize, require_visibility)), Some(there)) =
++            (sink, reply["result"]["channel"].as_u64())
++        {
+             if require_resize && reply["result"]["resize_notifications"] != true {
+                 let _ = self.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
+                 reply = crate::rpc::response(
+                     reply["id"].clone(),
+                     Err(RpcError::new("unavailable", RESIZE_LOST, "attach again")),
+                 );
++            } else if require_visibility && reply["result"]["visibility_updates"] != true {
++                let _ = self.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
++                reply = crate::rpc::response(
++                    reply["id"].clone(),
++                    Err(RpcError::new("unavailable", VISIBILITY_LOST, "attach again")),
++                );
+             } else {
+                 lock(&self.streams).insert(there as u32, sink);
+             }
+@@ -102,7 +112,7 @@ impl Line {
+         machine: &str,
+         method: &str,
+         params: Value,
+-        sink: Option<(Sink, bool)>,
++        sink: Option<(Sink, bool, bool)>,
+         deadline: Duration,
+     ) -> Result<Value, RpcError> {
+         let id = self.next.fetch_add(1, Ordering::Relaxed);
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index 9ae7e77..1d259d9 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -17,6 +17,79 @@ fn automatic_input_requires_support_at_every_hop() {
+     }
+ }
+ 
++#[test]
++fn viewer_visibility_requires_confirmation_from_every_hop() {
++    for features in [json!([]), json!(["viewer_visibility"])] {
++        let (frames, _rx) = mpsc::unbounded_channel();
++        let line = Line::new(frames, &json!({"features": features}));
++        for reply in [json!({}), json!({"visibility_updates": false}), json!({"visibility_updates": true})] {
++            assert_eq!(
++                visibility_updates(&line, true, &reply),
++                line.features.iter().any(|f| f == "viewer_visibility") && reply["visibility_updates"] == true
++            );
++        }
++        assert!(!visibility_updates(&line, false, &json!({"visibility_updates": true})));
++    }
++}
++
++#[tokio::test]
++async fn viewer_visibility_frame_stays_ordered_with_data_and_resize_across_a_relay() {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-visibility-relay-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let conn = Arc::new(Conn::default());
++    conn.with(|out| out.open(7));
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    core.lock().relayed.insert(
++        (conn_key(&conn), 7),
++        Relayed {
++            automatic_input: false,
++            visibility_updates: true,
++            line: Line::new(frames, &json!({"features": ["viewer_visibility"]})),
++            there: 9,
++            conn: conn.clone(),
++            machine: "remote".into(),
++            params: json!({"visible": true, "visibility_updates": true}),
++        },
++    );
++
++    let mut input = [
++        wire::encode(7, wire::DATA, b"before resize"),
++        wire::encode(7, wire::RESIZE, &[218, 0, 74, 0]),
++        wire::encode(7, wire::VISIBILITY, &[0]),
++        wire::encode(7, wire::DATA, b"after hidden"),
++    ]
++    .concat();
++    let mut reader = std::io::Cursor::new(&mut input);
++    let mut forwarded = Vec::new();
++    while let Some((channel, kind, payload)) = wire::read_frame(&mut reader).await.unwrap() {
++        assert!(relay_in(&core, &conn, channel, kind, &payload));
++        forwarded.push(rx.recv().await.unwrap());
++    }
++    assert_eq!(
++        forwarded,
++        [
++            wire::encode(9, wire::DATA, b"before resize"),
++            wire::encode(9, wire::RESIZE, &[218, 0, 74, 0]),
++            wire::encode(9, wire::VISIBILITY, &[0]),
++            wire::encode(9, wire::DATA, b"after hidden"),
++        ]
++    );
++    assert_eq!(core.lock().relayed[&(conn_key(&conn), 7)].params["visible"], false);
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
+ #[tokio::test]
+ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+     for (feature, confirmed) in [(false, true), (true, false), (true, true)] {
+@@ -50,6 +123,7 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+             (conn_key(&conn), 7),
+             Relayed {
+                 automatic_input: true,
++                visibility_updates: false,
+                 line: Line::new(old_frames, &json!({"features": ["automatic_input"]})),
+                 there: 9,
+                 conn: conn.clone(),
+@@ -105,7 +179,7 @@ async fn reconnect_rejects_downgrade_before_mapping_fallback_data() {
+                     "relay",
+                     "terminal.attach",
+                     json!({"observe": true, "resumed": true, "resize_notifications": true}),
+-                    Some(((sink, 7), true)),
++                    Some(((sink, 7), true, false)),
+                     Duration::from_secs(1),
+                 )
+                 .await
+@@ -170,6 +244,7 @@ async fn failed_reattach_drains_pending_data_before_close() {
+         (conn_key(&conn), 7),
+         Relayed {
+             automatic_input: true,
++            visibility_updates: false,
+             line: old_line,
+             there: 9,
+             conn: conn.clone(),
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index 5de1efd..6c57368 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -7,6 +7,7 @@ use super::*;
+ #[derive(Clone)]
+ pub struct Relayed {
+     pub automatic_input: bool,
++    pub visibility_updates: bool,
+     pub line: Arc<Line>,
+     pub there: u32,
+     pub conn: Arc<Conn>,
+@@ -16,6 +17,8 @@ pub struct Relayed {
+ 
+ /// Why an opted-in stream was refused: a hop on the way lost resize support.
+ pub(super) const RESIZE_LOST: &str = "resize notifications lost";
++/// Why an opted-in stream was refused: a hop on the way lost visibility support.
++pub(super) const VISIBILITY_LOST: &str = "viewer visibility updates lost";
+ 
+ /// Viewers left waiting by a dropped line to `m` get their terminal back.
+ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+@@ -32,10 +35,12 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+         params["history"] = 0.into();
+         params["resumed"] = true.into();
+         negotiate_resize(&line, &mut params);
++        negotiate_visibility(&line, &mut params);
+         let deadline = deadline_for(&core, "terminal.attach", &params);
+-        let sink = ((r.conn.clone(), here), r.params["resize_notifications"] == true);
++        let sink = ((r.conn.clone(), here), r.params["resize_notifications"] == true, r.visibility_updates);
+         let reply = line.call_into(&m.name, "terminal.attach", params, Some(sink), deadline).await;
+         let lost_resize = matches!(&reply, Err(e) if e.message == RESIZE_LOST);
++        let lost_visibility = matches!(&reply, Err(e) if e.message == VISIBILITY_LOST);
+         let mut st = core.lock();
+         // Gone meanwhile (the viewer detached): nothing to resume.
+         if !st.relayed.contains_key(&(key, here)) {
+@@ -59,7 +64,7 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+                 st.relayed.remove(&(key, here));
+                 // A downgraded path must not deliver paints sized for the old
+                 // contract; any other failure still hands over what arrived.
+-                if lost_resize {
++                if lost_resize || lost_visibility {
+                     r.conn.with(|out| out.close(here, b""));
+                 } else {
+                     r.conn.with(|out| out.finish(here, b""));
+@@ -79,29 +84,62 @@ pub(super) fn negotiate_resize(line: &Line, params: &mut Value) {
+     }
+ }
+ 
++pub(super) fn negotiate_visibility(line: &Line, params: &mut Value) {
++    if params["visibility_updates"] == true && !line.features.iter().any(|f| f == "viewer_visibility") {
++        params["visibility_updates"] = false.into();
++    }
++}
++
++pub(super) fn visibility_updates(line: &Line, requested: bool, reply: &Value) -> bool {
++    requested && line.features.iter().any(|f| f == "viewer_visibility") && reply["visibility_updates"] == true
++}
++
+ /// Opens a viewer here on a terminal there: the stream channel there is
+ /// relayed to a new channel on this connection, both ways.
+ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Value) -> Result<Value, RpcError> {
+     // Never launder an ordinary client's claimed desktop through our trusted line.
+     params["desktop_group"] =
+         core.desktop_group(conn, params["desktop_group"].as_str()).map_or(Value::Null, |(_, group)| group.into());
++    let visibility_requested = params["visibility_updates"] == true;
++    if !visibility_requested {
++        params["visible"] = true.into();
++    }
+     let line = line(core, m).await?;
+-    negotiate_resize(&line, &mut params);
++    let mut forwarded = params.clone();
++    negotiate_resize(&line, &mut forwarded);
++    negotiate_visibility(&line, &mut forwarded);
+     let here = conn.new_channel();
+     conn.with(|out| out.open_paused(here));
+-    let deadline = deadline_for(core, "terminal.attach", &params);
++    let deadline = deadline_for(core, "terminal.attach", &forwarded);
+     match line
+-        .call_into(&m.name, "terminal.attach", params.clone(), Some(((conn.clone(), here), false)), deadline)
++        .call_into(
++            &m.name,
++            "terminal.attach",
++            forwarded.clone(),
++            Some(((conn.clone(), here), forwarded["resize_notifications"] == true, false)),
++            deadline,
++        )
+         .await
+     {
+         Ok(mut r) => {
+             let there = r["channel"].as_u64().unwrap_or_default() as u32;
+-            let enabled = params["resize_notifications"] == true && r["resize_notifications"] == true;
+-            r["resize_notifications"] = enabled.into();
+-            params["resize_notifications"] = enabled.into();
++            let resize_enabled = forwarded["resize_notifications"] == true && r["resize_notifications"] == true;
++            let visibility_enabled = visibility_updates(&line, visibility_requested, &r);
++            r["resize_notifications"] = resize_enabled.into();
++            r["visibility_updates"] = visibility_enabled.into();
++            params["resize_notifications"] = resize_enabled.into();
++            params["visibility_updates"] = visibility_enabled.into();
+             let automatic_input = automatic_input(&line, &r);
+             r["automatic_input"] = automatic_input.into();
+-            let viewer = Relayed { automatic_input, line, there, conn: conn.clone(), machine: m.id.clone(), params };
++            let viewer = Relayed {
++                automatic_input,
++                visibility_updates: visibility_enabled,
++                line,
++                there,
++                conn: conn.clone(),
++                machine: m.id.clone(),
++                params,
++            };
+             core.lock().relayed.insert((conn_key(conn), here), viewer);
+             r["channel"] = here.into();
+             Ok(localize(core, &m.name, &[], r))
+@@ -118,6 +156,12 @@ pub fn relay_in(core: &Core, conn: &Arc<Conn>, here: u32, kind: u8, payload: &[u
+     let r = {
+         let mut st = core.lock();
+         let Some(r) = st.relayed.get_mut(&(conn_key(conn), here)) else { return false };
++        if kind == wire::VISIBILITY {
++            if !r.visibility_updates || payload.len() != 1 || payload[0] > 1 {
++                return true;
++            }
++            r.params["visible"] = (payload[0] == 1).into();
++        }
+         // What a reattach after a dropped line brings back.
+         if kind == wire::RESIZE && payload.len() == 4 {
+             r.params["cols"] = u16::from_le_bytes([payload[0], payload[1]]).into();
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index c4f3d46..e9e0bf0 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -27,6 +27,8 @@ async fn keys_pressed_during_a_paste_follow_its_submit() {
+             AttachRequest {
+                 observe: false,
+                 resize_notifications: false,
++                visible: true,
++                visibility_updates: false,
+                 history: 0,
+                 size: (80, 24),
+                 display: Display::default(),
+diff --git a/crates/herdr-core/src/server.rs b/crates/herdr-core/src/server.rs
+index f26c14b..f03acc9 100644
+--- a/crates/herdr-core/src/server.rs
++++ b/crates/herdr-core/src/server.rs
+@@ -362,6 +362,9 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
+             (ch, wire::RESIZE) if payload.len() == 4 => {
+                 core.viewer_resize(conn, ch, u16_at(&payload, 0), u16_at(&payload, 2))
+             }
++            (ch, wire::VISIBILITY) if payload.len() == 1 && payload[0] <= 1 => {
++                core.viewer_visibility(conn, ch, payload[0] == 1)
++            }
+             (ch, wire::FOCUS) => core.viewer_focus(conn, ch, payload.first() == Some(&1)),
+             (ch, wire::FACTS) => {
+                 if let Ok(display) = serde_json::from_slice(&payload) {
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 742b0ab..b5f99a6 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -39,8 +39,12 @@ pub struct Viewer {
+     active_at: Option<Instant>,
+     /// Desktop apps attach hidden tabs with a placeholder before reporting geometry.
+     sized: bool,
++    /// Whether this desktop view is currently eligible to constrain the PTY grid.
++    size_eligible: bool,
+     /// A relayed reconnect carries cached geometry, not a new physical offer.
+     awaiting_size: bool,
++    /// The attach path negotiated the viewer-to-core VISIBILITY frame.
++    visibility_updates: bool,
+     /// The source line's machine and the desktop identity carried on that line.
+     desktop_group: Option<(String, String)>,
+     display: Display,
+@@ -68,6 +72,8 @@ pub struct AttachRequest {
+     pub size: (u16, u16),
+     pub display: Display,
+     pub resumed: bool,
++    pub visible: bool,
++    pub visibility_updates: bool,
+     pub desktop_group: Option<(String, String)>,
+ }
+ 
+@@ -107,7 +113,9 @@ impl Core {
+             size: req.size,
+             active_at: (!req.resumed).then(Instant::now),
+             sized: false,
++            size_eligible: req.visible,
+             awaiting_size: req.resumed,
++            visibility_updates: req.visibility_updates,
+             desktop_group: req.desktop_group,
+             display: req.display,
+             recovering,
+@@ -309,6 +317,25 @@ impl Core {
+         conn.wake.notify_one();
+     }
+ 
++    /// Update size eligibility independently from focus or input activity.
++    pub fn viewer_visibility(&self, conn: &Arc<Conn>, channel: u32, visible: bool) {
++        let mut st = self.lock();
++        let id = {
++            let Some((id, viewer)) = Self::viewer(&mut st, conn, channel) else { return };
++            if viewer.observe || !viewer.visibility_updates || viewer.size_eligible == visible {
++                return;
++            }
++            viewer.size_eligible = visible;
++            if visible {
++                // A view returning to the active workspace can lead its desktop
++                // group, but it still needs a physical size after a resume.
++                viewer.active_at = Some(Instant::now());
++            }
++            id
++        };
++        self.apply_size(&mut st, id);
++    }
++
+     pub fn viewer_facts(&self, conn: &Arc<Conn>, channel: u32, display: Display) {
+         let mut st = self.lock();
+         let Some((id, v)) = Self::viewer(&mut st, conn, channel) else { return };
+@@ -448,10 +475,10 @@ impl Core {
+ }
+ 
+ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u16, u16)>) {
+-    let awaiting_size = viewers.iter().any(|v| !v.observe && v.awaiting_size);
++    let awaiting_size = viewers.iter().any(|v| !v.observe && v.size_eligible && v.awaiting_size);
+     let leader = viewers
+         .iter()
+-        .filter(|v| !v.observe && !v.awaiting_size && (!awaiting_size || v.sized))
++        .filter(|v| !v.observe && v.size_eligible && !v.awaiting_size && (!awaiting_size || v.sized))
+         .max_by_key(|v| v.active_at);
+     let Some(leader) = leader else { return (None, None) };
+     let size = if grouped && leader.desktop_group.is_some() {
+@@ -460,6 +487,7 @@ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u
+             .filter(|v| {
+                 !v.observe
+                     && v.desktop_group == leader.desktop_group
++                    && v.size_eligible
+                     && v.sized
+                     && v.size.0 > 0
+                     && v.size.1 > 0
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index 05408db..d0a737b 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -21,8 +21,10 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+         repaint_pending: false,
+         size,
+         active_at,
++        size_eligible: true,
+         sized: true,
+         awaiting_size: false,
++        visibility_updates: true,
+         desktop_group: conn.local_desktop.then(|| ("local".into(), "desktop".into())),
+         display: Display::default(),
+         recovering: false,
+@@ -87,6 +89,40 @@ fn phones_observers_resumed_and_placeholder_viewers_do_not_pin_desktop_size() {
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)), "zero size does not constrain");
+ }
+ 
++#[test]
++fn grouped_size_uses_visible_min_and_visibility_restores_the_grid() {
++    let now = Instant::now();
++    let portrait = desktop_conn();
++    let landscape = desktop_conn();
++    let mut vs = vec![viewer(&portrait, (218, 168), Some(now)), viewer(&landscape, (218, 74), Some(now))];
++
++    vs[1].size_eligible = false;
++    assert_eq!(viewer_size(&vs, true).1, Some((218, 168)), "off-workspace view is excluded");
++
++    vs[1].size_eligible = true;
++    assert_eq!(viewer_size(&vs, true).1, Some((218, 74)), "visible view constrains both axes");
++
++    vs[1].size_eligible = false;
++    assert_eq!(viewer_size(&vs, true).1, Some((218, 168)), "hiding restores the larger grid");
++}
++
++#[test]
++fn focus_and_idle_do_not_change_visibility_eligibility() {
++    let now = Instant::now();
++    let large = desktop_conn();
++    let small = desktop_conn();
++    let mut vs = vec![viewer(&large, (218, 168), Some(now)), viewer(&small, (218, 74), Some(now))];
++    vs[1].active_at = Some(now - std::time::Duration::from_secs(3600));
++    assert!(vs[1].size_eligible);
++    assert_eq!(viewer_size(&vs, true).1, Some((218, 74)), "an idle visible view still constrains");
++
++    vs[1].active_at = None;
++    assert_eq!(viewer_size(&vs, true).1, Some((218, 168)), "a returning viewer without a fresh size cannot constrain");
++    vs[1].size_eligible = true;
++    vs[1].active_at = Some(now - std::time::Duration::from_secs(3600));
++    assert_eq!(viewer_size(&vs, true).1, Some((218, 74)), "visibility, not recency, admits the measured size");
++}
++
+ fn core_with_screen(cols: u16, rows: u16) -> (Arc<Core>, u32, std::path::PathBuf) {
+     let root = std::path::PathBuf::from(format!("/var/tmp/hc-resize-{}", crate::platform::random_hex()));
+     let paths = crate::paths::Paths {
+@@ -120,6 +156,8 @@ fn resumed_viewers_hold_the_inherited_grid_until_a_physical_size_arrives() {
+         let request = |size, resumed, observe| AttachRequest {
+             observe,
+             resize_notifications: notifications,
++            visible: true,
++            visibility_updates: true,
+             history: 0,
+             size,
+             display: Display::default(),
+@@ -152,6 +190,65 @@ fn resumed_viewers_hold_the_inherited_grid_until_a_physical_size_arrives() {
+     }
+ }
+ 
++#[test]
++fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement() {
++    let (core, id, root) = core_with_screen(103, 74);
++    let portrait = desktop_conn();
++    let landscape = desktop_conn();
++    let request = |size, resumed, visible| AttachRequest {
++        observe: false,
++        resize_notifications: true,
++        visible,
++        visibility_updates: true,
++        history: 0,
++        size,
++        display: Display::default(),
++        resumed,
++        desktop_group: Some(("line".into(), "desktop".into())),
++    };
++    let grid = || core.lock().screens[&id].size();
++
++    let p = core.attach(&portrait, id, request((218, 168), false, true)).unwrap();
++    core.viewer_resize(&portrait, p, 218, 168);
++    assert_eq!(grid(), (218, 168));
++
++    let l = core.attach(&landscape, id, request((218, 74), true, false)).unwrap();
++    assert_eq!(grid(), (218, 168), "hidden resumed placeholder neither leads nor blocks");
++    core.viewer_visibility(&landscape, l, true);
++    assert_eq!(grid(), (218, 168), "showing an unmeasured resumed view holds the inherited grid");
++    core.viewer_focus(&landscape, l, false);
++    core.viewer_input(&landscape, l, b"", false);
++    core.viewer_resize(&landscape, l, 0, 0);
++    assert_eq!(grid(), (218, 168), "focus, input and zero size cannot release the resume hold");
++
++    core.viewer_resize(&landscape, l, 218, 74);
++    assert_eq!(grid(), (218, 74), "first positive physical measurement releases the hold");
++    core.viewer_visibility(&landscape, l, false);
++    assert_eq!(grid(), (218, 168), "hiding the smaller view restores the larger grid");
++    core.viewer_focus(&landscape, l, true);
++    core.viewer_focus(&landscape, l, false);
++    assert_eq!(grid(), (218, 168), "focus cannot make a hidden view eligible");
++
++    core.viewer_visibility(&landscape, l, true);
++    assert_eq!(grid(), (218, 74), "showing a measured view restores its constraint");
++    core.viewer_focus(&landscape, l, false);
++    assert_eq!(grid(), (218, 74), "focus loss does not hide a visible constraint");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn legacy_attach_visibility_defaults_to_eligible() {
++    let params: crate::api::AttachParams = serde_json::from_value(serde_json::json!({
++        "terminal": "t1",
++        "cols": 80,
++        "rows": 24
++    }))
++    .unwrap();
++    assert!(params.visible);
++    assert!(!params.visibility_updates);
++}
++
+ fn drain(conn: &Arc<Conn>, channel: u32, screen: &mut ghostty_vt::Terminal) {
+     conn.with(|out| {
+         out.resume(channel);
+@@ -174,6 +271,8 @@ fn wider_desktop_viewer_wraps_inline_redraw_at_the_shared_width() {
+     let request = |size| AttachRequest {
+         observe: false,
+         resize_notifications: true,
++        visible: true,
++        visibility_updates: true,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -221,6 +320,8 @@ fn larger_desktop_viewers_keep_only_the_shared_scrolling_grid() {
+     let request = |size| AttachRequest {
+         observe: false,
+         resize_notifications: false,
++        visible: true,
++        visibility_updates: true,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -277,6 +378,8 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
+     let request = |observe, resize_notifications| AttachRequest {
+         observe,
+         resize_notifications,
++        visible: true,
++        visibility_updates: false,
+         history: 0,
+         size: (80, 24),
+         display: Display::default(),
+diff --git a/crates/herdr-core/src/wire.rs b/crates/herdr-core/src/wire.rs
+index 3f1ef3f..7924dbb 100644
+--- a/crates/herdr-core/src/wire.rs
++++ b/crates/herdr-core/src/wire.rs
+@@ -21,6 +21,8 @@ pub const FOCUS: u8 = 4;
+ pub const FACTS: u8 = 5;
+ /// Viewer → core: terminal-generated replies, not human activity.
+ pub const AUTOMATIC_INPUT: u8 = 6;
++/// Viewer → core: 1 visible on an active workspace, 0 hidden/off-workspace.
++pub const VISIBILITY: u8 = 7;
+ 
+ /// Credit a stream starts with before the viewer acknowledges anything.
+ pub const WINDOW: usize = 256 * 1024;
+diff --git a/schema/README.md b/schema/README.md
+index 3b0a78d..f8c017f 100644
+--- a/schema/README.md
++++ b/schema/README.md
+@@ -56,6 +56,7 @@ most 16 MiB.
+ | 4 | FOCUS | viewer → core: 1 gained focus, 0 lost it |
+ | 5 | FACTS | viewer → core: JSON display facts (`Display` in the schema) |
+ | 6 | AUTOMATIC_INPUT | viewer → core: terminal-generated reply bytes, not human activity |
++| 7 | VISIBILITY | viewer → core: 1 visible on an active workspace, 0 hidden/off-workspace |
+ 
+ Channel 0 carries JSON-RPC both ways. Calls on it run side by side.
+ 
+@@ -100,6 +101,18 @@ frames, including on core-to-core relays and reconnects.
+ Without this opt-in, existing event-driven observers keep their previous output
+ behavior: no additional resize paints or RESIZE frames.
+ 
++Desktop viewers may request `visibility_updates: true` on `terminal.attach`.
++The optional `visible` value means the view is compositor-visible on an active
++workspace/window; it defaults to true for existing callers. The attach reply
++confirms `visibility_updates: true` only when every core on the path can relay
++VISIBILITY frames. Send kind 7 when compositor visibility changes, independently
++of focus and idle activity. If support is false or absent, do not send kind 7;
++the viewer remains eligible as with older cores. Grouped sizing includes only
++visible eligible viewers, while a visible idle viewer continues to constrain
++both axes. A hidden resumed viewer does not block sizing; when shown, it remains
++pending until a positive physical RESIZE arrives. VISIBILITY stays ordered with
++DATA and RESIZE, including across relays.
++
+ Flow control: a stream starts with 256 KiB of credit. The viewer sends
+ CREDIT for the bytes it has written out. A viewer that falls more than
+ 4 MiB behind gets a fresh repaint instead of the backlog. A stalled stream
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 8c85783..309a2db 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -33,12 +33,17 @@
+           },
+           "terminal": {
+             "$ref": "#/components/schemas/Terminal"
++          },
++          "visibility_updates": {
++            "description": "True only when every core on the path accepts viewer visibility updates.",
++            "type": "boolean"
+           }
+         },
+         "required": [
+           "channel",
+           "terminal",
+           "resize_notifications",
++          "visibility_updates",
+           "automatic_input"
+         ],
+         "type": "object"
+@@ -1589,12 +1594,12 @@
+           }
+         },
+         {
+-          "description": "Features supported by a core dialing in, including relaying size notifications.",
++          "description": "Features supported by a core dialing in, including relaying size and viewer visibility updates.",
+           "name": "features",
+           "required": false,
+           "schema": {
+             "default": [],
+-            "description": "Features supported by a core dialing in, including relaying size notifications.",
++            "description": "Features supported by a core dialing in, including relaying size and viewer visibility updates.",
+             "items": {
+               "type": "string"
+             },
+@@ -2494,6 +2499,26 @@
+             "description": "The terminal: `t7`, a name, or `machine/t7`.",
+             "type": "string"
+           }
++        },
++        {
++          "description": "The client understands the viewer-to-core VISIBILITY frame.",
++          "name": "visibility_updates",
++          "required": false,
++          "schema": {
++            "default": false,
++            "description": "The client understands the viewer-to-core VISIBILITY frame.",
++            "type": "boolean"
++          }
++        },
++        {
++          "description": "The view is visible on an active workspace and may constrain grouped desktop size.",
++          "name": "visible",
++          "required": false,
++          "schema": {
++            "default": true,
++            "description": "The view is visible on an active workspace and may constrain grouped desktop size.",
++            "type": "boolean"
++          }
+         }
+       ],
+       "result": {

@@ -1,0 +1,148 @@
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 3859c1c..2fc9784 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -695,16 +695,43 @@ fn focus_reporter(v: &Viewer) -> bool {
+ 
+ /// Focused-window-wins. The leader is the focused visible viewer (desktop
+ /// before phone, latest focus first), else the last focused one. A leader that
+-/// is hidden or unmeasured holds the grid: nobody else takes over.
++/// is hidden or unmeasured holds the grid, unless a visible measured phone (no
++/// desktop group; phones send no focus) was used after that leader was last
++/// focused: then the person is on the phone, and the latest such phone leads.
+ fn select_focused(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+-    let candidates: Vec<usize> =
++    let mut candidates: Vec<usize> =
+         (0..viewers.len()).filter(|i| focus_reporter(&viewers[*i]) && measured(&viewers[*i])).collect();
+     let leader = (0..viewers.len()).filter(|i| focus_reporter(&viewers[*i])).max_by_key(|i| {
+         let v = &viewers[*i];
+         (v.focused && v.visible, v.desktop_group.is_some(), v.focused_at)
+     });
+-    let Some(leader) = leader.filter(|i| measured(&viewers[*i])) else {
+-        return SizeSelection { candidates, focus_authority: true, ..Default::default() };
++    let leader = match leader {
++        Some(i) if measured(&viewers[i]) => i,
++        held => {
++            let since = held.and_then(|i| viewers[i].focused_at);
++            let phones: Vec<usize> = (0..viewers.len())
++                .filter(|i| {
++                    let v = &viewers[*i];
++                    measured(v) && v.desktop_group.is_none() && v.active_at.is_some() && v.active_at > since
++                })
++                .collect();
++            let Some(phone) = phones.iter().copied().max_by_key(|i| viewers[*i].active_at) else {
++                return SizeSelection { candidates, focus_authority: true, ..Default::default() };
++            };
++            for i in phones {
++                if !candidates.contains(&i) {
++                    candidates.push(i);
++                }
++            }
++            let size = viewers[phone].size;
++            return SizeSelection {
++                candidates,
++                leader: Some(phone),
++                contributors: vec![phone],
++                size: Some(size),
++                focus_authority: true,
++            };
++        }
+     };
+     let selected = &viewers[leader];
+     let contributors: Vec<usize> = if grouped && selected.focused && selected.desktop_group.is_some() {
+@@ -738,7 +765,8 @@ fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+     // Focus history rules while a reporter that has it is shown. When every
+     // such reporter is hidden, a visible measured desktop whose path could not
+     // negotiate focus (old app, old relay) leads under the previous rules;
+-    // reporting windows that were never focused, and phones, still never lead.
++    // reporting windows that were never focused never lead, and a phone leads
++    // only once used after the hidden window was last focused (select_focused).
+     let reporting = viewers.iter().any(focus_reporter);
+     let shown_reporter = viewers.iter().any(|v| focus_reporter(v) && v.visible);
+     let eligible = |v: &Viewer| !(reporting && v.focus_updates);
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index 65eba70..e1dc9fd 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -833,8 +833,16 @@ fn hidden_or_unmeasured_focused_window_holds_the_grid() {
+     core.viewer_visibility(&line, a, true);
+     core.viewer_visibility(&line, b, false);
+     assert_eq!(grid(), (90, 30), "hidden focused window holds");
+-    // Two panes of the same focused window share the smaller grid.
++    // A phone used while the focused window is hidden leads; once that window
++    // is shown and measured again, it decides again.
++    let phone = Arc::new(Conn::default());
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (40, 10), "the phone leads while the focused window is hidden");
+     core.viewer_visibility(&line, b, true);
++    assert_eq!(grid(), (90, 30), "the shown focused window takes the grid back");
++    core.detach(&phone, None);
++    // Two panes of the same focused window share the smaller grid.
+     core.viewer_window_focus(&line, a, true);
+     assert_eq!(grid(), (90, 30), "same focused window, same group: min");
+     drop(core);
+@@ -858,16 +866,20 @@ fn incident_2026_11_13_hidden_reporter_does_not_lock_out_a_visible_desktop() {
+     assert_eq!(grid(), (263, 96));
+     let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
+     core.viewer_resize(&phone, p, 40, 10);
+-    // The laptop window is hidden: a phone alone still holds the grid.
++    // The laptop window is hidden and the phone was used since it was last
++    // focused: the phone leads (it sends no focus).
+     core.viewer_window_focus(&app, a, false);
+     core.viewer_visibility(&app, a, false);
+-    assert_eq!(grid(), (263, 96), "a phone never takes over from a hidden reporter");
++    assert_eq!(grid(), (40, 10), "a phone used after the hidden window's focus leads");
++    let list = core.viewer_list(id, "t6k".into());
++    assert!(list.focus_authority);
++    assert_eq!(list.leader.map(|l| l.channel), Some(p));
+     // A reporting window that was never focused stays out, also as a contributor.
+     let other = desktop_conn();
+     let u = core.attach(&other, id, focus_request((90, 30), local, true, false)).unwrap();
+     core.viewer_resize(&other, u, 90, 30);
+-    assert_eq!(grid(), (263, 96), "an unfocused reporter never takes over");
+-    // The visible small-pickle window (non-reporting) may now lead.
++    assert_eq!(grid(), (40, 10), "an unfocused reporter never takes over");
++    // The visible small-pickle window (non-reporting) leads, also over the phone.
+     let r = core.attach(&line, id, focus_request((263, 197), Some(("pickle", "pickle")), false, false)).unwrap();
+     core.viewer_resize(&line, r, 263, 197);
+     assert_eq!(grid(), (263, 197), "a visible measured desktop is not locked out by a hidden reporter");
+@@ -883,3 +895,38 @@ fn incident_2026_11_13_hidden_reporter_does_not_lock_out_a_visible_desktop() {
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++/// Desktop first: the phone leads only while the focused window is hidden or
++/// unmeasured and it was used after that window was last focused.
++#[test]
++fn a_visible_focused_desktop_wins_over_a_phone() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let local = Some(("test", "test"));
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    let a = core.attach(&app, id, focus_request((120, 50), local, true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    assert_eq!(grid(), (120, 50));
++    // Phone input while the desktop is visible and measured, focused or not.
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (120, 50), "a phone never wins over a visible focused desktop");
++    core.viewer_window_focus(&app, a, false);
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (120, 50), "nor over the visible last focused desktop");
++    // Hidden, but the phone was last used before the window was focused again.
++    core.viewer_window_focus(&app, a, true);
++    core.viewer_visibility(&app, a, false);
++    assert_eq!(grid(), (120, 50), "a phone idle since the last focus does not take over");
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (40, 10), "a phone used since leads while the desktop is hidden");
++    core.viewer_visibility(&app, a, true);
++    core.viewer_resize(&app, a, 120, 50);
++    assert_eq!(grid(), (120, 50), "the desktop shown again wins");
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (120, 50), "phone input changes nothing while it is shown");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}

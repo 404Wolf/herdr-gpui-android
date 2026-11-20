@@ -125,7 +125,7 @@ HOME="$emu_home" avdmanager create avd --name herdr-test \
 (
     cd "$emu_home"
     HOME="$emu_home" exec emulator -avd herdr-test \
-        -no-window -no-audio -no-snapshot-save -gpu swiftshader_indirect -memory 4096 \
+        -no-window -no-audio -no-snapshot-save -gpu swiftshader_indirect -memory "${EMU_MEMORY:-3072}" \
         -report-console unix:console.sock,server
 ) > "$EMU_OUT/emulator.log" 2>&1 &
 emu_pid=$!
