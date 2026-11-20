@@ -256,6 +256,12 @@ the list continues past the screen. A host dot is solid while its session is
 connected and a ring while it dials or is down; a dot pulses once when its agent
 changes state, so a background refresh is visible without being noise.
 
+Each project manager's workers start collapsed. The chevron shows how many
+rows are hidden, and the project's attention count includes blocked workers
+and questions even when their rows are collapsed. Expanded worker titles sit
+to the right of the project manager's title. The app saves the fold per host
+and manager, and opens it when you pick a worker in search or an agent alert.
+
 The rail opens by default at 600 dp and wider and remembers the wide-panel
 preference across narrow-window transitions. The **Hosts** icon toggles it and
 shows a selected container while it is open; its tooltip and spoken label say

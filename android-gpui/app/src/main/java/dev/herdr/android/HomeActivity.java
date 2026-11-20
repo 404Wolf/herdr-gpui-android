@@ -166,7 +166,7 @@ public final class HomeActivity extends Activity {
         }
         // "Reopen the last session at launch" (Hosts): a fresh launch goes back to
         // the remembered agent once its machine is connected, if it still exists.
-        if (state == null && RemoteHostsActivity.reopenEnabled(this)
+        if (!takeNoticePick() && state == null && RemoteHostsActivity.reopenEnabled(this)
                 && !SharedImages.waiting(System.currentTimeMillis())) {
             android.content.SharedPreferences prefs = getSharedPreferences("remote-startup", MODE_PRIVATE);
             reopenHost = prefs.getString("last_host", "");
@@ -195,6 +195,31 @@ public final class HomeActivity extends Activity {
     }
 
     private String reopenHost = "", reopenPane = "";
+    private boolean reopenPicked;
+    private static android.util.Pair<String, String> noticePick;
+
+    /** Only the private terminal activity can pass us a notification's destination. */
+    static void openNotice(Activity from, String host, String pane) {
+        noticePick = android.util.Pair.create(host, pane);
+        from.startActivity(new Intent(from, HomeActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+    }
+
+    private boolean takeNoticePick() {
+        if (noticePick == null) return false;
+        reopenHost = noticePick.first;
+        reopenPane = noticePick.second;
+        reopenPicked = true;
+        noticePick = null;
+        return true;
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (takeNoticePick()) {
+            for (Machine machine : machines.values()) tryReopen(machine);
+        }
+    }
 
     private void tryReopen(Machine machine) {
         // Only a live list: a cached terminal may be gone.
@@ -206,7 +231,7 @@ public final class HomeActivity extends Activity {
         reopenPane = "";
         for (List<Agent> agents : spaces.values()) {
             for (Agent agent : agents) {
-                if (agent.id.equals(pane)) { openAgent(agent); return; }
+                if (agent.id.equals(pane)) { openAgent(agent, beginNavigation(), reopenPicked); return; }
             }
         }
     }
@@ -1975,6 +2000,10 @@ public final class HomeActivity extends Activity {
 
     /** Carries the original intent through a worktree/Deacon action and this asynchronous focus. */
     private void openAgent(Agent agent, long intent) {
+        openAgent(agent, intent, true);
+    }
+
+    private void openAgent(Agent agent, long intent, boolean picked) {
         Machine machine = agent.machine;
         long handle = machine.handle;
         if (GpuiLaunch.terminalOpen()) {
@@ -1982,7 +2011,8 @@ public final class HomeActivity extends Activity {
             startActivity(new Intent(this, GpuiTerminalActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP)
                     .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_HOST, machine.host.id)
-                    .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_PANE, agent.id));
+                    .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_PANE, agent.id)
+                    .putExtra(GpuiTerminalActivity.EXTRA_REVEAL_FLEET, picked));
             return;
         }
         if (!opening && (handle <= 0 || !"ready".equals(machine.state))
@@ -2022,7 +2052,9 @@ public final class HomeActivity extends Activity {
                 }
                 try {
                     RemoteHostsActivity.rememberLastSession(this, machine.host, agent.id);
-                    GpuiLaunch.launchRemote(this, machine.host, handle, agent.id, FleetPanes.displayTitle(agent));
+                    String title = FleetPanes.displayTitle(agent);
+                    if (picked) GpuiLaunch.launchPicked(this, machine.host, handle, agent.id, title);
+                    else GpuiLaunch.launchRemote(this, machine.host, handle, agent.id, title);
                     // The terminal owns the session now; coming back reconnects in the background.
                     machine.handle = 0;
                     machine.state = "connecting";

@@ -49,6 +49,74 @@ public final class FleetSidebarTest {
         throw new AssertionError(name);
     }
 
+    @Test public void workerTitlesStepPastThePmChevronAndSubagentsStepFurther() {
+        int pmTitle = FleetTree.railAgentPadding(1, false) + FleetTree.PM_CHEVRON_DP;
+        int workerTitle = FleetTree.railAgentPadding(2, true);
+        assertTrue(workerTitle - pmTitle >= 8);
+        assertTrue(FleetTree.railAgentPadding(3, true) > workerTitle);
+    }
+
+    @Test public void workersStartHiddenAndTheToggleSurvivesReloadByHostAndPmId() {
+        FleetTree.Member pm = member(1, "pm", "app", "/repo", "idle");
+        FleetTree.Member worker = member(2, "worker", "app", "/repo", "working");
+        worker.parent = pm.id;
+        FleetTree.PmRow row = project(FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker), null)), "app");
+        Set<String> saved = new HashSet<>();
+        String key = row.foldKey("host-a");
+        FleetTree.Folds folds = new FleetTree.Folds(saved);
+        assertTrue(folds.folded(key));
+        assertEquals(1, row.workerRows);
+        folds.toggle(key);
+        assertFalse(new FleetTree.Folds(new HashSet<>(saved)).folded(key));
+        assertTrue(new FleetTree.Folds(saved).folded(row.foldKey("host-b")));
+
+        pm.project = "renamed";
+        worker.project = "";
+        FleetTree.PmRow renamed = project(FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker), null)), "renamed");
+        assertEquals(key, renamed.foldKey("host-a"));
+        folds.toggle(key);
+        assertTrue(new FleetTree.Folds(new HashSet<>(saved)).folded(key));
+
+        pm.id = "t3";
+        worker.parent = pm.id;
+        FleetTree.PmRow replacement = project(FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker), null)), "renamed");
+        assertFalse(key.equals(replacement.foldKey("host-a")));
+    }
+
+    @Test public void foldedPmCountsBlockedWorkersAndNestedQuestions() {
+        FleetTree.Member pm = member(1, "pm", "app", "/repo", "idle");
+        FleetTree.Member worker = member(2, "worker", "", "/repo", "blocked");
+        worker.parent = pm.id;
+        FleetTree.Member question = member(3, "worker", "", "/worktree", "");
+        question.parent = worker.id;
+        question.waitKind = "question";
+        FleetTree.PmRow row = project(FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker, question), null)), "app");
+        assertEquals(2, row.workerRows);
+        assertEquals("≡2 2!", row.countsLabel());
+        assertTrue(row.blocked());
+        assertSame(question, row.workers.get(0).children.get(0).member);
+    }
+
+    @Test public void explicitlySelectingAWorkerRevealsItsPmOnColdAndRepeatedPicks() {
+        FleetTree.Member pm = member(1, "pm", "app", "/repo", "idle");
+        FleetTree.Member worker = member(2, "worker", "", "/repo", "working");
+        worker.parent = pm.id;
+        FleetTree.PmRow row = project(FleetTree.pmTree(FleetTree.build(Arrays.asList(pm, worker), null)), "app");
+        String key = row.foldKey("host-a");
+        assertEquals(key, row.workerFoldKey("host-a", worker.id));
+        assertNull(row.workerFoldKey("host-a", pm.id));
+        assertNull(row.workerFoldKey("host-a", "missing"));
+        List<String> ancestors = Collections.singletonList(key);
+        FleetTree.Folds folds = new FleetTree.Folds(new HashSet<>());
+        assertTrue(folds.focusSeen("host-a/t2", ancestors, Collections.emptyList(), true));
+        assertFalse(folds.folded(key));
+        folds.toggle(key);
+        assertFalse(folds.focusSeen("host-a/t2", ancestors, Collections.emptyList(), false));
+        assertTrue(folds.folded(key));
+        assertTrue(folds.focusSeen("host-a/t2", ancestors, Collections.emptyList(), true));
+        assertFalse(folds.folded(key));
+    }
+
     @Test public void countsIncludeNestedAgentsButExcludeThePmShellsAndKeptShellLabels() {
         FleetTree.Member pm = member(1, "pm", "app", "/repo", "working");
         FleetTree.Member a = member(2, "worker", "app", "/wt/a", "working");
