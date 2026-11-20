@@ -606,7 +606,9 @@ final class ComposerBar {
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
             // pressed in the old pane is settled with it (sent only if that pane is back).
             if (recording(dictationState)) dictation.stop();
-            drafts.dictationEnded();
+            // The partial leaves this pane's draft: its final (or, on an error, the last words
+            // heard) lands in the pane it was spoken for, once, never beside a copy of itself.
+            drafts.dictationCancelled();
         } else if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
             dictation.cancel();
@@ -1616,7 +1618,7 @@ final class ComposerBar {
      * queue it as one paste plus Enter; otherwise Enter goes to the program.
      */
     private void enter() {
-        switch (DictationRouting.onEnter(dictationState)) {
+        switch (routing.enterFor(dictationState)) {
             case STOP_THEN_SEND:
                 routing.sendWhenDone();
                 dictation.stop();

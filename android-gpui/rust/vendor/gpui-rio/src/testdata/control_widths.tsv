@@ -134,56 +134,56 @@
 138	idle	clear=clear	queue=2 queued	type=type	talk=talk	send=send
 139	idle	clear=clear	queue=2 queued	type=type	talk=talk	send=send
 140	idle	clear=clear	queue=2 queued	type=type	talk=talk	send=send
-5	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-6	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-7	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-8	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-9	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-10	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-11	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-12	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-13	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-14	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-15	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-16	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-17	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-18	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-19	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-20	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-21	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-22	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-23	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-24	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-25	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-26	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-27	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-28	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-29	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-30	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-31	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-32	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-33	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-34	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-35	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-36	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-37	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-38	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-39	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-40	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-41	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-42	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-43	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-44	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-45	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-46	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-47	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-48	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-49	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-50	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-51	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-52	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-53	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
-54	recording	cancel=cancel	clear=✕	queue=≡2	type=type	talk=stop	send=send
+5	recording	cancel=cancel	type=type	talk=stop	send=send
+6	recording	cancel=cancel	type=type	talk=stop	send=send
+7	recording	cancel=cancel	type=type	talk=stop	send=send
+8	recording	cancel=cancel	type=type	talk=stop	send=send
+9	recording	cancel=cancel	type=type	talk=stop	send=send
+10	recording	cancel=cancel	type=type	talk=stop	send=send
+11	recording	cancel=cancel	type=type	talk=stop	send=send
+12	recording	cancel=cancel	type=type	talk=stop	send=send
+13	recording	cancel=cancel	type=type	talk=stop	send=send
+14	recording	cancel=cancel	type=type	talk=stop	send=send
+15	recording	cancel=cancel	type=type	talk=stop	send=send
+16	recording	cancel=cancel	type=type	talk=stop	send=send
+17	recording	cancel=cancel	type=type	talk=stop	send=send
+18	recording	cancel=cancel	type=type	talk=stop	send=send
+19	recording	cancel=cancel	type=type	talk=stop	send=send
+20	recording	cancel=cancel	type=type	talk=stop	send=send
+21	recording	cancel=cancel	type=type	talk=stop	send=send
+22	recording	cancel=cancel	type=type	talk=stop	send=send
+23	recording	cancel=cancel	type=type	talk=stop	send=send
+24	recording	cancel=cancel	type=type	talk=stop	send=send
+25	recording	cancel=cancel	type=type	talk=stop	send=send
+26	recording	cancel=cancel	type=type	talk=stop	send=send
+27	recording	cancel=cancel	type=type	talk=stop	send=send
+28	recording	cancel=cancel	type=type	talk=stop	send=send
+29	recording	cancel=cancel	type=type	talk=stop	send=send
+30	recording	cancel=cancel	type=type	talk=stop	send=send
+31	recording	cancel=cancel	type=type	talk=stop	send=send
+32	recording	cancel=cancel	type=type	talk=stop	send=send
+33	recording	cancel=cancel	type=type	talk=stop	send=send
+34	recording	cancel=cancel	type=type	talk=stop	send=send
+35	recording	cancel=cancel	type=type	talk=stop	send=send
+36	recording	cancel=cancel	type=type	talk=stop	send=send
+37	recording	cancel=cancel	type=type	talk=stop	send=send
+38	recording	cancel=cancel	type=type	talk=stop	send=send
+39	recording	cancel=cancel	type=type	talk=stop	send=send
+40	recording	cancel=cancel	type=type	talk=stop	send=send
+41	recording	cancel=cancel	type=type	talk=stop	send=send
+42	recording	cancel=cancel	type=type	talk=stop	send=send
+43	recording	cancel=cancel	clear=✕	type=type	talk=stop	send=send
+44	recording	cancel=cancel	clear=✕	type=type	talk=stop	send=send
+45	recording	cancel=cancel	clear=✕	type=type	talk=stop	send=send
+46	recording	cancel=cancel	status=0:05	type=type	talk=stop	send=send
+47	recording	cancel=cancel	status=0:05	type=type	talk=stop	send=send
+48	recording	cancel=cancel	status=0:05	type=type	talk=stop	send=send
+49	recording	cancel=cancel	status=0:05	type=type	talk=stop	send=send
+50	recording	cancel=cancel	clear=✕	status=0:05	type=type	talk=stop	send=send
+51	recording	cancel=cancel	clear=✕	status=0:05	type=type	talk=stop	send=send
+52	recording	cancel=cancel	clear=✕	status=0:05	type=type	talk=stop	send=send
+53	recording	cancel=cancel	clear=✕	status=0:05	type=type	talk=stop	send=send
+54	recording	cancel=cancel	clear=✕	status=0:05	type=type	talk=stop	send=send
 55	recording	cancel=cancel	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	send=send
 56	recording	cancel=cancel	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	send=send
 57	recording	cancel=cancel	clear=✕	queue=≡2	status=0:05	type=type	talk=stop	send=send

@@ -18,11 +18,21 @@ final class KeyboardHide {
         return dy > 3 * slop && dy > 2 * Math.abs(dx);
     }
 
-    /** Hides the keyboard if it is up; true when it was (so Back has done its job). */
+    /**
+     * Hides the keyboard if it is up; true when it was (so Back has done its job). Visibility is
+     * read from the window insets (Android 11+), not guessed from the request's result.
+     */
     static boolean hideIfShown(Activity activity) {
         View decor = activity.getWindow().getDecorView();
         InputMethodManager input = activity.getSystemService(InputMethodManager.class);
-        return input != null && input.hideSoftInputFromWindow(decor.getWindowToken(), 0);
+        if (input == null) return false;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            android.view.WindowInsets insets = decor.getRootWindowInsets();
+            if (insets == null || !insets.isVisible(android.view.WindowInsets.Type.ime())) return false;
+            input.hideSoftInputFromWindow(decor.getWindowToken(), 0);
+            return true;
+        }
+        return input.hideSoftInputFromWindow(decor.getWindowToken(), 0);
     }
 
     /** Watches an activity's touches and hides the keyboard on a downward drag; never consumes one. */

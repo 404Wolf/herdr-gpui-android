@@ -1189,9 +1189,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     .setIconTintList(tint);
             menu.getMenu().add(0, 6, MoreMenu.GESTURES, "Gestures");
         }
+        if (attachTarget() != null) menu.getMenu().add(0, 7, MoreMenu.ATTACH, "Attach image");
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 1) showDisplayOptions();
+            if (item.getItemId() == 7) showAttachSources();
+            else if (item.getItemId() == 1) showDisplayOptions();
             else if (item.getItemId() == 2) showSessionActions();
             else if (item.getItemId() == 4) showPanes();
             else if (item.getItemId() == 5) toggleSidebar();

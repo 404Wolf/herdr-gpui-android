@@ -127,6 +127,8 @@ final class ComposerDrafts {
     private String connectionRevision;
     /** The draft before the utterance in progress, or null when not dictating. */
     private String dictationBase;
+    /** What the utterance in progress added after that base (its words and the space before them). */
+    private String dictationTail;
     /** At most this many marks per pane; the oldest go first. */
     static final int MAX_CUTS = 16;
     /** Each pane's unverified-cut marks: {length, hash} of the draft's text before each. */
@@ -299,6 +301,8 @@ final class ComposerDrafts {
     String dictationPartial(String utterance, int[] cuts) {
         if (dictationBase == null) dictationBase = text();
         edit(join(dictationBase, utterance));
+        String now = text();
+        dictationTail = now.length() >= dictationBase.length() ? now.substring(dictationBase.length()) : null;
         liveMarks = anchors(text(), placed(dictationBase, utterance, cuts));
         return text();
     }
@@ -402,6 +406,7 @@ final class ComposerDrafts {
     String dictationEnded() {
         settleCuts(true);
         dictationBase = null;
+        dictationTail = null;
         return text();
     }
 
@@ -410,9 +415,15 @@ final class ComposerDrafts {
      * words leave the draft, which is as it was before the dictation began.
      */
     String dictationCancelled() {
-        if (dictationBase != null) edit(dictationBase);
+        // Only the dictated words go: what was typed or edited meanwhile stays. When the words
+        // themselves were edited (so they cannot be told apart) nothing is destroyed.
+        String text = text();
+        if (dictationBase != null && dictationTail != null && !dictationTail.isEmpty() && text.endsWith(dictationTail)) {
+            edit(text.substring(0, text.length() - dictationTail.length()));
+        }
         settleCuts(false);
         dictationBase = null;
+        dictationTail = null;
         return text();
     }
 

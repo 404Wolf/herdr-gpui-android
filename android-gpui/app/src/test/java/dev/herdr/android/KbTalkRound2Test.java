@@ -107,7 +107,7 @@ public final class KbTalkRound2Test {
 
     @Test public void aPaneSwitchTakesThePartialOutOfTheOldDraftAndTheFinalLandsOnceNotWithIt() throws Exception {
         String bar = source("ComposerBar");
-        String setPane = section(bar, "void setPane(String hostId, String paneId, String paneKind)", "String next = paneKind");
+        String setPane = section(bar, "void setPane(String hostId, String revision", "String next = paneKind");
         assertTrue(setPane.contains("drafts.dictationCancelled()"));
         String routing = source("DictationRouting");
         assertTrue("an error after a switch still lands the spoken words", routing.contains("lastPartial"));

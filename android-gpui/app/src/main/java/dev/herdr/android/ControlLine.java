@@ -103,8 +103,7 @@ final class ControlLine {
         // The wide lines say "clear" in words (a lone dim cross was hard to find); the narrow ones
         // keep the cross. While a dictation is on, "cancel" is the clearer word beside it, so the
         // cross stays a cross there.
-        boolean dictation = in.recording || in.dictating;
-        GhostText.Control clearWord = in.clearable && !dictation ? new GhostText.Control("clear", "clear", "warn") : clear;
+        GhostText.Control clearWord = in.clearable ? new GhostText.Control("clear", "clear", "warn") : null;
         GhostText.Control undoWide = in.undoWide == null ? null : new GhostText.Control("undo", in.undoWide, "info");
         GhostText.Control undo = in.undoNarrow == null ? null : new GhostText.Control("undo", in.undoNarrow, "info");
         String mark = in.expanded ? " ▲" : "";
@@ -117,31 +116,60 @@ final class ControlLine {
         GhostText.Control shortStatus = statuses.isEmpty() ? null : statuses.get(statuses.size() - 1);
         // While a dictation is on, "cancel" leads every line: it stops and discards what was
         // dictated, keeping the text that was there before. "send" (in the slots) stops and sends.
-        GhostText.Control cancel = in.recording || in.dictating ? new GhostText.Control(CANCEL, "cancel", "warn") : null;
-        java.util.List<java.util.List<GhostText.Control>> left = new java.util.ArrayList<>();
-        left.add(line(cancel, clearWord, undoWide, queueWide, fullStatus));
-        left.add(line(cancel, clearWord, undoWide, queueWide, shortStatus));
-        left.add(line(cancel, clear, undo, queue, shortStatus));
-        left.add(line(cancel, clear, undo, queue, null));
-        left.add(line(cancel, clear, null, queue, null));
+        // Priority, highest first: hide, cancel, stop, send, the timer; then img; then the cross,
+        // undo and the queue, which give way on narrow grids (they come back with the idle line).
+        boolean dictation = in.recording || in.dictating;
+        GhostText.Control cancel = dictation ? new GhostText.Control(CANCEL, "cancel", "warn") : null;
+        GhostText.Control img = in.attach ? new GhostText.Control(ATTACH, "img", "dim") : null;
         java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
-        if (in.attach) {
-            // Only the fullest line carries it, ahead of its words: where that line does not fit,
-            // "img" is the first thing to go and every other rung is exactly as it was.
-            java.util.List<GhostText.Control> first = new java.util.ArrayList<>();
-            first.add(new GhostText.Control(ATTACH, "img", "dim"));
-            first.addAll(left.get(0));
-            first.addAll(slots);
-            out.add(first);
-        }
-        for (java.util.List<GhostText.Control> l : left) {
-            java.util.List<GhostText.Control> full = new java.util.ArrayList<>(l);
-            full.addAll(slots);
-            if (out.isEmpty() || !ids(out.get(out.size() - 1)).equals(ids(full)) || width(out.get(out.size() - 1)) != width(full)) {
-                out.add(full);
+        if (dictation) {
+            // Every combination, widest first: the renderer takes the widest that fits, so what
+            // the grid can hold of the lower priorities (img, the cross, undo, the queue) is kept.
+            java.util.List<java.util.List<GhostText.Control>> all = new java.util.ArrayList<>();
+            GhostText.Control[] leads = img == null ? new GhostText.Control[] {null} : new GhostText.Control[] {img, null};
+            for (GhostText.Control lead : leads) {
+                add(all, slots, lead, cancel, clear, undoWide, queueWide, fullStatus);
+                add(all, slots, lead, cancel, clear, undoWide, queueWide, shortStatus);
+                add(all, slots, lead, cancel, clear, undo, queue, shortStatus);
+                add(all, slots, lead, cancel, clear, shortStatus);
+                add(all, slots, lead, cancel, shortStatus);
+                add(all, slots, lead, cancel, clear);
+                add(all, slots, lead, cancel);
             }
+            all.sort((x, y) -> Integer.compare(width(y), width(x)));
+            for (java.util.List<GhostText.Control> line : all) {
+                if (out.isEmpty() || !ids(out.get(out.size() - 1)).equals(ids(line))
+                        || width(out.get(out.size() - 1)) != width(line)) {
+                    out.add(line);
+                }
+            }
+            return out;
         }
+        // Idle: where img shows it comes first and keeps the cross (the word needs room img would
+        // lose to); without img the wide lines say "clear".
+        if (in.attach) {
+            add(out, slots, img, clearWord, undoWide, queueWide, fullStatus);
+            add(out, slots, img, clear, undoWide, queueWide, fullStatus);
+        } else {
+            add(out, slots, null, clearWord, undoWide, queueWide, fullStatus);
+        }
+        add(out, slots, null, in.attach ? clear : clearWord, undoWide, queueWide, shortStatus);
+        add(out, slots, null, clear, undo, queue, shortStatus);
+        add(out, slots, null, clear, undo, queue, null);
+        add(out, slots, null, clear, null, queue, null);
         return out;
+    }
+
+    /** Appends {@code lead + words + slots} unless it repeats the last line (same ids and width). */
+    private static void add(java.util.List<java.util.List<GhostText.Control>> out,
+            java.util.List<GhostText.Control> slots, GhostText.Control lead, GhostText.Control... words) {
+        java.util.List<GhostText.Control> full = new java.util.ArrayList<>();
+        if (lead != null) full.add(lead);
+        for (GhostText.Control w : words) if (w != null) full.add(w);
+        full.addAll(slots);
+        if (out.isEmpty() || !ids(out.get(out.size() - 1)).equals(ids(full)) || width(out.get(out.size() - 1)) != width(full)) {
+            out.add(full);
+        }
     }
 
     /** The three fixed slots: "type" (or its reserved rule), "talk", "send" (or its rule). */

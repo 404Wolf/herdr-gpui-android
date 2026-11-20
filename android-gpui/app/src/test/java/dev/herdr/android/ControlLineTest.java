@@ -122,16 +122,20 @@ public final class ControlLineTest {
             for (int cols = 5; cols <= 140; cols++) {
                 java.util.List<GhostText.Control> line = controls(false, talks, 3, cols, recording, true);
                 String at = (recording ? "recording" : "idle") + " at " + cols + ": " + ids(line);
-                assertTrue(at, ids(line).contains("clear"));
-                assertTrue(at, ids(line).contains("queue"));
+                if (recording) {
+                    // Dictating: hide, cancel, stop and send are the priorities; the cross and the queue give way.
+                    assertTrue(at, ids(line).contains("cancel") && ids(line).contains("type") && ids(line).contains("send"));
+                } else {
+                    assertTrue(at, ids(line).contains("clear"));
+                    assertTrue(at, ids(line).contains("queue"));
+                }
                 assertTrue(at, ids(line).contains("talk"));
-                // Recording adds "cancel" (and keeps "send"): the barest line needs 9 cells more.
-                if (cols >= (recording ? 48 : 39)) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
+                if (cols >= 39) assertTrue("fits " + at, ControlLine.width(line) + ControlLine.MARGIN <= cols);
             }
         }
         // The cover screen (~46 columns) recording: the status words shorten, then go.
         assertEquals("0:05", byId(controls(false, LISTENING, 3, 62, true, true), "status").spans[0]);
-        assertEquals("cancel clear queue type talk send", ids(controls(false, LISTENING, 3, 41, true, true)));
+        assertEquals("cancel type talk send", ids(controls(false, LISTENING, 3, 41, true, true)));
         assertEquals("≡3", byId(controls(false, IDLE, 3, 41, false, true), "queue").spans[0]);
     }
 
@@ -228,7 +232,12 @@ public final class ControlLineTest {
         assertEquals("ghost.rs's width table is out of date", kept, now);
         // And the ladder itself never leaves out ✕, the queue or talk.
         for (String row : now.split("\n")) {
-            assertTrue(row, row.contains("\tclear=") && row.contains("\tqueue=") && row.contains("\ttalk="));
+            if (row.contains("\trecording\t")) {
+                // While dictating: cancel, hide (type), stop and send lead the priorities.
+                assertTrue(row, row.contains("\tcancel=") && row.contains("\ttype=") && row.contains("\ttalk=") && row.contains("\tsend="));
+            } else {
+                assertTrue(row, row.contains("\tclear=") && row.contains("\tqueue=") && row.contains("\ttalk="));
+            }
         }
     }
 
