@@ -5,6 +5,7 @@ set -euo pipefail
 : "${EMU_OUT:?Run through scripts/emu-test.sh}"
 : "${EMU_APK:?Run through scripts/emu-test.sh}"
 
+adb devices -l > "$EMU_OUT/adb-devices.log"
 aapt2="$ANDROID_HOME/build-tools/35.0.0/aapt2"
 badging=$("$aapt2" dump badging "$EMU_APK")
 package=$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$badging")

@@ -70,8 +70,8 @@ working directory with `ADB_SERIAL` set to the disposable API 34 emulator and
 `EMU_APK` set to the installed APK path. Write test artifacts to `EMU_OUT`, the
 run directory printed by the runner under `$JOBRUN_OUTPUTS/emu-out/` on Slurm or
 `./emu-out/` standalone. The smoke test enables the app's debug capture setting,
-launches Home, and saves `home.png` alongside the emulator and test logs. Use a
-debuggable APK with this test.
+launches Home, and saves `home.png` alongside the device list from the job's
+ADB server and the emulator and test logs. Use a debuggable APK with this test.
 
 ## Isolated Linux verification APK
 

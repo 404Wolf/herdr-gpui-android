@@ -38,15 +38,21 @@ fi
 export EMU_APK
 [[ -f "$EMU_APK" ]] || die "APK is missing: $EMU_APK"
 
-# Start the host ADB server before isolating the AVD's home and target every
-# device command by the console port reported by our emulator.
-timeout 15s adb start-server
 emu_home=$(mktemp -d)
 emu_pid=
+adb_pid=
 test_pid=
 ADB_SERIAL=
-# ShellCheck does not see the EXIT trap call when the script exits explicitly.
-# shellcheck disable=SC2329
+stop_process() {
+    local pid=$1 deadline=$((SECONDS + 5))
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+        sleep 0.2
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
     local status=$?
     trap '' HUP INT TERM
@@ -58,13 +64,10 @@ cleanup() {
             timeout -k 1s 5s adb -s "$ADB_SERIAL" logcat -b all -d \
                 > "$EMU_OUT/logcat.log" 2>&1 || true
         fi
-        kill -TERM "$emu_pid" 2>/dev/null || true
-        local stop_deadline=$((SECONDS + 5))
-        while kill -0 "$emu_pid" 2>/dev/null && (( SECONDS < stop_deadline )); do
-            sleep 0.2
-        done
-        kill -KILL "$emu_pid" 2>/dev/null || true
-        wait "$emu_pid" 2>/dev/null || true
+        stop_process "$emu_pid"
+    fi
+    if [[ -n "$adb_pid" ]]; then
+        stop_process "$adb_pid"
     fi
     rm -rf -- "$emu_home"
     exit "$status"
@@ -78,6 +81,38 @@ export ANDROID_USER_HOME="$emu_home/.android"
 export ANDROID_EMULATOR_HOME="$ANDROID_USER_HOME"
 export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
 mkdir -p "$ANDROID_AVD_HOME"
+
+# Pass an already bound loopback socket to ADB so concurrent jobs cannot claim
+# the same port between picking it and starting the server.
+# The emulator registers itself with this server, so disable discovery.
+HOME="$emu_home" ADB_USB=0 ADB_MDNS=0 ADB_LOCAL_TRANSPORT_MAX_PORT=0 \
+    python3 - "$emu_home/adb-port" > "$EMU_OUT/adb-server.log" 2>&1 <<'PY' &
+import os
+from pathlib import Path
+import socket
+import sys
+
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    fd = listener.fileno()
+    os.set_inheritable(fd, True)
+    Path(sys.argv[1]).write_text(str(listener.getsockname()[1]))
+    os.execvp("adb", ["adb", "-L", f"acceptfd:{fd}", "nodaemon", "server"])
+PY
+adb_pid=$!
+adb_deadline=$((SECONDS + 15))
+while [[ ! -s "$emu_home/adb-port" ]]; do
+    kill -0 "$adb_pid" 2>/dev/null || die "ADB server exited. See adb-server.log."
+    (( SECONDS < adb_deadline )) || die "ADB server did not report its port. See adb-server.log."
+    sleep 0.2
+done
+ANDROID_ADB_SERVER_PORT=$(< "$emu_home/adb-port")
+export ANDROID_ADB_SERVER_PORT
+# ADB clients treat an explicit IP as remote and leave server startup to us.
+export ADB_SERVER_SOCKET="tcp:127.0.0.1:$ANDROID_ADB_SERVER_PORT"
+timeout -k 1s 15s adb server-status > /dev/null || die "ADB server did not start. See adb-server.log."
+
 HOME="$emu_home" avdmanager create avd --name herdr-test \
     --package 'system-images;android-34;google_apis;x86_64' \
     --device pixel_6 <<< 'no' > "$EMU_OUT/avdmanager.log" 2>&1 \
@@ -121,4 +156,6 @@ test_pid=$!
 test_status=0
 wait "$test_pid" || test_status=$?
 test_pid=
-exit "$test_status"
+if (( test_status != 0 )); then
+    exit "$test_status"
+fi
