@@ -81,6 +81,9 @@ final class OutboxCourier {
      * caller keeps the draft.
      */
     Outbox.Message add(String id, Outbox.Target target, String text, Outbox.Composed composed) {
+        // The queue on disk first (once; the startup load then does nothing): the bounds and the
+        // order apply to the whole queue, never to the part read so far.
+        outbox.load();
         boolean known = outbox.message(id) != null;
         Outbox.Message message = outbox.add(id, target, text, composed);
         if (message == null) return null;

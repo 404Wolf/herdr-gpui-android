@@ -11,6 +11,8 @@ final class HeldEdit {
     interface Steps {
         /** The message's text, or null when there is none to edit (gone, or being sent). */
         String text(String id);
+        /** Whether the draft with {@code text} joined can be saved whole (no transfer otherwise). */
+        boolean fits(String text);
         /** The text joined to the draft and the drafts committed synchronously. */
         boolean commitDraft(String text);
         /** The message taken out of the outbox; false when it could not be (being sent). */
@@ -19,11 +21,12 @@ final class HeldEdit {
         void rollback();
     }
 
-    enum Result { EDITED, GONE, DRAFT_NOT_SAVED, NOT_TAKEN }
+    enum Result { EDITED, GONE, TOO_LONG, DRAFT_NOT_SAVED, NOT_TAKEN }
 
     static Result run(String id, Steps steps) {
         String text = steps.text(id);
         if (text == null) return Result.GONE;
+        if (!steps.fits(text)) return Result.TOO_LONG;
         if (!steps.commitDraft(text)) {
             steps.rollback();
             return Result.DRAFT_NOT_SAVED;

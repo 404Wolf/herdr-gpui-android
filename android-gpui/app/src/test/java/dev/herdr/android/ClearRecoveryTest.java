@@ -124,7 +124,7 @@ public final class ClearRecoveryTest {
     after.failPersist=false;assertTrue(resumed.undo(OWNER, now()));
     assertEquals("draft",after.drafts.text());assertEquals(m.id,HeldFixtures.shown(after.courier.outbox(),"h","A").get(0).id);
     assertFalse(after.clips.held(a));assertFalse(after.clips.held(b));
-    Outbox box=new Outbox(new File(dir.getRoot(),"dispatch.json"));
+    Outbox box=new Outbox(new File(dir.getRoot(),"dispatch.json"));box.load();
     Outbox.Message picked=HeldFixtures.add(box,"h","A","never send",now());
     box.clearAll(HeldFixtures.machine("h"),"h","A",now()+8000,now());assertFalse(box.claim(picked.id,HeldFixtures.live("h","A"),picked.text,now(),false));
   }

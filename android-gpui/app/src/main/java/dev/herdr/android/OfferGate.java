@@ -17,4 +17,27 @@ final class OfferGate {
     static boolean mayType(long offered, long now, boolean live, boolean covered) {
         return live && !covered && offered > 0 && offered == now;
     }
+
+    /** Where a tap was made: the pane, its session handle and its attach, taken together. */
+    static final class Tap {
+        final String pane;
+        final long handle;
+        final long attach;
+
+        Tap(String pane, long handle, long attach) {
+            this.pane = pane == null ? "" : pane;
+            this.handle = handle;
+            this.attach = attach;
+        }
+    }
+
+    /**
+     * {@link #mayType(long, long, boolean, boolean)} for a tap captured as one {@link Tap}: the
+     * pane, session and attach on screen now must all be the tap's. Nothing read after the tap
+     * (a pane switch while the outbox saved) can redirect it.
+     */
+    static boolean mayType(Tap tap, String pane, long handle, long attach, boolean live, boolean covered) {
+        return tap.pane.equals(pane) && tap.handle == handle && tap.handle > 0
+                && mayType(tap.attach, attach, live, covered);
+    }
 }

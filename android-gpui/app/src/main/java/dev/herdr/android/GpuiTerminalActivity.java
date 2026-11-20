@@ -4810,6 +4810,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void act(String id) { actOnHeld(id); }
 
+            @Override public boolean queuedKnown(String id) {
+                return outbox != null && outbox.outbox().known(id);
+            }
+
             @Override public boolean queuedEditable(String id) {
                 Outbox.Message m = outbox == null ? null : outbox.outbox().message(id);
                 return m != null && m.state != Outbox.State.SENDING;
@@ -5302,9 +5306,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         final String refusedBy;
         final Long createdMs;
         final String label, status;
+        /** Read once, with {@link #live}: the session handle, its attach, and its Herdr session. */
+        final long handle, attach;
+        final String session;
 
         Here(Connection c, String host, String pane, MachineKey machine, boolean live, String refusedBy,
-                Long createdMs, String label, String status) {
+                Long createdMs, String label, String status, long handle, long attach, String session) {
+            this.handle = handle;
+            this.attach = attach;
+            this.session = session == null ? "" : session;
             this.connection = c;
             this.host = host == null ? "" : host;
             this.pane = pane == null ? "" : pane;
@@ -5318,7 +5328,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
 
         Outbox.Live lane() {
-            return new Outbox.Live(machine, host, pane, createdMs);
+            return new Outbox.Live(machine, host, pane, createdMs, session);
+        }
+
+        /** Where a tap now would type: this pane, session and attach, taken together. */
+        OfferGate.Tap tap() {
+            return new OfferGate.Tap(pane, handle, attach);
+        }
+
+        boolean mayType(OfferGate.Tap tap, boolean covered) {
+            return OfferGate.mayType(tap, pane, handle, attach, live, covered);
         }
     }
 
@@ -5335,8 +5354,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 MachineBindings.Binding binding = bindings.binding(c.hostId, c.connectionRevision);
                 if (binding != null && !binding.bound()) refused = binding.refusedBy;
             }
+            long attach = c == null ? 0 : c.attach;
             boolean live = c != null && c.machine != null && c.ready && !c.isClosed() && !c.offline
-                    && c.painted && c.attach > 0 && c.remoteHandle > 0 && pane.equals(c.chromePane);
+                    && c.painted && attach > 0 && c.remoteHandle > 0 && pane.equals(c.chromePane);
             Long created = null;
             String label = "", status = "";
             JSONArray panes = c == null ? null : c.panes;
@@ -5348,7 +5368,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 label = HomeActivity.cleanTitle(item.optString("title", ""), pane);
                 status = item.optString("status", "");
             }
-            return new Here(c, host, pane, machine, live, refused, created, label, status);
+            return new Here(c, host, pane, machine, live, refused, created, label, status,
+                    c == null ? 0 : c.remoteHandle, attach, c == null ? "" : c.session);
         }
     }
 
@@ -5418,16 +5439,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         // Step 4 waits for the draft's clear to reach the disk (actOnHeld): typed at once in the
         // pane on screen, on the attach on screen now, no lead.
-        long handle = here.connection.remoteHandle;
-        long attach = here.connection.attach;
+        // Pane, session and attach as they were at the tap (here() ran before the outbox saved):
+        // a switch while it saved can never redirect the message.
+        OfferGate.Tap tap = here.tap();
         immediateId = id;
         immediate = () -> {
             Here now = here();
-            if (!OfferGate.mayType(attach, now.connection == null ? 0 : now.connection.attach, now.live, covered())) {
+            if (!now.mayType(tap, covered())) {
                 refreshOffer();
                 return;
             }
-            outbox.send(id, lane, handle, attach, text, true, outcome -> {
+            outbox.send(id, lane, tap.handle, tap.attach, text, true, outcome -> {
                 if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it waits in the queue");
                 else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
             });
@@ -5483,9 +5505,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             java.util.TimeZone zone = java.util.TimeZone.getDefault();
             String heading = HeldWords.offer(offer, targets, zone, android.text.format.DateFormat.is24HourFormat(this),
                     System.currentTimeMillis(), SystemClock.elapsedRealtime(), bootCount());
-            long attach = here.connection.attach;
-            heldOffer.show(offer.id + "@" + attach, heading, QueuedMessages.PROMPT + offer.text,
-                    "Send here", () -> sendHeld(offer.id, attach),
+            OfferGate.Tap tap = here.tap();
+            heldOffer.show(offer.id + "@" + tap.handle + "/" + tap.attach, heading, QueuedMessages.PROMPT + offer.text,
+                    "Send here", () -> sendHeld(offer.id, tap),
                     "Edit", () -> { if (composer != null) composer.editHeld(offer.id); },
                     "Queue", this::showQueueScreen);
             return;
@@ -5511,9 +5533,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * was drawn, with the late lead for a program that reports status. Anything changed since
      * (another pane, another attach, the link) and nothing is typed. Main thread.
      */
-    private void sendHeld(String id, long offeredAttach) {
+    private void sendHeld(String id, OfferGate.Tap tap) {
         Here here = here();
-        if (!OfferGate.mayType(offeredAttach, here.connection == null ? 0 : here.connection.attach, here.live, covered())) {
+        if (!here.mayType(tap, covered())) {
             note("The pane changed before the tap; nothing was sent");
             refreshOffer();
             return;
@@ -5525,7 +5547,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         String wire = HeldWords.wire(m.text, m.composed.wallMs, java.util.TimeZone.getDefault(),
                 !here.status.isEmpty(), false);
-        outbox.send(id, here.lane(), here.connection.remoteHandle, offeredAttach, wire, false, outcome -> {
+        outbox.send(id, here.lane(), tap.handle, tap.attach, wire, false, outcome -> {
             if (outcome == Outbox.Outcome.WRITTEN) note("Sent · check it arrived");
             else if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it still waits");
             else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
@@ -5613,6 +5635,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void bindMachine(Connection current, String coreId) {
         if (current.machine != null || current.refusedBy != null || current.hostId == null || bindings == null) return;
+        // Not before the held messages are read: their sessions own their machines.
+        if (outbox == null || !MachineBindings.mayBind(outbox.outbox())) return;
         MachineKey key = MachineKey.of(coreId, current.fingerprint);
         if (key == null) return;
         MachineBindings.Binding binding = bindings.bind(current.hostId, current.connectionRevision, current.session,
@@ -5637,6 +5661,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String signature = current.generation + "/" + pane + "/" + attach + "/" + painted + "/" + current.ready;
         current.attach = attach;
         current.painted = painted;
+        // A hello the outbox was not yet read for is bound on a later poll.
+        if (current.machine == null && current.ready && current.remoteBoot != null) bindMachine(current, current.remoteBoot);
         if (signature.equals(offerSignature)) return;
         offerSignature = signature;
         main.post(this::refreshOffer);
@@ -5689,10 +5715,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             case MESSAGE:
                 if (message == null || message.state == Outbox.State.SENDING) return;
                 Here opened = here();
-                if (message.state == Outbox.State.PENDING && message.id.equals(offeredId()) && opened.connection != null) {
-                    // Bound to the attach on screen now: a reattach before the tap types nothing.
-                    long attach = opened.connection.attach;
-                    sheet.add("Send here", () -> sendHeld(message.id, attach));
+                if (message.state == Outbox.State.PENDING && message.id.equals(offeredId()) && opened.live) {
+                    // Bound to the pane and attach on screen now: a reattach before the tap types nothing.
+                    OfferGate.Tap tap = opened.tap();
+                    sheet.add("Send here", () -> sendHeld(message.id, tap));
                 }
                 if (message.state == Outbox.State.NEEDS_YOU) {
                     sheet.add("It arrived", () -> composer.queueCommand(row.id, "drop"));

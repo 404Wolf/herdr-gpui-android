@@ -70,6 +70,8 @@ final class ComposerBar {
         default void act(String id) { }
         /** Whether the held message {@code id} can be taken back for editing (not being sent). */
         default boolean queuedEditable(String id) { return queuedText(id) != null; }
+        /** Whether submission {@code id} was ever held (it is, or it left after being held). */
+        default boolean queuedKnown(String id) { return queuedText(id) != null; }
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
@@ -533,7 +535,7 @@ final class ComposerBar {
         SendHandoff.Record record = handoff;
         if (record == null || !host.outboxLoaded()) return;
         handoff = null;
-        SendHandoff.Recovery recovery = SendHandoff.reconcile(record, id -> host.queuedText(id) != null);
+        SendHandoff.Recovery recovery = SendHandoff.reconcile(record, host::queuedKnown);
         if (recovery == SendHandoff.Recovery.CLEAR_DRAFT && drafts.removeSent(record.owner, record.text)) {
             showText(drafts.text());
         } else if (recovery == SendHandoff.Recovery.OFFER_AGAIN) {
@@ -549,7 +551,12 @@ final class ComposerBar {
 
     /** The user took the offered draft: it is in the composer now. */
     void acceptOfferedDraft() {
-        showText(drafts.acceptOffered());
+        String text = drafts.acceptOffered();
+        if (text == null) {
+            host.notice("Finish the dictation first; the earlier draft stays offered");
+            return;
+        }
+        showText(text);
         saveDraftsSoon();
     }
 
@@ -608,6 +615,10 @@ final class ComposerBar {
                 return host.queuedEditable(which) ? host.queuedText(which) : null;
             }
 
+            @Override public boolean fits(String text) {
+                return ComposerDrafts.fits(drafts.text(), text);
+            }
+
             @Override public boolean commitDraft(String text) {
                 before[0] = drafts.snapshot();
                 takeBack(text);
@@ -625,14 +636,16 @@ final class ComposerBar {
             }
         });
         if (result == HeldEdit.Result.DRAFT_NOT_SAVED) host.notice("Could not save the draft; the message stays held");
+        if (result == HeldEdit.Result.TOO_LONG) {
+            host.notice("The draft is too long to take this message in; it stays held. Send or shorten the draft first");
+        }
         return result == HeldEdit.Result.EDITED;
     }
 
     /** A queued message taken back: its text joins the draft, on a line of its own. */
     void takeBack(String text) {
         if (text == null || text.isEmpty()) return;
-        String draft = drafts.text();
-        String joined = draft.trim().isEmpty() ? text : draft.replaceAll("\\s+$", "") + "\n" + text;
+        String joined = ComposerDrafts.joinedBack(drafts.text(), text);
         drafts.edit(joined);
         showText(joined);
     }

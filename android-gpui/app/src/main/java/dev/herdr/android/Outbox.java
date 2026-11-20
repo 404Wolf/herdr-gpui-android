@@ -139,12 +139,19 @@ final class Outbox {
         final MachineKey machine;
         final String profileId, address;
         final Long createdMs;
+        /** The Herdr session of the profile on screen; null where it does not matter (a view). */
+        final String session;
 
         Live(MachineKey machine, String profileId, String address, Long createdMs) {
+            this(machine, profileId, address, createdMs, null);
+        }
+
+        Live(MachineKey machine, String profileId, String address, Long createdMs, String session) {
             this.machine = machine;
             this.profileId = nonNull(profileId);
             this.address = nonNull(address);
             this.createdMs = createdMs;
+            this.session = session;
         }
     }
 
@@ -268,6 +275,13 @@ final class Outbox {
 
     private final File file;
     private final List<Entry> entries = new ArrayList<>();
+    /**
+     * Ids of messages that were held and have left (sent receipts past their hour, messages
+     * typed at once, dropped or taken back), saved: a Send whose draft survived a stop is known
+     * to have been held after its row is gone, so its draft is never offered again as unsent.
+     */
+    private final java.util.LinkedHashSet<String> settled = new java.util.LinkedHashSet<>();
+    static final int MAX_SETTLED = 512;
     private int chars;
     /** Bumped by every change; {@link #save} writes only when it moved. */
     private long version;
@@ -294,7 +308,7 @@ final class Outbox {
                 if (diskRead) return;
                 List<Entry> loaded = new ArrayList<>();
                 String text = read(file);
-                if (text != null && !decode(text, loaded)) {
+                if (text != null && !decode(text, loaded, settled)) {
                     damaged = true;
                     File aside = new File(file.getPath() + ".unreadable-" + System.currentTimeMillis());
                     if (!file.renameTo(aside)) file.delete();
@@ -434,6 +448,11 @@ final class Outbox {
         return e == null ? null : e.text;
     }
 
+    /** Whether submission {@code id} was ever held here: it is, or it left after being held. */
+    synchronized boolean known(String id) {
+        return find(id) != null || settled.contains(id);
+    }
+
     /** Message {@code id} as it is now, cleared or not; null when there is none. */
     synchronized Message message(String id) {
         Entry e = find(id);
@@ -491,6 +510,9 @@ final class Outbox {
                 || composed == null || !sendable(text)) {
             return null;
         }
+        // Admitted only against the queue as it is on disk: before the load, the bounds would be
+        // checked against part of it, and a row reported held could be dropped by the next load.
+        if (!diskRead) return null;
         Entry existing = find(id);
         if (existing != null) return existing.view();
         if (unsettledCount() >= MAX_MESSAGES || entries.size() >= MAX_MESSAGES
@@ -522,6 +544,9 @@ final class Outbox {
         if (live == null || !e.target.address.equals(live.address)) return false;
         if (e.target.machine == null) return e.target.profileId.equals(live.profileId);
         if (!e.target.machine.equals(live.machine)) return false;
+        // A message belongs to the session it was typed in: a copied core in another session
+        // reports the same machine and is never offered it.
+        if (live.session != null && !e.target.session.equals(live.session)) return false;
         return e.target.createdMs == null || live.createdMs == null || e.target.createdMs.equals(live.createdMs);
     }
 
@@ -891,7 +916,11 @@ final class Outbox {
     }
 
     private void remove(Entry entry) {
-        if (entries.remove(entry)) chars -= entry.text.length();
+        if (!entries.remove(entry)) return;
+        chars -= entry.text.length();
+        settled.remove(entry.id);
+        settled.add(entry.id);
+        while (settled.size() > MAX_SETTLED) settled.remove(settled.iterator().next());
     }
 
     private String encode() throws JSONException {
@@ -924,17 +953,22 @@ final class Outbox {
                     .put("cleared_until", e.clearedUntil);
             list.put(item);
         }
-        return new JSONObject().put("v", 2).put("messages", list).toString();
+        return new JSONObject().put("v", 2).put("messages", list).put("settled", new JSONArray(settled)).toString();
     }
 
     /**
      * Whatever of the file is well formed and within the bounds, into {@code into}. False when the
      * file is not an outbox this build can read at all (it is then put aside).
      */
-    private static boolean decode(String text, List<Entry> into) {
+    private static boolean decode(String text, List<Entry> into, java.util.Set<String> settled) {
         try {
             JSONObject root = new JSONObject(text);
             if (root.optInt("v") != 2) return false;
+            JSONArray gone = root.optJSONArray("settled");
+            for (int i = 0; gone != null && i < gone.length() && settled.size() < MAX_SETTLED; i++) {
+                String id = gone.optString(i, "");
+                if (!id.isEmpty()) settled.add(id);
+            }
             JSONArray list = root.optJSONArray("messages");
             int chars = 0;
             for (int i = 0; list != null && i < list.length() && into.size() < MAX_MESSAGES; i++) {

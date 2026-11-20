@@ -151,6 +151,14 @@ final class MachineBindings {
                 && java.util.Objects.equals(a.refusedBy, b.refusedBy);
     }
 
+    /**
+     * Whether a hello may be bound now: only once the held messages are read, so a session's
+     * ownership of a machine is known before another session can claim it.
+     */
+    static boolean mayBind(Outbox held) {
+        return held != null && held.loaded();
+    }
+
     /** The machine {@code revision} of {@code profile} reaches, or null when unbound or refused. */
     synchronized MachineKey machine(String profile, String revision) {
         Binding binding = find(profile, revision);
