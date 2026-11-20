@@ -317,7 +317,10 @@ while (( SECONDS < end )); do
 done
 printf '%s\n' "$kept" > "$EMU_OUT/transcript-kept.txt"
 a shell "run-as $pkg sh -c 'ls -l no_backup/transcripts-v1/*/'" > "$EMU_OUT/transcript-files.txt" 2>&1
-incarnation=$(hc ls 2> /dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(t.get("incarnation","") for t in d["terminals"] if t.get("name")=="agent-a"))' 2> /dev/null)
+# The list's summary has no incarnation; the terminal's own record does.
+addr_a=$(hc ls 2> /dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(t["address"] for t in d["terminals"] if t.get("name")=="agent-a"))' 2> /dev/null)
+hc get "$addr_a" > "$EMU_OUT/agent-a-record.json" 2>&1
+incarnation=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("incarnation") or "")' "$EMU_OUT/agent-a-record.json" 2> /dev/null)
 if grep -q 'transcript line 299' <<< "$kept" && head -1 <<< "$kept" | grep -q "\"incarnation\":\"$incarnation\""; then
     record transcript-read PASS "kept while live, headed with agent-a's incarnation $incarnation (transcript-files.txt)"
 else
@@ -341,8 +344,9 @@ if hit=$(wait_ui 'transcript · as of' 30); then
 else
     record offline-offer FAIL "no transcript button for agent-a offline (offline-indicator.png)"
 fi
-if find_ui 'offline' > /dev/null; then
-    record offline-indicator PASS "$($ui text "$EMU_OUT/ui.xml" '^. offline' 2> /dev/null)"
+# The corner says "offline" with no network, "connecting" while it retries a host that is down.
+if find_ui '. (offline|connecting) · ' > /dev/null; then
+    record offline-indicator PASS "$($ui text "$EMU_OUT/ui.xml" '. (offline|connecting) · ' 2> /dev/null)"
 else
     record offline-indicator FAIL "no offline indicator (offline-indicator.png)"
 fi
