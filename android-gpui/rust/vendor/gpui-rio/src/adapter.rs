@@ -22,14 +22,23 @@ macro_rules! __bind_gpui {
                 ansi::CursorShape,
                 config::colors::ColorRgb,
                 crosswords::{
+                    Crosswords, Mode,
                     grid::Scroll,
                     pos::{Column, Line, Pos, Side},
                     square::Wide,
                     style::StyleFlags,
                 },
+                event::EventListener,
                 selection::{Selection, SelectionType},
             };
             use std::{ops::Range, sync::Arc, time::Duration};
+
+            struct PressTarget {
+                point: Point<Pixels>,
+                position: Pos,
+                cell: Option<(usize, usize)>,
+                link: Option<$crate::links::GridLink>,
+            }
 
             pub struct Terminal {
                 session: Arc<Session>,
@@ -40,6 +49,7 @@ macro_rules! __bind_gpui {
                 /// The grid cell (row, column) drawn at the pane's top-left.
                 view_origin: (i32, usize),
                 rows: $crate::footer::Rows,
+                alt_screen: bool,
                 /// The attached pane's agent, when its own footer should be collapsed.
                 footer_kind: $crate::ghost::PromptKind,
                 /// A column the reader panned a wider grid to (see `ColumnPan`).
@@ -56,16 +66,14 @@ macro_rules! __bind_gpui {
                 /// Told what each lifted press did, so the host can act on taps.
                 /// Presses come from touch: one is acted on only when this view saw
                 /// its touch begin (see `tap::owns`).
-                touch_presses: bool,
+                touch_active: Option<fn() -> bool>,
                 tap_listener: Option<(
                     std::rc::Rc<dyn Fn() -> $crate::tap::Gesture>,
                     std::rc::Rc<dyn Fn($crate::tap::Report)>,
                 )>,
-                /// Where the finger went down, while it may still be a tap.
-                press: Option<Point<Pixels>>,
-                /// The link under that finger: the columns it covers on each row
-                /// (several when wrapped) and its target.
-                pressed_link: Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)>,
+                press: Option<PressTarget>,
+                /// The target of the physical down, before GPUI synthesizes a click.
+                touch_target: Option<PressTarget>,
                 /// The finger on the screen, so a held one is not taken for a tap.
                 touch: $crate::tap::Touch,
                 /// Unsent words drawn at the program's caret (see `ghost`).
@@ -100,7 +108,9 @@ macro_rules! __bind_gpui {
                                     .await;
                                 let Ok(now) = this.update(cx, |this, cx| {
                                     let now = this.session.is_alive();
-                                    if (this.session.take_dirty() && this.visible) || now != alive {
+                                    let dirty = this.session.take_dirty();
+                                    let finish_projection = this.rows.deferred() && !this.touch_active();
+                                    if (this.visible && (dirty || finish_projection)) || now != alive {
                                         cx.notify();
                                     }
                                     now
@@ -118,6 +128,7 @@ macro_rules! __bind_gpui {
                             bounds: Bounds::default(),
                             view_origin: (0, 0),
                             rows: $crate::footer::Rows::default(),
+                            alt_screen: false,
                             footer_kind: $crate::ghost::PromptKind::Other,
                             pan: $crate::ColumnPan::default(),
                             pane: (0, 0),
@@ -127,10 +138,10 @@ macro_rules! __bind_gpui {
                             marked: String::new(),
                             host_input: false,
                             link_handler: None,
-                            touch_presses: false,
+                            touch_active: None,
                             tap_listener: None,
                             press: None,
-                            pressed_link: None,
+                            touch_target: None,
                             touch: $crate::tap::Touch::default(),
                             ghost: None,
                             prompt_kind: $crate::ghost::PromptKind::Other,
@@ -155,6 +166,7 @@ macro_rules! __bind_gpui {
                     if !visible {
                         // A view put away holds no touch to act on when it is back.
                         self.touch.clear();
+                        self.touch_target = None;
                     }
                 }
                 /// For hosts that deliver keys and text to the session themselves, as on
@@ -187,11 +199,13 @@ macro_rules! __bind_gpui {
                 ) {
                     self.tap_listener = Some((std::rc::Rc::new(stamp), std::rc::Rc::new(listener)));
                 }
-                /// For hosts whose presses all come from touch, as on Android: a
-                /// press is then acted on (a click, a link) only when this view saw
-                /// its touch begin, never one begun on a view it replaced mid-tap.
-                pub fn set_touch_presses(&mut self, touch: bool) {
-                    self.touch_presses = touch;
+                /// For touch hosts, report whether a gesture is in progress,
+                /// including one the host handles itself or GPUI has yet to drain.
+                pub fn set_touch_presses(&mut self, active: fn() -> bool) {
+                    self.touch_active = Some(active);
+                }
+                fn touch_active(&self) -> bool {
+                    self.touch_active.is_some_and(|active| active())
                 }
                 /// Pans a grid wider than the pane `dx` to the right (negative:
                 /// left), as the host's pan buttons do. Client-local: the program
@@ -226,13 +240,6 @@ macro_rules! __bind_gpui {
                     self.layout_listener = Some(std::rc::Rc::new(listener));
                     self.last_hint = None;
                 }
-                /// The link at `pos` on screen, with the columns it covers per row.
-                fn link_at(&self, pos: Pos) -> Option<(Vec<(Line, Range<usize>)>, $crate::links::Link)> {
-                    $crate::links::grid_link_at(&self.session.grid().lock(), pos)
-                }
-                /// The screen cell (column, row) under `point`, counted as the
-                /// program counts them: only on the live screen, not in history,
-                /// and not in the letterbox beside a smaller grid.
                 /// Whether `point` is on the draft as last drawn (at Claude's prompt or the host's
                 /// own): its words and its row from the prompt glyph on. Such a tap is the host's
                 /// (the caret goes there): it never reaches the program as a click, nor a link.
@@ -256,15 +263,28 @@ macro_rules! __bind_gpui {
                     from.is_some_and(|from| col + 2 >= from)
                 }
 
-                fn screen_cell(&self, point: Point<Pixels>) -> Option<(usize, usize)> {
-                    if !self.bounds.contains(&point) {
-                        return None;
-                    }
+                fn target_at(&self, point: Point<Pixels>) -> PressTarget {
                     let grid = self.session.grid().lock();
-                    if grid.display_offset() != 0 {
-                        return None;
+                    let position = self.position(point, &grid);
+                    let drawn = self.bounds.contains(&point)
+                        .then(|| self.drawn_cell(point, grid.columns(), grid.screen_lines()))
+                        .flatten();
+                    let on_draft = self.on_draft(point);
+                    // Selection can clamp to an edge. A tap in space left by
+                    // a collapsed grid has no link or program cell.
+                    let link = if !on_draft && self.link_handler.is_some()
+                        && (!self.rows.collapsed() || drawn.is_some())
+                    {
+                        $crate::links::grid_link_at(&*grid, position)
+                    } else {
+                        None
+                    };
+                    PressTarget {
+                        point,
+                        position,
+                        cell: drawn.filter(|_| !on_draft && grid.display_offset() == 0),
+                        link,
                     }
-                    self.drawn_cell(point, grid.columns(), grid.screen_lines())
                 }
 
                 fn drawn_cell(&self, point: Point<Pixels>, columns: usize, rows: usize) -> Option<(usize, usize)> {
@@ -281,8 +301,7 @@ macro_rules! __bind_gpui {
                     self.rows.source(row).filter(|&row| row < rows).map(|row| (col, row))
                 }
                 fn cancel_press(&mut self) -> bool {
-                    self.press = None;
-                    self.pressed_link.take().is_some()
+                    self.press.take().is_some_and(|press| press.link.is_some())
                 }
                 /// Applies colors and font settings to the running session.
                 /// The host should notify its view after changing the style.
@@ -331,8 +350,7 @@ macro_rules! __bind_gpui {
                     }
                 }
 
-                fn position(&self, point: Point<Pixels>) -> Pos {
-                    let grid = self.session.grid().lock();
+                fn position(&self, point: Point<Pixels>, grid: &Crosswords<impl EventListener>) -> Pos {
                     let row =
                         (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor() as i32;
                     let col =
@@ -506,9 +524,20 @@ macro_rules! __bind_gpui {
                         .as_ref()
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
-                    let offset = grid.display_offset() as i32;
+                    let offset = grid.display_offset();
+                    let alt_screen = grid.mode().contains(Mode::ALT_SCREEN);
+                    if self.alt_screen != alt_screen {
+                        // A main/alternate screen switch replaces the surface
+                        // under the finger. Cancel its target and show the new
+                        // screen in full, including every alternate-screen row.
+                        self.alt_screen = alt_screen;
+                        self.touch.clear();
+                        self.touch_target = None;
+                        self.press = None;
+                    }
                     let hidden = $crate::footer::hidden_on_screen(&grid, self.footer_kind);
-                    self.rows = $crate::footer::Rows::new(grid_rows, hidden);
+                    let defer = !alt_screen && self.touch_active();
+                    self.rows.update(grid_rows, offset, defer, hidden);
                     let cols = usize::from(pane.0.min(grid_cols));
                     let rows = usize::from(pane.1).min(self.rows.count());
                     // A column the reader panned to wins over the caret, in
@@ -531,7 +560,7 @@ macro_rules! __bind_gpui {
                         .take(rows).filter_map(|row| self.rows.source(row));
                     for (row, source) in drawn.enumerate() {
                         for col in 0..cols {
-                            let pos = Pos::new(Line(source as i32 - offset), Column(col + col_off));
+                            let pos = Pos::new(Line(source as i32 - offset as i32), Column(col + col_off));
                             let square = grid.grid[pos];
                             screen[row][col] = match square.c() {
                                 '\0' => ' ',
@@ -573,7 +602,7 @@ macro_rules! __bind_gpui {
                                     rgb_color(bg),
                                 ));
                             }
-                            if let Some((spans, _)) = &self.pressed_link
+                            if let Some((spans, _)) = self.press.as_ref().and_then(|press| press.link.as_ref())
                                 && $crate::links::pressed(spans, &pos.row, col, col_off)
                             {
                                 // Pressed link: a soft wash and a rule under it.
@@ -805,29 +834,35 @@ macro_rules! __bind_gpui {
                                 if !this.host_input {
                                     this.focus(window, cx);
                                 }
-                                let pos = this.position(event.position);
-                                this.press = Some(event.position);
-                                // Selection can clamp to an edge, but a tap in
-                                // the space below a collapsed grid has no link.
-                                let on_grid = !this.rows.collapsed() || {
-                                    let grid = this.session.grid().lock();
-                                    this.drawn_cell(event.position, grid.columns(), grid.screen_lines()).is_some()
-                                };
-                                this.pressed_link = if on_grid && this.link_handler.is_some() && !this.on_draft(event.position) {
-                                    this.link_at(pos)
+                                let target = if this.touch_active.is_some() {
+                                    // GPUI synthesizes this pair at lift, using
+                                    // lift coordinates. Reuse the real down's target.
+                                    if !this.touch.owned_now(this.tap_stamp()) {
+                                        return;
+                                    }
+                                    let Some(target) = this.touch_target.take() else { return };
+                                    target
                                 } else {
-                                    None
+                                    this.target_at(event.position)
                                 };
-                                this.session.grid().lock().selection =
-                                    Some(Selection::new(SelectionType::Simple, pos, Side::Left));
+                                let mut grid = this.session.grid().lock();
+                                if this.touch_active.is_some()
+                                    && this.alt_screen != grid.mode().contains(Mode::ALT_SCREEN)
+                                {
+                                    this.touch.clear();
+                                    return;
+                                }
+                                grid.selection =
+                                    Some(Selection::new(SelectionType::Simple, target.position, Side::Left));
+                                this.press = Some(target);
                                 this.selecting = true;
                                 cx.notify();
                             }),
                         )
                         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                             // A finger that travels is a scroll or a selection, not a tap.
-                            if let Some(start) = this.press {
-                                let moved = event.position - start;
+                            if let Some(press) = &this.press {
+                                let moved = event.position - press.point;
                                 let slop = this.cell.width.max(px(8.));
                                 if moved.x.abs() > slop || moved.y.abs() > slop {
                                     if this.cancel_press() {
@@ -836,8 +871,9 @@ macro_rules! __bind_gpui {
                                 }
                             }
                             if this.selecting && event.pressed_button == Some(MouseButton::Left) {
-                                let pos = this.position(event.position);
-                                if let Some(selection) = &mut this.session.grid().lock().selection {
+                                let mut grid = this.session.grid().lock();
+                                let pos = this.position(event.position, &grid);
+                                if let Some(selection) = &mut grid.selection {
                                     selection.update(pos, Side::Right);
                                 }
                                 cx.notify();
@@ -849,27 +885,20 @@ macro_rules! __bind_gpui {
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseUpEvent, _, cx| {
                                 this.selecting = false;
-                                let pressed_at = this.press.take();
+                                let target = this.press.take();
                                 let touch = this.touch.lifted();
                                 // The gesture lifting now: a touch this view holds from an
                                 // earlier one (cancelled, or begun elsewhere) is not it.
                                 let now = this.tap_stamp();
                                 let press = $crate::tap::Press {
-                                    on_link: this.pressed_link.is_some(),
-                                    travelled: pressed_at.is_none(),
+                                    on_link: target.as_ref().is_some_and(|target| target.link.is_some()),
+                                    travelled: target.is_none(),
                                     held: touch.is_some_and(|(held, _)| held),
                                 };
                                 let stamp = touch.map_or(now.stamp, |(_, began)| began.stamp);
-                                let owned = $crate::tap::owns(this.touch_presses, touch, now);
-                                let link = this.pressed_link.take();
-                                // A program that asked for mouse events (Claude Code's
-                                // fullscreen view, other TUIs) gets an owned tap as a
-                                // click, press and release on the cell it went down on.
-                                // Not on the draft: a tap there is the host's (its caret), never the
-                                // program's, even with mouse reporting on (fullscreen Claude).
-                                let cell = pressed_at
-                                    .filter(|at| !this.on_draft(*at))
-                                    .and_then(|at| this.screen_cell(at));
+                                let owned = $crate::tap::owns(this.touch_active.is_some(), touch, now);
+                                let cell = target.as_ref().and_then(|target| target.cell);
+                                let link = target.and_then(|target| target.link);
                                 let tapped = match $crate::tap::lift_on(&this.session, press, owned, cell) {
                                     $crate::tap::Lifted::OpenLink => {
                                         // A tap on a link opens it and selects nothing.
@@ -905,6 +934,7 @@ macro_rules! __bind_gpui {
                         )
                         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                             this.cancel_press();
+                            this.touch_target = None;
                             let delta = event.delta.pixel_delta(this.cell.height);
                             // A sideways drag (GPUI locks a touch pan to one axis)
                             // pans a grid wider than the pane; the content follows
@@ -942,6 +972,8 @@ macro_rules! __bind_gpui {
                                                 entity.update(cx, |this, _| {
                                                     let stamp = this.tap_stamp();
                                                     this.touch.began(stamp);
+                                                    this.touch_target = this.touch.owned_now(stamp)
+                                                        .then(|| this.target_at(event.start_position));
                                                 });
                                             }
                                         }

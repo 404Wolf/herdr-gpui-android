@@ -177,7 +177,7 @@ impl TerminalView {
                     // Every press here is a touch: one begun on a view this one
                     // replaced mid-tap is never this view's to click.
                     #[cfg(target_os = "android")]
-                    terminal.set_touch_presses(true);
+                    terminal.set_touch_presses(crate::android::touch_active);
                     // Every link found here carries the host and pane this
                     // renderer was attached for, fixed now: Java opens it
                     // only while that is still the selected pane.

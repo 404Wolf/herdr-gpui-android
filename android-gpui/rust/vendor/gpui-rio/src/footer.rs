@@ -258,19 +258,44 @@ fn directory(text: &str) -> bool {
 pub struct Rows {
     len: usize,
     hidden: Range<usize>,
+    footer: Option<Range<usize>>,
+    deferred: bool,
 }
 
 impl Rows {
     pub fn new(rows: usize, hidden: Option<Range<usize>>) -> Self {
-        let hidden = hidden.unwrap_or_default();
-        Self {
-            len: rows - hidden.len(),
-            hidden,
-        }
+        let mut projection = Self::default();
+        projection.update(rows, 0, false, hidden);
+        projection
     }
 
     pub fn count(&self) -> usize {
         self.len
+    }
+
+    pub fn update(
+        &mut self,
+        rows: usize,
+        offset: usize,
+        touching: bool,
+        hidden: Option<Range<usize>>,
+    ) {
+        self.deferred = touching && self.footer != hidden;
+        if !touching {
+            self.footer = hidden;
+        }
+        // Hold the same live rows across a swipe. The display offset moves
+        // them down in the viewport and out of view as history scrolls in.
+        let in_view = |row: usize| row.saturating_add(offset).min(rows);
+        self.hidden = self
+            .footer
+            .as_ref()
+            .map_or(0..0, |footer| in_view(footer.start)..in_view(footer.end));
+        self.len = rows - self.hidden.len();
+    }
+
+    pub fn deferred(&self) -> bool {
+        self.deferred
     }
 
     pub fn collapsed(&self) -> bool {
@@ -496,5 +521,86 @@ mod tests {
         );
         assert_eq!(scrolled.source(4), Some(4));
         assert_eq!(scrolled.source(5), Some(5));
+    }
+
+    #[test]
+    fn foreground_confirmation_keeps_the_original_link_through_lift() {
+        use crate::links::{Link, grid_link_at};
+        use rio_vt::{
+            crosswords::{CrosswordsSize, pos::Pos},
+            event::{VoidListener, WindowId},
+            performer::handler::Processor,
+        };
+
+        let mut grid = Crosswords::new(
+            CrosswordsSize::new(96, 12),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            0,
+        );
+        Processor::default().advance(
+            &mut grid,
+            concat!(
+                "\x1b[8;1H› \r\n\r\n",
+                "  gpt-5.2 medium · 84% context left\r\n",
+                "https://example.com/after\r\n",
+                "https://example.com/other\x1b[8;3H",
+            )
+            .as_bytes(),
+        );
+
+        let target = |rows: &Rows| {
+            let (col, row) = tap::cell_at((20., 201.), (10., 20.), (0, 0), (96, rows.count()))?;
+            let source = rows.source(row)?;
+            grid_link_at(&grid, Pos::new(Line(source as i32), Column(col)))
+                .map(|(_, link)| (source, link))
+        };
+        let mut rows = Rows::new(12, hidden_on_screen(&grid, PromptKind::Other));
+        let down = target(&rows);
+        assert_eq!(
+            down,
+            Some((10, Link::Web("https://example.com/after".into())))
+        );
+
+        // The only change between finger-down and GPUI's synthetic click is
+        // that the foreground has now been confirmed.
+        let confirmed = hidden_on_screen(&grid, PromptKind::Codex);
+        assert_eq!(confirmed, Some(9..10));
+        rows.update(12, 0, true, confirmed.clone());
+        assert_eq!(target(&rows), down);
+        assert!(rows.deferred());
+
+        rows.update(12, 0, false, confirmed);
+        let collapsed = target(&rows);
+        assert_eq!(
+            collapsed,
+            Some((11, Link::Web("https://example.com/other".into())))
+        );
+        assert!(!rows.deferred());
+
+        // An eligibility or settings change can also request expansion.
+        rows.update(12, 0, true, None);
+        assert_eq!(target(&rows), collapsed);
+        assert!(rows.deferred());
+        rows.update(12, 0, false, None);
+        assert_eq!(target(&rows), down);
+        assert!(!rows.deferred());
+    }
+
+    #[test]
+    fn a_scroll_during_touch_keeps_all_history_rows() {
+        let mut rows = Rows::new(12, Some(9..10));
+        rows.update(12, 2, true, None);
+        assert_eq!(rows.count(), 11);
+        assert_eq!(rows.source(9), Some(9));
+        assert_eq!(rows.source(10), Some(10));
+
+        rows.update(12, 3, true, None);
+        assert_eq!(rows.count(), 12);
+        assert_eq!(rows.source(11), Some(11));
+        rows.update(12, 0, true, Some(9..10));
+        assert_eq!(rows.source(9), Some(10));
     }
 }

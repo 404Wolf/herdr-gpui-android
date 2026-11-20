@@ -5472,16 +5472,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (hostStarted) nativeSurfaceDestroyed();
     }
 
-    /** Where the last finger lifted on the terminal (surface pixels): a tap on the draft's words puts the cursor there. */
-    private float liftX = Float.NaN, liftY = Float.NaN;
+    /** Where the last completed touch began (surface pixels), for taps on the draft. */
+    private float tapX = Float.NaN, tapY = Float.NaN;
 
     private boolean forwardTouch(MotionEvent event) {
-        int count = event.getPointerCount();
-        if (!hostStarted || count < 1 || count > 16) return false;
+        if (!hostStarted) return false;
         int masked = event.getActionMasked();
+        if (masked == MotionEvent.ACTION_DOWN) nativeSetTerminalTouchActive(true);
+        try {
+            return dispatchTerminalTouch(event, masked);
+        } finally {
+            // Local scrolls and pinches cancel GPUI's touch before the fingers lift.
+            if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
+                nativeSetTerminalTouchActive(false);
+            }
+        }
+    }
+
+    private boolean dispatchTerminalTouch(MotionEvent event, int masked) {
+        int count = event.getPointerCount();
+        if (count < 1 || count > 16) return false;
         if (masked == MotionEvent.ACTION_UP) {
-            liftX = event.getX();
-            liftY = event.getY();
+            tapX = touchDownX;
+            tapY = touchDownY;
         }
         if (masked == MotionEvent.ACTION_DOWN) rendererTouch.down(event.getPointerId(0));
         pinchDetector().onTouchEvent(event);
@@ -5728,7 +5741,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         stopConnection();
-        if (hostStarted) nativePaused();
+        if (hostStarted) {
+            claimRendererTouch();
+            nativeSetTerminalTouchActive(false);
+            nativePaused();
+        }
         super.onPause();
     }
 
@@ -6059,7 +6076,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { target = connection; }
         // An agent's pane types into the composer's draft instead.
         boolean handled = composer != null
-                ? composer.terminalTapped(clicked, liftX, liftY)
+                ? composer.terminalTapped(clicked, tapX, tapY)
                 : TerminalTap.after(outcome, false) == TerminalTap.Action.NOTHING;
         if (!handled && target != null && target.ready && terminalSurface != null) {
             final long generation = target.generation;
@@ -7560,6 +7577,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeSurfaceDestroyed();
     private static native void nativeResumed();
     private static native void nativePaused();
+    private static native void nativeSetTerminalTouchActive(boolean active);
     private static native boolean nativeTouch(int action, int actionIndex, int[] ids, float[] xs, float[] ys,
             long tapStamp);
     private static native boolean nativeKey(long generation, int keyCode, int action, int metaState, int unicodeCodepoint);

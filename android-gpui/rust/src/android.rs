@@ -176,6 +176,16 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativePaused(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSetTerminalTouchActive(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    active: jboolean,
+) {
+    lock_downs().set_host_touch(active != 0);
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeTouch(
     env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -261,6 +271,10 @@ fn lock_downs() -> std::sync::MutexGuard<'static, gpui_rio::tap::DownStamps> {
 /// which Java never hands out, when none was queued, so nothing acts on it.
 pub(crate) fn touch_stamp() -> gpui_rio::tap::Gesture {
     lock_downs().now()
+}
+
+pub(crate) fn touch_active() -> bool {
+    lock_downs().touching()
 }
 
 #[allow(unsafe_code)]
