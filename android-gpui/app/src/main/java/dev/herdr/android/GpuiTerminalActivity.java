@@ -6329,6 +6329,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             connection = null;
             if (old == null) return;
             old.cancel();
+            if (old.cacheKey != null && (old.remotePainted || old.cacheKey.equals(savedShownKey))) {
+                savedShownKey = old.cacheKey;
+            }
             if (old.poll != null) old.poll.cancel(false);
             nativeSetActive(old.generation, false);
             old.text = "";
@@ -6915,7 +6918,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             Connection now = connection;
             if (now != null && hostId.equals(now.hostId) && key != null && key.equals(now.cacheKey)) return;
             boolean sameComputer = PaneSnapshots.resumes(true, currentHostKey, key);
-            boolean keepFrame = sameComputer && (savedShownKey == null || key.equals(savedShownKey));
+            boolean keepFrame = sameComputer && key.equals(savedShownKey);
             if (!sameComputer) pendingInput.discardAll();
             Connection offline = new Connection(GENERATIONS.incrementAndGet(), 0L);
             offline.offline = true;

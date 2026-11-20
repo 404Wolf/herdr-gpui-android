@@ -154,6 +154,7 @@ public final class HomeActivity extends Activity {
         if (!ProvisionedSettings.capturable(this)) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         RemoteNative.ensureLoaded(this);
         store = new RemoteHostStore(this);
+        PaneSnapshots.shared(this);
         identityStore = new RemoteIdentityStore(this);
         int theme = getSharedPreferences("terminal-display", MODE_PRIVATE).getInt("theme", 0);
         boolean dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
