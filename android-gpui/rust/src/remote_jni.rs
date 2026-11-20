@@ -466,7 +466,7 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_putFile(
     handle: jlong,
     terminal: JString<'_>,
     name: JString<'_>,
-    data: jni::objects::JByteArray<'_>,
+    data: JByteArray<'_>,
 ) -> jstring {
     let Some(terminal) = read(&mut env, &terminal, 1024) else {
         return std::ptr::null_mut();
