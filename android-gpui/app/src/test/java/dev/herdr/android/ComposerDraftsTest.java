@@ -8,6 +8,67 @@ import static org.junit.Assert.assertTrue;
 import org.junit.Test;
 
 public final class ComposerDraftsTest {
+    private static final String STAGING = "/state/herdr-core/default/files/t1/";
+    private static final String IMAGE = STAGING + "herdr-paste-123.png";
+
+    @Test
+    public void repointingRemovesAParenthesizedShellQuotedPath() {
+        String path = ImageAttach.quotePaths(java.util.Collections.singletonList(
+                "/state & 'photos/herdr-core/default/files/t1/herdr-paste-123-2.png"));
+        assertAttachmentRemoved(path, "Compare (" + path.trim() + ") with the last build.",
+                "Compare () with the last build.");
+    }
+
+    @Test
+    public void repointingKeepsQuotesTheUserAdded() {
+        assertAttachmentRemoved(IMAGE + " ", "Compare \"" + IMAGE + "\" to the last build.",
+                "Compare \"\" to the last build.");
+    }
+
+    @Test
+    public void repointingKeepsATrailingComma() {
+        assertAttachmentRemoved(IMAGE + " ", "Compare " + IMAGE + ", then review the result.",
+                "Compare , then review the result.");
+    }
+
+    @Test
+    public void repointingKeepsATrailingPeriod() {
+        assertAttachmentRemoved(IMAGE + " ", "Compare " + IMAGE + ".", "Compare .");
+    }
+
+    @Test
+    public void repointingFindsPathsAtBothEndsOfTheDraft() {
+        String second = STAGING + "herdr-paste-456.gif";
+        assertAttachmentRemoved(IMAGE + " " + second + " ",
+                IMAGE + ":compare with=" + second, ":compare with=");
+    }
+
+    @Test
+    public void repointingRemovesTwoAdjacentPathsAndKeepsAdjacentText() {
+        String second = STAGING + "herdr-paste-456-2.webp";
+        assertAttachmentRemoved(IMAGE + " " + second + " ",
+                "before/notes:" + IMAGE + second + "after", "before/notes:after");
+    }
+
+    private static void assertAttachmentRemoved(String paths, String edited, String remaining) {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.setHost("host", "original", encoded -> true);
+        drafts.switchTo("t1");
+        drafts.appendAttachment("host", "original", "t1", paths);
+        drafts.edit(edited);
+        assertEquals("original", drafts.draftRevision());
+
+        ComposerDrafts restored = new ComposerDrafts();
+        restored.setHost("host", "repointed", encoded -> true);
+        restored.restore(drafts.encode());
+        assertEquals(remaining, restored.switchTo("t1"));
+        assertNull(restored.draftRevision());
+
+        drafts.setHost("host", "repointed", encoded -> true);
+        assertEquals(remaining, drafts.text());
+        assertNull(drafts.draftRevision());
+    }
+
     @Test
     public void cuttingAndPastingAnAttachmentKeepsTheReorderedDraftOnReopen() {
         String prompt = "Explain what changed in the second panel for the release notes.";
