@@ -32,12 +32,18 @@ record() { # name status detail
 }
 shot() { a exec-out screencap -p > "$EMU_OUT/$1.png"; }
 dump() { # -> a FRESH $EMU_OUT/ui.xml (retried: uiautomator is flaky right after a transition)
-    # No dump, no file: a failed dump must never leave an earlier screen's XML to be read as this one.
+    # No dump, no file. Each attempt dumps to a device path nobody used before and only a dump that
+    # said it was written is pulled, so a failed attempt can never hand back an earlier screen's XML.
+    local i path out
     rm -f "$EMU_OUT/ui.xml"
-    a shell rm -f /sdcard/ui.xml > /dev/null 2>&1
-    for _ in 1 2 3; do
-        a shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 \
-            && a pull /sdcard/ui.xml "$EMU_OUT/ui.xml" > /dev/null 2>&1 && [[ -s "$EMU_OUT/ui.xml" ]] && return 0
+    for i in 1 2 3; do
+        path="/sdcard/ui-$$-$SECONDS-$i.xml"
+        out=$(a shell "uiautomator dump $path" 2>&1) || { sleep 1; continue; }
+        grep -q 'dumped to' <<< "$out" || { sleep 1; continue; }
+        if a pull "$path" "$EMU_OUT/ui.xml" > /dev/null 2>&1 && [[ -s "$EMU_OUT/ui.xml" ]]; then
+            a shell rm -f "$path" > /dev/null 2>&1
+            return 0
+        fi
         rm -f "$EMU_OUT/ui.xml"
         sleep 1
     done
@@ -72,6 +78,29 @@ wait_partial() { # count-before [seconds=25]
     while (( SECONDS < end )); do
         now=$(partials)
         (( now > $1 )) && return 0
+        sleep 1
+    done
+    return 1
+}
+# The app's own last layout hint (what the renderer drew): "ids: ... | cols N | draft CELLS".
+layout_now() {
+    a logcat -d -s herdr-tap > "$EMU_OUT/herdr-tap.log" 2>&1
+    $ui layout "$EMU_OUT/herdr-tap.log"
+}
+# True when the hint's control ids include every id given (the recording state, on the app side).
+has_ids() {
+    local line; line=$(layout_now) || return 1
+    local id
+    for id in "$@"; do [[ " ${line#ids: } " == *" $id "* ]] || return 1; done
+    return 0
+}
+draft_cells() { layout_now | sed -n 's/.*draft \([0-9]*\).*/\1/p'; }
+# Waits until the draft is exactly N cells (seed + space + the partial) in the app's own layout.
+wait_draft_cells() { # cells [seconds=20]
+    local end=$((SECONDS + ${2:-20})) c
+    while (( SECONDS < end )); do
+        c=$(draft_cells)
+        [[ "$c" == "$1" ]] && return 0
         sleep 1
     done
     return 1
@@ -129,7 +158,9 @@ SSHD=$(command -v sshd) || { record setup FAIL "no sshd in the shell"; exit 1; }
 start_sshd() { "$SSHD" -f "$work/ssh/sshd.conf" -E "$work/ssh/sshd.log"; }
 stop_sshd() { [[ -s "$work/ssh/sshd.pid" ]] && kill "$(cat "$work/ssh/sshd.pid")" 2> /dev/null; return 0; }
 dict_pid=
+mem_pid=
 cleanup_host() {
+    [[ -n "$mem_pid" ]] && kill "$mem_pid" 2> /dev/null
     stop_sshd
     hc server stop > /dev/null 2>&1 || true
     [[ -n "$dict_pid" ]] && kill "$dict_pid" 2> /dev/null
@@ -145,8 +176,12 @@ hc run --bg --label agent.kind=claude --name agent-a -- sh -c \
     > "$EMU_OUT/hc-a.log" 2>&1 || { record setup FAIL "hc run A (see hc-a.log)"; exit 1; }
 hc run --bg --label agent.kind=claude --name agent-b -- sh -c 'printf "Claude Code (fixture B)\n\n> "; exec cat' \
     > "$EMU_OUT/hc-b.log" 2>&1 || { record setup FAIL "hc run B (see hc-b.log)"; exit 1; }
-nohup python3 -u "$here/fake-dictation.py" "$DICT_PORT" "fixture" "fixture partial" > "$EMU_OUT/dictation.log" 2>&1 &
+nohup python3 -u "$here/fake-dictation.py" "$DICT_PORT" --final="fixture final words" "fixture" "fixture partial" > "$EMU_OUT/dictation.log" 2>&1 &
 dict_pid=$!
+# Memory: the job's cgroup (cap 6 GiB) and its biggest processes, every 5 s, so an OOM kill can be
+# read off rss.log; the peak is recorded as a row at the end.
+( while :; do printf '%s %s\n' "$(date +%T)" "$($ui mem 2> /dev/null)" >> "$EMU_OUT/rss.log"; sleep 5; done ) &
+mem_pid=$!
 record setup PASS "ssh $SSH_PORT, dictation $DICT_PORT"
 # The dictation fixture is reached through the job's own ADB (adb reverse), not through the
 # emulator's 10.0.2.2 alias, which did not carry it on the job host; the scratch SSH stays at 10.0.2.2.
@@ -233,21 +268,26 @@ fi
 cols_now() { a logcat -d -s herdr-tap > "$EMU_OUT/herdr-tap.log" 2>&1; $ui cols "$EMU_OUT/herdr-tap.log"; }
 
 # (a) recording controls at 46 and 98 columns
-# Sets the display width so the renderer reports about `target` columns. The pixels per column differ
-# by system image and density, so it is measured: start from a guess, then rescale from what the
-# renderer reports (herdr-tap layout lines), a few times. Echoes the columns reached.
-set_width() { # target-cols  (narrow: 44..48 is "cover-like", wide: 96..110)
-    local target=$1 ppc=${PPC:-24} w c i lo hi
+# Sets the number of columns by display density, never by display size: a wider framebuffer made
+# the emulator's memory jump past the job's 6 GiB cap (OOM kills at the old 1700 px step), a lower
+# density gives the same columns at the same framebuffer. The density is rescaled from the columns the
+# renderer reports (herdr-tap layout lines) until they land in the target band; echoes the columns.
+DENSITY0=$(a shell wm density 2> /dev/null | sed -n 's/.*Physical density: *\([0-9]*\).*/\1/p' | head -1)
+DENSITY0=${DENSITY0:-420}
+set_cols() { # 46 (cover-like, band 44..48) or 98 (wide, band 96..110)
+    local target=$1 lo hi d=${DENSITY:-$DENSITY0} c i
     if (( target <= 50 )); then lo=44; hi=48; else lo=96; hi=110; fi
+    c=$(cols_now) || c=
     for i in 1 2 3 4 5 6; do
-        w=$(python3 -c "print(max(500, min(3200, round($target * $ppc))))")
-        a shell wm size "${w}x2000"
+        if [[ "$c" =~ ^[0-9]+$ ]]; then
+            (( c >= lo && c <= hi )) && { DENSITY=$d; echo "$c"; return 0; }
+            d=$(python3 -c "print(max(120, min(900, round($d * $c / $target))))")
+        fi
+        a shell wm density "$d"
         quiet 4
-        c=$(cols_now) || continue
-        [[ "$c" =~ ^[0-9]+$ ]] || continue
-        if (( c >= lo && c <= hi )); then PPC=$ppc; echo "$c"; return 0; fi
-        ppc=$(python3 -c "print($w / $c)")
+        c=$(cols_now) || c=
     done
+    DENSITY=$d
     echo "${c:-?}"
     return 1
 }
@@ -267,11 +307,15 @@ check_recording_controls() { # label
     fi
     quiet 2
     shot "recording-$label-a"
+    layout_now > "$EMU_OUT/recording-$label-layout.txt" 2> /dev/null || true
     sleep 3
     shot "recording-$label"
-    local moved
-    moved=$($ui diff "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" 40 100 2> /dev/null || echo 0)
-    local missing=""
+    local moved ticking=0 state="" missing=""
+    # App side: the renderer's own control ids. Recording has cancel, the timer (status), stop (talk), send and type.
+    has_ids cancel status talk send type || state=" [the app's layout lacks cancel/status/talk/send/type: $(layout_now)]"
+    # The timer's own region (from the layout hint) must change between the two screenshots.
+    moved=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" 2> /dev/null || echo none)
+    if [[ "$moved" != none ]] && python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then ticking=1; fi
     if dump; then
         for need in 'Stop and discard what was dictated' 'Send, or press Enter' 'Type a message, or put the keyboard away'; do
             $ui find "$EMU_OUT/ui.xml" "$need" > /dev/null || missing="$missing [$need]"
@@ -279,22 +323,23 @@ check_recording_controls() { # label
     else
         missing=" [no fresh UI dump]"
     fi
-    if [[ -n "$missing" ]]; then
-        record "recording-$label" FAIL "$cols columns, missing:$missing"
-    elif python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then
-        record "recording-$label" PASS "$cols columns: recording is active (partials flowing, timer ticking: $moved of the lower rows changed in 3 s); cancel, send, type and stop are on the line"
+    if [[ -n "$missing$state" ]]; then
+        record "recording-$label" FAIL "$cols columns, missing:$missing$state"
+    elif (( ! ticking )); then
+        record "recording-$label" FAIL "$cols columns: the timer's own region did not change in 3 s (changed: $moved); not recording"
     else
-        record "recording-$label" FAIL "$cols columns: the controls are there but nothing moved in 3 s (no ticking timer: not recording)"
+        record "recording-$label" PASS "$cols columns: recording is active (partials flowing, layout has cancel/status/stop/send/type, the timer's region changed $moved in 3 s)"
     fi
     # Cancel ends it.
     tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
     quiet 2
 }
-wide=$(set_width 98) && record width-98 PASS "$wide columns" || record width-98 FAIL "got $wide columns"
+wide=$(set_cols 98) && record width-98 PASS "$wide columns (density $DENSITY)" || record width-98 FAIL "got $wide columns"
 check_recording_controls 98cols
-narrow=$(set_width 46) && record width-46 PASS "$narrow columns" || record width-46 FAIL "got $narrow columns"
+narrow=$(set_cols 46) && record width-46 PASS "$narrow columns (density $DENSITY)" || record width-46 FAIL "got $narrow columns"
 check_recording_controls 46cols
-a shell wm size reset
+a shell wm density reset
+DENSITY=
 quiet 4
 
 # Which pane is on screen: the strip's active tab, "Window N, <name>, current".
@@ -325,33 +370,42 @@ else
     B_OK=0
 fi
 shot b-open
+FINAL_WORDS="fixture final words"
 stop_and_send() {
     # Talk, wait until the session is active, press Send DURING recording: the app stops, waits for
-    # the final transcript and sends the draft. The final must arrive at agent-b.
-    local before
+    # the final transcript and sends the draft. The fake server's final is NOT the last partial
+    # ("fixture final words" vs "fixture partial"), so only an app that waits for the final and sends
+    # it passes; one that sends the partial early would put "fixture partial" in the agent.
+    local before finals
+    agent_screen agent-b > "$EMU_OUT/agent-b-before-send.txt" 2> /dev/null || : > "$EMU_OUT/agent-b-before-send.txt"
     before=$(partials)
+    finals=$(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log")
     tap_ui 'Dictate; tap again to stop' 20 || { record stop-and-send FAIL "no Talk control"; return; }
     if ! wait_partial "$before" 25; then
         record stop-and-send FAIL "dictation never became active (no partial from the fake server); Send was not exercised"
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
+    has_ids cancel status talk send || { record stop-and-send FAIL "the app is not in the recording state: $(layout_now)"; return; }
     quiet 2
     shot stop-and-send-recording
     tap_ui 'Send, or press Enter' 15 || { record stop-and-send FAIL "no Send control while recording"; return; }
-    local end=$((SECONDS + 30)) got=0 screen
+    local end=$((SECONDS + 30)) got=0 screen="" added=""
     while (( SECONDS < end )); do
         screen=$(agent_screen agent-b) || screen=
-        # The echo of the sent final: a line holding "fixture partial" (the banner says "fixture B").
-        if grep -v 'Claude Code (fixture B)' <<< "$screen" | grep -q 'fixture partial'; then got=1; break; fi
+        echo "$screen" > "$EMU_OUT/stop-and-send-screen.txt"
+        added=$($ui newlines "$EMU_OUT/agent-b-before-send.txt" "$EMU_OUT/stop-and-send-screen.txt")
+        if grep -q "$FINAL_WORDS" <<< "$added"; then got=1; break; fi
         sleep 2
     done
-    echo "$screen" > "$EMU_OUT/stop-and-send-screen.txt"
+    echo "$added" > "$EMU_OUT/stop-and-send-new-lines.txt"
     shot stop-and-send-after
-    if (( got )) && grep -q 'sent final: fixture partial' "$EMU_OUT/dictation.log"; then
-        record stop-and-send PASS "Send during recording stopped it, took the final transcript and sent it: agent-b received 'fixture partial'"
+    local now_finals
+    now_finals=$(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log")
+    if (( got )) && (( now_finals > finals )) && ! grep -q 'fixture partial' <<< "$added"; then
+        record stop-and-send PASS "Send during recording stopped it, took the final transcript and sent exactly '$FINAL_WORDS' (not the partial) to agent-b"
     else
-        record stop-and-send FAIL "the final transcript did not reach agent-b (see stop-and-send-screen.txt, dictation.log)"
+        record stop-and-send FAIL "expected new agent-b output '$FINAL_WORDS' from this run's final and no 'fixture partial' (see stop-and-send-new-lines.txt, dictation.log)"
     fi
 }
 
@@ -363,8 +417,6 @@ cancel_z() {
     quiet 1
     tap_ui 'Type a message, or put the keyboard away' 10   # now says hide
     quiet 2
-    shot cancel-z-pre
-    # What agent-b already shows (the stop-and-send final): only newer lines count below.
     agent_screen agent-b > "$EMU_OUT/agent-b-before-cancel.txt" 2> /dev/null || : > "$EMU_OUT/agent-b-before-cancel.txt"
     # dictate: the fake server says "fixture", then "fixture partial"
     local before
@@ -376,10 +428,15 @@ cancel_z() {
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
-    quiet 3   # the partial reaches the draft
+    # The CURRENT draft must hold "seed fixture partial" (4 + 1 + 15 = 20 cells in the app's own
+    # layout) before the IME is opened or anything is typed.
+    if ! wait_draft_cells 20 20; then
+        shot cancel-z-dictating
+        record cancel-z FAIL "the draft does not hold 'seed fixture partial' (the app's layout says: $(layout_now)); Cancel was not exercised"
+        tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
+        return
+    fi
     shot cancel-z-dictating
-    # The CURRENT draft must hold the partial before it is edited: the control line's Talk is
-    # still recording and the draft row changed since the screenshot taken before the partial.
     # keyboard up, cursor to just before "fixture" (15 characters back), type 'z'
     tap_ui 'Type a message, or put the keyboard away' 15
     quiet 2
@@ -387,10 +444,8 @@ cancel_z() {
     a shell input text z
     quiet 1
     shot cancel-z-before
-    local seen
-    seen=$($ui diff "$EMU_OUT/cancel-z-pre.png" "$EMU_OUT/cancel-z-before.png" 60 100 2> /dev/null || echo 0)
-    if ! python3 -c "import sys; sys.exit(0 if float('$seen') > 0 else 1)"; then
-        record cancel-z FAIL "the draft area did not change after the partial and the typed text (no partial in the current draft); Cancel was not exercised"
+    if ! wait_draft_cells 21 10; then
+        record cancel-z FAIL "after typing z the draft is not 21 cells (the app's layout says: $(layout_now)); Cancel was not exercised"
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
@@ -400,15 +455,17 @@ cancel_z() {
     # send the draft; the agent (cat) echoes it into its terminal, which the core can read back
     tap_ui 'Send, or press Enter' 15
     quiet 4
-    local screen body
+    local screen added
     screen=$(agent_screen agent-b)
     echo "$screen" > "$EMU_OUT/agent-b-screen.txt"
-    # Only what arrived after the draft was started, and not the banner "Claude Code (fixture B)".
-    body=$(grep -vxF -f "$EMU_OUT/agent-b-before-cancel.txt" <<< "$screen" | grep -v 'Claude Code (fixture B)')
-    if grep -Eq 'seed z *$' <<< "$body" && ! grep -qi 'fixture' <<< "$body"; then
+    # Every line that is NEW since before the dictation (a sequence diff: a new repeat of an old
+    # line still counts), looking at what was added, not at the whole terminal.
+    added=$($ui newlines "$EMU_OUT/agent-b-before-cancel.txt" "$EMU_OUT/agent-b-screen.txt")
+    echo "$added" > "$EMU_OUT/cancel-z-new-lines.txt"
+    if grep -Eq 'seed z *$' <<< "$added" && ! grep -qi 'fixture' <<< "$added"; then
         record cancel-z PASS "draft after Cancel was 'seed z': the typed z stayed, the dictated words went"
     else
-        record cancel-z FAIL "expected a new line 'seed z' and no 'fixture' (see agent-b-screen.txt, cancel-z-*.png)"
+        record cancel-z FAIL "expected a new line 'seed z' and no 'fixture' in what was added (see cancel-z-new-lines.txt, cancel-z-*.png)"
     fi
 }
 if (( B_OK )); then
@@ -480,6 +537,8 @@ keyboard_cycle hide-control hide
 keyboard_cycle back-key back
 keyboard_cycle ime-nav-key navkey
 
+peak=$($ui mem 2> /dev/null)
+record memory PASS "job cgroup at the end: $peak (samples in rss.log; the cap is 6144 MiB)"
 shot final
 a logcat -b all -d > "$EMU_OUT/logcat-test.log" 2>&1
 echo "--- summary ---"

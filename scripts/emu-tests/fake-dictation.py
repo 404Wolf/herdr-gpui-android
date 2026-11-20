@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Usage: fake-dictation.py PORT [PARTIAL_WORDS...]  (the last words are the final)
+"""Usage: fake-dictation.py PORT [--final=TEXT] [PARTIAL_WORDS...]  (TEXT is sent as the final on stop;
+without it the last partial is the final)
 A fake dictation websocket for screenshots: 'ready' mode streams partials; 'stall' never says ready;
 'cut' is 'ready' with an unverified cut ("unverified_cuts", server.py) inside "bi|gger"."""
 import base64, hashlib, json, os, socket, struct, sys, threading, time
 MODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dict-mode")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8770
-PARTIALS = sys.argv[2:] or ["make the stop", "make the stop button bigger", "make the stop button bigger and keep it", "make the stop button bigger and keep it reachable while I scroll"]
+ARGS = sys.argv[2:]
+FINAL = next((a[len("--final="):] for a in ARGS if a.startswith("--final=")), None)
+PARTIALS = [a for a in ARGS if not a.startswith("--final=")] or ["make the stop", "make the stop button bigger", "make the stop button bigger and keep it", "make the stop button bigger and keep it reachable while I scroll"]
 
 def log(*parts):
     print(time.strftime("%H:%M:%S"), *parts, flush=True)
@@ -60,8 +63,8 @@ def handle(conn):
     for op, payload in frames(conn):
         if op == 1 and b"stop" in payload:
             stop.set(); time.sleep(0.3)
-            send(conn, msg("final", PARTIALS[-1]))
-            log("sent final:", PARTIALS[-1])
+            send(conn, msg("final", FINAL if FINAL is not None else PARTIALS[-1]))
+            log("sent final:", FINAL if FINAL is not None else PARTIALS[-1])
             return
         if op == 8: break
     stop.set()

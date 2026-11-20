@@ -15,11 +15,19 @@ job host in a private directory, starts `fake-dictation.py` (a fake dictation We
 through a job-local `adb reverse`), provisions a host at `10.0.2.2`, and creates the device key in
 the app and reads it back through the UI to authorize it.
 
+Memory: the job has a 6 GiB cap, so the emulator guest gets 3 GiB (`EMU_MEMORY` overrides it, in
+`scripts/emu-test.sh`) and the column count is changed with `wm density`, never `wm size` (a wider
+framebuffer pushed the job over the cap). `rss.log` holds the job cgroup's memory and its biggest
+processes every 5 s, and a `memory` row in `summary.tsv` shows the figures at the end.
+
 Checks, in order: the recording controls at about 46 and 100 columns (display width is calibrated
 from the columns the renderer reports; a recording only counts when the fake server has sent a
-partial, so the session is listening, and the timer visibly ticks between two screenshots); Stop-and-Send
-(Send pressed during recording must deliver the final transcript to the agent); the "seed" + dictated
-partial + `z` Cancel case (the draft is sent and read back from the agent's terminal); and offline, with a saved grid: the core and sshd are
+partial, so the session is listening, the app's own layout hint lists cancel/timer/stop/send/type, and
+the timer's own region changes between two screenshots); Stop-and-Send (Send pressed during recording
+must deliver the fake server's final, "fixture final words", which differs from the last partial, as
+new agent output, from this run's log); the "seed" + dictated
+partial + `z` Cancel case (the draft is checked in the app's layout as `seed fixture partial`
+before the keyboard opens, then sent and the lines added to the agent's terminal are inspected); and offline, with a saved grid: the core and sshd are
 stopped, the app relaunched, the pane opened from Home's cached tree, then the keyboard is hidden
 with the hide control, with Back, and with the navigation-bar key.
 
