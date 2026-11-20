@@ -258,14 +258,13 @@ fn directory(text: &str) -> bool {
 pub struct Rows {
     len: usize,
     hidden: Range<usize>,
-    footer: Option<Range<usize>>,
     deferred: bool,
 }
 
 impl Rows {
     pub fn new(rows: usize, hidden: Option<Range<usize>>) -> Self {
         let mut projection = Self::default();
-        projection.update(rows, 0, false, hidden);
+        projection.update(rows, false, hidden);
         projection
     }
 
@@ -273,25 +272,24 @@ impl Rows {
         self.len
     }
 
-    pub fn update(
-        &mut self,
-        rows: usize,
-        offset: usize,
-        touching: bool,
-        hidden: Option<Range<usize>>,
-    ) {
-        self.deferred = touching && self.footer != hidden;
-        if !touching {
-            self.footer = hidden;
-        }
-        // Hold the same live rows across a swipe. The display offset moves
-        // them down in the viewport and out of view as history scrolls in.
-        let in_view = |row: usize| row.saturating_add(offset).min(rows);
-        self.hidden = self
-            .footer
-            .as_ref()
-            .map_or(0..0, |footer| in_view(footer.start)..in_view(footer.end));
+    /// Returns whether previously hidden rows were revealed.
+    pub fn update(&mut self, rows: usize, touching: bool, footer: Option<Range<usize>>) -> bool {
+        let footer = footer.unwrap_or_default();
+        let hidden = if touching {
+            // Keep only rows that are still confirmed as footer. Any newly
+            // recognized rows can collapse after the gesture ends.
+            let start = self.hidden.start.max(footer.start);
+            let end = self.hidden.end.min(footer.end);
+            if start < end { start..end } else { 0..0 }
+        } else {
+            footer.clone()
+        };
+        let revealed =
+            self.collapsed() && (hidden.start > self.hidden.start || hidden.end < self.hidden.end);
+        self.deferred = touching && hidden != footer;
+        self.hidden = hidden;
         self.len = rows - self.hidden.len();
+        revealed
     }
 
     pub fn deferred(&self) -> bool {
@@ -311,12 +309,27 @@ impl Rows {
             }
         })
     }
+
+    /// The source cell drawn at the point, before the display offset.
+    pub fn cell_at(
+        &self,
+        point: (f32, f32),
+        cell: (f32, f32),
+        origin: (i32, usize),
+        (columns, rows): (usize, usize),
+    ) -> Option<(usize, usize)> {
+        let (col, row) =
+            crate::tap::cell_at(point, cell, origin, (columns, rows.min(self.count())))?;
+        self.source(row)
+            .filter(|&row| row < rows)
+            .map(|row| (col, row))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ghost, tap};
+    use crate::ghost;
 
     fn screen(lines: &[&str]) -> Vec<Vec<char>> {
         lines.iter().map(|line| line.chars().collect()).collect()
@@ -509,8 +522,9 @@ mod tests {
         assert_eq!(anchor.map(|anchor| anchor.row), Some(1));
 
         let touch = |y| {
-            let (_, row) = tap::cell_at((18., y), (9., 20.), origin, (30, projected.count()))?;
-            projected.source(row)
+            projected
+                .cell_at((18., y), (9., 20.), origin, (30, rows.len()))
+                .map(|(_, row)| row)
         };
         assert_eq!(touch(21.), Some(2));
         assert_eq!(touch(61.), Some(5));
@@ -523,11 +537,9 @@ mod tests {
         assert_eq!(scrolled.source(5), Some(5));
     }
 
-    #[test]
-    fn foreground_confirmation_keeps_the_original_link_through_lift() {
-        use crate::links::{Link, grid_link_at};
+    fn codex_screen() -> Crosswords<rio_vt::event::VoidListener> {
         use rio_vt::{
-            crosswords::{CrosswordsSize, pos::Pos},
+            crosswords::CrosswordsSize,
             event::{VoidListener, WindowId},
             performer::handler::Processor,
         };
@@ -550,10 +562,17 @@ mod tests {
             )
             .as_bytes(),
         );
+        grid
+    }
 
+    #[test]
+    fn foreground_confirmation_keeps_the_original_link_through_lift() {
+        use crate::links::{Link, grid_link_at};
+        use rio_vt::crosswords::pos::Pos;
+
+        let grid = codex_screen();
         let target = |rows: &Rows| {
-            let (col, row) = tap::cell_at((20., 201.), (10., 20.), (0, 0), (96, rows.count()))?;
-            let source = rows.source(row)?;
+            let (col, source) = rows.cell_at((20., 201.), (10., 20.), (0, 0), (96, 12))?;
             grid_link_at(&grid, Pos::new(Line(source as i32), Column(col)))
                 .map(|(_, link)| (source, link))
         };
@@ -568,11 +587,11 @@ mod tests {
         // that the foreground has now been confirmed.
         let confirmed = hidden_on_screen(&grid, PromptKind::Codex);
         assert_eq!(confirmed, Some(9..10));
-        rows.update(12, 0, true, confirmed.clone());
+        assert!(!rows.update(12, true, confirmed.clone()));
         assert_eq!(target(&rows), down);
         assert!(rows.deferred());
 
-        rows.update(12, 0, false, confirmed);
+        assert!(!rows.update(12, false, confirmed));
         let collapsed = target(&rows);
         assert_eq!(
             collapsed,
@@ -580,27 +599,70 @@ mod tests {
         );
         assert!(!rows.deferred());
 
-        // An eligibility or settings change can also request expansion.
-        rows.update(12, 0, true, None);
-        assert_eq!(target(&rows), collapsed);
-        assert!(rows.deferred());
-        rows.update(12, 0, false, None);
+        // An eligibility or settings change must reveal the row immediately.
+        assert!(rows.update(12, true, None));
         assert_eq!(target(&rows), down);
         assert!(!rows.deferred());
     }
 
     #[test]
-    fn a_scroll_during_touch_keeps_all_history_rows() {
-        let mut rows = Rows::new(12, Some(9..10));
-        rows.update(12, 2, true, None);
-        assert_eq!(rows.count(), 11);
-        assert_eq!(rows.source(9), Some(9));
-        assert_eq!(rows.source(10), Some(10));
+    fn a_footer_overwritten_during_a_touch_is_revealed_immediately() {
+        use rio_vt::performer::handler::Processor;
 
-        rows.update(12, 3, true, None);
-        assert_eq!(rows.count(), 12);
-        assert_eq!(rows.source(11), Some(11));
-        rows.update(12, 0, true, Some(9..10));
+        let mut grid = codex_screen();
+        let hidden = hidden_on_screen(&grid, PromptKind::Codex);
+        assert_eq!(hidden, Some(9..10));
+        let mut rows = Rows::new(12, hidden);
         assert_eq!(rows.source(9), Some(10));
+        let at = |rows: &Rows, y| rows.cell_at((20., y), (10., 20.), (0, 0), (96, 12));
+        let above = at(&rows, 161.);
+        let below = at(&rows, 181.);
+        assert_eq!(above, Some((2, 8)));
+        assert_eq!(below, Some((2, 10)));
+
+        Processor::default().advance(
+            &mut grid,
+            b"\x1b[10;1H\x1b[2KERROR: permission denied\x1b[8;3H",
+        );
+        let hidden = hidden_on_screen(&grid, PromptKind::Codex);
+        assert_eq!(hidden, None);
+        assert!(rows.update(12, true, hidden));
+
+        assert_eq!(rows.source(9), Some(9), "replacement output must be drawn");
+        assert_eq!(rows.count(), 12);
+        assert_eq!(at(&rows, 161.), above);
+        // The original link is still present at row 10, but a tap here was
+        // remapped to the error row and must be cancelled.
+        assert_eq!(at(&rows, 181.), Some((2, 9)));
+        assert_ne!(at(&rows, 181.), below);
+    }
+
+    #[test]
+    fn a_footer_revealed_in_scrollback_stays_visible_until_lift() {
+        let mut rows = Rows::new(12, Some(9..10));
+        assert!(rows.update(12, true, None));
+        assert_eq!(rows.count(), 12);
+        assert_eq!(rows.source(9), Some(9));
+
+        // A drag back to the live screen sees the footer again. Its collapse
+        // waits for the same gesture to end.
+        assert!(!rows.update(12, true, Some(9..10)));
+        assert_eq!(rows.count(), 12);
+        assert!(rows.deferred());
+        assert!(!rows.update(12, false, Some(9..10)));
+        assert_eq!(rows.source(9), Some(10));
+    }
+
+    #[test]
+    fn only_the_overlap_of_two_footer_ranges_stays_collapsed_during_touch() {
+        let mut rows = Rows::new(12, Some(8..10));
+        assert!(rows.update(12, true, Some(9..11)));
+        assert!(rows.deferred());
+        assert_eq!(rows.source(8), Some(8));
+        assert_eq!(rows.source(9), Some(10));
+
+        assert!(!rows.update(12, false, Some(9..11)));
+        assert!(!rows.deferred());
+        assert_eq!(rows.source(9), Some(11));
     }
 }

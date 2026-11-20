@@ -36,6 +36,8 @@ macro_rules! __bind_gpui {
             struct PressTarget {
                 point: Point<Pixels>,
                 position: Pos,
+                /// Unclamped hit, including the draft and scrollback.
+                drawn: Option<Pos>,
                 cell: Option<(usize, usize)>,
                 link: Option<$crate::links::GridLink>,
             }
@@ -266,9 +268,7 @@ macro_rules! __bind_gpui {
                 fn target_at(&self, point: Point<Pixels>) -> PressTarget {
                     let grid = self.session.grid().lock();
                     let position = self.position(point, &grid);
-                    let drawn = self.bounds.contains(&point)
-                        .then(|| self.drawn_cell(point, grid.columns(), grid.screen_lines()))
-                        .flatten();
+                    let drawn = self.drawn_position(point, &grid);
                     let on_draft = self.on_draft(point);
                     // Selection can clamp to an edge. A tap in space left by
                     // a collapsed grid has no link or program cell.
@@ -282,23 +282,32 @@ macro_rules! __bind_gpui {
                     PressTarget {
                         point,
                         position,
-                        cell: drawn.filter(|_| !on_draft && grid.display_offset() == 0),
+                        drawn,
+                        cell: drawn
+                            .filter(|_| !on_draft && grid.display_offset() == 0)
+                            .map(|pos| (pos.col.0, pos.row.0 as usize)),
                         link,
                     }
                 }
 
-                fn drawn_cell(&self, point: Point<Pixels>, columns: usize, rows: usize) -> Option<(usize, usize)> {
-                    // The geometry the last paint drew with, including any collapsed rows.
-                    let (col, row) = $crate::tap::cell_at(
+                fn drawn_position(
+                    &self,
+                    point: Point<Pixels>,
+                    grid: &Crosswords<impl EventListener>,
+                ) -> Option<Pos> {
+                    if !self.bounds.contains(&point) {
+                        return None;
+                    }
+                    let (col, row) = self.rows.cell_at(
                         (
                             f32::from(point.x - self.bounds.left()),
                             f32::from(point.y - self.bounds.top()),
                         ),
                         (f32::from(self.cell.width), f32::from(self.cell.height)),
                         self.view_origin,
-                        (columns, rows.min(self.rows.count())),
+                        (grid.columns(), grid.screen_lines()),
                     )?;
-                    self.rows.source(row).filter(|&row| row < rows).map(|row| (col, row))
+                    Some(Pos::new(Line(row as i32 - grid.display_offset() as i32), Column(col)))
                 }
                 fn cancel_press(&mut self) -> bool {
                     self.press.take().is_some_and(|press| press.link.is_some())
@@ -537,7 +546,7 @@ macro_rules! __bind_gpui {
                     }
                     let hidden = $crate::footer::hidden_on_screen(&grid, self.footer_kind);
                     let defer = !alt_screen && self.touch_active();
-                    self.rows.update(grid_rows, offset, defer, hidden);
+                    let revealed = self.rows.update(grid_rows, defer, hidden);
                     let cols = usize::from(pane.0.min(grid_cols));
                     let rows = usize::from(pane.1).min(self.rows.count());
                     // A column the reader panned to wins over the caret, in
@@ -552,6 +561,16 @@ macro_rules! __bind_gpui {
                         self.pan.column((grid_cols, pane.0), self.session.inputs()),
                     );
                     self.view_origin = (row_off, col_off);
+                    if revealed
+                        && self.touch_target.as_ref().is_some_and(|target| {
+                            self.drawn_position(target.point, &grid) != target.drawn
+                        })
+                    {
+                        // GPUI may still synthesize a click on lift. This touch
+                        // no longer owns the cell where it began.
+                        self.touch.clear();
+                        self.touch_target = None;
+                    }
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
                     // The rows as drawn, for finding the program's prompt.
