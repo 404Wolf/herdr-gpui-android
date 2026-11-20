@@ -2979,7 +2979,11 @@ mod tests {
             for (rows, anchor) in cases {
                 let layout = place_all(&g, anchor, rows, None);
                 let ids: Vec<&str> = layout.controls.iter().map(|c| c.id.as_str()).collect();
-                let ok = ["clear", "queue", "talk"].iter().all(|id| ids.contains(id))
+                // Idle: the clear, queue and talk never drop. Recording: the host's own ladder always
+                // has a line down to 31 cells with hide, cancel, stop and send, so this fallback is
+                // only reached below that, where talk (the stop) is what stays.
+                let need: &[&str] = if state == "recording" { &["talk"] } else { &["clear", "queue", "talk"] };
+                let ok = need.iter().all(|id| ids.contains(id))
                     && layout.controls.iter().all(|c| c.end <= cols && c.end > c.start);
                 if !ok {
                     failures.push(format!("{state} {cols} {}: {ids:?}", anchor.is_some()));

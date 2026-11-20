@@ -35,6 +35,14 @@ final class DictationRouting {
             appendDictation(pane, text);
         }
 
+        /**
+         * As above for the pane {@code pane} of computer {@code hostId}: the computer the session
+         * was started on, not the one on screen when its text arrives.
+         */
+        default void appendDictation(String hostId, String pane, String text, int[] unverifiedCuts) {
+            appendDictation(pane, text, unverifiedCuts);
+        }
+
         void clipLength(String clipId, long durationMs);
 
         /** The text just placed on screen is the phone's: say so ("talk offline"). */
@@ -87,7 +95,11 @@ final class DictationRouting {
     private final ComposerDrafts drafts;
     private final Bar bar;
     /** The pane an Enter was pressed in while a session was finishing; null for none. */
-    private String enterPane;
+    private String enterOwner;
+    /** The session an Enter waits on, and whose draft owns it (host and pane): never another's. */
+    private String sessionOwner = "";
+    private int sessionGen = -1;
+    private int enterGen = -1;
     /** Bumped by {@link #abandon}: listeners made before it say nothing more. */
     private int generation;
 
@@ -98,17 +110,34 @@ final class DictationRouting {
 
     /** Enter was pressed in the pane on screen while a session finishes: send once it ends. */
     void sendWhenDone() {
-        enterPane = drafts.pane();
+        enterOwner = here();
+        enterGen = sessionGen;
+    }
+
+    /** The draft on screen, as host and pane (the pane id alone is only unique per computer). */
+    private String here() {
+        String owner = drafts.owner();
+        return owner.isEmpty() ? "p:" + drafts.pane() : owner;
+    }
+
+    /**
+     * What Enter does now: it waits on a dictation only if that dictation belongs to the pane on
+     * screen; on any other pane it sends that pane's own draft at once and never waits on, or sends
+     * for, someone else's session.
+     */
+    Enter enterFor(DictationEngine.State s) {
+        Enter wanted = onEnter(s);
+        return wanted == Enter.SEND || sessionOwner.equals(here()) ? wanted : Enter.SEND;
     }
 
     /** An Enter is waiting on the session. */
     boolean sendPending() {
-        return enterPane != null;
+        return enterOwner != null;
     }
 
     /** The session was cancelled (or a new one starts): no Enter waits any more. */
     void forget() {
-        enterPane = null;
+        enterOwner = null;
     }
 
     /**
@@ -118,7 +147,7 @@ final class DictationRouting {
      */
     void abandon() {
         generation++;
-        enterPane = null;
+        enterOwner = null;
     }
 
     /**
@@ -139,6 +168,10 @@ final class DictationRouting {
     /** The callbacks of a session started in {@code pane}. */
     DictationEngine.Listener listener(String pane) {
         final int born = generation;
+        final String owner = here();
+        final String originHost = drafts.host();
+        sessionOwner = owner;
+        sessionGen = born;
         return new DictationEngine.Listener() {
             /** Abandoned: nothing of this session reaches the draft or the screen any more. */
             private boolean gone() {
@@ -149,9 +182,13 @@ final class DictationRouting {
                 onPartial(text, UnverifiedCuts.NONE);
             }
 
+            /** The last words heard: kept if the session ends in an error after a pane switch. */
+            private String lastPartial = "";
+
             @Override public void onPartial(String text, int[] cuts) {
                 if (gone()) return;
-                if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPartial(text, cuts));
+                lastPartial = text == null ? "" : text;
+                if (owner.equals(here())) bar.showText(drafts.dictationPartial(text, cuts));
             }
 
             @Override public void onFinal(String text) {
@@ -174,17 +211,17 @@ final class DictationRouting {
                 if (onDevice) {
                     bar.notice("Offline: transcribed on the phone (desktop away or slow); recording kept 48 h");
                 }
-                if (pane.equals(drafts.pane())) {
+                if (owner.equals(here())) {
                     if (onDevice) bar.transcribedOnPhone();
                     bar.showText(drafts.dictationFinal(text, cuts));
                 } else if (!text.isEmpty()) {
                     // Switched away while it finished: it joins the end of its own pane's draft.
-                    bar.appendDictation(pane, text, cuts);
+                    bar.appendDictation(originHost, pane, text, cuts);
                 }
                 // Saved before the engine deletes the recording; not saved, it keeps it.
                 stored = bar.persistNow();
                 // The session is over (IDLE follows): Enter must send, not wait again.
-                settle(DictationEngine.State.IDLE);
+                settle(DictationEngine.State.IDLE, born);
             }
 
             @Override public void onPending(PendingClip clip) {
@@ -195,9 +232,9 @@ final class DictationRouting {
                 }
                 bar.clipLength(clip.id, clip.durationMs);
                 // Elsewhere its chip is already in its pane's draft; the text finds it later.
-                if (pane.equals(drafts.pane())) bar.showText(drafts.dictationPending(clip.id));
+                if (owner.equals(here())) bar.showText(drafts.dictationPending(clip.id));
                 // A message sent with the chip waits in the outbox until the desktop fills it in.
-                settle(DictationEngine.State.PENDING);
+                settle(DictationEngine.State.PENDING, born);
             }
 
             @Override public void onFinishing(double tailSeconds) {
@@ -217,7 +254,8 @@ final class DictationRouting {
                 if (gone()) return;
                 forget();
                 bar.setDictationState(DictationEngine.State.IDLE);
-                if (pane.equals(drafts.pane())) bar.showText(drafts.dictationEnded());
+                if (owner.equals(here())) bar.showText(drafts.dictationEnded());
+                else if (!lastPartial.isEmpty()) bar.appendDictation(originHost, pane, lastPartial, null);
                 if (error.reason().nothingHeard()) {
                     // Said where the mic is, in "talk": no note over the terminal.
                     bar.nothingHeard(error.reason());
@@ -228,11 +266,12 @@ final class DictationRouting {
         };
     }
 
-    /** The session ended in {@code next}: a waiting Enter sends in its pane, or is dropped. */
-    private void settle(DictationEngine.State next) {
-        String pane = enterPane;
-        enterPane = null;
-        if (pane == null || !pane.equals(drafts.pane())) return;
+    /** The session ended in {@code next}: a waiting Enter sends in its own pane, or is dropped. */
+    private void settle(DictationEngine.State next, int born) {
+        String waiting = enterOwner;
+        int waitingGen = enterGen;
+        enterOwner = null;
+        if (waiting == null || waitingGen != born || !waiting.equals(here())) return;
         bar.setDictationState(next);
         bar.enter();
     }
