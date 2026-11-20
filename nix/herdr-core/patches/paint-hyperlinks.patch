@@ -1,8 +1,8 @@
 diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
-index c31b155..9ed9bca 100644
+index c31b155..452138c 100644
 --- a/crates/ghostty-vt/src/lib.rs
 +++ b/crates/ghostty-vt/src/lib.rs
-@@ -289,14 +289,19 @@ const DEFAULT_CELL: (u32, u32) = (10, 20);
+@@ -289,14 +289,97 @@ const DEFAULT_CELL: (u32, u32) = (10, 20);
  /// Ghostty's default theme, answered until a viewer tells us its own colors.
  const DEFAULT_FG: Rgb = [0xff, 0xff, 0xff];
  const DEFAULT_BG: Rgb = [0x28, 0x2c, 0x34];
@@ -26,14 +26,107 @@ index c31b155..9ed9bca 100644
  \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b[?66l\x1b[?2031l\x1b[?2048l\x1b[=0;1u\
 -\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J";
 +\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b]8;;\x1b\\\x1b[H\x1b[2J";
++
++/// The most bytes of OSC 8 hyperlink escapes one paint adds: as many as its
++/// other bytes (links at most double a paint), never fewer than
++/// `PAINT_LINKS_MIN` (a short screen keeps all its links) nor more than
++/// `PAINT_LINKS_MAX`. Unbounded, a link-dense history made a 77 KiB paint
++/// 4.7 MiB, and 51 such panes reached live output 20 s late in the app.
++const PAINT_LINKS_MIN: usize = 16 << 10;
++const PAINT_LINKS_MAX: usize = 128 << 10;
++const LINK_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
++
++fn paint_links_budget(other_bytes: usize) -> usize {
++    other_bytes.clamp(PAINT_LINKS_MIN, PAINT_LINKS_MAX)
++}
++
++/// Where the OSC 8 sequences in `paint` are, from `from` on, and whether each
++/// opens a link (has a target). The formatter ends them with ST, and no other
++/// byte of a paint is an ESC that could start one: cells hold no controls,
++/// and the title is an OSC of its own.
++fn osc8_spans(paint: &[u8], from: usize) -> Vec<(std::ops::Range<usize>, bool)> {
++    let mut spans = Vec::new();
++    let mut i = from;
++    while let Some(at) = paint[i..].windows(4).position(|w| w == b"\x1b]8;") {
++        let start = i + at;
++        let Some(len) = paint[start..].windows(2).position(|w| w == b"\x1b\\") else {
++            break;
++        };
++        let end = start + len + 2;
++        let body = &paint[start + 4..end - 2];
++        let opens = body.iter().position(|b| *b == b';').is_some_and(|semi| semi + 1 < body.len());
++        spans.push((start..end, opens));
++        i = end;
++    }
++    spans
++}
++
++/// `paint` with its hyperlinks within [`paint_links_budget`]: unchanged when
++/// they fit. Otherwise its newest links, the ones a viewer sees and taps
++/// (the screen's, then the cursor's active link), are kept while each fits
++/// whole, its open and close reserved together, counting back from the end;
++/// the text before the newest link that does not fit is written without
++/// links. The cursor's link is kept whenever any link is, so live text after
++/// the paint still continues it; otherwise the paint ends with no link open.
++/// Only OSC 8 sequences are left out, never another byte or part of one;
++/// closes with no link open (no-ops) go too, and the reset's closes are kept.
++/// Each row of a soft-wrapped link is its own open, so the cut can fall
++/// inside one: its first rows are then plain and its last rows linked.
++fn bound_paint_links(paint: Vec<u8>) -> Vec<u8> {
++    let spans = osc8_spans(&paint, PAINT_RESET.len());
++    let link_bytes: usize = spans.iter().map(|(span, _)| span.len()).sum();
++    let budget = paint_links_budget(paint.len() - link_bytes);
++    if link_bytes <= budget {
++        return paint;
++    }
++    // The oldest open kept: every open from it on fits, with its close.
++    let (mut first, mut left) = (spans.len(), budget);
++    for (i, (span, _)) in spans.iter().enumerate().rev().filter(|(_, (_, opens))| *opens) {
++        let Some(rest) = left.checked_sub(span.len() + LINK_CLOSE.len()) else {
++            break;
++        };
++        (first, left) = (i, rest);
++    }
++    let mut out = Vec::with_capacity(paint.len() - link_bytes + budget);
++    let (mut at, mut open) = (0, false);
++    for (i, (span, opens)) in spans.into_iter().enumerate() {
++        out.extend_from_slice(&paint[at..span.start]);
++        at = span.end;
++        if opens && i >= first {
++            out.extend_from_slice(&paint[span]);
++            open = true;
++        } else if open {
++            // A close, ending a kept link: reserved with its open.
++            out.extend_from_slice(LINK_CLOSE);
++            open = false;
++        }
++    }
++    out.extend_from_slice(&paint[at..]);
++    out
++}
  
  pub type Rgb = [u8; 3];
  
+@@ -762,8 +845,13 @@ impl Terminal {
+     /// can differ from this terminal's (a viewer never told this size): the
+     /// history goes exactly into its scrollback, with no row lost or blank row
+     /// added. The screen is this terminal's still; one taller than the viewer
+-    /// overflows it.
++    /// overflows it. Its hyperlinks are bounded (`bound_paint_links`).
+     pub fn paint_for(&self, history: usize, viewer_rows: u16) -> Vec<u8> {
++        bound_paint_links(self.paint_unbounded(history, viewer_rows))
++    }
++
++    /// [`Terminal::paint_for`] with all its hyperlinks.
++    fn paint_unbounded(&self, history: usize, viewer_rows: u16) -> Vec<u8> {
+         let (cols, rows) = self.size();
+         let last = (cols.saturating_sub(1), rows.saturating_sub(1) as u32);
+         let mut out = PAINT_RESET.to_vec();
 diff --git a/crates/ghostty-vt/src/tests.rs b/crates/ghostty-vt/src/tests.rs
-index 4ee38f5..36802f7 100644
+index 4ee38f5..636f18e 100644
 --- a/crates/ghostty-vt/src/tests.rs
 +++ b/crates/ghostty-vt/src/tests.rs
-@@ -355,3 +355,335 @@ fn painted_history_fits_a_viewer_taller_or_shorter_than_the_terminal() {
+@@ -355,3 +355,516 @@ fn painted_history_fits_a_viewer_taller_or_shorter_than_the_terminal() {
          }
      }
  }
@@ -368,6 +461,187 @@ index 4ee38f5..36802f7 100644
 +    let (glyphs, links) = osc8_placement(&viewer.paint(0));
 +    assert!(links.is_empty(), "{links:?}");
 +    assert!(linked(&glyphs, "plainNEXT")[0].iter().all(|g| g.1.is_none()));
++}
++
++/// `bytes` without its OSC 8 sequences.
++fn without_links(bytes: &[u8]) -> Vec<u8> {
++    let (mut out, mut at) = (Vec::new(), 0);
++    for (span, _) in osc8_spans(bytes, 0) {
++        out.extend_from_slice(&bytes[at..span.start]);
++        at = span.end;
++    }
++    out.extend_from_slice(&bytes[at..]);
++    out
++}
++
++/// The bytes of a paint's OSC 8 sequences after its reset.
++fn link_bytes(paint: &[u8]) -> usize {
++    osc8_spans(paint, PAINT_RESET.len()).iter().map(|(span, _)| span.len()).sum()
++}
++
++/// As link-dense as the history that made repaints 60 times bigger
++/// (handover-blank-1118): four links a row, with ids, targets of 600 bytes.
++fn link_dense(rows: usize) -> Terminal {
++    let mut t = Terminal::new(120, 10, 64 << 20);
++    let pad = "p".repeat(600);
++    for r in 0..rows {
++        let mut line = String::new();
++        for k in 0..4 {
++            line += &format!("\x1b]8;id=r{r}k{k};https://x.dev/{r}/{k}/{pad}\x1b\\L{r}.{k}\x1b]8;;\x1b\\ ");
++        }
++        t.write(format!("{line}\r\n").as_bytes());
++    }
++    t
++}
++
++#[test]
++fn wolf_ask_links_a_link_dense_paint_keeps_its_newest_links_whole_within_the_budget() {
++    let t = link_dense(2500);
++    let full = t.paint_unbounded(2000, 10);
++    let paint = t.paint(2000);
++    // At most as many link bytes as other bytes, here under the cap.
++    let other = full.len() - link_bytes(&full);
++    assert!(other < PAINT_LINKS_MAX && link_bytes(&full) > 50 * other);
++    assert!(link_bytes(&paint) <= paint_links_budget(other) && paint.len() <= 2 * other);
++    // Not a byte of the text, modes or cursor is lost or cut.
++    assert_eq!(without_links(&paint), without_links(&full));
++    // Placed right, every OSC whole, and no link open at the end.
++    let (glyphs, links) = osc8_placement(&paint);
++    // The oldest text is plain; from the first link kept on, every link keeps its id and target.
++    let pad = "p".repeat(600);
++    let (mut plain, mut kept) = (0, 0);
++    for r in 0..2500 {
++        for k in 0..4 {
++            let text = format!("L{r}.{k}");
++            let Some(found) = linked(&glyphs, &text).first().copied() else { continue };
++            let target = format!("https://x.dev/{r}/{k}/{pad}").into_bytes();
++            if found.iter().all(|g| g.1.as_ref() == Some(&target)) {
++                assert_eq!(links[kept], [format!("id=r{r}k{k};").into_bytes(), target].concat());
++                kept += 1;
++            } else {
++                assert!(found.iter().all(|g| g.1.is_none()), "{text} is part linked");
++                assert_eq!(kept, 0, "{text} is plain after a link");
++                plain += 1;
++            }
++        }
++    }
++    assert!(plain > 0 && kept > 0 && kept == links.len(), "{plain} plain, {kept} of {}", links.len());
++    // The rows on the screen keep theirs; the oldest painted history's are plain.
++    let (screen, oldest) = (t.screen_rows(), "L500.0");
++    let on_screen: Vec<String> = (0..2500)
++        .flat_map(|r| (0..4).map(move |k| format!("L{r}.{k}")))
++        .filter(|l| screen.iter().any(|row| row.contains(&format!("{l} "))))
++        .collect();
++    assert!(!on_screen.is_empty());
++    for l in &on_screen {
++        assert!(linked(&glyphs, l)[0].iter().all(|g| g.1.is_some()), "{l} on the screen is plain");
++    }
++    assert!(linked(&glyphs, oldest)[0].iter().all(|g| g.1.is_none()));
++    // A viewer shows the same screen, at ground: live text after the paint is plain text.
++    let mut viewer = Terminal::new(120, 10, 64 << 20);
++    viewer.write(&paint);
++    assert_eq!(viewer.screen_rows(), t.screen_rows());
++    viewer.write(b"NEXT");
++    let (glyphs, _) = osc8_placement(&viewer.paint(0));
++    assert!(linked(&glyphs, "NEXT")[0].iter().all(|g| g.1.is_none()));
++}
++
++/// The rows of a paint whose links it keeps (`L<row>`), from the review of #112.
++fn rows_keeping_links(paint: &[u8]) -> std::collections::BTreeSet<String> {
++    let (glyphs, _) = osc8_placement(paint);
++    let text: Vec<u8> = glyphs.iter().map(|g| g.0).collect();
++    let mut rows = std::collections::BTreeSet::new();
++    for (i, g) in glyphs.iter().enumerate() {
++        if g.1.is_some() && text[i] == b'L' {
++            let label: String = text[i..].iter().take_while(|b| **b != b'.').map(|b| *b as char).collect();
++            rows.insert(label);
++        }
++    }
++    rows
++}
++
++#[test]
++fn wolf_ask_links_r112_over_the_budget_the_screen_keeps_its_links() {
++    // Review of #112: the budget went to the oldest history first, and no
++    // row on the screen kept its links.
++    let t = link_dense(2500);
++    let rows = rows_keeping_links(&t.paint(2000));
++    assert!(!rows.is_empty());
++    for row in t.screen_rows().iter().filter(|row| row.starts_with('L')) {
++        let label = row.split('.').next().unwrap();
++        assert!(rows.contains(label), "screen row {label} lost its links; kept {rows:?}");
++    }
++    // The newest history rows keep theirs; the oldest painted ones do not.
++    assert!(rows.contains("L2490") && !rows.contains("L500"), "{rows:?}");
++}
++
++#[test]
++fn wolf_ask_links_over_the_budget_the_cursors_active_link_is_kept() {
++    // The cursor's active link is the newest: kept whenever any link is, so
++    // live text after the paint still continues it (review of #104, round 4).
++    let mut t = link_dense(2500);
++    t.write(b"\x1b]8;id=live;https://x.dev/live\x1b\\LIVE");
++    let paint = t.paint(2000);
++    let full = t.paint_unbounded(2000, 10);
++    assert!(link_bytes(&paint) <= paint_links_budget(full.len() - link_bytes(&full)));
++    assert_eq!(osc8_opens(&paint).last().unwrap(), b"id=live;https://x.dev/live");
++    let mut viewer = Terminal::new(120, 10, 64 << 20);
++    viewer.write(&paint);
++    viewer.write(b"MORE");
++    let opens = osc8_opens(&viewer.paint(0));
++    assert_eq!(opens.last().unwrap(), b"id=live;https://x.dev/live", "MORE continues the link");
++    // Without an active link, a paint over the budget ends with none open.
++    let t = link_dense(2500);
++    osc8_placement(&t.paint(2000));
++    // Within the budget, the paint is #104's.
++    let mut t = link_dense(3);
++    t.write(b"\x1b]8;id=live;https://x.dev/live\x1b\\LIVE");
++    let paint = t.paint(2000);
++    assert_eq!(paint, t.paint_unbounded(2000, 10));
++    assert_eq!(osc8_opens(&paint).last().unwrap(), b"id=live;https://x.dev/live");
++}
++
++#[test]
++fn wolf_ask_links_the_link_budget_holds_at_its_boundary() {
++    assert_eq!(paint_links_budget(0), PAINT_LINKS_MIN);
++    assert_eq!(paint_links_budget(100_000), 100_000);
++    assert_eq!(paint_links_budget(1 << 30), PAINT_LINKS_MAX);
++    // 32 bytes of link each (a 25-byte open, a 7-byte close) around one glyph.
++    let link = |n: usize| format!("\x1b]8;;https://x.dev/{n:04}\x1b\\x\x1b]8;;\x1b\\");
++    // Links `from..to`, the ones before `from` written as their plain glyph.
++    let paint_of = |text: usize, from: usize, to: usize, tail: &str| {
++        let links: String = (0..to).map(|n| if n < from { "x".to_string() } else { link(n) }).collect();
++        [PAINT_RESET, "t".repeat(text).as_bytes(), links.as_bytes(), tail.as_bytes()].concat()
++    };
++    // A 32-byte open and its close: 39 bytes.
++    let open = "\x1b]8;id=live;https://x.dev/live\x1b\\LIVE";
++    for (text, budget) in [(0, PAINT_LINKS_MIN), (200 << 10, PAINT_LINKS_MAX)] {
++        let fit = budget / 32;
++        assert_eq!(link_bytes(&paint_of(text, 0, fit, "")), budget);
++        // Exactly the budget: kept as it is.
++        assert_eq!(bound_paint_links(paint_of(text, 0, fit, "")), paint_of(text, 0, fit, ""));
++        // One more link: the oldest alone is left out, its glyph kept.
++        assert_eq!(bound_paint_links(paint_of(text, 0, fit + 1, "")), paint_of(text, 1, fit + 1, ""));
++        // A link still open at the end is kept, and the oldest that no longer fit go.
++        assert_eq!(bound_paint_links(paint_of(text, 0, fit, open)), paint_of(text, 2, fit, open));
++        assert_eq!(bound_paint_links(paint_of(text, 0, 10, open)), paint_of(text, 0, 10, open));
++        // Never more than the budget, never part of a sequence.
++        for links in [fit - 1, fit + 1, 2 * fit] {
++            let bounded = bound_paint_links(paint_of(text, 0, links, open));
++            assert!(link_bytes(&bounded) <= budget);
++            assert_eq!(without_links(&bounded), without_links(&paint_of(text, 0, links, open)));
++            assert!(osc8_opens(&bounded).last().is_some_and(|o| o == b"id=live;https://x.dev/live"));
++        }
++    }
++    // An open is at most the parser's 2 KiB capture, under the smallest
++    // budget: the newest link, however long, is always kept.
++    let target = format!("https://x.dev/{}", "y".repeat(2000));
++    let huge = format!("\x1b]8;;{target}\x1b\\LIVE");
++    let paint = [PAINT_RESET, (0..600).map(link).collect::<String>().as_bytes(), huge.as_bytes()].concat();
++    let bounded = bound_paint_links(paint.clone());
++    assert!(link_bytes(&bounded) <= PAINT_LINKS_MIN);
++    assert_eq!(osc8_opens(&bounded).last().unwrap(), format!(";{target}").as_bytes());
++    assert_eq!(without_links(&bounded), without_links(&paint));
 +}
 diff --git a/vendor/ghostty/src/terminal/formatter.zig b/vendor/ghostty/src/terminal/formatter.zig
 index 9dd28a0..9a04594 100644
