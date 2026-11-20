@@ -9,6 +9,64 @@ import org.junit.Test;
 
 public final class ComposerDraftsTest {
     @Test
+    public void cuttingAndPastingAnAttachmentKeepsTheReorderedDraftOnReopen() {
+        String prompt = "Explain what changed in the second panel for the release notes.";
+        String path = "/state/herdr-core/default/files/t1/herdr-paste-123.png";
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.setHost("host", "original", encoded -> true);
+        drafts.switchTo("t1");
+        drafts.edit(prompt);
+        drafts.appendAttachment("host", "original", "t1", path + " ");
+        drafts.edit(prompt);
+        assertNull(drafts.draftRevision());
+
+        String reordered = path + " " + prompt;
+        drafts.edit(reordered);
+        ComposerDrafts restored = new ComposerDrafts();
+        restored.restore(drafts.encode());
+        restored.setHost("host", "original", encoded -> true);
+        assertEquals(reordered, restored.switchTo("t1"));
+        assertEquals("original", restored.draftRevision());
+    }
+
+    @Test
+    public void repointingKeepsThePromptAndRemovesEveryGeneratedPath() {
+        String paths = ImageAttach.quotePaths(java.util.Arrays.asList(
+                "/state & 'photos/herdr-core/default/files/t1/herdr-paste-123-2.png",
+                "/other/files/t1/herdr-paste-124.jpg"));
+        String prompt = "Compare " + paths + "with /tmp/reference.png.\nKeep the 'second panel'.";
+        String expected = "Compare   with /tmp/reference.png.\nKeep the 'second panel'.";
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.setHost("host", "original", encoded -> true);
+        drafts.switchTo("t1");
+        drafts.edit("Compare");
+        drafts.appendAttachment("host", "original", "t1", paths);
+        drafts.edit(prompt);
+        String saved = drafts.encode();
+
+        drafts.setHost("host", "repointed", encoded -> true);
+        assertEquals(expected, drafts.text());
+        assertNull(drafts.draftRevision());
+
+        ComposerDrafts restored = new ComposerDrafts();
+        restored.setHost("host", "repointed", encoded -> true);
+        restored.restore(saved);
+        assertEquals(expected, restored.switchTo("t1"));
+        assertNull(restored.draftRevision());
+    }
+
+    @Test
+    public void adoptingALegacyDraftKeepsItsTextAndRemovesUnownedPaths() throws Exception {
+        ComposerDrafts drafts = new ComposerDrafts();
+        drafts.restore(new org.json.JSONObject().put("t1",
+                "Please inspect '/state & '\\''photos/herdr-core/default/files/t1/herdr-paste-123.png'\n"
+                        + "and the screenshot.").toString());
+        drafts.setHost("host", "original", encoded -> true);
+        assertEquals("Please inspect \nand the screenshot.", drafts.switchTo("t1"));
+        assertNull(drafts.draftRevision());
+    }
+
+    @Test
     public void draftsArePerPane() {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.switchTo("a");
