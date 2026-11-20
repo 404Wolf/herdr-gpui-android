@@ -456,7 +456,7 @@ a shell wm density reset
 quiet 4
 WIDE_COLS=$(cols_now || echo 0)
 if [[ "$WIDE_COLS" =~ ^[0-9]+$ ]] && (( WIDE_COLS >= 56 )); then
-    record width-98 PASS "widest reachable: $WIDE_COLS columns at the default density (98 is not reachable on a 1080 px display; see README)"
+    record width-98 PASS "default width: $WIDE_COLS columns (about 100 is not reachable on a 1080 px display; the timer is judged only at 46 columns; see README)"
 else
     record width-98 FAIL "the default density gave $WIDE_COLS columns (expected 56 or more)"
 fi

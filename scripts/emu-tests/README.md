@@ -22,15 +22,17 @@ framebuffer); the display density is never raised: density 900 made the renderer
 cgroup's memory and its biggest processes every 5 s, and a `memory` row in `summary.tsv` shows the
 figures at the end.
 
-Checks, in order: the recording controls at about 46 and 100 columns (display width is calibrated
-from the columns the renderer reports; a recording only counts when the fake server has sent a
-partial, so the session is listening, the app's own layout hint lists cancel/timer/stop/send/type, and
-the timer's own region changes between two screenshots); Stop-and-Send (Send pressed during recording
+Checks, in order: the recording controls at 46 columns (display width is calibrated
+from the columns the renderer reports) and at the default width, 62 columns (about 100 columns is not
+reachable on the 1080 px guest). A recording only counts when the fake server has sent a partial, so
+the session is listening, and the app's own layout hint lists its controls. The timer is judged only
+at 46 columns, where it is on the line: its own region must change between screenshots 3 s apart (two
+intervals). At 62 columns the timer is not on the line, so only the controls and partials are checked; Stop-and-Send (Send pressed during recording
 must deliver the fake server's final, "fixture final words", which differs from the last partial, as
 new agent output, from this run's log); the "seed" + dictated
 partial + `z` Cancel case (the draft is checked in the app's layout as `seed fixture partial`
 before the keyboard opens, then sent and the lines added to the agent's terminal are inspected); and offline, with a saved grid: the core and sshd are
-stopped, the app relaunched, the pane opened from Home's cached tree, then the keyboard is hidden
+stopped, the pane is opened by switching tabs in the tab strip (agent-a, with the app staying open), then the keyboard is hidden
 with the hide control, with Back, and with the navigation-bar key.
 
 ### Reading the results
@@ -69,7 +71,8 @@ are the app's content descriptions; change them there when a control's words cha
   physical devices are not covered.
 - **The network.** The core and sshd are loopback fixtures reached through the emulator alias and
   `adb reverse`; real links, Tailscale and a real Whisper server are not exercised.
-- **Offline.** The link is cut by stopping the fixtures and the app is relaunched; a link that drops
-  with a pane open and recovers is not covered.
+- **Offline.** The link is cut by stopping the fixtures and a pane is opened through the tab strip
+  without relaunching the app (opening from Home's cached tree after a relaunch is not covered); a link
+  that drops with a pane open and recovers is not covered.
 - **Cleanup.** Early setup failures can leave the scratch directory behind; Slurm's cgroup teardown
   is what stops surviving processes.
