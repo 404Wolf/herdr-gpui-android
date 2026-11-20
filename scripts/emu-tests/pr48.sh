@@ -112,14 +112,17 @@ hc run --bg --label agent.kind=claude --name agent-b -- sh -c 'printf "Claude Co
 nohup python3 -u "$here/fake-dictation.py" "$DICT_PORT" "fixture" "fixture partial" > "$EMU_OUT/dictation.log" 2>&1 &
 dict_pid=$!
 record setup PASS "ssh $SSH_PORT, dictation $DICT_PORT"
-# The emulator must reach the fixtures through 10.0.2.2 (toybox nc on the device), or every later
-# dictation check would measure the harness, not the app.
-a shell "echo ping | nc -w 2 10.0.2.2 $DICT_PORT" > /dev/null 2>&1 || true
+# The dictation fixture is reached through the job's own ADB (adb reverse), not through the
+# emulator's 10.0.2.2 alias, which did not carry it on the job host; the scratch SSH stays at 10.0.2.2.
+# A probe from the device must reach it, or every later dictation check would measure the harness.
+a reverse "tcp:$DICT_PORT" "tcp:$DICT_PORT" > "$EMU_OUT/adb-reverse.log" 2>&1 \
+    || record dictation-reach FAIL "adb reverse failed (see adb-reverse.log)"
+a shell "echo ping | nc -w 2 127.0.0.1 $DICT_PORT" > /dev/null 2>&1 || true
 sleep 1
 if grep -q 'connection accepted' "$EMU_OUT/dictation.log"; then
-    record dictation-reach PASS "the emulator reached the fake dictation server at 10.0.2.2:$DICT_PORT"
+    record dictation-reach PASS "the emulator reached the fake dictation server at 127.0.0.1:$DICT_PORT through adb reverse"
 else
-    record dictation-reach FAIL "no connection reached the fake dictation server (see dictation.log)"
+    record dictation-reach FAIL "no connection reached the fake dictation server (see dictation.log, adb-reverse.log)"
 fi
 
 # ---- the phone: provisioned host + settings, microphone, first launch ----
@@ -130,7 +133,7 @@ cat > "$work/hosts.json" << JSON
 {"format": "remote-for-herdr-hosts", "version": 1, "hosts": [{"transport": "tcp", "host": "10.0.2.2", "port": $SSH_PORT, "endpoint_id": "", "endpoint_ticket": "", "relay_url": "", "username": "$(id -un)", "session": "pr48", "expected_fingerprint": "$fp", "name": "pr48host", "shortcuts": "", "quickCommands": []}]}
 JSON
 cat > "$work/settings.json" << JSON
-{"format":"remote-for-herdr-settings","version":1,"capturable":true,"dictationUrl":"ws://10.0.2.2:$DICT_PORT/v1/dictate"}
+{"format":"remote-for-herdr-settings","version":1,"capturable":true,"dictationUrl":"ws://127.0.0.1:$DICT_PORT/v1/dictate"}
 JSON
 files=/sdcard/Android/data/$pkg/files
 a shell mkdir -p "$files"
