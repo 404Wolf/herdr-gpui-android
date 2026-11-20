@@ -36,6 +36,15 @@ public class FileDocumentTest {
         assertEquals("unreadable reply", FileDocument.parse("x", 0, "not json").error);
     }
 
+    @Test public void fileAskPermissionDirectoryAndSizeErrorsAreSaid() throws Exception {
+        String denied = "{\"queued\":false,\"error\":\"\\\"io\\\": /root/x: Permission denied (os error 13)\"}";
+        assertEquals("Permission denied", FileDocument.parse("/root/x", 0, denied).error);
+        String dir = "{\"queued\":false,\"error\":\"\\\"invalid_params\\\": /etc is not a regular file\"}";
+        assertEquals("Not a file (a folder?)", FileDocument.parse("/etc", 0, dir).error);
+        String big = "{\"queued\":false,\"error\":\"\\\"invalid_params\\\": /v/big.log is over 8 MB\"}";
+        assertEquals("Too large to open (over 8 MB)", FileDocument.parse("/v/big.log", 0, big).error);
+    }
+
     @Test public void theMarkedLineScrollsWithContextAbove() throws Exception {
         StringBuilder text = new StringBuilder();
         for (int i = 0; i < 100; i++) text.append("l").append(i).append('\n');
