@@ -49,7 +49,24 @@ dump() { # -> a FRESH $EMU_OUT/ui.xml (retried: uiautomator is flaky right after
     done
     return 1
 }
-find_ui() { dump && $ui find "$EMU_OUT/ui.xml" "$1"; }
+# A system "isn't responding" dialog (System UI on a small, busy guest) covers the app and hides
+# its controls from the dump: wait it out (Wait, never Close app) and let the caller look again.
+dismiss_anr() {
+    local hit
+    hit=$($ui find "$EMU_OUT/ui.xml" "isn.t responding" 2> /dev/null) || return 1
+    echo "[anr] $($ui text "$EMU_OUT/ui.xml" "isn.t responding" 2> /dev/null)" >> "$EMU_OUT/anr.log"
+    hit=$($ui find "$EMU_OUT/ui.xml" '^Wait$' 2> /dev/null) || return 1
+    local x y; read -r x y <<< "$hit"
+    a shell input tap "$x" "$y"
+    sleep 2
+    return 0
+}
+find_ui() {
+    dump || return 1
+    $ui find "$EMU_OUT/ui.xml" "$1" && return 0
+    dismiss_anr
+    return 1
+}
 wait_ui() { # regex [seconds=25]  -> "x y"
     local end=$((SECONDS + ${2:-25})) hit
     while (( SECONDS < end )); do
@@ -228,6 +245,36 @@ a shell settings put global animator_duration_scale 0
 a shell input keyevent KEYCODE_WAKEUP
 a shell wm dismiss-keyguard
 launch() { a shell am force-stop "$pkg"; a shell am start -n "$pkg/dev.herdr.android.HomeActivity" > /dev/null; }
+# The throwaway AVD does not need Google's background services, and on a small guest they are what
+# makes System UI stop responding: disable the ones present (this user only, undone with the AVD).
+for svc in com.android.vending com.google.android.gms com.google.android.gsf \
+    com.google.android.googlequicksearchbox com.google.android.apps.youtube.music com.google.android.youtube; do
+    a shell pm list packages "$svc" 2> /dev/null | grep -q "package:$svc\$" \
+        && a shell pm disable-user --user 0 "$svc" > /dev/null 2>&1
+done
+# A just-booted guest is still busy (System UI ANRs on the first dumps). Wait until boot has
+# completed, the package manager answers, and 30 s pass with a fresh dump showing no "isn't
+# responding" window; each one met is dismissed with Wait and counted. Up to 150 s.
+settle_ui() {
+    local end=$((SECONDS + 150)) calm_since=-1 anrs=0
+    while (( SECONDS < end )); do
+        if [[ "$(a shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" == 1 ]] \
+            && a shell cmd package list packages > /dev/null 2>&1 && dump; then
+            if dismiss_anr; then anrs=$((anrs + 1)); calm_since=-1
+            elif (( calm_since < 0 )); then calm_since=$SECONDS
+            elif (( SECONDS - calm_since >= 30 )); then
+                (( anrs > 0 )) && record settle WARN "$anrs System UI/Play ANR dialog(s) were dismissed with Wait while the guest settled (anr.log)"
+                return 0
+            fi
+        else
+            calm_since=-1
+        fi
+        sleep 3
+    done
+    record settle WARN "the guest did not stay calm for 30 s within 150 s ($anrs ANR dialog(s) dismissed); continuing"
+    return 1
+}
+settle_ui || true
 
 # Device key: create it in Hosts, copy its public key, paste it into a text field to read it back.
 launch
@@ -237,7 +284,10 @@ tap_ui 'Hosts and keys' 4 || true
 tap_ui 'Create a new device SSH key' 20 || { record device-key FAIL "no Create key"; shot device-key-fail; exit 1; }
 quiet 2
 tap_ui 'Copy the device SSH public key' 15 || { record device-key FAIL "no Copy public key"; shot device-key-fail; exit 1; }
-tap_ui '^Add host$' 15 || { record device-key FAIL "no Add host"; exit 1; }
+# "Add host" is on the Remote hosts screen; give Home time to render, wait out ANR dialogs, and if the
+# screen is not Remote hosts yet open the overflow again.
+tap_ui '^Add host$' 20 || { tap_ui 'Hosts, device key and settings' 20 && tap_ui '^Add host$' 30; } \
+    || { record device-key FAIL "no Add host (see device-key-fail.png, ui.xml, anr.log)"; shot device-key-fail; exit 1; }
 tap_ui 'SSH hostname or IP' 15 || { record device-key FAIL "no host field"; exit 1; }
 a shell input keyevent KEYCODE_PASTE
 quiet 1
@@ -537,6 +587,9 @@ keyboard_cycle hide-control hide
 keyboard_cycle back-key back
 keyboard_cycle ime-nav-key navkey
 
+if [[ -s "$EMU_OUT/anr.log" ]]; then
+    record anr WARN "$(wc -l < "$EMU_OUT/anr.log") ANR dialog(s) were dismissed with Wait during the run (anr.log)"
+fi
 peak=$($ui mem 2> /dev/null)
 record memory PASS "job cgroup at the end: $peak (samples in rss.log; the cap is 6144 MiB)"
 shot final
