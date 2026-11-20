@@ -4933,14 +4933,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             cameraFile = CaptureFiles.create(getCacheDir(), System.currentTimeMillis());
             android.net.Uri target = android.net.Uri.parse(
                     "content://" + getPackageName() + ".capture/" + cameraFile.getName());
-            startActivityForResult(AttachImages.cameraIntent(target), AttachImages.CAMERA_REQUEST);
+            android.content.Intent intent = AttachImages.cameraIntent(target, getPackageManager());
+            if (intent != null) {
+                startActivityForResult(intent, AttachImages.CAMERA_REQUEST);
+                return;
+            }
         } catch (android.content.ActivityNotFoundException none) {
-            dropCapture();
-            note("No camera app on this phone");
+            // A matching camera can disappear before launch.
         } catch (java.io.IOException | RuntimeException failed) {
             dropCapture();
             note("The camera could not start");
+            return;
         }
+        dropCapture();
+        note("No camera app on this phone");
     }
 
     /** A capture that never started: only its own file goes (another shot's may still be uploading). */

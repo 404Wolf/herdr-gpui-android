@@ -4,6 +4,7 @@ import android.content.ClipData;
 import android.content.ClipDescription;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
@@ -17,6 +18,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 /**
  * The Android side of attaching an image ({@link ImageAttach} holds the rules): the intents that
@@ -32,6 +35,9 @@ final class AttachImages {
     static final int PICK_REQUEST = 42, CAMERA_REQUEST = 43;
     private static final int SHRUNK_SIDE = 4096;
     private static final int[] JPEG_QUALITIES = {90, 75, 60, 45, 30};
+    private static final String[] CAMERA_PACKAGES = {
+        "com.google.android.GoogleCamera", "app.grapheneos.camera", "org.lineageos.aperture"
+    };
 
     private AttachImages() { }
 
@@ -69,13 +75,29 @@ final class AttachImages {
 
     /**
      * The camera app's intent, writing into this app's private capture file through a URI granted to
-     * it for this one capture ({@link CaptureProvider}); nothing reaches the gallery.
+     * it for this one capture ({@link CaptureProvider}), or null if no camera matches.
      */
-    static Intent cameraIntent(Uri target) {
+    static Intent cameraIntent(Uri target, PackageManager packages) {
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, target)
                 .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
         intent.setClipData(ClipData.newRawUri("capture", target));
-        return intent;
+        int implicitMatches = packages.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY).size();
+        return resolveCamera(intent, implicitMatches, capture -> Intent.createChooser(capture, null), name -> {
+            // Android 11+ limits implicit capture to preinstalled system camera apps.
+            Intent targeted = new Intent(intent).setPackage(name);
+            return targeted.resolveActivity(packages) == null ? null : targeted;
+        });
+    }
+
+    static <T> T resolveCamera(T intent, int implicitMatches, UnaryOperator<T> chooser,
+            Function<String, T> targetedCamera) {
+        if (implicitMatches == 1) return intent;
+        if (implicitMatches > 1) return chooser.apply(intent);
+        for (String name : CAMERA_PACKAGES) {
+            T targeted = targetedCamera.apply(name);
+            if (targeted != null) return targeted;
+        }
+        return null;
     }
 
     /** The URIs a picker returned: its clip, or its single data. */

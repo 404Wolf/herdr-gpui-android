@@ -18,6 +18,10 @@
         <intent>
             <action android:name="android.media.action.IMAGE_CAPTURE" />
         </intent>
+        <!-- Package visibility for cameras tried when implicit capture has no match. -->
+        <package android:name="com.google.android.GoogleCamera" />
+        <package android:name="app.grapheneos.camera" />
+        <package android:name="org.lineageos.aperture" />
     </queries>
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="false" />
