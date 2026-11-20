@@ -38,7 +38,9 @@ fi
 export EMU_APK
 [[ -f "$EMU_APK" ]] || die "APK is missing: $EMU_APK"
 
-emu_home=$(mktemp -d)
+# Android jobs put TMPDIR on disk to make room for the AVD's userdata.
+emu_home=$(mktemp -d --tmpdir herdr-emu.XXXXXXXX)
+emu_home=$(realpath -- "$emu_home")
 emu_pid=
 adb_pid=
 test_pid=

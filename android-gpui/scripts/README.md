@@ -64,7 +64,8 @@ with KVM:
 nix develop .#android-emu -c scripts/emu-test.sh scripts/emu-tests/smoke.sh
 ```
 
-The runner builds an x86-64 debug APK by default. Pass a compatible APK as the
+The runner creates the AVD under `TMPDIR`, which Slurm puts on disk for Android
+jobs. It builds an x86-64 debug APK by default. Pass a compatible APK as the
 second argument to skip the build. The test script runs from the caller's
 working directory with `ADB_SERIAL` set to the disposable API 34 emulator and
 `EMU_APK` set to the installed APK path. Write test artifacts to `EMU_OUT`, the
