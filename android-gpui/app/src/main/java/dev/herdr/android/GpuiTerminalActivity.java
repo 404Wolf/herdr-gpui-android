@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 
 import android.app.AlertDialog;
 import android.content.ClipData;
+import android.content.ClipDescription;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.content.res.ColorStateList;
@@ -5008,7 +5009,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         sources.add(AttachImages.uriSource(getContentResolver(), item.getUri()));
                     }
                 } else if (rest == null) {
-                    rest = new ClipData(clip.getDescription(), item);
+                    rest = new ClipData(new ClipDescription(clip.getDescription()), item);
                 } else {
                     rest.addItem(item);
                 }
@@ -5031,7 +5032,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean isImageUri(Uri uri) {
         try {
             String mime = getContentResolver().getType(uri);
-            return mime != null && android.content.ClipDescription.compareMimeTypes(mime, "image/*");
+            return mime != null && ClipDescription.compareMimeTypes(mime, "image/*");
         } catch (RuntimeException unavailable) {
             return false;
         }

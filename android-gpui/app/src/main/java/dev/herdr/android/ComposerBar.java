@@ -1423,6 +1423,18 @@ final class ComposerBar {
                 super.onSelectionChanged(start, end);
                 if (typing) pushGhost();
             }
+
+            @android.annotation.TargetApi(31)
+            @Override public ContentInfo onReceiveContent(ContentInfo payload) {
+                // The platform inserts a separate newline between clipboard items.
+                boolean wasInsertingNewline = insertingNewline;
+                insertingNewline = true;
+                try {
+                    return super.onReceiveContent(payload);
+                } finally {
+                    insertingNewline = wasInsertingNewline;
+                }
+            }
         };
         edit.setSaveEnabled(false);
         edit.setTextSize(14);
