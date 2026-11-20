@@ -16,9 +16,11 @@ through a job-local `adb reverse`), provisions a host at `10.0.2.2`, and creates
 the app and reads it back through the UI to authorize it.
 
 Memory: the job has a 6 GiB cap, so the emulator guest gets 3 GiB (`EMU_MEMORY` overrides it, in
-`scripts/emu-test.sh`) and the column count is changed with `wm density`, never `wm size` (a wider
-framebuffer pushed the job over the cap). `rss.log` holds the job cgroup's memory and its biggest
-processes every 5 s, and a `memory` row in `summary.tsv` shows the figures at the end.
+`scripts/emu-test.sh`). The narrow case uses `wm size` smaller than the default (a smaller
+framebuffer); the display density is never raised: density 900 made the renderer fail with
+"Texture with 'atlas' label is invalid" and stay black for the rest of a run. `rss.log` holds the job
+cgroup's memory and its biggest processes every 5 s, and a `memory` row in `summary.tsv` shows the
+figures at the end.
 
 Checks, in order: the recording controls at about 46 and 100 columns (display width is calibrated
 from the columns the renderer reports; a recording only counts when the fake server has sent a

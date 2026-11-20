@@ -354,28 +354,23 @@ fi
 cols_now() { a logcat -d -s herdr-tap > "$EMU_OUT/herdr-tap.log" 2>&1; $ui cols "$EMU_OUT/herdr-tap.log"; }
 
 # (a) recording controls at 46 and 98 columns
-# Sets the number of columns by display density, never by display size: a wider framebuffer made
-# the emulator's memory jump past the job's 6 GiB cap (OOM kills at the old 1700 px step), a lower
-# density gives the same columns at the same framebuffer. The density is rescaled from the columns the
-# renderer reports (herdr-tap layout lines) until they land in the target band; echoes the columns.
-DENSITY0=$(a shell wm density 2> /dev/null | sed -n 's/.*Physical density: *\([0-9]*\).*/\1/p' | head -1)
-DENSITY0=${DENSITY0:-420}
-DENSITY=$DENSITY0   # the density in force; global, because set_cols must not run in a subshell
+# Sets the pane's column count by display WIDTH (wm size, narrower than the default: a smaller
+# framebuffer, so no memory cost). Display density is left alone: density 900 (tried in 33e28c8)
+# made the renderer fail ("Texture with 'atlas' label is invalid") and stay black for the rest of
+# the run, and a low density opens the tablet rail. The width is rescaled from the columns the
+# renderer reports (herdr-tap layout lines); echoes nothing, sets COLS_NOW (no subshell).
 COLS_NOW=?
-set_cols() { # 46 (cover-like, band 44..48) or 98 (wide, band 96..110)
-    local target=$1 lo hi d=${DENSITY:-$DENSITY0} c i
-    if (( target <= 50 )); then lo=44; hi=48; else lo=96; hi=110; fi
-    c=$(cols_now) || c=
-    for i in 1 2 3 4 5 6; do
-        if [[ "$c" =~ ^[0-9]+$ ]]; then
-            (( c >= lo && c <= hi )) && { DENSITY=$d; COLS_NOW=$c; return 0; }
-            d=$(python3 -c "print(max(120, min(900, round($d * $c / $target))))")
-        fi
-        a shell wm density "$d"
+set_cols() { # 46: cover-like, band 44..48
+    local target=$1 w=${PPC_W:-760} c i
+    for i in 1 2 3 4; do
+        a shell wm size "${w}x2400"
         quiet 4
         c=$(cols_now) || c=
+        if [[ "$c" =~ ^[0-9]+$ ]]; then
+            if (( c >= target - 2 && c <= target + 2 )); then PPC_W=$w; COLS_NOW=$c; return 0; fi
+            w=$(python3 -c "print(max(500, min(1080, round($w * $target / $c))))")
+        fi
     done
-    DENSITY=$d
     COLS_NOW=${c:-?}
     return 1
 }
@@ -448,12 +443,10 @@ if [[ "$WIDE_COLS" =~ ^[0-9]+$ ]] && (( WIDE_COLS >= 56 )); then
 else
     record width-98 FAIL "the default density gave $WIDE_COLS columns (expected 56 or more)"
 fi
-DENSITY=$DENSITY0
 check_recording_controls 98cols
-if set_cols 46; then record width-46 PASS "$COLS_NOW columns (density $DENSITY)"; else record width-46 FAIL "got $COLS_NOW columns (density $DENSITY)"; fi
+if set_cols 46; then record width-46 PASS "$COLS_NOW columns (display ${PPC_W} px wide)"; else record width-46 FAIL "got $COLS_NOW columns"; fi
 check_recording_controls 46cols
-a shell wm density reset
-DENSITY=$DENSITY0
+a shell wm size reset
 quiet 4
 
 # Which pane is on screen: the strip's active tab, "Window N, <name>, current".
@@ -566,9 +559,9 @@ cancel_z() {
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
-    # The CURRENT draft must hold "seed fixture partial" (4 + 1 + 15 = 20 cells in the app's own
-    # layout) before the IME is opened or anything is typed.
-    if ! wait_draft_cells 20 20; then
+    # The CURRENT draft must hold "seed fixture partial" (4 + 1 + 15 = 20 characters; the layout's draft
+    # span adds the caret's cell, so 21) before the IME is opened or anything is typed.
+    if ! wait_draft_cells 21 20; then
         shot cancel-z-dictating
         record cancel-z FAIL "the draft does not hold 'seed fixture partial' (the app's layout says: $(layout_now)); Cancel was not exercised"
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
@@ -583,8 +576,8 @@ cancel_z() {
     a shell input text z
     quiet 1
     shot cancel-z-before
-    if ! wait_draft_cells 21 10; then
-        record cancel-z FAIL "after typing z the draft is not 21 cells (the app's layout says: $(layout_now)); Cancel was not exercised"
+    if ! wait_draft_cells 22 10; then
+        record cancel-z FAIL "after typing z the draft is not 22 cells (21 characters + the caret) (the app's layout says: $(layout_now)); Cancel was not exercised"
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
