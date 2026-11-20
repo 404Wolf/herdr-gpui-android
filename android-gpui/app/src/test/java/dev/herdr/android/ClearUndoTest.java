@@ -358,7 +358,7 @@ public final class ClearUndoTest {
     @Test public void anAttachmentUndoSurvivesRestartOnlyForItsOriginalRevision() {
         World w = new World();
         w.drafts.setHost("h", "revision-a", encoded -> true);
-        w.drafts.appendAttachment("h", "revision-a", "t1", "/herdr-paste-1.png ");
+        w.drafts.appendAttachment("h", "revision-a", "t1", java.util.Collections.singletonList("/herdr-paste-1.png"));
         new ClearUndo(w).tap(T1, true, now());
 
         Restarted r = w.restart();

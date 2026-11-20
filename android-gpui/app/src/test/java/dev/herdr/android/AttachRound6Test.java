@@ -9,13 +9,14 @@ import java.nio.file.Paths;
 import org.junit.Test;
 
 public final class AttachRound6Test {
-    private static final String PATH = "'/state & photos/herdr-core/default/files/t1/herdr-paste-123-2.png'";
+    private static final String RAW_PATH = "/state & photos/herdr-core/default/files/t1/herdr-paste-123-2.png";
+    private static final String PATH = "'" + RAW_PATH + "'";
 
     @Test public void replacingTheLastAttachmentReleasesTheDraftRevision() {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("host", "original", encoded -> true);
         drafts.switchTo("t1");
-        drafts.appendAttachment("host", "original", "t1", PATH + " ");
+        drafts.appendAttachment("host", "original", "t1", java.util.Collections.singletonList(RAW_PATH));
         drafts.edit("look at " + PATH);
         assertEquals("original", drafts.draftRevision());
 

@@ -46,18 +46,19 @@ public final class AttachRound5Test {
 
         ComposerDrafts drafts = new ComposerDrafts();
         select(drafts, original, "t1");
-        append(drafts, original, "t1", "'/host-a/herdr-paste-1.png' ");
+        drafts.appendAttachment(original.id, original.connectionRevision, "t1",
+                java.util.Collections.singletonList("/host-a photos/herdr-paste-1.png"));
         select(drafts, original, "t2");
         drafts.edit("plain text");
 
         ComposerDrafts restored = new ComposerDrafts();
         restored.restore(drafts.encode());
-        assertEquals("'/host-a/herdr-paste-1.png' ", select(restored, original, "t1"));
+        assertEquals("'/host-a photos/herdr-paste-1.png' ", select(restored, original, "t1"));
         assertEquals("plain text", select(restored, edited, "t2"));
         assertEquals("the old profile's saved attachment must not appear on the new computer",
                 "", select(restored, edited, "t1"));
         assertEquals("a late completion must not put the old path back", null,
-                restored.appendAttachment(original.id, original.connectionRevision, "t1", "/old.png "));
+                restored.appendAttachment(original.id, original.connectionRevision, "t1", java.util.Collections.singletonList("/old.png")));
     }
 
     @Test public void aPendingUploadChecksTheSavedConnectionRevisionBeforePutting() throws Exception {
@@ -86,10 +87,6 @@ public final class AttachRound5Test {
     private static String select(ComposerDrafts drafts, SavedRemoteHost host, String pane) {
         drafts.setHost(host.id, host.connectionRevision, encoded -> true);
         return drafts.switchTo(pane);
-    }
-
-    private static void append(ComposerDrafts drafts, SavedRemoteHost host, String pane, String paths) {
-        drafts.appendAttachment(host.id, host.connectionRevision, pane, paths);
     }
 
     private static String section(String name, String start, String end) throws Exception {

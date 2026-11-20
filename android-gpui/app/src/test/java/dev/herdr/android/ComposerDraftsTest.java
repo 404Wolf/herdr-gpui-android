@@ -5,6 +5,9 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import org.junit.Test;
 
 public final class ComposerDraftsTest {
@@ -13,44 +16,44 @@ public final class ComposerDraftsTest {
 
     @Test
     public void repointingRemovesAParenthesizedShellQuotedPath() {
-        String path = ImageAttach.quotePaths(java.util.Collections.singletonList(
-                "/state & 'photos/herdr-core/default/files/t1/herdr-paste-123-2.png"));
-        assertAttachmentRemoved(path, "Compare (" + path.trim() + ") with the last build.",
-                "Compare () with the last build.");
+        String path = "/state & 'photos/herdr-core/default/files/t1/herdr-paste-123-2.png";
+        assertAttachmentRemoved(Collections.singletonList(path),
+                "Compare (" + ImageAttach.quotePath(path) + ") with [" + path + "].", "Compare () with [].");
     }
 
     @Test
     public void repointingKeepsQuotesTheUserAdded() {
-        assertAttachmentRemoved(IMAGE + " ", "Compare \"" + IMAGE + "\" to the last build.",
-                "Compare \"\" to the last build.");
+        assertAttachmentRemoved(Collections.singletonList(IMAGE),
+                "Compare \"" + IMAGE + "\" and '" + IMAGE + "' to the last build.",
+                "Compare \"\" and '' to the last build.");
     }
 
     @Test
     public void repointingKeepsATrailingComma() {
-        assertAttachmentRemoved(IMAGE + " ", "Compare " + IMAGE + ", then review the result.",
+        assertAttachmentRemoved(Collections.singletonList(IMAGE), "Compare " + IMAGE + ", then review the result.",
                 "Compare , then review the result.");
     }
 
     @Test
     public void repointingKeepsATrailingPeriod() {
-        assertAttachmentRemoved(IMAGE + " ", "Compare " + IMAGE + ".", "Compare .");
+        assertAttachmentRemoved(Collections.singletonList(IMAGE), "Compare " + IMAGE + ".", "Compare .");
     }
 
     @Test
     public void repointingFindsPathsAtBothEndsOfTheDraft() {
         String second = STAGING + "herdr-paste-456.gif";
-        assertAttachmentRemoved(IMAGE + " " + second + " ",
-                IMAGE + ":compare with=" + second, ":compare with=");
+        assertAttachmentRemoved(Arrays.asList(IMAGE, second), IMAGE + ":compare with=" + second, ":compare with=");
     }
 
     @Test
     public void repointingRemovesTwoAdjacentPathsAndKeepsAdjacentText() {
         String second = STAGING + "herdr-paste-456-2.webp";
-        assertAttachmentRemoved(IMAGE + " " + second + " ",
-                "before/notes:" + IMAGE + second + "after", "before/notes:after");
+        String reference = "/reference/herdr-paste-456-2.webp";
+        assertAttachmentRemoved(Arrays.asList(IMAGE, second),
+                "before/notes:" + IMAGE + second + "after " + reference, "before/notes:after " + reference);
     }
 
-    private static void assertAttachmentRemoved(String paths, String edited, String remaining) {
+    private static void assertAttachmentRemoved(List<String> paths, String edited, String remaining) {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("host", "original", encoded -> true);
         drafts.switchTo("t1");
@@ -77,7 +80,7 @@ public final class ComposerDraftsTest {
         drafts.setHost("host", "original", encoded -> true);
         drafts.switchTo("t1");
         drafts.edit(prompt);
-        drafts.appendAttachment("host", "original", "t1", path + " ");
+        drafts.appendAttachment("host", "original", "t1", Collections.singletonList(path));
         drafts.edit(prompt);
         assertNull(drafts.draftRevision());
 
@@ -92,10 +95,10 @@ public final class ComposerDraftsTest {
 
     @Test
     public void repointingKeepsThePromptAndRemovesEveryGeneratedPath() {
-        String paths = ImageAttach.quotePaths(java.util.Arrays.asList(
+        List<String> paths = Arrays.asList(
                 "/state & 'photos/herdr-core/default/files/t1/herdr-paste-123-2.png",
-                "/other/files/t1/herdr-paste-124.jpg"));
-        String prompt = "Compare " + paths + "with /tmp/reference.png.\nKeep the 'second panel'.";
+                "/other/files/t1/herdr-paste-124.jpg");
+        String prompt = "Compare " + ImageAttach.quotePaths(paths) + "with /tmp/reference.png.\nKeep the 'second panel'.";
         String expected = "Compare   with /tmp/reference.png.\nKeep the 'second panel'.";
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("host", "original", encoded -> true);

@@ -171,9 +171,13 @@ final class ImageAttach {
     static String quotePaths(List<String> paths) {
         StringBuilder out = new StringBuilder();
         for (String path : paths) {
-            out.append(plain(path) ? path : "'" + path.replace("'", "'\\''") + "'").append(' ');
+            out.append(quotePath(path)).append(' ');
         }
         return out.toString();
+    }
+
+    static String quotePath(String path) {
+        return plain(path) ? path : "'" + path.replace("'", "'\\''") + "'";
     }
 
     private static boolean plain(String path) {

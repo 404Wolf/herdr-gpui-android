@@ -1,8 +1,15 @@
 package dev.herdr.android;
 
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 /**
  * The composer's local text, one draft per pane, so switching panes never loses
@@ -28,21 +35,67 @@ final class ComposerDrafts {
     /** A draft longer than this is not saved (it still lives while the app does). */
     static final int MAX_SAVED_CHARS = 64 * 1024;
 
+    // Fixed extensions let a match stop at the filename even when more letters follow it.
+    private static final String ATTACHMENT_FILENAME = "herdr-paste-[0-9]+(?:-[0-9]+)?\\.(?:png|jpg|gif|webp)";
+    // Older drafts and Undo records have no staging directories. Recover their absolute paths.
+    private static final Pattern LEGACY_ATTACHMENT_PATH = Pattern.compile(
+            "(?:'(?=/)(?:[^']*+'\\\\'')*+[^']*/" + ATTACHMENT_FILENAME
+                    + "'|(?<![-A-Za-z0-9/._+=,:@%~])/(?:[-A-Za-z0-9/._+=,:@%~]*?/)?" + ATTACHMENT_FILENAME + ")");
+
+    private static final class AttachmentPaths {
+        static final AttachmentPaths LEGACY = new AttachmentPaths(java.util.Collections.emptySet());
+        final Set<String> directories;
+        final Pattern pattern;
+
+        AttachmentPaths(Set<String> directories) {
+            this.directories = directories;
+            // An exact prefix preserves adjacent text that would also be valid in a shell path.
+            java.util.StringJoiner alternatives = new java.util.StringJoiner("|");
+            for (String directory : directories) {
+                String quoted = ImageAttach.quotePath(directory);
+                if (!quoted.equals(directory)) {
+                    alternatives.add(Pattern.quote(quoted.substring(0, quoted.length() - 1))
+                            + ATTACHMENT_FILENAME + "'");
+                }
+                alternatives.add(Pattern.quote(directory) + ATTACHMENT_FILENAME);
+            }
+            pattern = directories.isEmpty() ? LEGACY_ATTACHMENT_PATH : Pattern.compile(alternatives.toString());
+        }
+
+        AttachmentPaths withUploads(List<String> paths) {
+            Set<String> next = new LinkedHashSet<>(directories);
+            for (String path : paths) next.add(path.substring(0, path.lastIndexOf('/') + 1));
+            return next.equals(directories) ? this : new AttachmentPaths(next);
+        }
+
+        static AttachmentPaths restore(JSONArray saved) {
+            if (saved == null) return LEGACY;
+            Set<String> directories = new LinkedHashSet<>();
+            for (int i = 0; i < saved.length(); i++) {
+                String directory = saved.optString(i);
+                if (directory.startsWith("/") && directory.endsWith("/")) directories.add(directory);
+            }
+            return directories.isEmpty() ? LEGACY : new AttachmentPaths(directories);
+        }
+    }
+
     private static final class Draft {
         final String text;
         final String revision;
+        final AttachmentPaths attachments;
 
-        Draft(String text, String revision) {
+        Draft(String text, String revision, AttachmentPaths attachments) {
             this.text = text;
+            this.attachments = attachments;
             // Older saves can still carry a revision after the user removed the attachments.
-            this.revision = revision != null && hasUnversionedAttachment(text) ? revision : null;
+            this.revision = revision != null && attachments.pattern.matcher(text).find() ? revision : null;
         }
 
         Draft withoutAttachments() {
-            java.util.regex.Matcher paths = ATTACHMENT_PATH.matcher(text);
+            Matcher paths = attachments.pattern.matcher(text);
             if (!paths.find()) return this;
             String remaining = paths.replaceAll("");
-            return new Draft(remaining.trim().isEmpty() ? "" : remaining, null);
+            return new Draft(remaining.trim().isEmpty() ? "" : remaining, null, attachments);
         }
     }
 
@@ -72,16 +125,8 @@ final class ComposerDrafts {
     private java.util.List<long[]> liveMarks = new java.util.ArrayList<>();
 
     private static final char SEP = '\u0001';
-    // Match the whole bare or shell-quoted token emitted by ImageAttach.quotePaths, including
-    // escaped apostrophes in quoted directories, so removing it leaves the prompt intact.
-    // The core can add a numeric suffix when the generated filename is already taken.
-    private static final String ATTACHMENT_FILENAME = "/herdr-paste-[0-9]+(?:-[0-9]+)?\\.[a-z]+";
-    private static final java.util.regex.Pattern ATTACHMENT_PATH = java.util.regex.Pattern.compile(
-            "(?<!\\S)(?:'(?=/)(?:[^']*+'\\\\'')*+[^']*" + ATTACHMENT_FILENAME
-                    + "'|(?=/)[-A-Za-z0-9/._+=,:@%~]*" + ATTACHMENT_FILENAME + ")(?!\\S)");
-
     static boolean hasUnversionedAttachment(String text) {
-        return ATTACHMENT_PATH.matcher(text).find();
+        return LEGACY_ATTACHMENT_PATH.matcher(text).find();
     }
 
     /** The key a draft is kept under: the computer and its pane id together. */
@@ -164,7 +209,7 @@ final class ComposerDrafts {
     /** Every pane's draft (the dictation chips they hold must keep their recordings). */
     java.util.List<String> all() {
         java.util.List<String> texts = new java.util.ArrayList<>();
-        for (Draft draft : drafts.values()) texts.add(draft.text);
+        for (Draft draft : drafts.values()) if (!draft.text.isEmpty()) texts.add(draft.text);
         return texts;
     }
 
@@ -184,10 +229,17 @@ final class ComposerDrafts {
     }
 
     void edit(String text, String revision) {
-        Draft draft = new Draft(text == null ? "" : text, connectionRevision);
-        if (revision != null && !revision.equals(connectionRevision)) draft = draft.withoutAttachments();
-        if (draft.text.isEmpty()) drafts.remove(pane);
+        boolean stale = revision != null && !revision.equals(connectionRevision);
+        Draft draft = new Draft(text == null ? "" : text, connectionRevision,
+                stale ? AttachmentPaths.LEGACY : attachmentPaths(drafts.get(pane)));
+        if (stale) draft = draft.withoutAttachments();
+        // A cut can empty the field before paste puts the path back.
+        if (draft.text.isEmpty() && draft.attachments == AttachmentPaths.LEGACY) drafts.remove(pane);
         else drafts.put(pane, draft);
+    }
+
+    private static AttachmentPaths attachmentPaths(Draft draft) {
+        return draft == null ? AttachmentPaths.LEGACY : draft.attachments;
     }
 
     void dictationStarted() { dictationBase = text(); }
@@ -257,7 +309,8 @@ final class ComposerDrafts {
                 if (inBase != null) dictationBase = inBase;
             }
             if (filled.isEmpty()) drafts.remove(pane);
-            else draft.setValue(new Draft(filled, onHost(pane, host) ? connectionRevision : draft.getValue().revision));
+            else draft.setValue(new Draft(filled, onHost(pane, host) ? connectionRevision : draft.getValue().revision,
+                    draft.getValue().attachments));
             return rawPane(pane);
         }
         return null;
@@ -276,25 +329,26 @@ final class ComposerDrafts {
         String text = join(before, spoken);
         if (text.isEmpty()) return text;
         if (key.equals(this.pane) && dictationBase != null) dictationBase = join(dictationBase, spoken);
-        drafts.put(key, new Draft(text, connectionRevision));
+        drafts.put(key, new Draft(text, connectionRevision, attachmentPaths(draft)));
         for (int at : placed(before, spoken, cuts)) mark(key, text, at);
         return text;
     }
 
     /**
-     * Adds an attachment's quoted paths (they end in a space, as the desktop types them) to the end
+     * Adds an attachment's paths, shell-quoted with a trailing space as on desktop, to the end
      * of the draft of {@code pane} on {@code onHost}, a space after what is already there; never
      * sent. While a dictation is in progress the paths also join its base, so the next partial or
      * final transcript keeps them.
      */
-    String appendAttachment(String onHost, String revision, String pane, String paths) {
+    String appendAttachment(String onHost, String revision, String pane, List<String> uploaded) {
         if (host.equals(onHost) && !Objects.equals(revision, connectionRevision)) return null;
         String key = key(onHost, pane);
         Draft draft = drafts.get(key);
         if (draft != null && draft.revision != null && !draft.revision.equals(revision)) return null;
         String before = draft == null ? null : draft.text;
+        String paths = ImageAttach.quotePaths(uploaded);
         String text = joinAttachment(before, paths);
-        drafts.put(key, new Draft(text, revision));
+        drafts.put(key, new Draft(text, revision, attachmentPaths(draft).withUploads(uploaded)));
         if (key.equals(this.pane) && dictationBase != null) dictationBase = joinAttachment(dictationBase, paths);
         return text;
     }
@@ -445,13 +499,20 @@ final class ComposerDrafts {
 
     /** Each pane's draft, oldest first, for saving; at most {@link #MAX_PANES}. */
     String encode() {
-        org.json.JSONObject out = new org.json.JSONObject();
+        JSONObject out = new JSONObject();
         try {
             for (Map.Entry<String, Draft> entry : drafts.entrySet()) {
                 Draft draft = entry.getValue();
-                if (draft.text.length() > MAX_SAVED_CHARS) continue;
-                out.put(entry.getKey(), draft.revision == null ? draft.text : new org.json.JSONObject()
-                        .put("text", draft.text).put("revision", draft.revision));
+                if (draft.text.isEmpty() || draft.text.length() > MAX_SAVED_CHARS) continue;
+                if (draft.revision == null && draft.attachments == AttachmentPaths.LEGACY) {
+                    out.put(entry.getKey(), draft.text);
+                } else {
+                    JSONObject saved = new JSONObject().put("text", draft.text).put("revision", draft.revision);
+                    if (draft.attachments != AttachmentPaths.LEGACY) {
+                        saved.put("staging", new JSONArray(draft.attachments.directories));
+                    }
+                    out.put(entry.getKey(), saved);
+                }
             }
         } catch (org.json.JSONException impossible) {
             return "{}";
@@ -497,23 +558,26 @@ final class ComposerDrafts {
         if (saved == null || saved.isEmpty()) return;
         Map<String, Draft> typed = new LinkedHashMap<>(drafts);
         try {
-            org.json.JSONObject in = new org.json.JSONObject(saved);
+            JSONObject in = new JSONObject(saved);
             for (java.util.Iterator<String> keys = in.keys(); keys.hasNext(); ) {
                 String key = keys.next();
                 Object value = in.opt(key);
                 String text;
                 String revision = null;
-                if (value instanceof org.json.JSONObject) {
-                    org.json.JSONObject savedDraft = (org.json.JSONObject) value;
+                AttachmentPaths attachments = AttachmentPaths.LEGACY;
+                if (value instanceof JSONObject) {
+                    JSONObject savedDraft = (JSONObject) value;
                     text = savedDraft.optString("text", "");
                     revision = savedDraft.optString("revision", "");
+                    attachments = AttachmentPaths.restore(savedDraft.optJSONArray("staging"));
                 } else if (value instanceof String) {
                     text = (String) value;
                 } else continue;
                 if (key.isEmpty() || text.isEmpty() || text.length() > MAX_SAVED_CHARS) continue;
                 boolean unowned = revision == null || revision.isEmpty() || key.indexOf(SEP) < 0;
                 boolean foreign = onHost(key, host) && !Objects.equals(revision, connectionRevision);
-                Draft draft = unowned || foreign ? new Draft(text, null).withoutAttachments() : new Draft(text, revision);
+                Draft draft = unowned || foreign ? new Draft(text, null, attachments).withoutAttachments()
+                        : new Draft(text, revision, attachments);
                 if (!draft.text.isEmpty()) drafts.put(key, draft);
             }
         } catch (org.json.JSONException damaged) {

@@ -482,7 +482,7 @@ final class ComposerBar {
      * after what is there, one after them, as the desktop's paste types them), saved at once.
      * Nothing is sent. False when the draft could not be saved (left as it was).
      */
-    boolean appendAttachment(String hostId, String revision, String pane, String paths) {
+    boolean appendAttachment(String hostId, String revision, String pane, java.util.List<String> paths) {
         Object before = drafts.snapshot();
         String draft = drafts.appendAttachment(hostId, revision, pane, paths);
         if (draft == null) return false;

@@ -69,10 +69,10 @@ public final class AttachWiringTest {
 
     @Test public void attachedPathsJoinTheDraftWithASpaceAndKeepTheirTrailingSpace() {
         ComposerDrafts drafts = new ComposerDrafts();
-        assertEquals("/a/b.png ", drafts.appendAttachment("", null, "t1", "/a/b.png "));
-        assertEquals("/a/b.png /c.jpg ", drafts.appendAttachment("", null, "t1", "/c.jpg "));
+        assertEquals("/a/b.png ", drafts.appendAttachment("", null, "t1", java.util.Collections.singletonList("/a/b.png")));
+        assertEquals("/a/b.png /c.jpg ", drafts.appendAttachment("", null, "t1", java.util.Collections.singletonList("/c.jpg")));
         drafts.append("t3", "look at");
-        assertEquals("look at /d.png ", drafts.appendAttachment("", null, "t3", "/d.png "));
+        assertEquals("look at /d.png ", drafts.appendAttachment("", null, "t3", java.util.Collections.singletonList("/d.png")));
     }
 
     @Test public void aSharedImageWaitsForAnAgentAndIsForgottenAfterTenMinutes() throws Exception {

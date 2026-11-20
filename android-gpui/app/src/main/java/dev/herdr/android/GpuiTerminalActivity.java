@@ -5126,8 +5126,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (!outcome.paths.isEmpty()) {
             boolean kept = composer != null
-                    && composer.appendAttachment(target.host, target.revision, target.pane,
-                            ImageAttach.quotePaths(outcome.paths));
+                    && composer.appendAttachment(target.host, target.revision, target.pane, outcome.paths);
             int n = outcome.paths.size();
             note(!kept ? "The image arrived but the draft could not be saved"
                     : outcome.failures.isEmpty() ? (n == 1 ? "Image attached" : n + " images attached")

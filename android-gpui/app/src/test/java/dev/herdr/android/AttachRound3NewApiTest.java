@@ -16,7 +16,7 @@ public final class AttachRound3NewApiTest {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("hostA", "revision-a", encoded -> true);
         drafts.switchTo("t1");
-        drafts.appendAttachment("hostA", "revision-a", "t1", "/a/files/t1/herdr-paste-1.png ");
+        drafts.appendAttachment("hostA", "revision-a", "t1", java.util.Collections.singletonList("/a/files/t1/herdr-paste-1.png"));
         drafts.setHost("hostB");
         drafts.switchTo("t1");
         assertEquals("B's t1 has its own, empty draft", "", drafts.text());
@@ -31,7 +31,7 @@ public final class AttachRound3NewApiTest {
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.setHost("hostB");
         drafts.switchTo("t1");
-        drafts.appendAttachment("hostA", "revision-a", "t1", "/a/herdr-paste-1.png ");
+        drafts.appendAttachment("hostA", "revision-a", "t1", java.util.Collections.singletonList("/a/herdr-paste-1.png"));
         assertEquals("", drafts.text());
         drafts.setHost("hostA", "revision-a", encoded -> true);
         drafts.switchTo("t1");
@@ -42,7 +42,7 @@ public final class AttachRound3NewApiTest {
         ComposerDrafts first = new ComposerDrafts();
         first.setHost("hostA", "revision-a", encoded -> true);
         first.switchTo("t1");
-        first.appendAttachment("hostA", "revision-a", "t1", "/a/herdr-paste-1.png ");
+        first.appendAttachment("hostA", "revision-a", "t1", java.util.Collections.singletonList("/a/herdr-paste-1.png"));
         first.setHost("hostB");
         first.switchTo("t1");
         first.edit("b text");

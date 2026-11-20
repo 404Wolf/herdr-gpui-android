@@ -39,7 +39,7 @@ public final class AttachRound3Test {
         drafts.switchTo("t1");
         drafts.dictationStarted();
         drafts.dictationPartial("describe this");
-        drafts.appendAttachment("", null, "t1", "/run/t1/herdr-paste-1.png ");
+        drafts.appendAttachment("", null, "t1", java.util.Collections.singletonList("/run/t1/herdr-paste-1.png"));
         String partial = drafts.dictationPartial("describe this screenshot");
         assertTrue(partial, partial.contains("/run/t1/herdr-paste-1.png"));
         String done = drafts.dictationFinal("describe this screenshot please");
