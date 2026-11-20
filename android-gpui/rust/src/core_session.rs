@@ -2907,7 +2907,7 @@ mod connection_tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    fn frame(socket: &mut UnixStream, decoder: &mut Decoder) -> Frame {
+    pub(super) fn frame(socket: &mut UnixStream, decoder: &mut Decoder) -> Frame {
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(frame) = decoder.next().unwrap() {
@@ -5004,7 +5004,7 @@ mod focus_review_tests {
 
     /// After an automatic reconnect attached with an old idle_ms: focused,
     /// not yet visible, waiting for the view's measured RESIZE.
-    fn awaiting_measurement(owner: &Arc<Session>) -> (Connection<'_>, UnixStream) {
+    pub(super) fn awaiting_measurement(owner: &Arc<Session>) -> (Connection<'_>, UnixStream) {
         let (socket, peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         let connection = Connection {
@@ -5602,17 +5602,19 @@ mod cache_tests {
         crate::remote::register_for_test(session.clone());
         stream(&session, &tx, 9, 60);
         let free = Arc::new(Mutex::new(Vec::new()));
+        let watched = lock(&session.state).agent_watched().unwrap();
         let (seen, probe_session, probe_terminal) = (free.clone(), session.clone(), terminal.clone());
         crate::snapshot::probe::set("encode", move || {
             let state = probe_session.state.try_lock().is_ok();
             let grid = probe_terminal.grid().try_lock_unfair().is_some();
-            lock(&seen).push((state, grid));
+            let watched = watched.try_lock().is_ok();
+            lock(&seen).push((state, grid, watched));
         });
         crate::remote::scroll_local(7823, 3, paint_args(0)).unwrap();
         crate::snapshot::probe::clear();
         let free = lock(&free).clone();
         assert!(!free.is_empty(), "no copy was assembled");
-        assert!(free.iter().all(|(state, grid)| *state && *grid), "a lock the poll takes was held while the copy was assembled: {free:?}");
+        assert!(free.iter().all(|(state, grid, watched)| *state && *grid && *watched), "a lock the poll takes was held while the copy was assembled: {free:?}");
         crate::remote::close(7823);
         crate::remote::release_held();
     }
@@ -5840,10 +5842,18 @@ mod cache_tests {
         // About 1 MiB of history kept for it.
         let rows: Vec<crate::transcript::Row> = (0..30_000).map(|n| crate::transcript::Row::plain(&line(n))).collect();
         crate::remote::adopt_for_test(&session, crate::transcript::Transcript::restored(rows, 0, COLS.into()));
-        let started = Instant::now();
+        let watched = lock(&session.state).agent_watched().unwrap();
+        let (locked, acquired) = mpsc::sync_channel(0);
+        let (closed, returned) = mpsc::sync_channel(1);
+        let locker = std::thread::spawn(move || {
+            let _guard = lock(&watched);
+            locked.send(()).unwrap();
+            returned.recv_timeout(Duration::from_secs(10))
+        });
+        acquired.recv_timeout(Duration::from_secs(10)).unwrap();
         crate::remote::close(7793);
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(20), "close took {took:?}");
+        closed.send(()).unwrap();
+        assert!(locker.join().unwrap().is_ok(), "close waited for the watched lock");
         // The held frame becomes the phone's copy soon after, on another thread.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -5872,6 +5882,125 @@ mod cache_tests {
         assert!(sent_data(&sent), "the program got no wheel input");
         crate::remote::close(7794);
         crate::remote::release_held();
+    }
+
+    // ---- Review round 5 (#43, 7be52c0) ----
+
+    #[test]
+    fn ask2_pid_loss_during_encoding_cancels_the_reader() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7921, "core", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let invalidated = session.clone();
+        crate::snapshot::probe::set("encode", move || {
+            set_pane(&invalidated, json!({"pid": null}));
+            crate::remote::keep_local(&invalidated, &mut lock(&invalidated.state));
+        });
+        crate::remote::scroll_local(7921, 3, paint_args(0)).unwrap();
+        crate::snapshot::probe::clear();
+        let installed = lock(&session.state).local.reader_for_test().is_some();
+        crate::remote::close(7921);
+        crate::remote::release_held();
+        assert!(!installed, "a reader built before PID loss came back after it");
+    }
+
+    #[test]
+    fn ask2_a_missing_pid_published_between_polls_ends_watching() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7924, "core", terminal, "done");
+        stream(&session, &tx, 9, 40);
+        let (mut connection, mut peer) = focus_review_tests::awaiting_measurement(&session);
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut decoder = Decoder::default();
+            for pid in [Value::Null, json!(crate::remote::TEST_PID)] {
+                for expected in ["terminal.list", "doc.get", "doc.get"] {
+                    let frame = connection_tests::frame(&mut peer, &mut decoder);
+                    let request: Value = serde_json::from_slice(&frame.bytes).unwrap();
+                    assert_eq!(request["method"], expected);
+                    let result = if expected == "terminal.list" {
+                        json!({"terminals":[{"address":"t1","state":"live","pid":pid,
+                            "created_ms":0,"labels":{"agent.kind":"claude"}}]})
+                    } else {
+                        json!({"value":null})
+                    };
+                    let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                    write_frame(&mut peer, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
+                }
+            }
+        });
+        connection.refresh().unwrap();
+        connection.refresh().unwrap();
+        responder.join().unwrap();
+        assert!(crate::remote::transcript_rows(&session).is_none(),
+            "a matching list restored rows after a published PID loss between polls");
+    }
+
+    #[test]
+    fn ask2_replacement_pty_has_a_different_input_target_from_its_attach() {
+        let (terminal, _tx, _sent) = full_screen();
+        let session = owner(7925, "same-core", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        let poll = || serde_json::from_str::<Value>(&crate::remote::poll(7925, 0, false).unwrap()).unwrap();
+        let first = poll();
+        crate::remote::reattach_for_test(&session, &json!({"pid": crate::remote::TEST_PID + 1, "created_ms": 0}));
+        let replacement = poll();
+        crate::remote::close(7925);
+        crate::remote::release_held();
+        assert_eq!(first["pane_id"], replacement["pane_id"]);
+        assert_eq!(first["boot_id"], replacement["boot_id"]);
+        assert_ne!(first["attach_identity"], replacement["attach_identity"],
+            "a reconnect to a replacement PTY cannot distinguish its input from the previous PTY");
+    }
+
+    fn wheel_input(sent: &mpsc::Receiver<Operation>) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Operation::Frame(_, DATA, bytes) = sent.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
+                return bytes;
+            }
+        }
+    }
+
+    #[test]
+    fn ask2_reversing_before_the_program_repaints_sends_each_reverse_report() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7922, "core", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        at_copy_top(7922, &session);
+        crate::remote::scroll_local(7922, 3, paint_args(0)).unwrap();
+        let up = wheel_input(&sent);
+        let mut sent_to_program = 0;
+        for _ in 0..3 {
+            let outcome: Value = serde_json::from_str(&crate::remote::scroll_local(7922, -1, paint_args(0)).unwrap()).unwrap();
+            if outcome["local"] != true {
+                let bytes = wheel_input(&sent);
+                sent_to_program += String::from_utf8_lossy(&bytes).matches("\x1b[<65;").count();
+            }
+        }
+        crate::remote::close(7922);
+        crate::remote::release_held();
+        assert_eq!(String::from_utf8_lossy(&up).matches("\x1b[<64;").count(), 3);
+        assert_eq!(sent_to_program, 3, "the old frame swallowed reverse wheel reports");
+    }
+
+    #[test]
+    fn ask2_first_wheel_does_not_let_the_next_poll_replace_the_live_observation() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7923, "core", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 40, 40);
+        crate::remote::scroll_local(7923, 3, paint_args(0)).unwrap();
+        let bytes = wheel_input(&sent);
+        assert_eq!(String::from_utf8_lossy(&bytes).matches("\x1b[<64;").count(), 3);
+        stream(&session, &tx, 20, 20);
+        let copy = crate::remote::copy_pane(7923, "t1").unwrap().unwrap();
+        crate::remote::close(7923);
+        crate::remote::release_held();
+        assert!(String::from_utf8_lossy(&copy).contains(&line(40)), "the first wheel made the save lose the newest live row");
     }
 
     // ---- Review round 4 (#43, f6c193f) ----

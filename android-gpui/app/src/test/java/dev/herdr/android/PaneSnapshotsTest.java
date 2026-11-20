@@ -221,6 +221,41 @@ public final class PaneSnapshotsTest {
         assertArrayEquals(TRANSCRIPT, natives.opened.get(0));
     }
 
+    @Test public void ask2AnOfflineUpgradeAdoptsTheCopyOnlyForTheOriginalRevision() throws Exception {
+        File old = dir.newFolder("old-panes");
+        File folder = dir.newFolder("sealed-panes");
+        File plain = new File(old, PaneSnapshots.name("host", "t1").replace(".snap2", ".snap"));
+        byte[] saved = "{\"v\":1,\"cols\":80,\"rows\":24,\"pane\":\"t1\"}\nprevious grid"
+                .getBytes(StandardCharsets.UTF_8);
+        Files.write(plain.toPath(), saved);
+        SecretKey key = CacheSeal.newKey();
+        FakeNative natives = new FakeNative();
+        snapshots(folder, key, natives).migrate(old);
+        // Reopen the store, as after a process restart with no network.
+        PaneSnapshots after = snapshots(folder, key, natives);
+        List<Long> shown = new ArrayList<>();
+        after.open(PaneSnapshots.computer("host", "revision-a"), "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        assertEquals("the adopted copy should open offline", Collections.singletonList(41L), shown);
+        assertArrayEquals(saved, natives.opened.get(0));
+        shown.clear();
+        after.open(PaneSnapshots.computer("host", "revision-b"), "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        assertEquals("an edit must not readopt the copy for the new revision", Collections.singletonList(-1L), shown);
+        assertFalse(plain.exists());
+    }
+
+    @Test public void ask2AnOldUnpinnedCopySurvivesAnUnrelatedSaveWithinTheCaps() throws Exception {
+        File folder = dir.newFolder("sealed-panes");
+        FakeNative natives = new FakeNative();
+        natives.copies.put("t1", TRANSCRIPT);
+        natives.copies.put("t2", TRANSCRIPT);
+        PaneSnapshots store = snapshots(folder, CacheSeal.newKey(), natives);
+        store.save("host", "t1", 1);
+        File old = store.file("host", "t1");
+        assertTrue(old.setLastModified(System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000));
+        store.save("host", "t2", 1);
+        assertTrue("an unrelated save evicted a copy within the count and byte caps", old.isFile());
+    }
+
     @Test public void aPaneWithNoReadableCopyIsReportedMissingAndAnUnreadableOneGoes() throws Exception {
         List<String> heard = new ArrayList<>();
         File folder = dir.newFolder("panes");
