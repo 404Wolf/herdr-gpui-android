@@ -7,6 +7,10 @@ MODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dict-mode")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8770
 PARTIALS = sys.argv[2:] or ["make the stop", "make the stop button bigger", "make the stop button bigger and keep it", "make the stop button bigger and keep it reachable while I scroll"]
 
+def log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
 def send(conn, text):
     data = text.encode()
     header = bytes([0x81]) + (bytes([len(data)]) if len(data) < 126 else bytes([126]) + struct.pack(">H", len(data)))
@@ -25,6 +29,7 @@ def frames(conn):
         yield op, bytes(payload)
 
 def handle(conn):
+    log("connection accepted")
     req = b""
     while b"\r\n\r\n" not in req:
         chunk = conn.recv(4096)
@@ -33,6 +38,7 @@ def handle(conn):
     key = [l.split(b":", 1)[1].strip() for l in req.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0]
     accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
     conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+    log("websocket upgraded")
     mode = open(MODE).read().strip() if os.path.exists(MODE) else "ready"
     if mode == "stall":
         for _ in frames(conn): pass
@@ -46,19 +52,32 @@ def handle(conn):
     def partials():
         i = 0
         while not stop.is_set():
-            send(conn, msg("partial", PARTIALS[min(i, len(PARTIALS) - 1)])); i += 1
+            send(conn, msg("partial", PARTIALS[min(i, len(PARTIALS) - 1)]))
+            log("sent partial:", PARTIALS[min(i, len(PARTIALS) - 1)])
+            i += 1
             time.sleep(1.0)
     threading.Thread(target=partials, daemon=True).start()
     for op, payload in frames(conn):
         if op == 1 and b"stop" in payload:
             stop.set(); time.sleep(0.3)
             send(conn, msg("final", PARTIALS[-1]))
+            log("sent final:", PARTIALS[-1])
             return
         if op == 8: break
     stop.set()
 
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", PORT)); srv.listen(4)
+log("listening on", PORT, "partials", PARTIALS)
 while True:
     c, _ = srv.accept()
-    threading.Thread(target=lambda c=c: (handle(c), c.close()), daemon=True).start()
+    def serve(c=c):
+        try:
+            handle(c)
+        except Exception as error:  # the harness reads this log: never fail silently
+            import traceback
+            log("handler failed:", error)
+            traceback.print_exc()
+        finally:
+            c.close()
+    threading.Thread(target=serve, daemon=True).start()

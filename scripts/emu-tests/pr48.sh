@@ -109,9 +109,18 @@ hc run --bg --label agent.kind=claude --name agent-a -- sh -c \
     > "$EMU_OUT/hc-a.log" 2>&1 || { record setup FAIL "hc run A (see hc-a.log)"; exit 1; }
 hc run --bg --label agent.kind=claude --name agent-b -- sh -c 'printf "Claude Code (fixture B)\n\n> "; exec cat' \
     > "$EMU_OUT/hc-b.log" 2>&1 || { record setup FAIL "hc run B (see hc-b.log)"; exit 1; }
-nohup python3 "$here/fake-dictation.py" "$DICT_PORT" "fixture" "fixture partial" > "$EMU_OUT/dictation.log" 2>&1 &
+nohup python3 -u "$here/fake-dictation.py" "$DICT_PORT" "fixture" "fixture partial" > "$EMU_OUT/dictation.log" 2>&1 &
 dict_pid=$!
 record setup PASS "ssh $SSH_PORT, dictation $DICT_PORT"
+# The emulator must reach the fixtures through 10.0.2.2 (toybox nc on the device), or every later
+# dictation check would measure the harness, not the app.
+a shell "echo ping | nc -w 2 10.0.2.2 $DICT_PORT" > /dev/null 2>&1 || true
+sleep 1
+if grep -q 'connection accepted' "$EMU_OUT/dictation.log"; then
+    record dictation-reach PASS "the emulator reached the fake dictation server at 10.0.2.2:$DICT_PORT"
+else
+    record dictation-reach FAIL "no connection reached the fake dictation server (see dictation.log)"
+fi
 
 # ---- the phone: provisioned host + settings, microphone, first launch ----
 pkg=$("$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$EMU_APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
@@ -219,49 +228,86 @@ check_recording_controls 46cols
 a shell wm size reset
 quiet 4
 
-# Another terminal: its tab if the strip has one, else through the overflow menu's Panes.
+# Which pane is on screen: the strip's active tab, "Window N, <name>, current".
+pane_is() { dump && $ui find "$EMU_OUT/ui.xml" "Window [0-9]+, $1, current" > /dev/null; }
+# Another terminal: its tab (retried), else through the overflow menu's Panes; asserts it is now on
+# screen, so nothing later runs against the wrong pane.
 switch_to() { # name
-    tap_ui "$1" 8 && return 0
-    tap_ui 'Panes, hosts and terminal actions' 10 || return 1
-    tap_ui '^Panes$' 10 || return 1
-    quiet 1
-    tap_ui "$1" 15
+    local n
+    pane_is "$1" && return 0
+    for n in 1 2 3; do
+        tap_ui "Window [0-9]+, $1[.,]" 8 || tap_ui "$1" 8 || true
+        quiet 4
+        pane_is "$1" && return 0
+    done
+    tap_ui 'Panes, hosts and terminal actions' 10 && tap_ui '^Panes$' 10 && { quiet 1; tap_ui "$1" 15; }
+    quiet 4
+    pane_is "$1"
 }
 
 # switch to B (A's grid is saved), then (b) the 'seed' + partial + 'z' case on B
-switch_to agent-b || { record switch-b FAIL "no agent-b entry"; shot switch-fail; }
-quiet 6
-shot b-open
-# type 'seed', hide the keyboard with the hide control
-tap_ui 'Type a message, or put the keyboard away' 20
-quiet 2
-a shell input text seed
-quiet 1
-tap_ui 'Type a message, or put the keyboard away' 10   # now says hide
-quiet 2
-# dictate: the fake server says "fixture" then "fixture partial"
-tap_ui 'Dictate; tap again to stop' 20
-quiet 5
-# keyboard up, cursor to just before "fixture" (15 characters back), type 'z'
-tap_ui 'Type a message, or put the keyboard away' 15
-quiet 2
-for _ in $(seq 15); do a shell input keyevent KEYCODE_DPAD_LEFT; done
-a shell input text z
-quiet 1
-shot cancel-z-before
-tap_ui 'Stop and discard what was dictated' 15 || record cancel-z FAIL "no Cancel control"
-quiet 2
-shot cancel-z-after
-# send the draft; the agent (cat) echoes it into its terminal, which the core can read back
-tap_ui 'Send, or press Enter' 15
 quiet 4
-b_addr=$(hc ls 2> /dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(t["address"] for t in d["terminals"] if t.get("name")=="agent-b"))' 2> /dev/null)
-screen=$(hc read "${b_addr:-t2}" 2> /dev/null)
-echo "$screen" > "$EMU_OUT/agent-b-screen.txt"
-if grep -Eq 'seed z *$' <<< "$screen" && ! grep -q 'fixture' <<< "$screen"; then
-    record cancel-z PASS "draft after Cancel was 'seed z': the typed z stayed, the dictated words went"
+if switch_to agent-b; then
+    record switch-b PASS "agent-b is the active pane"
+    B_OK=1
 else
-    record cancel-z FAIL "expected a line 'seed z' and no 'fixture' (see agent-b-screen.txt, cancel-z-*.png)"
+    record switch-b FAIL "agent-b did not become the active pane (switch-fail.png)"
+    shot switch-fail
+    B_OK=0
+fi
+shot b-open
+cancel_z() {
+    # type 'seed', hide the keyboard with the hide control
+    tap_ui 'Type a message, or put the keyboard away' 20 || { record cancel-z FAIL "no composer"; return; }
+    quiet 2
+    a shell input text seed
+    quiet 1
+    tap_ui 'Type a message, or put the keyboard away' 10   # now says hide
+    quiet 2
+    # dictate: the fake server says "fixture", then "fixture partial"
+    local before
+    before=$(grep -c 'sent partial: fixture partial' "$EMU_OUT/dictation.log" 2> /dev/null || echo 0)
+    tap_ui 'Dictate; tap again to stop' 20 || { record cancel-z FAIL "no Talk control"; return; }
+    local end=$((SECONDS + 25)) seen=0
+    while (( SECONDS < end )); do
+        (( $(grep -c 'sent partial: fixture partial' "$EMU_OUT/dictation.log" 2> /dev/null || echo 0) > before )) && { seen=1; break; }
+        sleep 1
+    done
+    shot cancel-z-dictating
+    if (( ! seen )); then
+        record cancel-z FAIL "the fake dictation server never sent the partial (harness connectivity, see dictation.log and logcat); Cancel was not exercised"
+        tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
+        return
+    fi
+    quiet 3   # the partial reaches the draft
+    # keyboard up, cursor to just before "fixture" (15 characters back), type 'z'
+    tap_ui 'Type a message, or put the keyboard away' 15
+    quiet 2
+    local i
+    for i in $(seq 15); do a shell input keyevent KEYCODE_DPAD_LEFT; done
+    a shell input text z
+    quiet 1
+    shot cancel-z-before
+    tap_ui 'Stop and discard what was dictated' 15 || { record cancel-z FAIL "no Cancel control"; return; }
+    quiet 2
+    shot cancel-z-after
+    # send the draft; the agent (cat) echoes it into its terminal, which the core can read back
+    tap_ui 'Send, or press Enter' 15
+    quiet 4
+    local b_addr screen
+    b_addr=$(hc ls 2> /dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(t["address"] for t in d["terminals"] if t.get("name")=="agent-b"))' 2> /dev/null)
+    screen=$(hc read "${b_addr:-t2}" 2> /dev/null)
+    echo "$screen" > "$EMU_OUT/agent-b-screen.txt"
+    if grep -Eq 'seed z *$' <<< "$screen" && ! grep -q 'fixture' <<< "$screen"; then
+        record cancel-z PASS "draft after Cancel was 'seed z': the typed z stayed, the dictated words went"
+    else
+        record cancel-z FAIL "expected a line 'seed z' and no 'fixture' (see agent-b-screen.txt, cancel-z-*.png)"
+    fi
+}
+if (( B_OK )); then
+    cancel_z
+else
+    record cancel-z SKIP "agent-b was not the active pane"
 fi
 # the keyboard may still be up; put it away
 a shell input keyevent KEYCODE_BACK
@@ -276,7 +322,13 @@ switch_to agent-a || record offline-open FAIL "no agent-a entry while offline"
 quiet 6
 shot offline-a-before-keyboard
 base=$($ui blank "$EMU_OUT/offline-a-before-keyboard.png" 18 80)
-record offline-open PASS "blank rows in the terminal band before the keyboard: $base"
+if ! pane_is agent-a; then
+    record offline-open FAIL "agent-a is not the active pane while offline"
+elif python3 -c "import sys; sys.exit(0 if float('$base') < 0.9 else 1)"; then
+    record offline-open PASS "a rendered saved grid: blank rows in the terminal band $base"
+else
+    record offline-open FAIL "no saved grid is drawn (blank rows $base): agent-a was probably not saved, so the checks below test a stand-in"
+fi
 
 keyboard_cycle() { # name how
     local name=$1 how=$2 y0 y1 y2 blank
