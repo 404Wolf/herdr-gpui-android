@@ -276,22 +276,40 @@ settle_ui() {
 }
 settle_ui || true
 
+# step TAP-REGEX EXPECT-REGEX [tries=3]: tap, then wait for the NEXT screen's element; if it did not
+# appear (the tap landed on a screen that was still re-laying out, as on a first launch) look again
+# and tap once more. Succeeds at once if the expected element is already on screen.
+step() {
+    local tap=$1 expect=$2 tries=${3:-3} n
+    for (( n = 1; n <= tries; n++ )); do
+        wait_ui "$expect" 2 > /dev/null && return 0
+        tap_ui "$tap" 20 > /dev/null || { sleep 2; continue; }
+        wait_ui "$expect" 10 > /dev/null && return 0
+    done
+    return 1
+}
+device_key_fail() { record device-key FAIL "$1 (see device-key-fail.png, ui.xml, anr.log)"; shot device-key-fail; exit 1; }
+
 # Device key: create it in Hosts, copy its public key, paste it into a text field to read it back.
 launch
-tap_ui 'Hosts, device key and settings' 40 || { record device-key FAIL "no overflow menu on Home"; exit 1; }
-# The overflow opens Remote hosts directly on this build; older ones show a menu with "Hosts and keys".
-tap_ui 'Hosts and keys' 4 || true
-tap_ui 'Create a new device SSH key' 20 || { record device-key FAIL "no Create key"; shot device-key-fail; exit 1; }
-quiet 2
-tap_ui 'Copy the device SSH public key' 15 || { record device-key FAIL "no Copy public key"; shot device-key-fail; exit 1; }
-# "Add host" is on the Remote hosts screen; give Home time to render, wait out ANR dialogs, and if the
-# screen is not Remote hosts yet open the overflow again.
-tap_ui '^Add host$' 20 || { tap_ui 'Hosts, device key and settings' 20 && tap_ui '^Add host$' 30; } \
-    || { record device-key FAIL "no Add host (see device-key-fail.png, ui.xml, anr.log)"; shot device-key-fail; exit 1; }
-tap_ui 'SSH hostname or IP' 15 || { record device-key FAIL "no host field"; exit 1; }
+# Home must be rendered and have finished its first rebuild ("Added 1 provisioned host") before the first tap.
+wait_ui 'Hosts, device key and settings' 60 > /dev/null || device_key_fail "Home did not render"
+quiet 4
+# The overflow opens Remote hosts directly (or, on older builds, a menu with "Hosts and keys").
+step 'Hosts, device key and settings' 'Create a new device SSH key|Copy the device SSH public key|Hosts and keys|Add host' \
+    || device_key_fail "the overflow did not open the hosts screen"
+wait_ui 'Create a new device SSH key|Copy the device SSH public key' 2 > /dev/null \
+    || step 'Hosts and keys' 'Create a new device SSH key|Copy the device SSH public key' 2 \
+    || device_key_fail "no Create key"
+step 'Create a new device SSH key' 'Copy the device SSH public key' || device_key_fail "creating the key did not show Copy public key"
+tap_ui 'Copy the device SSH public key' 15 > /dev/null || device_key_fail "no Copy public key"
+quiet 1
+# "Add host" opens a form whose first field is the host name.
+step '^Add host$' 'SSH hostname or IP' || device_key_fail "Add host did not open the form"
+tap_ui 'SSH hostname or IP' 15 > /dev/null || device_key_fail "no host field"
 a shell input keyevent KEYCODE_PASTE
 quiet 1
-pub=$(wait_ui 'ssh-ed25519 ' 10 > /dev/null && $ui text "$EMU_OUT/ui.xml" 'ssh-ed25519 ') || { record device-key FAIL "public key not readable"; shot device-key-fail; exit 1; }
+pub=$(wait_ui 'ssh-ed25519 ' 10 > /dev/null && $ui text "$EMU_OUT/ui.xml" 'ssh-ed25519 ') || device_key_fail "public key not readable"
 echo "restrict,pty $pub" > "$work/ssh/authorized_keys"
 record device-key PASS "authorized"
 
@@ -360,6 +378,13 @@ check_recording_controls() { # label
     quiet 2
     shot "recording-$label-a"
     layout_now > "$EMU_OUT/recording-$label-layout.txt" 2> /dev/null || true
+    # One dump, taken while recording, kept as this check's evidence under its own name: the controls
+    # and the controls' row for the timer region both come from it, and nothing later can delete it.
+    local udump="$EMU_OUT/recording-$label-ui.xml" have_dump=0 try
+    for try in 1 2 3; do
+        if dump; then cp "$EMU_OUT/ui.xml" "$udump"; have_dump=1; break; fi
+        sleep 1
+    done
     sleep 3
     shot "recording-$label"
     local moved ticking=0 state="" missing=""
@@ -368,15 +393,14 @@ check_recording_controls() { # label
     # The timer's own region (from the layout hint) must change between the two screenshots.
     # The hint's rows are relative to the terminal surface; the controls' row on the device is read
     # from the accessibility dump (the Send target's centre), so no surface origin is guessed.
-    dump > /dev/null 2>&1 || true
-    moved=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" "$EMU_OUT/ui.xml" 2> /dev/null || echo none)
-    if [[ "$moved" != none ]] && python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then ticking=1; fi
-    if dump; then
+    if (( have_dump )); then
+        moved=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" "$udump" 2> /dev/null || echo none)
+        if [[ "$moved" != none ]] && python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then ticking=1; fi
         for need in 'Stop and discard what was dictated' 'Send, or press Enter' 'Type a message, or put the keyboard away'; do
-            $ui find "$EMU_OUT/ui.xml" "$need" > /dev/null || missing="$missing [$need]"
+            $ui find "$udump" "$need" > /dev/null || missing="$missing [$need]"
         done
     else
-        missing=" [no fresh UI dump]"
+        missing=" [no UI dump while recording after 3 attempts]"
     fi
     if [[ -n "$missing$state" ]]; then
         record "recording-$label" FAIL "$cols columns, missing:$missing$state"

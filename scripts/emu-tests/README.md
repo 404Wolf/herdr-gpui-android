@@ -55,10 +55,13 @@ are the app's content descriptions; change them there when a control's words cha
 - **Draft text.** The app's layout hint (`herdr-tap` in logcat) reports control ids, their cells and
   the draft's cell spans, not text. Cancel is therefore checked by the draft's length in cells before
   and after the typed `z`, and by what the agent finally receives, not by reading the draft itself.
-- **Timer text.** The same hint has no timer text: the timer is proven by the `status` control being
-  present and its screen region (rows from the accessibility dump, columns from the hint, grid
-  assumed to fill the display width) changing between two screenshots 3 s apart. A repaint of that
-  region that is not a counting timer would also pass.
+- **Timer text.** The same hint has no timer text: a ticking timer is only inferred: the `status` control is
+  present in the hint and its screen region (rows from the accessibility dump, columns from the hint, grid
+  assumed to fill the display width) changes between two screenshots 3 s apart. A repaint of that
+  region that is not a counting timer would also pass, so this is evidence, not proof.
+- **Extra output.** Stop-and-Send passes when a new line of the agent's terminal is exactly the final
+  text; other new lines, even ones that look wrong, on separate lines do not fail it (only a sent
+  `fixture partial` does).
 - **The system image.** One API 34 google_apis guest with Google's background services disabled and
   gesture navigation: the navigation-bar key check is a SKIP, other keyboards, other densities and
   physical devices are not covered.
