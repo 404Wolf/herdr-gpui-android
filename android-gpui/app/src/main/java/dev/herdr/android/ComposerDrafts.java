@@ -134,6 +134,8 @@ final class ComposerDrafts {
      */
     private int spanStart = -1, spanEnd = -1;
     private boolean spanTainted;
+    /** The span's words were joined to what precedes them by one added space, kept out of the span. */
+    private boolean spanSeparator;
     /** At most this many marks per pane; the oldest go first. */
     static final int MAX_CUTS = 16;
     /** Each pane's unverified-cut marks: {length, hash} of the draft's text before each. */
@@ -261,10 +263,9 @@ final class ComposerDrafts {
         int s = 0;
         while (s < max - p && old.charAt(old.length() - 1 - s) == now.charAt(now.length() - 1 - s)) s++;
         int oldEnd = old.length() - s;
-        // A pure insertion that lands in the span's own leading blanks is before its words.
-        boolean beforeWords = oldEnd == p && p >= spanStart && p <= spanEnd
-                && old.substring(spanStart, p).trim().isEmpty();
-        if (oldEnd <= spanStart || beforeWords) {
+        if (oldEnd <= spanStart) {
+            // At or before the span's left edge (an insert exactly there is typed text, before the
+            // dictated words): the whole span moves.
             int delta = now.length() - old.length();
             spanStart += delta;
             spanEnd += delta;
@@ -277,6 +278,7 @@ final class ComposerDrafts {
         spanStart = -1;
         spanEnd = -1;
         spanTainted = false;
+        spanSeparator = false;
     }
 
     void setDraft(Draft draft) { putDraft(pane, draft); }
@@ -329,10 +331,7 @@ final class ComposerDrafts {
         if (dictationBase == null || spanStart < 0 || spanTainted) return -1;
         String text = text();
         if (spanEnd <= spanStart || spanEnd > text.length()) return -1;
-        int from = spanStart;
-        // Past the space join() put between the draft and the utterance.
-        while (from < spanEnd && text.charAt(from) == ' ') from++;
-        return from < spanEnd ? from : -1;
+        return spanStart < spanEnd ? spanStart : -1;
     }
 
     /** The whole utterance so far; it replaces the previous partial. */
@@ -347,8 +346,10 @@ final class ComposerDrafts {
         String prefix;
         String suffix;
         if (spanStart >= 0 && !spanTainted && spanEnd <= text.length()) {
-            // The utterance replaces only its own span: what was typed before and after it stays.
-            prefix = text.substring(0, spanStart);
+            // The utterance replaces only its own span (and the space that joined it): what was
+            // typed before and after it stays.
+            int prefixEnd = spanSeparator && spanStart > 0 && text.charAt(spanStart - 1) == ' ' ? spanStart - 1 : spanStart;
+            prefix = text.substring(0, prefixEnd);
             suffix = text.substring(spanEnd);
         } else {
             // A first partial, or one whose words were edited (they are now the user's): a new span
@@ -358,9 +359,11 @@ final class ComposerDrafts {
             dictationBase = text;
         }
         String joined = join(prefix, utterance);
+        String spoken = utterance == null ? "" : utterance.trim();
         store(joined + suffix);
-        spanStart = prefix.length();
         spanEnd = joined.length();
+        spanStart = spanEnd - spoken.length();
+        spanSeparator = spanStart - prefix.length() == 1;
         spanTainted = false;
         liveMarks = anchors(text(), placed(prefix, utterance, cuts));
         return text();
@@ -496,7 +499,9 @@ final class ComposerDrafts {
         // is left as it is.
         String text = text();
         if (spanStart >= 0 && !spanTainted && spanStart <= spanEnd && spanEnd <= text.length()) {
-            store(text.substring(0, spanStart) + text.substring(spanEnd));
+            // The dictated characters, and the space that joined them if it is still right there.
+            int from = spanSeparator && spanStart > 0 && text.charAt(spanStart - 1) == ' ' ? spanStart - 1 : spanStart;
+            store(text.substring(0, from) + text.substring(spanEnd));
         }
         settleCuts(false);
         dictationBase = null;
@@ -648,7 +653,7 @@ final class ComposerDrafts {
         java.util.List<long[]> live = new java.util.ArrayList<>();
         for (long[] m : liveMarks) live.add(m.clone());
         return new Object[] {new LinkedHashMap<>(drafts), dictationBase, marks, live, new LinkedHashMap<>(cutPaths),
-            new int[] {spanStart, spanEnd, spanTainted ? 1 : 0}};
+            new int[] {spanStart, spanEnd, spanTainted ? 1 : 0, spanSeparator ? 1 : 0}};
     }
 
     @SuppressWarnings("unchecked")
@@ -661,6 +666,7 @@ final class ComposerDrafts {
         spanStart = span[0];
         spanEnd = span[1];
         spanTainted = span[2] != 0;
+        spanSeparator = span[3] != 0;
         // Copies: a snapshot rolled back to twice must not see the first rollback's changes.
         cutMarks.clear();
         for (Map.Entry<String, java.util.List<long[]>> e : ((Map<String, java.util.List<long[]>>) s[2]).entrySet()) {
