@@ -164,6 +164,19 @@ final class ComposerDrafts {
     }
 
     /**
+     * Adds an attachment's quoted paths (they end in a space, as the desktop types them) to the end
+     * of {@code pane}'s draft, a space after what is already there; never sent.
+     */
+    String appendAttachment(String pane, String paths) {
+        String key = pane == null ? "" : pane;
+        String before = drafts.get(key);
+        String gap = before == null || before.isEmpty() || Character.isWhitespace(before.charAt(before.length() - 1)) ? "" : " ";
+        String text = (before == null ? "" : before) + gap + paths;
+        drafts.put(key, text);
+        return text;
+    }
+
+    /**
      * The utterance ended without a final (an error, or cancelled by a mode or
      * pane change). The last partial stays in the draft: spoken words are never
      * thrown away, and the next utterance builds on them.

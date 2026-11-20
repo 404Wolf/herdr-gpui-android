@@ -28,6 +28,10 @@ pub enum Error {
     Capacity,
     #[error("Select a current terminal before sending input")]
     StaleTarget,
+    #[error("A file to put on the host is empty or over 8 MB")]
+    PutBounds,
+    #[error("A file to put on the host needs one plain file name")]
+    PutName,
     #[error("herdr-core protocol: {0}")]
     Protocol(String),
     /// The core answered an RPC with an error: a definite reply, so whatever
@@ -267,7 +271,38 @@ impl Heard {
 pub(crate) enum Operation {
     Discover(mpsc::SyncSender<Result<String>>),
     Action(String, mpsc::SyncSender<Result<String>>),
+    /// A file for a terminal's machine (`terminal.put`): bytes, so not an Action's bounded JSON.
+    Put(PutFile, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
+}
+/// The most one `terminal.put` takes: the core's own bound, 8 MiB raw.
+pub(crate) const MAX_PUT: usize = 8 * 1024 * 1024;
+/// A validated file to put beside a terminal: what the desktop's paste saves as
+/// `herdr-paste-<nanos>.<ext>`, here sent over the core connection instead.
+pub(crate) struct PutFile {
+    pub(crate) terminal: String,
+    pub(crate) name: String,
+    pub(crate) bytes: Vec<u8>,
+}
+impl PutFile {
+    pub(crate) fn new(terminal: &str, name: &str, bytes: Vec<u8>) -> Result<Self> {
+        if terminal.is_empty() || terminal.len() > 128 || terminal.chars().any(char::is_control) {
+            return Err(Error::StaleTarget);
+        }
+        if bytes.is_empty() || bytes.len() > MAX_PUT {
+            return Err(Error::PutBounds);
+        }
+        let plain = !name.is_empty()
+            && name.len() <= 128
+            && name != "."
+            && name != ".."
+            && !name.contains(['/', '\\'])
+            && !name.chars().any(char::is_control);
+        if !plain {
+            return Err(Error::PutName);
+        }
+        Ok(Self { terminal: terminal.into(), name: name.into(), bytes })
+    }
 }
 static SESSIONS: OnceLock<Mutex<HashMap<u64, Arc<Session>>>> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -767,6 +802,22 @@ pub fn deliver(id: u64, terminal: &str, text: &str) -> Result<String> {
         // always replies once it ran), so nothing was sent.
         Err(mpsc::RecvTimeoutError::Disconnected) => retry(),
     })
+}
+/// Puts an image (or any file) beside `terminal` on its machine, over the
+/// session's own core connection, and returns where it landed:
+/// `{"queued":true,"path":..,"bytes":..}`, or `{"queued":false,"kind":..}` when
+/// the core refused (`needs_update`: its Herdr predates `terminal.put`).
+/// Blocks up to about a minute: worker threads only. Types nothing.
+pub fn put_file(id: u64, terminal: &str, name: &str, bytes: Vec<u8>) -> Result<String> {
+    let file = PutFile::new(terminal, name, bytes)?;
+    let owner = session(id)?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    owner
+        .commands
+        .try_send(Operation::Put(file, tx))
+        .map_err(|_| Error::Capacity)?;
+    rx.recv_timeout(crate::core_session::PUT_WAIT + Duration::from_secs(15))
+        .map_err(|_| Error::Closed)?
 }
 pub struct UiPaint<'a> {
     pub generation: i64,

@@ -254,6 +254,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String lastSnapshotTitle, lastSnapshotText, lastSnapshotStatus, lastSnapshotShortcuts;
 
     @Override protected void onCreate(Bundle state) {
+        open = true;
         // A restored activity cannot recover authority from Intent extras or framework saved state.
         launch = state == null ? GpuiLaunch.consume(System.nanoTime()) : null;
         super.onCreate(null);
@@ -4780,6 +4781,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 nativeShowKeyboard(target.generation);
             }
 
+            @Override public boolean canAttach() { return true; }
+
+            @Override public void attachImages() { showAttachSources(); }
+
+            @Override public void attachUris(java.util.List<android.net.Uri> uris) { attachFrom(uris); }
+
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -4791,6 +4798,221 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         };
     }
+
+
+    // ---- Attaching images: the file lands on the host, its path goes into the composer. ----
+    private static volatile boolean open;
+    /** Whether a terminal screen exists to take a shared image (the share sheet checks). */
+    static boolean isOpen() { return open; }
+    static final String EXTRA_ATTACH_SHARED = "attach_shared";
+    private final java.util.concurrent.ExecutorService attachWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "herdr-attach");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+    /** The core session and pane an image is for, fixed when it was asked for. */
+    private static final class AttachTarget {
+        final long handle;
+        final String pane;
+        final String host;
+        AttachTarget(long handle, String pane, String host) {
+            this.handle = handle;
+            this.pane = pane;
+            this.host = host;
+        }
+    }
+
+    /** The live core session and the pane on screen, or null with no link (nothing to put an image on). */
+    private AttachTarget attachTarget() {
+        synchronized (stateLock) {
+            Connection c = connection;
+            if (c == null || c.offline || c.shell || !c.ready || c.isClosed() || c.remoteHandle <= 0
+                    || c.paneId == null || c.paneId.isEmpty()) return null;
+            return new AttachTarget(c.remoteHandle, c.paneId, c.hostId);
+        }
+    }
+
+    /**
+     * The live session for {@code target}'s pane right now. Leaving for a picker or the camera can
+     * end the session and bring up a new one on return, so the handle from before is never reused:
+     * waits up to 15 s for the same pane on the same host to be live again; null when it is not.
+     */
+    private AttachTarget liveTarget(AttachTarget target) {
+        long until = SystemClock.elapsedRealtime() + 15_000;
+        do {
+            AttachTarget now = attachTarget();
+            if (now != null && now.pane.equals(target.pane)
+                    && java.util.Objects.equals(now.host, target.host)) return now;
+            try {
+                Thread.sleep(250);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        } while (SystemClock.elapsedRealtime() < until);
+        return null;
+    }
+
+    private AttachTarget cameraFor;
+    private android.net.Uri cameraShot;
+
+    private void showAttachSources() {
+        if (attachTarget() == null) {
+            note("Connect to a computer to attach an image");
+            return;
+        }
+        new ActionSheet(this, chrome, "Attach an image")
+                .add("Photo library", this::pickImages)
+                .add("Take a photo", this::takePhoto)
+                .add("Paste image from clipboard", this::pasteImage)
+                .show();
+    }
+
+    private void pickImages() {
+        cameraFor = attachTarget();
+        try {
+            startActivityForResult(AttachImages.pickIntent(), AttachImages.PICK_REQUEST);
+        } catch (android.content.ActivityNotFoundException none) {
+            note("No photo picker on this phone");
+        }
+    }
+
+    private void takePhoto() {
+        cameraFor = attachTarget();
+        android.net.Uri target = AttachImages.cameraTarget(getContentResolver(), System.currentTimeMillis());
+        if (target == null) {
+            note("The camera could not start");
+            return;
+        }
+        cameraShot = target;
+        try {
+            startActivityForResult(AttachImages.cameraIntent(target), AttachImages.CAMERA_REQUEST);
+        } catch (android.content.ActivityNotFoundException none) {
+            cameraShot = null;
+            getContentResolver().delete(target, null, null);
+            note("No camera app on this phone");
+        }
+    }
+
+    private void pasteImage() {
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        android.content.ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+        java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
+        for (int i = 0; clip != null && i < clip.getItemCount(); i++) {
+            android.net.Uri uri = clip.getItemAt(i).getUri();
+            String type = uri == null ? null : getContentResolver().getType(uri);
+            if (type != null && type.startsWith("image/")) uris.add(uri);
+        }
+        if (uris.isEmpty()) {
+            note("No image on the clipboard");
+            return;
+        }
+        attachFrom(uris);
+    }
+
+    @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        AttachTarget target = cameraFor;
+        if (request == AttachImages.PICK_REQUEST) {
+            cameraFor = null;
+            if (result == RESULT_OK && target != null) attachTo(target, AttachImages.pickedUris(data));
+        } else if (request == AttachImages.CAMERA_REQUEST) {
+            android.net.Uri shot = cameraShot;
+            cameraShot = null;
+            cameraFor = null;
+            if (shot == null) return;
+            if (result != RESULT_OK || target == null) {
+                getContentResolver().delete(shot, null, null);
+                return;
+            }
+            attach(target, java.util.Collections.singletonList(
+                    AttachImages.uriSource(getContentResolver(), shot)),
+                    () -> getContentResolver().delete(shot, null, null));
+        }
+    }
+
+    private void attachFrom(java.util.List<android.net.Uri> uris) {
+        AttachTarget target = attachTarget();
+        if (target == null) {
+            note("Connect to a computer to attach an image");
+            return;
+        }
+        attachTo(target, uris);
+    }
+
+    private void attachTo(AttachTarget target, java.util.List<android.net.Uri> uris) {
+        java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+        for (android.net.Uri uri : uris) sources.add(AttachImages.uriSource(getContentResolver(), uri));
+        attach(target, sources, null);
+    }
+
+    /**
+     * Puts each image on the pane's computer (off the main thread, over the core connection), then
+     * types the paths into that pane's draft, shell-quoted, never sent.
+     */
+    private void attach(AttachTarget target, java.util.List<ImageAttach.Source> sources, Runnable done) {
+        if (sources.isEmpty()) return;
+        note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
+        try {
+            attachWorker.execute(() -> {
+                ImageAttach.Outcome outcome = ImageAttach.attach(sources, AttachImages.CONVERTER,
+                        (name, bytes) -> {
+                            AttachTarget live = liveTarget(target);
+                            if (live == null) {
+                                throw new ImageAttach.AttachException("The connection is down; try the image again");
+                            }
+                            try {
+                                return RemoteNative.putFile(live.handle, live.pane, name, bytes);
+                            } catch (RuntimeException dropped) {
+                                String why = dropped.getMessage();
+                                throw new ImageAttach.AttachException("The image did not arrive"
+                                        + (why == null || why.isEmpty() ? "" : ": " + (why.length() > 120 ? why.substring(0, 120) : why)), dropped);
+                            }
+                        },
+                        () -> java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis())
+                                + System.nanoTime() % 1_000_000L);
+                if (done != null) done.run();
+                main.post(() -> attached(target, outcome));
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            if (done != null) done.run();
+        }
+    }
+
+    private void attached(AttachTarget target, ImageAttach.Outcome outcome) {
+        if (destroyed) return;
+        if (!outcome.paths.isEmpty()) {
+            boolean kept = composer != null
+                    && composer.appendAttachment(target.pane, ImageAttach.quotePaths(outcome.paths));
+            int n = outcome.paths.size();
+            note(!kept ? "The image arrived but the draft could not be saved"
+                    : outcome.failures.isEmpty() ? (n == 1 ? "Image attached" : n + " images attached")
+                    : n + " attached, " + outcome.failures.size() + " failed: " + outcome.failures.get(0));
+        } else if (!outcome.failures.isEmpty()) {
+            note(outcome.failures.get(0));
+        }
+    }
+
+    /** Images from the share sheet, once an agent is on screen with a live link; retried while they wait. */
+    private void takeSharedImages() {
+        long now = System.currentTimeMillis();
+        if (destroyed || !SharedImages.waiting(now)) return;
+        AttachTarget target = attachTarget();
+        if (target == null) {
+            main.removeCallbacks(retrySharedImages);
+            main.postDelayed(retrySharedImages, 1500);
+            return;
+        }
+        java.util.List<java.io.File> files = SharedImages.take(now);
+        java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+        for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
+        attach(target, sources, () -> { for (java.io.File file : files) file.delete(); });
+    }
+
+    private final Runnable retrySharedImages = this::takeSharedImages;
 
     private static final int MICROPHONE_REQUEST = 41;
     /** What the composer asked to do once the microphone is allowed; one request at a time. */
@@ -5144,6 +5366,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     @Override protected void onNewIntent(android.content.Intent intent) {
         super.onNewIntent(intent);
+        if (intent.getBooleanExtra(EXTRA_ATTACH_SHARED, false)) takeSharedImages();
         String hostId = intent.getStringExtra(EXTRA_FOCUS_HOST);
         String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
         if (hostId == null || pane == null || destroyed) return;
@@ -5167,6 +5390,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean firstOpen = !openedOnce;
         openedOnce = true;
         nativeResumed();
+        takeSharedImages();
         // Herdr in front is Wolf looking at it (item 71): the attach that follows says so.
         markUsed();
         if (monitor == null && !launch.shell) {
@@ -5280,6 +5504,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
+        open = false;
+        attachWorker.shutdownNow();
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
         Dictation.pending(this).setListener(null);

@@ -221,9 +221,15 @@ public final class HomeActivity extends Activity {
         stopped = false;
         resumed = true;
         opening = false;
+        if (summary != null) summary.setText(sharedWords(summary.getText()));
         loadMachines();
         main.removeCallbacks(poll);
         main.post(poll);
+    }
+
+    /** Images shared from the share sheet wait for an agent: say so where Home reports status. */
+    private static CharSequence sharedWords(CharSequence otherwise) {
+        return SharedImages.waiting(System.currentTimeMillis()) ? "Pick an agent to attach the shared image" : otherwise;
     }
 
     @Override protected void onPause() {
@@ -805,7 +811,7 @@ public final class HomeActivity extends Activity {
         List<Agent> all = allAgents();
         int[] counts = new int[6];
         for (Agent agent : all) counts[statusPriority(agent.status)]++;
-        summary.setText(summaryText(counts));
+        summary.setText(sharedWords(summaryText(counts)));
         body.removeAllViews();
         machineBar.removeAllViews();
         deaconCard.removeAllViews();

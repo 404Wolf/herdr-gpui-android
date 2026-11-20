@@ -104,6 +104,12 @@ final class ComposerBar {
         void rawKeyboard();
         /** Wolf typed into the draft: he is using the phone (item 71). */
         default void typed() { }
+        /** Whether this screen can put an image on the computer ("img" leads the controls). */
+        default boolean canAttach() { return false; }
+        /** "img" was tapped: offer the image sources (library, camera, clipboard). */
+        default void attachImages() { }
+        /** Images the keyboard or a paste handed over: put them on the computer. */
+        default void attachUris(java.util.List<android.net.Uri> uris) { }
     }
 
     private static final String PREFS = "terminal-display";
@@ -449,6 +455,24 @@ final class ComposerBar {
         if (pane == null || pane.isEmpty()) pane = drafts.pane();
         Object before = drafts.snapshot();
         String draft = drafts.append(pane, text);
+        if (!persistNow()) {
+            drafts.rollback(before);
+            showText(drafts.text());
+            return false;
+        }
+        if (pane.equals(drafts.pane())) showText(draft);
+        return true;
+    }
+
+    /**
+     * Quoted paths of images just put on the computer join the end of {@code pane}'s draft (a space
+     * after what is there, one after them, as the desktop's paste types them), saved at once.
+     * Nothing is sent. False when the draft could not be saved (left as it was).
+     */
+    boolean appendAttachment(String pane, String paths) {
+        if (pane == null || pane.isEmpty()) pane = drafts.pane();
+        Object before = drafts.snapshot();
+        String draft = drafts.appendAttachment(pane, paths);
         if (!persistNow()) {
             drafts.rollback(before);
             showText(drafts.text());
@@ -971,6 +995,7 @@ final class ComposerBar {
         switch (id) {
             case "type": toggleTyping(); break;
             case "talk": toggleDictation(); break;
+            case ControlLine.ATTACH: host.attachImages(); break;
             case "send": enter(); break;
             case "clear": tapClear(false); break;
             case "undo":
@@ -992,6 +1017,7 @@ final class ComposerBar {
         switch (id) {
             case "type": return "Type a message";
             case "talk": return "Dictate; tap again to stop";
+            case ControlLine.ATTACH: return "Attach an image: photo library, camera or clipboard";
             case "row-retry": return "Send this recording to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
             case "clear": return "Clear the message; tap again or hold to clear the queue too";
@@ -1038,6 +1064,7 @@ final class ComposerBar {
         in.queued = QueueView.count(queuedMessages, loose, parkedHere(), linkDown);
         in.queueStyle = queueStyle(queuedMessages, loose.size() + parkedHere().size(), linkDown);
         in.expanded = queueOpen;
+        in.attach = host.canAttach();
         in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
         if (clearing.open(wall()) && clearing.pane().equals(drafts.pane())) {
             in.undoWide = clearing.label(false);
@@ -1437,7 +1464,24 @@ final class ComposerBar {
                 pushGhost();
             }
         });
+        if (android.os.Build.VERSION.SDK_INT >= 31) listenForImages(edit);
         return edit;
+    }
+
+    /** An image a keyboard inserts or a paste carries is attached, not typed; text is left to the field. */
+    @android.annotation.TargetApi(31)
+    private void listenForImages(EditText edit) {
+        edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
+            android.content.ClipData clip = payload.getClip();
+            java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
+            for (int i = 0; i < clip.getItemCount(); i++) {
+                android.net.Uri uri = clip.getItemAt(i).getUri();
+                if (uri != null) uris.add(uri);
+            }
+            if (uris.size() != clip.getItemCount()) return payload;
+            host.attachUris(uris);
+            return null;
+        });
     }
 
     /**

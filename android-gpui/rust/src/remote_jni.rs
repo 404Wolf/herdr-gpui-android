@@ -407,6 +407,34 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_deliver(
     };
     result_string(&mut env, remote::deliver(handle as u64, &terminal, &text))
 }
+/// `terminal.put` for an image the phone picked, snapped or pasted: its bytes
+/// go to the terminal's machine over the core connection; the reply names the
+/// path. Blocks: Java calls it from a worker thread.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_putFile(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    terminal: JString<'_>,
+    name: JString<'_>,
+    data: jni::objects::JByteArray<'_>,
+) -> jstring {
+    let Some(terminal) = read(&mut env, &terminal, 1024) else {
+        return std::ptr::null_mut();
+    };
+    let Some(name) = read(&mut env, &name, 256) else {
+        return std::ptr::null_mut();
+    };
+    let bytes = match env.convert_byte_array(&data) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            fail(&mut env, "Invalid or oversized remote argument");
+            return std::ptr::null_mut();
+        }
+    };
+    result_string(&mut env, remote::put_file(handle as u64, &terminal, &name, bytes))
+}
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollLocal(
