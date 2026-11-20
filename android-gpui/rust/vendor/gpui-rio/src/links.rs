@@ -401,7 +401,8 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
         .filter_map(|s| word[search..].find(s).map(|i| search + i))
         .min()
     {
-        let url = trim_url(&word[found..]);
+        let url = strip_stars(trim_url(&word[found..]), star_run(&word[..found]));
+        let url = trim_url(url);
         let (first, last) = (index_of(found), index_of(found + url.len()));
         if url.len()
             > SCHEMES
@@ -417,18 +418,16 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     if word.contains("://") {
         return None;
     }
-    // A path: it may follow wrapping punctuation or a tool call's bracket
-    // (`Update(src/a.rs)`, `path=/a/b.rs`, `**a.rs**`), so every opener in the
-    // word is a candidate start, latest first (`path=/a/b.rs` is `/a/b.rs`;
-    // a `:` before `12` fails and falls back); then a `:line:col` is cut.
-    let openers = word
-        .char_indices()
-        .filter(|(_, c)| matches!(c, '(' | '[' | '{' | '=' | ',' | ';' | ':' | '*' | '@'))
-        .map(|(i, c)| i + c.len_utf8());
-    let mut leads: Vec<usize> = std::iter::once(0).chain(openers).collect();
+    // A path is one target for the whole token: punctuation inside a valid
+    // file name (`icon@final.rs`, `a=b.rs`, `x[1].rs`) belongs to it. Only
+    // recognised wrapper syntax is peeled off the front (see `wrapper_ends`),
+    // latest first so `path=/a/b.rs` is `/a/b.rs`; the whole token is the
+    // fallback. A `:line:col` is cut from the end.
+    let mut leads = wrapper_ends(&word);
     leads.reverse();
+    leads.push(0);
     for lead in leads {
-        let body = trim_url(&word[lead..]);
+        let body = strip_stars(trim_url(&word[lead..]), star_run(&word[..lead]));
         let (path, line) = split_line(body);
         if !looks_like_file(path) {
             continue;
@@ -445,6 +444,49 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
         }
     }
     None
+}
+
+/// Byte offsets in `word` just after a wrapper that may precede a path:
+/// leading punctuation (`(`, `[`, `*`, ...), a tool call's `name(` or
+/// `key=` / `key:` (an identifier, so `src/a=b.rs` is not one), and a
+/// markdown `](`. Nothing inside a path-looking prefix counts.
+fn wrapper_ends(word: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let leading = word
+        .find(|c: char| !matches!(c, '(' | '[' | '{' | ',' | ';' | ':' | '*'))
+        .unwrap_or(word.len());
+    // Each position inside the leading punctuation run (all ASCII).
+    ends.extend(1..=leading);
+    let rest = &word[leading..];
+    let ident = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+        .unwrap_or(rest.len());
+    if ident > 0
+        && rest.as_bytes()[0].is_ascii_alphabetic()
+        && let Some(c) = rest[ident..].chars().next()
+        && matches!(c, '(' | '=' | ':')
+    {
+        ends.push(leading + ident + 1);
+    }
+    for (i, _) in word.match_indices("](") {
+        ends.push(i + 2);
+    }
+    ends.sort_unstable();
+    ends.dedup();
+    ends
+}
+
+/// The `*` characters that end `prefix`: a bold or italic wrapper the path sits in.
+fn star_run(prefix: &str) -> usize {
+    prefix.len() - prefix.trim_end_matches('*').len()
+}
+
+/// Drops up to `stars` closing `*` from `body`: one that closes a wrapper
+/// opened before it, never a literal one (`files/*`).
+fn strip_stars(body: &str, stars: usize) -> &str {
+    let kept = body.trim_end_matches('*');
+    let closing = (body.len() - kept.len()).min(stars);
+    &body[..body.len() - closing]
 }
 
 /// The markdown link `[text](http…)` covering index `at` of `text`: a tap
@@ -512,7 +554,7 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
 /// Drops sentence punctuation and an unbalanced closing bracket from the end.
 fn trim_url(mut url: &str) -> &str {
     loop {
-        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
         let trimmed = match trimmed.chars().last() {
             Some(close @ (')' | ']' | '}')) => {
                 let open = match close {
@@ -563,6 +605,10 @@ fn looks_like_file(path: &str) -> bool {
         return false;
     }
     if path.contains("//") || path.ends_with('/') {
+        return false;
+    }
+    // `team@vendor.zip` is an address, not a file named like one.
+    if !path.contains('/') && path.contains('@') {
         return false;
     }
     // Not `**a.rs`, `=a.rs` or other wrapping a candidate start left on.
@@ -927,6 +973,50 @@ mod tests {
             let rows = [Row::new(text, false)];
             assert_eq!(link(&rows, 0, *col), Some(file(path, *line)), "{text}");
         }
+    }
+
+    /// Punctuation inside a valid file name is part of it: one target for the
+    /// whole token, whichever character is tapped.
+    #[test]
+    fn file_ask_punctuation_inside_a_name_never_splits_the_token() {
+        for name in [
+            "src/icon@final.rs",
+            "src/a=b.rs",
+            "src/x[1].rs",
+            "src/a;b.rs",
+            "src/a,b.rs",
+            "~/v/a:b.rs",
+        ] {
+            let text = format!("open {name}:12 now");
+            for col in 5..5 + name.len() {
+                let rows = [Row::new(&text, false)];
+                assert_eq!(
+                    link(&rows, 0, col),
+                    Some(file(name, Some(12))),
+                    "{text} @{col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_ask_email_addresses_are_not_files() {
+        for text in ["Contact team@vendor.zip today", "mail a.b@corp.example.rs."] {
+            for col in 0..text.len() {
+                let rows = [Row::new(text, false)];
+                assert_eq!(link(&rows, 0, col), None, "{text} @{col}");
+            }
+        }
+    }
+
+    #[test]
+    fn file_ask_a_literal_trailing_star_stays_in_a_url() {
+        let rows = [Row::new("see https://example.com/files/* now", false)];
+        assert_eq!(link(&rows, 0, 10), Some(web("https://example.com/files/*")));
+        let rows = [Row::new("see **https://example.com/a** now", false)];
+        assert_eq!(link(&rows, 0, 12), Some(web("https://example.com/a")));
+        let rows = [Row::new("see src/glob/*.rs and **src/a.rs** now", false)];
+        assert_eq!(link(&rows, 0, 24), Some(file("src/a.rs", None)));
     }
 
     #[test]
