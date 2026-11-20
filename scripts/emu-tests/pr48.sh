@@ -15,8 +15,16 @@ SUMMARY="$EMU_OUT/summary.tsv"
 : > "$SUMMARY"
 FAILS=0
 
-a() { adb -s "$ADB_SERIAL" "$@"; }
+# Every adb call is bounded: a lost emulator (an OOM kill on a small job) makes calls fail fast
+# instead of blocking the job; once the device is gone the script stops with a FAIL row.
+a() { timeout -k 2 90 adb -s "$ADB_SERIAL" "$@"; }
+device_alive() { [[ "$(timeout 10 adb -s "$ADB_SERIAL" get-state 2> /dev/null)" == device ]]; }
 record() { # name status detail
+    if ! device_alive && [[ "$1" != emulator-lost ]]; then
+        printf '%s\t%s\t%s\n' emulator-lost FAIL "the emulator is gone (ADB transport ended; check emulator.log and the job's oom_kill)" >> "$SUMMARY"
+        echo "[FAIL] emulator-lost" >&2
+        exit 1
+    fi
     printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >> "$SUMMARY"
     echo "[$2] $1 ${3:-}"
     [[ "$2" == FAIL ]] && FAILS=$((FAILS + 1))
