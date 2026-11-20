@@ -298,17 +298,20 @@ composer message sent while the link is down waits in an on-device outbox
 herdr-core's `terminal.send`, once that pane's computer is back. A message
 whose send was cut off is never resent automatically: it may have been typed,
 so it waits for the user to send it again or drop it. Messages for a pane that
-closed, or a core that restarted, are kept and offered back as drafts. Keys
-pressed while reconnecting are held in memory only.
+closed, or a core that restarted, are kept and offered back as drafts. Unsent
+terminal input held in memory is sent only if the reconnect attaches to the
+same PTY on the same connection revision.
 
-The conversation stays readable with no link. While a reconnect runs, the last
-frame stays on screen, dimmed, and still scrolls through its own history on
-the phone. Whenever a session closes, the pane's terminal grid (history,
-screen and cursor, up to 4 MB) is saved in the app's no-backup storage, at
-most 16 panes and 32 MB in all. Opening a pane from Home while its computer is
-unreachable, or returning to the terminal before it reconnects, draws that
-saved grid exactly as the program drew it, dimmed, with "showing HH:MM" in
-the status line, until the live pane attaches. A dispatched action may
+The conversation stays readable with no link. A reconnect on the same profile
+revision keeps the last frame and its local scrollback on screen. Saved panes
+are encrypted in the app's no-backup storage, with count and size caps of 48
+panes and 64 MiB and priority for the current pane, Deacons, PMs and panes with
+waiting messages. A plain shell's saved grid retains up to 4 MiB. For an agent
+on the alternate screen, the phone saves the screen and the rows it observed
+on that attach. An offline copy is replaced when the live pane paints. The
+first readable profile store after upgrade assigns legacy pane copies to the
+revisions it contains. Subsequent edits use their own copies.
+A dispatched action may
 already have reached the host when the connection fails. SSH semantic input is
 reported as queued and has no daemon receipt; see the remote guide.
 

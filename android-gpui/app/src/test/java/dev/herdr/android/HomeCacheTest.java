@@ -24,6 +24,19 @@ public final class HomeCacheTest {
                 .put("panes", new JSONArray().put(new JSONObject().put("pane_id", "t1")));
     }
 
+    @Test public void the_fleet_cache_keeps_the_revision_that_listed_the_pane() throws Exception {
+        JSONObject view = new JSONObject().put("panes", new JSONArray().put(new JSONObject().put("id", "t1")))
+                .put("workspaces", new JSONArray());
+        String a = PaneSnapshots.computer("host", "revision-a");
+        String b = PaneSnapshots.computer("host", "revision-b");
+        HomeCache.Entry entry = new HomeCache.Entry(view, "", false, a);
+        String saved = HomeCache.encode(java.util.Collections.singletonMap("host", entry));
+        HomeCache.Entry reopened = HomeCache.decode(saved).get("host");
+        assertTrue(reopened.matches(a));
+        assertFalse(reopened.matches(b));
+        assertFalse(reopened.matches(null));
+    }
+
     @Test public void aPollWithoutTheTerminalListIsNotATree() throws Exception {
         assertFalse(HomeCache.hasTree(null));
         assertFalse(HomeCache.hasTree(new JSONObject().put("state", "connecting")));

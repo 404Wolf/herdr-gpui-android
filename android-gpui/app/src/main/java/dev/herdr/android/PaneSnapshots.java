@@ -166,6 +166,11 @@ final class PaneSnapshots {
                 byte[] copy = natives.copy(handle, pane);
                 if (copy == null) return;
                 sealer.write(into, copy);
+                File legacy = legacyFile(computer, pane);
+                if (legacy != null) {
+                    legacy.delete();
+                    used(legacy).delete();
+                }
                 prune();
             } catch (IOException | RuntimeException | LinkageError unsaved) {
                 // The previous copy, if any, stays.

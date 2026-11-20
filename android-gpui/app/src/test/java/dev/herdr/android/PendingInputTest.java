@@ -35,6 +35,15 @@ public class PendingInputTest {
     }
 
     @Test
+    public void a_replacement_pty_on_the_same_core_and_pane_drops_held_input() {
+        PendingInput pending = new PendingInput();
+        assertTrue(pending.add("[\"core\",\"t1\",421,99]", "old"));
+        assertEquals("old", pending.next("[\"core\",\"t1\",421,99]"));
+        assertNull(pending.next("[\"core\",\"t1\",422,99]"));
+        assertEquals(1, pending.takeDiscarded());
+    }
+
+    @Test
     public void the_hold_is_bounded_and_needs_a_pane() {
         PendingInput pending = new PendingInput();
         assertFalse(pending.add("", "a"));
