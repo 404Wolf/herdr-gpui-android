@@ -14,7 +14,37 @@ const MAX_ROWS: usize = 12;
 /// Border glyphs a program draws at a box's edges; never part of a link.
 const BORDERS: [char; 4] = ['\u{2502}', '\u{2503}', '\u{2551}', '|'];
 /// Extensions that make a bare `name.ext` a file, without a slash to say so.
+const NAMES: &[&str] = &[
+    "CHANGELOG",
+    "CODEOWNERS",
+    "Dockerfile",
+    "Gemfile",
+    "Justfile",
+    "LICENSE",
+    "Makefile",
+    "Procfile",
+    "README",
+    "Rakefile",
+    "justfile",
+];
 const EXTENSIONS: &[&str] = &[
+    // Binary or data files too: a tap shows "Not a text file", not nothing.
+    "apk",
+    "bin",
+    "dat",
+    "db",
+    "gif",
+    "gz",
+    "jar",
+    "jpeg",
+    "jpg",
+    "pdf",
+    "png",
+    "so",
+    "sqlite",
+    "tar",
+    "wasm",
+    "zip",
     "c",
     "cc",
     "cfg",
@@ -363,43 +393,66 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
             .position(|&b| b == byte)
             .unwrap_or(offsets.len() - 1)
     };
-    let tapped = at - start;
-    // URLs first: a word may hold one after other text ("(see:https://…").
+    // One token, one target: the tapped part of the word (a markdown `](`
+    // splits it in two) has its wrapper punctuation peeled off both ends
+    // repeatedly, and what is left is classified once, so every cell of the
+    // token gives the same answer.
+    let tapped = offsets[at - start];
+    let angle = start > 0 && text[start - 1] == '<';
+    // Split only at a real Markdown boundary: `[text](target)` whose
+    // brackets balance, starting at the token's start. A `](` inside a URL
+    // or path belongs to it.
+    let mut cuts = vec![0];
+    cuts.extend(markdown_cut(&word));
+    cuts.push(word.len());
+    let (lo, hi) = cuts
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .find(|(lo, hi)| (*lo..*hi).contains(&tapped))?;
+    let token = &word[lo..hi];
+    let peeled = peel(token);
+    let inner = &token[peeled.start..peeled.end];
+    let span =
+        |range: Range<usize>| start + index_of(lo + range.start)..start + index_of(lo + range.end);
+    if peeled.mail || inner.is_empty() {
+        return None;
+    }
+    // A URL: the token is one, or holds one after other text.
     let mut search = 0;
     while let Some(found) = SCHEMES
         .iter()
-        .filter_map(|s| word[search..].find(s).map(|i| search + i))
+        .filter_map(|s| {
+            let lower = inner.to_ascii_lowercase();
+            lower[search..].find(s).map(|i| search + i)
+        })
         .min()
     {
-        let url = trim_url(&word[found..]);
-        let (first, last) = (index_of(found), index_of(found + url.len()));
-        if url.len()
-            > SCHEMES
-                .iter()
-                .find(|s| url.starts_with(**s))
-                .map_or(0, |s| s.len())
-            && (first..last).contains(&tapped)
+        let url = trim_url(&inner[found..]);
+        let scheme = SCHEMES
+            .iter()
+            .find(|s| url.to_ascii_lowercase().starts_with(**s))
+            .map_or(0, |s| s.len());
+        let range = peeled.start + found..peeled.start + found + url.len();
+        if url.len() > scheme
+            && index_of(lo + range.start) <= at - start
+            && at - start < index_of(lo + range.end)
         {
-            return Some((start + first..start + last, Link::Web(url.to_owned())));
+            return Some((span(range), Link::Web(url.to_owned())));
         }
         search = found + 1;
     }
-    if word.contains("://") {
+    if inner.contains("://") || (angle && inner.contains('@')) {
         return None;
     }
-    // A path: drop wrapping punctuation and brackets, then a `:line:col`.
-    let lead = word
-        .find(|c: char| !matches!(c, '(' | '[' | '{' | ',' | ':' | ';'))
-        .unwrap_or(word.len());
-    let body = trim_url(&word[lead..]);
-    let (path, line) = split_line(body);
+    let (path, line) = split_line(inner);
     if !looks_like_file(path) {
         return None;
     }
-    let (first, last) = (index_of(lead), index_of(lead + body.len()));
-    (first..last).contains(&tapped).then(|| {
+    let range = peeled.start..peeled.end;
+    let range = span(range);
+    range.contains(&at).then(|| {
         (
-            start + first..start + last,
+            range,
             Link::File {
                 path: path.to_owned(),
                 line,
@@ -408,8 +461,95 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     })
 }
 
-/// The markdown link `[text](http…)` covering index `at` of `text`: a tap
-/// on its text or its URL opens the URL. The whole link is washed.
+/// Where `[text](target)` at the start of `word` splits: the byte offset of
+/// its `(`, when the `[` at 0 closes, balanced, right before it.
+fn markdown_cut(word: &str) -> Option<usize> {
+    if !word.starts_with('[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, c) in word.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return word[i + 1..].starts_with('(').then_some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A token with its wrapper punctuation peeled: the byte range left, and
+/// whether a `mailto:` was peeled (an address, never a file).
+struct Peeled {
+    start: usize,
+    end: usize,
+    mail: bool,
+}
+
+/// Peels wrapper punctuation from both ends until nothing more comes off:
+/// opening `( [ { * , ; :`, a tool call's `name(` or `key=` / `key:` before a
+/// path, trailing sentence punctuation, closing brackets nothing opened, and
+/// as many closing `*` as opened one (a literal `files/*` keeps its star).
+fn peel(token: &str) -> Peeled {
+    let (mut start, mut end, mut stars, mut mail) = (0, token.len(), 0usize, false);
+    loop {
+        let before = (start, end);
+        while let Some(c) = token[start..end].chars().next() {
+            if !matches!(c, '(' | '[' | '{' | '*' | ',' | ';' | ':') {
+                break;
+            }
+            stars += usize::from(c == '*');
+            start += 1;
+        }
+        end = start + trim_url(&token[start..end]).len();
+        while stars > 0 && token[start..end].ends_with('*') {
+            end -= 1;
+            stars -= 1;
+        }
+        if let Some((len, is_mail)) = call_prefix(&token[start..end]) {
+            start += len;
+            mail |= is_mail;
+        }
+        if (start, end) == before {
+            return Peeled { start, end, mail };
+        }
+    }
+}
+
+/// The length of a leading `name(`, `mailto:`, or `key=` / `key:` that
+/// introduces a path, and whether it was `mailto:`. A key only counts before
+/// something path-shaped (`path=/a/b.rs`, not `a=b.rs`), never a `scheme://`.
+fn call_prefix(text: &str) -> Option<(usize, bool)> {
+    let ident = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+        .unwrap_or(text.len());
+    if ident == 0 || !text.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    match text[ident..].chars().next()? {
+        '(' => Some((ident + 1, false)),
+        ':' if text[..ident].eq_ignore_ascii_case("mailto") => Some((ident + 1, true)),
+        '=' | ':' => {
+            // An explicit key (`path=main.rs`) or any key before something
+            // path-shaped (`x=src/a.rs`); never `a=b.rs`, a whole file name.
+            let rest = &text[ident + 1..];
+            let key = ["path", "file", "filename"]
+                .iter()
+                .any(|k| text[..ident].eq_ignore_ascii_case(k));
+            (!rest.starts_with("//") && (key || rest.contains('/'))).then_some((ident + 1, false))
+        }
+        _ => None,
+    }
+}
+
+/// The markdown link `[text](dest)` covering index `at` of `text`, found on
+/// the whole line before tokenizing: a tap on its text or its destination
+/// (a URL or a file) opens the destination. The whole link is washed.
 fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     /// A link's text this long or longer is not looked back over.
     const MAX_TEXT: usize = 512;
@@ -419,15 +559,6 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     {
         from = close + 1;
         let url_start = close + 2;
-        let rest: String = text[url_start..text.len().min(url_start + 8)]
-            .iter()
-            .collect();
-        if !SCHEMES
-            .iter()
-            .any(|scheme| rest.to_ascii_lowercase().starts_with(scheme))
-        {
-            continue;
-        }
         // The `[` that opens the text, on this logical line: brackets inside
         // the text are balanced (`[outer [inner] label]`, `[[docs]]`).
         let floor = close.saturating_sub(MAX_TEXT);
@@ -445,6 +576,11 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
             }
         }
         let Some(open) = open else { continue };
+        // The `[` starts a token: after a word character it is part of a URL
+        // query or a path (`?q=[abc](docs/x.md)`), not a Markdown link.
+        if open > 0 && part_of_link(text[open - 1]) && !matches!(text[open - 1], '(' | '*' | '[') {
+            continue;
+        }
         // The `)` that closes the URL, brackets inside it balanced.
         let mut depth = 0usize;
         let mut end = None;
@@ -464,8 +600,18 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
         if !(open..=end).contains(&at) {
             continue;
         }
-        let url: String = text[url_start..end].iter().collect();
-        return Some((open..end + 1, Link::Web(url)));
+        let dest: String = text[url_start..end].iter().collect();
+        // The destination is the one target, a URL or a file with its
+        // `:line`; a tap on the label (spaces, paths and all) opens it.
+        let lower = dest.to_ascii_lowercase();
+        if SCHEMES.iter().any(|scheme| lower.starts_with(scheme)) {
+            return Some((open..end + 1, Link::Web(dest)));
+        }
+        let (path, line) = split_line(&dest);
+        if looks_like_file(path) {
+            let path = path.to_owned();
+            return Some((open..end + 1, Link::File { path, line }));
+        }
     }
     None
 }
@@ -526,6 +672,18 @@ fn looks_like_file(path: &str) -> bool {
     if path.contains("//") || path.ends_with('/') {
         return false;
     }
+    // `team@vendor.zip` is an address, not a file named like one.
+    if !path.contains('/') && path.contains('@') {
+        return false;
+    }
+    // Not `**a.rs`, `=a.rs` or other wrapping a candidate start left on.
+    if !path
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '/' | '~' | '.' | '_'))
+    {
+        return false;
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     let extension = name.rsplit_once('.').filter(|(stem, ext)| {
         !stem.is_empty()
@@ -539,7 +697,10 @@ fn looks_like_file(path: &str) -> bool {
         || path.starts_with("../");
     if path.contains('/') {
         // `and/or` is prose; a rooted path or one ending in a file name is not.
-        return (rooted && path.len() > 1) || extension.is_some();
+        return (rooted && path.len() > 1) || extension.is_some() || NAMES.contains(&name);
+    }
+    if NAMES.contains(&name) {
+        return true;
     }
     // Lone file names only with an extension code is written in.
     extension.is_some_and(|(_, ext)| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
@@ -817,6 +978,248 @@ mod tests {
         assert_eq!(link(&rows, 0, 3), Some(file("README.md", Some(12))));
         assert_eq!(link(&rows, 0, 22), Some(file("Cargo.toml", None)));
         assert_eq!(link(&rows, 0, 34), Some(file("~/x/y", None)));
+    }
+
+    /// How agents really print a file: bare, in a tool call's parentheses,
+    /// in backticks or bold, with `:line[:col]`, rooted anywhere.
+    #[test]
+    fn file_ask_every_way_an_agent_prints_a_path_opens_it() {
+        let cases: &[(&str, usize, &str, Option<u32>)] = &[
+            (
+                "see /home/wolf/proj/src/main.rs",
+                20,
+                "/home/wolf/proj/src/main.rs",
+                None,
+            ),
+            (
+                "see /home/wolf/proj/src/main.rs:42",
+                20,
+                "/home/wolf/proj/src/main.rs",
+                Some(42),
+            ),
+            (
+                "see /home/wolf/proj/src/main.rs:42:9",
+                20,
+                "/home/wolf/proj/src/main.rs",
+                Some(42),
+            ),
+            (
+                "edit crates/a/src/lib.rs:7",
+                12,
+                "crates/a/src/lib.rs",
+                Some(7),
+            ),
+            ("edit ~/code/x.py:3", 10, "~/code/x.py", Some(3)),
+            ("see `src/main.rs:12` now", 8, "src/main.rs", Some(12)),
+            ("see `/home/wolf/a.rs`", 8, "/home/wolf/a.rs", None),
+            ("see **src/main.rs** now", 8, "src/main.rs", None),
+            ("see **`src/main.rs:5`** now", 10, "src/main.rs", Some(5)),
+            ("\u{23fa} Update(src/main.rs)", 12, "src/main.rs", None),
+            (
+                "\u{23fa} Read(/home/wolf/a.rs)",
+                12,
+                "/home/wolf/a.rs",
+                None,
+            ),
+            ("\u{23fa} Read(src/main.rs:12)", 12, "src/main.rs", Some(12)),
+            ("path=/home/wolf/a.rs next", 10, "/home/wolf/a.rs", None),
+            (
+                "see docs/Makefile and bin/justfile",
+                8,
+                "docs/Makefile",
+                None,
+            ),
+            ("see LICENSE and Makefile", 17, "Makefile", None),
+            ("binary: bin.dat and logo.png", 10, "bin.dat", None),
+            ("binary: bin.dat and logo.png", 24, "logo.png", None),
+            ("see [src/a.rs](src/a.rs)", 16, "src/a.rs", None),
+        ];
+        for (text, col, path, line) in cases {
+            let rows = [Row::new(text, false)];
+            assert_eq!(link(&rows, 0, *col), Some(file(path, *line)), "{text}");
+        }
+    }
+
+    /// Punctuation inside a valid file name is part of it: one target for the
+    /// whole token, whichever character is tapped.
+    #[test]
+    fn file_ask_punctuation_inside_a_name_never_splits_the_token() {
+        for name in [
+            "src/icon@final.rs",
+            "src/a=b.rs",
+            "src/x[1].rs",
+            "src/a;b.rs",
+            "src/a,b.rs",
+            "~/v/a:b.rs",
+        ] {
+            let text = format!("open {name}:12 now");
+            for col in 5..5 + name.len() {
+                let rows = [Row::new(&text, false)];
+                assert_eq!(
+                    link(&rows, 0, col),
+                    Some(file(name, Some(12))),
+                    "{text} @{col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_ask_email_addresses_are_not_files() {
+        for text in ["Contact team@vendor.zip today", "mail a.b@corp.example.rs."] {
+            for col in 0..text.len() {
+                let rows = [Row::new(text, false)];
+                assert_eq!(link(&rows, 0, col), None, "{text} @{col}");
+            }
+        }
+    }
+
+    #[test]
+    fn file_ask_a_literal_trailing_star_stays_in_a_url() {
+        let rows = [Row::new("see https://example.com/files/* now", false)];
+        assert_eq!(link(&rows, 0, 10), Some(web("https://example.com/files/*")));
+        let rows = [Row::new("see **https://example.com/a** now", false)];
+        assert_eq!(link(&rows, 0, 12), Some(web("https://example.com/a")));
+        let rows = [Row::new("see src/glob/*.rs and **src/a.rs** now", false)];
+        assert_eq!(link(&rows, 0, 24), Some(file("src/a.rs", None)));
+    }
+
+    /// The property that settles every review round: a token has ONE target
+    /// (or none), whichever of its cells is tapped. Each case is a token as it
+    /// is printed and the target it must give.
+    #[test]
+    fn file_ask_every_cell_of_a_token_gives_the_same_target() {
+        let f = |p: &str, l: Option<u32>| Some(file(p, l));
+        let w = |u: &str| Some(web(u));
+        let cases: Vec<(&str, Option<Link>)> = vec![
+            (
+                "/home/wolf/proj/src/main.rs",
+                f("/home/wolf/proj/src/main.rs", None),
+            ),
+            (
+                "/home/wolf/proj/src/main.rs:42:9",
+                f("/home/wolf/proj/src/main.rs", Some(42)),
+            ),
+            ("crates/a/src/lib.rs:7", f("crates/a/src/lib.rs", Some(7))),
+            ("~/code/x.py:3", f("~/code/x.py", Some(3))),
+            ("./run.sh", f("./run.sh", None)),
+            ("README.md#L12", f("README.md", Some(12))),
+            ("src/icon@final.rs:12", f("src/icon@final.rs", Some(12))),
+            ("src/a=b.rs:12", f("src/a=b.rs", Some(12))),
+            ("a=b.rs", f("a=b.rs", None)),
+            ("a=b.rs:3", f("a=b.rs", Some(3))),
+            ("src/x[1].rs", f("src/x[1].rs", None)),
+            ("src/a;b.rs", f("src/a;b.rs", None)),
+            ("src/a,b.rs", f("src/a,b.rs", None)),
+            ("~/v/a:b.rs", f("~/v/a:b.rs", None)),
+            ("path=/home/wolf/a.rs", f("/home/wolf/a.rs", None)),
+            ("path=main.rs", f("main.rs", None)),
+            ("path=Makefile", f("Makefile", None)),
+            ("file=src/a.rs:3", f("src/a.rs", Some(3))),
+            ("filename=a.rs", f("a.rs", None)),
+            ("/tmp/report](final)", f("/tmp/report](final)", None)),
+            (
+                "https://example.com/search?q=[abc](docs/readme.md)",
+                w("https://example.com/search?q=[abc](docs/readme.md)"),
+            ),
+            ("[docs/a.rs](docs/a.rs)", f("docs/a.rs", None)),
+            (
+                "[see /repo/src/parser.rs](/repo/src/parser.rs:12)",
+                f("/repo/src/parser.rs", Some(12)),
+            ),
+            (
+                "[the parser](/repo/src/parser.rs:12)",
+                f("/repo/src/parser.rs", Some(12)),
+            ),
+            ("[https://a.io/x](https://a.io/y)", w("https://a.io/y")),
+            (
+                "[the dashboard](https://grafana.example.com/d/abc?orgId=1)",
+                w("https://grafana.example.com/d/abc?orgId=1"),
+            ),
+            ("[the docs](https://x.io/d)", w("https://x.io/d")),
+            ("file:/home/wolf/a.rs:4", f("/home/wolf/a.rs", Some(4))),
+            ("Update(src/main.rs)", f("src/main.rs", None)),
+            ("Read(/tmp/a.rs:12)", f("/tmp/a.rs", Some(12))),
+            ("**Read(/tmp/a.rs:12)**", f("/tmp/a.rs", Some(12))),
+            ("**src/main.rs**", f("src/main.rs", None)),
+            ("**src/main.rs:5**", f("src/main.rs", Some(5))),
+            ("(src/a.rs)", f("src/a.rs", None)),
+            ("(src/a.rs:9),", f("src/a.rs", Some(9))),
+            ("[src/a.rs](src/a.rs)", f("src/a.rs", None)),
+            ("docs/Makefile", f("docs/Makefile", None)),
+            ("LICENSE", f("LICENSE", None)),
+            ("bin.dat", f("bin.dat", None)),
+            (
+                "https://example.com/files/*",
+                w("https://example.com/files/*"),
+            ),
+            ("**https://example.com/a**", w("https://example.com/a")),
+            ("**(https://example.com)**", w("https://example.com")),
+            ("(https://example.com/a).", w("https://example.com/a")),
+            ("Fetch(https://x.io/a?b=1)", w("https://x.io/a?b=1")),
+            ("see:https://x.io/a", w("https://x.io/a")),
+            ("team@vendor.zip", None),
+            ("<qa/ops@vendor.zip>", None),
+            ("mailto:qa/ops@vendor.zip", None),
+            ("mailto:team@vendor.zip", None),
+            ("v1.2.3", None),
+            ("and/or", None),
+            ("12:30", None),
+            ("e.g.", None),
+        ];
+        for (token, want) in cases {
+            let text = format!("see {token} now");
+            let rows = [Row::new(&text, false)];
+            let first = text.find(token).unwrap();
+            let mut seen = Vec::new();
+            for col in first..first + token.chars().count() {
+                if let Some(found) = link(&rows, 0, col) {
+                    seen.push((col, found));
+                }
+            }
+            assert!(
+                seen.iter().all(|(_, l)| Some(l) == want.as_ref()),
+                "{token}: {seen:?}"
+            );
+            assert_eq!(
+                !seen.is_empty(),
+                want.is_some(),
+                "{token}: no cell opens it"
+            );
+        }
+    }
+
+    #[test]
+    fn file_ask_a_path_wrapped_by_the_terminal_or_in_backticks_joins() {
+        let rows = [
+            Row::new("see `/home/wolf/code/herdr/crates/a/sr", true),
+            Row::new("c/lib.rs:88` here", false),
+        ];
+        let want = Some(file("/home/wolf/code/herdr/crates/a/src/lib.rs", Some(88)));
+        assert_eq!(link(&rows, 0, 10), want);
+        assert_eq!(link(&rows, 1, 3), want);
+        let rows = [
+            Row::new("  `/home/wolf/code/herdr/crates/a/src/", false),
+            Row::new("  lib.rs:88`", false),
+        ];
+        assert_eq!(link(&rows, 1, 4), want.clone());
+        assert_eq!(link(&rows, 0, 10), want);
+    }
+
+    #[test]
+    fn file_ask_urls_open_as_plain_text_in_parens_and_bold() {
+        let url = "https://grafana.example.com/d/abc/x?orgId=1&from=now-6h";
+        for text in [
+            format!("see {url} now"),
+            format!("\u{23fa} Fetch({url})"),
+            format!("**{url}**"),
+            format!("`{url}`"),
+            format!("<{url}>"),
+        ] {
+            let rows = [Row::new(&text, false)];
+            let col = text.find("grafana").unwrap();
+            assert_eq!(link(&rows, 0, col), Some(web(url)), "{text}");
+        }
     }
 
     #[test]
