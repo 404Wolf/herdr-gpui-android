@@ -224,11 +224,12 @@ public final class StableBarTest {
                 cw, ch, 20, 24 * ch, cols * cw, false);
         ControlTargets.Rect gap = null, talk = null;
         for (ControlTargets.Rect r : rects) {
-            if (r.id.equals("gap-type")) gap = r;
+            if (r.id.equals("type")) gap = r;
             if (r.id.equals("talk")) talk = r;
         }
-        assertNotNull("the empty type slot has a target", gap);
-        assertFalse("it does nothing and is no button", ControlLine.tappable(gap.id));
+        assertNotNull("the type slot has a target", gap);
+        // Ask 9: while the keyboard is up the slot is "hide", a real button.
+        assertTrue("it puts the keyboard away", ControlLine.tappable(gap.id));
         // Every point of the slot's words is in it, none in talk's.
         for (float x = gap.labelLeft; x < gap.labelRight; x += 0.5f) {
             assertTrue(x >= gap.left && x < gap.right);
@@ -352,7 +353,7 @@ public final class StableBarTest {
         // row 18 (its actions at its right end). The stop grows up into the rows above the prompt;
         // it must never take "drop" or "edit", nor they a tap meant for the stop.
         List<ControlTargets.Cells> bar = cells("clear 21 15 16; queue 21 19 22; type 21 25 29; talk 21 32 36;"
-                + " gap-send 21 39 43");
+                + " send 21 39 43");
         String[][] kinds = {
             {"unsure", "echo-m 18 0 14", "row-again 18 15 25; row-edit 18 28 32; row-drop 18 35 39; row-back 18 42 46"},
             {"ordinary", "echo-m 18 0 27", "row-edit 18 28 32; row-drop 18 35 39; row-back 18 42 46"},
@@ -386,13 +387,16 @@ public final class StableBarTest {
             }
             // The reviewer's tap, at 22 dp rows: the stop's, never drop's.
             float ch = 22, x = 220, y = 416;
-            ControlTargets.Rect stop = null;
+            ControlTargets.Rect stop = null, send = null;
             for (ControlTargets.Rect b : ControlTargets.layout(bar, left, top, cw, ch, topRow, top + rows * ch,
                     left + cols * cw, true, queueRows)) {
                 if (b.id.equals("talk")) stop = b;
+                if (b.id.equals("send")) send = b;
             }
             assertNotNull(stop);
-            assertEquals("the stop still reaches the grid's right edge", left + cols * cw, stop.right, 0.001f);
+            assertNotNull(send);
+            // Ask 10: "send" keeps its own target while recording; the stop grows up to the gap before it.
+            assertTrue("the stop reaches the gap before send", stop.right <= send.left + 0.001f);
             boolean inStop = x >= stop.left && x < stop.right && y >= stop.top && y < stop.bottom;
             for (ControlTargets.Rect r : ControlTargets.rows(echoes, actions, left, top, cw, ch, cols)) {
                 boolean inRow = x >= r.left && x < r.right && y >= r.top && y < r.bottom;

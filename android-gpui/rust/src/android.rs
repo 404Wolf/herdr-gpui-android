@@ -76,6 +76,8 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSurface
     if let Some(window) = window {
         gpui_mobile::android::host::surface_created(window, scale);
         surface_fence::posted();
+        // A surface resized by the keyboard is blank until drawn into: wake a held frame too.
+        model::mailbox().surface_changed();
     }
 }
 
