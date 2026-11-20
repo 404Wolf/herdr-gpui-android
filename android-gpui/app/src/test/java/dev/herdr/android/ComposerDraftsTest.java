@@ -85,6 +85,7 @@ public final class ComposerDraftsTest {
         assertNull(drafts.draftRevision());
 
         String reordered = path + " " + prompt;
+        drafts.edit("");
         drafts.edit(reordered);
         ComposerDrafts restored = new ComposerDrafts();
         restored.restore(drafts.encode());
@@ -153,17 +154,6 @@ public final class ComposerDraftsTest {
         org.json.JSONObject saved = new org.json.JSONObject(drafts.encode());
         assertEquals(prompt, saved.getString(ComposerDrafts.key("host", "t1")));
         assertFalse(saved.has("t1"));
-    }
-
-    @Test
-    public void adoptingALegacyDraftKeepsItsTextAndRemovesUnownedPaths() throws Exception {
-        ComposerDrafts drafts = new ComposerDrafts();
-        drafts.restore(new org.json.JSONObject().put("t1",
-                "Please inspect '/state & '\\''photos/herdr-core/default/files/t1/herdr-paste-123.png'\n"
-                        + "and the screenshot.").toString());
-        drafts.setHost("host", "original", encoded -> true);
-        assertEquals("Please inspect \nand the screenshot.", drafts.switchTo("t1"));
-        assertNull(drafts.draftRevision());
     }
 
     @Test

@@ -28,20 +28,6 @@ public final class AttachRound6Test {
         assertEquals("a new prompt", restored.switchTo("t1"));
     }
 
-    @Test public void previouslySavedPlainDraftsLoseTheirStaleAttachmentRevision() throws Exception {
-        String saved = new org.json.JSONObject()
-                .put(ComposerDrafts.key("host", "t1"), new org.json.JSONObject()
-                        .put("text", "new prompt").put("revision", "original"))
-                .put(ComposerDrafts.key("host", "t2"), new org.json.JSONObject()
-                        .put("text", PATH).put("revision", "original"))
-                .toString();
-        ComposerDrafts restored = new ComposerDrafts();
-        restored.restore(saved);
-        restored.setHost("host", "repointed", encoded -> true);
-        assertEquals("new prompt", restored.switchTo("t1"));
-        assertEquals("", restored.switchTo("t2"));
-    }
-
     @Test public void everyClipboardItemIsClassifiedBeforeAnyPutAndMixedClipsGoBackWhole() throws Exception {
         String activity = source("GpuiTerminalActivity");
         String worker = activity.substring(activity.indexOf("private boolean queueImagePaste("),

@@ -78,15 +78,13 @@ public final class ClearDuringDictationTest {
             return routing.cancelForClear(engine, dictating());
         }
 
-        @Override public String draftText() { return drafts.text(); }
+        @Override public ComposerDrafts.Draft draft() { return drafts.draft(); }
 
-        @Override public void setDraft(String text, String revision) { drafts.edit(text, revision); }
+        @Override public String connectionRevision() { return drafts.connectionRevision(); }
 
-        @Override public void restoreDraft(String text, String revision) {
-            String now = drafts.text();
-            drafts.edit(now.trim().isEmpty() ? text : text + " " + now,
-                    revision == null ? drafts.draftRevision() : revision);
-        }
+        @Override public void setDraft(ComposerDrafts.Draft draft) { drafts.setDraft(draft); }
+
+        @Override public void restoreDraft(ComposerDrafts.Draft draft) { drafts.restoreDraft(draft); }
 
         @Override public List<String> clearable() { return Collections.emptyList(); }
 

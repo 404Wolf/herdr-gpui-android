@@ -36,10 +36,11 @@ public final class AttachRound3Test {
 
     @Test public void anAttachedPathSurvivesTheNextDictationPartialAndFinal() {
         ComposerDrafts drafts = new ComposerDrafts();
+        drafts.setHost("host", "original", encoded -> true);
         drafts.switchTo("t1");
         drafts.dictationStarted();
         drafts.dictationPartial("describe this");
-        drafts.appendAttachment("", null, "t1", java.util.Collections.singletonList("/run/t1/herdr-paste-1.png"));
+        drafts.appendAttachment("host", "original", "t1", java.util.Collections.singletonList("/run/t1/herdr-paste-1.png"));
         String partial = drafts.dictationPartial("describe this screenshot");
         assertTrue(partial, partial.contains("/run/t1/herdr-paste-1.png"));
         String done = drafts.dictationFinal("describe this screenshot please");

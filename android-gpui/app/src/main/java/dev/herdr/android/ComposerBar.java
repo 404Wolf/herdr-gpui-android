@@ -160,22 +160,18 @@ final class ComposerBar {
     private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
         @Override public boolean cancelDictation() { return cancelDictationForClear(); }
 
-        @Override public String draftText() { return drafts.text(); }
-
-        @Override public String draftRevision() { return drafts.draftRevision(); }
+        @Override public ComposerDrafts.Draft draft() { return drafts.draft(); }
 
         @Override public String connectionRevision() { return drafts.connectionRevision(); }
 
-        @Override public void setDraft(String text, String revision) {
-            drafts.edit(text, revision);
-            if (text.isEmpty()) transcribedOnPhone = false;
+        @Override public void setDraft(ComposerDrafts.Draft draft) {
+            drafts.setDraft(draft);
+            if (draft.text.isEmpty()) transcribedOnPhone = false;
             showText(drafts.text());
         }
 
-        @Override public void restoreDraft(String text, String revision) {
-            String now = drafts.text();
-            String joined = now.trim().isEmpty() ? text : text.replaceAll("\\s+$", "") + " " + now;
-            drafts.edit(joined, revision == null ? drafts.draftRevision() : revision);
+        @Override public void restoreDraft(ComposerDrafts.Draft draft) {
+            drafts.restoreDraft(draft);
             showText(drafts.text());
         }
 

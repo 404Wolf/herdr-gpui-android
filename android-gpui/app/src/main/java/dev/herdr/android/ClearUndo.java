@@ -1,5 +1,6 @@
 package dev.herdr.android;
 
+import dev.herdr.android.ComposerDrafts.Draft;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -45,17 +46,15 @@ final class ClearUndo {
         boolean cancelDictation();
 
         /** The pane's draft. */
-        String draftText();
+        Draft draft();
 
-        default String draftRevision() { return null; }
-
-        default String connectionRevision() { return null; }
+        String connectionRevision();
 
         /** Sets the pane's draft (in memory; {@link #persist} saves it). */
-        void setDraft(String text, String revision);
+        void setDraft(Draft draft);
 
-        /** Puts {@code text} back as the pane's draft, ahead of anything typed since (in memory). */
-        void restoreDraft(String text, String revision);
+        /** Puts the cleared draft back, ahead of anything typed since (in memory). */
+        void restoreDraft(Draft draft);
 
         /** The pane's queued messages a clear takes: all but one being sent. */
         List<String> clearable();
@@ -107,8 +106,7 @@ final class ClearUndo {
     private Level level = Level.NONE;
     private String owner = "";
     private long until;
-    private String draft = "";
-    private String draftRevision;
+    private Draft draft = Draft.EMPTY;
     private final List<String> messages = new ArrayList<>();
     private final List<String> clips = new ArrayList<>();
     /** The user undid it; the record stays until the messages and recordings are back on disk. */
@@ -251,23 +249,21 @@ final class ClearUndo {
 
     private boolean clearDraft(String owner, long now) {
         cancelled = fx.cancelDictation();
-        String text = fx.draftText();
-        String revision = fx.draftRevision();
-        List<String> held = DictationToken.ids(text);
+        Draft before = fx.draft();
+        List<String> held = DictationToken.ids(before.text);
         if (!held.isEmpty() && !fx.holdClips(held)) {
             fx.failed("Could not clear: storage");
             return false;
         }
-        fx.setDraft("", null);
+        fx.setDraft(Draft.EMPTY);
         this.owner = owner;
         level = Level.DRAFT;
         until = now + DRAFT_WINDOW_MS;
-        draft = text;
-        draftRevision = revision;
+        draft = before;
         clips.addAll(held);
         // The record and the emptied draft, in one write.
         if (!fx.persist(encode())) {
-            fx.setDraft(text, revision);
+            fx.setDraft(before);
             reset();
             // The draft holds its chips again: their recordings go back (now, or soon).
             if (!held.isEmpty() && !fx.releaseClips(held)) fx.retryLater();
@@ -310,13 +306,12 @@ final class ClearUndo {
             if (!undone) commit();
             return false;
         }
-        String before = fx.draftText();
-        String beforeRevision = fx.draftRevision();
-        if (!draft.isEmpty()) fx.restoreDraft(draft, draftRevision);
+        Draft before = fx.draft();
+        if (!draft.text.isEmpty()) fx.restoreDraft(draft);
         undone = true;
         if (!fx.persist(encode())) {
             undone = false;
-            fx.setDraft(before, beforeRevision);
+            fx.setDraft(before);
             fx.failed("Could not undo: storage");
             return false;
         }
@@ -421,8 +416,9 @@ final class ClearUndo {
     }
 
     private boolean owns(String owner) {
+        String revision = draft.revision();
         return !owner.isEmpty() && this.owner.equals(owner)
-                && (draftRevision == null || draftRevision.equals(fx.connectionRevision()));
+                && (revision == null || revision.equals(fx.connectionRevision()));
     }
 
     /** Whether the undo window is open. */
@@ -467,7 +463,7 @@ final class ClearUndo {
     String label(boolean narrow) {
         if (narrow) return "undo";
         switch (level) {
-            case QUEUE: return "cleared " + (messages.size() + (draft.isEmpty() ? 0 : 1)) + " · undo";
+            case QUEUE: return "cleared " + (messages.size() + (draft.text.isEmpty() ? 0 : 1)) + " · undo";
             case ROW: return "dropped · undo";
             default: return "cleared · undo";
         }
@@ -477,7 +473,7 @@ final class ClearUndo {
     String encode() {
         try {
             return new JSONObject().put("pane", owner).put("level", level.name()).put("until", until)
-                    .put("draft", draft).put("draftRevision", draftRevision).put("messages", new JSONArray(messages))
+                    .put("draft", draft.encode()).put("messages", new JSONArray(messages))
                     .put("clips", new JSONArray(clips)).put("undone", undone)
                     .put("pendingLevel", pendingLevel.name()).put("pendingUntil", pendingUntil)
                     .put("pendingMessages", new JSONArray(pendingMessages))
@@ -502,9 +498,7 @@ final class ClearUndo {
             owner = o.optString("pane", "");
             level = Level.valueOf(o.optString("level", "NONE"));
             until = o.optLong("until", 0);
-            draft = o.optString("draft", "");
-            draftRevision = o.optString("draftRevision", null);
-            if (draftRevision == null && ComposerDrafts.hasUnversionedAttachment(draft)) draftRevision = "";
+            draft = Draft.decode(o.opt("draft"));
             undone = o.optBoolean("undone", false);
             JSONArray m = o.optJSONArray("messages");
             for (int i = 0; m != null && i < m.length(); i++) messages.add(m.getString(i));
@@ -539,8 +533,7 @@ final class ClearUndo {
         level = Level.NONE;
         owner = "";
         until = 0;
-        draft = "";
-        draftRevision = null;
+        draft = Draft.EMPTY;
         messages.clear();
         clips.clear();
         undone = false;
