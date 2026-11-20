@@ -174,16 +174,20 @@ fi
 cols_now() { a logcat -d -s herdr-tap > "$EMU_OUT/herdr-tap.log" 2>&1; $ui cols "$EMU_OUT/herdr-tap.log"; }
 
 # (a) recording controls at 46 and 98 columns
-set_width() { # target-cols
-    local target=$1 w c
-    local widths
-    if (( target <= 46 )); then widths=(760 780 800 820 840 740 720); else widths=(1700 1680 1720 1660 1760 1640 1800); fi
-    for w in "${widths[@]}"; do
+# Sets the display width so the renderer reports about `target` columns. The pixels per column differ
+# by system image and density, so it is measured: start from a guess, then rescale from what the
+# renderer reports (herdr-tap layout lines), a few times. Echoes the columns reached.
+set_width() { # target-cols  (narrow: 44..48 is "cover-like", wide: 96..110)
+    local target=$1 ppc=${PPC:-24} w c i lo hi
+    if (( target <= 50 )); then lo=44; hi=48; else lo=96; hi=110; fi
+    for i in 1 2 3 4 5 6; do
+        w=$(python3 -c "print(max(500, min(3200, round($target * $ppc))))")
         a shell wm size "${w}x2000"
         quiet 4
         c=$(cols_now) || continue
-        (( target <= 46 )) && [[ "$c" == 46 ]] && { echo "$c"; return 0; }
-        (( target > 46 )) && (( c >= target )) && { echo "$c"; return 0; }
+        [[ "$c" =~ ^[0-9]+$ ]] || continue
+        if (( c >= lo && c <= hi )); then PPC=$ppc; echo "$c"; return 0; fi
+        ppc=$(python3 -c "print($w / $c)")
     done
     echo "${c:-?}"
     return 1
