@@ -14,7 +14,37 @@ const MAX_ROWS: usize = 12;
 /// Border glyphs a program draws at a box's edges; never part of a link.
 const BORDERS: [char; 4] = ['\u{2502}', '\u{2503}', '\u{2551}', '|'];
 /// Extensions that make a bare `name.ext` a file, without a slash to say so.
+const NAMES: &[&str] = &[
+    "CHANGELOG",
+    "CODEOWNERS",
+    "Dockerfile",
+    "Gemfile",
+    "Justfile",
+    "LICENSE",
+    "Makefile",
+    "Procfile",
+    "README",
+    "Rakefile",
+    "justfile",
+];
 const EXTENSIONS: &[&str] = &[
+    // Binary or data files too: a tap shows "Not a text file", not nothing.
+    "apk",
+    "bin",
+    "dat",
+    "db",
+    "gif",
+    "gz",
+    "jar",
+    "jpeg",
+    "jpg",
+    "pdf",
+    "png",
+    "so",
+    "sqlite",
+    "tar",
+    "wasm",
+    "zip",
     "c",
     "cc",
     "cfg",
@@ -387,25 +417,34 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     if word.contains("://") {
         return None;
     }
-    // A path: drop wrapping punctuation and brackets, then a `:line:col`.
-    let lead = word
-        .find(|c: char| !matches!(c, '(' | '[' | '{' | ',' | ':' | ';'))
-        .unwrap_or(word.len());
-    let body = trim_url(&word[lead..]);
-    let (path, line) = split_line(body);
-    if !looks_like_file(path) {
-        return None;
+    // A path: it may follow wrapping punctuation or a tool call's bracket
+    // (`Update(src/a.rs)`, `path=/a/b.rs`, `**a.rs**`), so every opener in the
+    // word is a candidate start, latest first (`path=/a/b.rs` is `/a/b.rs`;
+    // a `:` before `12` fails and falls back); then a `:line:col` is cut.
+    let openers = word
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '(' | '[' | '{' | '=' | ',' | ';' | ':' | '*' | '@'))
+        .map(|(i, c)| i + c.len_utf8());
+    let mut leads: Vec<usize> = std::iter::once(0).chain(openers).collect();
+    leads.reverse();
+    for lead in leads {
+        let body = trim_url(&word[lead..]);
+        let (path, line) = split_line(body);
+        if !looks_like_file(path) {
+            continue;
+        }
+        let (first, last) = (index_of(lead), index_of(lead + body.len()));
+        if (first..last).contains(&tapped) {
+            return Some((
+                start + first..start + last,
+                Link::File {
+                    path: path.to_owned(),
+                    line,
+                },
+            ));
+        }
     }
-    let (first, last) = (index_of(lead), index_of(lead + body.len()));
-    (first..last).contains(&tapped).then(|| {
-        (
-            start + first..start + last,
-            Link::File {
-                path: path.to_owned(),
-                line,
-            },
-        )
-    })
+    None
 }
 
 /// The markdown link `[text](http…)` covering index `at` of `text`: a tap
@@ -473,7 +512,7 @@ fn markdown_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
 /// Drops sentence punctuation and an unbalanced closing bracket from the end.
 fn trim_url(mut url: &str) -> &str {
     loop {
-        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
         let trimmed = match trimmed.chars().last() {
             Some(close @ (')' | ']' | '}')) => {
                 let open = match close {
@@ -526,6 +565,14 @@ fn looks_like_file(path: &str) -> bool {
     if path.contains("//") || path.ends_with('/') {
         return false;
     }
+    // Not `**a.rs`, `=a.rs` or other wrapping a candidate start left on.
+    if !path
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '/' | '~' | '.' | '_'))
+    {
+        return false;
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     let extension = name.rsplit_once('.').filter(|(stem, ext)| {
         !stem.is_empty()
@@ -539,7 +586,10 @@ fn looks_like_file(path: &str) -> bool {
         || path.starts_with("../");
     if path.contains('/') {
         // `and/or` is prose; a rooted path or one ending in a file name is not.
-        return (rooted && path.len() > 1) || extension.is_some();
+        return (rooted && path.len() > 1) || extension.is_some() || NAMES.contains(&name);
+    }
+    if NAMES.contains(&name) {
+        return true;
     }
     // Lone file names only with an extension code is written in.
     extension.is_some_and(|(_, ext)| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
@@ -817,6 +867,99 @@ mod tests {
         assert_eq!(link(&rows, 0, 3), Some(file("README.md", Some(12))));
         assert_eq!(link(&rows, 0, 22), Some(file("Cargo.toml", None)));
         assert_eq!(link(&rows, 0, 34), Some(file("~/x/y", None)));
+    }
+
+    /// How agents really print a file: bare, in a tool call's parentheses,
+    /// in backticks or bold, with `:line[:col]`, rooted anywhere.
+    #[test]
+    fn file_ask_every_way_an_agent_prints_a_path_opens_it() {
+        let cases: &[(&str, usize, &str, Option<u32>)] = &[
+            (
+                "see /home/wolf/proj/src/main.rs",
+                20,
+                "/home/wolf/proj/src/main.rs",
+                None,
+            ),
+            (
+                "see /home/wolf/proj/src/main.rs:42",
+                20,
+                "/home/wolf/proj/src/main.rs",
+                Some(42),
+            ),
+            (
+                "see /home/wolf/proj/src/main.rs:42:9",
+                20,
+                "/home/wolf/proj/src/main.rs",
+                Some(42),
+            ),
+            (
+                "edit crates/a/src/lib.rs:7",
+                12,
+                "crates/a/src/lib.rs",
+                Some(7),
+            ),
+            ("edit ~/code/x.py:3", 10, "~/code/x.py", Some(3)),
+            ("see `src/main.rs:12` now", 8, "src/main.rs", Some(12)),
+            ("see `/home/wolf/a.rs`", 8, "/home/wolf/a.rs", None),
+            ("see **src/main.rs** now", 8, "src/main.rs", None),
+            ("see **`src/main.rs:5`** now", 10, "src/main.rs", Some(5)),
+            ("\u{23fa} Update(src/main.rs)", 12, "src/main.rs", None),
+            (
+                "\u{23fa} Read(/home/wolf/a.rs)",
+                12,
+                "/home/wolf/a.rs",
+                None,
+            ),
+            ("\u{23fa} Read(src/main.rs:12)", 12, "src/main.rs", Some(12)),
+            ("path=/home/wolf/a.rs next", 10, "/home/wolf/a.rs", None),
+            (
+                "see docs/Makefile and bin/justfile",
+                8,
+                "docs/Makefile",
+                None,
+            ),
+            ("see LICENSE and Makefile", 17, "Makefile", None),
+            ("binary: bin.dat and logo.png", 10, "bin.dat", None),
+            ("binary: bin.dat and logo.png", 24, "logo.png", None),
+            ("see [src/a.rs](src/a.rs)", 16, "src/a.rs", None),
+        ];
+        for (text, col, path, line) in cases {
+            let rows = [Row::new(text, false)];
+            assert_eq!(link(&rows, 0, *col), Some(file(path, *line)), "{text}");
+        }
+    }
+
+    #[test]
+    fn file_ask_a_path_wrapped_by_the_terminal_or_in_backticks_joins() {
+        let rows = [
+            Row::new("see `/home/wolf/code/herdr/crates/a/sr", true),
+            Row::new("c/lib.rs:88` here", false),
+        ];
+        let want = Some(file("/home/wolf/code/herdr/crates/a/src/lib.rs", Some(88)));
+        assert_eq!(link(&rows, 0, 10), want);
+        assert_eq!(link(&rows, 1, 3), want);
+        let rows = [
+            Row::new("  `/home/wolf/code/herdr/crates/a/src/", false),
+            Row::new("  lib.rs:88`", false),
+        ];
+        assert_eq!(link(&rows, 1, 4), want.clone());
+        assert_eq!(link(&rows, 0, 10), want);
+    }
+
+    #[test]
+    fn file_ask_urls_open_as_plain_text_in_parens_and_bold() {
+        let url = "https://grafana.example.com/d/abc/x?orgId=1&from=now-6h";
+        for text in [
+            format!("see {url} now"),
+            format!("\u{23fa} Fetch({url})"),
+            format!("**{url}**"),
+            format!("`{url}`"),
+            format!("<{url}>"),
+        ] {
+            let rows = [Row::new(&text, false)];
+            let col = text.find("grafana").unwrap();
+            assert_eq!(link(&rows, 0, col), Some(web(url)), "{text}");
+        }
     }
 
     #[test]
