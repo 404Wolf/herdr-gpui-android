@@ -521,9 +521,16 @@ fn place_with(
     out
 }
 
+/// The cells a draft line keeps beside the controls for the draft to be spread (wrap never
+/// narrows a line below 8 cells).
+const MIN_BESIDE_CONTROLS: usize = 8;
+
 /// Everything drawn over the screen in one frame, with where the controls went.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
+    /// Whether the draft's lines may be spread vertically without covering a control: the
+    /// controls' columns are kept clear on every draft row that could share their pixel band.
+    pub spread_safe: bool,
     pub placed: Vec<Placed>,
     pub controls: Vec<PlacedControl>,
     /// Where each queue row was drawn: `echo-<id>` with the host's `Ghost::echo_ids`, else
@@ -791,9 +798,24 @@ pub fn place_all(
     let has_draft = ghost.draft.iter().any(|s| !s.text.trim().is_empty());
     if let Some(anchor) = anchor {
         // The draft and the echoes, short of the controls on their row.
+        // The rows whose draft line may share a pixel band with the controls: their own row,
+        // and, when the controls sit on the box's lower rule below the caret, every later
+        // draft row from the one above them (the draft is spread over its box: see `rows`).
+        // Only while a draft line beside them keeps the cells wrap needs; on a grid where the
+        // controls take almost the whole row, the draft is not spread at all (`spread_safe`).
+        let controls_row_below = controls_row.filter(|&c| c > anchor.row);
+        let room_beside = cols.saturating_sub(len).saturating_sub(1);
+        layout.spread_safe = layout.controls.is_empty() || room_beside >= MIN_BESIDE_CONTROLS;
+        let spread_safe = layout.spread_safe;
+        let shares_band = |row: usize| {
+            !layout.controls.is_empty()
+                && (Some(row) == controls_row
+                    || (spread_safe
+                        && controls_row_below.is_some_and(|c| row > anchor.row && row + 1 >= c)))
+        };
         let width_of = |row: usize| {
-            // On the controls' row, the draft ends a cell short of them.
-            if Some(row) == controls_row && !layout.controls.is_empty() {
+            // Beside the controls, the draft ends a cell short of them.
+            if shares_band(row) {
                 (cols - len).saturating_sub(1)
             } else {
                 cols
@@ -830,7 +852,7 @@ pub fn place_all(
         let draft = place_with(source, Some(anchor), rows, cols, 1 + free_below, &width_of)
             .into_iter()
             .filter_map(|mut run| {
-                if Some(run.row) != controls_row || layout.controls.is_empty() {
+                if !shares_band(run.row) {
                     return Some(run);
                 }
                 let room = controls_from.saturating_sub(run.col);
@@ -3456,6 +3478,68 @@ mod tests {
                     .collect();
                 for p in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty() && p.text != "…") {
                     assert!(bounds.contains(&p.source.expect("a draft run")), "{grapheme} x{n}: {p:?}");
+                }
+            }
+        }
+    }
+
+    /// Claude's prompt box as the review's probe had it: the caret on row 20, the lower rule
+    /// on 21, one blank row, the status on 23.
+    fn spread_box(cols: usize) -> (Vec<Vec<char>>, Anchor) {
+        let rule = "─".repeat(cols);
+        let mut lines: Vec<String> = vec![String::new(); 24];
+        lines[19] = rule.clone();
+        lines[20] = "❯\u{a0}".into();
+        lines[21] = rule;
+        lines[23] = "  -- INSERT --".into();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let rows = screen(&refs, cols);
+        let anchor = locate(&rows, Some((20, 2)), PromptKind::Claude).expect("anchor");
+        (rows, anchor)
+    }
+
+    #[test]
+    fn a_spread_drafts_lines_never_cover_a_control_whatever_their_length_or_the_width() {
+        use crate::rows::RowGeometry;
+        let cell = (6.0f32, 40.0f32);
+        for cols in [40usize, 46, 52, 98] {
+            for lines in 1..=5usize {
+                let (rows, anchor) = spread_box(cols);
+                // A draft that wraps to about `lines` lines at this width.
+                let words: String = (0..(cols - 4) * lines).map(|i| if i % 7 == 6 { ' ' } else { 'x' }).collect();
+                let mut g = controls(ghost(vec![text(&words)]));
+                g.controls.push(control("clear", "x"));
+                let layout = place_all(&g, Some(anchor), &rows, None);
+                let block = draft_block(&layout.placed);
+                let spread = layout.spread_safe
+                    && block.is_some_and(|(first, _)| layout.controls.iter().all(|c| c.row > first));
+                let geo = if spread {
+                    RowGeometry::for_draft(cell.1, block, draft_limit(&rows, anchor))
+                } else {
+                    RowGeometry::uniform(cell.1)
+                };
+                for run in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty()) {
+                    let above = if run.row > geo.first && geo.rows > 1 { geo.gap } else { 0. };
+                    let (top, bottom) = (geo.draft_top(run.row) - above, geo.draft_top(run.row) + cell.1);
+                    let (left, right) = (run.col as f32 * cell.0, (run.col + cells(&run.text)) as f32 * cell.0);
+                    for c in &layout.controls {
+                        let band = (geo.grid_top(c.row), geo.grid_top(c.row) + cell.1);
+                        // The control's hit box: its words and one cell either side.
+                        let hit = ((c.start as f32 - 1.) * cell.0, (c.end as f32 + 1.) * cell.0);
+                        let rows_overlap = top < band.1 && bottom > band.0;
+                        let cols_overlap = left < hit.1 && right > hit.0;
+                        assert!(
+                            !(rows_overlap && cols_overlap),
+                            "{cols} cols, {lines} lines: draft row {} cols {}..{} covers {} (row {} cols {}..{})",
+                            run.row,
+                            run.col,
+                            run.col + cells(&run.text),
+                            c.id,
+                            c.row,
+                            c.start,
+                            c.end
+                        );
+                    }
                 }
             }
         }

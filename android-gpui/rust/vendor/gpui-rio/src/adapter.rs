@@ -569,7 +569,7 @@ macro_rules! __bind_gpui {
                     let block = $crate::ghost::draft_block(&layout.placed);
                     let geometry = match (anchor, block) {
                         (Some(anchor), Some((first, _)))
-                            if layout.controls.iter().all(|control| control.row > first) =>
+                            if layout.spread_safe && layout.controls.iter().all(|control| control.row > first) =>
                         {
                             $crate::rows::RowGeometry::for_draft(
                                 f32::from(self.cell.height),
