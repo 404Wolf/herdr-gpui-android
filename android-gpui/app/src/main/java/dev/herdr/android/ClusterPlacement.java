@@ -38,6 +38,14 @@ final class ClusterPlacement {
          * covers any of them ({@link ControlTargets}).
          */
         int[][] draftSpans = new int[0][];
+        /** The draft's rows as spread (RowGeometry in the renderer): first row, row count, gap and scroll in dp. */
+        int blockFirst, blockRows;
+        float rowGap, rowShift;
+
+        /** Where each row's top is, with a multi-line draft's rows spread. */
+        ControlTargets.Rows rows() {
+            return new ControlTargets.Rows(top, cellHeight, blockFirst, blockRows, rowGap, rowShift);
+        }
 
         Hint(float left, float top, float cellWidth, float cellHeight, int cols, int rows,
                 boolean anchored, int[] busy, int guard) {
@@ -112,6 +120,15 @@ final class ClusterPlacement {
                 }
                 hint.targetsTop = Math.max(0, Math.min(rows, o.optInt("targetsTop", rows)));
                 hint.draftShown = o.optBoolean("draftShown");
+                int blockRows = o.optInt("blockRows", 0), blockFirst = o.optInt("blockFirst", 0);
+                double rowGap = o.optDouble("rowGap", 0), rowShift = o.optDouble("rowShift", 0);
+                if (blockRows >= 2 && blockFirst >= 0 && blockFirst + blockRows <= rows && rowGap >= 0
+                        && rowGap < cellHeight * 2 && rowShift >= 0 && rowShift <= cellHeight * rows) {
+                    hint.rowShift = (float) rowShift;
+                    hint.blockFirst = blockFirst;
+                    hint.blockRows = blockRows;
+                    hint.rowGap = (float) rowGap;
+                }
                 JSONArray runs = o.optJSONArray("draft");
                 // Rows past the shared bound (never sent by this renderer) are kept whole from
                 // the controls: nothing drawn is ever open to them.
