@@ -35,6 +35,16 @@ def nodes(path):
     return out
 
 
+def find_bounds(path, pattern):
+    rx = re.compile(pattern)
+    for node in ET.parse(path).iter("node"):
+        text, desc = node.get("text", ""), node.get("content-desc", "")
+        b = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))
+        if b and (rx.search(text) or rx.search(desc)):
+            return tuple(map(int, b.groups()))
+    return None
+
+
 def find(path, pattern):
     rx = re.compile(pattern)
     for x, y, text, desc in nodes(path):
@@ -138,6 +148,12 @@ def timer_region_change(log_path, png_a, png_b, xml=None):
             return None
         half = max(2, int(layout["cellHeight"] * scale * 0.6))
         y0, y1 = max(0, hit[1] - half), min(ha, hit[1] + half)
+        # Columns too from the dump when it can: the timer sits between the Cancel and Type targets
+        # (the pane need not fill the display: a rail may take its left side).
+        cancel = find_bounds(xml, "Stop and discard what was dictated")
+        typ = find_bounds(xml, "Type a message, or put the keyboard away")
+        if cancel and typ and cancel[2] < typ[0]:
+            x0, x1 = cancel[2], min(wa, typ[0])
     changed = total = 0
     for y in range(y0, y1):
         for x in range(x0, x1):
