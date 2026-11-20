@@ -40,7 +40,7 @@ public final class ClearRecoveryTest {
 
     public void restoreDraft(ComposerDrafts.Draft draft) { drafts.restoreDraft(draft); }
 
-    public List<String> clearable(){return courier.outbox().clearable("h",drafts.pane(),now());}
+    public List<String> clearable(){return courier.outbox().clearable(HeldFixtures.machine("h"),"h",drafts.pane(),now());}
     public String messageText(String id){return courier.outbox().text(id);}
     public List<String> looseClips(){
       Set<String> used=new HashSet<>();for(String t:liveTexts())used.addAll(DictationToken.ids(t));
@@ -57,7 +57,7 @@ public final class ClearRecoveryTest {
       crash(record.contains("\"undone\":true")?"undone":"persist");return true;
     }
     public boolean outboxLoaded(){return courier.outbox().loaded();}
-    public List<Outbox.Cleared> clearedMessages(long t){return courier.outbox().clearedOn("h",t);}
+    public List<Outbox.Cleared> clearedMessages(long t){return courier.outbox().clearedOn(HeldFixtures.machine("h"),"h",t);}
     public List<String> liveTexts(){List<String> out=new ArrayList<>(drafts.all());out.addAll(courier.outbox().liveTexts());return out;}
     public void retryLater(){retries++;}
     public void failed(String why){notices++;}
@@ -126,7 +126,7 @@ public final class ClearRecoveryTest {
     assertFalse(after.clips.held(a));assertFalse(after.clips.held(b));
     Outbox box=new Outbox(new File(dir.getRoot(),"dispatch.json"));
     Outbox.Message picked=HeldFixtures.add(box,"h","A","never send",now());
-    box.clearAll("h","A",now()+8000,now());assertFalse(box.claim(picked.id,HeldFixtures.live("h","A"),picked.text,now(),false));
+    box.clearAll(HeldFixtures.machine("h"),"h","A",now()+8000,now());assertFalse(box.claim(picked.id,HeldFixtures.live("h","A"),picked.text,now(),false));
   }
 
   @Test public void anInterruptedOrdinaryQueuedMessageIsAdoptedAndUndone(){

@@ -102,7 +102,7 @@ public final class ClearUndoTest {
         @Override public void restoreDraft(ComposerDrafts.Draft draft) { drafts.restoreDraft(draft); }
 
         @Override public List<String> clearable() {
-            return courier.outbox().clearable("h", drafts.pane(), now());
+            return courier.outbox().clearable(HeldFixtures.machine("h"), "h", drafts.pane(), now());
         }
 
         @Override public String messageText(String id) { return courier.outbox().text(id); }
@@ -157,7 +157,7 @@ public final class ClearUndoTest {
         @Override public boolean outboxLoaded() { return courier.outbox().loaded(); }
 
         @Override public List<Outbox.Cleared> clearedMessages(long now) {
-            return courier.outbox().clearedOn("h", now);
+            return courier.outbox().clearedOn(HeldFixtures.machine("h"), "h", now);
         }
 
         @Override public List<String> liveTexts() {

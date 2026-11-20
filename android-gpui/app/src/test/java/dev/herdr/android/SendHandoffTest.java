@@ -62,6 +62,10 @@ public final class SendHandoffTest {
             @Override public void forget(SendHandoff.Record r) {
                 disk.remove(SendHandoff.KEY);
             }
+
+            @Override public void act(SendHandoff.Record r) {
+                // Typed after the clear is on disk; nothing to type here.
+            }
         });
     }
 
