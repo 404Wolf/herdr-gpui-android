@@ -97,6 +97,16 @@ final class MachineBindings {
      * before it returns; a failed save still answers (the binding holds until the app restarts).
      */
     synchronized Binding bind(String profile, String revision, String session, String name, MachineKey machine) {
+        return bind(profile, revision, session, name, machine, java.util.Collections.emptyList());
+    }
+
+    /**
+     * As {@link #bind(String, String, String, String, MachineKey)}, with the held messages: a
+     * machine a held message was typed for in another session stays that session's even when its
+     * binding has aged out of this store, and a binding a held message refers to is never evicted.
+     */
+    synchronized Binding bind(String profile, String revision, String session, String name, MachineKey machine,
+            java.util.Collection<Outbox.Message> held) {
         if (profile == null || profile.isEmpty() || revision == null || revision.isEmpty() || machine == null) {
             return null;
         }
@@ -110,12 +120,24 @@ final class MachineBindings {
                 break;
             }
         }
+        for (Outbox.Message m : held) {
+            if (refusedBy != null) break;
+            if (machine.equals(m.target.machine) && !m.target.session.equals(ownSession)) {
+                refusedBy = m.target.profileName.isEmpty() ? "another saved computer" : m.target.profileName;
+            }
+        }
         Binding next = new Binding(profile, revision, ownSession, ownName, machine, refusedBy);
         Binding previous = find(profile, revision);
         if (previous != null && same(previous, next)) return previous;
         if (previous != null) bindings.remove(previous);
         bindings.add(next);
-        while (bindings.size() > MAX_BINDINGS) bindings.remove(0);
+        java.util.Set<MachineKey> referenced = new java.util.HashSet<>();
+        for (Outbox.Message m : held) if (m.target.machine != null) referenced.add(m.target.machine);
+        // The oldest go first, never one a held message refers to (at most one per message).
+        for (java.util.Iterator<Binding> it = bindings.iterator(); bindings.size() > MAX_BINDINGS && it.hasNext(); ) {
+            Binding old = it.next();
+            if (old != next && !referenced.contains(old.machine)) it.remove();
+        }
         try {
             Outbox.write(file, encode());
         } catch (IOException | JSONException unsaved) {

@@ -73,13 +73,19 @@ final class SendHandoff {
         boolean clearDraft(Record record);
         /** The record removed (the message was not held: the draft stays as it is). */
         void forget(Record record);
+        /**
+         * Step 4: act on the held message (type it at once in its live pane). Only once the
+         * draft's clear is on disk: a draft that may still be there must never sit beside a
+         * message that was typed, which a restart would offer to send again.
+         */
+        void act(Record record);
     }
 
     /** How a Send ended. */
     enum Result {
         /** Held: act on it now. */
         HELD,
-        /** Held, but the draft could not be cleared on disk: the next start clears it. */
+        /** Held, not acted on: the draft could not be cleared on disk (the next start clears it). */
         HELD_DRAFT_STALE,
         /** The draft could not be saved: nothing was held, the draft stays. */
         DRAFT_NOT_SAVED,
@@ -93,7 +99,9 @@ final class SendHandoff {
             steps.forget(record);
             return Result.NOT_HELD;
         }
-        return steps.clearDraft(record) ? Result.HELD : Result.HELD_DRAFT_STALE;
+        if (!steps.clearDraft(record)) return Result.HELD_DRAFT_STALE;
+        steps.act(record);
+        return Result.HELD;
     }
 
     /** What a start does with a record left behind. */

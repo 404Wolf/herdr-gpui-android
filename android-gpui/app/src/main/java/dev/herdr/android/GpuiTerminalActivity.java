@@ -504,7 +504,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // field. The composer places each from the renderer's layout hints.
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
         column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
-        filePager.setOnShownChanged(() -> composer.setCovered(filePager.showingFile()));
+        filePager.setOnShownChanged(() -> {
+            composer.setCovered(filePager.showingFile());
+            refreshOffer();
+        });
         column.addView(composer.field(), new FrameLayout.LayoutParams(-1, ComposerBar.FIELD_HEIGHT_PX,
                 android.view.Gravity.BOTTOM));
         // A held message's offer, under the tab row and the crumb: over the pane it is for.
@@ -4795,19 +4798,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (outbox != null) outbox.resend(id);
             }
 
-            /** The host and pane on screen: what the composer's clear works on. */
-            private String[] onScreen() {
-                synchronized (stateLock) {
-                    String host = connection == null ? currentHostId : connection.hostId;
-                    String pane = connection == null ? "" : connection.paneId;
-                    return new String[] {host, pane};
-                }
+            @Override public java.util.List<String> clearableQueued() {
+                // The rows the pane shows, by the same machine and terminal identity.
+                Here at = here();
+                if (outbox == null || at.host.isEmpty()) return java.util.Collections.emptyList();
+                return outbox.outbox().clearable(at.machine, at.host, at.pane, System.currentTimeMillis());
             }
 
-            @Override public java.util.List<String> clearableQueued() {
-                String[] at = onScreen();
-                if (outbox == null || at[0] == null) return java.util.Collections.emptyList();
-                return outbox.outbox().clearable(at[0], at[1], System.currentTimeMillis());
+            @Override public void act(String id) { actOnHeld(id); }
+
+            @Override public boolean queuedEditable(String id) {
+                Outbox.Message m = outbox == null ? null : outbox.outbox().message(id);
+                return m != null && m.state != Outbox.State.SENDING;
             }
 
             @Override public String queuedText(String id) {
@@ -4831,9 +4833,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
 
             @Override public java.util.List<Outbox.Cleared> clearedQueued(long now) {
-                String[] at = onScreen();
-                if (outbox == null || at[0] == null) return java.util.Collections.emptyList();
-                return outbox.outbox().clearedOn(at[0], now);
+                Here at = here();
+                if (outbox == null || at.host.isEmpty()) return java.util.Collections.emptyList();
+                return outbox.outbox().clearedOn(at.machine, at.host, now);
             }
 
             @Override public java.util.List<String> liveQueuedTexts() {
@@ -5411,14 +5413,40 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             note(HeldWords.olderWaiting(older));
             return true;
         }
-        // Step 4, after the draft is cleared: typed at once in the pane on screen, no lead.
+        // Step 4 waits for the draft's clear to reach the disk (actOnHeld): typed at once in the
+        // pane on screen, on the attach on screen now, no lead.
         long handle = here.connection.remoteHandle;
         long attach = here.connection.attach;
-        main.post(() -> outbox.send(id, lane, handle, attach, text, true, outcome -> {
-            if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it waits in the queue");
-            else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
-        }));
+        immediateId = id;
+        immediate = () -> {
+            Here now = here();
+            if (!OfferGate.mayType(attach, now.connection == null ? 0 : now.connection.attach, now.live, covered())) {
+                refreshOffer();
+                return;
+            }
+            outbox.send(id, lane, handle, attach, text, true, outcome -> {
+                if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it waits in the queue");
+                else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
+            });
+        };
         return true;
+    }
+
+    /** A held message to type at once, waiting for its draft's clear to be on disk. Main thread. */
+    private String immediateId;
+    private Runnable immediate;
+
+    /** Step 4 of the Send handoff for {@code id}: its draft's clear is on disk. Main thread. */
+    private void actOnHeld(String id) {
+        Runnable run = id.equals(immediateId) ? immediate : null;
+        immediateId = null;
+        immediate = null;
+        if (run != null) run.run();
+    }
+
+    /** Whether the file page covers the terminal: then no held message is offered or typed. */
+    private boolean covered() {
+        return filePager != null && filePager.showingFile();
     }
 
     /** A live-only pane: typed at once through the input queue, as before stage 1; nothing held. */
@@ -5440,6 +5468,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void refreshOffer() {
         if (heldOffer == null || destroyed || outbox == null) return;
+        if (covered()) {
+            heldOffer.hide();
+            return;
+        }
         Here here = here();
         Outbox.Message offer = here.live ? outbox.outbox().offer(here.lane()) : null;
         if (offer != null) {
@@ -5451,7 +5483,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             long attach = here.connection.attach;
             heldOffer.show(offer.id + "@" + attach, heading, QueuedMessages.PROMPT + offer.text,
                     "Send here", () -> sendHeld(offer.id, attach),
-                    "Edit", () -> { String text = outbox.take(offer.id); if (text != null && composer != null) composer.takeBack(text); },
+                    "Edit", () -> { if (composer != null) composer.editHeld(offer.id); },
                     "Queue", this::showQueueScreen);
             return;
         }
@@ -5478,7 +5510,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void sendHeld(String id, long offeredAttach) {
         Here here = here();
-        if (!here.live || here.connection.attach != offeredAttach) {
+        if (!OfferGate.mayType(offeredAttach, here.connection == null ? 0 : here.connection.attach, here.live, covered())) {
             note("The pane changed before the tap; nothing was sent");
             refreshOffer();
             return;
@@ -5517,8 +5549,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
 
         @Override public void edit(Outbox.Message m) {
-            String text = outbox.take(m.id);
-            if (text != null && composer != null) composer.takeBack(text);
+            if (composer != null) composer.editHeld(m.id);
         }
 
         @Override public int boot() {
@@ -5582,7 +5613,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         MachineKey key = MachineKey.of(coreId, current.fingerprint);
         if (key == null) return;
         MachineBindings.Binding binding = bindings.bind(current.hostId, current.connectionRevision, current.session,
-                current.hostName, key);
+                current.hostName, key, outbox == null ? java.util.Collections.emptyList() : outbox.outbox().all());
         if (binding == null) return;
         if (binding.bound()) {
             current.machine = key;
@@ -5654,8 +5685,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         switch (row.kind) {
             case MESSAGE:
                 if (message == null || message.state == Outbox.State.SENDING) return;
-                if (message.state == Outbox.State.PENDING && message.id.equals(offeredId())) {
-                    sheet.add("Send here", () -> sendHeld(message.id, here().connection.attach));
+                Here opened = here();
+                if (message.state == Outbox.State.PENDING && message.id.equals(offeredId()) && opened.connection != null) {
+                    // Bound to the attach on screen now: a reattach before the tap types nothing.
+                    long attach = opened.connection.attach;
+                    sheet.add("Send here", () -> sendHeld(message.id, attach));
                 }
                 if (message.state == Outbox.State.NEEDS_YOU) {
                     sheet.add("It arrived", () -> composer.queueCommand(row.id, "drop"));

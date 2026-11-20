@@ -290,6 +290,8 @@ final class Outbox {
         // the migration's write and lose what was migrated.
         synchronized (writeLock) {
             synchronized (this) {
+                // Once: a save forces the load first, and the courier's own load then does nothing.
+                if (diskRead) return;
                 List<Entry> loaded = new ArrayList<>();
                 String text = read(file);
                 if (text != null && !decode(text, loaded)) {
@@ -404,11 +406,15 @@ final class Outbox {
         }
     }
 
-    /** Messages on {@code host} cleared and still in their undo window at {@code now}. */
-    synchronized List<Cleared> clearedOn(String host, long now) {
+    /**
+     * Messages cleared and still in their undo window at {@code now}, among those the panes of
+     * {@code host} show while it reaches {@code machine} ({@link #shown}'s rule).
+     */
+    synchronized List<Cleared> clearedOn(MachineKey machine, String host, long now) {
         List<Cleared> out = new ArrayList<>();
         for (Entry e : entries) {
-            if (e.target.profileId.equals(host) && e.clearedUntil > now) {
+            boolean shown = e.target.machine == null ? e.target.profileId.equals(host) : e.target.machine.equals(machine);
+            if (shown && e.clearedUntil > now) {
                 out.add(new Cleared(e.id, ComposerDrafts.key(host, e.target.address), e.text, e.clearedUntil));
             }
         }
@@ -439,6 +445,9 @@ final class Outbox {
         // One writer at a time, each writing the state it read inside the lock: a slower save of
         // an older state can never land over a newer one.
         synchronized (writeLock) {
+            // Never write over a file not read yet: what it holds is merged first, so the first
+            // Send after a start can never replace a queue the startup load has not read.
+            if (!diskRead) load();
             String text;
             long at;
             synchronized (this) {
@@ -734,18 +743,28 @@ final class Outbox {
      * marked cleared until {@code until} (epoch ms): kept on disk, never sent, shown or counted,
      * so an undo (or a restart within the window) can bring it back. Their ids.
      */
-    synchronized List<String> clearAll(String host, String pane, long until, long now) {
-        return clear(clearable(host, pane, now), until);
+    synchronized List<String> clearAll(MachineKey machine, String host, String pane, long until, long now) {
+        return clear(clearable(machine, host, pane, now), until);
     }
 
-    /** What a clear of {@code pane} would take: its pending messages and those needing the user. */
-    synchronized List<String> clearable(String host, String pane, long now) {
+    /**
+     * What a clear of {@code pane} would take: the pending messages and those needing the user
+     * among exactly the rows {@link #shown} shows there. A profile repointed to another machine
+     * never clears the old machine's rows it does not show.
+     */
+    synchronized List<String> clearable(MachineKey machine, String host, String pane, long now) {
         List<String> ids = new ArrayList<>();
+        Live live = new Live(machine, host, pane, null);
         for (Entry e : entries) {
-            if (e.clearedUntil > 0 || !e.target.profileId.equals(host) || !e.target.address.equals(pane)) continue;
+            if (e.clearedUntil > 0 || !inLane(e, live) || !shownFor(e, machine)) continue;
             if (e.state == State.PENDING || e.state == State.NEEDS_YOU) ids.add(e.id);
         }
         return ids;
+    }
+
+    /** Whether a pane of a profile reaching {@code machine} shows {@code e} at all. */
+    private static boolean shownFor(Entry e, MachineKey machine) {
+        return e.target.machine == null || e.target.machine.equals(machine);
     }
 
     /** Marks these messages cleared until {@code until}, never one being sent; those marked. */
@@ -839,8 +858,7 @@ final class Outbox {
         List<Message> out = new ArrayList<>();
         Live live = new Live(machine, host, pane, null);
         for (Entry e : entries) {
-            if (e.clearedUntil > 0) continue;
-            if (e.target.machine == null ? inLane(e, live) : machine != null && inLane(e, live)) out.add(e.view());
+            if (e.clearedUntil == 0 && inLane(e, live) && shownFor(e, machine)) out.add(e.view());
         }
         return out;
     }

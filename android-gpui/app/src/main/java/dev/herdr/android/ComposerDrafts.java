@@ -612,15 +612,19 @@ final class ComposerDrafts {
     String encode() {
         JSONObject out = new JSONObject();
         try {
+            for (Map.Entry<String, Draft> entry : drafts.entrySet()) {
+                Draft draft = entry.getValue();
+                Draft kept = offered.get(entry.getKey());
+                // Typed beside a draft still on offer: both are saved, the offered words first,
+                // so neither is lost to the other if the app stops before the offer is taken.
+                if (kept != null) draft = new Draft(kept.text.replaceAll("\\s+$", "") + "\n" + draft.text, draft.attachments, draft.at);
+                if (draft.text.length() <= MAX_SAVED_CHARS) out.put(entry.getKey(), draft.encode());
+            }
             for (Map.Entry<String, Draft> entry : offered.entrySet()) {
                 Draft draft = entry.getValue();
                 if (draft.text.length() <= MAX_SAVED_CHARS && !drafts.containsKey(entry.getKey())) {
                     out.put(entry.getKey(), draft.encode());
                 }
-            }
-            for (Map.Entry<String, Draft> entry : drafts.entrySet()) {
-                Draft draft = entry.getValue();
-                if (draft.text.length() <= MAX_SAVED_CHARS) out.put(entry.getKey(), draft.encode());
             }
         } catch (JSONException impossible) {
             return "{}";

@@ -169,16 +169,6 @@ final class OutboxCourier {
     }
 
     /**
-     * The composer's clear: the pane's messages, never one being sent, marked cleared until
-     * {@code until} and saved before returning; their ids, or null when the save failed (then
-     * nothing is cleared).
-     */
-    java.util.List<String> clearAll(String host, String pane, long until) {
-        java.util.List<String> ids = outbox.clearable(host, pane, System.currentTimeMillis());
-        return clear(ids, until) ? ids : null;
-    }
-
-    /**
      * Marks these messages cleared until {@code until} (never one being sent) and saves that
      * before returning; false when the save failed: then none is cleared.
      */

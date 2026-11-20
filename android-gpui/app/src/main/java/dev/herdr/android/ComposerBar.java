@@ -63,6 +63,13 @@ final class ComposerBar {
          * when it was not held: the draft stays.
          */
         default boolean send(String text, String id) { return send(text); }
+        /**
+         * Step 4 of the Send handoff: message {@code id}, held by {@link #send(String, String)},
+         * may now be acted on (typed at once when its pane is live): its draft's clear is on disk.
+         */
+        default void act(String id) { }
+        /** Whether the held message {@code id} can be taken back for editing (not being sent). */
+        default boolean queuedEditable(String id) { return queuedText(id) != null; }
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
@@ -581,6 +588,37 @@ final class ComposerBar {
         }
         scheduleQueueRefresh();
         pushGhost();
+    }
+
+    /**
+     * "Edit as draft" on held message {@code id}: its text joins this pane's draft, committed to
+     * disk, before the message leaves the outbox ({@link HeldEdit}). False when nothing changed.
+     */
+    boolean editHeld(String id) {
+        Object[] before = new Object[1];
+        HeldEdit.Result result = HeldEdit.run(id, new HeldEdit.Steps() {
+            @Override public String text(String which) {
+                return host.queuedEditable(which) ? host.queuedText(which) : null;
+            }
+
+            @Override public boolean commitDraft(String text) {
+                before[0] = drafts.snapshot();
+                takeBack(text);
+                return persistNow();
+            }
+
+            @Override public boolean take(String which) {
+                return host.takeQueued(which) != null;
+            }
+
+            @Override public void rollback() {
+                drafts.rollback(before[0]);
+                showText(drafts.text());
+                persistNow();
+            }
+        });
+        if (result == HeldEdit.Result.DRAFT_NOT_SAVED) host.notice("Could not save the draft; the message stays held");
+        return result == HeldEdit.Result.EDITED;
     }
 
     /** A queued message taken back: its text joins the draft, on a line of its own. */
@@ -1266,12 +1304,10 @@ final class ComposerBar {
                 Dictation.pending(context).retry(r.id);
                 host.notice("Sending the recording to the desktop again");
                 break;
-            case "row-edit": {
+            case "row-edit":
                 queue.forget(r.id);
-                String text = host.takeQueued(r.id);
-                if (text != null) takeBack(text);
+                editHeld(r.id);
                 break;
-            }
             case "row-drop":
                 if (r.kind == QueueView.Kind.CLIP || r.kind == QueueView.Kind.PARKED) {
                     clearing.dropped(drafts.owner(), null, r.id, now);
@@ -1692,7 +1728,14 @@ final class ComposerBar {
             @Override public void forget(SendHandoff.Record r) {
                 preferences.edit().remove(SendHandoff.KEY).commit();
             }
+
+            @Override public void act(SendHandoff.Record r) {
+                host.act(r.id);
+            }
         });
+        if (result == SendHandoff.Result.HELD_DRAFT_STALE) {
+            host.notice("Held, but the draft could not be cleared on disk; tap Send here to type it");
+        }
         if (result == SendHandoff.Result.DRAFT_NOT_SAVED) {
             host.notice("Could not save the draft; nothing was sent");
             return;
