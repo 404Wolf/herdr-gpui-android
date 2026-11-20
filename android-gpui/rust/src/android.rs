@@ -637,7 +637,6 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeAttachS
     handle: jlong,
     host: JString<'_>,
     pane: JString<'_>,
-    agent: JString<'_>,
 ) -> jboolean {
     let (Ok(Some(host)), Ok(Some(pane))) = (
         bounded_string(&mut env, &host, 4096),
@@ -645,11 +644,7 @@ pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeAttachS
     ) else {
         return 0;
     };
-    let agent = bounded_string(&mut env, &agent, 128)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let target = model::FrameTarget::with_agent(&host, &pane, &agent);
+    let target = model::FrameTarget::new(&host, &pane);
     u8::from(handle >= 0 && model::mailbox().set_shell(generation, handle as u64, Some(target)))
 }
 

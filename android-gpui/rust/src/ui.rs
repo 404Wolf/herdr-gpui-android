@@ -255,7 +255,7 @@ impl TerminalView {
             .state
             .frame_target
             .as_ref()
-            .filter(|_| !self.state.show_agent_footer)
+            .filter(|_| self.state.active && !self.state.show_agent_footer)
             .map_or(PromptKind::Other, |target| target.footer_kind);
         terminal.update(cx, |terminal, cx| {
             if terminal.set_footer_kind(kind) {

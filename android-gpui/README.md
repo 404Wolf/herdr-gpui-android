@@ -29,9 +29,10 @@ without the GPUI native library.
 
 ## Agent footers
 
-The phone collapses recognized Claude Code and Codex footer rows below the
-terminal prompt. Turn on **Show agent footer** in **View options** to see them
-again. The choice is saved on the device.
+The phone collapses recognized footer rows below the prompt when herdr-core
+reports Claude Code or Codex as the agent pane's foreground program. Turn on
+**Show agent footer** in **View options** to restore them. The choice is saved
+on the device.
 
 ## Raw SSH shell
 

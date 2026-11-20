@@ -6515,13 +6515,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** "claude" or "codex" for the pane on screen, from its agent.kind label. */
     private static String agentKind(Connection current) {
-        return agentKind(current.panes, current.paneId);
-    }
-
-    private static String agentKind(JSONArray panes, String paneId) {
+        JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
-            if (pane == null || !paneId.equals(pane.optString("id"))) continue;
+            if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
             String kind = pane.optString("kind", "").toLowerCase(java.util.Locale.ROOT);
             if (kind.contains("claude")) return "claude";
             if (kind.contains("codex")) return "codex";
@@ -6878,9 +6875,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (now != null && !pane.equals(now.paneId)) return;
             long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
             nativeHold(generation);
-            JSONArray[] last = lastLists(host);
-            JSONArray panes = now != null && now.panes != null ? now.panes : last == null ? null : last[2];
-            nativeAttachShell(generation, renderId, host, pane, agentKind(panes, pane));
+            nativeAttachShell(generation, renderId, host, pane);
             savedShownHost = host;
             savedShownAt = savedAt;
         }
@@ -7351,7 +7346,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 handle = 0;
                 next.ready = true;
                 nativeAttachShell(next.generation, next.shellHandle, LinkFrame.part(next.hostId),
-                        LinkFrame.part(next.paneId), "");
+                        LinkFrame.part(next.paneId));
                 nativeSetActive(next.generation, true);
                 publish(next, "Shell");
             }
@@ -7537,8 +7532,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeSetDisplayPreferences(float fontSize, boolean compact,
             float systemFontScale);
     /** Draws the raw shell {@code handle} (0 for Herdr's pane) for this generation only. */
-    private static native boolean nativeAttachShell(long generation, long handle, String host, String pane,
-                                                    String agent);
+    private static native boolean nativeAttachShell(long generation, long handle, String host, String pane);
     private static native void nativeShowAgentFooter(boolean show);
 
     /** Moves the terminal horizontally by this many logical pixels. */

@@ -662,6 +662,22 @@ pub fn poll(id: u64, _since: u64, _mirror: bool) -> Result<String> {
     Ok(view.to_string())
 }
 #[cfg(feature = "android-ui")]
+fn terminal_frame_target(view: &Value, host: &str, pane: &str) -> model::FrameTarget {
+    let Some(selected) = view["panes"]
+        .as_array()
+        .and_then(|panes| panes.iter().find(|item| item["id"] == pane))
+    else {
+        return model::FrameTarget::new(host, pane);
+    };
+    model::FrameTarget::with_foreground_agent(
+        host,
+        pane,
+        selected["kind"].as_str().unwrap_or(""),
+        selected["program"].as_str().unwrap_or(""),
+    )
+}
+
+#[cfg(feature = "android-ui")]
 pub fn poll_terminal(
     id: u64,
     since: u64,
@@ -683,12 +699,7 @@ pub fn poll_terminal(
         // for, under the same lock that installs it.
         if state.render_id != 0 || !mailbox.state().held {
             let pane = state.view["pane_id"].as_str().unwrap_or("");
-            let agent = state.view["panes"]
-                .as_array()
-                .and_then(|panes| panes.iter().find(|item| item["id"] == pane))
-                .and_then(|item| item["kind"].as_str())
-                .unwrap_or("");
-            let target = model::FrameTarget::with_agent(host, pane, agent);
+            let target = terminal_frame_target(&state.view, host, pane);
             mailbox.set_shell(generation, state.render_id, Some(target));
         }
     }
@@ -923,5 +934,75 @@ mod last_use_tests {
         let uses = LastUse::new();
         assert_eq!(uses.idle_ms(), NEVER_USED_MS);
         assert_eq!(json!(uses.idle_ms()).as_i64(), Some(i64::MAX));
+    }
+}
+
+#[cfg(all(test, feature = "android-ui"))]
+mod footer_tests {
+    use super::*;
+    use gpui_rio::{footer::hidden_on_screen, ghost::PromptKind};
+    use rio_vt::{
+        ansi::CursorShape,
+        crosswords::{Crosswords, CrosswordsSize},
+        event::{VoidListener, WindowId},
+        performer::handler::Processor,
+    };
+
+    #[test]
+    fn a_claude_labeled_nvim_transcript_keeps_its_mode_line() {
+        let mut grid = Crosswords::new(
+            CrosswordsSize::new(96, 8),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            0,
+        );
+        let transcript = concat!(
+            "\x1b[?1049h\x1b[4;1H",
+            "────────────────────────────────────────\r\n",
+            "❯ Inspect the saved transcript\r\n",
+            "────────────────────────────────────────\r\n",
+            "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell · 3 agents\r\n",
+            "Open https://example.com/after",
+            "\x1b[5;3H",
+        );
+        Processor::default().advance(&mut grid, transcript.as_bytes());
+        assert_eq!(hidden_on_screen(&grid, PromptKind::Claude), Some(6..7));
+
+        let mut view = json!({"panes": [
+            {"id": "t1", "kind": "claude", "program": "nvim"},
+            {"id": "t2", "kind": "claude", "program": "claude"}
+        ]});
+        let mut mailbox = model::Mailbox::default();
+        mailbox.set_active(1, true);
+        for (program, hidden) in [
+            ("nvim", None),
+            ("claude", Some(6..7)),
+            ("less", None),
+            ("bash", None),
+            ("codex", None),
+            ("aswap", None),
+            ("", None),
+        ] {
+            view["panes"][0]["program"] = json!(program);
+            let target = terminal_frame_target(&view, "host", "t1");
+            mailbox.set_shell(1, 7, Some(target));
+            let kind = mailbox
+                .state()
+                .frame_target
+                .map_or(PromptKind::Other, |target| target.footer_kind);
+            assert_eq!(hidden_on_screen(&grid, kind), hidden, "{program}");
+        }
+    }
+
+    #[test]
+    fn codex_requires_an_agent_label_and_matching_foreground_program() {
+        let mut view = json!({"panes": [{"id": "t1", "kind": "codex", "program": "codex"}]});
+        assert_eq!(terminal_frame_target(&view, "host", "t1").footer_kind, PromptKind::Codex);
+        view["panes"][0]["program"] = json!("nvim");
+        assert_eq!(terminal_frame_target(&view, "host", "t1").footer_kind, PromptKind::Other);
+        view["panes"][0] = json!({"id": "t1", "program": "codex"});
+        assert_eq!(terminal_frame_target(&view, "host", "t1").footer_kind, PromptKind::Other);
     }
 }

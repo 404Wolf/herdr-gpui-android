@@ -1202,17 +1202,18 @@ impl FrameTarget {
     }
 
     #[cfg(all(feature = "android-ui", unix))]
-    pub(crate) fn with_agent(host: &str, pane: &str, agent: &str) -> Self {
+    pub(crate) fn with_foreground_agent(host: &str, pane: &str, agent: &str, program: &str) -> Self {
         use gpui_rio::ghost::PromptKind;
 
-        let footer_kind =
-            if agent.eq_ignore_ascii_case("claude") || agent.eq_ignore_ascii_case("claude-code") {
-                PromptKind::Claude
-            } else if agent.eq_ignore_ascii_case("codex") {
-                PromptKind::Codex
-            } else {
-                PromptKind::Other
-            };
+        let foreground = |names: &[&str]| names.iter().any(|name| program.eq_ignore_ascii_case(name));
+        let claude = agent.eq_ignore_ascii_case("claude") || agent.eq_ignore_ascii_case("claude-code");
+        let footer_kind = if claude && foreground(&["claude", "claude-code", "claude.exe", "claude-code.exe"]) {
+            PromptKind::Claude
+        } else if agent.eq_ignore_ascii_case("codex") && foreground(&["codex", "codex.exe"]) {
+            PromptKind::Codex
+        } else {
+            PromptKind::Other
+        };
         Self {
             footer_kind,
             ..Self::new(host, pane)
