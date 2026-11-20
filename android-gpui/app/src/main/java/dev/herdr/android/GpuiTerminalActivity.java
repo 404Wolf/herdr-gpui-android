@@ -285,6 +285,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         if (launch == null) {
+            android.content.Intent intent = getIntent();
+            if (ACTION_OPEN_NOTICE.equals(intent.getAction())) {
+                String host = intent.getStringExtra(EXTRA_FOCUS_HOST);
+                String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
+                if (host != null && pane != null) HomeActivity.openNotice(this, host, pane);
+            }
             android.util.Log.w("herdr-gpui", "Reopen the terminal from the host list");
             finish();
             return;
@@ -293,6 +299,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             shortcuts = Shortcut.parseConfiguration(launch.shortcuts());
             currentHostId = launch.remoteHost == null ? null : launch.remoteHost.id;
             currentHostKey = PaneSnapshots.computer(launch.remoteHost);
+            if (launch.revealFleetSelection) requestRailReveal(currentHostId, launch.paneId);
             // Remote-mutating controls live on the Java UI thread, never a deferred GPUI click.
             shortcutJson = "[]";
             loadDisplayOptions();
@@ -1906,7 +1913,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void switchHost(SavedRemoteHost host) { switchHost(host, null); }
 
-    private void switchHost(SavedRemoteHost host, String pane) {
+    private void switchHost(SavedRemoteHost host, String pane) { switchHost(host, pane, true); }
+
+    private void switchHost(SavedRemoteHost host, String pane, boolean picked) {
         if (host == null || switchingHost || host.id.equals(currentHostId)) return;
         if (host.expectedFingerprint.isEmpty()) {
             note("Trust " + host.name + " from Remote hosts first");
@@ -1914,7 +1923,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (monitor != null && monitor.offline()) {
             // No network at all: no attempt to wait on, show it from the cache.
-            switchHostOffline(host, pane);
+            switchHostOffline(host, pane, picked);
             return;
         }
         switchingHost = true;
@@ -1955,6 +1964,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         switchingTo = null;
                         return;
                     }
+                    if (picked && readyPane.equals(forcedPane)) requestRailReveal(host.id, readyPane);
                     adoptHost(host, readyHandle, readyPane);
                 });
                 handle = 0;
@@ -1965,7 +1975,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     switchingTo = null;
                     if (destroyed || !hostResumed || hostEpoch.stale(epoch)) return;
                     // Unreachable: show it from the cache; the monitor keeps trying it.
-                    switchHostOffline(host, forcedPane);
+                    switchHostOffline(host, forcedPane, picked);
                 });
             }
         });
@@ -3182,12 +3192,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
         FleetTree.PmTree tree = FleetTree.pmTree(fleet);
         String selectedPane = live && current != null ? current.paneId : "";
-        // PM rows start folded. Nothing opens at startup; moving to another
-        // window later opens its PM row once, and a fold after that is kept.
+        // Reveal an explicit pick even on cold launch. Merely restoring the
+        // last pane leaves its PM at the saved fold state.
         FleetTree.Project focusedProject = FleetTree.projectOf(fleet, selectedPane);
         java.util.List<String> reveal = new java.util.ArrayList<>();
         java.util.List<String> revealRepos = new java.util.ArrayList<>();
-        if (focusedProject != null) reveal.add(railProjectKey(host, focusedProject));
+        for (FleetTree.PmRow pm : tree.allProjects) {
+            if (pm.project != focusedProject) continue;
+            String key = pm.workerFoldKey(host.id, selectedPane);
+            if (key != null) reveal.add(key);
+            break;
+        }
         for (FleetTree.RepoRow repo : tree.repos) {
             boolean selected = false;
             for (FleetTree.PmRow pm : repo.projects) if (pm.project == focusedProject) selected = true;
@@ -3217,10 +3232,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (containsMember(tree.otherMembers, selectedPane)) {
             reveal.add(railFold(railKey(host, "other-agents"), FleetTree.Fold.OTHERS));
         }
-        String focus = selectedPane.isEmpty() ? "" : host.id + "/" + selectedPane;
-        if (railFolds().focusSeen(focus, reveal, revealRepos)) {
-            getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                    .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
+        // The selection can arrive before its pane metadata, especially on a host switch.
+        if (containsMember(members, selectedPane)) {
+            String focus = host.id + "/" + selectedPane;
+            boolean picked = focus.equals(railPickedFocus);
+            if (picked) railPickedFocus = "";
+            if (railFolds().focusSeen(focus, reveal, revealRepos, picked)) saveRailFolds();
         }
         updateRailFleetButtons(header, host, live, current, fleet);
         FleetTree.Member deacon = fleet.deacon;
@@ -3230,8 +3247,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             boolean hFolded = railFolded(hKey) && !containsMember(tree.helpers, selectedPane);
             String said = FleetPanes.displayTitle(deacon);
             String sub = deacon.id + (FleetTree.genericName(said) || said.equals(deacon.id) ? "" : " · " + said);
-            railAgent(host, live, current, deacon, "Deacon", sub, 0, tree.helpers.isEmpty() ? null : hKey, hFolded,
-                    hFolded && tree.deaconBlocked(), selectedPane, order, keep);
+            railAgent(host, live, current, deacon, "Deacon", sub, FleetTree.railAgentPadding(0, false),
+                    tree.helpers.isEmpty() ? null : hKey, hFolded, 0, hFolded && tree.deaconBlocked(), selectedPane, order, keep);
             String pending = railDeaconPending.getOrDefault(host.id, "");
             if (deacon.id.equals(pending)) {
                 railNote(host, "deacon-state", "Starting the Deacon…", chrome.onSurfaceVariant, 1, null, order, keep);
@@ -3241,7 +3258,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (!hFolded) {
                 for (FleetTree.Member helper : tree.helpers) {
-                    railAgent(host, live, current, helper, null, "", 1, null, false, false, selectedPane, order, keep);
+                    railAgent(host, live, current, helper, null, "", FleetTree.railAgentPadding(1, false),
+                            null, false, 0, false, selectedPane, order, keep);
                 }
             }
             // New project is the computer row's +; while it is asking, say so here.
@@ -3291,7 +3309,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             railHeader(host, live, current, "group:other-agents", "Other agents", meta, key,
                     folded, 0, "", order, keep);
             if (!folded) {
-                for (FleetTree.AgentNode node : tree.others) railAgentTree(host, live, current, node, 1, selectedPane, order, keep);
+                for (FleetTree.AgentNode node : tree.others) {
+                    railAgentTree(host, live, current, node, FleetTree.railAgentPadding(1, false), selectedPane, order, keep);
+                }
             }
         }
     }
@@ -3313,16 +3333,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             row.action = () -> openRailWorktree(host, live ? current : null, worktree);
         }
         if (!folded) {
-            for (FleetTree.AgentNode agent : node.agents) railAgentTree(host, live, current, agent, depth + 1, selectedPane, order, keep);
+            for (FleetTree.AgentNode agent : node.agents) {
+                railAgentTree(host, live, current, agent, FleetTree.railAgentPadding(depth + 1, false), selectedPane, order, keep);
+            }
         }
     }
 
     /** One PM row (its project's name, the PM's checkout below), then its workers when unfolded. */
     private void railPm(SavedRemoteHost host, boolean live, Connection current,
             FleetTree.PmRow pm, int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
-        String key = railProjectKey(host, pm.project);
+        String key = pm.foldKey(host.id);
         boolean folded = railFolds().folded(key);
-        String foldKey = pm.workers.isEmpty() ? null : key;
+        String foldKey = pm.workerRows == 0 ? null : key;
         if (!pm.labelledPm()) {
             // Live and idle projects without a labelled PM keep a dimmed, direct terminal target.
             FleetTree.Member target = FleetTree.projectTarget(pm);
@@ -3335,19 +3357,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (live && !pm.catalogs.isEmpty()) header.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
         } else {
             String sub = pm.pm.id + (pm.where.isEmpty() ? "" : " · " + pm.where);
-            RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, depth, foldKey, folded,
-                    folded && pm.blocked(), selectedPane, order, keep);
+            RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, FleetTree.railAgentPadding(depth, false),
+                    foldKey, folded, pm.workerRows, folded && pm.blocked(), selectedPane, order, keep);
             if (row != null) {
                 row.state.setText(pm.countsLabel());
                 row.state.setTextColor(pm.blocked() ? chrome.danger : chrome.onSurfaceVariant);
-                row.row.setContentDescription("Open " + pm.name() + ", " + pm.countsLabel());
+                row.row.setContentDescription("Open " + pm.name() + ", " + pm.countsLabel()
+                        + (pm.blocked() ? ", needs attention" : ""));
             }
             if (row != null && live && !pm.catalogs.isEmpty()) {
                 row.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
             }
         }
         if (folded) return;
-        for (FleetTree.AgentNode node : pm.workers) railAgentTree(host, live, current, node, depth + 1, selectedPane, order, keep);
+        int workerPadding = FleetTree.railAgentPadding(depth + 1, pm.labelledPm());
+        for (FleetTree.AgentNode node : pm.workers) {
+            railAgentTree(host, live, current, node, workerPadding, selectedPane, order, keep);
+        }
     }
 
     private void selectRailHeader(RailWorkspaceRow holder, boolean selected) {
@@ -3401,6 +3427,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private FleetTree.Folds railFoldState;
+    private String railPickedFocus = "";
+
+    private void requestRailReveal(String hostId, String paneId) {
+        railPickedFocus = hostId == null || paneId == null || paneId.isEmpty() ? "" : hostId + "/" + paneId;
+    }
 
     /**
      * A rail row's stored fold key under FleetTree's one policy (shared with
@@ -3420,10 +3451,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return railFoldState;
     }
 
-    private static String railProjectKey(SavedRemoteHost host, FleetTree.Project project) {
-        return railKey(host, "p/" + project.name) + ":open";
-    }
-
     private static boolean containsMember(java.util.List<FleetTree.Member> list, String id) {
         for (FleetTree.Member m : list) if (m.id.equals(id)) return true;
         return false;
@@ -3435,9 +3462,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void railAgentTree(SavedRemoteHost host, boolean live, Connection current, FleetTree.AgentNode node,
-            int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
-        railAgent(host, live, current, node.member, null, node.where, depth, null, false, false, selectedPane, order, keep);
-        for (FleetTree.AgentNode kid : node.children) railAgentTree(host, live, current, kid, depth + 1, selectedPane, order, keep);
+            int padding, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
+        railAgent(host, live, current, node.member, null, node.where, padding, null, false, 0, false, selectedPane, order, keep);
+        for (FleetTree.AgentNode kid : node.children) {
+            railAgentTree(host, live, current, kid, padding + FleetTree.RAIL_DEPTH_DP, selectedPane, order, keep);
+        }
     }
 
     /**
@@ -3448,7 +3477,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * null when this terminal already has a row in this pass.
      */
     private RailPaneRow railAgent(SavedRemoteHost host, boolean live, Connection current, FleetTree.Member m,
-            String lead, String sub, int depth, String foldKey, boolean folded, boolean bubbled, String selectedPane,
+            String lead, String sub, int padding, String foldKey, boolean folded, int workerRows, boolean bubbled, String selectedPane,
             java.util.List<View> order, java.util.Set<String> keep) {
         String paneKey = "pane:" + host.id + "/" + m.id;
         if (!keep.add(paneKey)) return null; // each terminal once
@@ -3462,12 +3491,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String shownSub = sub + (changes.isEmpty() ? "" : (sub.isEmpty() ? "" : " · ") + changes);
         row.foldKey = foldKey;
         row.worktrees = null;
-        String mark = lead == null ? null : foldKey == null ? "" : folded ? "▸" : "▾";
+        String mark = lead == null ? null : foldKey == null ? "" : folded
+                ? workerRows > 0 ? "▸" + workerRows : "▸" : "▾";
+        int markWidth = dp(workerRows > 0 ? FleetTree.PM_CHEVRON_DP : FleetTree.RAIL_DEPTH_DP);
+        if (row.mark.getLayoutParams().width != markWidth) {
+            row.mark.getLayoutParams().width = markWidth;
+            row.mark.requestLayout();
+        }
         row.mark.setVisibility(mark == null ? View.GONE : View.VISIBLE);
         if (mark != null && !mark.contentEquals(row.mark.getText())) row.mark.setText(mark);
         // The chevron is the row's only fold control, so a screen reader gets it as its own button.
         String under = "deacon".equals(m.role) && "Deacon".equals(lead) ? "the Deacon's helpers" : "workers under " + lead;
-        String foldSays = foldKey == null ? null : (folded ? "Show " : "Hide ") + under;
+        String foldSays = foldKey == null ? null : workerRows == 0 ? (folded ? "Show " : "Hide ") + under
+                : (folded ? "Show " : "Hide ") + workerRows + (workerRows == 1 ? " row under " : " rows under ") + lead;
         row.mark.setImportantForAccessibility(foldSays == null ? View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 : View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         row.mark.setFocusable(foldSays != null);
@@ -3481,10 +3517,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             row.lead = lead != null;
             row.title.setTypeface(railMono(row.lead));
         }
-        updateRailPaneRow(row, host, live, current, m.id, title, m.status.isEmpty() ? "unknown" : m.status,
+        String status = "question".equals(m.waitKind) && !"blocked".equals(m.status) && !"error".equals(m.status)
+                ? "question" : m.status.isEmpty() ? "unknown" : m.status;
+        updateRailPaneRow(row, host, live, current, m.id, title, status,
                 m.id.equals(selectedPane), bubbled);
-        // One step in is one chevron slot, so a worker's mark sits under its PM's.
-        int pad = dp(4 + 18 * depth);
+        int pad = dp(padding);
         if (row.row.getPaddingLeft() != pad) row.row.setPadding(pad, dp(2), dp(6), dp(2));
         order.add(row.row);
         return row;
@@ -4116,11 +4153,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void toggleRepo(String key) {
-        java.util.Set<String> collapsed = collapsedRepos();
-        if (!collapsed.remove(key)) collapsed.add(key);
-        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
-                .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsed)).apply();
+        railFolds().toggle(key);
+        saveRailFolds();
         refreshSidebar(true);
+    }
+
+    private void saveRailFolds() {
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                .putStringSet("rail_collapsed", new java.util.HashSet<>(collapsedRepos())).apply();
     }
 
     private String paneCwd(Connection target, String paneId) {
@@ -4253,7 +4293,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (holder.foldKey != null) toggleRepo(holder.foldKey);
             else holder.row.performClick();
         });
-        holder.row.addView(holder.mark, new LinearLayout.LayoutParams(dp(18), -2));
+        holder.row.addView(holder.mark, new LinearLayout.LayoutParams(dp(FleetTree.RAIL_DEPTH_DP), -2));
         // Status as a small square mark (no ovals in the boxy rail).
         holder.dot = new View(this);
         holder.dot.setBackgroundColor(chrome.onSurfaceVariant);
@@ -4304,7 +4344,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!status.equals(holder.status)) {
             boolean pulse = holder.status != null;
             holder.status = status;
-            holder.dot.setBackgroundColor(chrome.status(status));
+            holder.dot.setBackgroundColor(chrome.status("question".equals(status) ? "blocked" : status));
             if (pulse) pulseRailDot(holder.dot);
         }
         if (holder.selected != selected) {
@@ -4316,7 +4356,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String word = status == null || status.isEmpty() || "unknown".equals(status) ? "" : status;
         // Blocked is a red "!" on the agent's own row, and on its PM's or the
         // Deacon's row while the blocked work is folded under it.
-        boolean alarm = "blocked".equals(status) || "error".equals(status) || bubbled;
+        boolean alarm = "blocked".equals(status) || "error".equals(status) || "question".equals(status) || bubbled;
         String state = alarm ? (word.isEmpty() ? "!" : "! " + word) : word;
         if (!state.contentEquals(holder.state.getText())) holder.state.setText(state);
         holder.state.setTextColor(alarm ? chrome.danger : selected ? chrome.onSurface : chrome.onSurfaceVariant);
@@ -4552,6 +4592,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void focusRemotePane(Connection target, String paneId) {
+        focusRemotePane(target, paneId, true);
+    }
+
+    private void focusRemotePane(Connection target, String paneId, boolean picked) {
         if (paneId.isEmpty() || paneId.length() > 128
                 || !paneId.matches("[A-Za-z0-9_./:-]+")) return;
         switch (OfflineSwitch.route(target.offline, target.isClosed(), target.remoteHandle)) {
@@ -4559,7 +4603,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 note("Switch panes from Remote hosts for this connection");
                 return;
             case OFFLINE:
-                focusOffline(target, paneId);
+                focusOffline(target, paneId, picked);
                 return;
             default:
                 break;
@@ -4578,13 +4622,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 target.nextRemotePollAt = 0;
                 publish(target, "Switching pane…");
             }
-            refreshSidebar(false);
+            if (picked) requestRailReveal(target.hostId, paneId);
+            refreshSidebar(picked);
         } catch (Exception | LinkageError failure) {
             // The only failure left is a session that has ended (the switch
             // itself is a slot that cannot overflow): show the pane's saved
             // copy now; the reconnect lands on it.
             android.util.Log.w("herdr-switch", "switch to " + paneId + " failed: " + failure);
-            focusOffline(target, paneId);
+            focusOffline(target, paneId, picked);
         }
     }
 
@@ -4594,7 +4639,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * drawn (or its title and a note when it has none). Nothing is asked of
      * the core: the live grid replaces this one when the pane attaches.
      */
-    private void focusOffline(Connection target, String paneId) {
+    private void focusOffline(Connection target, String paneId, boolean picked) {
         String host = target.hostId != null ? target.hostId : currentHostId;
         String key = target.hostId != null ? target.cacheKey : currentHostKey;
         rememberHostPane(host, paneId);
@@ -4605,7 +4650,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         nativeResetPan();
         showSaved(host, key, paneId);
-        refreshSidebar(false);
+        if (picked) requestRailReveal(host, paneId);
+        refreshSidebar(picked);
         // One attempt now unless one is running; the monitor keeps trying.
         reconnectCurrentHost();
     }
@@ -5580,18 +5626,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String hostId = intent.getStringExtra(EXTRA_FOCUS_HOST);
         String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
         if (hostId == null || pane == null || destroyed) return;
+        boolean picked = intent.getBooleanExtra(EXTRA_REVEAL_FLEET, true);
         Connection target;
         synchronized (stateLock) { target = connection; }
-        if (hostId.equals(currentHostId) && target != null && (target.remoteHandle > 0 || target.offline)) {
-            focusRemotePane(target, pane);
+        if (hostId.equals(currentHostId)) {
+            if (target == null) {
+                rememberHostPane(hostId, pane);
+                if (picked) requestRailReveal(hostId, pane);
+            } else if (target.remoteHandle > 0 || target.offline) {
+                focusRemotePane(target, pane, picked);
+            }
             return;
         }
         for (SavedRemoteHost host : savedHosts) {
-            if (host.id.equals(hostId)) { switchHost(host, pane); return; }
+            if (host.id.equals(hostId)) { switchHost(host, pane, picked); return; }
         }
+        if (ACTION_OPEN_NOTICE.equals(intent.getAction())) HomeActivity.openNotice(this, hostId, pane);
     }
 
     static final String EXTRA_FOCUS_HOST = "focus_host", EXTRA_FOCUS_PANE = "focus_pane";
+    static final String EXTRA_REVEAL_FLEET = "reveal_fleet";
+    private static final String ACTION_OPEN_NOTICE = "dev.herdr.android.OPEN_AGENT_NOTICE";
 
     @Override protected void onResume() {
         super.onResume();
@@ -5909,8 +5964,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** Agent alerts from the daemon, posted on one bounded channel, only when turned on. */
-    private void postNotice(String title, String body, String paneId) {
+    private void postNotice(Connection owner, String title, String body, String paneId) {
         if (destroyed || isFinishing() || !agentAlertsOn()) return;
+        synchronized (stateLock) { if (!current(owner)) return; }
         android.app.NotificationManager manager =
                 (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (manager == null) return;
@@ -5923,15 +5979,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 "herdr-agent-alerts", "Agent alerts", android.app.NotificationManager.IMPORTANCE_DEFAULT);
         channel.setDescription("A Herdr agent is waiting on you");
         manager.createNotificationChannel(channel);
-        android.app.Notification notification = new android.app.Notification.Builder(this, "herdr-agent-alerts")
+        android.app.Notification.Builder notice = new android.app.Notification.Builder(this, "herdr-agent-alerts")
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
                 .setContentTitle(title)
                 .setContentText(body)
                 .setStyle(new android.app.Notification.BigTextStyle().bigText(body))
-                .setAutoCancel(true)
-                .build();
+                .setAutoCancel(true);
+        String host = owner.hostId;
+        if (host != null && !paneId.isEmpty()) {
+            android.content.Intent open = new android.content.Intent(this, GpuiTerminalActivity.class)
+                    .setAction(ACTION_OPEN_NOTICE)
+                    .setIdentifier(host + "/" + paneId)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    .putExtra(EXTRA_FOCUS_HOST, host)
+                    .putExtra(EXTRA_FOCUS_PANE, paneId);
+            notice.setContentIntent(android.app.PendingIntent.getActivity(this, 0, open, android.app.PendingIntent.FLAG_IMMUTABLE));
+        }
         try {
-            manager.notify(paneId.isEmpty() ? title.hashCode() : paneId.hashCode(), notification);
+            manager.notify(paneId.isEmpty() ? title.hashCode() : paneId.hashCode(), notice.build());
         } catch (RuntimeException ignored) {
             // Posting can be refused while the user restricts notifications.
         }
@@ -6745,7 +6810,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         if (noticeTitle.isEmpty()) continue;
                         String noticeBody = notice.optString("body", "");
                         String noticePane = notice.optString("pane_id", "");
-                        main.post(() -> postNotice(noticeTitle, noticeBody, noticePane));
+                        main.post(() -> postNotice(current, noticeTitle, noticeBody, noticePane));
                     }
                 }
                 long serial = state.optLong("clipboard_serial", 0);
@@ -7061,7 +7126,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * does. Its picked (else last) pane is drawn from the cache and the
      * monitor reconnects to it. Main thread.
      */
-    private void switchHostOffline(SavedRemoteHost host, String pane) {
+    private void switchHostOffline(SavedRemoteHost host, String pane, boolean picked) {
         String shown = pane != null && !pane.isEmpty() ? pane : rememberedHostPane(host.id);
         if (shown.isEmpty()) {
             JSONArray[] last = lastLists(host.id, PaneSnapshots.computer(host));
@@ -7082,6 +7147,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!shown.isEmpty()) rememberHostPane(host.id, shown);
         installOffline(host.id, host, shown);
         showSaved(host.id, key, shown);
+        if (picked) requestRailReveal(host.id, pane);
         sidebarSignature = "";
         refreshSidebar(true);
         if (monitor != null) monitor.lost();

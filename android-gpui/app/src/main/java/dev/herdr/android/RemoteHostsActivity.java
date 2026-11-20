@@ -1716,7 +1716,7 @@ public final class RemoteHostsActivity extends Activity {
             if (ownedHandle != handle) return;
             try {
                 rememberLastSession(this, currentHost, id);
-                GpuiLaunch.launchRemote(this, currentHost, handle, id, title);
+                GpuiLaunch.launchPicked(this, currentHost, handle, id, title);
                 // startActivity succeeded: only the launch grant/terminal now owns the handle.
                 ownedHandle = 0;
                 generation++;
