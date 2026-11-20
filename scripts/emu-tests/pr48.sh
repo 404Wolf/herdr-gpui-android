@@ -506,7 +506,25 @@ stop_and_send() {
     local before_tap_finals
     before_tap_finals=$(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log")
     agent_screen agent-b > "$EMU_OUT/agent-b-before-send.txt" 2> /dev/null || : > "$EMU_OUT/agent-b-before-send.txt"
-    tap_ui 'Send, or press Enter' 15 || { record stop-and-send FAIL "no Send control while recording"; return; }
+    # Tap Send from a dump taken just now, and keep what was tapped, so a miss can be told from an app
+    # that ignores a correct tap: the dump, the coordinates, and the screen before and after.
+    dump || { record stop-and-send FAIL "no UI dump before the Send tap"; return; }
+    cp "$EMU_OUT/ui.xml" "$EMU_OUT/stop-and-send-ui.xml"
+    local sendxy
+    sendxy=$($ui find "$EMU_OUT/stop-and-send-ui.xml" 'Send, or press Enter') || { record stop-and-send FAIL "no Send control while recording"; return; }
+    echo "send target tapped at $sendxy; bounds: $($ui bounds "$EMU_OUT/stop-and-send-ui.xml" 'Send, or press Enter' 2> /dev/null)" > "$EMU_OUT/stop-and-send-tap.txt"
+    shot stop-and-send-before-tap
+    local sx sy; read -r sx sy <<< "$sendxy"
+    a shell input tap "$sx" "$sy"
+    sleep 4
+    shot stop-and-send-after-tap
+    # If the app is still recording (cancel + timer in its layout, no new final), the tap did nothing.
+    if has_ids cancel status && (( $(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log") <= before_tap_finals )); then
+        echo "after the tap the layout still says: $(layout_now)" >> "$EMU_OUT/stop-and-send-tap.txt"
+        record stop-and-send FAIL "the Send tap did not register: 4 s later the app is still recording and no final was requested (see stop-and-send-tap.txt, stop-and-send-ui.xml, stop-and-send-before/after-tap.png)"
+        tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
+        return
+    fi
     local end=$((SECONDS + 30)) got=0 screen="" added=""
     while (( SECONDS < end )); do
         screen=$(agent_screen agent-b) || screen=

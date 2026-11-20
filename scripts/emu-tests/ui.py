@@ -241,6 +241,11 @@ def main(argv):
         if last is None:
             return 1
         print(last)
+    elif cmd == "bounds":
+        b = find_bounds(argv[2], argv[3])
+        if b is None:
+            return 1
+        print("[%d,%d][%d,%d]" % b)
     elif cmd == "layout":
         layout = last_layout(argv[2])
         if layout is None:
