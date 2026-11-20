@@ -3271,7 +3271,7 @@ mod connection_tests {
 
     #[test]
     fn a_core_that_refuses_a_put_says_why_and_a_broken_link_is_an_error() {
-        for kind in ["needs_update", "not_found", "io"] {
+        for kind in ["needs_update", "unknown_method", "not_found", "io"] {
             let file = crate::remote::PutFile::new("t7", "a.png", vec![1, 2, 3]).unwrap();
             let (result, _) = operation_against(
                 |tx| Operation::Put(file, tx),

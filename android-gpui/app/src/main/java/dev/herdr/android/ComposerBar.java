@@ -110,6 +110,8 @@ final class ComposerBar {
         default void attachImages() { }
         /** Images the keyboard or a paste handed over: put them on the computer. */
         default void attachUris(java.util.List<android.net.Uri> uris) { }
+        /** Image files already copied to the cache (a keyboard's grant ends at once): put them, then delete them. */
+        default void attachFiles(java.util.List<java.io.File> files) { }
     }
 
     private static final String PREFS = "terminal-display";
@@ -1468,19 +1470,37 @@ final class ComposerBar {
         return edit;
     }
 
-    /** An image a keyboard inserts or a paste carries is attached, not typed; text is left to the field. */
+    /**
+     * An image a keyboard inserts or a paste carries is attached; everything else (text, document
+     * URIs) is handed back to the field so a normal paste works. A keyboard's image permission ends
+     * when this returns, so the image is copied to the cache here (bounded and decoded-checked), not read later.
+     */
     @android.annotation.TargetApi(31)
     private void listenForImages(EditText edit) {
         edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
             android.content.ClipData clip = payload.getClip();
-            java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
+            java.util.List<java.io.File> files = new java.util.ArrayList<>();
+            android.content.ClipData rest = null;
             for (int i = 0; i < clip.getItemCount(); i++) {
-                android.net.Uri uri = clip.getItemAt(i).getUri();
-                if (uri != null) uris.add(uri);
+                android.content.ClipData.Item item = clip.getItemAt(i);
+                android.net.Uri uri = item.getUri();
+                String type = uri == null ? null : context.getContentResolver().getType(uri);
+                if (type != null && type.startsWith("image/")) {
+                    try {
+                        files.add(AttachImages.copyValidated(context.getContentResolver(), uri,
+                                new java.io.File(context.getCacheDir(), "pasted")));
+                    } catch (ImageAttach.AttachException | RuntimeException unreadable) {
+                        host.notice("That image could not be attached");
+                    }
+                } else if (rest == null) {
+                    rest = new android.content.ClipData(clip.getDescription(), item);
+                } else {
+                    rest.addItem(item);
+                }
             }
-            if (uris.size() != clip.getItemCount()) return payload;
-            host.attachUris(uris);
-            return null;
+            if (!files.isEmpty()) host.attachFiles(files);
+            if (rest == null) return null;
+            return new android.view.ContentInfo.Builder(payload).setClip(rest).build();
         });
     }
 

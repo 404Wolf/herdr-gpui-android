@@ -155,10 +155,12 @@ public final class ImageAttachTest {
         String old = "{\"queued\":false,\"kind\":\"needs_update\"}";
         ImageAttach.Outcome out = ImageAttach.attach(Arrays.asList(source(PNG)), NO_CONVERSION, (n, b) -> old, () -> 1L);
         assertTrue(out.paths.isEmpty());
-        assertEquals(Arrays.asList("This computer's Herdr is too old to take images; update it"), out.failures);
+        assertEquals(Arrays.asList("Herdr on this computer is too old to take images; update it"), out.failures);
         assertEquals("That terminal is gone; open the agent again", ImageAttach.refusal("not_found"));
         assertEquals("That computer is not reachable right now", ImageAttach.refusal("unavailable"));
-        assertEquals("The host could not save the image", ImageAttach.refusal("io"));
+        // A refusal never claims nothing was written: part of a file may be left on the host.
+        assertEquals("The host could not save the image; a partial file may be left on it", ImageAttach.refusal("io"));
+        assertTrue(ImageAttach.refusal("internal").contains("partial file may be left"));
     }
 
     @Test public void aReplyWithoutAnAbsolutePathIsNeverTypedIntoTheComposer() {
@@ -174,5 +176,48 @@ public final class ImageAttachTest {
             throw new ImageAttach.AttachException("The connection dropped before the image arrived");
         }, () -> 1L);
         assertEquals(Arrays.asList("The connection dropped before the image arrived"), out.failures);
+    }
+
+    @Test public void aDirectUnknownMethodReplyGetsTheSameUpgradeGuidanceAsARelaysNeedsUpdate() {
+        // A core that predates terminal.put answers "unknown_method" itself; a relay says "needs_update".
+        String direct = "{\"queued\":false,\"kind\":\"unknown_method\"}";
+        ImageAttach.Outcome out = ImageAttach.attach(Arrays.asList(source(PNG)), NO_CONVERSION, (n, b) -> direct, () -> 1L);
+        assertEquals(Arrays.asList("Herdr on this computer is too old to take images; update it"), out.failures);
+        assertEquals(ImageAttach.refusal("needs_update"), ImageAttach.refusal("unknown_method"));
+    }
+
+    @Test public void aFileWithAnImageSignatureButABrokenBodyIsRefusedBeforeAnythingIsSent() {
+        ImageAttach.Converter broken = new ImageAttach.Converter() {
+            @Override public byte[] reencode(byte[] raw, boolean oversized) {
+                throw new AssertionError("never converted");
+            }
+
+            @Override public boolean decodable(byte[] raw) {
+                return false;
+            }
+        };
+        List<String> sent = new ArrayList<>();
+        ImageAttach.Outcome out = ImageAttach.attach(Arrays.asList(source(PNG), source(JPEG)), broken,
+                (n, b) -> {
+                    sent.add(n);
+                    return reply("/x/" + n);
+                }, () -> 1L);
+        assertTrue(sent.isEmpty());
+        assertEquals(Arrays.asList("That file is not a readable image", "That file is not a readable image"), out.failures);
+    }
+
+    @Test public void decodingIsBoundedByPixelsWhateverTheEncodedSize() {
+        long max = ImageAttach.MAX_DECODE_PIXELS;
+        // A 48 MP photo compressed to under 8 MiB: it is sampled, not decoded at full size.
+        int s = ImageAttach.sampleFor(8000, 6000, Integer.MAX_VALUE, max);
+        assertTrue((8000L / s) * (6000L / s) <= max);
+        assertEquals(2, s);
+        // The long-side limit and the pixel limit both hold.
+        int both = ImageAttach.sampleFor(12000, 9000, 4096, max);
+        assertTrue(12000 / both <= 4096 && (12000L / both) * (9000L / both) <= max);
+        assertEquals(1, ImageAttach.sampleFor(1000, 800, Integer.MAX_VALUE, max));
+        assertEquals(1, ImageAttach.sampleFor(0, 0, 4096, max));
+        // Reading is bounded on its own, below the old 48 MiB.
+        assertTrue(AttachImages.MAX_READ <= 32 * 1024 * 1024);
     }
 }

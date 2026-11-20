@@ -166,7 +166,8 @@ public final class HomeActivity extends Activity {
         }
         // "Reopen the last session at launch" (Hosts): a fresh launch goes back to
         // the remembered agent once its machine is connected, if it still exists.
-        if (state == null && RemoteHostsActivity.reopenEnabled(this)) {
+        if (state == null && RemoteHostsActivity.reopenEnabled(this)
+                && !SharedImages.waiting(System.currentTimeMillis())) {
             android.content.SharedPreferences prefs = getSharedPreferences("remote-startup", MODE_PRIVATE);
             reopenHost = prefs.getString("last_host", "");
             reopenPane = prefs.getString("last_pane", "");
@@ -221,15 +222,10 @@ public final class HomeActivity extends Activity {
         stopped = false;
         resumed = true;
         opening = false;
-        if (summary != null) summary.setText(sharedWords(summary.getText()));
         loadMachines();
+        render(true);
         main.removeCallbacks(poll);
         main.post(poll);
-    }
-
-    /** Images shared from the share sheet wait for an agent: say so where Home reports status. */
-    private static CharSequence sharedWords(CharSequence otherwise) {
-        return SharedImages.waiting(System.currentTimeMillis()) ? "Pick an agent to attach the shared image" : otherwise;
     }
 
     @Override protected void onPause() {
@@ -786,6 +782,8 @@ public final class HomeActivity extends Activity {
         // Keyed on what the tree shows, not the raw pane list: agents retitle
         // themselves with spinner glyphs many times a second, and rebuilding
         // the whole tree for each made it flicker and dropped taps.
+        String shared = SharedImages.notice(System.currentTimeMillis());
+        key.append(shared == null ? "" : shared).append('\n');
         for (Machine machine : machines.values()) {
             key.append(machine.host.id).append(machine.state).append(machine.status).append(machine.ui).append(live(machine))
                     .append(machine.git == null ? 0 : System.identityHashCode(machine.git)).append('\n');
@@ -811,7 +809,7 @@ public final class HomeActivity extends Activity {
         List<Agent> all = allAgents();
         int[] counts = new int[6];
         for (Agent agent : all) counts[statusPriority(agent.status)]++;
-        summary.setText(sharedWords(summaryText(counts)));
+        summary.setText(summaryText(counts));
         body.removeAllViews();
         machineBar.removeAllViews();
         deaconCard.removeAllViews();
@@ -819,6 +817,17 @@ public final class HomeActivity extends Activity {
             TextView line = text(note, 12, chrome.onSurfaceVariant);
             line.setPadding(dp(6), dp(4), dp(6), dp(4));
             machineBar.addView(line);
+        }
+        String waitingShare = SharedImages.notice(System.currentTimeMillis());
+        if (waitingShare != null) {
+            // In Home's own content, where a first-time user looks, not in the hidden top bar.
+            TextView card = text(waitingShare, 14, chrome.onSurface);
+            card.setPadding(dp(12), dp(10), dp(12), dp(10));
+            card.setBackgroundColor(chrome.control);
+            card.setContentDescription(waitingShare);
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.setMargins(dp(6), dp(4), dp(6), dp(6));
+            body.addView(card, params);
         }
         if (machines.isEmpty() && !hostsLoaded) {
             // Hosts not read yet (the first frame waits for them only briefly).

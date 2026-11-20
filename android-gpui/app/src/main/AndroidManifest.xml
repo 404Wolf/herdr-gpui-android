@@ -49,6 +49,10 @@
             android:theme="@style/GpuiTheme"
             android:windowSoftInputMode="adjustResize" />
         <activity android:name="dev.herdr.android.DeviceDiagnosticsActivity" android:exported="false" />
+        <!-- The camera's one private capture file, granted to the camera app per shot. -->
+        <provider android:name="dev.herdr.android.CaptureProvider"
+            android:authorities="${applicationId}.capture" android:exported="false"
+            android:grantUriPermissions="true" />
         <!-- "Share to Herdr": images from the share sheet go to the agent on screen. -->
         <activity android:name="dev.herdr.android.ShareTargetActivity" android:exported="true"
             android:label="Herdr" android:excludeFromRecents="true" android:noHistory="true"

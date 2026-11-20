@@ -255,6 +255,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onCreate(Bundle state) {
         open = true;
+        // A killed app's leftover camera capture, or a share's cached copies, are never kept.
+        CaptureFiles.clear(getCacheDir());
         // A restored activity cannot recover authority from Intent extras or framework saved state.
         launch = state == null ? GpuiLaunch.consume(System.nanoTime()) : null;
         super.onCreate(null);
@@ -4787,6 +4789,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void attachUris(java.util.List<android.net.Uri> uris) { attachFrom(uris); }
 
+            @Override public void attachFiles(java.util.List<java.io.File> files) {
+                AttachTarget target = attachTarget();
+                if (target == null) {
+                    for (java.io.File file : files) file.delete();
+                    note("Open an agent to attach an image");
+                    return;
+                }
+                java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
+                attach(target, sources, () -> { for (java.io.File file : files) file.delete(); });
+            }
+
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -4830,6 +4844,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             Connection c = connection;
             if (c == null || c.offline || c.shell || !c.ready || c.isClosed() || c.remoteHandle <= 0
                     || c.paneId == null || c.paneId.isEmpty()) return null;
+            // An image's path belongs in an agent's composer; a plain shell's Enter bypasses the draft.
+            if (!ComposerBar.isAgent(agentKind(c))) return null;
             return new AttachTarget(c.remoteHandle, c.paneId, c.hostId);
         }
     }
@@ -4856,7 +4872,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private AttachTarget cameraFor;
-    private android.net.Uri cameraShot;
 
     private void showAttachSources() {
         if (attachTarget() == null) {
@@ -4879,21 +4894,33 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    private java.io.File cameraFile;
+
     private void takePhoto() {
         cameraFor = attachTarget();
-        android.net.Uri target = AttachImages.cameraTarget(getContentResolver(), System.currentTimeMillis());
-        if (target == null) {
-            note("The camera could not start");
+        if (cameraFor == null) {
+            note("Open an agent to attach an image");
             return;
         }
-        cameraShot = target;
         try {
+            CaptureFiles.clear(getCacheDir());
+            cameraFile = CaptureFiles.create(getCacheDir(), System.currentTimeMillis());
+            android.net.Uri target = android.net.Uri.parse(
+                    "content://" + getPackageName() + ".capture/" + cameraFile.getName());
             startActivityForResult(AttachImages.cameraIntent(target), AttachImages.CAMERA_REQUEST);
         } catch (android.content.ActivityNotFoundException none) {
-            cameraShot = null;
-            getContentResolver().delete(target, null, null);
+            dropCapture();
             note("No camera app on this phone");
+        } catch (java.io.IOException | RuntimeException failed) {
+            dropCapture();
+            note("The camera could not start");
         }
+    }
+
+    private void dropCapture() {
+        cameraFile = null;
+        cameraFor = null;
+        CaptureFiles.clear(getCacheDir());
     }
 
     private void pasteImage() {
@@ -4920,17 +4947,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             cameraFor = null;
             if (result == RESULT_OK && target != null) attachTo(target, AttachImages.pickedUris(data));
         } else if (request == AttachImages.CAMERA_REQUEST) {
-            android.net.Uri shot = cameraShot;
-            cameraShot = null;
+            java.io.File shot = cameraFile;
+            cameraFile = null;
             cameraFor = null;
             if (shot == null) return;
-            if (result != RESULT_OK || target == null) {
-                getContentResolver().delete(shot, null, null);
+            if (result != RESULT_OK || target == null || shot.length() == 0) {
+                CaptureFiles.clear(getCacheDir());
                 return;
             }
-            attach(target, java.util.Collections.singletonList(
-                    AttachImages.uriSource(getContentResolver(), shot)),
-                    () -> getContentResolver().delete(shot, null, null));
+            attach(target, java.util.Collections.singletonList(AttachImages.fileSource(shot)),
+                    () -> CaptureFiles.clear(getCacheDir()));
         }
     }
 
@@ -4968,7 +4994,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                                 return RemoteNative.putFile(live.handle, live.pane, name, bytes);
                             } catch (RuntimeException dropped) {
                                 String why = dropped.getMessage();
-                                throw new ImageAttach.AttachException("The image did not arrive"
+                                throw new ImageAttach.AttachException("The image may not have arrived (it could still be on the computer)"
                                         + (why == null || why.isEmpty() ? "" : ": " + (why.length() > 120 ? why.substring(0, 120) : why)), dropped);
                             }
                         },
@@ -4985,6 +5011,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void attached(AttachTarget target, ImageAttach.Outcome outcome) {
         if (destroyed) return;
         if (!outcome.paths.isEmpty()) {
+            // Drafts are keyed by pane id alone, so a path goes into a draft only where it is unambiguous:
+            // the host the image was put on is still the one on screen. Otherwise it is only reported.
+            String onScreenHost;
+            synchronized (stateLock) { onScreenHost = connection == null ? null : connection.hostId; }
+            if (!java.util.Objects.equals(onScreenHost, target.host)) {
+                note("Image saved on " + (outcome.paths.size() == 1 ? "" : "the computer; first: ")
+                        + outcome.paths.get(0) + " (you switched computers, so it was not typed)");
+                return;
+            }
             boolean kept = composer != null
                     && composer.appendAttachment(target.pane, ImageAttach.quotePaths(outcome.paths));
             int n = outcome.paths.size();
@@ -4996,20 +5031,39 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    /** Images from the share sheet, once an agent is on screen with a live link; retried while they wait. */
+    private int askedShare = -1;
+
+    /**
+     * Images from the share sheet wait here until the user chooses: once a live agent is on screen
+     * this asks "attach to this agent?" (once per share). Nothing is uploaded before the answer.
+     */
     private void takeSharedImages() {
         long now = System.currentTimeMillis();
-        if (destroyed || !SharedImages.waiting(now)) return;
+        if (destroyed || !SharedImages.waiting(now) || askedShare == SharedImages.generation()) return;
         AttachTarget target = attachTarget();
         if (target == null) {
             main.removeCallbacks(retrySharedImages);
             main.postDelayed(retrySharedImages, 1500);
             return;
         }
-        java.util.List<java.io.File> files = SharedImages.take(now);
-        java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
-        for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
-        attach(target, sources, () -> { for (java.io.File file : files) file.delete(); });
+        askedShare = SharedImages.generation();
+        int count = SharedImages.count(now);
+        String where;
+        synchronized (stateLock) { where = connection == null || connection.title == null ? "this agent" : connection.title; }
+        new ActionSheet(this, chrome, (count == 1 ? "Attach the shared image to " : "Attach " + count + " shared images to ") + where + "?")
+                .add("Attach", () -> {
+                    AttachTarget live = attachTarget();
+                    if (live == null || !live.pane.equals(target.pane) || !java.util.Objects.equals(live.host, target.host)) {
+                        note("That agent is not on screen any more; open it and share again");
+                        return;
+                    }
+                    java.util.List<java.io.File> files = SharedImages.take(System.currentTimeMillis());
+                    java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                    for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
+                    attach(live, sources, () -> { for (java.io.File file : files) file.delete(); });
+                })
+                .add("Not now (pick another agent in Home)", () -> { })
+                .show();
     }
 
     private final Runnable retrySharedImages = this::takeSharedImages;

@@ -1,7 +1,7 @@
 package dev.herdr.android;
 
+import android.content.ClipData;
 import android.content.ContentResolver;
-import android.content.ContentValues;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -11,6 +11,7 @@ import android.provider.MediaStore;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -22,17 +23,21 @@ import java.util.List;
  * read. Nothing here touches the connection.
  */
 final class AttachImages {
-    /** Most bytes read from one source before it is refused (a shrunk photo still fits 8 MB). */
-    static final int MAX_READ = 48 * 1024 * 1024;
+    /**
+     * Most bytes read from one source before it is refused. A bound on the input, never the only
+     * one: decoding and encoding are bounded on their own ({@link ImageAttach#MAX_DECODE_PIXELS}).
+     */
+    static final int MAX_READ = 24 * 1024 * 1024;
     static final int PICK_REQUEST = 42, CAMERA_REQUEST = 43;
     private static final int SHRUNK_SIDE = 4096;
+    private static final int[] JPEG_QUALITIES = {90, 75, 60, 45, 30};
 
     private AttachImages() { }
 
-    /** The system picker: the photo picker on Android 13+, the document picker before. */
+    /** The system picker for images only: the photo picker on Android 13+, the document picker before. */
     static Intent pickIntent() {
         if (Build.VERSION.SDK_INT >= 33) {
-            return new Intent(MediaStore.ACTION_PICK_IMAGES)
+            return new Intent(MediaStore.ACTION_PICK_IMAGES).setType("image/*")
                     .putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, ImageAttach.MAX_IMAGES);
         }
         return new Intent(Intent.ACTION_GET_CONTENT).setType("image/*")
@@ -40,20 +45,14 @@ final class AttachImages {
     }
 
     /**
-     * A row in the media store for the camera to write into (no permission needed for one's own);
-     * it is deleted once its bytes are read, so the photo never lands in the gallery.
+     * The camera app's intent, writing into this app's private capture file through a URI granted to
+     * it for this one capture ({@link CaptureProvider}); nothing reaches the gallery.
      */
-    static Uri cameraTarget(ContentResolver resolver, long now) {
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.Images.Media.DISPLAY_NAME, "herdr-camera-" + now + ".jpg");
-        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-        values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Herdr");
-        return resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-    }
-
     static Intent cameraIntent(Uri target) {
-        return new Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, target)
+        Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, target)
                 .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.setClipData(ClipData.newRawUri("capture", target));
+        return intent;
     }
 
     /** The URIs a picker returned: its clip, or its single data. */
@@ -92,41 +91,104 @@ final class AttachImages {
         };
     }
 
+    /** At most {@link #MAX_READ} bytes; an allocation failure is a refusal, not a crash. */
     static byte[] readBounded(InputStream in) throws IOException, ImageAttach.AttachException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buffer = new byte[64 * 1024];
-        int read;
-        while ((read = in.read(buffer)) > 0) {
-            out.write(buffer, 0, read);
-            if (out.size() > MAX_READ) throw new ImageAttach.AttachException("That image is too large to attach");
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) > 0) {
+                out.write(buffer, 0, read);
+                if (out.size() > MAX_READ) throw new ImageAttach.AttachException("That image is too large to attach");
+            }
+            return out.toByteArray();
+        } catch (OutOfMemoryError tooBig) {
+            throw new ImageAttach.AttachException("That image is too large to attach", tooBig);
         }
-        return out.toByteArray();
+    }
+
+    /**
+     * Copies {@code uri} to a new file in {@code dir}, streaming (never held whole in memory), at
+     * most {@link #MAX_READ} bytes, and keeps it only if a decoder reads it as an image.
+     */
+    static File copyValidated(ContentResolver resolver, Uri uri, File dir) throws ImageAttach.AttachException {
+        dir.mkdirs();
+        File file = new File(dir, "img-" + System.nanoTime());
+        try (InputStream in = resolver.openInputStream(uri)) {
+            if (in == null) throw new ImageAttach.AttachException("That image could not be opened");
+            long total = 0;
+            try (FileOutputStream sink = new FileOutputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = in.read(buffer)) > 0) {
+                    total += read;
+                    if (total > MAX_READ) throw new ImageAttach.AttachException("That image is too large to attach");
+                    sink.write(buffer, 0, read);
+                }
+            }
+            if (total == 0) throw new ImageAttach.AttachException("That image is empty");
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(file.getPath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                throw new ImageAttach.AttachException("That file is not a readable image");
+            }
+            return file;
+        } catch (IOException | SecurityException | IllegalArgumentException failed) {
+            file.delete();
+            throw new ImageAttach.AttachException("That image could not be read", failed);
+        } catch (ImageAttach.AttachException refused) {
+            file.delete();
+            throw refused;
+        }
     }
 
     /**
      * Anything but png, jpeg, gif or webp (bmp, heic, avif, tiff) becomes a png; a photo over the
-     * bound is scaled to 4096 px on its long side and saved as a jpeg, its quality lowered until it fits.
+     * bound is scaled to 4096 px on its long side and saved as a jpeg, its quality lowered until it
+     * fits. Decoding is sampled so that no image holds more than
+     * {@link ImageAttach#MAX_DECODE_PIXELS} pixels, whatever its encoded size.
      */
-    static final ImageAttach.Converter CONVERTER = (raw, oversized) -> {
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeByteArray(raw, 0, raw.length, bounds);
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            throw new ImageAttach.AttachException("That is not an image Herdr can attach");
+    static final class Reencoder implements ImageAttach.Converter {
+        @Override public boolean decodable(byte[] raw) {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(raw, 0, raw.length, bounds);
+            return bounds.outWidth > 0 && bounds.outHeight > 0;
         }
-        BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inSampleSize = oversized ? ImageAttach.sampleSize(bounds.outWidth, bounds.outHeight, SHRUNK_SIDE) : 1;
-        Bitmap bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.length, options);
-        if (bitmap == null) throw new ImageAttach.AttachException("That is not an image Herdr can attach");
-        try {
-            for (int quality = 90; ; quality -= 15) {
-                ByteArrayOutputStream out = new ByteArrayOutputStream();
-                boolean png = !oversized;
-                bitmap.compress(png ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG, png ? 100 : quality, out);
-                if (out.size() <= ImageAttach.MAX_BYTES || png || quality <= 30) return out.toByteArray();
+
+        @Override public byte[] reencode(byte[] raw, boolean oversized) throws ImageAttach.AttachException {
+            Bitmap bitmap = null;
+            try {
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(raw, 0, raw.length, bounds);
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                    throw new ImageAttach.AttachException("That is not an image Herdr can attach");
+                }
+                BitmapFactory.Options options = new BitmapFactory.Options();
+                options.inSampleSize = ImageAttach.sampleFor(bounds.outWidth, bounds.outHeight,
+                        oversized ? SHRUNK_SIDE : Integer.MAX_VALUE, ImageAttach.MAX_DECODE_PIXELS);
+                bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.length, options);
+                if (bitmap == null) throw new ImageAttach.AttachException("That is not an image Herdr can attach");
+                if (!oversized) {
+                    ByteArrayOutputStream png = new ByteArrayOutputStream();
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
+                    if (png.size() <= ImageAttach.MAX_BYTES) return png.toByteArray();
+                }
+                for (int quality : JPEG_QUALITIES) {
+                    ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, quality, jpeg);
+                    if (jpeg.size() <= ImageAttach.MAX_BYTES) return jpeg.toByteArray();
+                }
+                throw new ImageAttach.AttachException("That image is too large to attach");
+            } catch (OutOfMemoryError | RuntimeException failed) {
+                throw new ImageAttach.AttachException("That image is too large to process", failed);
+            } finally {
+                if (bitmap != null) bitmap.recycle();
             }
-        } finally {
-            bitmap.recycle();
         }
-    };
+    }
+
+    static final ImageAttach.Converter CONVERTER = new Reencoder();
 }

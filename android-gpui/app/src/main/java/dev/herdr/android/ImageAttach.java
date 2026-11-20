@@ -59,6 +59,14 @@ final class ImageAttach {
     interface Converter {
         /** The image as a png (or a smaller one) of at most {@link #MAX_BYTES}; throws when it cannot. */
         byte[] reencode(byte[] raw, boolean oversized) throws AttachException;
+
+        /**
+         * Whether a decoder reads these bytes as an image: a file with a png's signature and a
+         * broken body is refused before anything is sent.
+         */
+        default boolean decodable(byte[] raw) {
+            return true;
+        }
     }
 
     /** Where the bytes go: the core's terminal.put for one pane; returns the reply JSON. */
@@ -90,6 +98,7 @@ final class ImageAttach {
     static Prepared prepare(byte[] raw, Converter converter, long nanos) throws AttachException {
         if (raw == null || raw.length == 0) throw new AttachException("That image is empty");
         Kind kind = sniff(raw);
+        if (!converter.decodable(raw)) throw new AttachException("That file is not a readable image");
         byte[] bytes = raw;
         if (!passesThrough(kind) || raw.length > MAX_BYTES) {
             bytes = converter.reencode(raw, raw.length > MAX_BYTES);
@@ -143,11 +152,15 @@ final class ImageAttach {
 
     static String refusal(String kind) {
         switch (kind) {
-            case "needs_update": return "This computer's Herdr is too old to take images; update it";
+            // A core that predates terminal.put answers "unknown_method" directly; a relay says
+            // "needs_update" for the same thing.
+            case "unknown_method":
+            case "needs_update": return "Herdr on this computer is too old to take images; update it";
             case "not_found": return "That terminal is gone; open the agent again";
             case "unavailable":
             case "machine_unknown": return "That computer is not reachable right now";
-            default: return "The host could not save the image";
+            // A refusal after bytes started to arrive can leave part of the file there.
+            default: return "The host could not save the image; a partial file may be left on it";
         }
     }
 
@@ -172,6 +185,19 @@ final class ImageAttach {
             if (!ok) return false;
         }
         return true;
+    }
+
+    /** Pixels the decoder may hold for one image: 16 MP is 64 MiB of bitmap. */
+    static final int MAX_DECODE_PIXELS = 16_000_000;
+
+    /**
+     * The power-of-two sampling that keeps both the longer side within {@code maxSide} and the
+     * decoded pixels within {@code maxPixels}, whatever the encoded size was.
+     */
+    static int sampleFor(int width, int height, int maxSide, long maxPixels) {
+        int sample = sampleSize(width, height, maxSide);
+        while (width > 0 && height > 0 && ((long) (width / sample)) * (height / sample) > maxPixels) sample *= 2;
+        return sample;
     }
 
     /** The sampling factor (a power of two) that brings the longer side to at most {@code maxSide}. */
