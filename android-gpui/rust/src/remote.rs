@@ -683,7 +683,12 @@ pub fn poll_terminal(
         // for, under the same lock that installs it.
         if state.render_id != 0 || !mailbox.state().held {
             let pane = state.view["pane_id"].as_str().unwrap_or("");
-            let target = model::FrameTarget::new(host, pane);
+            let agent = state.view["panes"]
+                .as_array()
+                .and_then(|panes| panes.iter().find(|item| item["id"] == pane))
+                .and_then(|item| item["kind"].as_str())
+                .unwrap_or("");
+            let target = model::FrameTarget::with_agent(host, pane, agent);
             mailbox.set_shell(generation, state.render_id, Some(target));
         }
     }

@@ -1162,6 +1162,7 @@ pub struct Mailbox {
     ime_session: i64,
     preedit: Arc<str>,
     display_preferences: DisplayPreferences,
+    show_agent_footer: bool,
     pan: f32,
     /// Furthest useful pan: the painted row width beyond the surface.
     pan_limit: f32,
@@ -1186,6 +1187,8 @@ pub struct Mailbox {
 pub struct FrameTarget {
     pub host: Arc<str>,
     pub pane: Arc<str>,
+    #[cfg(all(feature = "android-ui", unix))]
+    pub(crate) footer_kind: gpui_rio::ghost::PromptKind,
 }
 
 impl FrameTarget {
@@ -1193,6 +1196,26 @@ impl FrameTarget {
         Self {
             host: host.into(),
             pane: pane.into(),
+            #[cfg(all(feature = "android-ui", unix))]
+            footer_kind: Default::default(),
+        }
+    }
+
+    #[cfg(all(feature = "android-ui", unix))]
+    pub(crate) fn with_agent(host: &str, pane: &str, agent: &str) -> Self {
+        use gpui_rio::ghost::PromptKind;
+
+        let footer_kind =
+            if agent.eq_ignore_ascii_case("claude") || agent.eq_ignore_ascii_case("claude-code") {
+                PromptKind::Claude
+            } else if agent.eq_ignore_ascii_case("codex") {
+                PromptKind::Codex
+            } else {
+                PromptKind::Other
+            };
+        Self {
+            footer_kind,
+            ..Self::new(host, pane)
         }
     }
 }
@@ -1219,6 +1242,7 @@ pub struct ViewState {
     pub snapshot: Arc<Snapshot>,
     pub preedit: Arc<str>,
     pub display_preferences: DisplayPreferences,
+    pub show_agent_footer: bool,
     /// Whether new output should pull the viewport to the newest line.
     pub follow: bool,
     /// Client-local horizontal offset in logical pixels; the daemon owns the
@@ -1255,6 +1279,7 @@ impl Default for Mailbox {
             ime_session: 0,
             preedit: Arc::from(""),
             display_preferences: DisplayPreferences::default(),
+            show_agent_footer: false,
             pan: 0.,
             pan_limit: MAX_PAN,
             shell_pan: ShellPan::default(),
@@ -1347,6 +1372,13 @@ impl Mailbox {
         Ok(true)
     }
 
+    pub fn set_show_agent_footer(&mut self, show: bool) {
+        if self.show_agent_footer != show {
+            self.show_agent_footer = show;
+            self.touch();
+        }
+    }
+
     /// The Android side owns whether the pane is tailing or reading scrollback.
     pub fn set_follow(&mut self, generation: i64, follow: bool) -> bool {
         if generation <= 0 || generation < self.generation || follow == self.follow {
@@ -1370,16 +1402,20 @@ impl Mailbox {
     /// Draws renderer `shell` (0: none) for `generation`, attached for
     /// `target`'s host and pane.
     pub fn set_shell(&mut self, generation: i64, shell: u64, target: Option<FrameTarget>) -> bool {
-        if generation <= 0 || generation != self.generation || shell == self.shell {
+        let target = if shell == 0 { None } else { target };
+        if generation <= 0
+            || generation != self.generation
+            || (shell == self.shell && target == self.frame_target)
+        {
             return false;
         }
-        self.shell = shell;
-        self.frame_target = if shell == 0 { None } else { target };
         // Steps meant for the view of another pane never move the new one.
-        self.shell_pan = ShellPan::default();
-        self.revision = self.revision.wrapping_add(1);
-        #[cfg(feature = "android-ui")]
-        signal_change();
+        if shell != self.shell {
+            self.shell_pan = ShellPan::default();
+        }
+        self.shell = shell;
+        self.frame_target = target;
+        self.touch();
         true
     }
 
@@ -1516,6 +1552,7 @@ impl Mailbox {
             snapshot: self.snapshot.clone(),
             preedit: self.preedit.clone(),
             display_preferences: self.display_preferences,
+            show_agent_footer: self.show_agent_footer,
             follow: self.follow,
             shell: self.shell,
             held: self.held,

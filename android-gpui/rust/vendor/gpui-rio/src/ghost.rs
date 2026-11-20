@@ -38,10 +38,11 @@ pub fn cells(text: &str) -> usize {
 }
 
 /// Whose prompt the screen shows, as the host knows from the pane's agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PromptKind {
     Claude,
     Codex,
+    #[default]
     Other,
 }
 

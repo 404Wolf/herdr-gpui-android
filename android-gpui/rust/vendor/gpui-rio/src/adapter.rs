@@ -39,6 +39,9 @@ macro_rules! __bind_gpui {
                 bounds: Bounds<Pixels>,
                 /// The grid cell (row, column) drawn at the pane's top-left.
                 view_origin: (i32, usize),
+                rows: $crate::footer::Rows,
+                /// The attached pane's agent, when its own footer should be collapsed.
+                footer_kind: $crate::ghost::PromptKind,
                 /// A column the reader panned a wider grid to (see `ColumnPan`).
                 pan: $crate::ColumnPan,
                 /// The pane's size in cells at the last paint.
@@ -114,6 +117,8 @@ macro_rules! __bind_gpui {
                             visible: true,
                             bounds: Bounds::default(),
                             view_origin: (0, 0),
+                            rows: $crate::footer::Rows::default(),
+                            footer_kind: $crate::ghost::PromptKind::Other,
                             pan: $crate::ColumnPan::default(),
                             pane: (0, 0),
                             cell: size(px(8.), px(18.)),
@@ -209,6 +214,13 @@ macro_rules! __bind_gpui {
                 pub fn set_prompt_kind(&mut self, kind: $crate::ghost::PromptKind) {
                     self.prompt_kind = kind;
                 }
+                pub fn set_footer_kind(&mut self, kind: $crate::ghost::PromptKind) -> bool {
+                    if self.footer_kind == kind {
+                        return false;
+                    }
+                    self.footer_kind = kind;
+                    true
+                }
                 /// Called after a paint whose layout hint differs from the last one.
                 pub fn set_layout_listener(&mut self, listener: impl Fn(&$crate::ghost::LayoutHint) + 'static) {
                     self.layout_listener = Some(std::rc::Rc::new(listener));
@@ -252,17 +264,21 @@ macro_rules! __bind_gpui {
                     if grid.display_offset() != 0 {
                         return None;
                     }
-                    // The geometry the last paint drew with: cell size (font scale,
-                    // pinch zoom) and the grid cell at the pane's top-left.
-                    $crate::tap::cell_at(
+                    self.drawn_cell(point, grid.columns(), grid.screen_lines())
+                }
+
+                fn drawn_cell(&self, point: Point<Pixels>, columns: usize, rows: usize) -> Option<(usize, usize)> {
+                    // The geometry the last paint drew with, including any collapsed rows.
+                    let (col, row) = $crate::tap::cell_at(
                         (
                             f32::from(point.x - self.bounds.left()),
                             f32::from(point.y - self.bounds.top()),
                         ),
                         (f32::from(self.cell.width), f32::from(self.cell.height)),
                         self.view_origin,
-                        (grid.columns(), grid.screen_lines()),
-                    )
+                        (columns, rows.min(self.rows.count())),
+                    )?;
+                    self.rows.source(row).filter(|&row| row < rows).map(|row| (col, row))
                 }
                 fn cancel_press(&mut self) -> bool {
                     self.press = None;
@@ -323,8 +339,10 @@ macro_rules! __bind_gpui {
                         (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor() as usize;
                     // Through the window drawn (it may follow the caret on a larger grid).
                     let (row_off, col_off) = self.view_origin;
+                    let row = (row + row_off).clamp(0, self.rows.count().saturating_sub(1) as i32);
+                    let source = self.rows.source(row as usize).unwrap_or_default();
                     Pos::new(
-                        Line((row + row_off).clamp(0, grid.screen_lines() as i32 - 1) - grid.display_offset() as i32),
+                        Line(source.min(grid.screen_lines() - 1) as i32 - grid.display_offset() as i32),
                         Column((col + col_off).min(grid.columns() - 1)),
                     )
                 }
@@ -479,24 +497,27 @@ macro_rules! __bind_gpui {
                     } else {
                         $crate::pane_cells(pixels, (f32::from(self.cell.width), f32::from(self.cell.height)))
                     };
-                    let (cols, rows) = (
-                        usize::from(pane.0.min(grid_cols)),
-                        usize::from(pane.1.min(grid_rows)),
-                    );
                     let theme = self.style.theme;
                     let mut grid = self.session.grid().lock();
+                    let grid_cols = grid.columns() as u16;
+                    let grid_rows = grid.screen_lines();
                     let selection = grid
                         .selection
                         .as_ref()
                         .and_then(|selection| selection.to_range(&*grid));
                     let cursor = grid.cursor();
                     let offset = grid.display_offset() as i32;
+                    let hidden = $crate::footer::hidden_on_screen(&grid, self.footer_kind);
+                    self.rows = $crate::footer::Rows::new(grid_rows, hidden);
+                    let cols = usize::from(pane.0.min(grid_cols));
+                    let rows = usize::from(pane.1).min(self.rows.count());
                     // A column the reader panned to wins over the caret, in
                     // history too, so wide rows can be read to their end.
                     self.pane = pane;
                     let (row_off, col_off) = $crate::view_origin(
-                        (grid_cols, grid_rows),
+                        (grid_cols, self.rows.count() as u16),
                         pane,
+                        // The cursor is above any detected footer.
                         (cursor.pos.row.0, cursor.pos.col.0),
                         offset != 0,
                         self.pan.column((grid_cols, pane.0), self.session.inputs()),
@@ -506,9 +527,11 @@ macro_rules! __bind_gpui {
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
                     // The rows as drawn, for finding the program's prompt.
                     let mut screen: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
-                    for row in 0..rows {
+                    let drawn = (row_off as usize..self.rows.count())
+                        .take(rows).filter_map(|row| self.rows.source(row));
+                    for (row, source) in drawn.enumerate() {
                         for col in 0..cols {
-                            let pos = Pos::new(Line(row as i32 + row_off - offset), Column(col + col_off));
+                            let pos = Pos::new(Line(source as i32 - offset), Column(col + col_off));
                             let square = grid.grid[pos];
                             screen[row][col] = match square.c() {
                                 '\0' => ' ',
@@ -531,7 +554,7 @@ macro_rules! __bind_gpui {
                                 .is_some_and(|selection| selection.contains(pos));
                             let cursor_here = cursor_shown
                                 && cursor.content != CursorShape::Hidden
-                                && cursor.pos == Pos::new(Line(row as i32 + row_off), Column(col + col_off))
+                                && cursor.pos == pos
                                 && offset == 0;
                             if selected || (cursor_here && cursor.content == CursorShape::Block) {
                                 std::mem::swap(&mut fg, &mut bg);
@@ -784,7 +807,13 @@ macro_rules! __bind_gpui {
                                 }
                                 let pos = this.position(event.position);
                                 this.press = Some(event.position);
-                                this.pressed_link = if this.link_handler.is_some() && !this.on_draft(event.position) {
+                                // Selection can clamp to an edge, but a tap in
+                                // the space below a collapsed grid has no link.
+                                let on_grid = !this.rows.collapsed() || {
+                                    let grid = this.session.grid().lock();
+                                    this.drawn_cell(event.position, grid.columns(), grid.screen_lines()).is_some()
+                                };
+                                this.pressed_link = if on_grid && this.link_handler.is_some() && !this.on_draft(event.position) {
                                     this.link_at(pos)
                                 } else {
                                     None

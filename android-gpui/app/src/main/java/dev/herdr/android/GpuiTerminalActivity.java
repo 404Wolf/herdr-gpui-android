@@ -297,6 +297,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             themeIndex = getSharedPreferences("terminal-display", MODE_PRIVATE).getInt("theme", 0);
             if (themeIndex < 0 || themeIndex > GpuiDisplayOptions.THEME_SYSTEM) themeIndex = 0;
             nativeStart(this);
+            nativeShowAgentFooter(showAgentFooter);
             appliedPalette = currentPalette();
             nativeSetTheme(appliedPalette);
             chrome = GpuiChrome.load(appliedPalette);
@@ -1516,13 +1517,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 ? "Control armed for next letter. Tap to cancel" : "Control modifier for the next letter");
     }
 
+    private boolean showAgentFooter;
+
     private void loadDisplayOptions() {
         SharedPreferences preferences = getSharedPreferences("terminal-display", MODE_PRIVATE);
         try {
             displayOptions = new GpuiDisplayOptions(preferences.getInt("mode", 0),
                     preferences.getInt("font", 0), preferences.getInt("alt", 0));
+            showAgentFooter = AgentFooterPreference.show(preferences);
         } catch (ClassCastException invalid) {
             displayOptions = new GpuiDisplayOptions(0, 0, 0);
+            showAgentFooter = false;
         }
     }
 
@@ -1694,6 +1699,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         Spinner alerts = optionSpinner(context, new String[]{"Off", "Notify when an agent needs me"},
                 agentAlertsOn() ? 1 : 0);
         options.addView(alerts);
+        android.widget.Switch footer = new android.widget.Switch(context);
+        footer.setText("Show agent footer");
+        footer.setChecked(showAgentFooter);
+        footer.setMinHeight(dp(48));
+        options.addView(footer);
         // One line of guidance; the host and status it used to repeat are already
         // in the header this sheet opens over.
         TextView help = optionLabel(context, "Compact keeps more rows visible. Opening this sheet cancels an unsent draft.");
@@ -1707,10 +1717,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                             font.getSelectedItemPosition() == 0 ? 0 : font.getSelectedItemPosition() + 10,
                             alt.getSelectedItemPosition());
                     themeIndex = theme.getSelectedItemPosition();
-                    getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                    showAgentFooter = footer.isChecked();
+                    SharedPreferences.Editor editor = getSharedPreferences("terminal-display", MODE_PRIVATE).edit();
+                    AgentFooterPreference.save(editor, showAgentFooter)
                             .putInt("mode", displayOptions.mode).putInt("font", displayOptions.fontSize)
                             .putInt("alt", displayOptions.altMode).putInt("theme", themeIndex)
                             .putBoolean(AGENT_ALERTS, alerts.getSelectedItemPosition() == 1).apply();
+                    nativeShowAgentFooter(showAgentFooter);
                     applyTheme();
             // Host switching needs the saved hosts before the first rail paint.
             worker.execute(() -> {
@@ -6500,12 +6513,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return "";
     }
 
-    /** "claude" or "codex" for the pane on screen, from its agent.kind label or title. */
+    /** "claude" or "codex" for the pane on screen, from its agent.kind label. */
     private static String agentKind(Connection current) {
-        JSONArray panes = current.panes;
+        return agentKind(current.panes, current.paneId);
+    }
+
+    private static String agentKind(JSONArray panes, String paneId) {
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
-            if (pane == null || !current.paneId.equals(pane.optString("id"))) continue;
+            if (pane == null || !paneId.equals(pane.optString("id"))) continue;
             String kind = pane.optString("kind", "").toLowerCase(java.util.Locale.ROOT);
             if (kind.contains("claude")) return "claude";
             if (kind.contains("codex")) return "codex";
@@ -6862,7 +6878,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (now != null && !pane.equals(now.paneId)) return;
             long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
             nativeHold(generation);
-            nativeAttachShell(generation, renderId, host, pane);
+            JSONArray[] last = lastLists(host);
+            JSONArray panes = now != null && now.panes != null ? now.panes : last == null ? null : last[2];
+            nativeAttachShell(generation, renderId, host, pane, agentKind(panes, pane));
             savedShownHost = host;
             savedShownAt = savedAt;
         }
@@ -7333,7 +7351,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 handle = 0;
                 next.ready = true;
                 nativeAttachShell(next.generation, next.shellHandle, LinkFrame.part(next.hostId),
-                        LinkFrame.part(next.paneId));
+                        LinkFrame.part(next.paneId), "");
                 nativeSetActive(next.generation, true);
                 publish(next, "Shell");
             }
@@ -7519,7 +7537,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeSetDisplayPreferences(float fontSize, boolean compact,
             float systemFontScale);
     /** Draws the raw shell {@code handle} (0 for Herdr's pane) for this generation only. */
-    private static native boolean nativeAttachShell(long generation, long handle, String host, String pane);
+    private static native boolean nativeAttachShell(long generation, long handle, String host, String pane,
+                                                    String agent);
+    private static native void nativeShowAgentFooter(boolean show);
 
     /** Moves the terminal horizontally by this many logical pixels. */
     private static native void nativePan(float delta);

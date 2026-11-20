@@ -27,6 +27,12 @@ the terminal activity is rendered by **Rust GPUI and its wgpu Android backend**.
 It is not a WebView. The original `android/` application can still be built
 without the GPUI native library.
 
+## Agent footers
+
+The phone collapses recognized Claude Code and Codex footer rows below the
+terminal prompt. Turn on **Show agent footer** in **View options** to see them
+again. The choice is saved on the device.
+
 ## Raw SSH shell
 
 A trusted host's ⋮ menu in **Remote hosts** offers **Open shell** when a device

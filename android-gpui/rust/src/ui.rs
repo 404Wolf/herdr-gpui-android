@@ -248,7 +248,20 @@ impl TerminalView {
     /// The attached shell's element, after giving it the current theme and size.
     #[cfg(unix)]
     fn shell_element(&mut self, width: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use gpui_rio::ghost::PromptKind;
+
         let terminal = self.shell.as_ref()?.1.clone();
+        let kind = self
+            .state
+            .frame_target
+            .as_ref()
+            .filter(|_| !self.state.show_agent_footer)
+            .map_or(PromptKind::Other, |target| target.footer_kind);
+        terminal.update(cx, |terminal, cx| {
+            if terminal.set_footer_kind(kind) {
+                cx.notify();
+            }
+        });
         let style = self.shell_style(width);
         if self.shell_style.as_ref() != Some(&style) {
             let next = style.clone();
