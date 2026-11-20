@@ -63,6 +63,58 @@ final class ControlTargets {
     private ControlTargets() { }
 
     /**
+     * Where each grid row's top is, in dp, when a multi-line draft spreads the rows it covers
+     * (the renderer's {@code RowGeometry}): rows above the block move up by its growth, the
+     * block's rows are {@code gap} further apart each, rows below stay put.
+     */
+    static final class Rows {
+        final float top, cell;
+        final int first, count;
+        final float gap;
+
+        Rows(float top, float cell, int first, int count, float gap) {
+            this.top = top;
+            this.cell = cell;
+            this.first = first;
+            this.count = count < 2 ? 0 : count;
+            this.gap = this.count == 0 ? 0 : gap;
+        }
+
+        static Rows uniform(float top, float cell) {
+            return new Rows(top, cell, 0, 0, 0);
+        }
+
+        float growth() {
+            return count < 2 ? 0 : gap * (count - 1);
+        }
+
+        float top(int row) {
+            float plain = row * cell;
+            if (count < 2 || row < first) return top + plain - growth();
+            if (row < first + count) return top + plain - growth() + (row - first) * gap;
+            return top + plain;
+        }
+
+        float bottom(int row) {
+            return top(row) + cell;
+        }
+
+        /** The row at {@code y} dp (same origin as {@code top}); a gap belongs to the row above. */
+        int rowAt(float y) {
+            float rel = y - top;
+            if (count < 2) return (int) Math.floor(rel / cell);
+            float blockTop = top(first) - top;
+            float blockEnd = top(first + count - 1) - top + cell;
+            if (rel < blockTop) return (int) Math.floor((rel + growth()) / cell);
+            if (rel < blockEnd) {
+                int i = (int) Math.floor((rel - blockTop) / (cell + gap));
+                return first + Math.min(i, count - 1);
+            }
+            return (int) Math.floor(rel / cell);
+        }
+    }
+
+    /**
      * The targets for {@code controls} on a grid at ({@code left}, {@code top})
      * with cells {@code cellWidth}×{@code cellHeight}, the surface ending at
      * {@code surfaceBottom}; none reaches above row {@code topRow - 1} or past
@@ -111,8 +163,17 @@ final class ControlTargets {
     static List<Rect> layout(List<Cells> controls, float left, float top, float cellWidth, float cellHeight,
             int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans,
             List<Cells> rows) {
+        return layout(controls, Rows.uniform(top, cellHeight), left, cellWidth, topRow, surfaceBottom, maxRight,
+                recording, draftSpans, rows);
+    }
+
+    /** As above, on rows a multi-line draft may have spread ({@code geo}). */
+    static List<Rect> layout(List<Cells> controls, Rows geo, float left, float cellWidth,
+            int topRow, float surfaceBottom, float maxRight, boolean recording, int[][] draftSpans,
+            List<Cells> rows) {
+        float top = geo.top, cellHeight = geo.cell;
         List<Rect> out = new ArrayList<>();
-        float ceiling = top + Math.max(0, topRow - 1) * cellHeight;
+        float ceiling = geo.top(Math.max(0, topRow - 1));
         for (Cells c : controls) {
             // The status words take no taps. A reserved slot ("gap-type", "gap-send") keeps its
             // place in the geometry exactly as its button would, so no neighbour's target changes
@@ -130,7 +191,7 @@ final class ControlTargets {
                 l -= grow;
                 r += grow;
             }
-            float rowTop = top + c.row * cellHeight;
+            float rowTop = geo.top(c.row);
             float b = Math.max(surfaceBottom, rowTop + cellHeight);
             float t = Math.max(ceiling, Math.min(rowTop - cellHeight, b - MIN_DP));
             if (talk && recording) {
@@ -141,7 +202,7 @@ final class ControlTargets {
                 t = Math.max(top, Math.min(t, b - STOP_MIN_HEIGHT_DP));
             }
             for (Cells row : rows) {
-                float rowBottom = top + (row.row + 1) * cellHeight;
+                float rowBottom = geo.bottom(row.row);
                 if (row.row < c.row && rowBottom > t) t = rowBottom;
             }
             if (draftSpans != null) {
@@ -151,7 +212,7 @@ final class ControlTargets {
                         if (span == null || span.length < 3 || span[2] <= span[1]) continue;
                         if ((span[0] == c.row) != (pass == 0)) continue;
                         float spanLeft = left + span[1] * cellWidth, spanRight = left + span[2] * cellWidth;
-                        float spanTop = top + span[0] * cellHeight, spanBottom = spanTop + cellHeight;
+                        float spanTop = geo.top(span[0]), spanBottom = spanTop + cellHeight;
                         if (spanRight <= l || spanLeft >= r || spanBottom <= t || spanTop >= b) continue;
                         if (span[0] < c.row) {
                             t = spanBottom;
@@ -225,12 +286,18 @@ final class ControlTargets {
      */
     static List<Rect> rows(List<Cells> rows, List<Cells> actions, float left, float top, float cellWidth,
             float cellHeight, int cols) {
+        return rows(rows, actions, Rows.uniform(top, cellHeight), left, cellWidth, cols);
+    }
+
+    /** As above, on rows a multi-line draft may have spread. */
+    static List<Rect> rows(List<Cells> rows, List<Cells> actions, Rows geo, float left, float cellWidth, int cols) {
+        float cellHeight = geo.cell;
         List<Rect> out = new ArrayList<>();
         float edge = left + cols * cellWidth;
         List<Cells> sorted = new ArrayList<>(actions);
         sorted.sort((a, b) -> a.start - b.start);
         for (Cells c : rows) {
-            float t = top + c.row * cellHeight;
+            float t = geo.top(c.row);
             float right = edge;
             for (Cells a : sorted) {
                 if (a.row == c.row) {
@@ -243,7 +310,7 @@ final class ControlTargets {
         }
         for (int i = 0; i < sorted.size(); i++) {
             Cells a = sorted.get(i);
-            float t = top + a.row * cellHeight;
+            float t = geo.top(a.row);
             Cells before = i > 0 && sorted.get(i - 1).row == a.row ? sorted.get(i - 1) : null;
             Cells after = i + 1 < sorted.size() && sorted.get(i + 1).row == a.row ? sorted.get(i + 1) : null;
             float l = before == null ? left + (a.start - 1) * cellWidth

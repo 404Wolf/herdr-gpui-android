@@ -187,6 +187,8 @@ pub struct LayoutHint {
     /// Every row's drawn draft cells, `[row, first, past last]`, one per row ([`draft_spans`]):
     /// the host keeps its control targets off all of them, above, beside or below.
     pub draft_spans: Vec<[usize; 3]>,
+    /// Where each row was drawn vertically: a multi-line draft spreads its rows.
+    pub rows_geometry: crate::rows::RowGeometry,
 }
 
 /// The program's input caret, in the rows as drawn.
@@ -270,6 +272,13 @@ pub struct DraftRun {
 /// The most draft runs a layout hint carries; the host takes as many (ClusterPlacement).
 /// Past it every row's draft is one cluster run instead, so nothing drawn goes unreported.
 pub const MAX_DRAFT_RUNS: usize = 4096;
+
+/// The rows the draft is drawn on, first to last, or None when none of it is.
+pub fn draft_block(placed: &[Placed]) -> Option<(usize, usize)> {
+    let mut rows = placed.iter().filter(|p| p.source.is_some()).map(|p| p.row);
+    let first = rows.next()?;
+    Some(rows.fold((first, first), |(lo, hi), row| (lo.min(row), hi.max(row))))
+}
 
 /// The rows' drawn draft cells among `placed`: `[row, first, past last]`, one per row, at most
 /// one per grid row.
@@ -1496,6 +1505,18 @@ pub fn guard_row(screen: &[Vec<char>], anchor: Option<Anchor>, placed: &[Placed]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn placed(row: usize, source: Option<usize>) -> Placed {
+        Placed { row, col: 2, text: "x".into(), style: GhostStyle::Text, source }
+    }
+
+    #[test]
+    fn the_draft_block_spans_the_rows_of_the_draft_only() {
+        let runs = [placed(30, None), placed(37, Some(0)), placed(39, Some(4)), placed(38, Some(2))];
+        assert_eq!(draft_block(&runs), Some((37, 39)));
+        assert_eq!(draft_block(&runs[..1]), None);
+        assert_eq!(draft_block(&[]), None);
+    }
 
     fn screen(lines: &[&str], cols: usize) -> Vec<Vec<char>> {
         lines
