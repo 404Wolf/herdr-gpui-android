@@ -16,6 +16,7 @@ mod keys;
 pub mod links;
 mod mouse;
 mod options;
+pub mod rows;
 mod session;
 #[doc(hidden)]
 pub mod tap;

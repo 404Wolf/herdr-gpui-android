@@ -24,7 +24,7 @@ macro_rules! __bind_gpui {
                 crosswords::{
                     Crosswords, Mode,
                     grid::Scroll,
-                    pos::{Column, Line, Pos, Side},
+                    pos::{Column, Pos, Side},
                     square::Wide,
                     style::StyleFlags,
                 },
@@ -48,8 +48,8 @@ macro_rules! __bind_gpui {
                 style: TerminalStyle,
                 visible: bool,
                 bounds: Bounds<Pixels>,
-                /// The grid cell (row, column) drawn at the pane's top-left.
-                view_origin: (i32, usize),
+                /// The first terminal column drawn in the pane.
+                first_column: usize,
                 rows: $crate::footer::Rows,
                 alt_screen: bool,
                 /// The attached pane's agent, when its own footer should be collapsed.
@@ -85,6 +85,8 @@ macro_rules! __bind_gpui {
                 /// Told where the screen is busy after each paint that changed it.
                 layout_listener: Option<std::rc::Rc<dyn Fn(&$crate::ghost::LayoutHint)>>,
                 last_hint: Option<$crate::ghost::LayoutHint>,
+                /// Where each row was drawn vertically at the last paint (a multi-line draft spreads its rows).
+                geometry: $crate::rows::RowGeometry,
                 _poll: Task<()>,
             }
 
@@ -128,7 +130,7 @@ macro_rules! __bind_gpui {
                             style,
                             visible: true,
                             bounds: Bounds::default(),
-                            view_origin: (0, 0),
+                            first_column: 0,
                             rows: $crate::footer::Rows::default(),
                             alt_screen: false,
                             footer_kind: $crate::ghost::PromptKind::Other,
@@ -149,6 +151,7 @@ macro_rules! __bind_gpui {
                             prompt_kind: $crate::ghost::PromptKind::Other,
                             layout_listener: None,
                             last_hint: None,
+                            geometry: $crate::rows::RowGeometry::uniform(1.),
                             _poll: poll,
                         }
                     })
@@ -217,7 +220,7 @@ macro_rules! __bind_gpui {
                 pub fn pan(&mut self, dx: Pixels) -> bool {
                     let columns = f32::from(dx) / f32::from(self.cell.width);
                     let (grid_cols, _) = self.session.grid_size();
-                    self.pan.pan(columns, self.view_origin.1, (grid_cols, self.pane.0), self.session.inputs())
+                    self.pan.pan(columns, self.first_column, (grid_cols, self.pane.0), self.session.inputs())
                 }
                 fn tap_stamp(&self) -> $crate::tap::Gesture {
                     self.tap_listener.as_ref().map_or($crate::tap::Gesture::NONE, |(stamp, _)| stamp())
@@ -251,11 +254,12 @@ macro_rules! __bind_gpui {
                     }
                     let Some(hint) = self.last_hint.as_ref() else { return false };
                     let x = f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width);
-                    let y = f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height);
+                    let y = f32::from(point.y - self.bounds.top());
                     if x < 0. || y < 0. {
                         return false;
                     }
-                    let (col, row) = (x as usize, y as usize);
+                    let Some(row) = self.geometry.draft_row_at(y) else { return false };
+                    let col = x as usize;
                     let from = hint
                         .draft_runs
                         .iter()
@@ -284,7 +288,7 @@ macro_rules! __bind_gpui {
                         position,
                         drawn,
                         cell: drawn
-                            .filter(|_| !on_draft && grid.display_offset() == 0)
+                            .filter(|_| !on_draft && !self.rows.scrolled() && grid.display_offset() == 0)
                             .map(|pos| (pos.col.0, pos.row.0 as usize)),
                         link,
                     }
@@ -298,16 +302,10 @@ macro_rules! __bind_gpui {
                     if !self.bounds.contains(&point) {
                         return None;
                     }
-                    let (col, row) = self.rows.cell_at(
-                        (
-                            f32::from(point.x - self.bounds.left()),
-                            f32::from(point.y - self.bounds.top()),
-                        ),
-                        (f32::from(self.cell.width), f32::from(self.cell.height)),
-                        self.view_origin,
-                        (grid.columns(), grid.screen_lines()),
-                    )?;
-                    Some(Pos::new(Line(row as i32 - grid.display_offset() as i32), Column(col)))
+                    let col = self.first_column
+                        + (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)) as usize;
+                    let line = self.rows.source_at(&self.geometry, f32::from(point.y - self.bounds.top()))?;
+                    (col < grid.columns()).then_some(Pos::new(line, Column(col)))
                 }
                 fn cancel_press(&mut self) -> bool {
                     self.press.take().is_some_and(|press| press.link.is_some())
@@ -360,17 +358,13 @@ macro_rules! __bind_gpui {
                 }
 
                 fn position(&self, point: Point<Pixels>, grid: &Crosswords<impl EventListener>) -> Pos {
-                    let row =
-                        (f32::from(point.y - self.bounds.top()) / f32::from(self.cell.height)).floor() as i32;
+                    let row = self.geometry.grid_row_at(f32::from(point.y - self.bounds.top())).unwrap_or_default();
                     let col =
                         (f32::from(point.x - self.bounds.left()) / f32::from(self.cell.width)).floor() as usize;
-                    // Through the window drawn (it may follow the caret on a larger grid).
-                    let (row_off, col_off) = self.view_origin;
-                    let row = (row + row_off).clamp(0, self.rows.count().saturating_sub(1) as i32);
-                    let source = self.rows.source(row as usize).unwrap_or_default();
+                    let row = row.min(self.rows.view_len().saturating_sub(1));
                     Pos::new(
-                        Line(source.min(grid.screen_lines() - 1) as i32 - grid.display_offset() as i32),
-                        Column((col + col_off).min(grid.columns() - 1)),
+                        self.rows.source(row).unwrap_or_default(),
+                        Column((col + self.first_column).min(grid.columns() - 1)),
                     )
                 }
 
@@ -396,7 +390,13 @@ macro_rules! __bind_gpui {
                     for run in placed {
                         // Cells, as the grid draws them: wide and combined characters too.
                         let len = $crate::ghost::cells(&run.text);
-                        let at = origin + point(self.cell.width * run.col, self.cell.height * run.row as f32);
+                        // The draft's lines are spread; everything else (controls, queue rows) is on its grid row.
+                        let y = if run.source.is_some() {
+                            self.geometry.draft_top(run.row)
+                        } else {
+                            self.geometry.grid_top(run.row)
+                        };
+                        let at = origin + point(self.cell.width * run.col, px(y));
                         // A run of the draft (at Claude's prompt or the host's own) carries its source.
                         if run.style == GhostStyle::Caret {
                             if run.source.is_some() {
@@ -409,7 +409,17 @@ macro_rules! __bind_gpui {
                         }
                         let width = self.cell.width * len;
                         let back = if run.style == GhostStyle::Selected { colors.info } else { colors.background };
-                        window.paint_quad(fill(Bounds::new(at, size(width, self.cell.height)), hex(back)));
+                        // The gap above a spread line is covered too, so none of the grid's own
+                        // cells under the draft show through between its lines.
+                        let above = if run.source.is_some() && run.row > self.geometry.first {
+                            px(self.geometry.gap)
+                        } else {
+                            px(0.)
+                        };
+                        window.paint_quad(fill(
+                            Bounds::new(at - point(px(0.), above), size(width, self.cell.height + above)),
+                            hex(back),
+                        ));
                         let color = match run.style {
                             GhostStyle::Text | GhostStyle::Partial => colors.text,
                             GhostStyle::Selected | GhostStyle::Caret => colors.background,
@@ -548,7 +558,6 @@ macro_rules! __bind_gpui {
                     let defer = !alt_screen && self.touch_active();
                     let revealed = self.rows.update(grid_rows, defer, hidden);
                     let cols = usize::from(pane.0.min(grid_cols));
-                    let rows = usize::from(pane.1).min(self.rows.count());
                     // A column the reader panned to wins over the caret, in
                     // history too, so wide rows can be read to their end.
                     self.pane = pane;
@@ -560,31 +569,62 @@ macro_rules! __bind_gpui {
                         offset != 0,
                         self.pan.column((grid_cols, pane.0), self.session.inputs()),
                     );
-                    self.view_origin = (row_off, col_off);
+                    self.first_column = col_off;
+                    self.rows.set_viewport(row_off as usize, usize::from(pane.1), offset);
+                    let rows = self.rows.view_len();
+                    // The rows as drawn, for finding the program's prompt.
+                    let screen = self.rows.screen(&grid, cols, col_off);
+                    // The caret as drawn, only while visible and the view is at the bottom.
+                    let caret = (cursor.content != CursorShape::Hidden && offset == 0)
+                        .then(|| {
+                            let row = self.rows.projected(cursor.pos.row)?;
+                            let col = cursor.pos.col.0.checked_sub(col_off)?;
+                            (col <= cols).then_some((row, col))
+                        })
+                        .flatten();
+                    let kind = self.ghost.as_ref().map_or(self.prompt_kind, |ghost| ghost.kind);
+                    let anchor = $crate::ghost::locate(&screen, caret, kind);
+                    // Without a caret the controls keep the row they last had.
+                    let previous = self
+                        .last_hint
+                        .as_ref()
+                        .and_then(|hint| hint.controls.first())
+                        .map(|control| $crate::ghost::Previous {
+                            row: control.row,
+                            scrolled: offset != 0,
+                        });
+                    let layout = self
+                        .ghost
+                        .as_ref()
+                        .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen, previous))
+                        .unwrap_or_default();
+                    let placed = &layout.placed;
+                    // Spread only at Claude's prompt (the program's own box), and only when the
+                    // controls sit below the draft's first line (on the box's lower rule): the
+                    // controls' rows, and Claude's status line below, never move.
+                    let geometry = $crate::rows::RowGeometry::for_layout(
+                        f32::from(self.cell.height), &layout, anchor, &screen,
+                    );
+                    self.geometry = geometry;
                     if revealed
                         && self.touch_target.as_ref().is_some_and(|target| {
                             self.drawn_position(target.point, &grid) != target.drawn
                         })
                     {
-                        // GPUI may still synthesize a click on lift. This touch
-                        // no longer owns the cell where it began.
+                        // The final geometry includes both the revealed row and the draft.
                         self.touch.clear();
                         self.touch_target = None;
                     }
                     let cursor_shown = self.host_input || self.focus.is_focused(window);
                     window.paint_quad(fill(bounds, rgb_color(theme.background)));
-                    // The rows as drawn, for finding the program's prompt.
-                    let mut screen: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
-                    let drawn = (row_off as usize..self.rows.count())
-                        .take(rows).filter_map(|row| self.rows.source(row));
-                    for (row, source) in drawn.enumerate() {
+                    for row in 0..rows {
+                        let Some(line) = self.rows.source(row).filter(|_| geometry.visible(row)) else {
+                            continue;
+                        };
+                        let row_top = px(geometry.grid_top(row));
                         for col in 0..cols {
-                            let pos = Pos::new(Line(source as i32 - offset as i32), Column(col + col_off));
+                            let pos = Pos::new(line, Column(col + col_off));
                             let square = grid.grid[pos];
-                            screen[row][col] = match square.c() {
-                                '\0' => ' ',
-                                c => c,
-                            };
                             if square.wide() == Wide::Spacer {
                                 continue;
                             }
@@ -607,7 +647,7 @@ macro_rules! __bind_gpui {
                             if selected || (cursor_here && cursor.content == CursorShape::Block) {
                                 std::mem::swap(&mut fg, &mut bg);
                             }
-                            let origin = bounds.origin + point(self.cell.width * col, self.cell.height * row);
+                            let origin = bounds.origin + point(self.cell.width * col, row_top);
                             let width = if square.wide() == Wide::Wide {
                                 self.cell.width * 2.
                             } else {
@@ -716,31 +756,6 @@ macro_rules! __bind_gpui {
                             ));
                         }
                     }
-                    // The caret as drawn, only while visible and the view is at the bottom.
-                    let caret = (cursor.content != CursorShape::Hidden && offset == 0)
-                        .then(|| {
-                            let row = cursor.pos.row.0 - row_off;
-                            let col = cursor.pos.col.0.checked_sub(col_off)?;
-                            (row >= 0 && (row as usize) < rows && col <= cols).then_some((row as usize, col))
-                        })
-                        .flatten();
-                    let kind = self.ghost.as_ref().map_or(self.prompt_kind, |ghost| ghost.kind);
-                    let anchor = $crate::ghost::locate(&screen, caret, kind);
-                    // Without a caret the controls keep the row they last had.
-                    let previous = self
-                        .last_hint
-                        .as_ref()
-                        .and_then(|hint| hint.controls.first())
-                        .map(|control| $crate::ghost::Previous {
-                            row: control.row,
-                            scrolled: offset != 0,
-                        });
-                    let layout = self
-                        .ghost
-                        .as_ref()
-                        .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen, previous))
-                        .unwrap_or_default();
-                    let placed = &layout.placed;
                     if let Some(ghost) = self.ghost.clone() {
                         self.paint_ghost(&ghost, placed, bounds.origin, &font, font_size, window, cx);
                     }
@@ -763,6 +778,7 @@ macro_rules! __bind_gpui {
                             draft_shown: layout.draft_shown,
                             draft_runs: $crate::ghost::draft_runs(placed),
                             draft_spans: $crate::ghost::draft_spans(placed),
+                            rows_geometry: geometry,
                         };
                         let mut busy = $crate::ghost::busy_columns(&screen, anchor, placed);
                         busy.drain(..hint.busy_from.min(busy.len()));
@@ -776,7 +792,9 @@ macro_rules! __bind_gpui {
                             self.last_hint = Some(hint);
                         }
                     }
-                    if !self.host_input && !self.marked.is_empty() && self.focus.is_focused(window) {
+                    if !self.host_input && !self.marked.is_empty() && self.focus.is_focused(window)
+                        && let Some(row) = self.rows.projected(cursor.pos.row)
+                    {
                         let text = self.marked.replace(['\n', '\r'], " ");
                         let run = TextRun {
                             len: text.len(),
@@ -796,7 +814,7 @@ macro_rules! __bind_gpui {
                         let origin = bounds.origin
                             + point(
                                 self.cell.width * cursor.pos.col.0.saturating_sub(col_off),
-                                self.cell.height * (cursor.pos.row.0 - row_off) as f32,
+                                px(geometry.grid_top(row)),
                             );
                         let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
                     }
@@ -1085,12 +1103,12 @@ macro_rules! __bind_gpui {
                 ) -> Option<Bounds<Pixels>> {
                     let cursor = self.session.grid().lock().cursor();
                     // The IME sits at the caret as drawn (the window may follow it).
-                    let (row_off, col_off) = self.view_origin;
+                    let row = self.rows.projected(cursor.pos.row)?;
                     Some(Bounds::new(
                         self.bounds.origin
                             + point(
-                                self.cell.width * cursor.pos.col.0.saturating_sub(col_off),
-                                self.cell.height * (cursor.pos.row.0 - row_off) as f32,
+                                self.cell.width * cursor.pos.col.0.saturating_sub(self.first_column),
+                                px(self.geometry.grid_top(row)),
                             ),
                         self.cell,
                     ))

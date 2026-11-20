@@ -259,6 +259,9 @@ pub struct Rows {
     len: usize,
     hidden: Range<usize>,
     deferred: bool,
+    first: usize,
+    capacity: Option<usize>,
+    offset: i32,
 }
 
 impl Rows {
@@ -300,29 +303,73 @@ impl Rows {
         !self.hidden.is_empty()
     }
 
-    pub fn source(&self, row: usize) -> Option<usize> {
-        (row < self.len).then(|| {
-            if row < self.hidden.start {
-                row
-            } else {
-                row + self.hidden.len()
-            }
-        })
+    pub fn set_viewport(&mut self, first: usize, capacity: usize, display_offset: usize) {
+        self.first = first;
+        self.capacity = Some(capacity);
+        self.offset = display_offset as i32;
     }
 
-    /// The source cell drawn at the point, before the display offset.
-    pub fn cell_at(
+    pub fn view_len(&self) -> usize {
+        self.len
+            .saturating_sub(self.first)
+            .min(self.capacity.unwrap_or(self.len))
+    }
+
+    pub fn scrolled(&self) -> bool {
+        self.offset != 0
+    }
+
+    /// The terminal line at a viewport row, including scrollback.
+    pub fn source(&self, row: usize) -> Option<Line> {
+        if row >= self.view_len() {
+            return None;
+        }
+        let index = self.first + row;
+        let skipped = if index >= self.hidden.start {
+            self.hidden.len()
+        } else {
+            0
+        };
+        Some(Line((index + skipped) as i32 - self.offset))
+    }
+
+    /// The viewport row for a terminal line, if it is in the projection.
+    pub fn projected(&self, line: Line) -> Option<usize> {
+        let index = usize::try_from(line.0 + self.offset).ok()?;
+        if self.hidden.contains(&index) {
+            return None;
+        }
+        let skipped = if index >= self.hidden.end {
+            self.hidden.len()
+        } else {
+            0
+        };
+        let row = (index - skipped).checked_sub(self.first)?;
+        (row < self.view_len()).then_some(row)
+    }
+
+    pub fn source_at(&self, geometry: &crate::rows::RowGeometry, y: f32) -> Option<Line> {
+        self.source(geometry.grid_row_at(y)?)
+    }
+
+    /// The viewport text used to place the prompt, draft, and controls.
+    pub fn screen<U: EventListener>(
         &self,
-        point: (f32, f32),
-        cell: (f32, f32),
-        origin: (i32, usize),
-        (columns, rows): (usize, usize),
-    ) -> Option<(usize, usize)> {
-        let (col, row) =
-            crate::tap::cell_at(point, cell, origin, (columns, rows.min(self.count())))?;
-        self.source(row)
-            .filter(|&row| row < rows)
-            .map(|row| (col, row))
+        grid: &Crosswords<U>,
+        cols: usize,
+        first_col: usize,
+    ) -> Vec<Vec<char>> {
+        (0..self.view_len())
+            .filter_map(|row| self.source(row))
+            .map(|line| {
+                (first_col..first_col + cols)
+                    .map(|col| match grid.grid[line][Column(col)].c() {
+                        '\0' => ' ',
+                        c => c,
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }
 
@@ -330,6 +377,7 @@ impl Rows {
 mod tests {
     use super::*;
     use crate::ghost;
+    use crate::rows::RowGeometry;
 
     fn screen(lines: &[&str]) -> Vec<Vec<char>> {
         lines.iter().map(|line| line.chars().collect()).collect()
@@ -506,35 +554,32 @@ mod tests {
             CODEX_WARNINGS,
         ]);
         let hidden = detect(&rows, |_| false, Some((2, 2)), PromptKind::Codex);
-        let projected = Rows::new(rows.len(), hidden);
+        let mut projected = Rows::new(rows.len(), hidden);
         let projected_rows: Vec<_> = (0..projected.count())
-            .filter_map(|row| projected.source(row))
+            .filter_map(|row| projected.source(row).map(|line| line.0 as usize))
             .collect();
         assert_eq!(projected_rows, [0, 1, 2, 3, 5]);
         let origin =
             crate::view_origin((30, projected.count() as u16), (30, 4), (2, 2), false, None);
         assert_eq!(origin, (1, 0));
-        let drawn: Vec<_> = projected_rows[1..]
-            .iter()
-            .map(|&row| rows[row].clone())
+        projected.set_viewport(origin.0 as usize, 4, 0);
+        let drawn: Vec<_> = (0..projected.view_len())
+            .filter_map(|row| projected.source(row))
+            .map(|line| rows[line.0 as usize].clone())
             .collect();
         let anchor = ghost::locate(&drawn, Some((1, 2)), PromptKind::Codex);
         assert_eq!(anchor.map(|anchor| anchor.row), Some(1));
 
-        let touch = |y| {
-            projected
-                .cell_at((18., y), (9., 20.), origin, (30, rows.len()))
-                .map(|(_, row)| row)
-        };
-        assert_eq!(touch(21.), Some(2));
-        assert_eq!(touch(61.), Some(5));
+        let touch = |y| projected.source_at(&RowGeometry::uniform(20.), y);
+        assert_eq!(touch(21.), Some(Line(2)));
+        assert_eq!(touch(61.), Some(Line(5)));
         assert_eq!(touch(81.), None);
         let scrolled = Rows::new(
             rows.len(),
             detect(&rows, |_| false, None, PromptKind::Codex),
         );
-        assert_eq!(scrolled.source(4), Some(4));
-        assert_eq!(scrolled.source(5), Some(5));
+        assert_eq!(scrolled.source(4), Some(Line(4)));
+        assert_eq!(scrolled.source(5), Some(Line(5)));
     }
 
     fn codex_screen() -> Crosswords<rio_vt::event::VoidListener> {
@@ -572,15 +617,14 @@ mod tests {
 
         let grid = codex_screen();
         let target = |rows: &Rows| {
-            let (col, source) = rows.cell_at((20., 201.), (10., 20.), (0, 0), (96, 12))?;
-            grid_link_at(&grid, Pos::new(Line(source as i32), Column(col)))
-                .map(|(_, link)| (source, link))
+            let line = rows.source_at(&RowGeometry::uniform(20.), 201.)?;
+            grid_link_at(&grid, Pos::new(line, Column(2))).map(|(_, link)| (line, link))
         };
         let mut rows = Rows::new(12, hidden_on_screen(&grid, PromptKind::Other));
         let down = target(&rows);
         assert_eq!(
             down,
-            Some((10, Link::Web("https://example.com/after".into())))
+            Some((Line(10), Link::Web("https://example.com/after".into())))
         );
 
         // The only change between finger-down and GPUI's synthetic click is
@@ -595,7 +639,7 @@ mod tests {
         let collapsed = target(&rows);
         assert_eq!(
             collapsed,
-            Some((11, Link::Web("https://example.com/other".into())))
+            Some((Line(11), Link::Web("https://example.com/other".into())))
         );
         assert!(!rows.deferred());
 
@@ -613,12 +657,12 @@ mod tests {
         let hidden = hidden_on_screen(&grid, PromptKind::Codex);
         assert_eq!(hidden, Some(9..10));
         let mut rows = Rows::new(12, hidden);
-        assert_eq!(rows.source(9), Some(10));
-        let at = |rows: &Rows, y| rows.cell_at((20., y), (10., 20.), (0, 0), (96, 12));
+        assert_eq!(rows.source(9), Some(Line(10)));
+        let at = |rows: &Rows, y| rows.source_at(&RowGeometry::uniform(20.), y);
         let above = at(&rows, 161.);
         let below = at(&rows, 181.);
-        assert_eq!(above, Some((2, 8)));
-        assert_eq!(below, Some((2, 10)));
+        assert_eq!(above, Some(Line(8)));
+        assert_eq!(below, Some(Line(10)));
 
         Processor::default().advance(
             &mut grid,
@@ -628,12 +672,16 @@ mod tests {
         assert_eq!(hidden, None);
         assert!(rows.update(12, true, hidden));
 
-        assert_eq!(rows.source(9), Some(9), "replacement output must be drawn");
+        assert_eq!(
+            rows.source(9),
+            Some(Line(9)),
+            "replacement output must be drawn"
+        );
         assert_eq!(rows.count(), 12);
         assert_eq!(at(&rows, 161.), above);
         // The original link is still present at row 10, but a tap here was
         // remapped to the error row and must be cancelled.
-        assert_eq!(at(&rows, 181.), Some((2, 9)));
+        assert_eq!(at(&rows, 181.), Some(Line(9)));
         assert_ne!(at(&rows, 181.), below);
     }
 
@@ -642,7 +690,7 @@ mod tests {
         let mut rows = Rows::new(12, Some(9..10));
         assert!(rows.update(12, true, None));
         assert_eq!(rows.count(), 12);
-        assert_eq!(rows.source(9), Some(9));
+        assert_eq!(rows.source(9), Some(Line(9)));
 
         // A drag back to the live screen sees the footer again. Its collapse
         // waits for the same gesture to end.
@@ -650,7 +698,7 @@ mod tests {
         assert_eq!(rows.count(), 12);
         assert!(rows.deferred());
         assert!(!rows.update(12, false, Some(9..10)));
-        assert_eq!(rows.source(9), Some(10));
+        assert_eq!(rows.source(9), Some(Line(10)));
     }
 
     #[test]
@@ -658,11 +706,11 @@ mod tests {
         let mut rows = Rows::new(12, Some(8..10));
         assert!(rows.update(12, true, Some(9..11)));
         assert!(rows.deferred());
-        assert_eq!(rows.source(8), Some(8));
-        assert_eq!(rows.source(9), Some(10));
+        assert_eq!(rows.source(8), Some(Line(8)));
+        assert_eq!(rows.source(9), Some(Line(10)));
 
         assert!(!rows.update(12, false, Some(9..11)));
         assert!(!rows.deferred());
-        assert_eq!(rows.source(9), Some(11));
+        assert_eq!(rows.source(9), Some(Line(11)));
     }
 }
