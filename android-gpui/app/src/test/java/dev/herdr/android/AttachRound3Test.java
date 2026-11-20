@@ -29,9 +29,9 @@ public final class AttachRound3Test {
 
     @Test public void anAuthorityWithAUserQualifierIsStillHerdrsOwn() {
         // content://10@dev.wolf.herdrgpui.capture/... names this app's provider for user 10.
-        assertFalse(ShareUris.allowed("content", "10@dev.wolf.herdrgpui.capture", ShareUris.GRANT_READ, "dev.wolf.herdrgpui"));
-        assertFalse(ShareUris.allowed("content", "0@dev.wolf.herdrgpui", ShareUris.GRANT_READ, "dev.wolf.herdrgpui"));
-        assertTrue(ShareUris.allowed("content", "10@media", ShareUris.GRANT_READ, "dev.wolf.herdrgpui"));
+        assertFalse(ShareUris.allowed("content", "10@dev.wolf.herdrgpui.capture", "dev.wolf.herdrgpui"));
+        assertFalse(ShareUris.allowed("content", "0@dev.wolf.herdrgpui", "dev.wolf.herdrgpui"));
+        assertTrue(ShareUris.allowed("content", "10@media", "dev.wolf.herdrgpui"));
     }
 
     @Test public void anAttachedPathSurvivesTheNextDictationPartialAndFinal() {
@@ -90,7 +90,9 @@ public final class AttachRound3Test {
         assertFalse(listener.contains("copyValidated("));
         assertFalse(listener.contains("getContentResolver()"));
         assertTrue("the payload stays referenced until the worker is done", listener.contains("host.attachPasted("));
-        assertTrue("the cap applies before anything is copied", listener.contains("MAX_IMAGES"));
+        String worker = section(source("GpuiTerminalActivity"), "private void attachPastedOnWorker(", "private boolean isImageUri(");
+        assertTrue("the cap applies before anything is copied", worker.contains("MAX_IMAGES"));
+        assertTrue("the payload retains its grant until the worker finishes", worker.contains("reachabilityFence(payload)"));
     }
 
     @Test public void draftsAreScopedToTheHostThatOwnsThePane() throws Exception {

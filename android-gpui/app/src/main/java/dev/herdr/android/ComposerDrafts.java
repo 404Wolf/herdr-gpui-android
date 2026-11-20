@@ -65,24 +65,31 @@ final class ComposerDrafts {
 
     /**
      * The computer whose panes are shown. Drafts saved before drafts knew their computer (a key with
-     * no host) move to the first computer shown, once; every later save keeps host and pane together.
+     * no host) move to the first computer that can save their adoption.
      */
     void setHost(String next) {
+        setHost(next, encoded -> true);
+    }
+
+    boolean setHost(String next, java.util.function.Predicate<String> persistMigration) {
         String target = next == null ? "" : next;
-        if (target.equals(host)) return;
+        if (target.equals(host)) return true;
         settleCuts(true);
         dictationBase = null;
-        if (!target.isEmpty()) migrateLegacy(target);
+        boolean saved = target.isEmpty() || migrateLegacy(target, persistMigration);
         String raw = rawPane(pane);
         host = target;
         pane = key(host, raw);
+        return saved;
     }
 
     String host() { return host; }
 
-    private void migrateLegacy(String to) {
+    private boolean migrateLegacy(String to, java.util.function.Predicate<String> persist) {
         java.util.List<String> legacy = new java.util.ArrayList<>();
         for (String k : drafts.keySet()) if (k.indexOf(SEP) < 0) legacy.add(k);
+        if (legacy.isEmpty()) return true;
+        Object before = snapshot();
         for (String k : legacy) {
             String text = drafts.remove(k);
             String moved = key(to, k);
@@ -90,6 +97,9 @@ final class ComposerDrafts {
             java.util.List<long[]> marks = cutMarks.remove(k);
             if (marks != null) cutMarks.putIfAbsent(moved, marks);
         }
+        if (persist.test(encode())) return true;
+        rollback(before);
+        return false;
     }
 
     /** Shows {@code next}'s draft, keeping the current one for later. */
@@ -103,6 +113,8 @@ final class ComposerDrafts {
     }
 
     String pane() { return rawPane(pane); }
+
+    String owner() { return host.isEmpty() || rawPane(pane).isEmpty() ? "" : pane; }
 
     /** Every pane's draft (the dictation chips they hold must keep their recordings). */
     java.util.List<String> all() {

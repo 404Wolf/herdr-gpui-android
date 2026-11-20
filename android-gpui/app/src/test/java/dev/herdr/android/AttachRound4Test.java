@@ -30,8 +30,10 @@ public final class AttachRound4Test {
 
     @Test public void mixedPasteClassifiesEachUriOnTheWorkerAndReturnsNonImagesToTheField() throws Exception {
         String activity = source("GpuiTerminalActivity");
+        String paste = activity.substring(activity.indexOf("private void attachPastedOnWorker("),
+                activity.indexOf("private void attach(AttachTarget"));
         assertTrue("the paste worker must use each item's MIME type, not the clip's image/* label",
-                activity.contains("getContentResolver().getType("));
+                paste.contains("isImageUri(item.getUri())") && paste.contains("getContentResolver().getType(uri)"));
         assertTrue("items outside the image partition must reach the native field",
                 source("ComposerBar").contains("edit.onReceiveContent("));
     }
@@ -41,7 +43,7 @@ public final class AttachRound4Test {
                 Arrays.asList(0), ShareUris.filter(Arrays.asList(
                         new String[] {"content", "public.images"}, new String[] {"content", "herdr.only"},
                         new String[] {"file", ""}, new String[] {"content", "10@dev.wolf.herdrgpui.capture"}),
-                        0, "dev.wolf.herdrgpui", i -> i != 1));
+                        "dev.wolf.herdrgpui", i -> i != 1));
     }
 
     private static String source(String name) throws Exception {

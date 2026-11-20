@@ -123,6 +123,7 @@ public final class ClearDuringDictationTest {
         try (DictationFakes.Rig rig = new DictationFakes.Rig(dir.newFolder(), desktop, phone)) {
             Composer c = new Composer(rig.engine);
             rig.onMain(() -> {
+                c.drafts.setHost("h");
                 c.drafts.switchTo("A");
                 c.drafts.edit("note:");
                 c.drafts.dictationStarted();
@@ -135,7 +136,7 @@ public final class ClearDuringDictationTest {
                 cleared = rig.onMain(() -> {
                     boolean ready = when == ClearWhen.RECORDING ? DictationRouting.recording(c.state)
                             : c.state == DictationEngine.State.TRANSCRIBING;
-                    if (ready) c.clearing.tap("A", true, 0);
+                    if (ready) c.clearing.tap(c.drafts.owner(), true, 0);
                     return ready;
                 });
                 if (!cleared) Thread.sleep(2);
@@ -153,7 +154,7 @@ public final class ClearDuringDictationTest {
                         || s.contains(DictationFakes.PHONE_WORDS));
             }
             // Undo: the draft as it was, without the cancelled words.
-            assertTrue(rig.onMain(() -> c.clearing.undo(1)));
+            assertTrue(rig.onMain(() -> c.clearing.undo(c.drafts.owner(), 1)));
             assertEquals("note:", rig.onMain(c.drafts::text));
             // A new dictation afterwards starts as usual (its listener is a new one).
             rig.onMain(() -> {

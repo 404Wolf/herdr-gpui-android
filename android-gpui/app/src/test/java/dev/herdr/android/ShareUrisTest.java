@@ -13,30 +13,27 @@ import org.junit.Test;
 public final class ShareUrisTest {
     private static final String OWN = "dev.wolf.herdrgpui";
 
-    @Test public void onlyAGrantedContentUriIsOpened() {
-        assertTrue(ShareUris.allowed("content", "com.android.providers.media.documents", ShareUris.GRANT_READ, OWN));
-        assertTrue(ShareUris.allowed("CONTENT", "media", ShareUris.GRANT_READ | 2, OWN));
-        // No explicit read grant: Herdr's own access would be used, not the sender's.
-        assertFalse(ShareUris.allowed("content", "media", 0, OWN));
-        assertFalse(ShareUris.allowed("content", "media", 2, OWN));
+    @Test public void contentSchemesAreAcceptedCaseInsensitively() {
+        assertTrue(ShareUris.allowed("content", "com.android.providers.media.documents", OWN));
+        assertTrue(ShareUris.allowed("CONTENT", "media", OWN));
     }
 
     @Test public void fileAndOtherSchemesAreRefused() {
-        assertFalse(ShareUris.allowed("file", "", ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("file", "host", ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("http", "example.com", ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("android.resource", "x", ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed(null, "media", ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("content", null, ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("content", "", ShareUris.GRANT_READ, OWN));
+        assertFalse(ShareUris.allowed("file", "", OWN));
+        assertFalse(ShareUris.allowed("file", "host", OWN));
+        assertFalse(ShareUris.allowed("http", "example.com", OWN));
+        assertFalse(ShareUris.allowed("android.resource", "x", OWN));
+        assertFalse(ShareUris.allowed(null, "media", OWN));
+        assertFalse(ShareUris.allowed("content", null, OWN));
+        assertFalse(ShareUris.allowed("content", "", OWN));
     }
 
     @Test public void herdrsOwnProviderAuthoritiesAreRefused() {
-        assertFalse(ShareUris.allowed("content", OWN + ".capture", ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("content", OWN, ShareUris.GRANT_READ, OWN));
-        assertFalse(ShareUris.allowed("content", "DEV.WOLF.HERDRGPUI.capture", ShareUris.GRANT_READ, OWN));
+        assertFalse(ShareUris.allowed("content", OWN + ".capture", OWN));
+        assertFalse(ShareUris.allowed("content", OWN, OWN));
+        assertFalse(ShareUris.allowed("content", "DEV.WOLF.HERDRGPUI.capture", OWN));
         // A lookalike that merely starts with the same letters is another app's.
-        assertTrue(ShareUris.allowed("content", OWN + "x.files", ShareUris.GRANT_READ, OWN));
+        assertTrue(ShareUris.allowed("content", OWN + "x.files", OWN));
     }
 
     @Test public void captureFilesAreOnePlainNameInsideTheCaptureFolder() throws Exception {

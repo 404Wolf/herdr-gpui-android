@@ -3,15 +3,18 @@ package dev.herdr.android;
 import android.annotation.SuppressLint;
 
 import android.app.AlertDialog;
+import android.content.ClipData;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.content.res.ColorStateList;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.inputmethod.BaseInputConnection;
+import android.view.ContentInfo;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.KeyCharacterMap;
@@ -4789,17 +4792,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void attachUris(java.util.List<android.net.Uri> uris) { attachFrom(uris); }
 
-            @Override public void attachPasted(java.util.List<android.net.Uri> uris, Object keepAlive) {
+            @android.annotation.TargetApi(31)
+            @Override public boolean attachPasted(ContentInfo payload, java.util.function.Consumer<ContentInfo> unhandled) {
                 AttachTarget target = attachTarget();
-                if (target == null) {
-                    note("Open an agent to attach an image");
-                    return;
+                try {
+                    attachWorker.execute(() -> attachPastedOnWorker(target, payload, unhandled));
+                    return true;
+                } catch (java.util.concurrent.RejectedExecutionException closed) {
+                    return false;
                 }
-                // The payload carries a keyboard's temporary grant: held until the worker is done with it.
-                pasteKeepAlive.add(keepAlive);
-                java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
-                for (android.net.Uri uri : uris) sources.add(AttachImages.uriSource(getContentResolver(), uri));
-                attach(target, sources, () -> pasteKeepAlive.remove(keepAlive));
             }
 
             @Override public void attachFiles(java.util.List<java.io.File> files) {
@@ -4883,8 +4884,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         } while (SystemClock.elapsedRealtime() < until);
         return null;
     }
-
-    private final java.util.Set<Object> pasteKeepAlive = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
     private AttachTarget cameraFor;
 
@@ -4995,37 +4994,87 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         attach(target, sources, null);
     }
 
+    @android.annotation.TargetApi(31)
+    private void attachPastedOnWorker(AttachTarget target, ContentInfo payload,
+            java.util.function.Consumer<ContentInfo> unhandled) {
+        try {
+            ClipData clip = payload.getClip();
+            ClipData rest = null;
+            List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+            for (int i = 0; i < clip.getItemCount(); i++) {
+                ClipData.Item item = clip.getItemAt(i);
+                if (AttachImages.isPastedUri(item) && isImageUri(item.getUri())) {
+                    if (sources.size() < ImageAttach.MAX_IMAGES) {
+                        sources.add(AttachImages.uriSource(getContentResolver(), item.getUri()));
+                    }
+                } else if (rest == null) {
+                    rest = new ClipData(clip.getDescription(), item);
+                } else {
+                    rest.addItem(item);
+                }
+            }
+            if (rest != null) {
+                ContentInfo remaining = new ContentInfo.Builder(payload).setClip(rest).build();
+                main.post(() -> {
+                    if (!destroyed) unhandled.accept(remaining);
+                });
+            }
+            if (sources.isEmpty()) return;
+            if (target == null) note("Open an agent to attach an image");
+            else attachOnWorker(target, sources);
+        } finally {
+            // A keyboard's temporary grant lasts as long as the original ContentInfo is reachable.
+            java.lang.ref.Reference.reachabilityFence(payload);
+        }
+    }
+
+    private boolean isImageUri(Uri uri) {
+        try {
+            String mime = getContentResolver().getType(uri);
+            return mime != null && android.content.ClipDescription.compareMimeTypes(mime, "image/*");
+        } catch (RuntimeException unavailable) {
+            return false;
+        }
+    }
+
     /**
      * Puts each image on the pane's computer (off the main thread, over the core connection), then
      * types the paths into that pane's draft, shell-quoted, never sent.
      */
     private void attach(AttachTarget target, java.util.List<ImageAttach.Source> sources, Runnable done) {
         if (sources.isEmpty()) return;
-        note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
         try {
             attachWorker.execute(() -> {
-                ImageAttach.Outcome outcome = ImageAttach.attach(sources, AttachImages.CONVERTER,
-                        (name, bytes) -> {
-                            AttachTarget live = liveTarget(target);
-                            if (live == null) {
-                                throw new ImageAttach.AttachException("The connection is down; try the image again");
-                            }
-                            try {
-                                return RemoteNative.putFile(live.handle, live.pane, name, bytes);
-                            } catch (RuntimeException dropped) {
-                                String why = dropped.getMessage();
-                                throw new ImageAttach.AttachException("The image may not have arrived (it could still be on the computer)"
-                                        + (why == null || why.isEmpty() ? "" : ": " + (why.length() > 120 ? why.substring(0, 120) : why)), dropped);
-                            }
-                        },
-                        () -> java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis())
-                                + System.nanoTime() % 1_000_000L);
-                if (done != null) done.run();
-                main.post(() -> attached(target, outcome));
+                try {
+                    attachOnWorker(target, sources);
+                } finally {
+                    if (done != null) done.run();
+                }
             });
         } catch (java.util.concurrent.RejectedExecutionException closed) {
             if (done != null) done.run();
         }
+    }
+
+    private void attachOnWorker(AttachTarget target, List<ImageAttach.Source> sources) {
+        note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
+        ImageAttach.Outcome outcome = ImageAttach.attach(sources, AttachImages.CONVERTER,
+                (name, bytes) -> {
+                    AttachTarget live = liveTarget(target);
+                    if (live == null) {
+                        throw new ImageAttach.AttachException("The connection is down; try the image again");
+                    }
+                    try {
+                        return RemoteNative.putFile(live.handle, live.pane, name, bytes);
+                    } catch (RuntimeException dropped) {
+                        String why = dropped.getMessage();
+                        throw new ImageAttach.AttachException("The image may not have arrived (it could still be on the computer)"
+                                + (why == null || why.isEmpty() ? "" : ": " + (why.length() > 120 ? why.substring(0, 120) : why)), dropped);
+                    }
+                },
+                () -> java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis())
+                        + System.nanoTime() % 1_000_000L);
+        main.post(() -> attached(target, outcome));
     }
 
     private void attached(AttachTarget target, ImageAttach.Outcome outcome) {

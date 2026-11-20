@@ -61,15 +61,19 @@ public final class AttachRound3NewApiTest {
         // The old store had one draft per pane id and no host.
         ComposerDrafts drafts = new ComposerDrafts();
         drafts.restore("{\"t1\":\"old draft\",\"t2\":\"other\"}");
-        drafts.setHost("hostA");
+        java.util.concurrent.atomic.AtomicReference<String> saved = new java.util.concurrent.atomic.AtomicReference<>();
+        drafts.setHost("hostA", encoded -> {
+            saved.set(encoded);
+            return true;
+        });
         drafts.switchTo("t1");
         assertEquals("old draft", drafts.text());
         drafts.setHost("hostB");
         drafts.switchTo("t1");
         assertEquals("", drafts.text());
-        // Saved again, they are qualified: a new process cannot load them under another host.
+        // Restart from what migration wrote, without a subsequent edit or save.
         ComposerDrafts next = new ComposerDrafts();
-        next.restore(drafts.encode());
+        next.restore(saved.get());
         next.setHost("hostB");
         next.switchTo("t1");
         assertEquals("", next.text());
@@ -104,8 +108,8 @@ public final class AttachRound3NewApiTest {
                 new String[] {"content", "media"}, new String[] {"content", "other"},
                 new String[] {"file", ""}, new String[] {"content", "10@dev.wolf.herdrgpui.capture"});
         // Only "media" holds the sender's grant; "other" is a content URI the sender was not granted.
-        List<Integer> ok = ShareUris.filter(uris, ShareUris.GRANT_READ, "dev.wolf.herdrgpui", i -> i == 0);
+        List<Integer> ok = ShareUris.filter(uris, "dev.wolf.herdrgpui", i -> i == 0);
         assertEquals(Arrays.asList(0), ok);
-        assertFalse(ShareUris.filter(uris, 0, "dev.wolf.herdrgpui", i -> true).contains(0));
+        assertFalse(ShareUris.filter(uris, "dev.wolf.herdrgpui", i -> false).contains(0));
     }
 }

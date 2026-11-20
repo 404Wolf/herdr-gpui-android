@@ -189,12 +189,12 @@ final class Outbox {
 
     /** A message the user cleared, still recoverable: for a clear's recovery after a restart. */
     static final class Cleared {
-        final String id, pane, text;
+        final String id, owner, text;
         final long until;
 
-        Cleared(String id, String pane, String text, long until) {
+        Cleared(String id, String owner, String text, long until) {
             this.id = id;
-            this.pane = pane;
+            this.owner = owner;
             this.text = text;
             this.until = until;
         }
@@ -204,7 +204,9 @@ final class Outbox {
     synchronized List<Cleared> clearedOn(String host, long now) {
         List<Cleared> out = new ArrayList<>();
         for (Entry e : entries) {
-            if (e.host.equals(host) && e.clearedUntil > now) out.add(new Cleared(e.id, e.pane, e.text, e.clearedUntil));
+            if (e.host.equals(host) && e.clearedUntil > now) {
+                out.add(new Cleared(e.id, ComposerDrafts.key(e.host, e.pane), e.text, e.clearedUntil));
+            }
         }
         return out;
     }

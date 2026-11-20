@@ -3,17 +3,22 @@ package dev.herdr.android;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ProviderInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
+import android.os.UserHandle;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * "Share to Herdr": the share sheet's images. A sender's URIs are untrusted: only content:// URIs
- * the sender granted for reading are opened ({@link ShareUris}); each is streamed into the app's
+ * the sender can read or explicitly granted are opened ({@link ShareUris}); each is streamed into the app's
  * cache and kept only if a decoder reads it as an image. Nothing is uploaded here: the images wait
  * ({@link SharedImages}) until the user picks an agent for them, in the terminal already open
  * (which asks) or in Home. Shows nothing of its own.
@@ -22,11 +27,12 @@ public final class ShareTargetActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         Intent intent = getIntent();
-        int[] refused = new int[1];
-        List<Uri> uris = sharedUris(intent, getPackageName(), refused,
-                uri -> checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(),
-                        ShareUris.GRANT_READ) == android.content.pm.PackageManager.PERMISSION_GRANTED);
+        int senderUid = Build.VERSION.SDK_INT >= 34 ? getLaunchedFromUid() : -1;
         Thread copier = new Thread(() -> {
+            int[] refused = new int[1];
+            boolean grantFlag = intent != null && (intent.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0;
+            List<Uri> uris = sharedUris(intent, getPackageName(), refused,
+                    uri -> canReadShare(uri, senderUid, grantFlag));
             File dir = new File(getCacheDir(), "shared");
             File[] old = dir.listFiles();
             if (old != null) for (File stale : old) stale.delete();
@@ -46,14 +52,37 @@ public final class ShareTargetActivity extends Activity {
         copier.start();
     }
 
+    private boolean canReadShare(Uri uri, int senderUid, boolean grantFlag) {
+        int read = Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        int granted = PackageManager.PERMISSION_GRANTED;
+        try {
+            if (grantFlag && checkUriPermission(uri, Process.myPid(), Process.myUid(), read) == granted) return true;
+            if (senderUid < 0 || senderUid == Process.myUid()) return false;
+            if (Build.VERSION.SDK_INT >= 35) {
+                return checkContentUriPermissionFull(uri, -1, senderUid, read) == granted;
+            }
+            if (checkUriPermission(uri, -1, senderUid, read) == granted) return true;
+            // Android 14 exposes the sender UID, but its URI check only covers grants.
+            // Without a full check, require a same-user provider with public reads.
+            String authority = uri.getAuthority();
+            if (authority.indexOf('@') >= 0
+                    || !Process.myUserHandle().equals(UserHandle.getUserHandleForUid(senderUid))) return false;
+            ProviderInfo provider = getPackageManager().resolveContentProvider(authority, 0);
+            return provider != null && !provider.forceUriPermissions && (provider.applicationInfo.uid == senderUid
+                    || (provider.exported && provider.readPermission == null
+                        && (provider.pathPermissions == null || provider.pathPermissions.length == 0)));
+        } catch (RuntimeException denied) {
+            return false;
+        }
+    }
+
     /**
-     * The shared URIs that may be opened: only those Android granted with the intent (its data and
-     * ClipData), each authorized on its own by {@code granted} and the scheme/authority rules
-     * ({@link ShareUris}). A stream extra is never opened by itself: Android does not grant it when
-     * a clip is present, so one outside the grant, or malformed, is only counted in {@code refused[0]}.
+     * Only URIs from the intent's data and ClipData, with per-URI authorization and the
+     * scheme/authority rules ({@link ShareUris}). An extra outside those fields, or a malformed
+     * extra, is only counted in {@code refused[0]}.
      */
     static List<Uri> sharedUris(Intent intent, String ownPackage, int[] refused,
-            java.util.function.Predicate<Uri> granted) {
+            java.util.function.Predicate<Uri> authorized) {
         List<Uri> candidates = new ArrayList<>();
         if (intent == null) return candidates;
         if (intent.getData() != null) candidates.add(intent.getData());
@@ -75,7 +104,7 @@ public final class ShareTargetActivity extends Activity {
         }
         List<String[]> parts = new ArrayList<>();
         for (Uri uri : candidates) parts.add(new String[] {uri.getScheme(), uri.getAuthority()});
-        List<Integer> ok = ShareUris.filter(parts, intent.getFlags(), ownPackage, i -> granted.test(candidates.get(i)));
+        List<Integer> ok = ShareUris.filter(parts, ownPackage, i -> authorized.test(candidates.get(i)));
         refused[0] += candidates.size() - ok.size();
         List<Uri> allowed = new ArrayList<>();
         for (int i : ok) allowed.add(candidates.get(i));

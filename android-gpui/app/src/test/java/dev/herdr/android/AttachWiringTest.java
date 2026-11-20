@@ -175,7 +175,10 @@ public final class AttachWiringTest {
     @Test public void thePasteListenerHandsBackWhatIsNotAnImage() throws Exception {
         String listener = section(source("ComposerBar"), "private void listenForImages(", "A session that a pane switch");
         assertTrue(listener.contains("hasMimeType(\"image/*\")"));
-        assertTrue("the rest goes back to the field", listener.contains("ContentInfo.Builder(payload).setClip(rest)"));
+        String worker = section(source("GpuiTerminalActivity"), "private void attachPastedOnWorker(", "private boolean isImageUri(");
+        assertTrue("the rest keeps the original payload metadata",
+                worker.contains("ContentInfo.Builder(payload).setClip(rest)"));
+        assertTrue("the rest goes back to the field", listener.contains("edit.onReceiveContent(rest)"));
         assertTrue("a clip with no images is a normal paste", listener.contains("return payload;"));
     }
 

@@ -34,6 +34,11 @@ final class AttachImages {
 
     private AttachImages() { }
 
+    static boolean isPastedUri(ClipData.Item item) {
+        return item.getUri() != null && item.getText() == null && item.getHtmlText() == null
+                && item.getIntent() == null;
+    }
+
     /** The system picker for images only: the photo picker on Android 13+, the document picker before. */
     static Intent pickIntent() {
         if (Build.VERSION.SDK_INT >= 33) {

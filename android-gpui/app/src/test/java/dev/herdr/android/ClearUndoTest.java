@@ -28,6 +28,8 @@ import org.junit.rules.TemporaryFolder;
  * undo is put right, and no chip is left on a held recording.
  */
 public final class ClearUndoTest {
+    private static final String T1 = ComposerDrafts.key("h", "t1");
+    private static final String T2 = ComposerDrafts.key("h", "t2");
     @Rule public final TemporaryFolder dir = new TemporaryFolder();
 
     /** The process dies here. */
@@ -67,6 +69,7 @@ public final class ClearUndoTest {
                 throw new AssertionError("nothing is sent here");
             });
             courier.outbox().ready("h", "boot", new java.util.HashSet<>(Arrays.asList("t1", "t2")));
+            drafts.setHost("h");
             drafts.switchTo("t1");
         }
 
@@ -184,7 +187,7 @@ public final class ClearUndoTest {
             // ComposerBar.setPane for the first pane after the start.
             String previous = w.drafts.pane();
             w.drafts.switchTo("t1");
-            if (c.endsOnPaneChange(previous, "t1")) c.commit();
+            if (c.endsOnPaneChange(previous, T1)) c.commit();
             c.reconcile(now());
             return new Restarted(w, c);
         }
@@ -213,14 +216,14 @@ public final class ClearUndoTest {
         w.add("queued");
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        clear.tap("t1", true, t);
+        clear.tap(T1, true, t);
         assertEquals("", w.drafts.text());
         assertEquals(1, w.cancelled);
         assertEquals("the queue is untouched by one tap", 1, w.queue().size());
         assertTrue(clear.open(t + ClearUndo.DRAFT_WINDOW_MS - 1));
         assertEquals("cleared · undo", clear.label(false));
         assertEquals("undo", clear.label(true));
-        assertTrue(clear.undo(t + 1000));
+        assertTrue(clear.undo(T1, t + 1000));
         assertEquals("half a thought", w.drafts.text());
         assertEquals("the cancelled dictation is not brought back", 1, w.cancelled);
         assertFalse(w.dictating);
@@ -237,14 +240,14 @@ public final class ClearUndoTest {
         assertTrue(w.courier.outbox().sending(s.id));
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        clear.tap("t1", true, t);
-        clear.tap("t1", true, t + 2000);
+        clear.tap(T1, true, t);
+        clear.tap(T1, true, t + 2000);
         assertEquals(ClearUndo.Level.QUEUE, clear.level());
         assertEquals(Collections.singletonList("going"), w.queue());
         assertEquals("cleared 3 · undo", clear.label(false));
         // The longer window, from the second tap.
         assertTrue(clear.open(t + 2000 + ClearUndo.QUEUE_WINDOW_MS - 1));
-        assertTrue(clear.undo(t + 5000));
+        assertTrue(clear.undo(T1, t + 5000));
         assertEquals("draft", w.drafts.text());
         assertEquals(Arrays.asList("going", "one", "unsure"), w.queue());
     }
@@ -254,7 +257,7 @@ public final class ClearUndoTest {
         w.drafts.edit("d");
         w.add("x");
         ClearUndo clear = new ClearUndo(w);
-        clear.longPress("t1", now());
+        clear.longPress(T1, now());
         assertEquals("", w.drafts.text());
         assertTrue(w.queue().isEmpty());
         assertEquals(ClearUndo.Level.QUEUE, clear.level());
@@ -263,7 +266,7 @@ public final class ClearUndoTest {
     @Test public void withNothingInTheDraftATapClearsTheQueue() {
         World w = new World();
         w.add("x");
-        new ClearUndo(w).tap("t1", false, now());
+        new ClearUndo(w).tap(T1, false, now());
         assertTrue(w.queue().isEmpty());
     }
 
@@ -275,11 +278,11 @@ public final class ClearUndoTest {
         w.loose.add("parked1");
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        clear.tap("t1", true, t);
+        clear.tap(T1, true, t);
         assertEquals(new LinkedHashSet<>(Collections.singletonList("d1")), w.clips.held);
-        clear.tap("t1", true, t + 100);
+        clear.tap(T1, true, t + 100);
         assertEquals(new LinkedHashSet<>(Arrays.asList("d1", "q1", "l1", "parked1")), w.clips.held);
-        assertTrue(clear.undo(t + 200));
+        assertTrue(clear.undo(T1, t + 200));
         assertTrue("all released", w.clips.held.isEmpty());
     }
 
@@ -289,10 +292,10 @@ public final class ClearUndoTest {
         w.add("cleared message");
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        clear.longPress("t1", t);
+        clear.longPress(T1, t);
         clear.expire(t + ClearUndo.QUEUE_WINDOW_MS);
         assertFalse(clear.open(t + ClearUndo.QUEUE_WINDOW_MS));
-        assertFalse(clear.undo(t + ClearUndo.QUEUE_WINDOW_MS + 1));
+        assertFalse(clear.undo(T1, t + ClearUndo.QUEUE_WINDOW_MS + 1));
         assertEquals("", w.drafts.text());
         assertTrue(w.queue().isEmpty());
         assertEquals("the message went for good", 0, w.courier.outbox().waiting("h"));
@@ -300,7 +303,7 @@ public final class ClearUndoTest {
         // A tap after the window starts over: the draft level, not the queue.
         w.drafts.edit("new");
         w.add("x");
-        clear.tap("t1", true, t + ClearUndo.QUEUE_WINDOW_MS + 10);
+        clear.tap(T1, true, t + ClearUndo.QUEUE_WINDOW_MS + 10);
         assertEquals(ClearUndo.Level.DRAFT, clear.level());
         assertEquals(1, w.queue().size());
     }
@@ -310,14 +313,14 @@ public final class ClearUndoTest {
         w.drafts.edit("on t1");
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        clear.tap("t1", true, t);
+        clear.tap(T1, true, t);
         w.drafts.switchTo("t2");
         w.drafts.edit("on t2");
         w.courier.add("h", "t2", "x");
-        clear.tap("t2", true, t + 100);
+        clear.tap(T2, true, t + 100);
         assertEquals("a second tap elsewhere is not the queue's", ClearUndo.Level.DRAFT, clear.level());
         assertEquals(1, w.courier.outbox().shown("h", "t2", now()).size());
-        assertTrue(clear.undo(t + 200));
+        assertTrue(clear.undo(T2, t + 200));
         assertEquals("on t2", w.drafts.text());
     }
 
@@ -326,11 +329,11 @@ public final class ClearUndoTest {
         Outbox.Message m = w.add("dropped " + DictationToken.of("c1"));
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        assertTrue(clear.dropped("t1", m.id, null, t));
+        assertTrue(clear.dropped(T1, m.id, null, t));
         assertTrue(w.queue().isEmpty());
         assertTrue(w.clips.held.contains("c1"));
         assertEquals("dropped · undo", clear.label(false));
-        assertTrue(clear.undo(t + 10));
+        assertTrue(clear.undo(T1, t + 10));
         assertEquals(Collections.singletonList(m.text), w.queue());
         assertTrue(w.clips.held.isEmpty());
     }
@@ -339,9 +342,9 @@ public final class ClearUndoTest {
         World w = new World();
         ClearUndo clear = new ClearUndo(w);
         long t = now();
-        assertTrue(clear.dropped("t1", null, "p1", t));
+        assertTrue(clear.dropped(T1, null, "p1", t));
         assertEquals(Collections.singleton("p1"), w.clips.held);
-        assertTrue(clear.undo(t + 10));
+        assertTrue(clear.undo(T1, t + 10));
         assertTrue(w.clips.held.isEmpty());
     }
 
@@ -352,12 +355,19 @@ public final class ClearUndoTest {
         w.drafts.edit("my draft");
         w.add("first");
         w.add("second");
-        new ClearUndo(w).longPress("t1", now());
+        new ClearUndo(w).longPress(T1, now());
         Restarted r = w.restart();
-        assertTrue("the first pane after the start keeps the undo", r.c.open(now()));
+        String otherOwner = ComposerDrafts.key("other-host", "t1");
+        r.w.drafts.setHost("other-host");
+        r.w.drafts.edit("other host draft");
+        assertFalse(r.c.open(otherOwner, now()));
+        assertFalse(r.c.undo(otherOwner, now()));
+        assertEquals("other host draft", r.w.drafts.text());
+        r.w.drafts.setHost("h");
+        assertTrue("the owning pane keeps the undo across restart", r.c.open(T1, now()));
         assertTrue("nothing cleared is shown", r.w.queue().isEmpty());
         assertNull("or sent", r.w.courier.outbox().next("h", now()));
-        assertTrue(r.c.undo(now()));
+        assertTrue(r.c.undo(T1, now()));
         assertEquals("my draft", r.w.drafts.text());
         assertEquals(Arrays.asList("first", "second"), r.w.queue());
     }
@@ -366,10 +376,10 @@ public final class ClearUndoTest {
         World w = new World();
         w.drafts.edit("my draft");
         ClearUndo c = new ClearUndo(w);
-        c.tap("t1", true, now());
-        assertFalse(c.endsOnPaneChange("", "t1"));
-        assertFalse(c.endsOnPaneChange("t2", "t1"));
-        assertTrue(c.endsOnPaneChange("t1", "t2"));
+        c.tap(T1, true, now());
+        assertFalse(c.endsOnPaneChange("", T1));
+        assertFalse(c.endsOnPaneChange(T2, T1));
+        assertTrue(c.endsOnPaneChange(T1, T2));
     }
 
     @Test public void aRestartPastTheWindowFinishesTheClear() {
@@ -377,7 +387,7 @@ public final class ClearUndoTest {
         w.drafts.edit("my draft");
         w.add("first");
         long t = now() - ClearUndo.QUEUE_WINDOW_MS - 1;
-        new ClearUndo(w).longPress("t1", t);
+        new ClearUndo(w).longPress(T1, t);
         Restarted r = w.restart();
         assertFalse(r.c.open(now()));
         assertEquals("", r.w.drafts.text());
@@ -393,7 +403,7 @@ public final class ClearUndoTest {
         Outbox.Message m = w.add("must not send");
         Outbox.Message picked = w.courier.outbox().next("h", now());
         assertEquals(m.id, picked.id);
-        new ClearUndo(w).tap("t1", false, now());
+        new ClearUndo(w).tap(T1, false, now());
         assertNull(w.courier.outbox().next("h", now()));
         assertFalse("the sender's pick is refused at dispatch", w.courier.outbox().sending(picked.id));
     }
@@ -406,10 +416,10 @@ public final class ClearUndoTest {
         w.add("queued " + DictationToken.of("q1"));
         ClearUndo c = new ClearUndo(w);
         long t = now();
-        c.tap("t1", true, t);
+        c.tap(T1, true, t);
         w.crashAfter = "messages";
         try {
-            c.tap("t1", true, t + 100);
+            c.tap(T1, true, t + 100);
             fail("killed");
         } catch (Crash expected) {
         }
@@ -418,7 +428,7 @@ public final class ClearUndoTest {
         assertNull("or sent", r.w.courier.outbox().next("h", now()));
         assertTrue("its recording stays held", r.w.clips.held.contains("q1"));
         assertTrue("the undo is on offer", r.c.open(now()));
-        assertTrue(r.c.undo(now()));
+        assertTrue(r.c.undo(T1, now()));
         assertEquals(Collections.singletonList("queued " + DictationToken.of("q1")), r.w.queue());
         assertEquals("draft", r.w.drafts.text());
         assertTrue("its recording waits again", r.w.clips.held.isEmpty());
@@ -432,7 +442,7 @@ public final class ClearUndoTest {
         w.add("and " + DictationToken.of("q1"));
         w.crashAfter = "hold";
         try {
-            new ClearUndo(w).longPress("t1", now());
+            new ClearUndo(w).longPress(T1, now());
             fail("killed");
         } catch (Crash expected) {
         }
@@ -450,10 +460,10 @@ public final class ClearUndoTest {
         w.add("and " + DictationToken.of("q1"));
         ClearUndo c = new ClearUndo(w);
         long t = now();
-        c.tap("t1", true, t);
+        c.tap(T1, true, t);
         w.crashAfter = "hold";
         try {
-            c.tap("t1", true, t + 100);
+            c.tap(T1, true, t + 100);
             fail("killed");
         } catch (Crash expected) {
         }
@@ -462,7 +472,7 @@ public final class ClearUndoTest {
         assertTrue(r.w.clips.held.isEmpty());
         // The draft's clear, saved before, is still undoable.
         assertTrue(r.c.open(now()));
-        assertTrue(r.c.undo(now()));
+        assertTrue(r.c.undo(T1, now()));
         assertEquals("draft", r.w.drafts.text());
     }
 
@@ -470,7 +480,7 @@ public final class ClearUndoTest {
         World w = new World();
         w.crashAfter = "hold";
         try {
-            new ClearUndo(w).dropped("t1", null, "loose1", now());
+            new ClearUndo(w).dropped(T1, null, "loose1", now());
             fail("killed");
         } catch (Crash expected) {
         }
@@ -487,10 +497,10 @@ public final class ClearUndoTest {
         w.add("queued");
         long t = now() - ClearUndo.QUEUE_WINDOW_MS - 1000;
         ClearUndo c = new ClearUndo(w);
-        c.longPress("t1", t);
+        c.longPress(T1, t);
         w.crashAfter = "persist:undone";
         try {
-            c.undo(t + 100);
+            c.undo(T1, t + 100);
             fail("killed");
         } catch (Crash expected) {
         }
@@ -505,10 +515,10 @@ public final class ClearUndoTest {
         w.add("queued " + DictationToken.of("q1"));
         ClearUndo c = new ClearUndo(w);
         long t = now();
-        c.longPress("t1", t);
+        c.longPress(T1, t);
         w.crashAfter = "persist:undone";
         try {
-            c.undo(t + 100);
+            c.undo(T1, t + 100);
             fail("killed");
         } catch (Crash expected) {
         }
@@ -527,14 +537,14 @@ public final class ClearUndoTest {
         w.drafts.edit("draft");
         ClearUndo c = new ClearUndo(w);
         long t = now();
-        c.tap("t1", true, t);
+        c.tap(T1, true, t);
         w.failPersist = true;
-        assertFalse(c.undo(t + 100));
+        assertFalse(c.undo(T1, t + 100));
         assertTrue("still on offer", c.open(t + 100));
         assertEquals("", w.drafts.text());
         assertEquals(1, w.notices.size());
         w.failPersist = false;
-        assertTrue(c.undo(t + 200));
+        assertTrue(c.undo(T1, t + 200));
         assertEquals("draft", w.drafts.text());
     }
 
@@ -543,9 +553,9 @@ public final class ClearUndoTest {
         w.add("queued");
         ClearUndo c = new ClearUndo(w);
         long t = now();
-        c.tap("t1", false, t);
+        c.tap(T1, false, t);
         w.failUnclear = true;
-        assertTrue("the draft is saved: the undo is done", c.undo(t + 100));
+        assertTrue("the draft is saved: the undo is done", c.undo(T1, t + 100));
         assertEquals("back at once", 1, w.queue().size());
         assertTrue("its record stays", c.restoring());
         assertTrue(w.retries > 0);
@@ -561,13 +571,13 @@ public final class ClearUndoTest {
         w.drafts.edit("see " + DictationToken.of("d1"));
         ClearUndo c = new ClearUndo(w);
         long t = now();
-        c.tap("t1", true, t);
+        c.tap(T1, true, t);
         w.clips.failRelease = true;
-        assertTrue(c.undo(t + 100));
+        assertTrue(c.undo(T1, t + 100));
         assertTrue(w.clips.held.contains("d1"));
         assertTrue(c.restoring());
         // A new clear waits for it.
-        c.tap("t1", true, t + 200);
+        c.tap(T1, true, t + 200);
         assertEquals("see " + DictationToken.of("d1"), w.drafts.text());
         assertFalse(w.notices.isEmpty());
         w.clips.failRelease = false;
@@ -581,7 +591,7 @@ public final class ClearUndoTest {
         w.drafts.edit("see " + DictationToken.of("d1"));
         w.clips.failHold = true;
         ClearUndo clear = new ClearUndo(w);
-        clear.tap("t1", true, now());
+        clear.tap(T1, true, now());
         assertEquals("nothing cleared", "see " + DictationToken.of("d1"), w.drafts.text());
         assertTrue(w.clips.held.isEmpty());
         assertFalse(clear.open(now()));
@@ -592,7 +602,7 @@ public final class ClearUndoTest {
         World w = new World();
         w.add("and " + DictationToken.of("q1"));
         w.clips.failHold = true;
-        new ClearUndo(w).longPress("t1", now());
+        new ClearUndo(w).longPress(T1, now());
         assertEquals(1, w.queue().size());
         assertTrue(w.clips.held.isEmpty());
         assertFalse(w.notices.isEmpty());
@@ -605,7 +615,7 @@ public final class ClearUndoTest {
         w.failPersist = true;
         w.clips.failRelease = true;
         ClearUndo clear = new ClearUndo(w);
-        clear.longPress("t1", now());
+        clear.longPress(T1, now());
         assertEquals("d " + DictationToken.of("d1"), w.drafts.text());
         assertEquals(1, w.queue().size());
         assertFalse(clear.open(now()));

@@ -7,6 +7,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.view.ContentInfo;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -113,10 +114,13 @@ final class ComposerBar {
         /** Image files already copied to the cache: put them, then delete them. */
         default void attachFiles(java.util.List<java.io.File> files) { }
         /**
-         * Images a paste or keyboard handed over. The host reads them off the UI thread and must keep
-         * {@code keepAlive} (the payload carrying their permission) referenced until it is done.
+         * Classifies the payload off the UI thread, then gives unhandled items back on the UI
+         * thread. Returns whether it took the payload.
          */
-        default void attachPasted(java.util.List<android.net.Uri> uris, Object keepAlive) { }
+        @android.annotation.TargetApi(31)
+        default boolean attachPasted(ContentInfo payload, java.util.function.Consumer<ContentInfo> unhandled) {
+            return false;
+        }
     }
 
     private static final String PREFS = "terminal-display";
@@ -496,7 +500,15 @@ final class ComposerBar {
      */
     boolean persistNow() {
         field.removeCallbacks(saveDrafts);
-        return preferences.edit().putString(DRAFTS, drafts.encode()).commit();
+        return commitDrafts(drafts.encode());
+    }
+
+    private boolean commitDrafts(String encoded) {
+        String previous = preferences.getString(DRAFTS, "");
+        if (preferences.edit().putString(DRAFTS, encoded).commit()) return true;
+        // A failed commit can leave the new value in SharedPreferences' in-memory cache.
+        preferences.edit().putString(DRAFTS, previous).apply();
+        return false;
     }
 
     /** Where the drawn screen is busy, from the renderer after a paint that changed it. */
@@ -587,6 +599,7 @@ final class ComposerBar {
      */
     void setPane(String hostId, String paneId, String paneKind) {
         String previous = drafts.pane();
+        String previousOwner = drafts.owner();
         String onHost = hostId == null ? "" : hostId;
         // A pane id names a terminal on one computer only: the same id on another is another pane.
         boolean switched = !onHost.equals(drafts.host()) || !previous.equals(paneId == null ? "" : paneId);
@@ -603,12 +616,12 @@ final class ComposerBar {
             routing.forget();
             drafts.dictationEnded();
         }
-        drafts.setHost(onHost);
+        if (!drafts.setHost(onHost, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);
         if (switched) {
             // An undo belongs to the pane it cleared; the rows to the pane on screen. The first
             // pane after a start is no switch: a clear resumed from before it stays on offer.
-            if (clearing.endsOnPaneChange(previous, drafts.pane())) clearing.commit();
+            if (clearing.endsOnPaneChange(previousOwner, drafts.owner())) clearing.commit();
             queueOpen = false;
             selectedRow = null;
             transcribedOnPhone = false;
@@ -1010,7 +1023,7 @@ final class ComposerBar {
             case "send": enter(); break;
             case "clear": tapClear(false); break;
             case "undo":
-                clearing.undo(wall());
+                clearing.undo(drafts.owner(), wall());
                 pushGhost();
                 scheduleQueueRefresh();
                 break;
@@ -1077,7 +1090,7 @@ final class ComposerBar {
         in.expanded = queueOpen;
         in.attach = host.canAttach();
         in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
-        if (clearing.open(wall()) && clearing.pane().equals(drafts.pane())) {
+        if (clearing.open(drafts.owner(), wall())) {
             in.undoWide = clearing.label(false);
             in.undoNarrow = clearing.label(true);
         }
@@ -1148,8 +1161,8 @@ final class ComposerBar {
     private void tapClear(boolean longPress) {
         long now = wall();
         boolean draftClearable = !drafts.text().trim().isEmpty() || dictating();
-        if (longPress) clearing.longPress(drafts.pane(), now);
-        else clearing.tap(drafts.pane(), draftClearable, now);
+        if (longPress) clearing.longPress(drafts.owner(), now);
+        else clearing.tap(drafts.owner(), draftClearable, now);
         selectedRow = null;
         pushGhost();
         scheduleQueueRefresh();
@@ -1222,9 +1235,9 @@ final class ComposerBar {
             }
             case "row-drop":
                 if (r.kind == QueueView.Kind.CLIP || r.kind == QueueView.Kind.PARKED) {
-                    clearing.dropped(drafts.pane(), null, r.id, now);
+                    clearing.dropped(drafts.owner(), null, r.id, now);
                 } else if (r.kind == QueueView.Kind.MESSAGE) {
-                    clearing.dropped(drafts.pane(), r.id, null, now);
+                    clearing.dropped(drafts.owner(), r.id, null, now);
                 }
                 break;
             default:
@@ -1481,34 +1494,25 @@ final class ComposerBar {
 
     /**
      * An image a keyboard inserts or a paste carries is attached; everything else (text, document
-     * URIs) is handed back to the field so a normal paste works. No I/O happens here: the clip's
-     * URIs go to {@link Host#attachPasted} with the payload itself, which the host keeps referenced
-     * (a keyboard's temporary grant lives with it) until its worker has opened and checked them.
-     * The eight-image cap applies before anything is copied.
+     * URIs) is handed back to the field. Even MIME lookup can start or block on a provider, so
+     * the host partitions URI-bearing clips on its worker, with the original payload's grant.
      */
     @android.annotation.TargetApi(31)
     private void listenForImages(EditText edit) {
         edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
             android.content.ClipData clip = payload.getClip();
-            // Only a clip that says it holds images is ours; a text or document URI is a normal paste.
             if (!clip.getDescription().hasMimeType("image/*")) return payload;
-            java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
-            android.content.ClipData rest = null;
             for (int i = 0; i < clip.getItemCount(); i++) {
-                android.content.ClipData.Item item = clip.getItemAt(i);
-                boolean uriOnly = item.getUri() != null && item.getText() == null && item.getHtmlText() == null
-                        && item.getIntent() == null;
-                if (uriOnly) {
-                    if (uris.size() < ImageAttach.MAX_IMAGES) uris.add(item.getUri());
-                } else if (rest == null) {
-                    rest = new android.content.ClipData(clip.getDescription(), item);
-                } else {
-                    rest.addItem(item);
-                }
+                if (!AttachImages.isPastedUri(clip.getItemAt(i))) continue;
+                String owner = drafts.owner();
+                boolean accepted = host.attachPasted(payload, rest -> {
+                    if (edit.isAttachedToWindow() && owner.equals(drafts.owner())) {
+                        edit.onReceiveContent(rest);
+                    }
+                });
+                return accepted ? null : payload;
             }
-            if (!uris.isEmpty()) host.attachPasted(uris, payload);
-            if (rest == null) return null;
-            return new android.view.ContentInfo.Builder(payload).setClip(rest).build();
+            return payload;
         });
     }
 
