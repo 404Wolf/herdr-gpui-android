@@ -39,6 +39,57 @@
       # The pinned toolchain (with clippy and rustfmt) and the native libraries
       # GPUI's Linux backend builds against, shared by the package and the CI shell.
       toolchainFor = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      androidEmuShell =
+        pkgs:
+        let
+          androidPkgs = import nixpkgs {
+            inherit (pkgs.stdenv.hostPlatform) system;
+            config = {
+              allowUnfree = true;
+              android_sdk.accept_license = true;
+            };
+          };
+          repo = lib.importJSON "${nixpkgs}/pkgs/development/mobile/androidenv/repo.json";
+          ndkVersion = "28.0.13004108";
+          sdk = androidPkgs.androidenv.composeAndroidPackages {
+            # Gradle compiles against 36, while the AVD boots 34.
+            repo = repo // {
+              images."34" = repo.images."34";
+            };
+            platformVersions = [
+              "34"
+              "36"
+            ];
+            buildToolsVersions = [ "35.0.0" ];
+            includeNDK = true;
+            inherit ndkVersion;
+            includeEmulator = true;
+            emulatorVersion = "37.1.11";
+            includeSystemImages = true;
+            systemImageTypes = [ "google_apis" ];
+            abiVersions = [ "x86_64" ];
+            includeCmake = false;
+            toolsVersion = null;
+          };
+          inherit (sdk) androidsdk;
+          sdkRoot = "${androidsdk}/libexec/android-sdk";
+        in
+        pkgs.mkShell {
+          name = "herdr-gpui-android-emu";
+          packages = [
+            ((toolchainFor pkgs).override { targets = [ "x86_64-linux-android" ]; })
+            androidsdk
+            pkgs.jdk17
+            pkgs.git
+            pkgs.pkg-config
+            pkgs.python3
+            pkgs.socat
+          ];
+          ANDROID_HOME = sdkRoot;
+          ANDROID_SDK_ROOT = sdkRoot;
+          ANDROID_NDK_HOME = "${sdkRoot}/ndk/${ndkVersion}";
+          JAVA_HOME = pkgs.jdk17.home;
+        };
       rustPlatformFor =
         pkgs:
         let
@@ -131,21 +182,27 @@
       # Host-side Rust only, for jobs run off this machine (lease-run/jobrun use
       # `nix develop .#ci`): clippy and the tests of the android-gpui and
       # android-remote workspaces. No Android SDK, NDK or JDK, and no secrets.
-      devShells = forAllSystems (pkgs: {
-        ci = pkgs.mkShell {
-          name = "herdr-gpui-android-ci";
-          packages = [
-            (toolchainFor pkgs)
-            pkgs.pkg-config
-            # Tests drive real repositories and worktrees.
-            pkgs.git
-          ];
-          nativeBuildInputs = [ (rustPlatformFor pkgs).bindgenHook ];
-          buildInputs = buildLibrariesFor pkgs;
-          # Tests that need git fail here instead of skipping themselves.
-          HERDR_TESTS_REQUIRE_GIT = "1";
-        };
-      });
+      devShells = forAllSystems (
+        pkgs:
+        {
+          ci = pkgs.mkShell {
+            name = "herdr-gpui-android-ci";
+            packages = [
+              (toolchainFor pkgs)
+              pkgs.pkg-config
+              # Tests drive real repositories and worktrees.
+              pkgs.git
+            ];
+            nativeBuildInputs = [ (rustPlatformFor pkgs).bindgenHook ];
+            buildInputs = buildLibrariesFor pkgs;
+            # Tests that need git fail here instead of skipping themselves.
+            HERDR_TESTS_REQUIRE_GIT = "1";
+          };
+        }
+        // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+          android-emu = androidEmuShell pkgs;
+        }
+      );
       overlays.default = final: _prev: {
         herdr-gpui = self.packages.${final.stdenv.hostPlatform.system}.default;
       };

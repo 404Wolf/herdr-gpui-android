@@ -1,6 +1,7 @@
 /target/
 /android-gpui/target/
 /dist/
+/emu-out/
 .DS_Store
 
 # Generated from git history at release time; never tracked.
