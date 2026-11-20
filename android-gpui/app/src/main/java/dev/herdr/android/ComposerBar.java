@@ -57,6 +57,21 @@ final class ComposerBar {
          * is up, or through the outbox when it is not. False keeps the draft.
          */
         boolean send(String text);
+        /**
+         * Step 2 of the Send handoff ({@link SendHandoff}): holds {@code text} under submission
+         * {@code id} durably, then acts on it (typed at once in the live pane, or kept). False
+         * when it was not held: the draft stays.
+         */
+        default boolean send(String text, String id) { return send(text); }
+        /**
+         * Step 4 of the Send handoff: message {@code id}, held by {@link #send(String, String)},
+         * may now be acted on (typed at once when its pane is live): its draft's clear is on disk.
+         */
+        default void act(String id) { }
+        /** Whether the held message {@code id} can be taken back for editing (not being sent). */
+        default boolean queuedEditable(String id) { return queuedText(id) != null; }
+        /** Whether submission {@code id} was ever held (it is, or it left after being held). */
+        default boolean queuedKnown(String id) { return queuedText(id) != null; }
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
@@ -374,7 +389,8 @@ final class ComposerBar {
         this.host = host;
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        drafts.restore(preferences.getString(DRAFTS, ""));
+        drafts.restoreOffered(preferences.getString(DRAFTS, ""));
+        handoff = SendHandoff.Record.decode(preferences.getString(SendHandoff.KEY, ""));
         // A clear made before a restart: its undo is still on offer within its window.
         clearing.resume(preferences.getString(CLEAR_RECORD, ""), wall());
         field = createField();
@@ -507,6 +523,43 @@ final class ComposerBar {
         return commitDrafts(drafts.encode());
     }
 
+    /** A Send that had not finished when the app last stopped; settled once the outbox is read. */
+    private SendHandoff.Record handoff;
+
+    /**
+     * Settles a Send the app stopped in the middle of (§3.2): its message held, the draft that
+     * still holds its text is cleared; not held, the draft stays and says so. Main thread, once
+     * the outbox has been read.
+     */
+    private void settleHandoff() {
+        SendHandoff.Record record = handoff;
+        if (record == null || !host.outboxLoaded()) return;
+        handoff = null;
+        SendHandoff.Recovery recovery = SendHandoff.reconcile(record, host::queuedKnown);
+        if (recovery == SendHandoff.Recovery.CLEAR_DRAFT && drafts.removeSent(record.owner, record.text)) {
+            showText(drafts.text());
+        } else if (recovery == SendHandoff.Recovery.OFFER_AGAIN) {
+            host.notice(SendHandoff.NOT_SENT);
+        }
+        preferences.edit().putString(DRAFTS, drafts.encode()).remove(SendHandoff.KEY).commit();
+    }
+
+    /** The draft found on disk at start for the pane on screen, offered but not loaded; or null. */
+    ComposerDrafts.Draft offeredDraft() {
+        return drafts.offered();
+    }
+
+    /** The user took the offered draft: it is in the composer now. */
+    void acceptOfferedDraft() {
+        String text = drafts.acceptOffered();
+        if (text == null) {
+            host.notice("Finish the dictation first; the earlier draft stays offered");
+            return;
+        }
+        showText(text);
+        saveDraftsSoon();
+    }
+
     private boolean commitDrafts(String encoded) {
         String previous = preferences.getString(DRAFTS, "");
         if (preferences.edit().putString(DRAFTS, encoded).commit()) return true;
@@ -536,6 +589,7 @@ final class ComposerBar {
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
     void showQueued(List<Outbox.Message> messages) {
         queuedMessages = messages;
+        settleHandoff();
         queue.update(drafts.pane(), messages, android.os.SystemClock.uptimeMillis());
         // The outbox changed (or was just read from disk): an interrupted clear or undo is put right.
         clearing.reconcile(wall());
@@ -550,11 +604,48 @@ final class ComposerBar {
         pushGhost();
     }
 
+    /**
+     * "Edit as draft" on held message {@code id}: its text joins this pane's draft, committed to
+     * disk, before the message leaves the outbox ({@link HeldEdit}). False when nothing changed.
+     */
+    boolean editHeld(String id) {
+        Object[] before = new Object[1];
+        HeldEdit.Result result = HeldEdit.run(id, new HeldEdit.Steps() {
+            @Override public String text(String which) {
+                return host.queuedEditable(which) ? host.queuedText(which) : null;
+            }
+
+            @Override public boolean fits(String text) {
+                return ComposerDrafts.fits(drafts.text(), text);
+            }
+
+            @Override public boolean commitDraft(String text) {
+                before[0] = drafts.snapshot();
+                takeBack(text);
+                return persistNow();
+            }
+
+            @Override public boolean take(String which) {
+                return host.takeQueued(which) != null;
+            }
+
+            @Override public void rollback() {
+                drafts.rollback(before[0]);
+                showText(drafts.text());
+                persistNow();
+            }
+        });
+        if (result == HeldEdit.Result.DRAFT_NOT_SAVED) host.notice("Could not save the draft; the message stays held");
+        if (result == HeldEdit.Result.TOO_LONG) {
+            host.notice("The draft is too long to take this message in; it stays held. Send or shorten the draft first");
+        }
+        return result == HeldEdit.Result.EDITED;
+    }
+
     /** A queued message taken back: its text joins the draft, on a line of its own. */
     void takeBack(String text) {
         if (text == null || text.isEmpty()) return;
-        String draft = drafts.text();
-        String joined = draft.trim().isEmpty() ? text : draft.replaceAll("\\s+$", "") + "\n" + text;
+        String joined = ComposerDrafts.joinedBack(drafts.text(), text);
         drafts.edit(joined);
         showText(joined);
     }
@@ -1245,12 +1336,10 @@ final class ComposerBar {
                 Dictation.pending(context).retry(r.id);
                 host.notice("Sending the recording to the desktop again");
                 break;
-            case "row-edit": {
+            case "row-edit":
                 queue.forget(r.id);
-                String text = host.takeQueued(r.id);
-                if (text != null) takeBack(text);
+                editHeld(r.id);
                 break;
-            }
             case "row-drop":
                 if (r.kind == QueueView.Kind.CLIP || r.kind == QueueView.Kind.PARKED) {
                     clearing.dropped(drafts.owner(), null, r.id, now);
@@ -1648,9 +1737,42 @@ final class ComposerBar {
             host.enterKey();
             return;
         }
-        // The draft stays until the message is queued or kept, so nothing is lost.
-        if (!host.send(outgoing)) return;
-        drafts.sent();
+        // The durable handoff (§3.2): the exact text is on disk as a draft or as a held
+        // message at every moment, never both and never neither.
+        SendHandoff.Record record = new SendHandoff.Record(java.util.UUID.randomUUID().toString(),
+                drafts.owner().isEmpty() ? drafts.pane() : drafts.owner(), outgoing);
+        SendHandoff.Result result = SendHandoff.run(record, new SendHandoff.Steps() {
+            @Override public boolean commitDraft(SendHandoff.Record r) {
+                field.removeCallbacks(saveDrafts);
+                return preferences.edit().putString(DRAFTS, drafts.encode())
+                        .putString(SendHandoff.KEY, r.encode()).commit();
+            }
+
+            @Override public boolean holdMessage(SendHandoff.Record r) {
+                return host.send(r.text, r.id);
+            }
+
+            @Override public boolean clearDraft(SendHandoff.Record r) {
+                drafts.sent();
+                return preferences.edit().putString(DRAFTS, drafts.encode()).remove(SendHandoff.KEY).commit();
+            }
+
+            @Override public void forget(SendHandoff.Record r) {
+                preferences.edit().remove(SendHandoff.KEY).commit();
+            }
+
+            @Override public void act(SendHandoff.Record r) {
+                host.act(r.id);
+            }
+        });
+        if (result == SendHandoff.Result.HELD_DRAFT_STALE) {
+            host.notice("Held, but the draft could not be cleared on disk; tap Send here to type it");
+        }
+        if (result == SendHandoff.Result.DRAFT_NOT_SAVED) {
+            host.notice("Could not save the draft; nothing was sent");
+            return;
+        }
+        if (result == SendHandoff.Result.NOT_HELD) return;
         transcribedOnPhone = false;
         nothingHeard = null;
         showText("");

@@ -284,7 +284,7 @@ public final class NativeInputTest {
     @Test public void wolfAsk1_aQueuedRowsPreviewKeepsAnEmojiWhole() throws Exception {
         // Review of #34 (r3, P3): at 24 columns the preview is cut before the heart, not inside it.
         QueueView.Row row = new QueueView.Row("m1", QueueView.Kind.MESSAGE, "❯ aaaaaaaaaaa❤️bbbbbbbbbbbbbbbbbbbb",
-                "queued", "tag", true, Outbox.State.QUEUED);
+                "queued", "tag", true, Outbox.State.PENDING);
         org.json.JSONArray drawn = GhostText.row(row, false, false, 24, java.util.Collections.<String, Long>emptyMap(),
                 java.util.Collections.<String>emptySet());
         String text = drawn.getJSONObject(0).getString("t");

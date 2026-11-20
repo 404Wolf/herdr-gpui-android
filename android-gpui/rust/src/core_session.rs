@@ -107,6 +107,9 @@ struct Connection<'a> {
     automatic_input: bool,
     /// What this viewer told the core about Wolf using it (item 71).
     focus: Focus,
+    /// The attached stream has delivered output since its attach: the view
+    /// says `painted`, and only then may a held message be sent into it.
+    painted: bool,
 }
 
 /// Item 71, latest-touched device wins: with a core whose hello offers
@@ -406,6 +409,10 @@ impl Connection<'_> {
             match frame.kind {
                 0 => {
                     self.owner.heard.printed(frame.bytes.len());
+                    if !self.painted && self.output.is_some() {
+                        self.painted = true;
+                        lock(&self.owner.state).painted = true;
+                    }
                     if let Some(output) = &self.output {
                         // 256 KiB starting credit bounds this queue. Credit is returned
                         // only as Rio consumes bytes, never when the network receives them.
@@ -437,6 +444,7 @@ impl Connection<'_> {
                         json!("Terminal stream ended; select a terminal to attach again");
                     state.terminal = None;
                     state.render_id = 0;
+                    state.painted = false;
                     bump(&mut state.view);
                     drop(state);
                     // Attached again by the session loop, at most once per
@@ -536,21 +544,39 @@ impl Connection<'_> {
                     }
                     .to_string());
                 }
-                Some(TabEdit::Deliver { terminal, text }) => {
-                    // The outbox's send: never forced, and the reply says
-                    // whether the text was typed, refused, or cannot be known.
-                    let sent = self.call_within(
-                        "terminal.send",
-                        json!({"terminal":terminal,"text":text}),
-                        DELIVER_WAIT,
-                    );
-                    return Ok(delivery(&sent).to_string());
-                }
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
                 None => return Err(Error::StaleTarget),
             },
         }
         Ok(json!({"queued":true}).to_string())
+    }
+    /// A held message, typed into the attach it was tapped over and nowhere
+    /// else: every part goes on that attach's channel, in order, or the
+    /// reply says how far it got. Answered before a write error ends the
+    /// session, so the phone never reads a lost reply as "nothing typed".
+    fn compose(
+        &mut self,
+        compose: crate::remote::Compose,
+        reply: &mpsc::SyncSender<crate::remote::Typed>,
+    ) -> Result<()> {
+        use crate::remote::Typed;
+        let current = self.channel != 0
+            && self.output.is_some()
+            && self.painted
+            && lock(&self.owner.state).render_id == compose.attach;
+        if !current {
+            let _ = reply.send(Typed::Unwritten);
+            return Ok(());
+        }
+        for part in &compose.parts {
+            if let Err(error) = write_frame(&mut self.socket, self.channel, DATA, part) {
+                // Some of it may have left: the paste may sit unsent in the input box.
+                let _ = reply.send(Typed::Unsure);
+                return Err(error);
+            }
+        }
+        let _ = reply.send(Typed::Written);
+        Ok(())
     }
     /// `terminal.put`: the file lands beside the terminal on its machine, in a
     /// folder of the terminal's own, for its program to read; nothing is typed.
@@ -961,8 +987,7 @@ impl Connection<'_> {
             TabEdit::GitLook { .. }
             | TabEdit::FileRead { .. }
             | TabEdit::SpaceOpen { .. }
-            | TabEdit::Send { .. }
-            | TabEdit::Deliver { .. } => {
+            | TabEdit::Send { .. } => {
                 Err(Error::StaleTarget)
             }
             TabEdit::ToSpace { space, tab, to } => {
@@ -1072,6 +1097,7 @@ impl Connection<'_> {
                 }
             }
             state.render_id = 0;
+            state.painted = false;
             state.view["state"] = json!("connecting");
             bump(&mut state.view);
         }
@@ -1175,9 +1201,11 @@ impl Connection<'_> {
         crate::remote::release_held();
         self.channel = channel;
         self.output = Some(tx);
+        self.painted = false;
         let mut state = lock(&self.owner.state);
         state.terminal = Some(terminal_session);
         state.render_id = NEXT_RENDER.fetch_add(1, Ordering::Relaxed);
+        state.painted = false;
         state.view["pane_id"] = json!(terminal);
         state.view["focused_pane"] = json!(terminal);
         state.view["state"] = json!("ready");
@@ -1218,12 +1246,8 @@ pub(crate) enum TabEdit {
     FileRead { terminal: String, path: String },
     SpaceOpen { folder: String },
     Send { terminal: String, text: String },
-    /// An outbox message: like `Send`, but a composer's draft, so it may hold
-    /// line breaks and tabs and be as long as one compose command.
-    Deliver { terminal: String, text: String },
 }
-/// A JSON edit's bound: an outbox message is up to one compose command's text,
-/// and JSON escaping at most doubles the line breaks and tabs it may hold.
+/// A JSON edit's bound: room for one compose command's text, JSON-escaped.
 pub(crate) const MAX_ACTION: usize = 2 * crate::model::MAX_TEXT_BYTES + 1024;
 impl TabEdit {
     pub(crate) fn parse(action: &str) -> Option<Self> {
@@ -1325,17 +1349,6 @@ impl TabEdit {
                 text: value["text"]
                     .as_str()
                     .filter(|t| !t.trim().is_empty() && t.chars().count() <= 1000 && !t.chars().any(char::is_control))
-                    .map(str::to_owned)?,
-            },
-            "pane.deliver" => Self::Deliver {
-                terminal: id("terminal")?,
-                text: value["text"]
-                    .as_str()
-                    .filter(|t| {
-                        !t.trim().is_empty()
-                            && t.len() <= crate::model::MAX_TEXT_BYTES
-                            && !t.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
-                    })
                     .map(str::to_owned)?,
             },
             _ => return None,
@@ -1488,25 +1501,8 @@ fn send_refusal(error: &Error) -> Value {
         _ => json!({"queued":false,"error":error.to_string()}),
     }
 }
-/// How long the outbox's `terminal.send` may take: the core waits for a
-/// starting agent to settle, for a person to pause typing, then for the turn
-/// to start, each a few seconds.
-pub(crate) const DELIVER_WAIT: Duration = Duration::from_secs(60);
 /// A put sends up to 8 MiB (about 11 MB of base64) down the phone's link.
 pub(crate) const PUT_WAIT: Duration = Duration::from_secs(60);
-/// What an outbox send did, as `{"outcome": ..}`:
-/// `sent` (the core typed it), `blocked` (refused: the program waits on a
-/// dialog, nothing typed), `gone` (no such terminal, nothing typed), or
-/// `unsure` (anything else: the text may have been typed, so it must never be
-/// sent again without the user's word).
-fn delivery(sent: &Result<Value>) -> Value {
-    match sent {
-        Ok(_) => json!({"outcome":"sent"}),
-        Err(Error::Rpc { kind, .. }) if kind == "blocked" => json!({"outcome":"blocked"}),
-        Err(Error::Rpc { kind, .. }) if kind == "not_found" => json!({"outcome":"gone"}),
-        Err(error) => json!({"outcome":"unsure","why":error.to_string()}),
-    }
-}
 /// The phone's git look, one `sh -c` over the folders it shows (see git_look).
 const GIT_LOOK: &str = r#"seen='
 '
@@ -1898,6 +1894,7 @@ pub(crate) fn run(
             offered: offers(&hello, "viewer_focus") && offers(&hello, "focus_by_use"),
             ..Focus::default()
         },
+        painted: false,
     };
     let result = serve(&mut connection, cols, rows, active, &commands);
     connection.release();
@@ -1957,6 +1954,7 @@ fn serve(
                 Ok(Operation::Put(file, reply)) => {
                     let _ = reply.send(connection.put(&file));
                 }
+                Ok(Operation::Compose(compose, reply)) => connection.compose(compose, &reply)?,
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
                     // current size, not the size it connected with.
@@ -2316,7 +2314,7 @@ mod tests {
         assert_eq!(deacon_dir("/a/.herdr/deacon\n/b\n"), None);
         assert_eq!(deacon_dir(""), None);
     }
-    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, delivery, existing_at, initial_grid, resize_frame, send_refusal};
+    use super::{GIT_LOOK, add_space, attach_params, canonical_deacon, deacon_line, existing_at, initial_grid, resize_frame, send_refusal};
     #[test]
     fn the_attach_replys_grid_is_used_only_when_negotiated() {
         let reply = json!({"channel":3,"resize_notifications":true,"terminal":{"cols":174,"rows":69}});
@@ -2350,34 +2348,6 @@ mod tests {
         assert_eq!(other["queued"], false);
         assert!(other["refused"].is_null());
         assert!(other["error"].as_str().is_some_and(|e| e.contains("not_found")));
-    }
-    #[test]
-    fn an_outbox_send_says_whether_it_was_typed() {
-        let rpc = |kind: &str| Err(Error::Rpc { kind: kind.into(), message: "m".into() });
-        assert_eq!(delivery(&Ok(json!({"turn":3})))["outcome"], "sent");
-        assert_eq!(delivery(&rpc("blocked"))["outcome"], "blocked");
-        assert_eq!(delivery(&rpc("not_found"))["outcome"], "gone");
-        // A core that may have typed before failing (its save timed out).
-        assert_eq!(delivery(&rpc("unavailable"))["outcome"], "unsure");
-        // The link failed or the reply never came: it may have been typed.
-        assert_eq!(delivery(&Err(Error::Closed))["outcome"], "unsure");
-        assert_eq!(delivery(&Err(Error::Protocol("terminal.send timed out".into())))["outcome"], "unsure");
-    }
-    #[test]
-    fn outbox_messages_keep_line_breaks_but_no_other_controls() {
-        let parse = |text: &str| {
-            TabEdit::parse(&json!({"op":"pane.deliver","terminal":"t3","text":text}).to_string())
-        };
-        assert_eq!(
-            parse("first line\n\tsecond"),
-            Some(TabEdit::Deliver { terminal: "t3".into(), text: "first line\n\tsecond".into() })
-        );
-        assert_eq!(parse("a\u{1b}[2J"), None);
-        assert_eq!(parse("ok\r"), None);
-        assert_eq!(parse(" \n "), None);
-        let longest = "é\n".repeat(crate::model::MAX_TEXT_BYTES / 3);
-        assert!(parse(&longest).is_some());
-        assert_eq!(parse(&"x".repeat(crate::model::MAX_TEXT_BYTES + 1)), None);
     }
     #[test]
     fn reopening_a_worktree_finds_the_space_already_there() {
@@ -2952,6 +2922,7 @@ mod connection_tests {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
                 render_id: 0,
+                painted: false,
             }),
             cancel: CancellationToken::new(),
             commands,
@@ -3042,6 +3013,100 @@ mod connection_tests {
         assert!(runtime.join().unwrap().is_ok());
         peer.join().unwrap();
     }
+    /// Stage 1's one-tap send: a held message is typed only into the attach
+    /// that was on screen at the tap, after its first paint, as one paste
+    /// then Enter; a stale or unpainted attach gets nothing (E5, E7, E14).
+    #[test]
+    fn a_held_message_is_typed_only_into_the_painted_attach_it_was_tapped_over() {
+        use crate::remote::{Typed, compose_on};
+        let (phone, mut core) = UnixStream::pair().unwrap();
+        core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let (commands, rx) = mpsc::sync_channel(256);
+        let owner = Arc::new(Session {
+            id: 0,
+            state: Mutex::new(State {
+                view: json!({"revision":0,"panes":[]}),
+                terminal: None,
+                render_id: 0,
+                painted: false,
+            }),
+            cancel: CancellationToken::new(),
+            commands,
+            focus: Mutex::new(None),
+            heard: crate::remote::Heard::default(),
+            visible: std::sync::atomic::AtomicBool::new(true),
+            uses: Box::leak(Box::new(crate::remote::LastUse::new())),
+        });
+        let worker = owner.clone();
+        let runtime = std::thread::spawn(move || run(&worker, phone, 80, 24, true, rx));
+        let (paint, paint_rx) = mpsc::sync_channel::<()>(1);
+        let (typed, typed_rx) = mpsc::sync_channel(8);
+        let peer = std::thread::spawn(move || {
+            let mut hello = String::new();
+            read_hello(&core, &mut hello);
+            core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
+            let mut decoder = Decoder::default();
+            for expected in ["events.subscribe", "terminal.list", "doc.get", "doc.get", "terminal.attach"] {
+                let request: Value = serde_json::from_slice(&frame(&mut core, &mut decoder).bytes).unwrap();
+                assert_eq!(request["method"], expected);
+                let result = match expected {
+                    "events.subscribe" => json!({"channel":1,"seq":0,"terminals":[]}),
+                    "terminal.list" => json!({"terminals":[{"address":"t1","state":"live","labels":{},"cwd":"/tmp"}]}),
+                    "doc.get" => json!({"value":null,"version":0}),
+                    _ => json!({"channel":2}),
+                };
+                let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).unwrap();
+            }
+            // The first paint comes only when the test says so.
+            paint_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            write_frame(&mut core, 2, 0, b"$ ").unwrap();
+            // Everything the phone types on the attach's channel from now on.
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until {
+                let mut bytes = [0; 4096];
+                match core.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => decoder.bytes.extend_from_slice(&bytes[..n]),
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+                while let Some(frame) = decoder.next().unwrap() {
+                    if frame.channel == 2 && frame.kind == DATA {
+                        typed.send(frame.bytes).unwrap();
+                    }
+                }
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(20);
+        while lock(&owner.state).render_id == 0 {
+            assert!(Instant::now() < until, "never attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let attach = lock(&owner.state).render_id;
+        let wait = Duration::from_secs(5);
+        // Attached but not painted yet: nothing is typed.
+        assert_eq!(compose_on(&owner, attach, "too early", wait), Typed::Unwritten);
+        paint.send(()).unwrap();
+        while !lock(&owner.state).painted {
+            assert!(Instant::now() < until, "never painted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Another attach than the one on screen (an older tap): nothing is typed.
+        assert_eq!(compose_on(&owner, attach + 1, "stale tap", wait), Typed::Unwritten);
+        assert_eq!(compose_on(&owner, 0, "no attach", wait), Typed::Unwritten);
+        // The attach on screen: one paste, then Enter, in that order.
+        assert_eq!(compose_on(&owner, attach, "go\nnow", wait), Typed::Written);
+        assert_eq!(typed_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"go\rnow");
+        assert_eq!(typed_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"\r");
+        // Nothing else was typed: not the early tap, not the stale ones.
+        assert!(typed_rx.recv_timeout(Duration::from_millis(300)).is_err());
+        owner.cancel.cancel();
+        assert!(runtime.join().unwrap().is_ok());
+        peer.join().unwrap();
+        // The session is gone: a later tap writes nothing.
+        assert_eq!(compose_on(&owner, attach, "after the end", wait), Typed::Unwritten);
+    }
     #[test]
     fn a_coalesced_attach_reply_initial_resize_and_paint_are_all_applied_without_echo() {
         let (phone, mut core) = UnixStream::pair().unwrap();
@@ -3053,6 +3118,7 @@ mod connection_tests {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
                 render_id: 0,
+                painted: false,
             }),
             cancel: CancellationToken::new(),
             commands,
@@ -3166,7 +3232,7 @@ mod connection_tests {
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
             id: 0,
-            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0 }),
+            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0, painted: false }),
             cancel: CancellationToken::new(),
             commands: commands.clone(),
             focus: Mutex::new(None),
@@ -3297,23 +3363,6 @@ mod connection_tests {
             assert!(matches!(PutFile::new("t1", bad, vec![1]), Err(Error::PutName)), "{bad:?}");
         }
         assert!(matches!(PutFile::new("", "a.png", vec![1]), Err(Error::StaleTarget)));
-    }
-
-    #[test]
-    fn an_outbox_message_is_sent_with_terminal_send_and_its_outcome_reported() {
-        let action = r#"{"op":"pane.deliver","terminal":"t3","text":"two\nlines"}"#;
-        let (result, seen) = action_against(action, |method, _, _| Ok(base_answer(method)));
-        assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["outcome"], "sent");
-        let send = seen.iter().find(|(m, _)| m == "terminal.send").unwrap();
-        // Never forced, and the line break survives as one paste.
-        assert_eq!(send.1, json!({"terminal":"t3","text":"two\nlines"}));
-        for (kind, outcome) in [("blocked", "blocked"), ("not_found", "gone"), ("internal", "unsure")] {
-            let (result, _) = action_against(action, move |method, _, _| match method {
-                "terminal.send" => Err(kind),
-                m => Ok(base_answer(m)),
-            });
-            assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["outcome"], outcome);
-        }
     }
 
     #[test]
@@ -4117,6 +4166,7 @@ mod claim_tests {
                     view: json!({"revision":0,"panes":[]}),
                     terminal: None,
                     render_id: 0,
+                    painted: false,
                 }),
                 cancel: CancellationToken::new(),
                 commands,
@@ -5060,6 +5110,7 @@ mod focus_review_tests {
                 view: json!({"revision":0,"panes":[]}),
                 terminal: None,
                 render_id: 0,
+                painted: false,
             }),
             cancel: CancellationToken::new(),
             commands,
@@ -5104,6 +5155,7 @@ mod focus_review_tests {
                 uses: owner.uses.count(),
                 ..Focus::default()
             },
+            painted: false,
         };
         (connection, peer)
     }

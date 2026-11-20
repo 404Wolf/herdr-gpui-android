@@ -38,7 +38,7 @@ public final class GhostTextTest {
     }
 
     private static QueueView.Row row(String id, String text, String state, String style) {
-        return new QueueView.Row(id, QueueView.Kind.MESSAGE, text, state, style, true, Outbox.State.QUEUED);
+        return new QueueView.Row(id, QueueView.Kind.MESSAGE, text, state, style, true, Outbox.State.PENDING);
     }
 
     @Test public void queueRowsBecomeEchoesWithTheirStateAtTheRightEnd() throws Exception {
@@ -187,7 +187,7 @@ public final class GhostTextTest {
 
     @Test public void wolfAsk4_aSelectedRowsActionsTravelWithItsId() throws Exception {
         QueueView.Row unsure = new QueueView.Row("m-1", QueueView.Kind.MESSAGE, "❯ x", "?", "warn", true,
-                Outbox.State.UNSURE);
+                Outbox.State.NEEDS_YOU);
         String json = GhostText.withRowActions("{\"kind\":\"claude\"}", "m-1", ControlLine.rowRungs(unsure));
         JSONObject o = new JSONObject(json);
         assertEquals("m-1", o.getString("selected"));

@@ -23,7 +23,7 @@ public final class ComposerBarTest {
     private static final java.util.List<GhostText.Control> IDLE = java.util.Collections.singletonList(TALK);
     private static final java.util.List<GhostText.Control> NONE = java.util.Collections.emptyList();
     private static final Outbox.Message QUEUED =
-            new Outbox.Message("a", "h", "t1", "b", "x", 1, Outbox.State.QUEUED, false);
+            new Outbox.Message("a", "h", "t1", "x", Outbox.State.PENDING);
 
     @Test public void agentsGetTheComposerAndShellsKeepTheirBar() {
         assertTrue(ComposerBar.isAgent("claude"));

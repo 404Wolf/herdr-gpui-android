@@ -10,389 +10,385 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.json.JSONObject;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-/** The outbox: order, bounds, the one ambiguous moment, and what survives a restart. */
+/**
+ * Stage 1 of the offline design (§3, §6.3 E1 to E18 below the emulator): held messages are kept
+ * per machine and pane, survive a restart, are typed only by a tap in their live pane, one lane
+ * head at a time, and are never reported as delivered.
+ */
 public final class OutboxTest {
     @Rule public final TemporaryFolder dir = new TemporaryFolder();
 
-    private static Set<String> panes(String... ids) {
-        return new HashSet<>(Arrays.asList(ids));
+    private static final MachineKey A = MachineKey.of("core-a", "SHA256:host-a");
+    private static final MachineKey B = MachineKey.of("core-b", "SHA256:host-b");
+
+    private File file() {
+        return new File(dir.getRoot(), Outbox.FILE_NAME);
     }
 
     private Outbox fresh() {
-        Outbox outbox = new Outbox(new File(dir.getRoot(), Outbox.FILE_NAME));
+        Outbox outbox = new Outbox(file());
         outbox.load();
         return outbox;
     }
 
-    private Outbox reopened() {
-        return fresh();
+    private static Outbox.Target target(MachineKey machine, String profile, String pane, Long created) {
+        return new Outbox.Target(machine, profile, "computer " + profile, "default", pane, created, "PM herdr",
+                "idle");
     }
 
-    @Test public void messagesLeaveInTheOrderTheyWereTyped() {
+    private static Outbox.Live live(MachineKey machine, String profile, String pane, Long created) {
+        return new Outbox.Live(machine, profile, pane, created);
+    }
+
+    private static int ids;
+
+    private static Outbox.Message hold(Outbox outbox, MachineKey machine, String profile, String pane, String text) {
+        return outbox.add("m" + (++ids), target(machine, profile, pane, 7L), text, new Outbox.Composed(1_000, 50, 3));
+    }
+
+    /** One tap, as the courier makes it: claim, write, settle. */
+    private static void tap(Outbox outbox, Outbox.Message m, Outbox.Live where, Outbox.Outcome outcome) {
+        assertTrue("the tap claims its lane's head", outbox.claim(m.id, where, m.text, 2_000, false));
+        outbox.settle(m.id, outcome, 2_000, true);
+    }
+
+    // ---- E1: typed offline, nothing sent until each tap, in order, then "sent · check it arrived" ----
+
+    @Test public void e1_heldMessagesGoOnlyByATapInOrderAndStaySentNotDelivered() {
         Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        outbox.add("h", "t1", "first", 1);
-        outbox.add("h", "t1", "second", 2);
-        List<String> sent = new ArrayList<>();
-        for (Outbox.Message m; (m = outbox.next("h", 10)) != null; ) {
-            assertTrue(outbox.sending(m.id));
-            // Nothing else of this pane goes while one is in flight.
-            assertNull(outbox.next("h", 10));
-            outbox.settle(m.id, Outbox.Outcome.SENT, 10);
-            sent.add(m.text);
-        }
-        assertEquals(Arrays.asList("first", "second"), sent);
+        Outbox.Message first = hold(outbox, A, "p", "t1", "first");
+        Outbox.Message second = hold(outbox, A, "p", "t1", "second");
+        Outbox.Live here = live(A, "p", "t1", 7L);
+        // Nothing moves by itself: the head is only offered.
+        assertEquals(first.id, outbox.offer(here).id);
+        assertFalse("the second never overtakes", outbox.claim(second.id, here, second.text, 0, false));
+        tap(outbox, first, here, Outbox.Outcome.WRITTEN);
+        Outbox.Message sent = outbox.message(first.id);
+        assertEquals(Outbox.State.SENT, sent.state);
+        assertEquals("first", sent.text);
+        String words = HeldWords.state(sent, true, java.util.TimeZone.getTimeZone("UTC"), true);
+        assertEquals("sent 00:00 · check it arrived", words);
+        assertFalse(words.contains("deliver"));
+        // A sent row does not hold its lane: the next is offered.
+        assertEquals(second.id, outbox.offer(here).id);
+        tap(outbox, second, here, Outbox.Outcome.WRITTEN);
+        assertNull(outbox.offer(here));
+        assertEquals("sent rows wait for nobody", 0, outbox.waiting());
+        assertEquals(2, outbox.all().size());
+        // Kept an hour for Copy and Send again, then gone.
+        assertFalse(outbox.purgeSent(2_000 + Outbox.SENT_KEEP_MS - 1));
+        assertTrue(outbox.purgeSent(2_000 + Outbox.SENT_KEEP_MS));
+        assertTrue(outbox.all().isEmpty());
+    }
+
+    @Test public void e1_theLeadIsOnTheSameLineForAnAgentAndNeverForAnImmediateSend() {
+        java.util.TimeZone zone = java.util.TimeZone.getTimeZone("America/New_York");
+        long at = 1_795_201_320_000L; // 2026-11-20T19:02Z
+        assertEquals("[from the phone, composed 14:02 EST (2026-11-20T19:02Z), delivered later] go",
+                HeldWords.wire("go", at, zone, true, false));
+        assertEquals("go", HeldWords.wire("go", at, zone, true, true));
+        String wire = HeldWords.wire("two\nlines", at, zone, true, false);
+        assertTrue("one input: the lead shares the first line", wire.startsWith("[from the phone") && wire.indexOf('\n') > wire.indexOf(']'));
+    }
+
+    // ---- E18: a plain shell gets the text unchanged ----
+
+    @Test public void e18_aProgramWithoutAStatusReportGetsTheTextUnchanged() {
+        assertEquals("ls -la", HeldWords.wire("ls -la", 1_000, java.util.TimeZone.getDefault(), false, false));
+    }
+
+    // ---- survives restart and process death ----
+
+    @Test public void heldMessagesSurviveARestartAndAKillWhileSendingNeedsTheUser() throws Exception {
+        Outbox outbox = fresh();
+        Outbox.Message going = hold(outbox, A, "p", "t1", "being typed");
+        Outbox.Message kept = hold(outbox, A, "p", "t2", "kept");
+        assertTrue(outbox.claim(going.id, live(A, "p", "t1", 7L), going.text, 5, false));
+        assertTrue(outbox.save());
+        // The process dies here, before the answer.
+        Outbox again = fresh();
+        assertEquals(2, again.size());
+        Outbox.Message unsure = again.message(going.id);
+        assertEquals(Outbox.State.NEEDS_YOU, unsure.state);
+        assertEquals(Outbox.Reason.UNSURE, unsure.reason);
+        assertEquals("needs your decision: may have been sent, or may be sitting unsent in the input box",
+                HeldWords.state(unsure, true, java.util.TimeZone.getDefault(), true));
+        assertEquals(Outbox.State.PENDING, again.message(kept.id).state);
+        JSONObject saved = new JSONObject(new String(Files.readAllBytes(file().toPath()), StandardCharsets.UTF_8));
+        assertEquals(2, saved.getInt("v"));
+        JSONObject row = saved.getJSONArray("messages").getJSONObject(0);
+        assertEquals("core-a", row.getJSONObject("machine").getString("core"));
+        assertEquals("SHA256:host-a", row.getJSONObject("machine").getString("hostkey"));
+        assertEquals("t1", row.getString("address"));
+        assertEquals("sending", row.getString("state"));
+        assertTrue(row.getBoolean("tap_required"));
+        assertEquals("being typed", row.getJSONObject("attempt").getString("wire_text"));
+    }
+
+    // ---- E3, E4, E10, E12: lanes are per machine and terminal ----
+
+    @Test public void e3_e4_twoMachinesWithTheSamePaneIdAreSeparateLanes() {
+        Outbox outbox = fresh();
+        Outbox.Message forA = hold(outbox, A, "pa", "t1", "for A");
+        Outbox.Message forB = hold(outbox, B, "pb", "t1", "for B");
+        assertEquals(forB.id, outbox.offer(live(B, "pb", "t1", 7L)).id);
+        assertEquals(forA.id, outbox.offer(live(A, "pa", "t1", 7L)).id);
+        // A's row is never offered in B's pane, whatever the profile is called.
+        assertFalse(outbox.claim(forA.id, live(B, "pa", "t1", 7L), forA.text, 0, false));
+        // Viewing B, the whole queue still counts A's row.
+        assertEquals(2, outbox.waiting());
+        assertEquals("waits for computer pa", HeldWords.state(forA, false, java.util.TimeZone.getDefault(), true));
+        // The rows above B's prompt show only B's lane.
+        assertEquals(Collections.singletonList(forB.id), ids(outbox.shown(B, "pb", "t1")));
+        // An unbound profile (no proven machine) shows nothing of any machine's.
+        assertTrue(outbox.shown(null, "pa", "t1").isEmpty());
+    }
+
+    @Test public void e10_aTerminalReplacedOnTheSameAddressIsAnotherLane() {
+        Outbox outbox = fresh();
+        Outbox.Message old = hold(outbox, A, "p", "t1", "for the old one");
+        assertNull("another created_ms is another terminal", outbox.offer(live(A, "p", "t1", 99L)));
+        assertEquals(old.id, outbox.offer(live(A, "p", "t1", 7L)).id);
+    }
+
+    @Test public void aMessageWithNoProvenMachineIsNeverHeld() {
+        Outbox outbox = fresh();
+        assertNull(outbox.add("x", target(null, "p", "t1", 7L), "hello", new Outbox.Composed(1, 1, 1)));
         assertEquals(0, outbox.size());
     }
 
-    @Test public void anUnsureSendIsNeverResentOnItsOwnAndHoldsItsPane() {
+    @Test public void e12_theQueueTellsTwoSessionsWithOneNameApart() {
+        Outbox.Target one = new Outbox.Target(A, "p1", "home", "default", "t1", 1L, "", "");
+        Outbox.Target two = new Outbox.Target(B, "p2", "home", "work", "t1", 1L, "", "");
+        List<Outbox.Target> all = java.util.Arrays.asList(one, two);
+        assertEquals("home (default) · t1", HeldWords.target(one, all));
+        assertEquals("home (work) · t1", HeldWords.target(two, all));
+        assertEquals("home · t1", HeldWords.target(one, Collections.singletonList(one)));
+    }
+
+    // ---- E5, E6: what a tap's write says ----
+
+    @Test public void e5_e6_aWriteSaysOnlyHowFarItGot() {
         Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1", "t2"));
-        Outbox.Message first = outbox.add("h", "t1", "may have gone", 1);
-        outbox.add("h", "t1", "after it", 2);
-        Outbox.Message other = outbox.add("h", "t2", "other pane", 3);
-        assertTrue(outbox.sending(first.id));
-        outbox.settle(first.id, Outbox.Outcome.UNSURE, 4);
-        // The unsure message's pane waits; another pane's line is independent.
-        Outbox.Message next = outbox.next("h", 5);
-        assertEquals(other.id, next.id);
-        outbox.take(other.id);
-        assertNull(outbox.next("h", 5));
-        assertEquals(Outbox.State.UNSURE, outbox.shown("h", "t1", 5).get(0).state);
-        // Only the user's word puts it back, at the head of its line.
-        assertTrue(outbox.resend(first.id));
-        assertEquals(first.id, outbox.next("h", 6).id);
+        Outbox.Live here = live(A, "p", "t1", 7L);
+        Outbox.Message dropped = hold(outbox, A, "p", "t1", "link dropped before the write");
+        tap(outbox, dropped, here, Outbox.Outcome.UNWRITTEN);
+        Outbox.Message pending = outbox.message(dropped.id);
+        assertEquals("nothing was written: pending again", Outbox.State.PENDING, pending.state);
+        assertTrue("and it needs a tap", pending.tapRequired);
+        assertEquals(dropped.id, outbox.offer(here).id);
+        tap(outbox, pending, here, Outbox.Outcome.UNSURE);
+        Outbox.Message unsure = outbox.message(dropped.id);
+        assertEquals(Outbox.State.NEEDS_YOU, unsure.state);
+        assertNull("it stops its lane", outbox.offer(here));
+        // Send again: pending, offered for one more tap.
+        assertTrue(outbox.resend(unsure.id));
+        assertEquals(dropped.id, outbox.offer(here).id);
+        tap(outbox, outbox.message(dropped.id), here, Outbox.Outcome.WRITTEN);
+        assertEquals(Outbox.State.SENT, outbox.message(dropped.id).state);
+        // Sent may be sent again, at the user's word only.
+        assertTrue(outbox.resend(dropped.id));
+        assertEquals(Outbox.State.PENDING, outbox.message(dropped.id).state);
     }
 
-    @Test public void aProcessKilledMidSendLeavesTheMessageUnsureNotQueued() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        Outbox.Message m = outbox.add("h", "t1", "in flight", 1);
-        outbox.sending(m.id);
-        assertTrue(outbox.save());
-        Outbox after = reopened();
-        List<Outbox.Message> shown = after.shown("h", "t1", 2);
-        assertEquals(1, shown.size());
-        assertEquals(Outbox.State.UNSURE, shown.get(0).state);
-        assertNull(after.next("h", 2));
-    }
-
-    @Test public void queuedMessagesAndBootsSurviveARestart() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        outbox.add("h", "t1", "line one\nline two", 1);
-        assertTrue(outbox.save());
-        Outbox after = reopened();
-        Outbox.Message m = after.next("h", 2);
-        assertNotNull(m);
-        assertEquals("line one\nline two", m.text);
-        assertEquals("b1", m.boot);
-        // Typed offline after the restart, it takes the boot last seen ready.
-        assertEquals("b1", after.add("h", "t1", "offline", 3).boot);
-    }
-
-    @Test public void messagesTypedBeforeTheLoadFinishedComeAfterTheSavedOnes() throws Exception {
-        Outbox first = fresh();
-        first.ready("h", "b1", panes("t1"));
-        first.add("h", "t1", "older", 1);
-        assertTrue(first.save());
-        Outbox outbox = new Outbox(new File(dir.getRoot(), Outbox.FILE_NAME));
-        outbox.add("h", "t1", "newer", 2);
-        outbox.load();
-        List<Outbox.Message> shown = outbox.shown("h", "t1", 3);
-        assertEquals("older", shown.get(0).text);
-        assertEquals("newer", shown.get(1).text);
-    }
-
-    @Test public void aClosedPaneOrRestartedCoreMakesMessagesGoneButKeepsThem() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1", "t2"));
-        Outbox.Message closed = outbox.add("h", "t1", "pane closed", 1);
-        outbox.add("h", "t2", "core restarted", 2);
-        outbox.ready("h", "b1", panes("t2"));
-        assertEquals(Outbox.State.GONE, outbox.shown("h", "t2", 3).get(1).state);
-        outbox.ready("h", "b2", panes("t1", "t2"));
-        assertNull(outbox.next("h", 3));
-        List<Outbox.Message> shown = outbox.shown("h", "t9", 3);
-        assertEquals(2, shown.size());
-        for (Outbox.Message m : shown) assertEquals(Outbox.State.GONE, m.state);
-        // Taken back as a draft, not lost.
-        assertEquals("pane closed", outbox.take(closed.id));
-        assertEquals(0, outbox.waiting("h"));
-    }
-
-    @Test public void aMessageBeingSentIsNotMadeGoneUnderItsAnswer() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        Outbox.Message m = outbox.add("h", "t1", "racing", 1);
-        outbox.sending(m.id);
-        outbox.ready("h", "b1", panes());
-        outbox.settle(m.id, Outbox.Outcome.SENT, 2);
-        assertEquals(0, outbox.size());
-        // And a message being sent cannot be taken out from under the sender.
-        Outbox.Message n = outbox.add("h", "t1", "again", 3);
-        outbox.ready("h", "b1", panes("t1"));
-        outbox.sending(n.id);
-        assertNull(outbox.take(n.id));
-    }
-
-    @Test public void aRefusalWaitsAndThenTriesAgain() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        Outbox.Message m = outbox.add("h", "t1", "after the dialog", 1);
-        outbox.sending(m.id);
-        outbox.settle(m.id, Outbox.Outcome.BLOCKED, 100);
-        assertNull(outbox.next("h", 101));
-        assertTrue(outbox.shown("h", "t1", 101).get(0).blocked);
-        assertEquals(m.id, outbox.next("h", 100 + Outbox.BLOCKED_BACKOFF_MS).id);
-    }
-
-    @Test public void aMessageWithNoKnownBootWaitsForOneAndTakesIt() {
-        Outbox outbox = fresh();
-        Outbox.Message m = outbox.add("h", "t1", "cold start, offline", 1);
-        assertEquals("", m.boot);
-        assertNull(outbox.next("h", 2));
-        outbox.ready("h", "b7", panes("t1"));
-        assertEquals("b7", outbox.next("h", 3).boot);
-    }
-
-    @Test public void boundsAndTextRulesKeepTheDraftInsteadOfQueueing() {
-        Outbox outbox = fresh();
-        assertNull(outbox.add("h", "t1", "   ", 1));
-        assertNull(outbox.add("h", "t1", "esc\u001b[2J", 1));
-        assertNull(outbox.add("h", "", "no pane", 1));
-        assertNull(outbox.add("h", "t1", "x".repeat(Outbox.MAX_TEXT_BYTES + 1), 1));
-        assertNotNull(outbox.add("h", "t1", "tab\tand\nnewline", 1));
-        for (int i = 1; i < Outbox.MAX_MESSAGES; i++) assertNotNull(outbox.add("h", "t1", "m" + i, 1));
-        assertNull(outbox.add("h", "t1", "one too many", 1));
-    }
-
-    @Test public void aDamagedOrForeignFileYieldsNothingAndIsNotParsedWhenHuge() throws Exception {
-        File file = new File(dir.getRoot(), Outbox.FILE_NAME);
-        Files.write(file.toPath(), "{\"version\":1,\"messages\":[".getBytes(StandardCharsets.UTF_8));
-        Outbox damaged = new Outbox(file);
-        damaged.load();
-        assertEquals(0, damaged.size());
-        Files.write(file.toPath(), ("{\"version\":1,\"messages\":[{\"id\":\"a\",\"host\":\"h\",\"pane\":\"t1\","
-                + "\"boot\":\"b\",\"text\":\"hi\",\"state\":\"FUTURE\"}]}").getBytes(StandardCharsets.UTF_8));
-        Outbox future = new Outbox(file);
-        future.load();
-        // A state this build does not know might have been in flight: unsure, never resent.
-        assertEquals(Outbox.State.UNSURE, future.shown("h", "t1", 1).get(0).state);
-    }
-
-    @Test public void theCourierSendsInOrderAndStopsAtTheFirstThatDoesNotGo() {
-        File file = new File(dir.getRoot(), Outbox.FILE_NAME);
-        List<String> wire = new ArrayList<>();
-        String[] replies = {"{\"outcome\":\"sent\"}", "{\"outcome\":\"unsure\",\"why\":\"no answer\"}"};
-        OutboxCourier courier = new OutboxCourier(file, Runnable::run,
-                (handle, pane, text) -> {
-                    wire.add(pane + ":" + text);
-                    return replies[Math.min(wire.size() - 1, replies.length - 1)];
-                });
-        courier.add("h", "t1", "one");
-        courier.add("h", "t1", "two");
-        courier.add("h", "t1", "three");
-        courier.ready("h", 5, "b1", panes("t1"));
-        assertEquals(Arrays.asList("t1:one", "t1:two"), wire);
-        // "two" is unsure: nothing more goes, however often the poll says ready.
-        courier.ready("h", 5, "b1", panes("t1"));
-        assertEquals(2, wire.size());
-        Outbox after = reopened();
-        List<Outbox.Message> shown = after.shown("h", "t1", 1);
-        assertEquals(Outbox.State.UNSURE, shown.get(0).state);
-        assertEquals("two", shown.get(0).text);
-        assertEquals("three", shown.get(1).text);
-    }
-
-    @Test public void aNativeRefusalOfTheArgumentsIsOfferedBackNotRetried() {
-        File file = new File(dir.getRoot(), Outbox.FILE_NAME);
-        OutboxCourier courier = new OutboxCourier(file, Runnable::run,
-                (handle, pane, text) -> { throw new IllegalStateException("Invalid or oversized remote argument"); });
-        courier.add("h", "t1", "refused");
-        courier.ready("h", 5, "b1", panes("t1"));
-        assertEquals(Outbox.State.GONE, courier.outbox().shown("h", "t1", 1).get(0).state);
-        assertFalse(courier.outbox().holds("h", "t1"));
-    }
-
-    @Test public void unknownOutcomesAreUnsure() {
-        assertEquals(Outbox.Outcome.UNSURE, Outbox.Outcome.parse("maybe"));
+    @Test public void anUnknownAnswerIsInDoubtNeverAResend() {
+        assertEquals(Outbox.Outcome.UNSURE, Outbox.Outcome.parse("delivered"));
         assertEquals(Outbox.Outcome.UNSURE, Outbox.Outcome.parse(null));
-        assertEquals(Outbox.Outcome.SENT, Outbox.Outcome.parse("sent"));
-        assertEquals(Outbox.Outcome.RETRY, Outbox.Outcome.parse("retry"));
+        assertEquals(Outbox.Outcome.WRITTEN, Outbox.Outcome.parse("written"));
+        assertEquals(Outbox.Outcome.UNWRITTEN, Outbox.Outcome.parse("unwritten"));
     }
 
-    @Test public void aFilledDictationCanBeUndoneWhenItsSaveFails() {
+    @Test public void aMessageTypedAtOnceFromTheLivePaneLeavesWhenWritten() {
         Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        String token = DictationToken.of("c1");
-        Outbox.Message m = outbox.add("h", "t1", "see " + token, 1);
-        Runnable undo = outbox.fillDictationUndoably("c1", "the words");
-        assertNotNull(undo);
-        assertEquals("see the words", outbox.shown("h", "t1", 2).get(0).text);
-        undo.run();
-        assertEquals("see " + token, outbox.shown("h", "t1", 2).get(0).text);
-        // A message left blank by an empty dictation is dropped; the undo brings it back.
-        Outbox.Message only = outbox.add("h", "t1", DictationToken.of("c2"), 3);
-        Runnable undo2 = outbox.fillDictationUndoably("c2", "");
-        assertEquals(1, outbox.shown("h", "t1", 4).size());
-        undo2.run();
-        assertEquals(Arrays.asList(m.id, only.id), ids(outbox.shown("h", "t1", 5)));
-        assertNull(outbox.fillDictationUndoably("nobody", "x"));
+        Outbox.Message m = hold(outbox, A, "p", "t1", "typed now");
+        assertTrue(outbox.claim(m.id, live(A, "p", "t1", 7L), m.text, 1, true));
+        outbox.settle(m.id, Outbox.Outcome.WRITTEN, 1, false);
+        assertNull(outbox.message(m.id));
     }
 
-    @Test public void theCourierSaysWhenAFilledDictationCouldNotBeSaved() throws Exception {
-        File file = new File(dir.getRoot(), "courier-" + Outbox.FILE_NAME);
-        OutboxCourier courier = new OutboxCourier(file, Runnable::run, (handle, pane, text) -> "sent");
-        courier.outbox().ready("h", "b1", panes("t1"));
-        String token = DictationToken.of("c1");
-        courier.add("h", "t1", "see " + token);
-        assertEquals(0, courier.fillDictation("nobody", "x"));
-        // The file cannot be written: its temporary's place is taken.
-        File tmp = new File(file.getPath() + ".tmp");
-        assertTrue(tmp.mkdirs());
-        assertTrue(new File(tmp, "x").createNewFile());
-        assertEquals(-1, courier.fillDictation("c1", "the words"));
-        assertEquals("as it was", "see " + token, courier.outbox().shown("h", "t1", 1).get(0).text);
-        new File(tmp, "x").delete();
-        assertTrue(tmp.delete());
-        assertEquals(1, courier.fillDictation("c1", "the words"));
-        assertEquals("see the words", courier.outbox().shown("h", "t1", 1).get(0).text);
-    }
+    // ---- E8: a removed terminal ----
 
-    @Test public void anOlderSaveNeverLandsOverANewerOne() throws Exception {
-        // The courier's thread snapshots the outbox and is paused before writing; meanwhile a
-        // dictation's fill is saved on the main thread. The older write must not win.
+    @Test public void e8_aRemovedTerminalsMessagesNeedTheUserAndADoubtfulOneKeepsItsDoubt() {
         Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        String token = DictationToken.of("c1");
-        outbox.add("h", "t1", "see " + token, 1);
-        java.util.concurrent.CountDownLatch paused = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
-        Thread courier = new Thread(() -> {
-            outbox.beforeWrite = () -> {
-                outbox.beforeWrite = null;
-                paused.countDown();
-                try {
-                    go.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            };
-            outbox.save();
-        });
-        courier.start();
-        assertTrue(paused.await(5, java.util.concurrent.TimeUnit.SECONDS));
-        assertTrue(outbox.fillDictation("c1", "the words"));
-        Thread main = new Thread(outbox::save);
-        main.start();
-        Thread.sleep(200);
-        go.countDown();
-        courier.join(5000);
-        main.join(5000);
-        assertEquals("see the words", reopened().shown("h", "t1", 2).get(0).text);
+        Outbox.Message pending = hold(outbox, A, "p", "t5", "for t5");
+        Outbox.Message unsure = hold(outbox, A, "p", "t6", "maybe typed");
+        Outbox.Message sent = hold(outbox, A, "p", "t7", "was written");
+        tap(outbox, unsure, live(A, "p", "t6", 7L), Outbox.Outcome.UNSURE);
+        tap(outbox, sent, live(A, "p", "t7", 7L), Outbox.Outcome.WRITTEN);
+        Outbox.Message other = hold(outbox, B, "q", "t5", "B's t5 is still there");
+        Map<String, Long> listed = new HashMap<>();
+        listed.put("t1", 1L);
+        assertTrue(outbox.observe(A, listed));
+        Outbox.Message gone = outbox.message(pending.id);
+        assertEquals(Outbox.State.NEEDS_YOU, gone.state);
+        assertEquals(Outbox.Reason.GONE, gone.reason);
+        assertEquals("needs your decision: t5 is gone", HeldWords.state(gone, false, java.util.TimeZone.getDefault(), true));
+        assertEquals(Outbox.Reason.UNSURE, outbox.message(unsure.id).reason);
+        assertEquals(Outbox.State.SENT, outbox.message(sent.id).state);
+        assertEquals("another machine's lane is untouched", Outbox.State.PENDING, outbox.message(other.id).state);
+        // The text is offered back as a draft (Edit as draft takes it out).
+        assertEquals("for t5", outbox.take(gone.id));
+        assertFalse("gone is never sent again", outbox.resend(other.id + "-none"));
     }
 
-    @Test public void clearMarksThePanesQueueButNeverAMessageBeingSentAndUndoPutsItBackInOrder() {
+    @Test public void aTerminalReplacedOnItsAddressMakesItsPendingMessagesGone() {
         Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1", "t2"));
-        Outbox.Message going = outbox.add("h", "t1", "going", 1);
-        Outbox.Message a = outbox.add("h", "t1", "a", 2);
-        Outbox.Message b = outbox.add("h", "t1", "b", 3);
-        Outbox.Message other = outbox.add("h", "t2", "other pane", 4);
-        assertTrue(outbox.sending(going.id));
+        Outbox.Message m = hold(outbox, A, "p", "t5", "for the first t5");
+        assertTrue(outbox.observe(A, Collections.singletonMap("t5", 99L)));
+        assertEquals(Outbox.Reason.GONE, outbox.message(m.id).reason);
+    }
+
+    // ---- E9: a head that needs the user holds its lane ----
+
+    @Test public void e9_theOthersWaitBehindAHeadThatNeedsYou() {
+        Outbox outbox = fresh();
+        Outbox.Live here = live(A, "p", "t1", 7L);
+        Outbox.Message first = hold(outbox, A, "p", "t1", "first");
+        Outbox.Message second = hold(outbox, A, "p", "t1", "second");
+        hold(outbox, A, "p", "t1", "third");
+        tap(outbox, first, here, Outbox.Outcome.UNSURE);
+        assertNull(outbox.offer(here));
+        assertFalse(outbox.claim(second.id, here, second.text, 0, false));
+        assertEquals(3, outbox.waitingIn(here));
+        assertEquals("3 older messages wait for you", HeldWords.olderWaiting(outbox.waitingIn(here)));
+        assertEquals("1 older message waits for you", HeldWords.olderWaiting(1));
+        // Settled ("It arrived"): the next is offered.
+        assertEquals("first", outbox.take(first.id));
+        assertEquals(second.id, outbox.offer(here).id);
+    }
+
+    // ---- E16: upgrade from phone-feedback ----
+
+    @Test public void e16_v1MessagesAreMigratedOnceAsUnverifiedAndACancelledOneStaysCancelled() throws Exception {
+        File v1 = new File(dir.getRoot(), Outbox.V1_FILE_NAME);
         long until = System.currentTimeMillis() + 60_000;
-        List<String> cleared = outbox.clearAll("h", "t1", until, 5);
-        assertEquals(Arrays.asList(a.id, b.id), cleared);
-        assertEquals(Arrays.asList(going.id), ids(outbox.shown("h", "t1", 5)));
-        assertEquals(Arrays.asList(other.id), ids(outbox.shown("h", "t2", 5)));
-        assertEquals("cleared ones are not counted", 2, outbox.waiting("h"));
-        // Never sent while cleared, even when the one being sent is done.
-        outbox.settle(going.id, Outbox.Outcome.SENT, 6);
-        Outbox.Message next = outbox.next("h", 6);
-        assertEquals(other.id, next.id);
-        // Typed after the clear, then undone: the cleared ones are back in their place.
-        Outbox.Message later = outbox.add("h", "t1", "later", 7);
-        assertTrue(outbox.unclear(cleared));
-        assertEquals(Arrays.asList(a.id, b.id, later.id), ids(outbox.shown("h", "t1", 8)));
-        // A second undo changes nothing.
-        assertFalse(outbox.unclear(cleared));
+        String text = new JSONObject().put("version", 1).put("boots", new JSONObject().put("h", "boot"))
+                .put("messages", new org.json.JSONArray()
+                        .put(new JSONObject().put("id", "q").put("host", "h").put("pane", "t1").put("boot", "boot")
+                                .put("text", "queued one").put("created", 100).put("state", "QUEUED").put("clearedUntil", 0))
+                        .put(new JSONObject().put("id", "c").put("host", "h").put("pane", "t1").put("boot", "boot")
+                                .put("text", "cancelled").put("created", 101).put("state", "QUEUED")
+                                .put("clearedUntil", until))
+                        .put(new JSONObject().put("id", "s").put("host", "h").put("pane", "t2").put("boot", "boot")
+                                .put("text", "was sending").put("created", 102).put("state", "SENDING").put("clearedUntil", 0))
+                        .put(new JSONObject().put("id", "g").put("host", "h").put("pane", "t3").put("boot", "boot")
+                                .put("text", "gone one").put("created", 103).put("state", "GONE").put("clearedUntil", 0)))
+                .toString();
+        Files.write(v1.toPath(), text.getBytes(StandardCharsets.UTF_8));
+        Outbox outbox = fresh();
+        Outbox.Message queued = outbox.message("q");
+        assertEquals(Outbox.State.PENDING, queued.state);
+        assertEquals(Outbox.Reason.UNVERIFIED, queued.reason);
+        assertTrue(queued.unverified());
+        assertTrue(HeldWords.state(queued, true, java.util.TimeZone.getDefault(), true)
+                .startsWith("destination not verified"));
+        assertEquals(Outbox.Reason.UNSURE, outbox.message("s").reason);
+        assertEquals(Outbox.Reason.GONE, outbox.message("g").reason);
+        assertFalse("cancelled stays cancelled", ids(outbox.all()).contains("c"));
+        assertNotNull(outbox.message("c"));
+        // Offered only in the pane of its old profile and pane, saying so; never by a guessed machine.
+        Outbox.Message offered = outbox.offer(live(A, "h", "t1", 7L));
+        assertEquals("q", offered.id);
+        assertNull(outbox.offer(live(A, "other", "t1", 7L)));
+        String heading = HeldWords.offer(offered, Collections.emptyList(), java.util.TimeZone.getDefault(), true,
+                200, 0, 1);
+        assertTrue(heading, heading.startsWith("destination not verified · typed "));
+        // v1 is put aside; a second start migrates nothing twice.
+        assertFalse(v1.exists());
+        assertTrue(new File(v1.getPath() + Outbox.MIGRATED_SUFFIX).exists());
+        Files.copy(new File(v1.getPath() + Outbox.MIGRATED_SUFFIX).toPath(), v1.toPath());
+        Outbox again = fresh();
+        assertEquals(4, again.size());
     }
 
-    @Test public void aMessagePickedForSendingBeforeItWasClearedIsRefusedAtDispatch() {
+    @Test public void anUnreadableFileIsPutAsideAndTheQueueStartsEmpty() throws Exception {
+        Files.write(file().toPath(), "{not json".getBytes(StandardCharsets.UTF_8));
         Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        Outbox.Message m = outbox.add("h", "t1", "must not send", 1);
-        Outbox.Message picked = outbox.next("h", 2);
-        assertEquals(m.id, picked.id);
-        outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 3);
-        assertFalse(outbox.sending(picked.id));
-        assertEquals(Outbox.State.QUEUED, outbox.cleared(Arrays.asList(m.id), 4).get(0).state);
-        // Undone, it goes as usual.
-        outbox.unclear(Arrays.asList(m.id));
-        assertTrue(outbox.sending(m.id));
+        assertTrue(outbox.damaged());
+        assertEquals(0, outbox.size());
+        File[] aside = dir.getRoot().listFiles((d, name) -> name.startsWith(Outbox.FILE_NAME + ".unreadable-"));
+        assertEquals(1, aside.length);
     }
 
-    @Test public void aClearedMessageStaysClearedAcrossARestartAndCanStillBeUndone() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        Outbox.Message a = outbox.add("h", "t1", "keep me recoverable", 1);
-        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 2);
-        assertTrue(outbox.save());
-        Outbox after = reopened();
-        after.ready("h", "b1", panes("t1"));
-        assertTrue("not shown after a restart", after.shown("h", "t1", 3).isEmpty());
-        assertNull("never sent after a restart", after.next("h", 3));
-        assertEquals("but still there for the undo", 1, after.cleared(cleared, 3).size());
-        assertTrue(after.unclear(cleared));
-        assertEquals(Arrays.asList(a.id), ids(after.shown("h", "t1", 4)));
+    // ---- the courier: a tap's attempt is on disk before the write; nothing is sent by itself ----
+
+    @Test public void theCourierSavesTheAttemptBeforeWritingAndNeverSendsByItself() throws Exception {
+        AtomicInteger writes = new AtomicInteger();
+        List<String> seenOnDisk = new ArrayList<>();
+        OutboxCourier courier = new OutboxCourier(file(), Runnable::run, (handle, attach, text) -> {
+            writes.incrementAndGet();
+            try {
+                seenOnDisk.add(new String(Files.readAllBytes(file().toPath()), StandardCharsets.UTF_8));
+            } catch (java.io.IOException e) {
+                throw new AssertionError(e);
+            }
+            assertEquals(42, attach);
+            return "{\"outcome\":\"written\"}";
+        });
+        Outbox.Message m = courier.add("sub-1", target(A, "p", "t1", 7L), "hello", new Outbox.Composed(1, 1, 1));
+        assertNotNull(m);
+        // Adding twice under one submission is one message.
+        assertEquals(m.id, courier.add("sub-1", target(A, "p", "t1", 7L), "hello", new Outbox.Composed(1, 1, 1)).id);
+        courier.observe(A, Collections.singletonMap("t1", 7L));
+        assertEquals("held, never sent without a tap", 0, writes.get());
+        List<Outbox.Outcome> outcomes = new ArrayList<>();
+        courier.send(m.id, live(B, "p", "t1", 7L), 1, 42, "hello", false, outcomes::add);
+        assertEquals("another machine's pane writes nothing", 0, writes.get());
+        assertNull(outcomes.get(0));
+        courier.send(m.id, live(A, "p", "t1", 7L), 1, 42, "hello", false, outcomes::add);
+        assertEquals(1, writes.get());
+        assertTrue("sending was on disk before the write", seenOnDisk.get(0).contains("\"state\":\"sending\""));
+        assertEquals(Outbox.Outcome.WRITTEN, outcomes.get(1));
+        assertEquals(Outbox.State.SENT, courier.outbox().message(m.id).state);
+        // A second tap on a sent message writes nothing.
+        courier.send(m.id, live(A, "p", "t1", 7L), 1, 42, "hello", false, outcomes::add);
+        assertEquals(1, writes.get());
     }
 
-    @Test public void aClearedMessageWhoseWindowPassedStaysHiddenAfterARestartUntilPurged() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        outbox.add("h", "t1", "an undo may still want me", 1);
-        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() - 1, 2);
-        assertTrue(outbox.save());
-        Outbox after = reopened();
-        after.ready("h", "b1", panes("t1"));
-        assertTrue(after.shown("h", "t1", 3).isEmpty());
-        assertNull(after.next("h", 3));
-        assertEquals(0, after.waiting("h"));
-        assertEquals("kept for an undo accepted before the restart", 1, after.cleared(cleared, 3).size());
-        assertTrue(after.purgeCleared(cleared));
-        assertTrue(after.cleared(cleared, 3).isEmpty());
+    @Test public void aFailedSaveHoldsNothingAndWritesNothing() {
+        AtomicInteger writes = new AtomicInteger();
+        OutboxCourier courier = new OutboxCourier(file(), Runnable::run, (handle, attach, text) -> {
+            writes.incrementAndGet();
+            return "{\"outcome\":\"written\"}";
+        });
+        courier.outbox().failSaves = true;
+        assertNull("the draft stays", courier.add("s", target(A, "p", "t1", 7L), "x", new Outbox.Composed(1, 1, 1)));
+        assertEquals(0, courier.outbox().size());
+        courier.outbox().failSaves = false;
+        Outbox.Message m = courier.add("s", target(A, "p", "t1", 7L), "x", new Outbox.Composed(1, 1, 1));
+        courier.outbox().failSaves = true;
+        courier.send(m.id, live(A, "p", "t1", 7L), 1, 1, "x", false, null);
+        assertEquals("no write without a saved attempt", 0, writes.get());
+        assertEquals(Outbox.State.PENDING, courier.outbox().message(m.id).state);
     }
 
-    @Test public void theWindowClosingPurgesTheClearedMessages() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        outbox.add("h", "t1", "x", 1);
-        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 2);
-        assertTrue(outbox.purgeCleared(cleared));
-        assertFalse(outbox.unclear(cleared));
-        assertTrue(outbox.cleared(cleared, 3).isEmpty());
-    }
+    // ---- age (§4.1) ----
 
-    @Test public void anUnsureMessageComesBackUnsure() {
-        Outbox outbox = fresh();
-        outbox.ready("h", "b1", panes("t1"));
-        Outbox.Message u = outbox.add("h", "t1", "maybe", 1);
-        assertTrue(outbox.sending(u.id));
-        outbox.settle(u.id, Outbox.Outcome.UNSURE, 2);
-        List<String> cleared = outbox.clearAll("h", "t1", System.currentTimeMillis() + 60_000, 3);
-        assertEquals(1, cleared.size());
-        outbox.unclear(cleared);
-        assertEquals(Outbox.State.UNSURE, outbox.shown("h", "t1", 5).get(0).state);
-        assertNull("still never resent on its own", outbox.next("h", 5));
+    @Test public void ageIsMeasuredOnThePhonesOwnClockAndIsUnknownAcrossAReboot() {
+        Outbox.Composed typed = new Outbox.Composed(1_000_000, 10_000, 3);
+        assertEquals(47 * 60_000, typed.ageMs(10_000 + 47 * 60_000, 3));
+        assertEquals(-1, typed.ageMs(10_000 + 47 * 60_000, 4));
+        assertEquals(-1, typed.ageMs(5_000, 3));
+        assertEquals("47 min ago", HeldWords.age(47 * 60_000));
+        assertEquals("age unknown", HeldWords.age(-1));
+        Outbox.Message m = new Outbox.Message("m", target(A, "p", "t1", 7L), "x", typed, Outbox.State.PENDING, null,
+                false, 0, "");
+        // The wall clock set back before the typing: only the time, age unknown.
+        assertTrue(HeldWords.typed(m, 999_999, 10_000 + 60_000, 3, java.util.TimeZone.getDefault(), true)
+                .endsWith("· age unknown"));
+        String heading = HeldWords.offer(m, Collections.emptyList(), java.util.TimeZone.getTimeZone("UTC"), true,
+                1_000_000 + 47 * 60_000, 10_000 + 47 * 60_000, 3);
+        assertEquals("typed 00:16 for computer p · PM herdr · t1 · 47 min ago", heading);
     }
 
     private static List<String> ids(List<Outbox.Message> messages) {

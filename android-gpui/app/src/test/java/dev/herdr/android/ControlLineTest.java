@@ -152,10 +152,10 @@ public final class ControlLineTest {
 
     @Test public void wolfAsk4_aSelectedRowsActionsGoOnItsRowNeverInTheLine() {
         QueueView.Row unsure = new QueueView.Row("m", QueueView.Kind.MESSAGE, "❯ x", "?", "warn", true,
-                Outbox.State.UNSURE);
+                Outbox.State.NEEDS_YOU);
         assertEquals("row-again row-edit row-drop row-back", ids(ControlLine.rowActions(unsure)));
         QueueView.Row queued = new QueueView.Row("m", QueueView.Kind.MESSAGE, "❯ x", "◌1", "tag", true,
-                Outbox.State.QUEUED);
+                Outbox.State.PENDING);
         assertEquals("row-edit row-drop row-back", ids(ControlLine.rowActions(queued)));
         QueueView.Row clip = new QueueView.Row("c", QueueView.Kind.CLIP, "⟦dictation c⟧", "◌", "tag", true, null);
         assertEquals("row-drop row-back", ids(ControlLine.rowActions(clip)));
