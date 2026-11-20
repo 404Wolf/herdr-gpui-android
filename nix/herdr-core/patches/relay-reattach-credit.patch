@@ -1,0 +1,1094 @@
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index dc30d5d..45a08a6 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -26,6 +26,7 @@ pub const FEATURES: &[&str] = &[
+     "viewer_visibility",
+     "viewer_focus",
+     "resize_history",
++    "attach_credit",
+ ];
+ pub const FINISHED_LINES: usize = 1000;
+ /// A terminal's identity: fixed at start from whoever starts it.
+@@ -478,6 +479,11 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         desktop_group: core.desktop_group(conn, p.desktop_group.as_deref()),
+     };
+     let channel = core.attach(conn, id, req)?;
++    if let Some(credit) = p.credit {
++        // Still paused: nothing has gone out on it yet.
++        conn.with(|out| out.set_credit(channel, credit as usize));
++    }
++    attach_gate(p.resumed, p.credit).await;
+     Ok(AttachResult {
+         channel,
+         terminal: Public(record(core, id)?),
+@@ -493,6 +499,21 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+     })
+ }
+ 
++/// Tests only (debug builds): with `HC_TEST_ATTACH_GATE` set to a folder,
++/// a resumed attach writes `ready` there (`{"credit": ..}`) once it is set up, and
++/// waits for `release` before its reply goes out: a scheduling barrier for
++/// what a relay does while a reattach is in flight.
++async fn attach_gate(resumed: bool, credit: Option<u32>) {
++    if !cfg!(debug_assertions) || !resumed {
++        return;
++    }
++    let Some(gate) = std::env::var_os("HC_TEST_ATTACH_GATE").map(std::path::PathBuf::from) else { return };
++    let _ = std::fs::write(gate.join("ready"), json!({ "credit": credit }).to_string());
++    while !gate.join("release").exists() {
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++}
++
+ async fn terminal_queue(core: Ctx<'_>, p: QueueParams) -> Result<SendResult, RpcError> {
+     if p.key.as_ref().is_some_and(|k| k.is_empty() || k.len() > crate::inbox::MAX_KEY) {
+         return Err(RpcError::invalid_params(format!("a key is 1 to {} bytes", crate::inbox::MAX_KEY)));
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 1a4fcf8..89774e3 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -442,6 +442,12 @@ pub struct AttachParams {
+     #[arg(skip)]
+     #[serde(default)]
+     pub resumed: bool,
++    /// The stream's starting credit in bytes, at most the usual 256 KiB
++    /// window (the default). A relay reattaching a viewer passes what that
++    /// viewer can still take, so bytes it already holds for it count.
++    #[arg(skip)]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub credit: Option<u32>,
+     /// Desktop identity forwarded by a core line; ignored from ordinary clients.
+     #[arg(skip)]
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index 0b0a60f..15ad1f2 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -396,13 +396,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
+                 mirror_events(core, m, &line, &payload);
+                 let _ = line.frames.send(wire::encode(there, wire::CREDIT, &(payload.len() as u32).to_le_bytes()));
+             }
+-            (there, wire::DATA) => {
+-                if let Some((conn, here)) = lock(&line.streams).get(&there) {
+-                    conn.with(|out| {
+-                        out.data(*here, &payload);
+-                    });
+-                }
+-            }
++            (there, wire::DATA) => stream_data(core, &line, there, &payload),
+             (there, wire::RESIZE) if payload.len() == 4 => {
+                 if let Some((conn, here)) = lock(&line.streams).get(&there) {
+                     conn.with(|out| out.ordered_resize(*here, &payload));
+@@ -432,16 +426,44 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
+     // Viewers here hear that the line is gone and stay open; the programs keep
+     // running there, and the viewers get them back with the line.
+     let notice = format!("\r\n[line to {} lost; reconnecting...]\r\n", m.name);
+-    for (_, (conn, here)) in lock(&line.streams).drain() {
+-        conn.with(|out| {
+-            out.data(here, notice.as_bytes());
+-        });
++    let streams: Vec<(u32, Sink)> = lock(&line.streams).drain().collect();
++    for (there, (conn, here)) in streams {
++        let mut taken = true;
++        conn.with(|out| taken = out.data(here, notice.as_bytes()));
++        if !taken {
++            overflowed(core, &line, &conn, here, there);
++        }
+     }
+     // Killed, not waited for: a Mac core once never heard the old ssh had
+     // died and stayed "connecting" for good. It is reaped in the background.
+     let _ = d.child.start_kill();
+ }
+ 
++/// Stream bytes from there for a viewer here.
++fn stream_data(core: &Core, line: &Line, there: u32, payload: &[u8]) {
++    let target = lock(&line.streams).get(&there).cloned();
++    if let Some((conn, here)) = target {
++        let mut taken = true;
++        conn.with(|out| taken = out.data(here, payload));
++        if !taken {
++            // Too far behind here (an older core there ignored our credit):
++            // its backlog is gone, so the stream ends now, never going on as
++            // if those bytes had arrived.
++            lock(&line.streams).remove(&there);
++            overflowed(core, line, &conn, here, there);
++        }
++    }
++}
++
++/// A relayed stream's backlog here overflowed and was dropped: the viewer
++/// is told (CLOSE, `relay_overflow`) and attaches again; the stream there ends.
++fn overflowed(core: &Core, line: &Line, conn: &Arc<Conn>, here: u32, there: u32) {
++    eprintln!("core: a relayed stream fell too far behind: closed");
++    core.lock().relayed.remove(&(conn_key(conn), here));
++    let _ = line.frames.send(wire::encode(there, wire::CLOSE, b""));
++    conn.with(|out| out.close(here, br#"{"reason":"relay_overflow"}"#));
++}
++
+ /// A machine's terminals now (after a connect, or after it says we missed
+ /// some): subscribers here hear what appeared, changed or went.
+ fn mirror_replace(core: &Core, m: &Machine, terminals: Vec<Value>) {
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index b0b2761..7e16bed 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -61,6 +61,7 @@ async fn viewer_visibility_frame_stays_ordered_with_data_and_resize_across_a_rel
+             conn: conn.clone(),
+             machine: "remote".into(),
+             params: json!({"visible": true, "visibility_updates": true}),
++            attempt: None,
+         },
+     );
+ 
+@@ -131,6 +132,7 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+                 conn: conn.clone(),
+                 machine: machine.id.clone(),
+                 params: json!({"terminal": "t1"}),
++                attempt: None,
+             },
+         );
+         assert!(relay_in(&core, &conn, 7, wire::AUTOMATIC_INPUT, b"\x1b"));
+@@ -138,6 +140,7 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+         assert_eq!(frame, wire::encode(9, wire::AUTOMATIC_INPUT, b"\x1b"));
+         let (frames, mut rx) = mpsc::unbounded_channel();
+         let line = Line::new(frames, &json!({"features": if feature { vec!["automatic_input"] } else { vec![] }}));
++        core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone())); // this pass's line is current
+         let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
+         let request = rx.recv().await.unwrap();
+         let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+@@ -255,11 +258,13 @@ async fn failed_reattach_drains_pending_data_before_close() {
+             conn: conn.clone(),
+             machine: machine.id.clone(),
+             params: json!({"terminal": "t1"}),
++            attempt: None,
+         },
+     );
+     drop(old_rx); // The viewer survives its old line.
+     let (frames, mut rx) = mpsc::unbounded_channel();
+     let line = Line::new(frames, &json!({}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone())); // this pass's line is current
+     let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
+     let request = rx.recv().await.unwrap();
+     let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+@@ -462,6 +467,7 @@ async fn window_focus_is_relayed_per_downstream_viewer() {
+                 conn: conn.clone(),
+                 machine: "macro".into(),
+                 params: json!({"visible": true, "visibility_updates": true, "focus_updates": focus, "focused": focus}),
++                attempt: None,
+             },
+         );
+     }
+@@ -646,12 +652,14 @@ async fn reconnect_rejects_a_resize_history_downgrade() {
+                 conn: conn.clone(),
+                 machine: machine.id.clone(),
+                 params: json!({"terminal": "t1", "resize_notifications": true, "resize_history": 1000}),
++                attempt: None,
+             },
+         );
+         let (frames, mut rx) = mpsc::unbounded_channel();
+         let features =
+             if feature { vec!["resize_notifications", "resize_history"] } else { vec!["resize_notifications"] };
+         let line = Line::new(frames, &json!({"features": features}));
++        core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone())); // this pass's line is current
+         let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
+         let request = rx.recv().await.unwrap();
+         let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+@@ -719,12 +727,14 @@ async fn a_resize_history_downgrade_is_refused_before_any_frame_is_forwarded() {
+                 conn: conn.clone(),
+                 machine: machine.id.clone(),
+                 params: json!({"terminal": "t1", "resize_notifications": true, "resize_history": 1000}),
++                attempt: None,
+             },
+         );
+         let (frames, mut rx) = mpsc::unbounded_channel();
+         let features =
+             if feature { vec!["resize_notifications", "resize_history"] } else { vec!["resize_notifications"] };
+         let line = Line::new(frames, &json!({"features": features}));
++        core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone())); // this pass's line is current
+         let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
+         let request = rx.recv().await.unwrap();
+         let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+@@ -814,3 +824,378 @@ async fn reviewer_v3_missing_and_lower_echo_are_rejected_before_mapping() {
+         }
+     }
+ }
++
++/// INS-2950: when an older core there ignores the reattach credit and the
++/// backlog here for a viewer overflows anyway, the stream is closed
++/// (`relay_overflow`) and ended there, never continued after a hole.
++#[tokio::test]
++async fn a_relay_backlog_overflow_closes_the_stream_instead_of_dropping_silently() {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-relay-overflow-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let conn = Arc::new(Conn::default());
++    conn.with(|out| out.open(7));
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({}));
++    core.lock().relayed.insert(
++        (conn_key(&conn), 7),
++        Relayed {
++            automatic_input: false,
++            visibility_updates: false,
++            focus_updates: false,
++            line: line.clone(),
++            there: 9,
++            conn: conn.clone(),
++            machine: "remote".into(),
++            params: json!({}),
++            attempt: None,
++        },
++    );
++    lock(&line.streams).insert(9, (conn.clone(), 7));
++    // The viewer is not reading: an old core there keeps sending.
++    let chunk = vec![b'x'; 16 * 1024];
++    for _ in 0..(wire::MAX_PENDING / chunk.len()) {
++        stream_data(&core, &line, 9, &chunk);
++    }
++    assert!(core.lock().relayed.contains_key(&(conn_key(&conn), 7)), "4 MiB still fits");
++    stream_data(&core, &line, 9, &chunk);
++    assert!(!core.lock().relayed.contains_key(&(conn_key(&conn), 7)), "no longer relayed");
++    assert!(!lock(&line.streams).contains_key(&9));
++    assert_eq!(rx.recv().await.unwrap(), wire::encode(9, wire::CLOSE, b""), "ended there");
++    let close = conn.outbox().next_frame().unwrap();
++    assert_eq!(close, wire::encode(7, wire::CLOSE, br#"{"reason":"relay_overflow"}"#), "the viewer is told");
++    stream_data(&core, &line, 9, b"later");
++    assert!(conn.outbox().next_frame().is_none(), "nothing after the hole");
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++#[test]
++fn a_reattach_starts_with_the_credit_the_viewer_has_left() {
++    let mut out = wire::Outbox::default();
++    out.open(7);
++    assert_eq!(out.room(7), wire::WINDOW);
++    out.data(7, &vec![b'x'; 100]);
++    assert_eq!(out.room(7), wire::WINDOW - 100, "queued bytes count");
++    while out.next_frame().is_some() {}
++    assert_eq!(out.room(7), wire::WINDOW - 100, "sent and not credited back count too");
++    out.data(7, &vec![b'x'; wire::WINDOW]);
++    assert_eq!(out.room(7), 0);
++    out.open(8);
++    out.set_credit(8, 10 * wire::WINDOW);
++    out.data(8, &vec![b'x'; wire::WINDOW + 1]);
++    assert_eq!(out.room(8), 0, "never more than a window");
++}
++
++/// INS-2950 review (deterministic): the reattach takes the viewer's room as
++/// the new stream's starting credit; CREDIT the viewer returns before the
++/// new stream is installed here (also right after the reply maps it, before
++/// the reattach resumes) is kept and given to the new stream once, and
++/// nothing goes to the dead line. CREDIT after that goes straight there.
++#[tokio::test(flavor = "current_thread")]
++async fn credit_during_a_reattach_reaches_the_new_stream_exactly_once() {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-credit-race-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let machine = Machine {
++        name: "owner".into(),
++        target: "owner".into(),
++        via: false,
++        temporary: false,
++        session: None,
++        id: "remote".into(),
++        host: "owner".into(),
++        version: "test".into(),
++    };
++    let conn = Arc::new(Conn::default());
++    conn.with(|out| {
++        out.open(7);
++        out.set_credit(7, 0); // the phone holds its whole window
++    });
++    let (old_frames, mut old_rx) = mpsc::unbounded_channel();
++    core.lock().relayed.insert(
++        (conn_key(&conn), 7),
++        Relayed {
++            automatic_input: false,
++            visibility_updates: false,
++            focus_updates: false,
++            line: Line::new(old_frames, &json!({})),
++            there: 9,
++            conn: conn.clone(),
++            machine: machine.id.clone(),
++            params: json!({"terminal": "t1"}),
++            attempt: None,
++        },
++    );
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({"features": ["attach_credit"]}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone())); // this pass's line is current
++    let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
++    let request = rx.recv().await.unwrap();
++    let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++    assert_eq!(request["params"]["credit"], 0);
++    let credit = |n: u32| assert!(relay_in(&core, &conn, 7, wire::CREDIT, &n.to_le_bytes()));
++    // In flight: the phone consumed and credited everything it held.
++    credit(wire::WINDOW as u32);
++    assert_eq!(conn.outbox().room(7), wire::WINDOW);
++    // The reply maps the stream; before the reattach resumes, more CREDIT.
++    line.take_reply(json!({"id": request["id"], "result": {"channel": 10}}));
++    credit(100);
++    assert!(old_rx.try_recv().is_err(), "nothing to the dead line");
++    task.await.unwrap();
++    // Installed: later CREDIT goes straight to the new stream.
++    credit(5);
++    let mut granted = Vec::new();
++    while let Ok(frame) = rx.try_recv() {
++        assert_eq!(frame[4], wire::CREDIT);
++        assert_eq!(frame[..4], 10u32.to_le_bytes(), "to the new stream there");
++        granted.push(u32::from_le_bytes(frame[wire::HEADER..].try_into().unwrap()) as usize);
++    }
++    assert_eq!(granted, [wire::WINDOW + 100, 5], "each credited byte once, to the new stream");
++    assert!(old_rx.try_recv().is_err());
++    assert!(core.lock().relayed[&(conn_key(&conn), 7)].attempt.is_none());
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++/// A core with one relayed viewer (channel 7 here, 9 on a dead old line)
++/// that holds its whole window.
++fn held_viewer(name: &str) -> (Arc<Core>, Machine, Arc<Conn>, std::path::PathBuf) {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-{name}-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let machine = Machine {
++        name: "owner".into(),
++        target: "owner".into(),
++        via: false,
++        temporary: false,
++        session: None,
++        id: "remote".into(),
++        host: "owner".into(),
++        version: "test".into(),
++    };
++    let conn = Arc::new(Conn::default());
++    conn.with(|out| {
++        out.open(7);
++        out.set_credit(7, 0);
++    });
++    let (old_frames, _old_rx) = mpsc::unbounded_channel();
++    core.lock().relayed.insert(
++        (conn_key(&conn), 7),
++        Relayed {
++            automatic_input: false,
++            visibility_updates: false,
++            focus_updates: false,
++            line: Line::new(old_frames, &json!({})),
++            there: 9,
++            conn: conn.clone(),
++            machine: machine.id.clone(),
++            params: json!({"terminal": "t1"}),
++            attempt: None,
++        },
++    );
++    (core, machine, conn, root)
++}
++
++/// Polls a future once (the test drives the interleaving itself).
++fn poll_once<F: std::future::Future>(f: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
++    f.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
++}
++
++/// Frames a line sent, as (kind, channel, payload).
++fn sent(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<(u8, u32, Vec<u8>)> {
++    std::iter::from_fn(|| rx.try_recv().ok())
++        .map(|f| (f[4], u32::from_le_bytes(f[..4].try_into().unwrap()), f[wire::HEADER..].to_vec()))
++        .collect()
++}
++
++fn attach_request(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Value {
++    let frame = rx.try_recv().expect("an attach request");
++    serde_json::from_slice(&frame[wire::HEADER..]).unwrap()
++}
++
++/// INS-2950 v3: attempt A got its reply (mapped there) but its line dropped
++/// before A installed; attempt B began on the next line. CREDIT returned
++/// during B belongs to B: A, now stale, neither takes it nor installs, and
++/// only closes its own stream there.
++#[tokio::test(flavor = "current_thread")]
++async fn an_older_reattach_finishing_late_leaves_the_newer_one_its_credit() {
++    let (core, machine, conn, root) = held_viewer("overlap");
++    let (a_frames, mut a_rx) = mpsc::unbounded_channel();
++    let a = Line::new(a_frames, &json!({"features": ["attach_credit"]}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(a.clone())); // this pass's line is current
++    let mut attempt_a = Box::pin(reattach(core.clone(), machine.clone(), a.clone()));
++    assert!(poll_once(attempt_a.as_mut()).is_pending());
++    let request = attach_request(&mut a_rx);
++    assert_eq!(request["params"]["credit"], 0);
++    a.take_reply(json!({"id": request["id"], "result": {"channel": 10}}));
++    lock(&a.streams).clear(); // A's line drops
++    let (b_frames, mut b_rx) = mpsc::unbounded_channel();
++    let b = Line::new(b_frames, &json!({"features": ["attach_credit"]}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(b.clone())); // this pass's line is current
++    let mut attempt_b = Box::pin(reattach(core.clone(), machine, b.clone()));
++    assert!(poll_once(attempt_b.as_mut()).is_pending());
++    let request = attach_request(&mut b_rx);
++    assert_eq!(request["params"]["credit"], 0);
++    // The phone consumes and credits all it held while B waits.
++    assert!(relay_in(&core, &conn, 7, wire::CREDIT, &(wire::WINDOW as u32).to_le_bytes()));
++    assert!(poll_once(attempt_a.as_mut()).is_ready());
++    assert_eq!(sent(&mut a_rx), [(wire::CLOSE, 10, vec![])], "stale A only closes its own stream");
++    {
++        let st = core.lock();
++        let entry = &st.relayed[&(conn_key(&conn), 7)];
++        assert_eq!(entry.there, 9, "A installed nothing");
++        assert_eq!(entry.attempt.as_ref().map(|a| a.kept), Some(wire::WINDOW as u64), "B's bucket untouched");
++    }
++    b.take_reply(json!({"id": request["id"], "result": {"channel": 11}}));
++    assert!(poll_once(attempt_b.as_mut()).is_ready());
++    let credit = (wire::WINDOW as u32).to_le_bytes().to_vec();
++    assert_eq!(sent(&mut b_rx), [(wire::CREDIT, 11, credit)], "B gets every credited byte, once");
++    let st = core.lock();
++    let entry = &st.relayed[&(conn_key(&conn), 7)];
++    assert!(Arc::ptr_eq(&entry.line, &b) && entry.there == 11 && entry.attempt.is_none());
++    drop(st);
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++/// INS-2950 v3: attempt A fails (its line drops before the reply) only after
++/// a newer attempt B has installed. Stale A must not remove B's stream nor
++/// close the viewer.
++#[tokio::test(flavor = "current_thread")]
++async fn an_older_reattach_failing_late_does_not_end_the_newer_stream() {
++    let (core, machine, conn, root) = held_viewer("stale-fail");
++    let (a_frames, mut a_rx) = mpsc::unbounded_channel();
++    let a = Line::new(a_frames, &json!({}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(a.clone())); // this pass's line is current
++    let mut attempt_a = Box::pin(reattach(core.clone(), machine.clone(), a.clone()));
++    assert!(poll_once(attempt_a.as_mut()).is_pending());
++    attach_request(&mut a_rx);
++    let (b_frames, mut b_rx) = mpsc::unbounded_channel();
++    let b = Line::new(b_frames, &json!({}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(b.clone())); // this pass's line is current
++    let mut attempt_b = Box::pin(reattach(core.clone(), machine, b.clone()));
++    assert!(poll_once(attempt_b.as_mut()).is_pending());
++    let request = attach_request(&mut b_rx);
++    b.take_reply(json!({"id": request["id"], "result": {"channel": 11}}));
++    assert!(poll_once(attempt_b.as_mut()).is_ready());
++    lock(&a.pending).clear(); // A's line drops: its call fails
++    assert!(poll_once(attempt_a.as_mut()).is_ready());
++    let st = core.lock();
++    let entry = st.relayed.get(&(conn_key(&conn), 7)).expect("B's stream stays relayed");
++    assert!(Arc::ptr_eq(&entry.line, &b) && entry.there == 11);
++    drop(st);
++    assert!(lock(&b.streams).contains_key(&11), "B's mapping stays");
++    assert!(sent(&mut b_rx).is_empty(), "no CLOSE to B's stream");
++    assert!(conn.outbox().next_frame().is_none(), "the viewer is not closed");
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++/// `held_viewer` plus a second relayed viewer (channel 8 here, 19 on the
++/// same dead old line), also holding its whole window.
++fn two_held_viewers(name: &str) -> (Arc<Core>, Machine, Arc<Conn>, std::path::PathBuf) {
++    let (core, machine, conn, root) = held_viewer(name);
++    let mut second = core.lock().relayed[&(conn_key(&conn), 7)].clone();
++    second.params = json!({"terminal": "t2"});
++    second.there = 19;
++    conn.with(|out| {
++        out.open(8);
++        out.set_credit(8, 0);
++    });
++    core.lock().relayed.insert((conn_key(&conn), 8), second);
++    (core, machine, conn, root)
++}
++
++/// INS-2950 v4: an older reconnect pass A, paused on its first viewer,
++/// resumes only after the newer pass B installed both viewers. A must not
++/// begin a fresh attempt for the second viewer on its dead line (it would
++/// time out as "current" and end B's live stream).
++#[tokio::test(flavor = "current_thread")]
++async fn an_older_reconnect_pass_does_not_begin_again_after_a_newer_one() {
++    let (core, machine, conn, root) = two_held_viewers("old-pass");
++    let (a_frames, mut a_rx) = mpsc::unbounded_channel();
++    let a = Line::new(a_frames, &json!({}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(a.clone()));
++    let mut pass_a = Box::pin(reattach(core.clone(), machine.clone(), a.clone()));
++    assert!(poll_once(pass_a.as_mut()).is_pending());
++    attach_request(&mut a_rx);
++    lock(&a.pending).clear(); // A's line drops; its first attempt fails when A resumes
++    let (b_frames, mut b_rx) = mpsc::unbounded_channel();
++    let b = Line::new(b_frames, &json!({}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(b.clone()));
++    let mut pass_b = Box::pin(reattach(core.clone(), machine, b.clone()));
++    for there in [30, 31] {
++        assert!(poll_once(pass_b.as_mut()).is_pending());
++        let request = attach_request(&mut b_rx);
++        b.take_reply(json!({"id": request["id"], "result": {"channel": there}}));
++    }
++    assert!(poll_once(pass_b.as_mut()).is_ready());
++    assert!(poll_once(pass_a.as_mut()).is_ready(), "A stops: a newer line took over");
++    assert!(a_rx.try_recv().is_err(), "A began nothing more on its dead line");
++    let st = core.lock();
++    for here in [7, 8] {
++        let entry = &st.relayed[&(conn_key(&conn), here)];
++        assert!(Arc::ptr_eq(&entry.line, &b) && entry.attempt.is_none(), "viewer {here} stays on B");
++    }
++    drop(st);
++    assert!(conn.outbox().next_frame().is_none(), "no viewer closed");
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++/// INS-2950 v4: what a later viewer in the same pass asks for is read when
++/// its attempt begins, not when the pass started: a RESIZE and FACTS it
++/// sent meanwhile go into its attach.
++#[tokio::test(flavor = "current_thread")]
++async fn a_later_viewer_in_a_pass_attaches_with_its_current_state() {
++    let (core, machine, conn, root) = two_held_viewers("fresh-begin");
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({}));
++    core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone()));
++    let mut pass = Box::pin(reattach(core.clone(), machine, line.clone()));
++    assert!(poll_once(pass.as_mut()).is_pending());
++    let first = attach_request(&mut rx);
++    let later = if first["params"]["terminal"] == "t1" { 8 } else { 7 };
++    assert!(relay_in(&core, &conn, later, wire::RESIZE, &[90, 0, 30, 0]));
++    assert!(relay_in(&core, &conn, later, wire::FACTS, br##"{"fg":"#112233"}"##));
++    line.take_reply(json!({"id": first["id"], "result": {"channel": 40}}));
++    assert!(poll_once(pass.as_mut()).is_pending());
++    let second = attach_request(&mut rx);
++    assert_eq!((second["params"]["cols"].clone(), second["params"]["rows"].clone()), (json!(90), json!(30)));
++    assert_eq!(second["params"]["display"]["fg"], "#112233");
++    line.take_reply(json!({"id": second["id"], "result": {"channel": 41}}));
++    assert!(poll_once(pass.as_mut()).is_ready());
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index c889f52..93be1ff 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -15,8 +15,34 @@ pub struct Relayed {
+     pub conn: Arc<Conn>,
+     pub machine: String,
+     pub params: Value,
++    /// The reattach in flight, if any (see [`Attempt`]). None: live, CREDIT
++    /// goes straight to `line`/`there`.
++    pub attempt: Option<Attempt>,
+ }
+ 
++/// One reattach of a relayed viewer, after its line dropped. Per viewer
++/// there is at most one current attempt, kept on its [`Relayed`] and only
++/// changed under the core lock:
++///
++/// - live (`attempt: None`): `line`/`there` is the stream; CREDIT goes there.
++/// - reattaching (`Some(Attempt { id, kept })`): started by `reattach`, which
++///   takes the viewer's room as the new stream's starting credit; CREDIT is
++///   counted here (`kept`), not sent to the dead line. A new attempt
++///   replaces an older one (its room already counts that one's `kept`).
++/// - install (only the current `id`): `line`/`there` become the new stream,
++///   `kept` is sent to it once, back to live.
++/// - fail (only the current `id`): the viewer's stream ends here.
++/// - stale (the `id` is no longer current, or the viewer is gone): the
++///   attempt touches nothing of the viewer; it only closes the stream it
++///   opened there.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Attempt {
++    pub id: u64,
++    pub kept: u64,
++}
++
++static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
++
+ /// Why an opted-in stream was refused: a hop on the way lost resize support.
+ pub(super) const RESIZE_LOST: &str = "resize notifications lost";
+ /// Why an opted-in stream was refused: a hop on the way lost visibility support.
+@@ -28,18 +54,43 @@ pub(super) const HISTORY_LOST: &str = "resize history lost";
+ 
+ /// Viewers left waiting by a dropped line to `m` get their terminal back.
+ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+-    let waiting: Vec<((usize, u32), Relayed)> = core
++    let waiting: Vec<(usize, u32)> = core
+         .lock()
+         .relayed
+         .iter()
+         .filter(|(_, r)| r.machine == m.id && !Arc::ptr_eq(&r.line, &line))
+-        .map(|(k, r)| (*k, r.clone()))
++        .map(|(k, _)| *k)
+         .collect();
+-    for ((key, here), r) in waiting {
++    for (key, here) in waiting {
++        // Begin this attempt (see `Attempt`). The viewer's credit here is still
++        // partly spent on what is queued for it: the new stream there starts
++        // with only what it can still take, not a fresh window each time
++        // (repeated drops would pile windows up here until the backlog
++        // overflows). Taken under the lock `relay_in` counts CREDIT under, so
++        // each credited byte is in this starting credit or in `kept`, once.
++        // A pass only acts on viewers whose current stream is still on the
++        // line it is repairing, using fresh entry state: none at all once a
++        // newer line took over (that line's own pass repairs them), and not a
++        // viewer already moved on. Its params are read now, not when the pass
++        // started.
++        let id = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
++        let (r, room) = {
++            let mut st = core.lock();
++            if !matches!(st.lines.get(&m.id), Some(LineState::Connected(l)) if Arc::ptr_eq(l, &line)) {
++                break;
++            }
++            let Some(entry) = st.relayed.get_mut(&(key, here)) else { continue };
++            if entry.machine != m.id || Arc::ptr_eq(&entry.line, &line) {
++                continue;
++            }
++            entry.attempt = Some(Attempt { id, kept: 0 });
++            (entry.clone(), entry.conn.outbox().room(here))
++        };
+         // The screen is painted again; the viewer already has its history.
+         let mut params = r.params.clone();
+         params["history"] = 0.into();
+         params["resumed"] = true.into();
++        params["credit"] = room.into();
+         negotiate_resize(&line, &mut params);
+         negotiate_visibility(&line, &mut params);
+         negotiate_focus(&line, &mut params);
+@@ -55,15 +106,22 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+             wanted_history,
+         );
+         let reply = line.call_into(&m.name, "terminal.attach", params, Some(sink), deadline).await;
++        reattach_gate(reply.is_ok()).await;
+         let lost_resize = matches!(&reply, Err(e) if e.message == RESIZE_LOST);
+         let lost_visibility =
+             matches!(&reply, Err(e) if [VISIBILITY_LOST, FOCUS_LOST, HISTORY_LOST].contains(&e.message.as_str()));
+         let mut st = core.lock();
+-        // Gone meanwhile (the viewer detached): nothing to resume.
+-        if !st.relayed.contains_key(&(key, here)) {
++        let reply = reply.ok();
++        // Stale: a newer attempt took over, or the viewer is gone (detached,
++        // or closed for overflow). Only the stream this attempt opened there ends.
++        let current = st.relayed.get(&(key, here)).and_then(|e| e.attempt.as_ref()).is_some_and(|a| a.id == id);
++        if !current {
++            if let Some(there) = reply.as_ref().and_then(|reply| reply["channel"].as_u64()) {
++                lock(&line.streams).remove(&(there as u32));
++                let _ = line.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
++            }
+             continue;
+         }
+-        let reply = reply.ok();
+         if r.automatic_input && reply.as_ref().is_some_and(|reply| !automatic_input(&line, reply)) {
+             st.relayed.remove(&(key, here));
+             if let Some(there) = reply.as_ref().and_then(|reply| reply["channel"].as_u64()) {
+@@ -75,7 +133,14 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+         }
+         match reply.and_then(|reply| reply["channel"].as_u64()) {
+             Some(there) => {
+-                st.relayed.insert((key, here), Relayed { line: line.clone(), there: there as u32, ..r });
++                // Install: the new stream gets the CREDIT kept meanwhile, once;
++                // later CREDIT goes straight there.
++                let there = there as u32;
++                let entry = st.relayed.get_mut(&(key, here)).expect("current attempt");
++                let kept = entry.attempt.take().map_or(0, |a| a.kept);
++                entry.line = line.clone();
++                entry.there = there;
++                send_credit(&line, there, kept);
+             }
+             None => {
+                 st.relayed.remove(&(key, here));
+@@ -91,6 +156,24 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+     }
+ }
+ 
++/// Tests only (debug builds): with `HC_TEST_REATTACH_GATE` set to a folder,
++/// the n-th reattach in this process (1, 2, ...) writes `ready-n` there
++/// (`{"ok": ..}`, whether its reply came) once its reply is in, and waits for
++/// `release-n` before it installs or fails: a scheduling barrier for
++/// overlapping reattaches.
++async fn reattach_gate(ok: bool) {
++    static SEEN: AtomicU64 = AtomicU64::new(0);
++    if !cfg!(debug_assertions) {
++        return;
++    }
++    let Some(gate) = std::env::var_os("HC_TEST_REATTACH_GATE").map(std::path::PathBuf::from) else { return };
++    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
++    let _ = std::fs::write(gate.join(format!("ready-{n}")), json!({ "ok": ok }).to_string());
++    while !gate.join(format!("release-{n}")).exists() {
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++}
++
+ pub(super) fn automatic_input(line: &Line, reply: &Value) -> bool {
+     line.features.iter().any(|f| f == "automatic_input") && reply["automatic_input"] == true
+ }
+@@ -196,6 +279,7 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+                 conn: conn.clone(),
+                 machine: m.id.clone(),
+                 params,
++                attempt: None,
+             };
+             core.lock().relayed.insert((conn_key(conn), here), viewer);
+             r["channel"] = here.into();
+@@ -235,17 +319,33 @@ pub fn relay_in(core: &Core, conn: &Arc<Conn>, here: u32, kind: u8, payload: &[u
+         {
+             r.params["display"] = display;
+         }
++        // Read here: our stream to the viewer may send more, and so may the
++        // one there to us. Counted under the lock (see `reattach`); while a
++        // reattach is in flight it is kept for the new stream there.
++        if kind == wire::CREDIT && payload.len() == 4 {
++            let n = u32::from_le_bytes(payload.try_into().unwrap());
++            conn.with(|out| out.credit(here, n as usize));
++            if let Some(attempt) = &mut r.attempt {
++                attempt.kept += u64::from(n);
++                return true;
++            }
++        }
+         r.clone()
+     };
+-    // Read here: our stream to the viewer may send more, and so may the one there to us.
+-    if kind == wire::CREDIT && payload.len() == 4 {
+-        conn.with(|out| out.credit(here, u32::from_le_bytes(payload.try_into().unwrap()) as usize));
+-    }
+     // While the line is down this goes nowhere: typing into a gap is lost, not queued.
+     let _ = r.line.frames.send(wire::encode(r.there, kind, payload));
+     true
+ }
+ 
++/// CREDIT for a stream there, in frames of at most u32::MAX bytes.
++fn send_credit(line: &Line, there: u32, mut bytes: u64) {
++    while bytes > 0 {
++        let n = bytes.min(u64::from(u32::MAX)) as u32;
++        let _ = line.frames.send(wire::encode(there, wire::CREDIT, &n.to_le_bytes()));
++        bytes -= u64::from(n);
++    }
++}
++
+ /// A viewer's connection closed: its relayed streams there end.
+ pub fn conn_gone(core: &Core, conn: &Arc<Conn>) {
+     let key = conn_key(conn);
+diff --git a/crates/herdr-core/src/wire.rs b/crates/herdr-core/src/wire.rs
+index 270faee..c4a9b79 100644
+--- a/crates/herdr-core/src/wire.rs
++++ b/crates/herdr-core/src/wire.rs
+@@ -266,6 +266,18 @@ impl Outbox {
+         }
+     }
+ 
++    /// A starting credit below the usual window (a relay's reattach).
++    pub fn set_credit(&mut self, channel: u32, credit: usize) {
++        if let Some(s) = self.streams.get_mut(&channel) {
++            s.credit = credit.min(WINDOW);
++        }
++    }
++
++    /// What the viewer will still take beyond what is queued for it.
++    pub fn room(&self, channel: u32) -> usize {
++        self.streams.get(&channel).map_or(0, |s| s.credit.saturating_sub(s.pending.len()))
++    }
++
+     pub fn can_send(&self, channel: u32) -> bool {
+         self.streams.get(&channel).is_some_and(|s| !s.paused && s.credit > 0)
+     }
+diff --git a/crates/herdr-core/tests/resize_history.rs b/crates/herdr-core/tests/resize_history.rs
+index 6418324..d172778 100644
+--- a/crates/herdr-core/tests/resize_history.rs
++++ b/crates/herdr-core/tests/resize_history.rs
+@@ -209,3 +209,230 @@ fn an_oversized_reconnect_repair_overflowed_by_output_still_arrives_whole() {
+     });
+     assert!(phone.received > 2 << 20, "an oversized repair: {} bytes since the reattach", phone.received);
+ }
++
++/// The relayed viewer's connection at the owner, if one is attached.
++fn relayed_at_owner(owner: &Session, t: &str) -> Option<u64> {
++    let viewers = owner.json(&["viewers", t]);
++    let relayed = viewers["viewers"].as_array()?.iter().find(|v| v["origin"] == "relayed")?.clone();
++    relayed["identity"]["connection_id"].as_u64()
++}
++
++/// INS-2950, the real relay path: a phone stops returning credit (its
++/// parser is busy) while the line to the owner drops and comes back 20
++/// times. Each reattach used to start a fresh 256 KiB window there, so the
++/// relay piled up windows for the phone until its 4 MiB backlog overflowed
++/// and was dropped silently, the stream then going on mid-paint. Now a
++/// reattach starts with only the credit the phone has left: nothing piles
++/// up, nothing is dropped, and once the phone reads again every paint it
++/// gets is whole.
++#[test]
++fn twenty_reattaches_under_a_held_phone_credit_drop_nothing() {
++    let owner = Session::new();
++    let t = owner_terminal(&owner, 400);
++    let relay = relay_to(&owner);
++    let remote = format!("owner/{t}");
++    let mut phone = slow_phone(&relay, &remote, 200);
++    // The phone takes its first window, then holds its credit.
++    phone.drain(Duration::from_millis(800));
++    assert!(phone.received > 0 && phone.received <= wire::WINDOW, "{}", phone.received);
++    let mut previous = relayed_at_owner(&owner, &t);
++    for round in 0..20 {
++        cut_line(&relay, &owner);
++        restore_line(&relay);
++        wait_until(&format!("reattach {round}"), || {
++            let now = relayed_at_owner(&owner, &t);
++            now.is_some() && now != previous
++        });
++        previous = relayed_at_owner(&owner, &t);
++        phone.drain(Duration::from_millis(100));
++    }
++    assert!(phone.received <= wire::WINDOW, "the held credit was respected: {}", phone.received);
++    assert!(phone.closed.is_none(), "not closed while held");
++    phone.raw.clear();
++    credit(&mut phone);
++    phone.until("the history back", |v| v.screen.plain_text().contains("R0300"));
++    phone.drain(Duration::from_millis(500));
++    assert!(phone.closed.is_none(), "{:?}", phone.closed);
++    // What arrived after the hold: line notices, then whole paints (each a
++    // CAN, then the same replacement), never the rest of a cut one.
++    let notice = b"\r\n[line to owner lost; reconnecting...]\r\n";
++    let mut after = phone.raw.clone();
++    while let Some(at) = after.windows(notice.len()).position(|w| w == notice) {
++        after.drain(at..at + notice.len());
++    }
++    let head = String::from_utf8_lossy(&after[..after.len().min(200)]).to_string();
++    assert_eq!(after.first(), Some(&0x18), "it goes on with a whole paint: {head:?}");
++    let paints: Vec<&[u8]> = after.split(|b| *b == 0x18).skip(1).collect();
++    let last = paints.last().unwrap();
++    assert!(paints.iter().all(|p| last.starts_with(p)), "every paint is a prefix of the whole one, none spliced");
++    assert!(has(last, b"\x1b[3J"), "a whole replacement");
++}
++
++/// INS-2950 review: CREDIT the phone returns while a reattach is in flight
++/// (after the relay took its starting credit, before the new stream there
++/// is connected here) must reach the new stream. With a scheduling barrier
++/// at the owner (a debug-build test gate) holding the attach reply, the phone
++/// credits every byte it held; after the reply the repair must flow, not
++/// stall at a starting credit of 0.
++#[test]
++fn credit_returned_while_a_reattach_is_in_flight_reaches_the_new_stream() {
++    let mut owner = Session::new();
++    let gate = owner.root.join("attach-gate");
++    std::fs::create_dir(&gate).unwrap();
++    owner.env.push(("HC_TEST_ATTACH_GATE".into(), gate.display().to_string()));
++    let t = owner_terminal(&owner, 400);
++    let relay = relay_to(&owner);
++    let mut phone = slow_phone(&relay, &format!("owner/{t}"), 300);
++    phone.drain(Duration::from_millis(500));
++    assert_eq!(phone.received, wire::WINDOW, "the phone holds a whole window");
++    cut_line(&relay, &owner);
++    restore_line(&relay);
++    wait_until("the reattach waits at the gate", || gate.join("ready").exists());
++    let request: serde_json::Value =
++        serde_json::from_str(&std::fs::read_to_string(gate.join("ready")).unwrap()).unwrap();
++    assert_eq!(request["credit"], 0, "nothing left to take when it started: {request}");
++    // Every held byte consumed and credited before the new stream is connected here.
++    phone.conn.send(phone.channel, wire::CREDIT, &(phone.received as u32).to_le_bytes());
++    phone.credit = true;
++    phone.drain(Duration::from_millis(300));
++    phone.raw.clear();
++    phone.received = 0;
++    std::fs::write(gate.join("release"), "").unwrap();
++    phone.until("the repair flows", |v| v.screen.plain_text().contains("R0385"));
++    assert!(phone.closed.is_none());
++    assert!(has(&phone.raw, b"\x1b[3J"), "the whole replacement");
++}
++
++/// A relay to `owner` whose reattaches wait at `HC_TEST_REATTACH_GATE`
++/// after their reply (debug builds); returns it and the gate folder.
++fn gated_relay_to(owner: &Session) -> (Session, std::path::PathBuf) {
++    let mut relay = Session::new();
++    let gate = relay.root.join("reattach-gate");
++    std::fs::create_dir(&gate).unwrap();
++    relay.env.push(("HC_TEST_REATTACH_GATE".into(), gate.display().to_string()));
++    relay.env.push(fake_ssh(&relay, &[("owner", owner)]));
++    relay.env.push(("HC_RECONNECT_MS".into(), "200".into()));
++    relay.json(&["machine", "add", "owner"]);
++    (relay, gate)
++}
++
++fn gated_owner() -> (Session, std::path::PathBuf) {
++    let mut owner = Session::new();
++    let gate = owner.root.join("attach-gate");
++    std::fs::create_dir(&gate).unwrap();
++    owner.env.push(("HC_TEST_ATTACH_GATE".into(), gate.display().to_string()));
++    (owner, gate)
++}
++
++/// INS-2950 v3, the real relay path with scheduling barriers: reattach A
++/// gets its reply, then waits (relay gate) while its line drops again;
++/// reattach B starts at credit 0 and its owner reply is held (owner gate)
++/// while the phone credits everything it held. A, finishing late, is stale:
++/// B must get that credit and its repair must flow.
++#[test]
++fn an_older_reattach_finishing_late_does_not_starve_the_newer_one() {
++    let (owner, owner_gate) = gated_owner();
++    std::fs::write(owner_gate.join("release"), "").unwrap(); // A's owner reply passes
++    let t = owner_terminal(&owner, 400);
++    let (relay, gate) = gated_relay_to(&owner);
++    let mut phone = slow_phone(&relay, &format!("owner/{t}"), 300);
++    phone.drain(Duration::from_millis(500));
++    assert_eq!(phone.received, wire::WINDOW);
++    cut_line(&relay, &owner);
++    restore_line(&relay);
++    wait_until("A has its reply", || gate.join("ready-1").exists());
++    std::fs::write(gate.join("release-2"), "").unwrap(); // B installs as soon as its reply is in
++    std::fs::remove_file(owner_gate.join("release")).unwrap();
++    std::fs::remove_file(owner_gate.join("ready")).unwrap();
++    cut_line(&relay, &owner);
++    restore_line(&relay);
++    wait_until("B's owner reply is held", || owner_gate.join("ready").exists());
++    let request: serde_json::Value =
++        serde_json::from_str(&std::fs::read_to_string(owner_gate.join("ready")).unwrap()).unwrap();
++    assert_eq!(request["credit"], 0);
++    phone.conn.send(phone.channel, wire::CREDIT, &(phone.received as u32).to_le_bytes());
++    phone.credit = true;
++    phone.drain(Duration::from_millis(200));
++    std::fs::write(gate.join("release-1"), "").unwrap(); // A finishes late
++    std::thread::sleep(Duration::from_millis(300));
++    phone.raw.clear();
++    phone.received = 0;
++    std::fs::write(owner_gate.join("release"), "").unwrap();
++    phone.until("B's repair flows", |v| v.screen.plain_text().contains("R0385"));
++    assert!(phone.closed.is_none());
++}
++
++/// INS-2950 v3, real relay path: reattach A's line drops before its reply
++/// (owner gate holds it), A's failure waits (relay gate); reattach B
++/// succeeds and history flows. A failing late must not close B's stream.
++#[test]
++fn an_older_reattach_failing_late_does_not_close_the_newer_stream() {
++    let (owner, owner_gate) = gated_owner();
++    let t = owner_terminal(&owner, 400);
++    let (relay, gate) = gated_relay_to(&owner);
++    let mut phone = slow_phone(&relay, &format!("owner/{t}"), 300);
++    phone.drain(Duration::from_millis(500));
++    cut_line(&relay, &owner);
++    restore_line(&relay);
++    wait_until("A's owner reply is held", || owner_gate.join("ready").exists());
++    phone.conn.send(phone.channel, wire::CREDIT, &(phone.received as u32).to_le_bytes());
++    phone.credit = true;
++    cut_line(&relay, &owner);
++    wait_until("A failed, held at the relay gate", || gate.join("ready-1").exists());
++    assert_eq!(std::fs::read_to_string(gate.join("ready-1")).unwrap(), r#"{"ok":false}"#);
++    std::fs::write(gate.join("release-2"), "").unwrap();
++    std::fs::write(owner_gate.join("release"), "").unwrap();
++    restore_line(&relay);
++    phone.until("B's history flows", |v| v.screen.plain_text().contains("R0385"));
++    std::fs::write(gate.join("release-1"), "").unwrap();
++    phone.drain(Duration::from_millis(500));
++    assert!(phone.closed.is_none(), "A's late failure left B alone: {:?}", phone.closed);
++    let before = phone.received;
++    owner.json(&["send", &t, "flood"]);
++    phone.until("B's stream still carries output", |v| v.received > before);
++}
++
++/// INS-2950 v4, the real relay path with two viewers: reconnect pass A is
++/// held (relay gate) after its first viewer's reply while its line drops
++/// again; pass B reattaches both viewers and output reaches both. A, let go,
++/// must not begin anything on its dead line: no attempt times out there and
++/// closes a live viewer.
++#[test]
++fn an_older_reconnect_pass_leaves_both_newer_viewers_alone() {
++    let owner = Session::new();
++    let t = owner_terminal(&owner, 400);
++    let (relay, gate) = gated_relay_to(&owner);
++    for n in [2, 3, 4] {
++        std::fs::write(gate.join(format!("release-{n}")), "").unwrap();
++    }
++    let config = relay.root.join("config/herdr-core");
++    std::fs::create_dir_all(&config).unwrap();
++    std::fs::write(config.join("config.toml"), "machine_timeout = 2.0\n").unwrap();
++    let mut one = slow_phone(&relay, &format!("owner/{t}"), 300);
++    let mut two = slow_phone(&relay, &format!("owner/{t}"), 300);
++    for phone in [&mut one, &mut two] {
++        phone.credit = true;
++        phone.conn.send(phone.channel, wire::CREDIT, &(phone.received as u32).to_le_bytes());
++        phone.drain(Duration::from_millis(200));
++    }
++    cut_line(&relay, &owner);
++    restore_line(&relay);
++    wait_until("A has its first viewer's reply", || gate.join("ready-1").exists());
++    cut_line(&relay, &owner);
++    restore_line(&relay);
++    wait_until("B reattached both viewers", || gate.join("ready-3").exists());
++    for phone in [&mut one, &mut two] {
++        phone.drain(Duration::from_millis(300));
++    }
++    let (before_one, before_two) = (one.received, two.received);
++    owner.json(&["send", &t, "main"]);
++    one.until("output on B (one)", |v| v.received > before_one);
++    two.until("output on B (two)", |v| v.received > before_two);
++    std::fs::write(gate.join("release-1"), "").unwrap();
++    // Longer than the 2 s attach deadline a dead-line attempt would wait out.
++    for phone in [&mut one, &mut two] {
++        phone.drain(Duration::from_millis(1700));
++    }
++    assert!(!gate.join("ready-4").exists(), "A began no attempt on its dead line");
++    assert!(one.closed.is_none() && two.closed.is_none(), "{:?} {:?}", one.closed, two.closed);
++}
+diff --git a/schema/README.md b/schema/README.md
+index b506ebe..f1ba7c4 100644
+--- a/schema/README.md
++++ b/schema/README.md
+@@ -141,7 +141,16 @@ DATA and RESIZE, including across relays.
+ 
+ Flow control: a stream starts with 256 KiB of credit. The viewer sends
+ CREDIT for the bytes it has written out. A viewer that falls more than
+-4 MiB behind gets a fresh repaint instead of the backlog. A stalled stream
++4 MiB behind gets a fresh repaint instead of the backlog. `terminal.attach` may
++pass `credit` (bytes, at most the 256 KiB default) to start lower; cores
++with `attach_credit` in `hello.features` honor it. A relaying core uses it
++when it reattaches a viewer after a dropped line: the new stream there
++starts with only what the viewer can still take, so held credit is never
++granted twice, and CREDIT the viewer returns while that reattach is in
++flight is passed on to the new stream once it is connected. If a relay's backlog for a viewer still overflows (an older
++core there ignores `credit`), the relay closes that stream with
++`{"reason":"relay_overflow"}` rather than going on after a hole; attach
++again. A stalled stream
+ never blocks channel 0 or other streams.
+ 
+ A viewer detaches by sending CLOSE; the core answers with an empty CLOSE.
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 56ad557..6cc3633 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -2713,6 +2713,20 @@
+             "type": "integer"
+           }
+         },
++        {
++          "description": "The stream's starting credit in bytes, at most the usual 256 KiB\nwindow (the default). A relay reattaching a viewer passes what that\nviewer can still take, so bytes it already holds for it count.",
++          "name": "credit",
++          "required": false,
++          "schema": {
++            "description": "The stream's starting credit in bytes, at most the usual 256 KiB\nwindow (the default). A relay reattaching a viewer passes what that\nviewer can still take, so bytes it already holds for it count.",
++            "format": "uint32",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          }
++        },
+         {
+           "description": "Desktop identity forwarded by a core line; ignored from ordinary clients.",
+           "name": "desktop_group",

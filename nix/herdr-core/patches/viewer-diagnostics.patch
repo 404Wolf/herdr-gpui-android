@@ -1,0 +1,1288 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 986bb72..1f2c70b 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -59,6 +59,7 @@ failed send: it may still have arrived; read first.
+ ```sh
+ hc ls                              # all live terminals, not just yours
+ hc get review                      # one terminal's observed state/status
++hc viewers review                  # attached viewers and the exact selected grid (local core only)
+ hc send review "Focus on the first bug"
+ hc send --wait review "Recheck the fix"
+ hc read --lines 100 review          # screen plus history; waits return status only
+@@ -151,7 +152,13 @@ most recently active. With grouped sizing, visible panes in the selected
+ desktop group share the smaller grid. `size_policy = "latest"` selects the
+ latest active desktop pane instead; secondary viewers control size only when no
+ eligible desktop pane remains. Focus between desktop panes keeps the shared
+-grid; colors and cell facts still follow the latest active viewer.
++grid; colors and cell facts follow the selected sizing leader.
++`hc viewers <t>` reports attached viewers, negotiated resize/visibility
++capabilities, offered and selected grids, and the exact sizing candidates.
++It is read-only and local to the current core; it never queries peers. Legacy
++viewers without visibility updates remain visible until their connection ends.
++Viewer identities are connection-lifetime IDs; a same-uid local socket PID is
++shown when available (it may be an `hc connect` helper, not the app process).
+ The same desktop group is forwarded when attaching to another machine;
+ both cores must have this support. `terminal.attach`'s `desktop_group` is
+ core-to-core metadata: ordinary clients cannot claim a group. Forwarded
+@@ -183,6 +190,11 @@ desktop sizing; secondary viewers remain fallback-only. Set
+ latest active desktop pane instead of fitting the group (default: `"grouped"`).
+ Secondary viewers remain fallback-only. No restart needed;
+ the setting applies on the next viewer activity, visibility change or detach.
++`hc viewers <t>` shows this core's attached views, verified local socket peer
++PID when available, offered geometry, effective visibility, selector eligibility,
++and the shared grid decision. It is local-only and read-only. Legacy viewers
++without visibility negotiation remain visible until their connection detaches;
++there is no idle timeout.
+ 
+ ```sh
+ hc run cargo test                  # wait, stream output, return its exit code
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 04309d0..1e21da8 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -90,6 +90,9 @@ methods! { Ctx<'_>;
+     "terminal.get" => terminal_get, TerminalParams => Public,
+         "One terminal's facts, live or finished.",
+         errors ["not_found", "machine_unknown"];
++    "terminal.viewers" => terminal_viewers, ViewerListParams => crate::viewers::ViewerListResult,
++        "Read-only local snapshot of attached viewers and the active sizing selector; never queries peers.",
++        errors ["not_found", "machine_unknown"];
+     "terminal.kill" => terminal_kill, TerminalParams => Public,
+         "End the program: hangup, then terminate, then kill. Returns the observed result.",
+         errors ["not_found", "machine_unknown"];
+@@ -310,6 +313,12 @@ async fn terminal_get(core: Ctx<'_>, p: TerminalParams) -> Result<Public, RpcErr
+     result
+ }
+ 
++async fn terminal_viewers(core: Ctx<'_>, p: ViewerListParams) -> Result<crate::viewers::ViewerListResult, RpcError> {
++    let id = resolve(core, &p.terminal)?;
++    record(core, id)?;
++    Ok(core.viewer_list(id, crate::terminals::address(id)))
++}
++
+ async fn terminal_kill(core: Ctx<'_>, p: TerminalParams) -> Result<Public, RpcError> {
+     let id = resolve(core, &p.terminal)?;
+     if core.lock().reg.terminals.get(&id).is_some_and(|t| t.is_live()) {
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index cc881e8..130fdbd 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -302,6 +302,12 @@ pub struct TerminalParams {
+     pub caller: Option<String>,
+ }
+ 
++#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
++pub struct ViewerListParams {
++    /// A local terminal: `t7` or its local name. This query never fans out to peers.
++    pub terminal: String,
++}
++
+ #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+ pub struct ListParams {
+     /// Include finished terminals.
+diff --git a/crates/herdr-core/src/cli.rs b/crates/herdr-core/src/cli.rs
+index e7fdf2a..11e1f20 100644
+--- a/crates/herdr-core/src/cli.rs
++++ b/crates/herdr-core/src/cli.rs
+@@ -2,7 +2,7 @@
+ 
+ use crate::api::{
+     AttachParams, ExecParams, InterruptParams, KeysParams, LabelParams, ListParams, PutParams, ReadParams, RunParams,
+-    SendParams, SubscribeParams, TerminalParams, WaitParams,
++    SendParams, SubscribeParams, TerminalParams, ViewerListParams, WaitParams,
+ };
+ use crate::client;
+ use crate::paths::Paths;
+@@ -41,6 +41,8 @@ enum Cmd {
+     Ls(ListParams),
+     /// Show one terminal.
+     Get(TerminalParams),
++    /// Show attached viewers and the local sizing decision for one terminal.
++    Viewers(ViewerListParams),
+     /// End a terminal's program (hangup, then escalate).
+     Kill(TerminalParams),
+     /// Remove a finished terminal.
+@@ -462,6 +464,11 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
+             let human = describe(&r);
+             Out { json: r, human }
+         }
++        Cmd::Viewers(p) => {
++            let r = call("terminal.viewers", to(&p))?;
++            let human = viewers(&r);
++            Out { json: r, human }
++        }
+         Cmd::Kill(mut p) => {
+             (p.terminal, p.caller) = (pick(p.terminal)?, Some(caller()));
+             let r = call("terminal.kill", to(&p))?;
+@@ -873,6 +880,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
+     ("run", "terminal.run"),
+     ("ls", "terminal.list"),
+     ("get", "terminal.get"),
++    ("viewers", "terminal.viewers"),
+     ("kill", "terminal.kill"),
+     ("rm", "terminal.rm"),
+     ("label", "terminal.label"),
+diff --git a/crates/herdr-core/src/cli/output.rs b/crates/herdr-core/src/cli/output.rs
+index 04dc44b..dcfa313 100644
+--- a/crates/herdr-core/src/cli/output.rs
++++ b/crates/herdr-core/src/cli/output.rs
+@@ -231,6 +231,78 @@ pub(super) fn table(r: &Value) -> String {
+     out
+ }
+ 
++/// Attached views on one local terminal and the exact current sizing decision.
++pub(super) fn viewers(r: &Value) -> String {
++    let grid =
++        |value: &Value| format!("{}x{}", value["cols"].as_u64().unwrap_or(0), value["rows"].as_u64().unwrap_or(0));
++    let leader = r["leader"].as_object().map_or_else(
++        || "none".into(),
++        |id| format!("c{}/ch{}", id["connection_id"].as_u64().unwrap_or(0), id["channel"].as_u64().unwrap_or(0)),
++    );
++    let selected = r["selected_grid"].as_object().map_or_else(|| "held".into(), |_| grid(&r["selected_grid"]));
++    let mut lines = vec![format!(
++        "{}  PTY {}  selected {}  leader {}",
++        r["terminal"].as_str().unwrap_or("?"),
++        grid(&r["current_grid"]),
++        selected,
++        leader
++    )];
++    let entries = r["viewers"].as_array().map(Vec::as_slice).unwrap_or_default();
++    if entries.is_empty() {
++        lines.push("no attached viewers".into());
++    }
++    for v in entries {
++        let id = &v["identity"];
++        let connection = id["connection_id"].as_u64().unwrap_or(0);
++        let channel = id["channel"].as_u64().unwrap_or(0);
++        let origin = match v["origin"].as_str().unwrap_or("local_client") {
++            "local_desktop" => "local desktop".to_owned(),
++            "relayed" => format!("relayed via {}", v["peer"].as_str().unwrap_or("?")),
++            _ => "local client".to_owned(),
++        };
++        let pid = v["peer_pid"].as_u64().map(|pid| format!(" pid={pid}")).unwrap_or_default();
++        let visibility = if v["visible"] == true { "visible" } else { "hidden" };
++        let eligibility = if v["size_eligible"] == true { "eligible" } else { "excluded" };
++        let capabilities =
++            format!("vis={} resize={}", v["visibility_updates"] == true, v["resize_notifications"] == true);
++        let state = if v["awaiting_size"] == true {
++            "awaiting-size"
++        } else if v["sized"] == true {
++            "sized"
++        } else {
++            "unsized"
++        };
++        let mut roles = Vec::new();
++        if v["observe"] == true {
++            roles.push("observe");
++        }
++        if v["leader"] == true {
++            roles.push("leader");
++        }
++        if v["contributes_to_grid"] == true && v["leader"] != true {
++            roles.push("group-min");
++        }
++        let group = v["desktop_group"].as_object().map_or_else(String::new, |g| {
++            format!(" group={}/{}", g["line"].as_str().unwrap_or("?"), g["group"].as_str().unwrap_or("?"))
++        });
++        let activity = v["active_ms_ago"].as_u64().map_or_else(|| "inactive".into(), |ms| format!("active {ms}ms ago"));
++        lines.push(format!(
++            "c{connection}/ch{channel}  {}{}  {} {} {}  offer={}  {}  {}{}{}",
++            origin,
++            pid,
++            visibility,
++            eligibility,
++            state,
++            grid(&v["offered"]),
++            capabilities,
++            activity,
++            group,
++            if roles.is_empty() { String::new() } else { format!("  [{}]", roles.join(",")) }
++        ));
++    }
++    lines.join("\n")
++}
++
+ /// How a machine's line is: "connected", "unreachable since 14:02 (why)", ...
+ pub(super) fn line_state(m: &Value) -> String {
+     let since = m["since_ms"].as_u64().map(|ms| {
+@@ -281,6 +353,38 @@ pub(super) fn describe(t: &Value) -> String {
+     description
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn viewers_output_reports_both_negotiated_capabilities() {
++        let output = viewers(&serde_json::json!({
++            "terminal":"t1",
++            "current_grid":{"cols":80,"rows":24},
++            "selected_grid":{"cols":80,"rows":24},
++            "leader":{"connection_id":3,"channel":1},
++            "viewers":[{
++                "identity":{"connection_id":3,"channel":1},
++                "origin":"local_desktop",
++                "peer_pid":42,
++                "visible":true,
++                "size_eligible":true,
++                "sized":true,
++                "awaiting_size":false,
++                "visibility_updates":true,
++                "resize_notifications":true,
++                "offered":{"cols":80,"rows":24},
++                "active_ms_ago":1,
++                "leader":true,
++                "contributes_to_grid":true
++            }]
++        }));
++        assert!(output.contains("vis=true resize=true"));
++        assert!(output.contains("c3/ch1  local desktop pid=42"));
++    }
++}
++
+ /// An exec's output as the program wrote it, then its exit code as ours.
+ pub(super) fn exec_out(r: &Value) -> ! {
+     use std::io::Write;
+diff --git a/crates/herdr-core/src/help.txt b/crates/herdr-core/src/help.txt
+index 6f8bc69..89df3cb 100644
+--- a/crates/herdr-core/src/help.txt
++++ b/crates/herdr-core/src/help.txt
+@@ -7,6 +7,7 @@ Terminals
+   run <cmd|template> [task]   run it and wait like a shell (--bg: don't wait)
+   ls                          list live terminals (--all: finished too)
+   get <t>                     show one terminal
++  viewers <t>                 show attached viewers and local sizing decision
+   attach [t]                  put this terminal on it (ctrl+\ detaches)
+   read <t>                    print its screen and history
+   kill <t>                    end its program
+diff --git a/crates/herdr-core/src/platform/desktop_peer.rs b/crates/herdr-core/src/platform/desktop_peer.rs
+index 36279b4..be209cc 100644
+--- a/crates/herdr-core/src/platform/desktop_peer.rs
++++ b/crates/herdr-core/src/platform/desktop_peer.rs
+@@ -4,11 +4,15 @@
+ use super::AsyncRead;
+ 
+ pub(super) fn is_desktop(read: &AsyncRead) -> bool {
+-    let Ok(cred) = read.as_ref().peer_cred() else { return false };
++    same_uid_peer_pid(read).is_some_and(desktop_process)
++}
++
++pub(super) fn same_uid_peer_pid(read: &AsyncRead) -> Option<u32> {
++    let cred = read.as_ref().peer_cred().ok()?;
+     if cred.uid() != unsafe { libc::geteuid() } {
+-        return false;
++        return None;
+     }
+-    cred.pid().is_some_and(|pid| desktop_process(pid as u32))
++    cred.pid().filter(|pid| *pid > 0).map(|pid| pid as u32)
+ }
+ 
+ fn desktop_process(pid: u32) -> bool {
+@@ -35,6 +39,13 @@ mod tests {
+     use std::path::PathBuf;
+     use std::process::{Command, Stdio};
+ 
++    #[tokio::test]
++    async fn peer_pid_comes_from_kernel_same_uid_credentials() {
++        let (server, _client) = tokio::net::UnixStream::pair().unwrap();
++        let (read, _write) = server.into_split();
++        assert_eq!(same_uid_peer_pid(&read), Some(std::process::id()));
++    }
++
+     #[test]
+     fn desktop_identity_uses_the_executable_and_only_one_parent_hop() {
+         assert!(!desktop_process(std::process::id()));
+diff --git a/crates/herdr-core/src/platform/mod.rs b/crates/herdr-core/src/platform/mod.rs
+index 6ece6b6..45a6ac1 100644
+--- a/crates/herdr-core/src/platform/mod.rs
++++ b/crates/herdr-core/src/platform/mod.rs
+@@ -27,6 +27,19 @@ pub(crate) fn local_desktop_viewer(read: &AsyncRead) -> bool {
+     }
+ }
+ 
++/// Kernel-authenticated same-uid Unix peer PID, when this platform exposes it.
++pub(crate) fn local_peer_pid(read: &AsyncRead) -> Option<u32> {
++    #[cfg(target_os = "linux")]
++    {
++        desktop_peer::same_uid_peer_pid(read)
++    }
++    #[cfg(not(target_os = "linux"))]
++    {
++        let _ = read;
++        None
++    }
++}
++
+ #[cfg(target_os = "macos")]
+ mod macos_bundle;
+ #[cfg(target_os = "macos")]
+diff --git a/crates/herdr-core/src/server.rs b/crates/herdr-core/src/server.rs
+index f03acc9..7e2c419 100644
+--- a/crates/herdr-core/src/server.rs
++++ b/crates/herdr-core/src/server.rs
+@@ -187,6 +187,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
+     }
+     let mut conn = Conn::default();
+     conn.local_desktop = local_desktop;
++    conn.peer_pid = platform::local_peer_pid(read.get_ref());
+     let conn = Arc::new(conn);
+     let mut writer = tokio::spawn(write_frames(core.clone(), conn.clone(), write));
+     // Another core dialing in says who it is in its hello.
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index a5857da..a790cd0 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -39,12 +39,15 @@ pub struct Viewer {
+     active_at: Option<Instant>,
+     /// Desktop apps attach hidden tabs with a placeholder before reporting geometry.
+     sized: bool,
+-    /// Whether this desktop view is currently eligible to constrain the PTY grid.
+-    size_eligible: bool,
++    /// The effective compositor visibility. Old clients default to true.
++    visible: bool,
+     /// A relayed reconnect carries cached geometry, not a new physical offer.
+     awaiting_size: bool,
+     /// The attach path negotiated the viewer-to-core VISIBILITY frame.
+     visibility_updates: bool,
++    /// Origin is captured at attach so peer-line cleanup cannot relabel a viewer.
++    origin: ViewerOrigin,
++    peer: Option<String>,
+     /// The source line's machine and the desktop identity carried on that line.
+     desktop_group: Option<(String, String)>,
+     display: Display,
+@@ -52,6 +55,83 @@ pub struct Viewer {
+     pub(crate) recovering: bool,
+ }
+ 
++fn viewer_origin(st: &State, conn: &Arc<Conn>) -> (ViewerOrigin, Option<String>) {
++    let key = crate::remote::conn_key(conn);
++    let peer_id = st.peer_lines.iter().find(|(_, (conn, _))| *conn == key).map(|(id, _)| id);
++    if let Some(id) = peer_id {
++        let peer = st.peers.get(id).map(|peer| peer.name.clone()).unwrap_or_else(|| id.clone());
++        (ViewerOrigin::Relayed, Some(peer))
++    } else if conn.local_desktop {
++        (ViewerOrigin::LocalDesktop, None)
++    } else {
++        (ViewerOrigin::LocalClient, None)
++    }
++}
++
++#[derive(Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ViewerIdentity {
++    /// Monotonic connection ID, unique for this core process lifetime.
++    pub connection_id: u64,
++    pub channel: u32,
++}
++
++#[derive(Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct GridSize {
++    pub cols: u16,
++    pub rows: u16,
++}
++
++#[derive(Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum ViewerOrigin {
++    LocalDesktop,
++    LocalClient,
++    Relayed,
++}
++
++#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
++pub struct ViewerDesktopGroup {
++    pub line: String,
++    pub group: String,
++}
++
++#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
++pub struct ViewerInfo {
++    pub identity: ViewerIdentity,
++    pub origin: ViewerOrigin,
++    /// Connected peer name for a relayed viewer; absent for local connections.
++    pub peer: Option<String>,
++    /// Same-uid local Unix socket peer PID (possibly an `hc connect` child, not its GPUI parent).
++    /// Never populated for relayed connections; unavailable credentials/PID are null.
++    pub peer_pid: Option<u32>,
++    pub offered: GridSize,
++    /// Effective visibility; legacy clients remain visible until detach.
++    pub visible: bool,
++    /// Candidate in the current sizing selector (can be false while visible).
++    pub size_eligible: bool,
++    pub visibility_updates: bool,
++    pub resize_notifications: bool,
++    pub observe: bool,
++    pub sized: bool,
++    pub awaiting_size: bool,
++    pub desktop_group: Option<ViewerDesktopGroup>,
++    /// Milliseconds since last focus/input/size/visibility activity.
++    pub active_ms_ago: Option<u64>,
++    pub leader: bool,
++    /// Included in the selected group's min-grid, or the selected fallback size.
++    pub contributes_to_grid: bool,
++}
++
++#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
++pub struct ViewerListResult {
++    pub terminal: String,
++    pub current_grid: GridSize,
++    /// What the same selector used by the live resizer currently chooses.
++    pub selected_grid: Option<GridSize>,
++    pub leader: Option<ViewerIdentity>,
++    pub viewers: Vec<ViewerInfo>,
++}
++
+ impl Display {
+     /// Answer the program's color and cell-size queries with these facts.
+     pub(crate) fn apply(&self, screen: &mut ghostty_vt::Terminal) {
+@@ -103,6 +183,7 @@ impl Core {
+             ));
+         }
+         let channel = conn.new_channel();
++        let (origin, peer) = viewer_origin(&st, conn);
+         let recovering = st.screens[&id].continuation().is_none();
+         st.viewers.entry(id).or_default().push(Viewer {
+             conn: conn.clone(),
+@@ -113,9 +194,11 @@ impl Core {
+             size: req.size,
+             active_at: (!req.resumed).then(Instant::now),
+             sized: false,
+-            size_eligible: req.visible,
++            visible: req.visible,
+             awaiting_size: req.resumed,
+             visibility_updates: req.visibility_updates,
++            origin,
++            peer,
+             desktop_group: req.desktop_group,
+             display: req.display,
+             recovering,
+@@ -338,10 +421,13 @@ impl Core {
+         let mut st = self.lock();
+         let id = {
+             let Some((id, viewer)) = Self::viewer(&mut st, conn, channel) else { return };
+-            if viewer.observe || !viewer.visibility_updates || viewer.size_eligible == visible {
++            if !viewer.visibility_updates || viewer.visible == visible {
++                return;
++            }
++            viewer.visible = visible;
++            if viewer.observe {
+                 return;
+             }
+-            viewer.size_eligible = visible;
+             if visible {
+                 // A view returning to the active workspace can lead its desktop
+                 // group, but it still needs a physical size after a resume.
+@@ -354,18 +440,21 @@ impl Core {
+ 
+     pub fn viewer_facts(&self, conn: &Arc<Conn>, channel: u32, display: Display) {
+         let mut st = self.lock();
+-        let Some((id, v)) = Self::viewer(&mut st, conn, channel) else { return };
+-        v.display.fg = display.fg.or(v.display.fg.take());
+-        v.display.bg = display.bg.or(v.display.bg.take());
+-        v.display.cursor = display.cursor.or(v.display.cursor.take());
+-        v.display.cell = display.cell.or(v.display.cell);
+-        let display = st.viewers[&id]
+-            .iter()
+-            .filter(|v| !v.observe)
+-            .max_by_key(|v| v.active_at)
+-            .filter(|v| Arc::ptr_eq(&v.conn, conn) && v.channel == channel)
+-            .map(|v| v.display.clone());
+-        if let Some(display) = display {
++        let id = {
++            let Some((id, v)) = Self::viewer(&mut st, conn, channel) else { return };
++            v.display.fg = display.fg.or(v.display.fg.take());
++            v.display.bg = display.bg.or(v.display.bg.take());
++            v.display.cursor = display.cursor.or(v.display.cursor.take());
++            v.display.cell = display.cell.or(v.display.cell);
++            id
++        };
++        let viewers = &st.viewers[&id];
++        let selection = select_sizing(viewers, self.settings().size_policy == crate::config::SizePolicy::Grouped);
++        let selected_display = selection
++            .leader
++            .filter(|leader| Arc::ptr_eq(&viewers[*leader].conn, conn) && viewers[*leader].channel == channel)
++            .map(|leader| viewers[leader].display.clone());
++        if let Some(display) = selected_display {
+             self.apply_display(&mut st, id, Some(&display));
+         }
+     }
+@@ -404,19 +493,65 @@ impl Core {
+         }
+     }
+ 
+-    /// Fit the active device's desktop windows; display facts still follow activity.
++    /// A local snapshot of attached viewers and the exact selector result used for resizing.
++    pub fn viewer_list(&self, id: u32, terminal: String) -> ViewerListResult {
++        let st = self.lock();
++        let viewers = st.viewers.get(&id).map_or(&[][..], Vec::as_slice);
++        let selection = select_sizing(viewers, self.settings().size_policy == crate::config::SizePolicy::Grouped);
++        let current = st
++            .screens
++            .get(&id)
++            .map(|screen| screen.size())
++            .or_else(|| st.reg.terminals.get(&id).map(|record| (record.cols, record.rows)))
++            .unwrap_or_default();
++        let identity =
++            |index: usize| ViewerIdentity { connection_id: viewers[index].conn.id, channel: viewers[index].channel };
++        let now = Instant::now();
++        let details = viewers
++            .iter()
++            .enumerate()
++            .map(|(index, viewer)| ViewerInfo {
++                identity: identity(index),
++                origin: viewer.origin,
++                peer: viewer.peer.clone(),
++                peer_pid: (viewer.origin != ViewerOrigin::Relayed).then_some(viewer.conn.peer_pid).flatten(),
++                offered: GridSize { cols: viewer.size.0, rows: viewer.size.1 },
++                visible: viewer.visible,
++                size_eligible: selection.candidates.contains(&index),
++                visibility_updates: viewer.visibility_updates,
++                resize_notifications: viewer.resize_notifications,
++                observe: viewer.observe,
++                sized: viewer.sized,
++                awaiting_size: viewer.awaiting_size,
++                desktop_group: viewer
++                    .desktop_group
++                    .as_ref()
++                    .map(|(line, group)| ViewerDesktopGroup { line: line.clone(), group: group.clone() }),
++                active_ms_ago: viewer.active_at.map(|active| now.saturating_duration_since(active).as_millis() as u64),
++                leader: selection.leader == Some(index),
++                contributes_to_grid: selection.contributors.contains(&index),
++            })
++            .collect();
++        ViewerListResult {
++            terminal,
++            current_grid: GridSize { cols: current.0, rows: current.1 },
++            selected_grid: selection.size.map(|(cols, rows)| GridSize { cols, rows }),
++            leader: selection.leader.map(identity),
++            viewers: details,
++        }
++    }
++
++    /// Fit the selected desktop window group; display facts follow its sizing leader.
+     fn apply_size(&self, st: &mut State, id: u32) {
+-        let (leader, size) = viewer_size(
+-            st.viewers.get(&id).map_or(&[], Vec::as_slice),
+-            self.settings().size_policy == crate::config::SizePolicy::Grouped,
+-        );
++        let viewers = st.viewers.get(&id).map_or(&[][..], Vec::as_slice);
++        let selection = select_sizing(viewers, self.settings().size_policy == crate::config::SizePolicy::Grouped);
+         // Keep the holder's inherited grid while legacy relays resume. Focus,
+         // input and hidden attach placeholders cannot replace a physical offer.
+-        if leader.is_none() && st.viewers.get(&id).is_some_and(|vs| vs.iter().any(|v| !v.observe)) {
++        if selection.leader.is_none() && st.viewers.get(&id).is_some_and(|vs| vs.iter().any(|v| !v.observe)) {
+             return;
+         }
+-        let (cols, rows) = size.unwrap_or_else(|| self.headless());
+-        let display = leader.map(|v| v.display.clone());
++        let (cols, rows) = selection.size.unwrap_or_else(|| self.headless());
++        let display = selection.leader.map(|leader| st.viewers[&id][leader].display.clone());
+         if !st.screens.contains_key(&id) {
+             return;
+         }
+@@ -491,51 +626,70 @@ impl Core {
+ }
+ 
+ fn desktop_sizer(v: &Viewer) -> bool {
+-    !v.observe
+-        && v.size_eligible
+-        && v.desktop_group.is_some()
+-        && v.sized
+-        && !v.awaiting_size
+-        && v.size.0 > 0
+-        && v.size.1 > 0
++    !v.observe && v.visible && v.desktop_group.is_some() && v.sized && !v.awaiting_size && v.size.0 > 0 && v.size.1 > 0
+ }
+ 
+-fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u16, u16)>) {
+-    let awaiting_size = viewers.iter().any(|v| !v.observe && v.size_eligible && v.awaiting_size);
++#[derive(Default)]
++struct SizeSelection {
++    candidates: Vec<usize>,
++    leader: Option<usize>,
++    contributors: Vec<usize>,
++    size: Option<(u16, u16)>,
++}
++
++fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
++    let awaiting_size = viewers.iter().any(|v| !v.observe && v.visible && v.awaiting_size);
+     // A measured visible desktop owns the sizing device. Phone and legacy
+     // viewers are fallback leaders only until such a desktop is available.
+     let desktop_available = viewers.iter().any(desktop_sizer);
+-    let leader = viewers
++    let candidates: Vec<usize> = viewers
+         .iter()
+-        .filter(|v| {
+-            !v.observe
+-                && v.size_eligible
++        .enumerate()
++        .filter_map(|(index, v)| {
++            (!v.observe
++                && v.visible
+                 && !v.awaiting_size
+                 && (!awaiting_size || v.sized)
+-                && if desktop_available { desktop_sizer(v) } else { v.desktop_group.is_none() }
++                && if desktop_available { desktop_sizer(v) } else { v.desktop_group.is_none() })
++            .then_some(index)
+         })
+-        .max_by_key(|v| v.active_at);
+-    let Some(leader) = leader else { return (None, None) };
+-    let size = if grouped && leader.desktop_group.is_some() {
+-        viewers
++        .collect();
++    let Some(leader) = candidates.iter().copied().max_by_key(|index| viewers[*index].active_at) else {
++        return SizeSelection { candidates, ..Default::default() };
++    };
++    let selected = &viewers[leader];
++    let (contributors, size) = if grouped && selected.desktop_group.is_some() {
++        let contributors: Vec<usize> = viewers
+             .iter()
+-            .filter(|v| {
+-                !v.observe
+-                    && v.desktop_group == leader.desktop_group
+-                    && v.size_eligible
++            .enumerate()
++            .filter_map(|(index, v)| {
++                (!v.observe
++                    && v.desktop_group == selected.desktop_group
++                    && v.visible
+                     && v.sized
+                     && !v.awaiting_size
+                     && v.size.0 > 0
+                     && v.size.1 > 0
+-                    && v.active_at.is_some()
++                    && v.active_at.is_some())
++                .then_some(index)
+             })
+-            .map(|v| v.size)
++            .collect();
++        let size = contributors
++            .iter()
++            .map(|index| viewers[*index].size)
+             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+-            .unwrap_or(leader.size)
++            .unwrap_or(selected.size);
++        (if contributors.is_empty() { vec![leader] } else { contributors }, size)
+     } else {
+-        leader.size
++        (vec![leader], selected.size)
+     };
+-    (Some(leader), Some(size))
++    SizeSelection { candidates, leader: Some(leader), contributors, size: Some(size) }
++}
++
++#[cfg(test)]
++fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u16, u16)>) {
++    let selection = select_sizing(viewers, grouped);
++    (selection.leader.map(|index| &viewers[index]), selection.size)
+ }
+ 
+ /// The screen, then the latest 7501 report of every record and whether the
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index 22394f1..f10e2fb 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -21,10 +21,12 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+         repaint_pending: false,
+         size,
+         active_at,
+-        size_eligible: true,
++        visible: true,
+         sized: true,
+         awaiting_size: false,
+         visibility_updates: true,
++        origin: if conn.local_desktop { ViewerOrigin::LocalDesktop } else { ViewerOrigin::LocalClient },
++        peer: None,
+         desktop_group: conn.local_desktop.then(|| ("local".into(), "desktop".into())),
+         display: Display::default(),
+         recovering: false,
+@@ -32,12 +34,13 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+ }
+ 
+ #[test]
+-fn desktop_windows_fit_both_axes_without_focus_reflow_and_keep_latest_display() {
++fn desktop_windows_fit_both_axes_and_use_the_selected_leader_display() {
+     let now = Instant::now();
+     let a = desktop_conn();
+     let b = desktop_conn();
+     let mut vs = vec![viewer(&a, (100, 20), Some(now)), viewer(&b, (80, 30), Some(now))];
+     vs[0].display.bg = Some("#ffffff".into());
++    vs[1].display.bg = Some("#eeeeee".into());
+     vs[0].active_at = Some(now + std::time::Duration::from_secs(1));
+     let (leader, size) = viewer_size(&vs, true);
+     assert_eq!(size, Some((80, 20)));
+@@ -45,6 +48,15 @@ fn desktop_windows_fit_both_axes_without_focus_reflow_and_keep_latest_display()
+     vs[1].active_at = Some(now + std::time::Duration::from_secs(2));
+     assert_eq!(viewer_size(&vs, true).1, Some((80, 20)));
+     assert_eq!(viewer_size(&vs, false).1, Some((80, 30)), "latest policy remains available");
++    let phone = Arc::new(Conn::default());
++    let mut mobile = viewer(&phone, (40, 10), Some(now + std::time::Duration::from_secs(3)));
++    mobile.display.bg = Some("#000000".into());
++    vs.push(mobile);
++    let (leader, size) = viewer_size(&vs, true);
++    assert_eq!(size, Some((80, 20)), "phone activity cannot override visible desktop sizing");
++    assert_eq!(leader.unwrap().display.bg.as_deref(), Some("#eeeeee"), "display facts follow selected desktop leader");
++    vs.pop();
++    assert_eq!(viewer_size(&vs, true).1, Some((80, 20)));
+     vs.pop();
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 20)), "detach releases the constraint");
+ }
+@@ -76,11 +88,11 @@ fn phones_observers_resumed_and_placeholder_viewers_do_not_pin_desktop_size() {
+     assert_eq!(viewer_size(&vs, false).1, Some((100, 30)), "latest policy still prefers an eligible desktop");
+     vs[1].observe = true;
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)));
+-    vs[0].size_eligible = false;
++    vs[0].visible = false;
+     vs[1].observe = false;
+     assert_eq!(viewer_size(&vs, true).1, Some((40, 10)), "hiding the last desktop restores mobile fallback");
+     assert_eq!(viewer_size(&vs, false).1, Some((40, 10)));
+-    vs[0].size_eligible = true;
++    vs[0].visible = true;
+     vs[1] = viewer(&desktop, (40, 10), None);
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)), "reconnect is not activity");
+     vs[1].active_at = Some(now);
+@@ -111,7 +123,7 @@ fn mobile_only_and_desktop_pending_fallbacks_remain_authoritative() {
+     assert_eq!(viewer_size(&mobile_only, false).1, Some((40, 10)));
+ 
+     mobile_only[1].awaiting_size = false;
+-    mobile_only[1].size_eligible = false;
++    mobile_only[1].visible = false;
+     assert_eq!(viewer_size(&mobile_only, true).1, Some((40, 10)), "a hidden desktop cannot lead");
+ }
+ 
+@@ -122,13 +134,13 @@ fn grouped_size_uses_visible_min_and_visibility_restores_the_grid() {
+     let landscape = desktop_conn();
+     let mut vs = vec![viewer(&portrait, (218, 168), Some(now)), viewer(&landscape, (218, 74), Some(now))];
+ 
+-    vs[1].size_eligible = false;
++    vs[1].visible = false;
+     assert_eq!(viewer_size(&vs, true).1, Some((218, 168)), "off-workspace view is excluded");
+ 
+-    vs[1].size_eligible = true;
++    vs[1].visible = true;
+     assert_eq!(viewer_size(&vs, true).1, Some((218, 74)), "visible view constrains both axes");
+ 
+-    vs[1].size_eligible = false;
++    vs[1].visible = false;
+     assert_eq!(viewer_size(&vs, true).1, Some((218, 168)), "hiding restores the larger grid");
+ }
+ 
+@@ -139,12 +151,12 @@ fn focus_and_idle_do_not_change_visibility_eligibility() {
+     let small = desktop_conn();
+     let mut vs = vec![viewer(&large, (218, 168), Some(now)), viewer(&small, (218, 74), Some(now))];
+     vs[1].active_at = Some(now - std::time::Duration::from_secs(3600));
+-    assert!(vs[1].size_eligible);
++    assert!(vs[1].visible);
+     assert_eq!(viewer_size(&vs, true).1, Some((218, 74)), "an idle visible view still constrains");
+ 
+     vs[1].active_at = None;
+     assert_eq!(viewer_size(&vs, true).1, Some((218, 168)), "a returning viewer without a fresh size cannot constrain");
+-    vs[1].size_eligible = true;
++    vs[1].visible = true;
+     vs[1].active_at = Some(now - std::time::Duration::from_secs(3600));
+     assert_eq!(viewer_size(&vs, true).1, Some((218, 74)), "visibility, not recency, admits the measured size");
+ }
+@@ -242,6 +254,17 @@ fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement(
+     assert_eq!(grid(), (218, 168), "hidden resumed placeholder neither leads nor blocks");
+     core.viewer_visibility(&landscape, l, true);
+     assert_eq!(grid(), (218, 168), "showing an unmeasured resumed view holds the inherited grid");
++    let pending = core.viewer_list(id, "t1".into());
++    let pending = pending
++        .viewers
++        .iter()
++        .find(|viewer| viewer.identity == (ViewerIdentity { connection_id: landscape.id, channel: l }))
++        .unwrap();
++    assert!(pending.visible);
++    assert!(!pending.size_eligible);
++    assert!(pending.awaiting_size);
++    assert!(!pending.sized);
++    assert!(!pending.leader);
+     core.viewer_focus(&landscape, l, false);
+     core.viewer_input(&landscape, l, b"", false);
+     core.viewer_resize(&landscape, l, 0, 0);
+@@ -249,6 +272,14 @@ fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement(
+ 
+     core.viewer_resize(&landscape, l, 218, 74);
+     assert_eq!(grid(), (218, 74), "first positive physical measurement releases the hold");
++    let measured = core.viewer_list(id, "t1".into());
++    let measured = measured
++        .viewers
++        .iter()
++        .find(|viewer| viewer.identity == (ViewerIdentity { connection_id: landscape.id, channel: l }))
++        .unwrap();
++    assert!(measured.size_eligible && measured.leader && measured.contributes_to_grid);
++    assert!(!measured.awaiting_size);
+     core.viewer_visibility(&landscape, l, false);
+     assert_eq!(grid(), (218, 168), "hiding the smaller view restores the larger grid");
+     core.viewer_focus(&landscape, l, true);
+@@ -263,6 +294,158 @@ fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement(
+     std::fs::remove_dir_all(root).unwrap();
+ }
+ 
++#[test]
++fn viewer_diagnostics_track_visibility_group_min_and_disconnect() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let wide = desktop_conn();
++    let narrow = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let request = |size, desktop_group, visibility_updates| AttachRequest {
++        observe: false,
++        resize_notifications: true,
++        visible: true,
++        visibility_updates,
++        history: 0,
++        size,
++        display: Display::default(),
++        resumed: false,
++        desktop_group,
++    };
++    let a = core.attach(&wide, id, request((100, 40), Some(("local".into(), "desktop".into())), true)).unwrap();
++    core.viewer_resize(&wide, a, 100, 40);
++    let b = core.attach(&narrow, id, request((80, 30), Some(("local".into(), "desktop".into())), true)).unwrap();
++    core.viewer_resize(&narrow, b, 80, 30);
++    let mobile = core.attach(&phone, id, request((40, 10), None, false)).unwrap();
++    core.viewer_resize(&phone, mobile, 40, 10);
++    let grid = || core.lock().screens[&id].size();
++    assert_eq!(grid(), (80, 30));
++
++    let snapshot = core.viewer_list(id, "t1".into());
++    assert_eq!(snapshot.current_grid, GridSize { cols: 80, rows: 30 });
++    assert_eq!(snapshot.selected_grid, Some(GridSize { cols: 80, rows: 30 }));
++    let a_identity = ViewerIdentity { connection_id: wide.id, channel: a };
++    let b_identity = ViewerIdentity { connection_id: narrow.id, channel: b };
++    let mobile_identity = ViewerIdentity { connection_id: phone.id, channel: mobile };
++    let a_info = snapshot.viewers.iter().find(|v| v.identity == a_identity).unwrap();
++    let b_info = snapshot.viewers.iter().find(|v| v.identity == b_identity).unwrap();
++    let mobile_info = snapshot.viewers.iter().find(|v| v.identity == mobile_identity).unwrap();
++    assert!(snapshot.leader == Some(b_info.identity));
++    assert!(a_info.size_eligible && a_info.contributes_to_grid);
++    assert!(b_info.size_eligible && b_info.leader && b_info.contributes_to_grid);
++    assert!(mobile_info.visible && !mobile_info.size_eligible && !mobile_info.contributes_to_grid);
++    assert_eq!(mobile_info.origin, ViewerOrigin::LocalClient);
++    assert!(!mobile_info.visibility_updates, "legacy peers do not negotiate visibility");
++    assert!(mobile_info.peer_pid.is_none(), "non-Unix or unavailable PID is omitted");
++    assert_eq!(
++        core.viewer_list(id, "t1".into()).viewers.iter().find(|v| v.identity == mobile_identity).unwrap().identity,
++        mobile_info.identity,
++        "identity stays stable while the connection lives"
++    );
++
++    core.viewer_visibility(&narrow, b, false);
++    assert_eq!(grid(), (100, 40), "hidden minimum no longer constrains the visible desktop");
++    let hidden = core.viewer_list(id, "t1".into());
++    let hidden_b = hidden.viewers.iter().find(|v| v.identity == b_identity).unwrap();
++    assert!(!hidden_b.visible && !hidden_b.size_eligible && !hidden_b.contributes_to_grid);
++    assert_eq!(hidden.selected_grid, Some(GridSize { cols: 100, rows: 40 }));
++
++    core.viewer_visibility(&wide, a, false);
++    assert_eq!(grid(), (40, 10), "with no visible desktop, mobile becomes fallback");
++    let no_desktop = core.viewer_list(id, "t1".into());
++    let phone_info = no_desktop.viewers.iter().find(|v| v.identity == mobile_identity).unwrap();
++    assert!(phone_info.size_eligible && phone_info.leader && phone_info.contributes_to_grid);
++    assert!(!no_desktop.viewers.iter().any(|v| v.identity == a_identity && v.leader));
++
++    core.viewer_visibility(&wide, a, true);
++    assert_eq!(grid(), (100, 40));
++    core.detach(&wide, None);
++    assert_eq!(grid(), (40, 10), "EOF detach removes the desktop offer and restores mobile sizing");
++    let detached = core.viewer_list(id, "t1".into());
++    assert!(!detached.viewers.iter().any(|v| v.identity == a_identity));
++    assert!(detached.viewers.iter().find(|v| v.identity == mobile_identity).unwrap().leader);
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn legacy_viewer_stays_visible_and_eligible_until_detach() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let legacy = desktop_conn();
++    let channel = core
++        .attach(
++            &legacy,
++            id,
++            AttachRequest {
++                observe: false,
++                resize_notifications: false,
++                visible: true,
++                visibility_updates: false,
++                history: 0,
++                size: (100, 40),
++                display: Display::default(),
++                resumed: false,
++                desktop_group: Some(("local".into(), "desktop".into())),
++            },
++        )
++        .unwrap();
++    core.viewer_resize(&legacy, channel, 100, 40);
++    core.viewer_visibility(&legacy, channel, false);
++    core.viewer_focus(&legacy, channel, false);
++    let visible = core.viewer_list(id, "t1".into());
++    let legacy_view = visible.viewers.first().unwrap();
++    assert!(legacy_view.visible && legacy_view.size_eligible && legacy_view.leader);
++    assert!(!legacy_view.visibility_updates);
++    std::thread::sleep(std::time::Duration::from_millis(2));
++    assert!(core.viewer_list(id, "t1".into()).viewers[0].visible, "idle time never expires legacy offers");
++    core.detach(&legacy, None);
++    assert!(core.viewer_list(id, "t1".into()).viewers.is_empty());
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[tokio::test]
++async fn relayed_viewer_origin_and_pid_mask_survive_peer_line_cleanup() {
++    let (core, id, root) = core_with_screen(80, 24);
++    let mut peer_conn = Conn::default();
++    peer_conn.peer_pid = Some(4242);
++    let peer_conn = Arc::new(peer_conn);
++    crate::remote::peer_joined(
++        &core,
++        &peer_conn,
++        &serde_json::json!({"core":{"id":"remote-id","name":"remote"},"calls_you":"test"}),
++    );
++    let channel = core
++        .attach(
++            &peer_conn,
++            id,
++            AttachRequest {
++                observe: false,
++                resize_notifications: true,
++                visible: true,
++                visibility_updates: true,
++                history: 0,
++                size: (80, 24),
++                display: Display::default(),
++                resumed: false,
++                desktop_group: Some(("remote-id".into(), "desktop".into())),
++            },
++        )
++        .unwrap();
++    crate::remote::peer_left(&core, &peer_conn);
++    let info = core
++        .viewer_list(id, "t1".into())
++        .viewers
++        .into_iter()
++        .find(|viewer| viewer.identity == (ViewerIdentity { connection_id: peer_conn.id, channel }))
++        .unwrap();
++    assert_eq!(info.origin, ViewerOrigin::Relayed);
++    assert_eq!(info.peer.as_deref(), Some("remote"));
++    assert_eq!(info.peer_pid, None, "a remote PID is never reported, even after peer-line cleanup");
++    assert!(info.resize_notifications);
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
+ #[tokio::test]
+ async fn fresh_same_size_reoffers_do_not_ping_pong_between_desktop_groups() {
+     let (core, id, root) = core_with_screen(100, 40);
+diff --git a/crates/herdr-core/src/wire.rs b/crates/herdr-core/src/wire.rs
+index 7924dbb..2583b65 100644
+--- a/crates/herdr-core/src/wire.rs
++++ b/crates/herdr-core/src/wire.rs
+@@ -2,6 +2,7 @@
+ //! Channel 0 carries JSON-RPC messages; attach streams get their own channels.
+ 
+ use std::collections::{BTreeMap, VecDeque};
++use std::sync::atomic::{AtomicU64, Ordering};
+ use tokio::io::{AsyncRead, AsyncReadExt};
+ 
+ pub const HEADER: usize = 9;
+@@ -116,8 +117,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for Watched<'_, R> {
+ }
+ 
+ /// A framed connection as the rest of the core sees it: queue frames, wake the writer.
+-#[derive(Default)]
+ pub struct Conn {
++    /// Monotonic identity for diagnostics; stable for this connection's lifetime.
++    pub(crate) id: u64,
++    /// Kernel-authenticated same-uid Unix peer. Never reported for peer-core lines.
++    pub(crate) peer_pid: Option<u32>,
+     /// A verified local desktop app (possibly through its `hc connect` child).
+     pub(crate) local_desktop: bool,
+     outbox: std::sync::Mutex<Outbox>,
+@@ -127,6 +131,22 @@ pub struct Conn {
+     next_channel: std::sync::atomic::AtomicU32,
+ }
+ 
++static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
++
++impl Default for Conn {
++    fn default() -> Self {
++        Self {
++            id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
++            peer_pid: None,
++            local_desktop: false,
++            outbox: std::sync::Mutex::new(Outbox::default()),
++            wake: tokio::sync::Notify::new(),
++            overflowed: tokio::sync::Notify::new(),
++            next_channel: std::sync::atomic::AtomicU32::new(0),
++        }
++    }
++}
++
+ impl Conn {
+     pub fn outbox(&self) -> std::sync::MutexGuard<'_, Outbox> {
+         self.outbox.lock().unwrap_or_else(|p| p.into_inner())
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 309a2db..606df7d 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -322,6 +322,27 @@
+         ],
+         "type": "object"
+       },
++      "GridSize": {
++        "properties": {
++          "cols": {
++            "format": "uint16",
++            "maximum": 65535,
++            "minimum": 0,
++            "type": "integer"
++          },
++          "rows": {
++            "format": "uint16",
++            "maximum": 65535,
++            "minimum": 0,
++            "type": "integer"
++          }
++        },
++        "required": [
++          "cols",
++          "rows"
++        ],
++        "type": "object"
++      },
+       "HelloResult": {
+         "properties": {
+           "core": {
+@@ -1477,6 +1498,185 @@
+         ],
+         "type": "object"
+       },
++      "ViewerDesktopGroup": {
++        "properties": {
++          "group": {
++            "type": "string"
++          },
++          "line": {
++            "type": "string"
++          }
++        },
++        "required": [
++          "line",
++          "group"
++        ],
++        "type": "object"
++      },
++      "ViewerIdentity": {
++        "properties": {
++          "channel": {
++            "format": "uint32",
++            "minimum": 0,
++            "type": "integer"
++          },
++          "connection_id": {
++            "description": "Monotonic connection ID, unique for this core process lifetime.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": "integer"
++          }
++        },
++        "required": [
++          "connection_id",
++          "channel"
++        ],
++        "type": "object"
++      },
++      "ViewerInfo": {
++        "properties": {
++          "active_ms_ago": {
++            "description": "Milliseconds since last focus/input/size/visibility activity.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          },
++          "awaiting_size": {
++            "type": "boolean"
++          },
++          "contributes_to_grid": {
++            "description": "Included in the selected group's min-grid, or the selected fallback size.",
++            "type": "boolean"
++          },
++          "desktop_group": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/ViewerDesktopGroup"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "identity": {
++            "$ref": "#/components/schemas/ViewerIdentity"
++          },
++          "leader": {
++            "type": "boolean"
++          },
++          "observe": {
++            "type": "boolean"
++          },
++          "offered": {
++            "$ref": "#/components/schemas/GridSize"
++          },
++          "origin": {
++            "$ref": "#/components/schemas/ViewerOrigin"
++          },
++          "peer": {
++            "description": "Connected peer name for a relayed viewer; absent for local connections.",
++            "type": [
++              "string",
++              "null"
++            ]
++          },
++          "peer_pid": {
++            "description": "Same-uid local Unix socket peer PID (possibly an `hc connect` child, not its GPUI parent).\nNever populated for relayed connections; unavailable credentials/PID are null.",
++            "format": "uint32",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          },
++          "resize_notifications": {
++            "type": "boolean"
++          },
++          "size_eligible": {
++            "description": "Candidate in the current sizing selector (can be false while visible).",
++            "type": "boolean"
++          },
++          "sized": {
++            "type": "boolean"
++          },
++          "visibility_updates": {
++            "type": "boolean"
++          },
++          "visible": {
++            "description": "Effective visibility; legacy clients remain visible until detach.",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "identity",
++          "origin",
++          "offered",
++          "visible",
++          "size_eligible",
++          "visibility_updates",
++          "resize_notifications",
++          "observe",
++          "sized",
++          "awaiting_size",
++          "leader",
++          "contributes_to_grid"
++        ],
++        "type": "object"
++      },
++      "ViewerListResult": {
++        "properties": {
++          "current_grid": {
++            "$ref": "#/components/schemas/GridSize"
++          },
++          "leader": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/ViewerIdentity"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "selected_grid": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/GridSize"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "What the same selector used by the live resizer currently chooses."
++          },
++          "terminal": {
++            "type": "string"
++          },
++          "viewers": {
++            "items": {
++              "$ref": "#/components/schemas/ViewerInfo"
++            },
++            "type": "array"
++          }
++        },
++        "required": [
++          "terminal",
++          "current_grid",
++          "viewers"
++        ],
++        "type": "object"
++      },
++      "ViewerOrigin": {
++        "enum": [
++          "local_desktop",
++          "local_client",
++          "relayed"
++        ],
++        "type": "string"
++      },
+       "WaitResult": {
+         "properties": {
+           "children": {
+@@ -2074,6 +2274,44 @@
+         }
+       }
+     },
++    {
++      "description": "Read-only local snapshot of attached viewers and the active sizing selector; never queries peers.",
++      "errors": [
++        {
++          "code": -32000,
++          "data": {
++            "kind": "not_found"
++          },
++          "message": "not_found"
++        },
++        {
++          "code": -32000,
++          "data": {
++            "kind": "machine_unknown"
++          },
++          "message": "machine_unknown"
++        }
++      ],
++      "name": "terminal.viewers",
++      "paramStructure": "by-name",
++      "params": [
++        {
++          "description": "A local terminal: `t7` or its local name. This query never fans out to peers.",
++          "name": "terminal",
++          "required": true,
++          "schema": {
++            "description": "A local terminal: `t7` or its local name. This query never fans out to peers.",
++            "type": "string"
++          }
++        }
++      ],
++      "result": {
++        "name": "result",
++        "schema": {
++          "$ref": "#/components/schemas/ViewerListResult"
++        }
++      }
++    },
+     {
+       "description": "End the program: hangup, then terminate, then kill. Returns the observed result.",
+       "errors": [

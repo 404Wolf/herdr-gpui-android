@@ -1,0 +1,1549 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 56f6b6b..a1a31c6 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -133,6 +133,19 @@ queued on that terminal in the last hour (`server status`'s
+ `queue_keys_kept_ms`) isn't queued again (`repeated: true`); `--core <id>`
+ makes sure it's that core.
+ 
++A `warning` in the answer of `send`, `keys` or `interrupt` means the call went
++through but core could not save its terminals just now (a full disk, say). It
++keeps trying on its own: don't repeat the call. `hc server status` says the
++same once, as `saving` with `since_ms` and `reason`.
++
++`hc server restart` first saves the registry and waits for it, and refuses if
++it can't: the next core kills every terminal its registry doesn't list. From
++the moment it is asked, `run` and `exec` refuse until the core is back.
++`hc server restart --force-stale-registry` restarts anyway, and says which
++terminals that kills (the live ones missing from the registry saved on disk,
++read from the file), or that it can't tell: only for a restart that can't
++wait, such as a disk that won't recover. Otherwise free the disk.
++
+ ## Run programs
+ 
+ API clients that already know a terminal's pane size can pass `size: {cols, rows}`
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index b106ea7..5a56044 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -79,9 +79,9 @@ methods! { Ctx<'_>;
+     "server.stop" => server_stop, Empty => StopResult,
+         "Stop the core and its programs. Kept terminals remain pending and get new shells when the core next starts.",
+         errors [];
+-    "server.restart" => server_restart, Empty => StopResult,
+-        "Planned restart (e.g. after an update): screens are saved, programs keep running, the next core adopts them.",
+-        errors [];
++    "server.restart" => server_restart, RestartParams => StopResult,
++        "Planned restart (e.g. after an update): screens are saved, programs keep running, the next core adopts them. Once asked, terminal.run and machine.exec refuse until it has restarted. It first saves its registry and waits for that: if it can't (a full disk), it refuses with `unavailable` and nothing changes, because the next core kills every terminal its registry doesn't list. `force_stale_registry` restarts anyway; the answer's `warning` names the live terminals missing from the registry saved on disk, which the next core kills.",
++        errors ["unavailable"];
+     "terminal.run" => terminal_run, RunParams => RunResult,
+         "Start a program in a new terminal; or, when argv[0] names a template, start its command and send its body plus the rest of argv as the first message once the agent is ready. Returns once it runs (and the first message is sent or not).",
+         errors ["invalid_params", "name_taken", "spawn_failed", "unavailable", "invalid_template", "not_found", "machine_unknown", "config"];
+@@ -243,6 +243,7 @@ async fn server_status(core: Ctx<'_>, _: Empty) -> Result<StatusResult, RpcError
+         installed_by: crate::client::installed_by().map(String::from),
+         features: FEATURES.iter().map(|f| f.to_string()).collect(),
+         queue_keys_kept_ms: crate::inbox::KEYS_KEPT_MS,
++        saving: core.saving_failure().map(|(since_ms, reason)| SavingFailure { since_ms, reason }),
+     })
+ }
+ 
+@@ -252,14 +253,69 @@ async fn server_stop(core: Ctx<'_>, _: Empty) -> Result<StopResult, RpcError> {
+     }
+     crate::restart::discard(&core.paths);
+     if let Err(e) = core.shutdown().await {
+-        eprintln!("core: shutdown registry flush failed: {}", e.message);
++        crate::log!("core: shutdown registry flush failed: {}", e.message);
+     }
+-    Ok(StopResult { stopped: true })
++    Ok(StopResult { stopped: true, warning: None })
+ }
+ 
+-async fn server_restart(core: Ctx<'_>, _: Empty) -> Result<StopResult, RpcError> {
++async fn server_restart(core: Ctx<'_>, p: RestartParams) -> Result<StopResult, RpcError> {
++    // From here nothing new starts (terminal.run and exec refuse), so the registry
++    // can't gain a terminal the next core would kill.
+     crate::restart::prepare(core).map_err(|e| RpcError::internal(e.to_string()))?;
+-    Ok(StopResult { stopped: true })
++    // The next core only knows the terminals saved. Save the registry as it is and
++    // wait for it before anything is acknowledged or any holder hears of the restart.
++    core.save(&core.lock());
++    let Some(why) = core.flush_warning().await else {
++        return Ok(StopResult { stopped: true, warning: None });
++    };
++    if !p.force_stale_registry {
++        crate::restart::cancel(core);
++        return Err(RpcError::new(
++            "unavailable",
++            format!("not restarting: {why}"),
++            "the next core would kill the live terminals missing from the saved registry; free the disk and try again, or --force-stale-registry",
++        ));
++    }
++    let warning = format!(
++        "restarting with a registry that is behind ({why}): {}",
++        match unsaved(core) {
++            Ok(lost) if lost.is_empty() =>
++                "every live terminal is in the saved registry, so the next core kills none".into(),
++            Ok(lost) =>
++                format!("the next core kills the live terminals missing from the saved registry: {}", lost.join(" ")),
++            Err(e) => format!(
++                "the saved registry can't be read to tell which ({e}); the next core kills every live terminal it doesn't list"
++            ),
++        }
++    );
++    crate::log!("core: {warning}");
++    Ok(StopResult { stopped: true, warning: Some(warning) })
++}
++
++/// The live terminals the next core would kill: not in the registry saved on disk as live on
++/// the holder that runs them (what `adopt` requires). Read from the file itself, not inferred
++/// from when saving began to fail: a terminal created before the first failed write was
++/// reported is just as missing. Err when the file can't be read.
++pub(crate) fn unsaved(core: &Core) -> Result<Vec<String>, String> {
++    let saved: crate::terminals::Registry =
++        crate::paths::read_state(&core.paths.state.join("terminals.json")).map_err(|e| e.to_string())?;
++    let st = core.lock();
++    let mut lost: Vec<String> = st
++        .reg
++        .terminals
++        .values()
++        .filter(|t| t.is_live())
++        .filter(|t| {
++            let on = t.holder.as_deref();
++            !saved
++                .terminals
++                .get(&t.id())
++                .is_some_and(|s| s.is_live() && s.holder.as_deref().or(saved.holder.as_deref()) == on)
++        })
++        .map(|t| t.address.clone())
++        .collect();
++    lost.sort();
++    Ok(lost)
+ }
+ 
+ async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcError> {
+@@ -590,7 +646,7 @@ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcEr
+     } else {
+         None
+     };
+-    core.flush_saved().await?;
++    let warning = core.flush_warning().await;
+     Ok(SendResult {
+         status: sent.status,
+         turn: sent.turn,
+@@ -599,6 +655,7 @@ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcEr
+         via: sent.via.into(),
+         waiting: sent.waiting,
+         repeated: sent.repeated,
++        warning,
+     })
+ }
+ 
+@@ -655,8 +712,8 @@ async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysResult, RpcEr
+     let id = resolve(core, &p.terminal)?;
+     let (status, turn) = core.keys(id, &p.keys).await?;
+     core.saw(p.caller.as_deref(), id);
+-    core.flush_saved().await?;
+-    Ok(KeysResult { status, turn })
++    let warning = core.flush_warning().await;
++    Ok(KeysResult { status, turn, warning })
+ }
+ 
+ async fn terminal_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<InterruptResult, RpcError> {
+@@ -670,8 +727,8 @@ async fn terminal_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<Interru
+         Interrupted::StillWorking => "still_working",
+         Interrupted::Unknown => "unknown",
+     };
+-    core.flush_saved().await?;
+-    Ok(InterruptResult { outcome: outcome.into(), key })
++    let warning = core.flush_warning().await;
++    Ok(InterruptResult { outcome: outcome.into(), key, warning })
+ }
+ 
+ async fn events_subscribe(core: Ctx<'_>, p: SubscribeParams) -> Result<SubscribeResult, RpcError> {
+diff --git a/crates/herdr-core/src/api/run.rs b/crates/herdr-core/src/api/run.rs
+index f9cda2e..e02eea2 100644
+--- a/crates/herdr-core/src/api/run.rs
++++ b/crates/herdr-core/src/api/run.rs
+@@ -81,11 +81,17 @@ pub(crate) fn tail(text: String, id: u32) -> String {
+ }
+ 
+ /// A stopping core starts nothing: whatever it started now would outlive the stop.
+-pub(crate) fn not_stopping(st: &crate::runtime::State) -> Result<(), RpcError> {
+-    match st.stopping {
+-        true => Err(RpcError::new("unavailable", "the core is stopping", "run it again once it has stopped")),
+-        false => Ok(()),
++/// Nor does one that is restarting: it would not be in the registry the next core loads,
++/// and the next core kills what its registry doesn't list. (Check and creation both
++/// happen under the state lock, which `restart::prepare` takes to set the flag.)
++pub(crate) fn not_stopping(core: &Core, st: &crate::runtime::State) -> Result<(), RpcError> {
++    if st.stopping {
++        return Err(RpcError::new("unavailable", "the core is stopping", "run it again once it has stopped"));
+     }
++    if core.restart.load(std::sync::atomic::Ordering::SeqCst) {
++        return Err(RpcError::new("unavailable", "the core is restarting", "run it again once it has restarted"));
++    }
++    Ok(())
+ }
+ 
+ pub(super) async fn start(
+@@ -93,7 +99,7 @@ pub(super) async fn start(
+     p: RunParams,
+     template: Option<crate::templates::Template>,
+ ) -> Result<Terminal, RpcError> {
+-    not_stopping(&core.lock())?;
++    not_stopping(core, &core.lock())?;
+     core.ensure_holder().await.map_err(|e| {
+         RpcError::new(
+             "unavailable",
+@@ -132,7 +138,7 @@ pub(super) async fn start(
+     };
+     let (id, rx) = {
+         let mut st = core.lock();
+-        not_stopping(&st)?;
++        not_stopping(core, &st)?;
+         let instance = st
+             .current()
+             .ok_or_else(|| {
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 11232cc..0fe60c3 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -158,6 +158,19 @@ pub struct StatusResult {
+     /// How long a terminal remembers a `terminal.queue` key: a sender may
+     /// retry a send whose answer it lost for up to this long.
+     pub queue_keys_kept_ms: u64,
++    /// Present while the core can't save its terminals (a full disk, say). It
++    /// keeps trying and says so here once, instead of failing calls; what
++    /// changed meanwhile is lost if the core stops before it saves.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub saving: Option<SavingFailure>,
++}
++
++#[derive(Serialize, JsonSchema)]
++pub struct SavingFailure {
++    /// When saving started to fail, ms since the epoch.
++    pub since_ms: u64,
++    /// Why the newest try failed.
++    pub reason: String,
+ }
+ 
+ #[derive(Deserialize, JsonSchema)]
+@@ -193,6 +206,20 @@ pub struct DocSetResult {
+ #[derive(Serialize, JsonSchema)]
+ pub struct StopResult {
+     pub stopped: bool,
++    /// A restart with `force_stale_registry`: the terminals the next core will kill.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub warning: Option<String>,
++}
++
++#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
++pub struct RestartParams {
++    /// Restart even though the core can't save its terminals. The next core
++    /// then kills every live terminal missing from the registry saved on disk
++    /// (it loads that one), and the answer says which. For a restart that
++    /// can't wait, such as a disk that won't recover; otherwise free the disk.
++    #[arg(long)]
++    #[serde(default)]
++    pub force_stale_registry: bool,
+ }
+ 
+ #[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
+@@ -625,6 +652,10 @@ pub struct SendResult {
+     /// `terminal.queue`: its key was queued before, so it wasn't queued again.
+     #[serde(default, skip_serializing_if = "is_false")]
+     pub repeated: bool,
++    /// The core could not save its terminals just now (a full disk, say) and
++    /// keeps trying; this call itself went through, so don't repeat it.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub warning: Option<String>,
+ }
+ 
+ fn is_false(b: &bool) -> bool {
+@@ -722,6 +753,10 @@ pub struct KeysParams {
+ pub struct KeysResult {
+     pub status: Option<String>,
+     pub turn: u64,
++    /// The core could not save its terminals just now (a full disk, say) and
++    /// keeps trying; this call itself went through, so don't repeat it.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub warning: Option<String>,
+ }
+ 
+ #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+@@ -741,6 +776,10 @@ pub struct InterruptResult {
+     pub outcome: String,
+     /// The key sent: esc for programs that report status, else ctrl+c.
+     pub key: String,
++    /// The core could not save its terminals just now (a full disk, say) and
++    /// keeps trying; this call itself went through, so don't repeat it.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub warning: Option<String>,
+ }
+ 
+ #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+diff --git a/crates/herdr-core/src/cli.rs b/crates/herdr-core/src/cli.rs
+index 11e1f20..9d971c3 100644
+--- a/crates/herdr-core/src/cli.rs
++++ b/crates/herdr-core/src/cli.rs
+@@ -1,8 +1,8 @@
+ //! `hc`: one API call per command. Tables for people, JSON when piped or `--json`.
+ 
+ use crate::api::{
+-    AttachParams, ExecParams, InterruptParams, KeysParams, LabelParams, ListParams, PutParams, ReadParams, RunParams,
+-    SendParams, SubscribeParams, TerminalParams, ViewerListParams, WaitParams,
++    AttachParams, ExecParams, InterruptParams, KeysParams, LabelParams, ListParams, PutParams, ReadParams,
++    RestartParams, RunParams, SendParams, SubscribeParams, TerminalParams, ViewerListParams, WaitParams,
+ };
+ use crate::client;
+ use crate::paths::Paths;
+@@ -132,7 +132,9 @@ enum ServerCmd {
+     Stop,
+     Status,
+     /// Restart the core (e.g. after an update); programs keep running.
+-    Restart,
++    /// Refused while the core can't save its terminals (a full disk): the next
++    /// core would kill every live terminal missing from the saved registry.
++    Restart(RestartParams),
+ }
+ 
+ const HELP: &str = include_str!("help.txt");
+@@ -396,18 +398,18 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
+             if !r["wait"].is_null() {
+                 human = format!("{human}\n{}", describe_wait(&r["wait"]));
+             }
+-            Out { json: r, human }
++            Out { human: with_warning(human, &r), json: r }
+         }
+         Cmd::Keys(mut p) => {
+             p.caller = Some(caller());
+             let r = call("terminal.keys", to(&p))?;
+-            Out { json: r, human: "keys sent".into() }
++            Out { human: with_warning("keys sent".into(), &r), json: r }
+         }
+         Cmd::Interrupt(mut p) => {
+             p.terminal = pick(p.terminal)?;
+             let r = call("terminal.interrupt", to(&p))?;
+             let human = format!("sent {}: {}", r["key"].as_str().unwrap_or("?"), r["outcome"].as_str().unwrap_or("?"));
+-            Out { json: r, human }
++            Out { human: with_warning(human, &r), json: r }
+         }
+         Cmd::Run(mut p) => {
+             if p.on.is_none() {
+@@ -577,11 +579,14 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
+             let human = serde_json::to_string_pretty(&r).unwrap_or_default();
+             Out { json: r, human }
+         }
+-        Cmd::Server { action: action @ (ServerCmd::Start | ServerCmd::Status | ServerCmd::Restart) } => {
+-            if matches!(action, ServerCmd::Restart)
++        Cmd::Server { action: action @ (ServerCmd::Start | ServerCmd::Status | ServerCmd::Restart(_)) } => {
++            if let ServerCmd::Restart(p) = &action
+                 && let Some(stream) = client::connect_existing(&paths)
+             {
+-                client::call(&stream, "server.restart", json!({}))?;
++                let r = client::call(&stream, "server.restart", to(p))?;
++                if let Some(warning) = r["warning"].as_str() {
++                    eprintln!("hc: {warning}");
++                }
+                 wait_closed(&stream);
+             }
+             let r = if crate::platform::status_may_start_core() {
+@@ -595,13 +600,16 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
+                 client::call(&stream, "server.status", json!({}))?
+             };
+             let id = r["core"]["id"].as_str().unwrap_or("?");
+-            let human = format!(
++            let mut human = format!(
+                 "core {} ({}) running, pid {}, up {}s",
+                 r["core"]["name"].as_str().unwrap_or("?"),
+                 id.get(..8).unwrap_or(id),
+                 r["pid"],
+                 r["uptime_ms"].as_u64().unwrap_or(0) / 1000
+             );
++            if let Some(reason) = r["saving"]["reason"].as_str() {
++                human = format!("{human}\nnot saving its terminals: {reason}");
++            }
+             Out { json: r, human }
+         }
+         Cmd::Server { action: ServerCmd::Stop } => stop(&paths)?,
+diff --git a/crates/herdr-core/src/cli/output.rs b/crates/herdr-core/src/cli/output.rs
+index 0adb632..8752b09 100644
+--- a/crates/herdr-core/src/cli/output.rs
++++ b/crates/herdr-core/src/cli/output.rs
+@@ -159,6 +159,14 @@ pub(super) fn short(t: &Value) -> Value {
+     Value::Object(out)
+ }
+ 
++/// A call that went through but whose registry save failed says so after its own line.
++pub(super) fn with_warning(human: String, r: &Value) -> String {
++    match r["warning"].as_str() {
++        Some(warning) => format!("{human}\nwarning: {warning}"),
++        None => human,
++    }
++}
++
+ pub(super) fn describe_wait(r: &Value) -> String {
+     let t = r["terminal"].as_str().unwrap_or("?");
+     let mut lines: Vec<String> = r["children"].as_array().into_iter().flatten().map(describe_wait).collect();
+diff --git a/crates/herdr-core/src/exec.rs b/crates/herdr-core/src/exec.rs
+index 4d68446..b1b15b6 100644
+--- a/crates/herdr-core/src/exec.rs
++++ b/crates/herdr-core/src/exec.rs
+@@ -141,7 +141,7 @@ pub async fn run(core: &Arc<Core>, p: ExecParams, from_afar: bool) -> Result<Exe
+         ),
+         None => None,
+     };
+-    crate::api::not_stopping(&core.lock())?;
++    crate::api::not_stopping(core, &core.lock())?;
+     let slot = Slot::take()?;
+     let cwd = folder(p.cwd.as_deref(), from_afar);
+     let token = crate::sweep::token();
+diff --git a/crates/herdr-core/src/holder.rs b/crates/herdr-core/src/holder.rs
+index 5c6a221..8035c78 100644
+--- a/crates/herdr-core/src/holder.rs
++++ b/crates/herdr-core/src/holder.rs
+@@ -119,7 +119,7 @@ pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
+         let stream = stream?;
+         std::thread::spawn(move || {
+             if let Err(e) = holder.serve(stream) {
+-                eprintln!("holder: core connection: {e}");
++                crate::log!("holder: core connection: {e}");
+             }
+         });
+     }
+@@ -318,7 +318,7 @@ impl Holder {
+         let frame = match started {
+             Err(e) => {
+                 let error = format!("cannot start {:?}: {e}", spec.argv.first().map_or("", |s| s.as_str()));
+-                eprintln!("holder: {}: {error}", crate::terminals::address(id));
++                crate::log!("holder: {}: {error}", crate::terminals::address(id));
+                 proto::json_frame(proto::SPAWN_FAILED, id, &proto::SpawnFailed { error })
+             }
+             Ok((reader, mut writer, pty, child)) => {
+@@ -393,7 +393,7 @@ impl Holder {
+         let (code, signal) = match platform::wait(&mut child) {
+             Ok(ended) => ended,
+             Err(e) => {
+-                eprintln!("holder: wait {}: {e}", crate::terminals::address(id));
++                crate::log!("holder: wait {}: {e}", crate::terminals::address(id));
+                 return;
+             }
+         };
+@@ -440,7 +440,7 @@ impl Holder {
+             st.core_left = now;
+             drop(st);
+             if let Err(e) = crate::client::spawn_core(&self.paths) {
+-                eprintln!("holder: cannot start core: {e:?}");
++                crate::log!("holder: cannot start core: {e:?}");
+             }
+         }
+     }
+diff --git a/crates/herdr-core/src/kept.rs b/crates/herdr-core/src/kept.rs
+index 1830359..2869577 100644
+--- a/crates/herdr-core/src/kept.rs
++++ b/crates/herdr-core/src/kept.rs
+@@ -49,13 +49,13 @@ impl Core {
+             return;
+         }
+         if let Err(e) = self.ensure_holder().await {
+-            eprintln!("core: kept terminals waiting for a holder: {e}");
++            crate::log!("core: kept terminals waiting for a holder: {e}");
+             return;
+         }
+         let shell = match crate::config::load(&self.paths.config).and_then(|settings| settings.shell()) {
+             Ok(shell) => shell,
+             Err(e) => {
+-                eprintln!("core: kept terminals waiting for a shell: {}", e.message);
++                crate::log!("core: kept terminals waiting for a shell: {}", e.message);
+                 return;
+             }
+         };
+diff --git a/crates/herdr-core/src/lib.rs b/crates/herdr-core/src/lib.rs
+index f0d614f..319060f 100644
+--- a/crates/herdr-core/src/lib.rs
++++ b/crates/herdr-core/src/lib.rs
+@@ -15,6 +15,7 @@ pub mod input;
+ mod kept;
+ pub mod keys;
+ pub mod locale;
++mod log;
+ pub mod machines;
+ pub mod notes;
+ pub mod paths;
+diff --git a/crates/herdr-core/src/log.rs b/crates/herdr-core/src/log.rs
+new file mode 100644
+index 0000000..141b0f5
+--- /dev/null
++++ b/crates/herdr-core/src/log.rs
+@@ -0,0 +1,15 @@
++//! The core's log. Stderr (core.log, the holder's log) can fail to take a
++//! line: a full disk, a closed pipe. `eprintln!` panics then, and a panic in
++//! the registry writer or in a holder thread ends it for good. A log line is
++//! never worth that, so the core and the holder log with this and lose the
++//! line when it can't be written.
++
++/// `eprintln!` that never panics: a line that can't be written is dropped.
++#[macro_export]
++#[doc(hidden)]
++macro_rules! log {
++    ($($arg:tt)*) => {{
++        use std::io::Write as _;
++        let _ = writeln!(std::io::stderr(), $($arg)*);
++    }};
++}
+diff --git a/crates/herdr-core/src/machines.rs b/crates/herdr-core/src/machines.rs
+index 3d0e24a..3696d3b 100644
+--- a/crates/herdr-core/src/machines.rs
++++ b/crates/herdr-core/src/machines.rs
+@@ -91,7 +91,7 @@ pub fn unknown(machines: &[Machine], name: &str) -> crate::rpc::RpcError {
+ pub fn save(state: &Path, machines: &[Machine]) {
+     let bytes = serde_json::to_vec_pretty(machines).expect("machines serialize");
+     if let Err(e) = crate::paths::write_atomic(&state.join("machines.json"), &bytes) {
+-        eprintln!("core: cannot save machines: {e}");
++        crate::log!("core: cannot save machines: {e}");
+     }
+ }
+ 
+diff --git a/crates/herdr-core/src/platform/macos_bundle.rs b/crates/herdr-core/src/platform/macos_bundle.rs
+index 900799b..b436416 100644
+--- a/crates/herdr-core/src/platform/macos_bundle.rs
++++ b/crates/herdr-core/src/platform/macos_bundle.rs
+@@ -337,7 +337,7 @@ pub fn installer_startup() -> bool {
+         Err(io::Error::other("expected source executable and destination entry point"))
+     };
+     if let Err(error) = result {
+-        eprintln!("hc: bundle install failed: {error}");
++        crate::log!("hc: bundle install failed: {error}");
+         std::process::exit(1);
+     }
+     std::process::exit(0)
+diff --git a/crates/herdr-core/src/platform/macos_launchd.rs b/crates/herdr-core/src/platform/macos_launchd.rs
+index 178121c..b1633cb 100644
+--- a/crates/herdr-core/src/platform/macos_launchd.rs
++++ b/crates/herdr-core/src/platform/macos_launchd.rs
+@@ -107,7 +107,7 @@ pub fn startup() -> bool {
+         return false;
+     };
+     if let Err(error) = result {
+-        eprintln!("hc: launchd detach failed: {error}");
++        crate::log!("hc: launchd detach failed: {error}");
+         std::process::exit(1);
+     }
+     true
+@@ -138,7 +138,7 @@ pub fn prepare_core() {
+             if let Ok(paths) = crate::paths::Paths::from_env() {
+                 fallback(&paths.state.join("core.log"), &error);
+             } else {
+-                eprintln!("hc: cannot move core startup to launchd: {error}");
++                crate::log!("hc: cannot move core startup to launchd: {error}");
+             }
+         }
+     }
+@@ -167,7 +167,7 @@ pub fn spawn(cmd: &mut Command, log: &Path) -> bool {
+ 
+ fn fallback(log: &Path, error: &io::Error) {
+     let reason = format!("hc: launchd startup failed; starting directly (may end with the launching app): {error}");
+-    eprintln!("{reason}");
++    crate::log!("{reason}");
+     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+         let _ = writeln!(file, "{reason}");
+     }
+@@ -288,7 +288,7 @@ impl Job {
+ impl Drop for Job {
+     fn drop(&mut self) {
+         if let Err(error) = self.remove() {
+-            eprintln!("hc: cannot remove launchd job {}: {error}", self.target);
++            crate::log!("hc: cannot remove launchd job {}: {error}", self.target);
+         }
+         let _ = std::fs::remove_dir_all(&self.dir);
+     }
+@@ -313,7 +313,7 @@ fn remove_stale(domain: &str, now: Duration) {
+     for label in stale_labels(&list, now) {
+         let target = format!("{domain}/{label}");
+         if let Err(error) = launchctl(&[OsStr::new("bootout"), OsStr::new(&target)]) {
+-            eprintln!("hc: cannot remove finished launchd job {target}: {error}");
++            crate::log!("hc: cannot remove finished launchd job {target}: {error}");
+         }
+     }
+ }
+@@ -344,7 +344,7 @@ fn remove_stale_dirs(root: &Path, now: Duration) {
+             continue;
+         }
+         if let Err(error) = std::fs::remove_dir_all(&path) {
+-            eprintln!("hc: cannot remove abandoned launchd directory {}: {error}", path.display());
++            crate::log!("hc: cannot remove abandoned launchd directory {}: {error}", path.display());
+         }
+     }
+ }
+diff --git a/crates/herdr-core/src/platform/macos_responsibility.rs b/crates/herdr-core/src/platform/macos_responsibility.rs
+index 7ddbb79..534e15f 100644
+--- a/crates/herdr-core/src/platform/macos_responsibility.rs
++++ b/crates/herdr-core/src/platform/macos_responsibility.rs
+@@ -24,7 +24,7 @@ pub fn holder_startup() {
+         exec(cmd)
+     })();
+     if let Err(error) = result {
+-        eprintln!("hc: cannot disclaim holder responsibility: {error}");
++        crate::log!("hc: cannot disclaim holder responsibility: {error}");
+         std::process::exit(1);
+     }
+ }
+@@ -41,9 +41,9 @@ fn exec_or_inherit(mut cmd: Command, disclaim: Option<Disclaim>) -> io::Result<(
+     match disclaim {
+         Some(disclaim) => {
+             let error = exec_with(&cmd, disclaim).unwrap_err();
+-            eprintln!("hc: responsibility disclaimer failed ({error}); using inherited responsibility");
++            crate::log!("hc: responsibility disclaimer failed ({error}); using inherited responsibility");
+         }
+-        None => eprintln!("hc: responsibility disclaimer unavailable; using inherited responsibility"),
++        None => crate::log!("hc: responsibility disclaimer unavailable; using inherited responsibility"),
+     }
+     Err(cmd.exec())
+ }
+diff --git a/crates/herdr-core/src/platform/macos_shutdown.rs b/crates/herdr-core/src/platform/macos_shutdown.rs
+index 57cb663..dacbf93 100644
+--- a/crates/herdr-core/src/platform/macos_shutdown.rs
++++ b/crates/herdr-core/src/platform/macos_shutdown.rs
+@@ -89,7 +89,7 @@ pub fn monitor() -> Option<Registration> {
+     match Registration::new(PREFIX, watcher) {
+         Ok(registration) => Some(registration),
+         Err(e) => {
+-            eprintln!("core: cannot watch host shutdown: {e}");
++            crate::log!("core: cannot watch host shutdown: {e}");
+             None
+         }
+     }
+diff --git a/crates/herdr-core/src/platform/mod.rs b/crates/herdr-core/src/platform/mod.rs
+index 45a6ac1..e1c1f4b 100644
+--- a/crates/herdr-core/src/platform/mod.rs
++++ b/crates/herdr-core/src/platform/mod.rs
+@@ -73,7 +73,7 @@ pub fn prepare_core() {
+ pub(crate) fn raise_nofile_limit() {
+     #[cfg(unix)]
+     if let Err(error) = unix::raise_nofile_limit() {
+-        eprintln!("cannot raise open file limit; using inherited limit: {error}");
++        crate::log!("cannot raise open file limit; using inherited limit: {error}");
+     }
+ }
+ 
+@@ -262,7 +262,7 @@ pub async fn program_env() -> std::collections::BTreeMap<String, String> {
+     {
+         env = tokio::task::spawn_blocking(move || {
+             if let Err(error) = windows_env::refresh(&mut env) {
+-                eprintln!("cannot refresh Windows environment; using inherited settings: {error}");
++                crate::log!("cannot refresh Windows environment; using inherited settings: {error}");
+             }
+             env
+         })
+diff --git a/crates/herdr-core/src/platform/systemd.rs b/crates/herdr-core/src/platform/systemd.rs
+index 12158b2..13ded69 100644
+--- a/crates/herdr-core/src/platform/systemd.rs
++++ b/crates/herdr-core/src/platform/systemd.rs
+@@ -69,7 +69,7 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
+         Ok(run) => run,
+         Err(warn) => {
+             if warn {
+-                eprintln!("{NO_MANAGER}");
++                crate::log!("{NO_MANAGER}");
+             }
+             return None;
+         }
+@@ -77,7 +77,7 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
+     let guarded = match ensure_shutdown_guard(&run, log) {
+         Ok(()) => true,
+         Err(e) => {
+-            eprintln!("hc: {e}; starting without shutdown ordering");
++            crate::log!("hc: {e}; starting without shutdown ordering");
+             false
+         }
+     };
+@@ -125,7 +125,7 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
+         Ok(out) => Err(io::Error::other(format!("systemd-run: {}", String::from_utf8_lossy(&out.stderr).trim()))),
+         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+             let _ = std::fs::remove_dir_all(&dir);
+-            eprintln!("{NO_MANAGER} (no systemd-run on PATH)");
++            crate::log!("{NO_MANAGER} (no systemd-run on PATH)");
+             return None;
+         }
+         Err(e) => Err(io::Error::new(e.kind(), format!("systemd-run: {e}"))),
+@@ -331,9 +331,9 @@ fn enable_linger(mut command: Command, user: String) -> io::Result<std::thread::
+             .status()
+             .is_ok_and(|s| s.success());
+         if enabled {
+-            eprintln!("hc: turned on linger for {user}, so the core outlives your logins");
++            crate::log!("hc: turned on linger for {user}, so the core outlives your logins");
+         } else {
+-            eprintln!("hc: the core stops when your last login ends; `sudo loginctl enable-linger {user}` keeps it");
++            crate::log!("hc: the core stops when your last login ends; `sudo loginctl enable-linger {user}` keeps it");
+         }
+     })
+ }
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index 15ad1f2..c283495 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -370,7 +370,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
+                 _ => break,
+             },
+             () = heard.silent_for(silence) => {
+-                eprintln!("core: {} sent nothing for {} s: line given up", m.name, silence.as_secs());
++                crate::log!("core: {} sent nothing for {} s: line given up", m.name, silence.as_secs());
+                 break;
+             }
+         };
+@@ -458,7 +458,7 @@ fn stream_data(core: &Core, line: &Line, there: u32, payload: &[u8]) {
+ /// A relayed stream's backlog here overflowed and was dropped: the viewer
+ /// is told (CLOSE, `relay_overflow`) and attaches again; the stream there ends.
+ fn overflowed(core: &Core, line: &Line, conn: &Arc<Conn>, here: u32, there: u32) {
+-    eprintln!("core: a relayed stream fell too far behind: closed");
++    crate::log!("core: a relayed stream fell too far behind: closed");
+     core.lock().relayed.remove(&(conn_key(conn), here));
+     let _ = line.frames.send(wire::encode(there, wire::CLOSE, b""));
+     conn.with(|out| out.close(here, br#"{"reason":"relay_overflow"}"#));
+@@ -639,7 +639,7 @@ pub struct Peer {
+ fn save_peers(core: &Core, st: &State) {
+     let bytes = serde_json::to_vec(&st.peers).expect("peers serialize");
+     if let Err(e) = crate::paths::write_atomic(&core.paths.state.join("peers.json"), &bytes) {
+-        eprintln!("core: cannot save peers: {e}");
++        crate::log!("core: cannot save peers: {e}");
+     }
+ }
+ 
+diff --git a/crates/herdr-core/src/restart.rs b/crates/herdr-core/src/restart.rs
+index 56a9f9e..759c90b 100644
+--- a/crates/herdr-core/src/restart.rs
++++ b/crates/herdr-core/src/restart.rs
+@@ -31,12 +31,18 @@ pub(crate) fn prepare(core: &Core) -> io::Result<()> {
+     drop(state);
+     discard(&core.paths);
+     if let Err(error) = save(&core.paths) {
+-        eprintln!("core: cannot preserve restart environment; using the next launcher's environment: {error}");
++        crate::log!("core: cannot preserve restart environment; using the next launcher's environment: {error}");
+         discard(&core.paths);
+     }
+     Ok(())
+ }
+ 
++/// Takes the restart back: it was refused before any holder heard of it.
++pub(crate) fn cancel(core: &Core) {
++    core.restart.store(false, Ordering::SeqCst);
++    discard(&core.paths);
++}
++
+ fn save(paths: &Paths) -> io::Result<()> {
+     let env = Environment {
+         machine_id: crate::platform::machine_id(),
+@@ -92,7 +98,7 @@ pub(crate) unsafe fn restore(paths: &Paths) {
+         Ok(Some(vars)) => vars,
+         Ok(None) => return,
+         Err(error) => {
+-            eprintln!("core: ignoring restart environment: {error}");
++            crate::log!("core: ignoring restart environment: {error}");
+             discard(paths);
+             return;
+         }
+@@ -122,7 +128,7 @@ fn remove(path: &Path) {
+     if let Err(error) = std::fs::remove_file(path)
+         && error.kind() != io::ErrorKind::NotFound
+     {
+-        eprintln!("core: cannot remove {}: {error}", path.display());
++        crate::log!("core: cannot remove {}: {error}", path.display());
+     }
+ }
+ 
+@@ -150,7 +156,7 @@ pub(crate) fn discard_if_stopped(paths: &Paths) {
+         Ok(lock) if crate::platform::try_lock(&lock) => discard(paths),
+         Ok(_) => {}
+         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+-        Err(error) => eprintln!("core: cannot lock restart environment for cleanup: {error}"),
++        Err(error) => crate::log!("core: cannot lock restart environment for cleanup: {error}"),
+     }
+ }
+ 
+diff --git a/crates/herdr-core/src/runtime.rs b/crates/herdr-core/src/runtime.rs
+index 4b68d08..4db6889 100644
+--- a/crates/herdr-core/src/runtime.rs
++++ b/crates/herdr-core/src/runtime.rs
+@@ -165,9 +165,9 @@ impl Core {
+         let reg: Registry = read_state(&paths.state.join("terminals.json"))?;
+         let docs_path = paths.state.join("docs.json");
+         let docs = read_state(&docs_path).unwrap_or_else(|e| {
+-            eprintln!("core: cannot load documents, starting empty: {e}");
++            crate::log!("core: cannot load documents, starting empty: {e}");
+             if let Err(e) = std::fs::rename(&docs_path, paths.state.join("docs.json.bad")) {
+-                eprintln!("core: cannot quarantine documents: {e}");
++                crate::log!("core: cannot quarantine documents: {e}");
+             }
+             Default::default()
+         });
+@@ -225,18 +225,35 @@ impl Core {
+ 
+     /// Acknowledged mutations wait here without holding the state lock or blocking the executor.
+     /// Attach, events.subscribe snapshots, forwarded run `afar`, and NotesAfar replies do not wait.
+-    /// Completed write failures are logged, as before; a stuck disk still times out.
++    /// A write that failed is not the caller's failure: the writer logs it once and keeps
++    /// trying, and the mutation stands; a stuck disk still times out.
+     pub async fn flush_saved(&self) -> Result<(), crate::rpc::RpcError> {
+-        tokio::time::timeout(Duration::from_secs(10), self.registry_writer.flush())
+-            .await
+-            .map_err(|_| {
+-                crate::rpc::RpcError::new(
+-                    "unavailable",
+-                    "registry persistence timed out; the operation may already have completed",
+-                    "check the terminal and disk before retrying",
+-                )
+-            })?
+-            .map_err(|e| crate::rpc::RpcError::internal(format!("cannot save terminals: {e}")))
++        self.saved().await.map(drop)
++    }
++
++    /// While saving the registry fails: since when (ms since the epoch) and why.
++    pub fn saving_failure(&self) -> Option<(u64, String)> {
++        self.registry_writer.failing()
++    }
++
++    /// For a call whose effect cannot be undone (text typed, keys pressed): a registry that
++    /// can't be saved, or not in time, is a warning in its answer, never an error. A caller
++    /// told its send failed sends it again.
++    pub async fn flush_warning(&self) -> Option<String> {
++        self.saved().await.unwrap_or_else(|e| Some(e.message))
++    }
++
++    /// Waits for the registry to be saved: `Some(why)` when it couldn't be (the writer keeps trying).
++    async fn saved(&self) -> Result<Option<String>, crate::rpc::RpcError> {
++        match tokio::time::timeout(Duration::from_secs(10), self.registry_writer.flush()).await {
++            Err(_) => Err(crate::rpc::RpcError::new(
++                "unavailable",
++                "registry persistence timed out; the operation may already have completed",
++                "check the terminal and disk before retrying",
++            )),
++            Ok(Ok(())) => Ok(None),
++            Ok(Err(e)) => Ok(Some(format!("the core could not save its terminals ({e}); it keeps trying"))),
++        }
+     }
+ 
+     /// For frequent changes a crash may lose (the next start rebuilds them):
+@@ -601,10 +618,10 @@ impl Core {
+                 Ok(Ok(_))
+             );
+         if taken {
+-            eprintln!("core: lost the link to holder {instance}, reconnected");
++            crate::log!("core: lost the link to holder {instance}, reconnected");
+             return;
+         }
+-        eprintln!("core: lost the link to holder {instance} for good; its terminals wait for the next core start");
++        crate::log!("core: lost the link to holder {instance} for good; its terminals wait for the next core start");
+         // Closed, so the holder sees us leave instead of waiting on a link nobody reads.
+         if let Ok(ours) = ours {
+             let _ = ours.shutdown(std::net::Shutdown::Both);
+@@ -741,7 +758,7 @@ impl Core {
+         if let Some(snapshot) = st.screens.remove(&id).and_then(|s| s.snapshot())
+             && let Err(e) = write_atomic(&self.snapshot_path(id), &snapshot)
+         {
+-            eprintln!("core: cannot save screen of {}: {e}", crate::terminals::address(id));
++            crate::log!("core: cannot save screen of {}: {e}", crate::terminals::address(id));
+         }
+         // `--rm`: gone now, unless its parent is waiting for the exit code.
+         let rm = st.reg.terminals.get(&id).is_some_and(|t| {
+diff --git a/crates/herdr-core/src/runtime/persistence.rs b/crates/herdr-core/src/runtime/persistence.rs
+index ffb465b..fc66ca8 100644
+--- a/crates/herdr-core/src/runtime/persistence.rs
++++ b/crates/herdr-core/src/runtime/persistence.rs
+@@ -1,14 +1,20 @@
+ //! Ordered registry persistence, without disk IO on the core state lock.
++//!
++//! The writer never stops. A write that fails (a full disk) is kept and tried
++//! again, backing off, and only the newest snapshot is ever written. The caller
++//! who asked hears of the failure at once; nothing waits for a disk that may
++//! stay full.
+ use crate::paths::write_atomic;
+ use std::io;
+ use std::path::PathBuf;
+-use std::sync::{Arc, Condvar, Mutex};
++use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+ use std::thread::JoinHandle;
++use std::time::{Duration, Instant};
+ use tokio::sync::watch;
+ 
+ pub(super) struct RegistryWriter {
+     queue: Arc<(Mutex<Pending>, Condvar)>,
+-    completed: watch::Receiver<u64>,
++    progress: watch::Receiver<Progress>,
+     worker: Option<JoinHandle<()>>,
+ }
+ 
+@@ -19,6 +25,32 @@ struct Pending {
+     closed: bool,
+ }
+ 
++/// How far the writer got: the newest snapshot it tried, and why that failed
++/// (with when saving started to fail, ms since the epoch).
++#[derive(Clone, Default)]
++struct Progress {
++    tried: u64,
++    failed: Option<String>,
++    since_ms: u64,
++}
++
++/// The wait before the first retry of a failed write; it doubles up to `RETRY_MAX` times this.
++fn retry_base() -> Duration {
++    let ms = std::env::var("HC_SAVE_RETRY_MS").ok().and_then(|v| v.parse().ok());
++    Duration::from_millis(ms.unwrap_or(if cfg!(test) { 10 } else { 250 }))
++}
++const RETRY_MAX: u32 = 20;
++
++fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++}
++
++/// One write, which may fail or panic: either is a failed write, never the end of the writer.
++fn attempt(write: &mut impl FnMut(&[u8]) -> io::Result<()>, bytes: &[u8]) -> io::Result<()> {
++    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(bytes)))
++        .unwrap_or_else(|_| Err(io::Error::other("the write panicked")))
++}
++
+ impl RegistryWriter {
+     pub fn new(path: PathBuf) -> io::Result<Self> {
+         Self::start(move |bytes| write_atomic(&path, bytes))
+@@ -26,54 +58,102 @@ impl RegistryWriter {
+ 
+     pub(super) fn start(mut write: impl FnMut(&[u8]) -> io::Result<()> + Send + 'static) -> io::Result<Self> {
+         let queue = Arc::new((Mutex::new(Pending::default()), Condvar::new()));
+-        let (done, completed) = watch::channel(0);
++        let (done, progress) = watch::channel(Progress::default());
+         let work = queue.clone();
+         let worker = std::thread::Builder::new().name("registry-writer".into()).spawn(move || {
+             let (mutex, changed) = &*work;
+-            let mut pending = mutex.lock().unwrap();
++            let base = retry_base();
++            let mut backoff = base;
++            // The newest snapshot not saved yet, and while failing, when to try it again.
++            let mut held: Option<(u64, Vec<u8>)> = None;
++            let mut next_try: Option<Instant> = None;
++            let mut failing = false;
++            let mut since_ms = 0;
++            let mut last_try = false;
++            let mut pending = lock(mutex);
+             loop {
+-                if let Some((version, bytes)) = pending.latest.take() {
++                if let Some(newest) = pending.latest.take() {
++                    held = Some(newest);
++                }
++                let closing = pending.closed;
++                // Once closed it tries what it still holds one last time, then ends.
++                let finished = closing && last_try;
++                let due = held.is_some() && !finished && (closing || next_try.is_none_or(|at| Instant::now() >= at));
++                if due {
++                    let (version, bytes) = held.take().expect("due means held");
+                     drop(pending);
+-                    if let Err(e) = write(&bytes) {
+-                        eprintln!("core: cannot save terminals: {e}");
++                    match attempt(&mut write, &bytes) {
++                        Ok(()) => {
++                            if failing {
++                                crate::log!("core: saving terminals again");
++                            }
++                            (failing, next_try, backoff) = (false, None, base);
++                            done.send_replace(Progress { tried: version, ..Default::default() });
++                        }
++                        Err(e) => {
++                            if !failing {
++                                crate::log!("core: cannot save terminals, trying again: {e}");
++                                since_ms = super::now_ms();
++                            }
++                            failing = true;
++                            next_try = Some(Instant::now() + backoff);
++                            backoff = (backoff * 2).min(base * RETRY_MAX);
++                            held = Some((version, bytes));
++                            done.send_replace(Progress { tried: version, failed: Some(e.to_string()), since_ms });
++                        }
+                     }
+-                    done.send_replace(version);
+-                    pending = mutex.lock().unwrap();
+-                } else if pending.closed {
++                    last_try = closing;
++                    pending = lock(mutex);
++                } else if closing && (held.is_none() || finished) {
+                     break;
+                 } else {
+-                    pending = changed.wait(pending).unwrap();
++                    pending = match next_try.filter(|_| held.is_some()) {
++                        Some(at) => {
++                            let wait = at.saturating_duration_since(Instant::now());
++                            changed.wait_timeout(pending, wait).unwrap_or_else(|poisoned| poisoned.into_inner()).0
++                        }
++                        None => changed.wait(pending).unwrap_or_else(|poisoned| poisoned.into_inner()),
++                    };
+                 }
+             }
+         })?;
+-        Ok(Self { queue, completed, worker: Some(worker) })
++        Ok(Self { queue, progress, worker: Some(worker) })
+     }
+ 
+     /// Called under the core lock: snapshots enter the queue in state order.
+     pub fn save(&self, bytes: Vec<u8>) {
+         let (mutex, changed) = &*self.queue;
+-        let mut pending = mutex.lock().unwrap();
++        let mut pending = lock(mutex);
+         pending.submitted += 1;
+         pending.latest = Some((pending.submitted, bytes));
+         changed.notify_one();
+     }
+ 
++    /// While saving fails: when it started to (ms since the epoch) and why the newest try failed.
++    pub fn failing(&self) -> Option<(u64, String)> {
++        let progress = self.progress.borrow();
++        progress.failed.clone().map(|why| (progress.since_ms, why))
++    }
++
+     /// Wait for the current snapshot, not for unrelated future saves. Never hold the core lock.
++    /// While the writer is failing the answer is the failure, at once: it keeps trying on its own.
+     pub async fn flush(&self) -> io::Result<()> {
+-        let version = self.queue.0.lock().unwrap().submitted;
+-        let mut completed = self.completed.clone();
+-        completed
+-            .wait_for(|written| *written >= version)
++        let version = lock(&self.queue.0).submitted;
++        let mut progress = self.progress.clone();
++        let failed = progress
++            .wait_for(|p| p.tried >= version || p.failed.is_some())
+             .await
+-            .map_err(|_| io::Error::other("registry writer stopped"))?;
+-        Ok(())
++            .map_err(|_| io::Error::other("registry writer stopped"))?
++            .failed
++            .clone();
++        failed.map_or(Ok(()), |why| Err(io::Error::other(why)))
+     }
+ }
+ 
+ impl Drop for RegistryWriter {
+     fn drop(&mut self) {
+         let (mutex, changed) = &*self.queue;
+-        mutex.lock().unwrap().closed = true;
++        lock(mutex).closed = true;
+         changed.notify_one();
+         if let Some(worker) = self.worker.take() {
+             let _ = worker.join();
+@@ -84,6 +164,7 @@ impl Drop for RegistryWriter {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+     use std::sync::mpsc;
+     use std::time::Duration;
+ 
+@@ -156,21 +237,79 @@ mod tests {
+         drop(writer);
+     }
+ 
+-    #[tokio::test]
+-    async fn a_flush_can_be_cancelled_and_a_failed_write_does_not_fail_the_barrier() {
+-        let (started, writes) = mpsc::channel();
+-        let (release, blocked) = mpsc::channel();
+-        let writer = RegistryWriter::start(move |_| {
+-            started.send(()).unwrap();
+-            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+-            Err(io::Error::other("disk failed"))
++    /// A write that fails while `failing` is set, and otherwise sends what it got.
++    fn flaky(failing: &Arc<AtomicBool>) -> (RegistryWriter, mpsc::Receiver<Vec<u8>>) {
++        let (wrote, writes) = mpsc::channel();
++        let failing = failing.clone();
++        let writer = RegistryWriter::start(move |bytes| {
++            if failing.load(Ordering::SeqCst) {
++                return Err(io::Error::other("disk full"));
++            }
++            wrote.send(bytes.to_vec()).unwrap();
++            Ok(())
+         })
+         .unwrap();
++        (writer, writes)
++    }
++
++    /// Waits for the writer to report a save again: it reports a write after making it.
++    async fn saved(writer: &RegistryWriter) {
++        tokio::time::timeout(Duration::from_secs(5), async {
++            while writer.flush().await.is_err() {
++                tokio::time::sleep(Duration::from_millis(5)).await;
++            }
++        })
++        .await
++        .expect("the writer saves again");
++    }
++
++    #[tokio::test]
++    async fn a_failed_write_is_tried_again_and_never_stops_the_writer() {
++        let failing = Arc::new(AtomicBool::new(true));
++        let (writer, writes) = flaky(&failing);
++        // The caller hears of the failure at once, and so does the next one,
++        // for the newer snapshot: nothing waits for a disk that may stay full.
+         writer.save(vec![1]);
+-        writes.recv_timeout(Duration::from_secs(5)).unwrap();
+-        assert!(tokio::time::timeout(Duration::from_millis(10), writer.flush()).await.is_err());
+-        release.send(()).unwrap();
+-        writer.flush().await.unwrap();
++        assert_eq!(writer.flush().await.unwrap_err().to_string(), "disk full");
++        let (since, why) = writer.failing().expect("saving fails");
++        assert!(since > 0 && why == "disk full");
++        writer.save(vec![2]);
++        assert_eq!(writer.flush().await.unwrap_err().to_string(), "disk full");
++        assert!(writes.try_recv().is_err());
++        // The disk comes back: the newest snapshot is written by itself, and a flush is good again.
++        failing.store(false, Ordering::SeqCst);
++        assert_eq!(writes.recv_timeout(Duration::from_secs(5)).unwrap(), [2]);
++        saved(&writer).await;
++        assert!(writer.failing().is_none());
++        // Still the same writer.
++        writer.save(vec![3]);
+         writer.flush().await.unwrap();
++        assert_eq!(writes.recv_timeout(Duration::from_secs(5)).unwrap(), [3]);
++    }
++
++    #[tokio::test]
++    async fn a_panicking_write_is_a_failed_write() {
++        let calls = Arc::new(AtomicU32::new(0));
++        let counted = calls.clone();
++        let (wrote, writes) = mpsc::channel();
++        let writer = RegistryWriter::start(move |bytes| {
++            assert!(counted.fetch_add(1, Ordering::SeqCst) > 0, "the first write panics");
++            wrote.send(bytes.to_vec()).unwrap();
++            Ok(())
++        })
++        .unwrap();
++        writer.save(vec![1]);
++        assert!(writer.flush().await.is_err());
++        assert_eq!(writes.recv_timeout(Duration::from_secs(5)).unwrap(), [1]);
++        saved(&writer).await;
++    }
++
++    #[test]
++    fn dropping_a_writer_whose_disk_is_full_still_ends() {
++        let failing = Arc::new(AtomicBool::new(true));
++        let (writer, writes) = flaky(&failing);
++        writer.save(vec![1]);
++        drop(writer);
++        assert!(writes.try_recv().is_err());
+     }
+ }
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index 247889f..56b0c32 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -113,6 +113,109 @@ async fn server_stop_succeeds_even_when_the_registry_flush_times_out() {
+     assert_eq!(stop.unwrap()["stopped"], true);
+ }
+ 
++#[tokio::test]
++async fn a_restart_saves_first_starts_nothing_meanwhile_and_is_taken_back_when_it_cannot() {
++    let (mut core, root) = test_core();
++    core.flush_saved().await.unwrap();
++    let (release, blocked) = mpsc::channel();
++    let mut first = true;
++    Arc::get_mut(&mut core).unwrap().registry_writer = RegistryWriter::start(move |_| {
++        if first {
++            first = false;
++            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
++        }
++        Err(io::Error::other("disk full"))
++    })
++    .unwrap();
++    let call = crate::api::Call { core: &core, conn: None, plain: None };
++    let err = {
++        let restarting = crate::api::dispatch(&call, "server.restart", json!({}));
++        tokio::pin!(restarting);
++        // It waits for its save, and nothing can start meanwhile: a terminal created now
++        // would be missing from what the next core loads, and it kills what that doesn't list.
++        assert!(tokio::time::timeout(Duration::from_millis(50), &mut restarting).await.is_err());
++        let refused = crate::api::not_stopping(&core, &core.lock()).unwrap_err();
++        assert!(refused.message.contains("restarting"), "{}", refused.message);
++        release.send(()).unwrap();
++        // The save failed: refused before anything was acknowledged, and taken back.
++        restarting.await.unwrap_err()
++    };
++    assert_eq!(err.kind, "unavailable");
++    assert!(err.message.contains("not restarting") && err.message.contains("disk full"), "{}", err.message);
++    assert!(!core.restart.load(std::sync::atomic::Ordering::SeqCst), "the restart was taken back");
++    assert!(!root.join("state/restart-env.json").exists(), "no environment left behind");
++    crate::api::not_stopping(&core, &core.lock()).unwrap();
++
++    // Forced: it goes ahead and names what the next core will kill.
++    let lost = {
++        let mut st = core.lock();
++        let id = st
++            .reg
++            .create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, now_ms())
++            .unwrap();
++        crate::terminals::address(id)
++    };
++    let forced = crate::api::dispatch(&call, "server.restart", json!({"force_stale_registry": true})).await.unwrap();
++    let warning = forced["warning"].as_str().expect("it says what it kills");
++    assert!(warning.contains(&lost) && warning.contains("disk full"), "{warning}");
++    assert!(core.restart.load(std::sync::atomic::Ordering::SeqCst));
++    drop(core);
++    remove_root(&root);
++}
++
++/// A restart forced over a failing save names what the next core kills: the live terminals
++/// missing from the registry on disk, whenever saving began to fail. (The terminal that
++/// triggers the first failed write is created before that failure is reported.)
++#[tokio::test]
++async fn a_forced_restart_names_every_live_terminal_missing_from_the_saved_registry() {
++    let (mut core, root) = test_core();
++    core.flush_saved().await.unwrap(); // the empty registry is on disk
++    let (began, started) = mpsc::channel();
++    let (release, blocked) = mpsc::channel();
++    let mut first = true;
++    Arc::get_mut(&mut core).unwrap().registry_writer = RegistryWriter::start(move |_| {
++        if first {
++            first = false;
++            began.send(()).unwrap();
++            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
++        }
++        Err(io::Error::other("disk full"))
++    })
++    .unwrap();
++    let new_terminal = |core: &Core| {
++        let mut st = core.lock();
++        let id = st
++            .reg
++            .create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, now_ms())
++            .unwrap();
++        core.save(&st);
++        crate::terminals::address(id)
++    };
++    let first_lost = new_terminal(&core);
++    started.recv_timeout(Duration::from_secs(5)).unwrap();
++    // The first failure is reported well after the terminal was created.
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    release.send(()).unwrap();
++    assert!(core.flush_warning().await.is_some());
++    assert!(core.saving_failure().unwrap().0 > 0);
++    let call = crate::api::Call { core: &core, conn: None, plain: None };
++    let answer = crate::api::dispatch(&call, "server.restart", json!({"force_stale_registry": true})).await.unwrap();
++    let warning = answer["warning"].as_str().unwrap();
++    assert!(warning.contains(&first_lost) && warning.contains("disk full"), "{warning}");
++
++    // What is on disk is not lost, whenever it was written; the file is what counts.
++    let saved = serde_json::to_vec(&core.lock().reg).unwrap();
++    write_atomic(&core.paths.state.join("terminals.json"), &saved).unwrap();
++    assert_eq!(crate::api::unsaved(&core).unwrap(), Vec::<String>::new());
++    let second_lost = new_terminal(&core);
++    assert_eq!(crate::api::unsaved(&core).unwrap(), [second_lost]);
++    // A registry that can't be read says so, instead of promising anything.
++    std::fs::write(core.paths.state.join("terminals.json"), b"{ not json").unwrap();
++    assert!(crate::api::unsaved(&core).is_err());
++    drop(core);
++    remove_root(&root);
++}
++
+ fn test_core() -> (Arc<Core>, PathBuf) {
+     let root = std::env::temp_dir().join(format!("hc-persistence-{}", platform::random_hex()));
+     let paths = Paths {
+diff --git a/crates/herdr-core/src/server.rs b/crates/herdr-core/src/server.rs
+index bfbe562..ac8f329 100644
+--- a/crates/herdr-core/src/server.rs
++++ b/crates/herdr-core/src/server.rs
+@@ -82,8 +82,8 @@ pub(crate) async fn finish(core: &Core) -> io::Result<()> {
+     if core.restart.load(std::sync::atomic::Ordering::SeqCst) {
+         core.handover().await?;
+     }
+-    if let Err(e) = core.flush_saved().await {
+-        eprintln!("core: final registry flush failed: {}", e.message);
++    if let Some(why) = core.flush_warning().await {
++        crate::log!("core: final registry flush failed: {why}");
+     }
+     Ok(())
+ }
+@@ -113,7 +113,7 @@ fn load_identity(state: &Path, machine_id: Option<String>) -> io::Result<CoreInf
+     let saved: Option<Identity> = crate::paths::read_state(&path)?;
+     let info = match saved {
+         Some(saved) if saved.machine_id.is_some() && machine_id.is_some() && saved.machine_id != machine_id => {
+-            eprintln!("core: this disk came from another machine: a new identity, its terminals forgotten");
++            crate::log!("core: this disk came from another machine: a new identity, its terminals forgotten");
+             // All gone before the new identity is written, or the next start tries again.
+             for name in CLONE_FORGETS {
+                 let p = state.join(name);
+@@ -199,7 +199,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
+         result = read_frames(&core, &conn, &mut read) => result,
+         _ = &mut writer => Ok(()),
+         () = conn.overflowed.notified() => {
+-            eprintln!("core: a client stopped reading its replies: disconnected");
++            crate::log!("core: a client stopped reading its replies: disconnected");
+             Ok(())
+         }
+     };
+diff --git a/crates/herdr-core/tests/disk_full.rs b/crates/herdr-core/tests/disk_full.rs
+new file mode 100644
+index 0000000..62886c1
+--- /dev/null
++++ b/crates/herdr-core/tests/disk_full.rs
+@@ -0,0 +1,99 @@
++#![cfg(unix)] // Windows: no /dev/full, and tests/windows.rs
++
++mod common;
++
++use common::*;
++use std::path::Path;
++use std::time::Duration;
++
++/// The disk fills up: the core's registry can't be written, and its own log
++/// (on the same disk) can't take a line either.
++#[test]
++fn a_full_disk_neither_stops_the_registry_writer_nor_fails_a_send() {
++    let mut s = Session::new();
++    s.env.push(("HC_SAVE_RETRY_MS".into(), "50".into()));
++    s.env.push(("HC_QUIET_MS".into(), "100".into()));
++    let state = s.root.join("state/herdr-core/test");
++    std::fs::create_dir_all(&state).unwrap();
++    // Every line the core logs fails with ENOSPC, as on a full disk (`eprintln!` panics then).
++    std::os::unix::fs::symlink("/dev/full", state.join("core.log")).unwrap();
++    let t = s.json(&["run", "--bg", "sh", "-c", BYTES])["address"].as_str().unwrap().to_string();
++    let registry = state.join("terminals.json");
++    wait_until("saved", || std::fs::read_to_string(&registry).is_ok_and(|r| r.contains(&t)));
++
++    // A directory where the registry's temporary file goes: every write fails and the file stays as it was.
++    std::fs::create_dir(state.join("terminals.tmp")).unwrap();
++
++    // A change the registry can't take: calls that only change it still answer.
++    s.json(&["label", &t, "k=v"]);
++    // The status says so once, for whoever shows health; no call has to.
++    let status = s.json(&["server", "status"]);
++    assert!(status["saving"]["since_ms"].as_u64().is_some_and(|ms| ms > 0), "{status}");
++    assert!(status["saving"]["reason"].is_string(), "{status}");
++    // The send is typed, so it is no error: it says the save failed.
++    let sent = s.json(&["send", &t, "x"]);
++    assert!(sent["warning"].as_str().is_some_and(|w| w.contains("could not save")), "{sent}");
++    wait_until("typed", || text(&s, &t).contains("78"));
++    // So do keys.
++    assert!(s.json(&["keys", &t, "a"])["warning"].is_string());
++
++    // A restart over a registry that is behind would kill terminals: refused, and taken back.
++    let (_, err) = s.err(&["server", "restart"]);
++    assert_eq!(err["error"]["kind"], "unavailable", "{err}");
++    assert!(err["error"]["message"].as_str().unwrap().contains("not restarting"), "{err}");
++    let t2 = s.json(&["run", "--bg", "sh", "-c", BYTES])["address"].as_str().unwrap().to_string();
++
++    // Forced, it says what it kills: t2, live but missing from the registry on disk that the next core loads.
++    let out = s.hc(&["server", "restart", "--force-stale-registry"]);
++    assert!(out.status.success(), "{out:?}");
++    let said = String::from_utf8_lossy(&out.stderr);
++    assert!(said.contains("missing from the saved registry") && said.contains(&t2), "{said}");
++    wait_until_for("the old terminal is adopted", Duration::from_secs(20), || get(&s, &t)["state"] == "live");
++    let (_, gone) = s.err(&["get", &t2]);
++    assert_eq!(gone["error"]["kind"], "not_found", "{gone}");
++
++    // The disk has room again: the writer, still alive, saves what changed.
++    std::fs::remove_dir(state.join("terminals.tmp")).unwrap();
++    s.json(&["label", &t, "k=w"]);
++    wait_until("saved again", || std::fs::read_to_string(&registry).is_ok_and(|r| r.contains("\"k\":\"w\"")));
++    let sent = s.json(&["send", &t, "y"]);
++    assert!(sent.get("warning").is_none(), "{sent}");
++    assert!(s.json(&["server", "status"]).get("saving").is_none());
++    wait_until_for("typed", Duration::from_secs(10), || text(&s, &t).contains("79"));
++}
++
++/// `eprintln!` panics when stderr can't be written, and a panic in the registry writer or a
++/// holder thread ends it for good: the core and holder log with `log!`. (The CLI prints for
++/// people and may panic on a closed pipe; so may tests.)
++#[test]
++fn the_core_logs_with_log_not_eprintln() {
++    fn scan(dir: &Path, found: &mut Vec<String>) {
++        for entry in std::fs::read_dir(dir).unwrap().flatten() {
++            let path = entry.path();
++            let name = path.file_name().unwrap().to_string_lossy().to_string();
++            if path.is_dir() {
++                if name != "cli" {
++                    scan(&path, found);
++                }
++                continue;
++            }
++            let skipped = name.ends_with("tests.rs") || ["cli.rs", "main.rs", "log.rs"].contains(&name.as_str());
++            if !name.ends_with(".rs") || skipped {
++                continue;
++            }
++            let text = std::fs::read_to_string(&path).unwrap();
++            // What follows `#[cfg(test)]` is test code.
++            let code = text.split("#[cfg(test)]").next().unwrap();
++            for (n, line) in code.lines().enumerate() {
++                let line = line.trim_start();
++                let prints = ["eprintln!", "eprint!", "println!", "print!"].iter().any(|m| line.contains(m));
++                if prints && !line.starts_with("//") {
++                    found.push(format!("{}:{}: {line}", path.display(), n + 1));
++                }
++            }
++        }
++    }
++    let mut found = Vec::new();
++    scan(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
++    assert!(found.is_empty(), "use crate::log! (it never panics):\n{}", found.join("\n"));
++}
+diff --git a/docs/commands.md b/docs/commands.md
+index c322f61..67b3a3c 100644
+--- a/docs/commands.md
++++ b/docs/commands.md
+@@ -589,7 +589,7 @@ Commands:
+   start    
+   stop     
+   status   
+-  restart  Restart the core (e.g. after an update); programs keep running
++  restart  Restart the core (e.g. after an update); programs keep running. Refused while the core can't save its terminals (a full disk): the next core would kill every live terminal missing from the saved registry
+   help     Print this message or the help of the given subcommand(s)
+ 
+ Options:
+@@ -600,13 +600,14 @@ Options:
+ ## hc server restart
+ 
+ ```text
+-Restart the core (e.g. after an update); programs keep running
++Restart the core (e.g. after an update); programs keep running. Refused while the core can't save its terminals (a full disk): the next core would kill every live terminal missing from the saved registry
+ 
+ Usage: hc server restart [OPTIONS]
+ 
+ Options:
+-      --json  JSON output even in a terminal
+-  -h, --help  Print help
++      --force-stale-registry  Restart even though the core can't save its terminals. The next core then kills every live terminal missing from the registry saved on disk (it loads that one), and the answer says which. For a restart that can't wait, such as a disk that won't recover; otherwise free the disk
++      --json                  JSON output even in a terminal
++  -h, --help                  Print help
+ ```
+ 
+ ## hc server start
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 3080b70..b584424 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -495,6 +495,13 @@
+           "outcome": {
+             "description": "stopped (left working, or a shell got its prompt back), exited,\nstill_working (no change in time), or unknown (it doesn't report status).",
+             "type": "string"
++          },
++          "warning": {
++            "description": "The core could not save its terminals just now (a full disk, say) and\nkeeps trying; this call itself went through, so don't repeat it.",
++            "type": [
++              "string",
++              "null"
++            ]
+           }
+         },
+         "required": [
+@@ -515,6 +522,13 @@
+             "format": "uint64",
+             "minimum": 0,
+             "type": "integer"
++          },
++          "warning": {
++            "description": "The core could not save its terminals just now (a full disk, say) and\nkeeps trying; this call itself went through, so don't repeat it.",
++            "type": [
++              "string",
++              "null"
++            ]
+           }
+         },
+         "required": [
+@@ -1041,6 +1055,25 @@
+         ],
+         "type": "object"
+       },
++      "SavingFailure": {
++        "properties": {
++          "reason": {
++            "description": "Why the newest try failed.",
++            "type": "string"
++          },
++          "since_ms": {
++            "description": "When saving started to fail, ms since the epoch.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": "integer"
++          }
++        },
++        "required": [
++          "since_ms",
++          "reason"
++        ],
++        "type": "object"
++      },
+       "SendResult": {
+         "properties": {
+           "repeated": {
+@@ -1090,6 +1123,13 @@
+               "integer",
+               "null"
+             ]
++          },
++          "warning": {
++            "description": "The core could not save its terminals just now (a full disk, say) and\nkeeps trying; this call itself went through, so don't repeat it.",
++            "type": [
++              "string",
++              "null"
++            ]
+           }
+         },
+         "required": [
+@@ -1195,6 +1235,17 @@
+             "minimum": 0,
+             "type": "integer"
+           },
++          "saving": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/SavingFailure"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "Present while the core can't save its terminals (a full disk, say). It\nkeeps trying and says so here once, instead of failing calls; what\nchanged meanwhile is lost if the core stops before it saves."
++          },
+           "uptime_ms": {
+             "format": "uint64",
+             "minimum": 0,
+@@ -1221,6 +1272,13 @@
+         "properties": {
+           "stopped": {
+             "type": "boolean"
++          },
++          "warning": {
++            "description": "A restart with `force_stale_registry`: the terminals the next core will kill.",
++            "type": [
++              "string",
++              "null"
++            ]
+           }
+         },
+         "required": [
+@@ -1942,11 +2000,30 @@
+       }
+     },
+     {
+-      "description": "Planned restart (e.g. after an update): screens are saved, programs keep running, the next core adopts them.",
+-      "errors": [],
++      "description": "Planned restart (e.g. after an update): screens are saved, programs keep running, the next core adopts them. Once asked, terminal.run and machine.exec refuse until it has restarted. It first saves its registry and waits for that: if it can't (a full disk), it refuses with `unavailable` and nothing changes, because the next core kills every terminal its registry doesn't list. `force_stale_registry` restarts anyway; the answer's `warning` names the live terminals missing from the registry saved on disk, which the next core kills.",
++      "errors": [
++        {
++          "code": -32000,
++          "data": {
++            "kind": "unavailable"
++          },
++          "message": "unavailable"
++        }
++      ],
+       "name": "server.restart",
+       "paramStructure": "by-name",
+-      "params": [],
++      "params": [
++        {
++          "description": "Restart even though the core can't save its terminals. The next core\nthen kills every live terminal missing from the registry saved on disk\n(it loads that one), and the answer says which. For a restart that\ncan't wait, such as a disk that won't recover; otherwise free the disk.",
++          "name": "force_stale_registry",
++          "required": false,
++          "schema": {
++            "default": false,
++            "description": "Restart even though the core can't save its terminals. The next core\nthen kills every live terminal missing from the registry saved on disk\n(it loads that one), and the answer says which. For a restart that\ncan't wait, such as a disk that won't recover; otherwise free the disk.",
++            "type": "boolean"
++          }
++        }
++      ],
+       "result": {
+         "name": "result",
+         "schema": {

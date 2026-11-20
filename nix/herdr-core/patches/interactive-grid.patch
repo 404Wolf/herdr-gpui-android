@@ -1,0 +1,504 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index d5fa5fc..07f6e85 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -156,7 +156,13 @@ The core hosting the terminal applies its `size_policy` setting.
+ Taller desktop panes get a cleared replacement paint when the grid or pane
+ changes size. Their scrolling region stays within the shared grid; `CSI r` and `RIS`
+ resets are bounded too, so old rows do not remain below an inline TUI.
+-This uses terminal bytes; the app does not need resize-frame support.
++Legacy apps use terminal bytes for the taller-pane repair. Viewers opting into
++`terminal.attach`'s `resize_notifications` get ordered core-to-viewer RESIZE
++frames before replacement paints, including their initial grid. This works for
++interactive viewers too: render those rows and columns, but keep reporting the
++pane's available geometry separately. The reply confirms support across the
++whole path; false or absent retains legacy sizing. A reconnect that loses
++negotiated support ends the stream rather than sending an incompatible paint.
+ Observers never control size, and a viewer returning after a dropped line
+ does not constrain the desktop until active again. Attach placeholders are
+ ignored until a window reports geometry. Sized desktop viewers keep their
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index b4f5cb2..0a94cba 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -463,7 +463,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+     Ok(AttachResult {
+         channel,
+         terminal: Public(record(core, id)?),
+-        resize_notifications: p.observe && p.resize_notifications,
++        resize_notifications: p.resize_notifications,
+         automatic_input: true,
+     })
+ }
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 9a24193..a2daf89 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -388,7 +388,7 @@ pub struct AttachParams {
+     #[arg(long)]
+     #[serde(default)]
+     pub observe: bool,
+-    /// Observer understands core-to-viewer RESIZE before replacement paints.
++    /// Viewer understands core-to-viewer RESIZE before replacement paints.
+     #[arg(skip)]
+     #[serde(default)]
+     pub resize_notifications: bool,
+@@ -426,7 +426,7 @@ pub struct AttachResult {
+     pub channel: u32,
+     pub terminal: Public,
+     /// True only when the entire path sends RESIZE before replacement paints.
+-    /// False or absent means the observer must track size changes separately.
++    /// False or absent means the viewer must track size changes separately.
+     pub resize_notifications: bool,
+     /// The entire attach path accepts AUTOMATIC_INPUT (kind 6). Absent means use DATA.
+     pub automatic_input: bool,
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index 65ef50e..5de1efd 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -96,9 +96,7 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+     {
+         Ok(mut r) => {
+             let there = r["channel"].as_u64().unwrap_or_default() as u32;
+-            let enabled = params["observe"] == true
+-                && params["resize_notifications"] == true
+-                && r["resize_notifications"] == true;
++            let enabled = params["resize_notifications"] == true && r["resize_notifications"] == true;
+             r["resize_notifications"] = enabled.into();
+             params["resize_notifications"] = enabled.into();
+             let automatic_input = automatic_input(&line, &r);
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index c343ca2..742b0ab 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -39,6 +39,8 @@ pub struct Viewer {
+     active_at: Option<Instant>,
+     /// Desktop apps attach hidden tabs with a placeholder before reporting geometry.
+     sized: bool,
++    /// A relayed reconnect carries cached geometry, not a new physical offer.
++    awaiting_size: bool,
+     /// The source line's machine and the desktop identity carried on that line.
+     desktop_group: Option<(String, String)>,
+     display: Display,
+@@ -100,11 +102,12 @@ impl Core {
+             conn: conn.clone(),
+             channel,
+             observe: req.observe,
+-            resize_notifications: req.observe && req.resize_notifications,
++            resize_notifications: req.resize_notifications,
+             repaint_pending: false,
+             size: req.size,
+             active_at: (!req.resumed).then(Instant::now),
+             sized: false,
++            awaiting_size: req.resumed,
+             desktop_group: req.desktop_group,
+             display: req.display,
+             recovering,
+@@ -114,7 +117,7 @@ impl Core {
+         st.viewers.get_mut(&id).unwrap().last_mut().unwrap().repaint_pending = false;
+         conn.with(|out| {
+             out.open_paused(channel);
+-            if req.observe && req.resize_notifications {
++            if req.resize_notifications {
+                 let t = &st.reg.terminals[&id];
+                 let size = [t.cols.to_le_bytes(), t.rows.to_le_bytes()].concat();
+                 out.resize(channel, &size);
+@@ -174,7 +177,8 @@ impl Core {
+             if v.repaint_pending {
+                 continue;
+             }
+-            let taller = !v.observe && v.sized && v.desktop_group.is_some() && v.size.1 > rows;
++            let taller =
++                !v.resize_notifications && !v.observe && v.sized && v.desktop_group.is_some() && v.size.1 > rows;
+             let bytes = if v.recovering {
+                 let Some(paint) = &recovered else { continue };
+                 v.recovering = false;
+@@ -297,7 +301,10 @@ impl Core {
+         self.touch(&mut st, conn, channel, |v| {
+             v.size = (cols, rows);
+             v.sized = true;
+-            v.repaint_pending |= !v.observe && v.desktop_group.is_some();
++            if cols > 0 && rows > 0 {
++                v.awaiting_size = false;
++            }
++            v.repaint_pending |= !v.resize_notifications && !v.observe && v.desktop_group.is_some();
+         });
+         conn.wake.notify_one();
+     }
+@@ -360,6 +367,11 @@ impl Core {
+             st.viewers.get(&id).map_or(&[], Vec::as_slice),
+             self.settings().size_policy == crate::config::SizePolicy::Grouped,
+         );
++        // Keep the holder's inherited grid while legacy relays resume. Focus,
++        // input and hidden attach placeholders cannot replace a physical offer.
++        if leader.is_none() && st.viewers.get(&id).is_some_and(|vs| vs.iter().any(|v| !v.observe)) {
++            return;
++        }
+         let (cols, rows) = size.unwrap_or_else(|| self.headless());
+         let display = leader.map(|v| v.display.clone());
+         if !st.screens.contains_key(&id) {
+@@ -436,7 +448,11 @@ impl Core {
+ }
+ 
+ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u16, u16)>) {
+-    let leader = viewers.iter().filter(|v| !v.observe).max_by_key(|v| v.active_at);
++    let awaiting_size = viewers.iter().any(|v| !v.observe && v.awaiting_size);
++    let leader = viewers
++        .iter()
++        .filter(|v| !v.observe && !v.awaiting_size && (!awaiting_size || v.sized))
++        .max_by_key(|v| v.active_at);
+     let Some(leader) = leader else { return (None, None) };
+     let size = if grouped && leader.desktop_group.is_some() {
+         viewers
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index 68beb05..05408db 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -22,6 +22,7 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+         size,
+         active_at,
+         sized: true,
++        awaiting_size: false,
+         desktop_group: conn.local_desktop.then(|| ("local".into(), "desktop".into())),
+         display: Display::default(),
+         recovering: false,
+@@ -108,17 +109,110 @@ fn core_with_screen(cols: u16, rows: u16) -> (Arc<Core>, u32, std::path::PathBuf
+     (core, id, root)
+ }
+ 
++#[test]
++fn resumed_viewers_hold_the_inherited_grid_until_a_physical_size_arrives() {
++    for notifications in [false, true] {
++        let (core, id, root) = core_with_screen(103, 74);
++        let narrow = desktop_conn();
++        let wide = desktop_conn();
++        let placeholder = desktop_conn();
++        let observer = desktop_conn();
++        let request = |size, resumed, observe| AttachRequest {
++            observe,
++            resize_notifications: notifications,
++            history: 0,
++            size,
++            display: Display::default(),
++            resumed,
++            desktop_group: Some(("line".into(), "desktop".into())),
++        };
++        let grid = || core.lock().screens[&id].size();
++        let a = core.attach(&narrow, id, request((103, 74), true, false)).unwrap();
++        let b = core.attach(&wide, id, request((246, 91), true, false)).unwrap();
++        assert_eq!(grid(), (103, 74), "all resumed streams must retain the inherited grid");
++        core.viewer_focus(&wide, b, true);
++        core.viewer_input(&wide, b, b"", false);
++        assert_eq!(grid(), (103, 74), "focus and input are not physical geometry");
++        core.attach(&placeholder, id, request((10, 3), false, false)).unwrap();
++        let observed = core.attach(&observer, id, request((20, 5), false, true)).unwrap();
++        core.viewer_resize(&observer, observed, 20, 5);
++        core.viewer_resize(&wide, b, 0, 0);
++        assert_eq!(grid(), (103, 74), "placeholders, observers and zero sizes must not release the hold");
++        core.viewer_resize(&wide, b, 246, 91);
++        assert_eq!(grid(), (246, 91), "a fresh physical offer releases the provisional hold");
++        core.viewer_focus(&narrow, a, true);
++        core.viewer_input(&narrow, a, b"", false);
++        assert_eq!(grid(), (246, 91), "a still-unmeasured resumed stream must not take sizing back");
++        core.viewer_resize(&narrow, a, 120, 50);
++        assert_eq!(grid(), (120, 50), "new physical offers again constrain both axes");
++        core.viewer_focus(&wide, b, true);
++        assert_eq!(grid(), (120, 50), "focus must not cause a resize tug-of-war");
++        drop(core);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++}
++
+ fn drain(conn: &Arc<Conn>, channel: u32, screen: &mut ghostty_vt::Terminal) {
+     conn.with(|out| {
+         out.resume(channel);
+         while let Some(frame) = out.next_frame() {
+             if frame[4] == wire::DATA {
+                 screen.write(&frame[wire::HEADER..]);
++            } else if frame[4] == wire::RESIZE {
++                let size = &frame[wire::HEADER..];
++                screen.resize(u16::from_le_bytes([size[0], size[1]]), u16::from_le_bytes([size[2], size[3]]));
+             }
+         }
+     });
+ }
+ 
++#[test]
++fn wider_desktop_viewer_wraps_inline_redraw_at_the_shared_width() {
++    let (core, id, root) = core_with_screen(20, 8);
++    let wide = desktop_conn();
++    let narrow = desktop_conn();
++    let request = |size| AttachRequest {
++        observe: false,
++        resize_notifications: true,
++        history: 0,
++        size,
++        display: Display::default(),
++        resumed: false,
++        desktop_group: Some(("forwarded-line".into(), "desktop".into())),
++    };
++    let a = core.attach(&wide, id, request((40, 8))).unwrap();
++    core.viewer_resize(&wide, a, 40, 8);
++    let b = core.attach(&narrow, id, request((20, 8))).unwrap();
++    core.viewer_resize(&narrow, b, 20, 8);
++    wide.with(|out| out.resume(a));
++    narrow.with(|out| out.resume(b));
++    let mut wide_screen = ghostty_vt::Terminal::new(40, 8, 1 << 20);
++    let mut narrow_screen = ghostty_vt::Terminal::new(20, 8, 1 << 20);
++    core.prepare_repaints(&wide);
++    core.prepare_repaints(&narrow);
++    drain(&wide, a, &mut wide_screen);
++    drain(&narrow, b, &mut narrow_screen);
++    for bytes in [
++        b"| markdown table row | result |\r\n\r\n> prompt\r\nINSERT bypass".as_slice(),
++        b"\x1b[2A\r\x1b[J> next prompt\r\nINSERT bypass",
++    ] {
++        core.output(&mut core.lock(), id, bytes);
++        core.prepare_repaints(&wide);
++        core.prepare_repaints(&narrow);
++        drain(&wide, a, &mut wide_screen);
++        drain(&narrow, b, &mut narrow_screen);
++        let expected = core.lock().screens[&id].screen_rows();
++        assert_eq!(narrow_screen.screen_rows(), expected);
++        assert_eq!(
++            wide_screen.screen_rows().iter().map(|r| r.trim_end()).collect::<Vec<_>>(),
++            expected.iter().map(|r| r.trim_end()).collect::<Vec<_>>(),
++            "inline cursor-up redraw must use the PTY's wrap width"
++        );
++    }
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
+ #[test]
+ fn larger_desktop_viewers_keep_only_the_shared_scrolling_grid() {
+     let (core, id, root) = core_with_screen(20, 4);
+diff --git a/crates/herdr-core/tests/common/framed.rs b/crates/herdr-core/tests/common/framed.rs
+index c7c67c4..4956abd 100644
+--- a/crates/herdr-core/tests/common/framed.rs
++++ b/crates/herdr-core/tests/common/framed.rs
+@@ -101,6 +101,9 @@ impl Viewer {
+             return;
+         }
+         match kind {
++            wire::RESIZE if payload.len() == 4 => self
++                .screen
++                .resize(u16::from_le_bytes([payload[0], payload[1]]), u16::from_le_bytes([payload[2], payload[3]])),
+             wire::DATA => {
+                 self.screen.write(&payload);
+                 self.received += payload.len();
+diff --git a/crates/herdr-core/tests/redraw_grid.rs b/crates/herdr-core/tests/redraw_grid.rs
+new file mode 100644
+index 0000000..7a9013b
+--- /dev/null
++++ b/crates/herdr-core/tests/redraw_grid.rs
+@@ -0,0 +1,138 @@
++#![cfg(target_os = "linux")]
++
++mod common;
++
++use common::framed::{Framed, Viewer, desktop};
++use common::*;
++use herdr_core::wire;
++use serde_json::json;
++use std::time::Duration;
++
++#[test]
++fn same_version_grid_upgrade_keeps_the_holder_child_id_and_backlog() {
++    let Some(old) = std::env::var_os("HC_PRE_GRID_BIN") else {
++        eprintln!("skipped: set HC_PRE_GRID_BIN to the installed pre-fix core");
++        return;
++    };
++    let mut s = Session::new();
++    let bin = s.root.join("bin/herdr-core");
++    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
++    std::fs::copy(old, &bin).unwrap();
++    s.bin = bin.clone();
++    let t = run(&s, &["sh", "-c", "echo preserved-backlog; while read l; do echo received-$l; done"]);
++    wait_until("old PTY is ready", || text(&s, &t).contains("preserved-backlog"));
++    let before = s.json(&["server", "status"]);
++    let child = get(&s, &t)["pid"].clone();
++    let attach = |s: &Session| {
++        Framed::open(s).call(
++            "terminal.attach",
++            json!({"terminal": t, "cols": 80, "rows": 24, "resize_notifications": true}),
++        )["result"]["resize_notifications"]
++            .clone()
++    };
++    assert_eq!(attach(&s), false, "the running pre-fix binary cannot negotiate an interactive grid");
++    let new = std::env::var_os("HC_GRID_BIN").map(std::path::PathBuf::from).unwrap_or_else(|| BIN.into());
++    std::fs::copy(new, bin.with_extension("new")).unwrap();
++    std::fs::rename(bin.with_extension("new"), &bin).unwrap();
++    s.json(&["server", "restart"]);
++    let after = s.json(&["server", "status"]);
++    assert_eq!(before["version"], after["version"], "the wire version stays 0.1.18");
++    assert_ne!(before["pid"], after["pid"], "an explicit restart runs the new same-version binary");
++    assert_eq!(attach(&s), true, "the new behavior is active, not merely a different process");
++    assert!(
++        after["holders"].as_array().unwrap().iter().any(|h| {
++            h["pid"] == before["holder"]["pid"]
++                && h["instance"] == before["holder"]["instance"]
++                && h["current"] == false
++        }),
++        "the old holder stays alive and drains while its build differs from the new core"
++    );
++    assert_eq!(get(&s, &t)["pid"], child);
++    assert_eq!(get(&s, &t)["state"], "live");
++    s.json(&["send", &t, "after-upgrade"]);
++    wait_until("same child accepts input", || text(&s, &t).contains("received-after-upgrade"));
++    assert!(text(&s, &t).contains("preserved-backlog"));
++}
++
++#[test]
++fn remote_inline_redraw_uses_one_grid_across_resize_and_holder_reconnect() {
++    let far = Session::new();
++    let program = format!(
++        "stty -echo; i=0; while [ $i -lt 160 ]; do echo retained-backlog-$i; i=$((i+1)); done; while read frame; do \
++         stty size >{}/pty-size; \
++         printf '\\033[H\\033[2J| markdown table row | result | expected | duplicated wrap |\\r\\n\\r\\n> prompt\\r\\nINSERT bypass'; \
++         printf '\\033['; sleep 0.02; \
++         printf '2A\\r\\033[J> updated prompt with wrapping words for the shared grid\\r\\nINSERT frame-%s' \"$frame\"; \
++         done",
++        far.root.display()
++    );
++    let t = run(&far, &["sh", "-c", &program]);
++    let pid = get(&far, &t)["pid"].clone();
++    let holder = far.json(&["server", "status"])["holder"].clone();
++    let mut near = Session::new();
++    near.env.push(fake_ssh(&near, &[("far", &far)]));
++    near.env.push(("HC_RECONNECT_MS".into(), "100".into()));
++    near.json(&["machine", "add", "far"]);
++    let address = format!("far/{t}");
++    let (mut app_a, conn_a) = desktop(&near);
++    let (mut app_b, conn_b) = desktop(&near);
++    let mut a = Viewer::attach_on(conn_a, &address, 80, 16, json!({"resize_notifications": true}));
++    let mut b = Viewer::attach_on(conn_b, &address, 40, 12, json!({"resize_notifications": true}));
++    let resize = |v: &mut Viewer, cols: u16, rows: u16| {
++        v.conn.send(v.channel, wire::RESIZE, &[cols.to_le_bytes(), rows.to_le_bytes()].concat());
++        v.conn.call("terminal.get", json!({"terminal": address}));
++    };
++    resize(&mut a, 80, 16);
++    resize(&mut b, 40, 12);
++
++    let check = |a: &mut Viewer, b: &mut Viewer, frame: &str, size: (u16, u16)| {
++        a.typed(format!("{frame}\n").as_bytes());
++        a.shows(&format!("frame-{frame}"));
++        b.shows(&format!("frame-{frame}"));
++        let mut owner =
++            Viewer::attach(&far, &t, size.0, size.1, json!({"observe": true, "resize_notifications": true}));
++        owner.shows(&format!("frame-{frame}"));
++        assert_eq!(a.screen.size(), size, "wide viewer renders the PTY grid");
++        assert_eq!(b.screen.size(), size, "narrow viewer renders the PTY grid");
++        assert_eq!(a.screen.screen_rows(), owner.screen.screen_rows());
++        assert_eq!(b.screen.screen_rows(), owner.screen.screen_rows());
++        assert_eq!(get(&far, &t)["pid"], pid, "the same PTY child survives");
++        assert_eq!(
++            std::fs::read_to_string(far.root.join("pty-size")).unwrap().trim(),
++            format!("{} {}", size.1, size.0)
++        );
++    };
++    check(&mut a, &mut b, "one", (40, 12));
++    resize(&mut b, 50, 10); // Both rows and columns change.
++    check(&mut a, &mut b, "two", (50, 10));
++    // Focus must not cause repeated size arbitration or change either pane's offer.
++    for _ in 0..4 {
++        a.conn.send(a.channel, wire::FOCUS, &[1]);
++        b.conn.send(b.channel, wire::FOCUS, &[1]);
++    }
++    b.conn.call("terminal.get", json!({"terminal": address}));
++    assert_eq!((get(&far, &t)["cols"].as_u64(), get(&far, &t)["rows"].as_u64()), (Some(50), Some(10)));
++
++    // Only this test's isolated core restarts; its holder and PTY child live on.
++    far.json(&["server", "restart"]);
++    let holders = far.json(&["server", "status"])["holders"].clone();
++    assert!(
++        holders.as_array().unwrap().iter().any(|h| h["pid"] == holder["pid"] && h["instance"] == holder["instance"]),
++        "the same holder process owns the same child after reconnect"
++    );
++    wait_until("bridge reconnects to isolated owner", || {
++        near.json(&["machine", "ls"])["machines"][0]["state"] == "connected"
++    });
++    a.drain(Duration::from_millis(100));
++    b.drain(Duration::from_millis(100));
++    assert!(a.closed.is_none() && b.closed.is_none(), "capable reattach keeps the channels");
++    // Returning viewers re-establish their pane offers through the same channels.
++    resize(&mut a, 80, 16);
++    resize(&mut b, 50, 10);
++    check(&mut a, &mut b, "three", (50, 10));
++    assert!(text(&far, &t).contains("retained-backlog"), "the original backlog survives the restart");
++    drop(a);
++    drop(b);
++    app_a.wait().unwrap();
++    app_b.wait().unwrap();
++}
+diff --git a/crates/herdr-core/tests/resize_negotiation.rs b/crates/herdr-core/tests/resize_negotiation.rs
+index 09c39a8..c1c575d 100644
+--- a/crates/herdr-core/tests/resize_negotiation.rs
++++ b/crates/herdr-core/tests/resize_negotiation.rs
+@@ -29,7 +29,7 @@ fn attach_confirms_size_notifications_locally_and_through_two_relays() {
+                     "observe": observe, "resize_notifications": requested
+                 }),
+             );
+-            let enabled = observe && requested;
++            let enabled = requested;
+             assert_eq!(reply["result"]["resize_notifications"], enabled, "{reply}");
+             if enabled {
+                 let channel = reply["result"]["channel"].as_u64().unwrap() as u32;
+@@ -39,3 +39,29 @@ fn attach_confirms_size_notifications_locally_and_through_two_relays() {
+         }
+     }
+ }
++
++#[test]
++fn interactive_grid_negotiation_falls_back_if_either_hop_is_pre_fix() {
++    let Some(old) = std::env::var_os("HC_PRE_GRID_BIN") else {
++        eprintln!("skipped: set HC_PRE_GRID_BIN to the pre-fix core");
++        return;
++    };
++    for old_owner in [true, false] {
++        let mut owner = Session::new();
++        let mut client = Session::new();
++        let legacy = if old_owner { &mut owner } else { &mut client };
++        let bin = legacy.root.join("bin/herdr-core");
++        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
++        std::fs::copy(&old, &bin).unwrap();
++        legacy.bin = bin;
++        let t = run(&owner, &["sleep", "100"]);
++        client.env.push(fake_ssh(&client, &[("owner", &owner)]));
++        client.json(&["machine", "add", "owner"]);
++        let mut conn = Framed::open(&client);
++        let reply = conn.call(
++            "terminal.attach",
++            json!({"terminal": format!("owner/{t}"), "cols": 80, "rows": 24, "resize_notifications": true}),
++        );
++        assert_eq!(reply["result"]["resize_notifications"], false, "legacy owner={old_owner}: {reply}");
++    }
++}
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 8033813..8c85783 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -28,7 +28,7 @@
+             "type": "integer"
+           },
+           "resize_notifications": {
+-            "description": "True only when the entire path sends RESIZE before replacement paints.\nFalse or absent means the observer must track size changes separately.",
++            "description": "True only when the entire path sends RESIZE before replacement paints.\nFalse or absent means the viewer must track size changes separately.",
+             "type": "boolean"
+           },
+           "terminal": {
+@@ -2457,12 +2457,12 @@
+           }
+         },
+         {
+-          "description": "Observer understands core-to-viewer RESIZE before replacement paints.",
++          "description": "Viewer understands core-to-viewer RESIZE before replacement paints.",
+           "name": "resize_notifications",
+           "required": false,
+           "schema": {
+             "default": false,
+-            "description": "Observer understands core-to-viewer RESIZE before replacement paints.",
++            "description": "Viewer understands core-to-viewer RESIZE before replacement paints.",
+             "type": "boolean"
+           }
+         },

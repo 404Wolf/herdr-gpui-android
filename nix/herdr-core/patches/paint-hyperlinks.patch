@@ -1,0 +1,635 @@
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index c31b155..9ed9bca 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -289,14 +289,19 @@ const DEFAULT_CELL: (u32, u32) = (10, 20);
+ /// Ghostty's default theme, answered until a viewer tells us its own colors.
+ const DEFAULT_FG: Rgb = [0xff, 0xff, 0xff];
+ const DEFAULT_BG: Rgb = [0x28, 0x2c, 0x34];
+-/// How every [`Terminal::paint`] starts: the viewer's main screen, cleared,
+-/// cursor home. A soft reset leaves mouse, focus, paste, sync and key modes
+-/// alone: they are turned off too, so a viewer that missed their "off" (a
+-/// dropped backlog) ends up with exactly the screen's own modes, replayed
+-/// after it.
+-pub const PAINT_RESET: &[u8] = b"\x1b[!p\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\
++/// How every [`Terminal::paint`] starts: no hyperlink open (a viewer that
++/// missed a link's close must not carry it into the paint, nor into the live
++/// text after it; the screen's own active link is restored at the end), the
++/// viewer's main screen, cleared, cursor home. The link is closed on the
++/// screen the viewer was on, and again once the main screen is back, whose
++/// restored cursor can carry one of its own. A soft reset leaves mouse,
++/// focus, paste, sync and key modes alone: they are turned off too, so a
++/// viewer that missed their "off" (a dropped backlog) ends up with exactly
++/// the screen's own modes, replayed after it.
++pub const PAINT_RESET: &[u8] = b"\x1b]8;;\x1b\\\
++\x1b[!p\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\
+ \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b[?66l\x1b[?2031l\x1b[?2048l\x1b[=0;1u\
+-\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J";
++\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b]8;;\x1b\\\x1b[H\x1b[2J";
+ 
+ pub type Rgb = [u8; 3];
+ 
+diff --git a/crates/ghostty-vt/src/tests.rs b/crates/ghostty-vt/src/tests.rs
+index 4ee38f5..36802f7 100644
+--- a/crates/ghostty-vt/src/tests.rs
++++ b/crates/ghostty-vt/src/tests.rs
+@@ -355,3 +355,335 @@ fn painted_history_fits_a_viewer_taller_or_shorter_than_the_terminal() {
+         }
+     }
+ }
++
++/// Glyphs written, each with the hyperlink target active then.
++type Glyph = (u8, Option<Vec<u8>>);
++type Glyphs = Vec<Glyph>;
++
++/// The OSC 8 hyperlinks in VT output, checked where they are placed, not
++/// counted: every glyph with the target active when it is written, and no
++/// link left open across a CR or LF, a cursor move or other CSI (SGR aside),
++/// or the end of the paint. Returns the glyphs and each link's opening
++/// parameters and target (`id=x;uri`). From the review of #104.
++fn osc8_placement(bytes: &[u8]) -> (Glyphs, Vec<Vec<u8>>) {
++    let (mut i, mut active, mut glyphs, mut links) = (0, None, Vec::new(), Vec::new());
++    while i < bytes.len() {
++        if bytes[i..].starts_with(b"\x1b]") {
++            let start = i + 2;
++            i = start;
++            while i < bytes.len() && bytes[i] != 7 && !bytes[i..].starts_with(b"\x1b\\") {
++                assert_ne!(bytes[i], 0x1b, "unescaped ESC inside an OSC");
++                i += 1;
++            }
++            assert!(i < bytes.len(), "unterminated OSC");
++            let body = &bytes[start..i];
++            if let Some(rest) = body.strip_prefix(b"8;") {
++                let split = rest.iter().position(|b| *b == b';').expect("OSC 8 parameters end with ;");
++                if rest[split + 1..].is_empty() {
++                    active = None;
++                } else {
++                    assert!(active.is_none(), "a link opened over an open one");
++                    active = Some(rest[split + 1..].to_vec());
++                    links.push(rest.to_vec());
++                }
++            }
++            i += if bytes[i] == 7 { 1 } else { 2 };
++        } else if bytes[i..].starts_with(b"\x1b[") {
++            i += 2;
++            while !(0x40..=0x7e).contains(&bytes[i]) {
++                i += 1;
++            }
++            if bytes[i] != b'm' {
++                assert!(active.is_none(), "a link open over CSI {:?}", bytes[i] as char);
++            }
++            i += 1;
++        } else if bytes[i] == 0x1b {
++            i += 2;
++        } else if matches!(bytes[i], b'\r' | b'\n') {
++            assert!(active.is_none(), "a link open across a CR or LF");
++            i += 1;
++        } else {
++            glyphs.push((bytes[i], active.clone()));
++            i += 1;
++        }
++    }
++    assert!(active.is_none(), "the paint left a link open");
++    (glyphs, links)
++}
++
++/// The glyphs of `text` in `glyphs`, each with the target it was written under.
++fn linked<'a>(glyphs: &'a [Glyph], text: &str) -> Vec<&'a [Glyph]> {
++    glyphs.windows(text.len()).filter(|w| w.iter().map(|g| g.0).eq(text.bytes())).collect()
++}
++
++/// Wolf's ask (11-18, phone links): a link printed before a viewer attached
++/// opens there too. Claude Code prints a markdown link as only its text, the
++/// URL in an OSC 8 hyperlink, and puts every row of a long URL it broke
++/// itself in OSC 8 of the same id. A repaint dropped them all.
++#[test]
++fn wolf_ask_links_paint_keeps_osc8_hyperlinks_for_a_viewer_that_attaches_later() {
++    const DOCS: &[u8] = b"https://x.dev/docs";
++    const LONG: &[u8] = b"https://x.dev/0123456789abcdefghij";
++    let mut t = Terminal::new(20, 6, 1 << 20);
++    // As Claude Code writes them (BEL-terminated, with ids; indents by moving the cursor).
++    t.write(b"Read \x1b]8;id=a;https://x.dev/docs\x07the docs\x1b]8;;\x07 now\r\n");
++    for part in ["https://x.dev/0123", "456789abcdefghij"] {
++        t.write(format!("\x1b[2C\x1b]8;id=b;https://x.dev/0123456789abcdefghij\x07{part}\x1b]8;;\x07\r\n").as_bytes());
++    }
++    t.write(b"plain https://not.linked");
++    let paint = t.paint(0);
++    let (glyphs, links) = osc8_placement(&paint);
++    let all_under = |text: &str, target: Option<&[u8]>| {
++        let found = linked(&glyphs, text);
++        !found.is_empty() && found.iter().all(|w| w.iter().all(|g| g.1.as_deref() == target))
++    };
++    assert!(all_under("the docs", Some(DOCS)), "the markdown text keeps its target");
++    assert!(all_under("Read ", None) && all_under(" now", None));
++    assert!(all_under("https://x.dev/0123", Some(LONG)) && all_under("456789abcdefghij", Some(LONG)));
++    assert!(all_under("plain https://not.linked", None), "text that never was a link");
++    // Each row of the broken URL opens again with its id; the indents are not linked.
++    assert_eq!(
++        links,
++        [
++            b"id=a;https://x.dev/docs".to_vec(),
++            [b"id=b;".as_slice(), LONG].concat(),
++            [b"id=b;".as_slice(), LONG].concat()
++        ]
++    );
++    assert!(String::from_utf8_lossy(&paint).contains("\r\n  \x1b]8;id=b;"));
++
++    // A viewer painted from it carries the same links on.
++    let mut viewer = Terminal::new(20, 6, 1 << 20);
++    viewer.write(&paint);
++    assert_eq!(osc8_placement(&viewer.paint(0)).1, links);
++
++    // History lines keep theirs too.
++    let mut tall = Terminal::new(20, 3, 1 << 20);
++    tall.write(b"\x1b]8;;https://x.dev/docs\x07docs\x1b]8;;\x07\r\na\r\nb\r\nc\r\nd");
++    let (glyphs, _) = osc8_placement(&tall.paint(10));
++    assert!(linked(&glyphs, "docs").iter().all(|w| w.iter().all(|g| g.1.as_deref() == Some(DOCS))));
++}
++
++#[test]
++fn wolf_ask_links_a_cursor_gap_after_a_link_is_not_linked() {
++    // Review of #104: blanks were written as spaces under the open link.
++    let mut t = Terminal::new(20, 3, 1 << 20);
++    t.write(b"\x1b]8;;https://x.dev/docs\x1b\\LINK\x1b]8;;\x1b\\\x1b[3Cplain");
++    let paint = t.paint(0);
++    let (glyphs, _) = osc8_placement(&paint);
++    assert!(String::from_utf8_lossy(&paint).contains("LINK\x1b]8;;\x1b\\   plain"));
++    assert!(linked(&glyphs, "   plain")[0].iter().all(|g| g.1.is_none()));
++}
++
++#[test]
++fn wolf_ask_links_a_soft_wrapped_link_in_history_ends_with_its_row() {
++    // Review of #104: joined history rows did not close the link at the
++    // physical row, so the next row's indent was linked.
++    let mut t = Terminal::new(10, 3, 1 << 20);
++    // 'x' wraps; erase it and make an unlinked indent on the continuation row.
++    t.write(b"\x1b]8;;https://x.dev/docs\x1b\\abcdefghij\x1b]8;;\x1b\\x\r\x1b[K\x1b[2Ctail\r\none\r\ntwo\r\nthree");
++    let paint = t.paint(100);
++    osc8_placement(&paint);
++    assert!(String::from_utf8_lossy(&paint).contains("abcdefghij\x1b]8;;\x1b\\  tail"));
++    // A link without an id, soft-wrapped, reopens as the same link.
++    let mut t = Terminal::new(10, 3, 1 << 20);
++    t.write(b"\x1b]8;;https://x.dev/docs\x1b\\abcdefghijklm\x1b]8;;\x1b\\\r\none\r\ntwo\r\nthree");
++    let (_, links) = osc8_placement(&t.paint(100));
++    assert_eq!(links.len(), 2, "{links:?}");
++    assert_eq!(links[0], links[1], "one id for both rows");
++    assert!(links[0].starts_with(b"id=herdr.i."));
++}
++
++#[test]
++fn wolf_ask_links_explicit_ids_are_kept_across_rows() {
++    let mut t = Terminal::new(20, 4, 1 << 20);
++    for s in ["first", "second"] {
++        t.write(format!("\x1b]8;id=claude;https://x.dev/docs\x07{s}\x1b]8;;\x07\r\n").as_bytes());
++    }
++    // An id that is not plain ASCII is dropped, never written raw.
++    t.write("\x1b]8;id=é;https://x.dev/e\x07third\x1b]8;;\x07".as_bytes());
++    let (_, links) = osc8_placement(&t.paint(0));
++    assert_eq!(
++        links,
++        [
++            b"id=claude;https://x.dev/docs".to_vec(),
++            b"id=claude;https://x.dev/docs".to_vec(),
++            b";https://x.dev/e".to_vec()
++        ]
++    );
++}
++
++#[test]
++fn wolf_ask_links_targets_are_portable_ascii_without_double_encoding() {
++    let mut t = Terminal::new(20, 3, 1 << 20);
++    t.write("\x1b]8;;https://x.dev/Ü;a:b%20é\x1b\\LINK\x1b]8;;\x1b\\plain".as_bytes());
++    let (_, links) = osc8_placement(&t.paint(0));
++    // Implicit (no id given): the stable herdr.i.N id, then the encoded target.
++    assert_eq!(links.len(), 1);
++    assert!(links[0].starts_with(b"id=herdr.i."), "{links:?}");
++    assert!(links[0].ends_with(b";https://x.dev/%C3%9C;a:b%20%C3%A9"), "{links:?}");
++    assert!(links[0].iter().all(|b| (0x21..=0x7e).contains(b)));
++}
++
++#[test]
++fn wolf_ask_links_links_close_at_every_boundary_of_every_kind_of_paint() {
++    // From the review of #104: main and alternate screen, BEL and ST input,
++    // history pages, a pending wrap at the edge, and a plain paint after.
++    let uri = "https://x.dev/a;b:c%20d?q=é中&z=%1b%07#frag";
++    let portable = b"https://x.dev/a;b:c%20d?q=%C3%A9%E4%B8%AD&z=%1b%07#frag";
++    for alt in [false, true] {
++        for end in ["\x07", "\x1b\\"] {
++            let mut t = Terminal::new(20, 5, 8 << 20);
++            if alt {
++                t.write(b"\x1b[?1049h");
++            }
++            for n in 0..100 {
++                t.write(format!("\x1b]8;id=same;{uri}{end}LINK{n}中\x1b]8;;{end}\r\n").as_bytes());
++            }
++            t.write(b"\x1b[3Cplain\r\n\r\nprompt> ");
++            let paint = t.paint(1000);
++            let (glyphs, links) = osc8_placement(&paint);
++            assert!(!links.is_empty() && links.iter().all(|l| l.ends_with(portable)));
++            assert!(linked(&glyphs, "prompt>")[0].iter().all(|g| g.1.is_none()));
++            let mut viewer = Terminal::new(20, 5, 8 << 20);
++            viewer.write(&paint);
++            assert_eq!(viewer.alt_screen(), alt);
++            assert_eq!(viewer.screen_rows(), t.screen_rows());
++            osc8_placement(&viewer.paint(1000));
++            viewer.write(b"NEXT");
++            let (glyphs, _) = osc8_placement(&viewer.paint(0));
++            assert!(linked(&glyphs, "NEXT")[0].iter().all(|g| g.1.is_none()));
++        }
++    }
++    for history in [0, 10] {
++        let mut t = Terminal::new(10, 3, 1 << 20);
++        t.write(b"\x1b]8;;https://x.dev/docs\x1b\\abcdefghij\x1b]8;;\x1b\\\r\n\r\nplain\r\n");
++        // A pending wrap at the right edge after the program closed its link.
++        t.write(b"\x1b]8;;https://x.dev/docs\x1b\\0123456789\x1b]8;;\x1b\\");
++        let paint = t.paint(history);
++        osc8_placement(&paint);
++        let mut viewer = Terminal::new(10, 3, 1 << 20);
++        viewer.write(&paint);
++        assert_eq!(viewer.screen_rows(), t.screen_rows());
++        osc8_placement(&viewer.paint(history));
++        // The next paint, all plain, leaves no link behind.
++        viewer.write(&Terminal::new(10, 3, 1 << 20).paint(0));
++        viewer.write(b"prompt> ");
++        assert!(osc8_placement(&viewer.paint(0)).1.is_empty());
++    }
++}
++
++/// Every OSC 8 opening in `bytes`, as `params;target`, in order.
++fn osc8_opens(bytes: &[u8]) -> Vec<Vec<u8>> {
++    let mut opens = Vec::new();
++    let mut rest = bytes;
++    while let Some(at) = rest.windows(4).position(|w| w == b"\x1b]8;") {
++        let body = &rest[at + 4..];
++        let end = body.windows(2).position(|w| w == b"\x1b\\").expect("an ST ends the OSC");
++        let body = &body[..end];
++        if !body.ends_with(b";") {
++            opens.push(body.to_vec());
++        }
++        rest = &rest[at + 4 + end..];
++    }
++    opens
++}
++
++#[test]
++fn wolf_ask_links_a_link_too_long_once_encoded_is_left_out_whole() {
++    // Review of #104, round 2: the parser's 2048-byte capture holds the
++    // parameters, a ";", the target and a NUL, encoded; the phone drops a
++    // target past 4096. Over it: no id, then no link, never a cut target.
++    let paint_of = |input: String| {
++        let mut t = Terminal::new(40, 3, 1 << 20);
++        t.write(input.as_bytes());
++        t.paint(0)
++    };
++    // 400 "é": 814 bytes kept by the source, 2414 encoded.
++    let wide = format!("https://x.dev/{}", "é".repeat(400));
++    let paint = paint_of(format!("\x1b]8;id=a;{wide}\x07LINK\x1b]8;;\x07 plain"));
++    let (glyphs, links) = osc8_placement(&paint);
++    assert!(links.is_empty(), "{links:?}");
++    assert!(linked(&glyphs, "LINK plain")[0].iter().all(|g| g.1.is_none()));
++    // 800 "é" with Claude's id: 1614 bytes, 4814 encoded (tappable live, dead painted before).
++    let wider = format!("https://x.dev/{}", "é".repeat(800));
++    assert!(osc8_opens(&paint_of(format!("\x1b]8;id=sg4g0w;{wider}\x07LINK\x1b]8;;\x07"))).is_empty());
++    // 2037 ASCII bytes, no id: kept whole, without the implicit id that would not fit.
++    let long = format!("https://x.dev/{}", "x".repeat(2037 - 14));
++    let opens = osc8_opens(&paint_of(format!("\x1b]8;;{long}\x07LINK\x1b]8;;\x07")));
++    assert_eq!(opens, [format!(";{long}").into_bytes()]);
++    // Short enough for its id too: both kept.
++    let fits = format!("https://x.dev/{}", "x".repeat(2000));
++    let opens = osc8_opens(&paint_of(format!("\x1b]8;id=a;{fits}\x07LINK\x1b]8;;\x07")));
++    assert_eq!(opens, [format!("id=a;{fits}").into_bytes()]);
++}
++
++#[test]
++fn wolf_ask_links_a_repaint_drops_a_link_the_viewer_missed_the_close_of() {
++    // Review of #104, round 2 (inherited): a viewer painted while the
++    // program was inside a link, which then closed it while the viewer fell
++    // behind, kept the old link for the repaint's text and the live text
++    // after it. Both a Ghostty viewer and the phone tapped "plainNEXT" open.
++    let mut source = Terminal::new(20, 3, 1 << 20);
++    source.write(b"\x1b]8;id=sg4g0w;https://x.dev/docs\x1b\\LINK");
++    let mut viewer = Terminal::new(20, 3, 1 << 20);
++    viewer.write(&source.paint(0));
++    source.write(b"\x1b]8;;\x1b\\\x1b[2J\x1b[Hplain");
++    viewer.write(&source.paint(0));
++    viewer.write(b"NEXT");
++    let (glyphs, links) = osc8_placement(&viewer.paint(0));
++    assert!(links.is_empty(), "{links:?}");
++    assert!(linked(&glyphs, "plainNEXT")[0].iter().all(|g| g.1.is_none()));
++    // The program's own active link still reaches live text after a paint.
++    let mut source = Terminal::new(20, 3, 1 << 20);
++    source.write(b"\x1b]8;id=sg4g0w;https://x.dev/docs\x1b\\LINK");
++    let mut viewer = Terminal::new(20, 3, 1 << 20);
++    viewer.write(&source.paint(0));
++    viewer.write(b"MORE");
++    let opens = osc8_opens(&viewer.paint(0));
++    assert!(!opens.is_empty() && opens.iter().all(|o| o == b"id=sg4g0w;https://x.dev/docs"), "{opens:?}");
++}
++
++#[test]
++fn wolf_ask_links_cells_and_their_active_continuation_share_one_id_none_a_programs() {
++    // Review of #104, round 2: an implicit link still open at the paint gets
++    // the same id on its cells and on the cursor's continuation.
++    let mut t = Terminal::new(20, 3, 1 << 20);
++    t.write(b"\x1b]8;;https://x.dev/c\x1b\\abc");
++    let opens = osc8_opens(&t.paint(0));
++    assert!(opens.len() >= 2, "{opens:?}");
++    assert!(opens[0].starts_with(b"id=herdr.i.") && opens.iter().all(|o| *o == opens[0]), "{opens:?}");
++    // A program's id in the implicit ids' namespace is dropped, not shared.
++    let mut t = Terminal::new(20, 3, 1 << 20);
++    t.write(b"\x1b]8;;https://x.dev/c\x1b\\abc\x1b]8;;\x1b\\\r\n");
++    t.write(b"\x1b]8;id=herdr.i.0;https://x.dev/c\x1b\\def\x1b]8;;\x1b\\");
++    let (_, links) = osc8_placement(&t.paint(0));
++    assert_eq!(links.len(), 2, "{links:?}");
++    assert!(links[0].starts_with(b"id=herdr.i."));
++    assert_eq!(links[1], b";https://x.dev/c".to_vec());
++}
++
++#[test]
++fn wolf_ask_links_a_repaint_closes_a_link_the_main_screen_kept_under_the_alternate_one() {
++    // Review of #104, round 3: the first close lands on the screen the viewer
++    // is on; back on the main screen, its restored cursor carried the old
++    // link, and the phone tapped "plain" and the live "NEXT" open.
++    let reset = PAINT_RESET;
++    let main_back = reset.windows(6).position(|w| w == b"\x1b[?47l").expect("the reset leaves the alternate screen");
++    let later = &reset[main_back..];
++    let close = later.windows(7).position(|w| w == b"\x1b]8;;\x1b\\").expect("and closes links after");
++    assert!(close < later.windows(7).position(|w| w == b"\x1b[H\x1b[2J").expect("before its clear"));
++    // The case itself, on a viewer.
++    let mut source = Terminal::new(20, 3, 1 << 20);
++    source.write(b"\x1b]8;id=sg4g0w;https://x.dev/docs\x1b\\LINK");
++    let mut viewer = Terminal::new(20, 3, 1 << 20);
++    viewer.write(&source.paint(0));
++    // The viewer sees the program go to the alternate screen, then misses the rest.
++    viewer.write(b"\x1b[?1049halt");
++    source.write(b"\x1b[?1049halt\x1b[?1049l\x1b]8;;\x1b\\\x1b[2J\x1b[Hplain");
++    viewer.write(&source.paint(0));
++    viewer.write(b"NEXT");
++    let (glyphs, links) = osc8_placement(&viewer.paint(0));
++    assert!(links.is_empty(), "{links:?}");
++    assert!(linked(&glyphs, "plainNEXT")[0].iter().all(|g| g.1.is_none()));
++}
+diff --git a/vendor/ghostty/src/terminal/formatter.zig b/vendor/ghostty/src/terminal/formatter.zig
+index 9dd28a0..9a04594 100644
+--- a/vendor/ghostty/src/terminal/formatter.zig
++++ b/vendor/ghostty/src/terminal/formatter.zig
+@@ -20,6 +20,97 @@ const Row = @import("page.zig").Row;
+ const Selection = @import("Selection.zig");
+ const Style = @import("style.zig").Style;
+ 
++/// herdr: the parser's OSC 8 capture: parameters, their ";", the target and
++/// a NUL. A link written back must fit it, encoded, or a viewer (and Herdr's
++/// own phone, whose limit is twice this) drops it.
++const max_vt_link_payload = 2048;
++
++/// herdr: how the ids of links the program gave none are written: a stable
++/// "herdr.i.N" from the screen's own counter. An explicit id with this
++/// prefix is dropped, so the two never collide. Known limit: a paint of a
++/// screen that was itself fed a herdr paint (a core relaying another) drops
++/// those received "herdr.i.N" ids too, so such a link's rows are written as
++/// separate links there; their targets are kept.
++const implicit_link_prefix = "herdr.i.";
++
++/// herdr: the id a VT hyperlink is written with.
++const VtLinkId = union(enum) {
++    none,
++    explicit: []const u8,
++    implicit: u64,
++};
++
++/// herdr: whether an explicit OSC 8 id can be written back as is: printable
++/// ASCII without the parameter separators, short, and not in the implicit
++/// ids' namespace.
++fn portableLinkId(id: []const u8) bool {
++    if (id.len == 0 or id.len > 256) return false;
++    if (std.mem.startsWith(u8, id, implicit_link_prefix)) return false;
++    for (id) |byte| {
++        if (byte <= 0x20 or byte >= 0x7f or byte == ':' or byte == ';') return false;
++    }
++    return true;
++}
++
++/// herdr: the bytes of `uri` as portable ASCII (writeVtLinkUri).
++fn encodedLinkUriLen(uri: []const u8) usize {
++    var len: usize = 0;
++    for (uri) |byte| len += if (byte > 0x20 and byte < 0x7f) 1 else 3;
++    return len;
++}
++
++/// herdr: the bytes the parameters take for `id` ("id=...", or none).
++fn linkIdParamLen(id: VtLinkId) usize {
++    return switch (id) {
++        .none => 0,
++        .explicit => |v| "id=".len + v.len,
++        .implicit => |n| "id=".len + implicit_link_prefix.len + std.fmt.count("{d}", .{n}),
++    };
++}
++
++/// herdr: an OSC 8 target as portable ASCII: bytes outside printable ASCII
++/// are percent-encoded (a raw 0x9C is ST to a C1-aware viewer), existing %XX
++/// escapes are kept as they are.
++fn writeVtLinkUri(writer: *std.Io.Writer, uri: []const u8) std.Io.Writer.Error!void {
++    for (uri) |byte| {
++        if (byte > 0x20 and byte < 0x7f) {
++            try writer.writeByte(byte);
++        } else {
++            try writer.print("%{X:0>2}", .{byte});
++        }
++    }
++}
++
++/// herdr: opens a VT hyperlink to `uri` as the program wrote it, the cells'
++/// and the cursor's alike: its id (explicit as is when portable, implicit as
++/// "herdr.i.N") and its target as portable ASCII. It must fit the parser's
++/// capture, encoded: over it, the id is left out; still over, no link is
++/// opened at all (never a cut target; the close that follows is harmless).
++fn writeVtLinkOpen(writer: *std.Io.Writer, id_in: VtLinkId, uri: []const u8) std.Io.Writer.Error!void {
++    var id = id_in;
++    switch (id) {
++        .explicit => |v| if (!portableLinkId(v)) {
++            id = .none;
++        },
++        else => {},
++    }
++    const uri_len = encodedLinkUriLen(uri);
++    if (uri.len == 0 or 1 + uri_len + 1 > max_vt_link_payload) return;
++    if (linkIdParamLen(id) + 1 + uri_len + 1 > max_vt_link_payload) id = .none;
++    try writer.writeAll("\x1b]8;");
++    switch (id) {
++        .none => {},
++        .explicit => |v| {
++            try writer.writeAll("id=");
++            try writer.writeAll(v);
++        },
++        .implicit => |n| try writer.print("id=" ++ implicit_link_prefix ++ "{d}", .{n}),
++    }
++    try writer.writeByte(';');
++    try writeVtLinkUri(writer, uri);
++    try writer.writeAll("\x1b\\");
++}
++
+ /// Formats available.
+ pub const Format = lib.Enum(lib.target, &.{
+     // Plain text.
+@@ -772,16 +863,12 @@ pub const ScreenFormatter = struct {
+             const cursor = &self.screen.cursor;
+             if (cursor.hyperlink) |link| {
+                 // Start hyperlink with uri (and explicit id if present)
+-                switch (link.id) {
+-                    .explicit => |id| try writer.print(
+-                        "\x1b]8;id={s};{s}\x1b\\",
+-                        .{ id, link.uri },
+-                    ),
+-                    .implicit => try writer.print(
+-                        "\x1b]8;;{s}\x1b\\",
+-                        .{link.uri},
+-                    ),
+-                }
++                // herdr: as the cells' links are written (writeVtLinkOpen),
++                // so live text after it joins the same link.
++                try writeVtLinkOpen(writer, switch (link.id) {
++                    .explicit => |id| .{ .explicit = id },
++                    .implicit => |n| .{ .implicit = n },
++                }, link.uri);
+             }
+         }
+ 
+@@ -1195,6 +1282,18 @@ pub const PageFormatter = struct {
+             const row: *Row = self.page.getRow(y);
+             const cells: []const Cell = self.page.getCells(row);
+ 
++            // herdr: a VT hyperlink ends with its physical row, also where
++            // soft-wrapped rows are joined (no newline is added for that), so
++            // the next row's leading blanks (a program's indent) are never
++            // part of it. A link that goes on there opens again, with the
++            // same id, at its first cell.
++            if (comptime emit == .vt) {
++                if (current_hyperlink_id != null) {
++                    try self.formatHyperlinkClose(emit, writer);
++                    current_hyperlink_id = null;
++                }
++            }
++
+             // Determine the x range for this row
+             // - First row: start_x to end of row (or end_x if single row)
+             // - Last row: start of row to end_x
+@@ -1357,6 +1456,20 @@ pub const PageFormatter = struct {
+                         if (!cell.isEmpty() or cell.hasStyling()) break :blank;
+                     }
+ 
++                    // herdr: blanks are written later as spaces, before the
++                    // next text. In VT, close a link they are not part of
++                    // now, or those spaces (a cursor-made gap) would be in it.
++                    if (comptime emit == .vt) {
++                        if (current_hyperlink_id) |open_id| {
++                            const same = cell.hyperlink and
++                                (self.page.lookupHyperlink(cell) orelse 0) == open_id;
++                            if (!same) {
++                                try self.formatHyperlinkClose(emit, writer);
++                                current_hyperlink_id = null;
++                            }
++                        }
++                    }
++
+                     // Cells with no text are blank
+                     if (!cell.hasText()) {
+                         blank_cells += 1;
+@@ -1470,10 +1583,9 @@ pub const PageFormatter = struct {
+ 
+                 // Hyperlink state
+                 hyperlink: {
+-                    // We currently only emit hyperlinks for HTML. In the
+-                    // future we can support emitting OSC 8 hyperlinks for
+-                    // VT output as well.
+-                    if (comptime emit != .html) break :hyperlink;
++                    // herdr: HTML and VT (as OSC 8) carry hyperlinks; plain
++                    // text has nowhere to put them.
++                    if (comptime emit == .plain) break :hyperlink;
+ 
+                     // Get the hyperlink ID. This ID is our internal ID,
+                     // not necessarily the OSC8 ID.
+@@ -1498,17 +1610,14 @@ pub const PageFormatter = struct {
+                     current_hyperlink_id = link_id;
+ 
+                     // Emit the opening hyperlink tag
+-                    const uri = uri: {
+-                        const link = self.page.hyperlink_set.get(
+-                            self.page.memory,
+-                            link_id,
+-                        );
+-                        break :uri link.uri.offset.ptr(self.page.memory)[0..link.uri.len];
+-                    };
++                    const link = self.page.hyperlink_set.get(
++                        self.page.memory,
++                        link_id,
++                    );
+                     try self.formatHyperlinkOpen(
+                         emit,
+                         writer,
+-                        uri,
++                        link,
+                     );
+ 
+                     // If we have a point map, we map the hyperlink to
+@@ -1518,7 +1627,7 @@ pub const PageFormatter = struct {
+                         try self.formatHyperlinkOpen(
+                             emit,
+                             &discarding.writer,
+-                            uri,
++                            link,
+                         );
+                         map.map.appendNTimes(
+                             map.alloc,
+@@ -1666,6 +1775,12 @@ pub const PageFormatter = struct {
+ 
+             const cp: u21 = cell.content.codepoint.data;
+ 
++            // herdr: a blank under an open VT link takes the slow path, which
++            // closes the link unless the blank is part of it.
++            if (comptime emit == .vt) {
++                if (cp == 0 and run_hyperlink_id != null) break;
++            }
++
+             // Blank cell accounting, matching the slow path blank block.
+             if (comptime formatStyled(emit)) {
+                 // Styled formats only treat unstyled empty cells as
+@@ -1693,7 +1808,7 @@ pub const PageFormatter = struct {
+             // cell must belong to the currently open hyperlink (or none).
+             // Transitions take the slow path. This is checked after blank
+             // accounting because blank cells never touch hyperlink state.
+-            if (comptime emit == .html) {
++            if (comptime emit != .plain) {
+                 if (cell.hyperlink) {
+                     const run_id = run_hyperlink_id orelse break;
+                     const cell_id = self.page.lookupHyperlink(cell) orelse break;
+@@ -2091,10 +2206,18 @@ pub const PageFormatter = struct {
+         self: PageFormatter,
+         comptime emit: Format,
+         writer: *std.Io.Writer,
+-        uri: []const u8,
++        link: *const hyperlink.PageEntry,
+     ) std.Io.Writer.Error!void {
++        const uri = link.uri.offset.ptr(self.page.memory)[0..link.uri.len];
+         switch (emit) {
+-            .plain, .vt => unreachable,
++            .plain => unreachable,
++
++            // herdr: OSC 8 as the program wrote it (writeVtLinkOpen), so a
++            // link reopened on its next row is the same link to the viewer.
++            .vt => try writeVtLinkOpen(writer, switch (link.id) {
++                .explicit => |slice| .{ .explicit = slice.offset.ptr(self.page.memory)[0..slice.len] },
++                .implicit => |n| .{ .implicit = n },
++            }, uri),
+ 
+             // layout since we're primarily using it as a CSS wrapper.
+             .html => {
+@@ -2116,7 +2239,8 @@ pub const PageFormatter = struct {
+     ) std.Io.Writer.Error!void {
+         const str: []const u8 = switch (emit) {
+             .html => "</a>",
+-            .plain, .vt => return,
++            .vt => "\x1b]8;;\x1b\\",
++            .plain => return,
+         };
+ 
+         try writer.writeAll(str);
