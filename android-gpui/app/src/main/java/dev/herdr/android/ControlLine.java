@@ -43,6 +43,8 @@ final class ControlLine {
 
     /** The talk slot's width in cells: its words ("talk", "stop", "…") are padded to it. */
     static final int TALK_SLOT = 4;
+    /** The most alternatives the native bridge takes in one update (ghost_bridge.rs MAX_RUNGS). */
+    static final int MAX_RUNGS = 8;
     /** The most controls a line has (the renderer's limit, ghost_bridge MAX_CONTROLS). */
     static final int MAX_CONTROLS = 10;
     /** Ids of the reserved, untappable cells and the status words: never touch targets. */
@@ -92,6 +94,31 @@ final class ControlLine {
      * or a zoom never draws a line meant for the old width (ghost.rs).
      */
     static java.util.List<java.util.List<GhostText.Control>> ladder(State in) {
+        return trimmed(fullLadder(in));
+    }
+
+    /**
+     * At most {@link #MAX_RUNGS} lines, widest and barest kept: the native bridge refuses a whole
+     * update with more, which would drop Cancel and freeze the controls. The line whose neighbours
+     * are closest in width is the first to go.
+     */
+    static java.util.List<java.util.List<GhostText.Control>> trimmed(java.util.List<java.util.List<GhostText.Control>> rungs) {
+        java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>(rungs);
+        while (out.size() > MAX_RUNGS) {
+            int drop = 1, best = Integer.MAX_VALUE;
+            for (int i = 1; i + 1 < out.size(); i++) {
+                int gap = width(out.get(i - 1)) - width(out.get(i + 1));
+                if (gap < best) {
+                    best = gap;
+                    drop = i;
+                }
+            }
+            out.remove(drop);
+        }
+        return out;
+    }
+
+    private static java.util.List<java.util.List<GhostText.Control>> fullLadder(State in) {
         java.util.List<GhostText.Control> slots = slots(in);
         java.util.List<GhostText.Control> statuses = new java.util.ArrayList<>();
         // talk's fuller words, fullest first: status words left of the slots.

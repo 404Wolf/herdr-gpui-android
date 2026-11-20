@@ -317,6 +317,13 @@ final class ComposerBar {
             appendDictation(pane, text, null);
         }
 
+        @Override public void appendDictation(String hostId, String pane, String text, int[] unverifiedCuts) {
+            // A final for the computer and pane it was spoken on, whatever is on screen now.
+            String onHost = hostId == null ? "" : hostId;
+            String draft = drafts.append(onHost, pane, text, unverifiedCuts);
+            if (onHost.equals(drafts.host()) && pane.equals(drafts.pane())) showText(draft);
+        }
+
         @Override public void appendDictation(String pane, String text, int[] unverifiedCuts) {
             // A live final for another pane: it stays in memory either way; persistNow follows.
             if (pane == null || pane.isEmpty()) pane = drafts.pane();
@@ -614,7 +621,8 @@ final class ComposerBar {
             dictation.cancel();
             setDictationState(DictationEngine.State.IDLE);
             routing.forget();
-            drafts.dictationEnded();
+            // The listening partial leaves the draft it was spoken into (the session is cancelled).
+            drafts.dictationCancelled();
         }
         if (!drafts.setHost(onHost, revision, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);

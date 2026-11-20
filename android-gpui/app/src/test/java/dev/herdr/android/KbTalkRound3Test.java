@@ -153,6 +153,9 @@ public final class KbTalkRound3Test {
         @Override public void enter() { }
         @Override public void notice(String text) { }
         @Override public void appendDictation(String pane, String text) { drafts.append(pane, text); }
+        @Override public void appendDictation(String hostId, String pane, String text, int[] cuts) {
+            drafts.append(hostId, pane, text, cuts);
+        }
         @Override public void clipLength(String clipId, long durationMs) { }
         @Override public void transcribedOnPhone() { }
     }
@@ -166,5 +169,8 @@ public final class KbTalkRound3Test {
         c.drafts.switchTo("t1");
         session.onFinal("from A", false);
         assertEquals("host B's t1 is untouched", "", c.drafts.text());
+        c.drafts.setHost("hostA");
+        c.drafts.switchTo("t1");
+        assertEquals("the final is in the draft that started the dictation", "from A", c.drafts.text());
     }
 }

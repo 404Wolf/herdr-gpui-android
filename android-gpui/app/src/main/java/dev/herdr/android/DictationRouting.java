@@ -35,6 +35,14 @@ final class DictationRouting {
             appendDictation(pane, text);
         }
 
+        /**
+         * As above for the pane {@code pane} of computer {@code hostId}: the computer the session
+         * was started on, not the one on screen when its text arrives.
+         */
+        default void appendDictation(String hostId, String pane, String text, int[] unverifiedCuts) {
+            appendDictation(pane, text, unverifiedCuts);
+        }
+
         void clipLength(String clipId, long durationMs);
 
         /** The text just placed on screen is the phone's: say so ("talk offline"). */
@@ -161,6 +169,7 @@ final class DictationRouting {
     DictationEngine.Listener listener(String pane) {
         final int born = generation;
         final String owner = here();
+        final String originHost = drafts.host();
         sessionOwner = owner;
         sessionGen = born;
         return new DictationEngine.Listener() {
@@ -207,7 +216,7 @@ final class DictationRouting {
                     bar.showText(drafts.dictationFinal(text, cuts));
                 } else if (!text.isEmpty()) {
                     // Switched away while it finished: it joins the end of its own pane's draft.
-                    bar.appendDictation(pane, text, cuts);
+                    bar.appendDictation(originHost, pane, text, cuts);
                 }
                 // Saved before the engine deletes the recording; not saved, it keeps it.
                 stored = bar.persistNow();
@@ -246,7 +255,7 @@ final class DictationRouting {
                 forget();
                 bar.setDictationState(DictationEngine.State.IDLE);
                 if (owner.equals(here())) bar.showText(drafts.dictationEnded());
-                else if (!lastPartial.isEmpty()) bar.appendDictation(pane, lastPartial);
+                else if (!lastPartial.isEmpty()) bar.appendDictation(originHost, pane, lastPartial, null);
                 if (error.reason().nothingHeard()) {
                     // Said where the mic is, in "talk": no note over the terminal.
                     bar.nothingHeard(error.reason());
