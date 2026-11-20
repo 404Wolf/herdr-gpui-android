@@ -322,10 +322,19 @@ quiet 2
 # (c) offline: A's grid was saved when B was opened; cut the host, open A from the cache
 stop_sshd
 hc server stop > /dev/null 2>&1
-quiet 15
+quiet 8
 shot offline-b
-switch_to agent-a || record offline-open FAIL "no agent-a entry while offline"
-quiet 6
+# Open A the way a person does with no link: restart the app (the saved grids are on disk) and pick
+# the agent from Home's cached tree, which draws its saved copy. Switching tabs while the session is
+# still retrying ("connecting") shows only a blank held surface, which is not what this checks.
+launch
+quiet 10
+shot offline-home
+tap_ui 'Computer pr48host' 20 > /dev/null 2>&1 || true
+find_ui 'agent-a' > /dev/null 2>&1 || tap_ui 'Other agents' 10 || true
+quiet 2
+tap_ui 'agent-a' 25 || record offline-open FAIL "no agent-a on Home while offline"
+quiet 8
 shot offline-a-before-keyboard
 base=$($ui blank "$EMU_OUT/offline-a-before-keyboard.png" 18 80)
 if ! pane_is agent-a; then
