@@ -1,0 +1,164 @@
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index 1d259d9..c82e174 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -159,49 +159,51 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+ 
+ #[tokio::test]
+ async fn reconnect_rejects_downgrade_before_mapping_fallback_data() {
+-    for stalled in [false, true] {
+-        // The immediate relay is capable, but its deeper path has downgraded.
+-        let (frames, mut rx) = mpsc::unbounded_channel();
+-        let line = Line::new(frames, &json!({"features": ["resize_notifications"]}));
+-        let conn = Arc::new(Conn::default());
+-        conn.with(|out| {
+-            out.open(7);
+-            if stalled {
+-                out.data(7, &vec![120; wire::WINDOW]);
+-                while out.next_frame().is_some() {}
++    for (require_resize, require_visibility) in [(true, false), (false, true)] {
++        for stalled in [false, true] {
++            // The immediate relay is capable, but its deeper path has downgraded.
++            let (frames, mut rx) = mpsc::unbounded_channel();
++            let line = Line::new(frames, &json!({"features": ["resize_notifications", "viewer_visibility"]}));
++            let conn = Arc::new(Conn::default());
++            conn.with(|out| {
++                out.open(7);
++                if stalled {
++                    out.data(7, &vec![120; wire::WINDOW]);
++                    while out.next_frame().is_some() {}
++                }
++            });
++            let calling = line.clone();
++            let sink = conn.clone();
++            let task = tokio::spawn(async move {
++                calling
++                    .call_into(
++                        "relay",
++                        "terminal.attach",
++                        json!({"observe": true, "resumed": true, "resize_notifications": true}),
++                        Some(((sink, 7), require_resize, require_visibility)),
++                        Duration::from_secs(1),
++                    )
++                    .await
++            });
++            let request = rx.recv().await.unwrap();
++            let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++            line.take_reply(json!({"id": request["id"], "result": {"channel": 9, "resize_notifications": false, "visibility_updates": false}}));
++            // Model buffered DATA consumed before the awakened caller can run.
++            if let Some((sink, here)) = lock(&line.streams).get(&9) {
++                sink.with(|out| {
++                    out.data(*here, b"unsupported fallback paint");
++                });
+             }
+-        });
+-        let calling = line.clone();
+-        let sink = conn.clone();
+-        let task = tokio::spawn(async move {
+-            calling
+-                .call_into(
+-                    "relay",
+-                    "terminal.attach",
+-                    json!({"observe": true, "resumed": true, "resize_notifications": true}),
+-                    Some(((sink, 7), true, false)),
+-                    Duration::from_secs(1),
+-                )
+-                .await
+-        });
+-        let request = rx.recv().await.unwrap();
+-        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+-        line.take_reply(json!({"id": request["id"], "result": {"channel": 9, "resize_notifications": false}}));
+-        // Model buffered DATA consumed before the awakened caller can run.
+-        if let Some((sink, here)) = lock(&line.streams).get(&9) {
+-            sink.with(|out| {
+-                out.data(*here, b"unsupported fallback paint");
++            assert!(task.await.unwrap().is_err(), "downgraded reattach must be rejected");
++            conn.with(|out| {
++                assert_eq!(out.queued(7), 0, "rejected fallback DATA must not enter the downstream queue");
++                out.close(7, b"");
++                let frame = out.next_frame().expect("CLOSE must not wait for credit");
++                assert_eq!(wire::decode_header(frame[..wire::HEADER].try_into().unwrap()).unwrap().1, wire::CLOSE);
++                assert!(out.next_frame().is_none());
+             });
++            assert!(!lock(&line.streams).contains_key(&9), "rejected stream must never be mapped");
+         }
+-        assert!(task.await.unwrap().is_err(), "downgraded reattach must be rejected");
+-        conn.with(|out| {
+-            assert_eq!(out.queued(7), 0, "rejected fallback DATA must not enter the downstream queue");
+-            out.close(7, b"");
+-            let frame = out.next_frame().expect("CLOSE must not wait for credit");
+-            assert_eq!(wire::decode_header(frame[..wire::HEADER].try_into().unwrap()).unwrap().1, wire::CLOSE);
+-            assert!(out.next_frame().is_none());
+-        });
+-        assert!(!lock(&line.streams).contains_key(&9), "rejected stream must never be mapped");
+     }
+ }
+ 
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index 6c57368..5da78ba 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -112,13 +112,7 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+     conn.with(|out| out.open_paused(here));
+     let deadline = deadline_for(core, "terminal.attach", &forwarded);
+     match line
+-        .call_into(
+-            &m.name,
+-            "terminal.attach",
+-            forwarded.clone(),
+-            Some(((conn.clone(), here), forwarded["resize_notifications"] == true, false)),
+-            deadline,
+-        )
++        .call_into(&m.name, "terminal.attach", forwarded.clone(), Some(((conn.clone(), here), false, false)), deadline)
+         .await
+     {
+         Ok(mut r) => {
+diff --git a/crates/herdr-core/tests/resize_negotiation.rs b/crates/herdr-core/tests/resize_negotiation.rs
+index c1c575d..c9ad859 100644
+--- a/crates/herdr-core/tests/resize_negotiation.rs
++++ b/crates/herdr-core/tests/resize_negotiation.rs
+@@ -65,3 +65,44 @@ fn interactive_grid_negotiation_falls_back_if_either_hop_is_pre_fix() {
+         assert_eq!(reply["result"]["resize_notifications"], false, "legacy owner={old_owner}: {reply}");
+     }
+ }
++
++#[test]
++fn initial_two_relay_attach_falls_back_and_maps_data_from_old_owner() {
++    let Some(old) = std::env::var_os("HC_PRE_GRID_BIN") else {
++        eprintln!("skipped: set HC_PRE_GRID_BIN to a pre-grid artifact");
++        return;
++    };
++    let mut owner = Session::new();
++    owner.bin = old.into();
++    let t = run(&owner, &["sh", "-c", "echo fallback-stream-data; sleep 100"]);
++    wait_until("owner output", || text(&owner, &t).contains("fallback-stream-data"));
++    let mut relay = Session::new();
++    relay.env.push(fake_ssh(&relay, &[("owner", &owner)]));
++    relay.json(&["machine", "add", "owner"]);
++    let mut client = Session::new();
++    client.env.push(fake_ssh(&client, &[("relay", &relay)]));
++    client.json(&["machine", "add", "relay"]);
++    let mut conn = Framed::open(&client);
++    let reply = conn.call(
++        "terminal.attach",
++        json!({
++            "terminal": format!("relay/owner/{t}"), "cols": 80, "rows": 24,
++            "resize_notifications": true, "visibility_updates": true, "visible": false,
++            "history": 100
++        }),
++    );
++    let channel = reply["result"]["channel"].as_u64().expect("initial fallback must succeed") as u32;
++    assert_eq!(reply["result"]["resize_notifications"], false, "{reply}");
++    assert_eq!(reply["result"]["visibility_updates"], false, "{reply}");
++    let mut bytes = Vec::new();
++    let deadline = std::time::Instant::now() + Duration::from_secs(5);
++    while !String::from_utf8_lossy(&bytes).contains("fallback-stream-data") {
++        assert!(std::time::Instant::now() < deadline, "fallback DATA was not mapped");
++        if let Some((ch, kind, data)) = conn.read(Duration::from_millis(200)) {
++            assert_eq!(ch, channel);
++            if kind == wire::DATA {
++                bytes.extend(data);
++            }
++        }
++    }
++}

@@ -9,6 +9,12 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # The herdr-core the phone talks to, built as Wolf's own core is (nix/herdr-core), so the
+    # emulator jobs run a scratch core on the job host, not a stand-in.
+    herdr-core-src = {
+      url = "git+https://github.com/404Wolf/herdr-core?ref=master&rev=1c456496078558263e3f253bb8bd3cfe873cf9f6&submodules=1";
+      flake = false;
+    };
   };
 
   outputs =
@@ -16,6 +22,7 @@
       self,
       nixpkgs,
       rust-overlay,
+      herdr-core-src,
     }:
     let
       inherit (nixpkgs) lib;
@@ -84,6 +91,10 @@
             pkgs.pkg-config
             pkgs.python3
             pkgs.socat
+            # A scratch herdr-core (hc) and sshd for the emulator tests, both from Nix.
+            (pkgs.callPackage ./nix/herdr-core { src = herdr-core-src; })
+            pkgs.openssh
+            pkgs.coreutils
           ];
           ANDROID_HOME = sdkRoot;
           ANDROID_SDK_ROOT = sdkRoot;

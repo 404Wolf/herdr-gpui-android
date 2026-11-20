@@ -1,0 +1,151 @@
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index c5f96b4..3859c1c 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -735,7 +735,14 @@ struct SizeSelection {
+ }
+ 
+ fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+-    if viewers.iter().any(focus_reporter) {
++    // Focus history rules while a reporter that has it is shown. When every
++    // such reporter is hidden, a visible measured desktop whose path could not
++    // negotiate focus (old app, old relay) leads under the previous rules;
++    // reporting windows that were never focused, and phones, still never lead.
++    let reporting = viewers.iter().any(focus_reporter);
++    let shown_reporter = viewers.iter().any(|v| focus_reporter(v) && v.visible);
++    let eligible = |v: &Viewer| !(reporting && v.focus_updates);
++    if reporting && (shown_reporter || !viewers.iter().any(|v| desktop_sizer(v) && eligible(v))) {
+         return select_focused(viewers, grouped);
+     }
+     let awaiting_size = viewers.iter().any(|v| !v.observe && v.visible && v.awaiting_size);
+@@ -747,6 +754,7 @@ fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+         .enumerate()
+         .filter_map(|(index, v)| {
+             (!v.observe
++                && eligible(v)
+                 && v.visible
+                 && !v.awaiting_size
+                 && (!awaiting_size || v.sized)
+@@ -764,6 +772,7 @@ fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+             .enumerate()
+             .filter_map(|(index, v)| {
+                 (!v.observe
++                    && eligible(v)
+                     && v.desktop_group == selected.desktop_group
+                     && v.visible
+                     && v.sized
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index 6ae8dc2..65eba70 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -840,3 +840,46 @@ fn hidden_or_unmeasured_focused_window_holds_the_grid() {
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++/// 2026-11-13, laptop/t6k: the laptop's own app window (focus history,
++/// hidden, unmeasured 120x40) and Wolf's focused small-pickle window arriving
++/// through the small-pickle core without focus (263x197). The hidden reporter
++/// must not lock the visible measured window out for good.
++#[test]
++fn incident_2026_11_13_hidden_reporter_does_not_lock_out_a_visible_desktop() {
++    let (core, id, root) = core_with_screen(263, 96);
++    let app = desktop_conn();
++    let line = Arc::new(Conn::default()); // the small-pickle core's line
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let local = Some(("test", "test"));
++    let a = core.attach(&app, id, focus_request((263, 96), local, true, true)).unwrap();
++    core.viewer_resize(&app, a, 263, 96);
++    assert_eq!(grid(), (263, 96));
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    // The laptop window is hidden: a phone alone still holds the grid.
++    core.viewer_window_focus(&app, a, false);
++    core.viewer_visibility(&app, a, false);
++    assert_eq!(grid(), (263, 96), "a phone never takes over from a hidden reporter");
++    // A reporting window that was never focused stays out, also as a contributor.
++    let other = desktop_conn();
++    let u = core.attach(&other, id, focus_request((90, 30), local, true, false)).unwrap();
++    core.viewer_resize(&other, u, 90, 30);
++    assert_eq!(grid(), (263, 96), "an unfocused reporter never takes over");
++    // The visible small-pickle window (non-reporting) may now lead.
++    let r = core.attach(&line, id, focus_request((263, 197), Some(("pickle", "pickle")), false, false)).unwrap();
++    core.viewer_resize(&line, r, 263, 197);
++    assert_eq!(grid(), (263, 197), "a visible measured desktop is not locked out by a hidden reporter");
++    let list = core.viewer_list(id, "t6k".into());
++    assert!(!list.focus_authority);
++    assert_eq!(list.leader.map(|l| l.channel), Some(r));
++    // The reporter is shown again: focus history rules again (it keeps the grid
++    // as last focused) and the non-reporter only receives it.
++    core.viewer_visibility(&app, a, true);
++    core.viewer_resize(&app, a, 263, 96);
++    assert_eq!(grid(), (263, 96), "a shown reporter with focus history decides again");
++    assert!(core.viewer_list(id, "t6k".into()).focus_authority);
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
+diff --git a/crates/herdr-core/tests/focused_window.rs b/crates/herdr-core/tests/focused_window.rs
+index 29d9e8c..eb2f64e 100644
+--- a/crates/herdr-core/tests/focused_window.rs
++++ b/crates/herdr-core/tests/focused_window.rs
+@@ -109,3 +109,59 @@ fn non_reporting_viewer_through_a_relay_never_shrinks_the_focused_window() {
+     app.wait().unwrap();
+     app_old.wait().unwrap();
+ }
++
++/// 2026-11-13, laptop/t6k: a new app on small-pickle views a laptop terminal
++/// through the small-pickle core. At the owner the relayed viewer must be
++/// focus-reporting and visible; and a hidden owner-local window with focus
++/// history must not lock out a visible measured window that arrives without focus.
++#[test]
++fn incident_2026_11_13_relay_viewer_reports_focus_and_is_not_locked_out() {
++    let owner = Session::new();
++    let t = run(&owner, &["sleep", "100"]);
++    let mut pickle = Session::new();
++    pickle.env.push(fake_ssh(&pickle, &[("framework", &owner)]));
++    pickle.json(&["machine", "add", "framework"]);
++    let remote = format!("framework/{t}");
++    // The laptop's own window: focused once, then hidden on a special workspace.
++    let (mut app_local, mut local) = desktop(&owner);
++    let (l, _) = attach(&mut local, &t, 120, 40, true, true);
++    wait_until("local window sizes", || grid(&owner, &t) == (120, 40));
++    local.send(l, wire::WINDOW_FOCUS, &[0]);
++    local.send(l, wire::VISIBILITY, &[0]);
++    local.call("terminal.get", json!({"terminal": t}));
++
++    // A new app through the new relay: focus-reporting and visible at the owner.
++    let (mut app_new, mut new) = desktop(&pickle);
++    let (n, reply) = attach(&mut new, &remote, 263, 197, true, true);
++    assert_eq!(reply["result"]["focus_updates"], true, "{reply}");
++    wait_until("the relayed focused window decides", || grid(&owner, &t) == (263, 197));
++    let viewers = owner.json(&["viewers", &t]);
++    let relayed: Vec<&Value> =
++        viewers["viewers"].as_array().unwrap().iter().filter(|v| v["origin"] == "relayed").collect();
++    assert_eq!(relayed.len(), 1, "{viewers}");
++    assert_eq!(relayed[0]["focus_updates"], true, "{viewers}");
++    assert_eq!(relayed[0]["focused"], true, "{viewers}");
++    assert_eq!(relayed[0]["visible"], true, "{viewers}");
++    assert_eq!(relayed[0]["leader"], true, "{viewers}");
++    drop(new);
++    app_new.wait().unwrap();
++
++    // An old app through the same relay (no focus): with the only reporter
++    // hidden, its visible measured window takes the grid instead of waiting.
++    let (mut app_old, mut old) = desktop(&pickle);
++    let (o, reply) = attach(&mut old, &remote, 263, 150, false, false);
++    assert_eq!(reply["result"]["focus_updates"], false, "{reply}");
++    wait_until("visible non-reporter is not locked out", || grid(&owner, &t) == (263, 150));
++    // The laptop window is shown again: it holds focus history and decides.
++    local.send(l, wire::RESIZE, &[120, 0, 40, 0]);
++    local.send(l, wire::VISIBILITY, &[1]);
++    wait_until("shown reporter decides again", || grid(&owner, &t) == (120, 40));
++    old.send(o, wire::DATA, b"");
++    old.call("terminal.get", json!({"terminal": remote}));
++    std::thread::sleep(std::time::Duration::from_millis(300));
++    assert_eq!(grid(&owner, &t), (120, 40));
++    drop(old);
++    drop(local);
++    app_old.wait().unwrap();
++    app_local.wait().unwrap();
++}

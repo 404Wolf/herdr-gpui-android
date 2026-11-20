@@ -1,0 +1,184 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index a77cf71..986bb72 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -145,9 +145,13 @@ Attach replays primary-screen history with soft wraps joined, so the viewer
+ can wrap it and reflow it on resize. Explicit newlines stay hard line breaks.
+ 
+ On Linux, local Herdr app windows share the smallest reported columns and
+-rows while the desktop is active. Focus between those windows keeps that
+-grid; colors and cell facts still follow the latest active viewer. A phone,
+-SSH client, or other viewer takes size control when active, as before.
++rows while the desktop is active. A visible, measured desktop pane owns sizing
++before phones, SSH clients or other secondary viewers, regardless of which was
++most recently active. With grouped sizing, visible panes in the selected
++desktop group share the smaller grid. `size_policy = "latest"` selects the
++latest active desktop pane instead; secondary viewers control size only when no
++eligible desktop pane remains. Focus between desktop panes keeps the shared
++grid; colors and cell facts still follow the latest active viewer.
+ The same desktop group is forwarded when attaching to another machine;
+ both cores must have this support. `terminal.attach`'s `desktop_group` is
+ core-to-core metadata: ordinary clients cannot claim a group. Forwarded
+@@ -172,11 +176,12 @@ The reply confirms the feature only when every relay hop supports it. Such apps
+ send kind-7 VISIBILITY on compositor-visible active-workspace changes, separate
+ from focus. Hidden views do not constrain the grouped grid. A hidden resumed
+ view stays pending until it is shown and reports a positive physical RESIZE.
+-Without negotiated support, clients stay visible/eligible as before. Other
+-operating systems retain latest-active sizing for local viewers, but accept
+-forwarded desktop groups. Set
+-`size_policy = "latest"` in `~/.config/herdr-core/config.toml` to restore
+-latest-active sizing on Linux too (default: `"grouped"`). No restart needed;
++Without negotiated support, clients stay visible/eligible as before. The
++hosting core applies its `size_policy` to choose group-fit versus latest
++desktop sizing; secondary viewers remain fallback-only. Set
++`size_policy = "latest"` in `~/.config/herdr-core/config.toml` to use the
++latest active desktop pane instead of fitting the group (default: `"grouped"`).
++Secondary viewers remain fallback-only. No restart needed;
+ the setting applies on the next viewer activity, visibility change or detach.
+ 
+ ```sh
+diff --git a/crates/herdr-core/src/config.rs b/crates/herdr-core/src/config.rs
+index fb287c1..8895577 100644
+--- a/crates/herdr-core/src/config.rs
++++ b/crates/herdr-core/src/config.rs
+@@ -19,7 +19,7 @@ pub struct Config {
+     pub notes_quiet: Option<f64>,
+     /// Size of a terminal nobody is typing in, `COLSxROWS` (default 200x120).
+     pub headless: Option<String>,
+-    /// Fit local desktop windows together (default), or use the latest active viewer.
++    /// Fit desktop windows together (default), or use the latest active desktop; mobile is fallback.
+     #[serde(default)]
+     pub size_policy: SizePolicy,
+     /// Scrollback kept per live terminal, in MB (default 5).
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 8a5e192..a5857da 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -490,11 +490,30 @@ impl Core {
+     }
+ }
+ 
++fn desktop_sizer(v: &Viewer) -> bool {
++    !v.observe
++        && v.size_eligible
++        && v.desktop_group.is_some()
++        && v.sized
++        && !v.awaiting_size
++        && v.size.0 > 0
++        && v.size.1 > 0
++}
++
+ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u16, u16)>) {
+     let awaiting_size = viewers.iter().any(|v| !v.observe && v.size_eligible && v.awaiting_size);
++    // A measured visible desktop owns the sizing device. Phone and legacy
++    // viewers are fallback leaders only until such a desktop is available.
++    let desktop_available = viewers.iter().any(desktop_sizer);
+     let leader = viewers
+         .iter()
+-        .filter(|v| !v.observe && v.size_eligible && !v.awaiting_size && (!awaiting_size || v.sized))
++        .filter(|v| {
++            !v.observe
++                && v.size_eligible
++                && !v.awaiting_size
++                && (!awaiting_size || v.sized)
++                && if desktop_available { desktop_sizer(v) } else { v.desktop_group.is_none() }
++        })
+         .max_by_key(|v| v.active_at);
+     let Some(leader) = leader else { return (None, None) };
+     let size = if grouped && leader.desktop_group.is_some() {
+@@ -505,6 +524,7 @@ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u
+                     && v.desktop_group == leader.desktop_group
+                     && v.size_eligible
+                     && v.sized
++                    && !v.awaiting_size
+                     && v.size.0 > 0
+                     && v.size.1 > 0
+                     && v.active_at.is_some()
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index 8eff548..22394f1 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -72,9 +72,15 @@ fn phones_observers_resumed_and_placeholder_viewers_do_not_pin_desktop_size() {
+     vs[0].active_at = Some(now + std::time::Duration::from_secs(1));
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)));
+     vs[1].active_at = Some(now + std::time::Duration::from_secs(2));
+-    assert_eq!(viewer_size(&vs, true).1, Some((40, 10)), "phone activity still takes over");
++    assert_eq!(viewer_size(&vs, true).1, Some((100, 30)), "phone activity cannot displace a visible desktop");
++    assert_eq!(viewer_size(&vs, false).1, Some((100, 30)), "latest policy still prefers an eligible desktop");
+     vs[1].observe = true;
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)));
++    vs[0].size_eligible = false;
++    vs[1].observe = false;
++    assert_eq!(viewer_size(&vs, true).1, Some((40, 10)), "hiding the last desktop restores mobile fallback");
++    assert_eq!(viewer_size(&vs, false).1, Some((40, 10)));
++    vs[0].size_eligible = true;
+     vs[1] = viewer(&desktop, (40, 10), None);
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)), "reconnect is not activity");
+     vs[1].active_at = Some(now);
+@@ -89,6 +95,26 @@ fn phones_observers_resumed_and_placeholder_viewers_do_not_pin_desktop_size() {
+     assert_eq!(viewer_size(&vs, true).1, Some((100, 30)), "zero size does not constrain");
+ }
+ 
++#[test]
++fn mobile_only_and_desktop_pending_fallbacks_remain_authoritative() {
++    let now = Instant::now();
++    let phone = Arc::new(Conn::default());
++    let mut mobile_only = vec![viewer(&phone, (40, 10), Some(now))];
++    assert_eq!(viewer_size(&mobile_only, true).1, Some((40, 10)), "mobile-only sizing remains available");
++    assert_eq!(viewer_size(&mobile_only, false).1, Some((40, 10)));
++
++    let desktop = desktop_conn();
++    mobile_only.push(viewer(&desktop, (218, 74), Some(now + std::time::Duration::from_secs(1))));
++    mobile_only[1].sized = false;
++    mobile_only[1].awaiting_size = true;
++    assert_eq!(viewer_size(&mobile_only, true).1, Some((40, 10)), "a pending desktop cannot lead before measurement");
++    assert_eq!(viewer_size(&mobile_only, false).1, Some((40, 10)));
++
++    mobile_only[1].awaiting_size = false;
++    mobile_only[1].size_eligible = false;
++    assert_eq!(viewer_size(&mobile_only, true).1, Some((40, 10)), "a hidden desktop cannot lead");
++}
++
+ #[test]
+ fn grouped_size_uses_visible_min_and_visibility_restores_the_grid() {
+     let now = Instant::now();
+diff --git a/crates/herdr-core/tests/desktop_size.rs b/crates/herdr-core/tests/desktop_size.rs
+index 7f141d9..863b162 100644
+--- a/crates/herdr-core/tests/desktop_size.rs
++++ b/crates/herdr-core/tests/desktop_size.rs
+@@ -8,7 +8,7 @@ use herdr_core::wire;
+ use serde_json::json;
+ 
+ #[test]
+-fn local_windows_share_a_real_pty_size_but_remote_input_still_takes_over() {
++fn local_windows_share_a_real_pty_size_and_remote_input_never_shrinks_it() {
+     let s = Session::new();
+     let t = run(&s, &["sh", "-c", "while read l; do stty size; done"]);
+     let (mut app_a, mut a) = desktop(&s);
+@@ -36,16 +36,21 @@ fn local_windows_share_a_real_pty_size_but_remote_input_still_takes_over() {
+     assert_eq!(size(), (80, 20));
+     wait_until("PTY sees the shared size", || text(&s, &t).contains("20 80"));
+ 
++    // Desktop first: a visible, measured desktop window keeps the grid; a
++    // phone attaching or typing never shrinks it.
+     let mut phone = Viewer::attach(&s, &t, 40, 10, json!({}));
+-    assert_eq!(size(), (40, 10));
++    phone.conn.call("terminal.get", json!({"terminal": t}));
++    assert_eq!(size(), (80, 20), "a phone attaching does not shrink the desktop grid");
++    phone.typed(b"phone\r");
++    phone.conn.call("terminal.get", json!({"terminal": t}));
++    assert_eq!(size(), (80, 20), "remote input does not take size control");
++    wait_until("PTY keeps the desktop size after remote input", || text(&s, &t).matches("20 80").count() >= 2);
+     a.send(ca, wire::FOCUS, &[1]);
+     a.call("terminal.get", json!({"terminal": t}));
+     assert_eq!(size(), (80, 20));
+-    phone.typed(b"phone\r");
+-    phone.conn.call("terminal.get", json!({"terminal": t}));
+-    assert_eq!(size(), (40, 10));
+     drop(phone);
+-    wait_until("desktop takes over after phone detaches", || size() == (80, 20));
++    a.call("terminal.get", json!({"terminal": t}));
++    assert_eq!(size(), (80, 20), "the desktop grid is unchanged after the phone detaches");
+ 
+     let config = s.root.join("config/herdr-core/config.toml");
+     std::fs::create_dir_all(config.parent().unwrap()).unwrap();

@@ -73,6 +73,21 @@ run directory printed by the runner under `$JOBRUN_OUTPUTS/emu-out/` on Slurm or
 launches Home, and saves `home.png` alongside the device list from the job's
 ADB server and the emulator and test logs. Use a debuggable APK with this test.
 
+### PR #48 checks (keyboard hide, stop-and-send, cancel, offline)
+
+```sh
+lease-run --kind android --outputs <dir> -- scripts/emu-test.sh scripts/emu-tests/pr48.sh
+```
+
+`scripts/emu-tests/pr48.sh` starts a scratch herdr-core and sshd on the job host (both from the
+`android-emu` shell; the core is built as `nix/herdr-core`, the same pinned source and patches as
+the maintainers' own core), connects the app to them at `10.0.2.2` with a device key it creates and
+reads back through the UI, and checks: the recording controls at 46 and 98 columns, the `seed` +
+partial + `z` Cancel case, and, offline with a saved grid, that hiding the keyboard (hide control,
+Back, the navigation-bar key) leaves no blank region. `emu-out/<run>/summary.tsv` lists each check
+as PASS, FAIL or SKIP with screenshots beside it; the exit status is 1 on any FAIL. The UI
+automation has not yet run on an emulator (emulators were paused when it was written).
+
 ## Isolated Linux verification APK
 
 The verification packager prefers an installed SDK when `ANDROID_HOME` (or

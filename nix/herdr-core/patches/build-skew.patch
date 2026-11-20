@@ -1,0 +1,244 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 1f2c70b..2841471 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -346,3 +346,8 @@ paths start at your current folder. Prefer explicit paths for remote work.
+   3 not_found, 7 needs_target, 9 blocked, 10 status_mismatch, 11 finished.
+ - Codex must run with `--no-daemon` (including templates), or its commands
+   execute outside hc.
++
++`hc machine ls` includes each connected core’s precise build identity. `≠` means
++that live peer differs from the serving core; `unknown` means its hello did not
++include an identity (or it is disconnected). Connected peers without an identity
++are older builds and also marked `≠`; disconnected peers are unmarked.
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 1e21da8..2287d25 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -201,6 +201,7 @@ async fn hello(core: Ctx<'_>, p: HelloParams) -> Result<HelloResult, RpcError> {
+     Ok(HelloResult {
+         generation: GENERATION,
+         version: version(),
++        build: crate::client::peer_build(),
+         core: core.info.clone(),
+         framed: p.framed,
+         methods: METHOD_NAMES.iter().map(|m| m.to_string()).collect(),
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 130fdbd..45ed759 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -107,6 +107,8 @@ pub struct HelloParams {
+     pub core: Option<CoreInfo>,
+     /// What that core calls this one (`rohan`), so news about `t7` reaches it as `rohan/t7`.
+     pub calls_you: Option<String>,
++    /// Immutable build identity; older cores may omit it.
++    pub build: Option<String>,
+     /// Features supported by a core dialing in, including relaying size and viewer visibility updates.
+     #[serde(default)]
+     pub features: Vec<String>,
+@@ -116,6 +118,7 @@ pub struct HelloParams {
+ pub struct HelloResult {
+     pub generation: u32,
+     pub version: String,
++    pub build: String,
+     pub core: CoreInfo,
+     pub framed: bool,
+     pub methods: Vec<String>,
+diff --git a/crates/herdr-core/src/cli/machine.rs b/crates/herdr-core/src/cli/machine.rs
+index ae5c735..bee4b77 100644
+--- a/crates/herdr-core/src/cli/machine.rs
++++ b/crates/herdr-core/src/cli/machine.rs
+@@ -73,8 +73,10 @@ pub(super) fn machine(
+                     let session = m["session"].as_str().map(|x| format!(" session {x}")).unwrap_or_default();
+                     let state = line_state(m);
+                     format!(
+-                        "{:<16} {state}  \x1b[2m{}{session} \u{b7} hc {}\x1b[22m",
++                        "{:<16} {state}  build {}{}  \x1b[2m{}{session} \u{b7} hc {}\x1b[22m",
+                         s(&m["name"]),
++                        m["build"].as_str().unwrap_or("unknown"),
++                        if m["build_skew"] == true { " ≠" } else { "" },
+                         s(&m["target"]),
+                         s(&m["version"])
+                     )
+diff --git a/crates/herdr-core/src/client.rs b/crates/herdr-core/src/client.rs
+index 23526c2..ecbb473 100644
+--- a/crates/herdr-core/src/client.rs
++++ b/crates/herdr-core/src/client.rs
+@@ -65,6 +65,12 @@ pub fn build_id() -> String {
+         .clone()
+ }
+ 
++/// Human-readable, immutable identity for peer compatibility diagnostics.
++pub fn peer_build() -> String {
++    option_env!("HERDR_CORE_BUILD").map(str::to_owned)
++        .unwrap_or_else(|| format!("{}/{}", env!("CARGO_PKG_VERSION"), build_id()))
++}
++
+ fn unavailable(message: String) -> RpcError {
+     RpcError::new("unavailable", message, "check the core log in the state directory")
+ }
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index 2d293cc..4948ba2 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -50,6 +50,7 @@ pub struct Line {
+     mirror: Mutex<(u64, Option<u32>, Vec<u8>)>,
+     /// What the core there said it can do (its `hello`).
+     features: Vec<String>,
++    build: Option<String>,
+ }
+ 
+ impl Line {
+@@ -57,6 +58,7 @@ impl Line {
+         let features = hello["features"].as_array().into_iter().flatten();
+         Arc::new(Line {
+             features: features.filter_map(|f| f.as_str().map(String::from)).collect(),
++            build: hello["build"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+             frames,
+             pending: Mutex::default(),
+             streams: Mutex::default(),
+@@ -188,6 +190,9 @@ pub struct MachineView {
+     pub machine: Machine,
+     /// connecting, connected, needs_login or unreachable.
+     pub state: String,
++    /// Identity from the live hello, absent for old or disconnected peers.
++    pub build: Option<String>,
++    pub build_skew: bool,
+     /// Since when it is not connected (ms since the epoch).
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub since_ms: Option<u64>,
+@@ -203,7 +208,13 @@ pub fn view(st: &State, m: &Machine) -> MachineView {
+         Some(LineState::NeedsUpdate { since_ms }) => ("needs_update", Some(*since_ms), None),
+         Some(LineState::Unreachable { since_ms, why }) => ("unreachable", Some(*since_ms), Some(why.clone())),
+     };
+-    MachineView { machine: m.clone(), state: state.into(), since_ms, why }
++    let build = match st.lines.get(&m.id) {
++        Some(LineState::Connected(line)) => line.build.clone(),
++        _ => None,
++    };
++    let build_skew = matches!(st.lines.get(&m.id), Some(LineState::Connected(_)))
++        && build.as_ref().is_none_or(|b| b != &crate::client::peer_build());
++    MachineView { machine: m.clone(), state: state.into(), since_ms, why, build, build_skew }
+ }
+ 
+ fn reconnect_max() -> Duration {
+@@ -267,7 +278,7 @@ async fn supervise(core: Arc<Core>, id: String) {
+             st.lines.insert(id.clone(), state);
+             core.changed.notify_waiters();
+         };
+-        let hello = json!({"framed": true, "core": core.info, "calls_you": m.name, "features": crate::api::FEATURES});
++        let hello = json!({"framed": true, "core": core.info, "calls_you": m.name, "build": crate::client::peer_build(), "features": crate::api::FEATURES});
+         match crate::machines::dial(&core.paths, m.reach(), m.session.as_deref(), hello).await {
+             Ok(d) if d.hello["core"]["id"] != m.id.as_str() => {
+                 down(&mut core.lock(), format!("a different core answers there ({})", d.hello["core"]["id"]));
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index c82e174..a37b1f7 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -370,3 +370,38 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++#[test]
++fn peer_build_hello_is_optional_and_preserves_precise_identity() {
++    for (hello, expected) in [
++        (json!({}), None),
++        (json!({"build": ""}), None),
++        (json!({"build": "0.1.18-c645d00-grid/abc123"}), Some("0.1.18-c645d00-grid/abc123")),
++    ] {
++        let (frames, _rx) = mpsc::unbounded_channel();
++        assert_eq!(Line::new(frames, &hello).build.as_deref(), expected);
++    }
++}
++
++#[test]
++fn peer_build_view_flags_live_differences_and_legacy_peers_and_clears_on_disconnect() {
++    let machine = Machine {
++        name: "peer".into(), target: "peer".into(), via: false, temporary: false,
++        session: None, id: "peer-id".into(), host: "peer".into(), version: "0.1.18".into(),
++    };
++    let mut st = State::default();
++    for (build, skew) in [(None, true), (Some(crate::client::peer_build()), false),
++        (Some("0.1.18-same-version/different-patches".into()), true)] {
++        let (frames, _rx) = mpsc::unbounded_channel();
++        st.lines.insert(machine.id.clone(), LineState::Connected(Line::new(frames, &json!({"build": build}))));
++        let current = view(&st, &machine);
++        assert_eq!(current.build, build);
++        assert_eq!(current.build_skew, skew);
++        let wire = serde_json::to_value(current).unwrap();
++        assert_eq!(wire["build_skew"], skew);
++    }
++    st.lines.insert(machine.id.clone(), LineState::Connecting);
++    let current = view(&st, &machine);
++    assert_eq!(current.build, None);
++    assert!(!current.build_skew);
++}
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 606df7d..31dd75a 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -345,6 +345,9 @@
+       },
+       "HelloResult": {
+         "properties": {
++          "build": {
++            "type": "string"
++          },
+           "core": {
+             "$ref": "#/components/schemas/CoreInfo"
+           },
+@@ -375,6 +378,7 @@
+         "required": [
+           "generation",
+           "version",
++          "build",
+           "core",
+           "framed",
+           "methods",
+@@ -597,6 +601,16 @@
+       "MachineView": {
+         "description": "A machine as `machine ls` and `ls` show it: its profile and its line now.",
+         "properties": {
++          "build": {
++            "description": "Identity from the live hello, absent for old or disconnected peers.",
++            "type": [
++              "string",
++              "null"
++            ]
++          },
++          "build_skew": {
++            "type": "boolean"
++          },
+           "host": {
+             "description": "What that core calls itself (its hostname).",
+             "type": "string"
+@@ -660,7 +674,8 @@
+           "id",
+           "host",
+           "version",
+-          "state"
++          "state",
++          "build_skew"
+         ],
+         "type": "object"
+       },
+@@ -1765,6 +1780,18 @@
+       "name": "hello",
+       "paramStructure": "by-name",
+       "params": [
++        {
++          "description": "Immutable build identity; older cores may omit it.",
++          "name": "build",
++          "required": false,
++          "schema": {
++            "description": "Immutable build identity; older cores may omit it.",
++            "type": [
++              "string",
++              "null"
++            ]
++          }
++        },
+         {
+           "description": "What that core calls this one (`rohan`), so news about `t7` reaches it as `rohan/t7`.",
+           "name": "calls_you",
