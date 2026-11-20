@@ -78,14 +78,13 @@ public final class ClearDuringDictationTest {
             return routing.cancelForClear(engine, dictating());
         }
 
-        @Override public String draftText() { return drafts.text(); }
+        @Override public ComposerDrafts.Draft draft() { return drafts.draft(); }
 
-        @Override public void setDraft(String text) { drafts.edit(text); }
+        @Override public String connectionRevision() { return drafts.connectionRevision(); }
 
-        @Override public void restoreDraft(String text) {
-            String now = drafts.text();
-            drafts.edit(now.trim().isEmpty() ? text : text + " " + now);
-        }
+        @Override public void setDraft(ComposerDrafts.Draft draft) { drafts.setDraft(draft); }
+
+        @Override public void restoreDraft(ComposerDrafts.Draft draft) { drafts.restoreDraft(draft); }
 
         @Override public List<String> clearable() { return Collections.emptyList(); }
 
@@ -123,6 +122,7 @@ public final class ClearDuringDictationTest {
         try (DictationFakes.Rig rig = new DictationFakes.Rig(dir.newFolder(), desktop, phone)) {
             Composer c = new Composer(rig.engine);
             rig.onMain(() -> {
+                c.drafts.setHost("h");
                 c.drafts.switchTo("A");
                 c.drafts.edit("note:");
                 c.drafts.dictationStarted();
@@ -135,7 +135,7 @@ public final class ClearDuringDictationTest {
                 cleared = rig.onMain(() -> {
                     boolean ready = when == ClearWhen.RECORDING ? DictationRouting.recording(c.state)
                             : c.state == DictationEngine.State.TRANSCRIBING;
-                    if (ready) c.clearing.tap("A", true, 0);
+                    if (ready) c.clearing.tap(c.drafts.owner(), true, 0);
                     return ready;
                 });
                 if (!cleared) Thread.sleep(2);
@@ -153,7 +153,7 @@ public final class ClearDuringDictationTest {
                         || s.contains(DictationFakes.PHONE_WORDS));
             }
             // Undo: the draft as it was, without the cancelled words.
-            assertTrue(rig.onMain(() -> c.clearing.undo(1)));
+            assertTrue(rig.onMain(() -> c.clearing.undo(c.drafts.owner(), 1)));
             assertEquals("note:", rig.onMain(c.drafts::text));
             // A new dictation afterwards starts as usual (its listener is a new one).
             rig.onMain(() -> {

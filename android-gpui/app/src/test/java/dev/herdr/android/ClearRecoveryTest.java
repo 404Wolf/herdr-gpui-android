@@ -28,13 +28,19 @@ public final class ClearRecoveryTest {
       courier=new OutboxCourier(file,Runnable::run,(h,p,t)->{throw new AssertionError();});
       clips=new ClipsFixture(clipDir);
       courier.outbox().ready("h","boot",new HashSet<>(Arrays.asList("A","B")));
+      drafts.setHost("h");
       drafts.switchTo("A");
     }
     void crash(String at){if(crashAfter.equals(at))throw new Crash();}
     public boolean cancelDictation(){return false;}
-    public String draftText(){return drafts.text();}
-    public void setDraft(String t){drafts.edit(t);}
-    public void restoreDraft(String t){drafts.edit(ComposerDrafts.join(t,drafts.text()));}
+    public ComposerDrafts.Draft draft() { return drafts.draft(); }
+
+    public String connectionRevision() { return drafts.connectionRevision(); }
+
+    public void setDraft(ComposerDrafts.Draft draft) { drafts.setDraft(draft); }
+
+    public void restoreDraft(ComposerDrafts.Draft draft) { drafts.restoreDraft(draft); }
+
     public List<String> clearable(){return courier.outbox().clearable("h",drafts.pane(),now());}
     public String messageText(String id){return courier.outbox().text(id);}
     public List<String> looseClips(){
@@ -64,18 +70,19 @@ public final class ClearRecoveryTest {
     ClearUndo attach(){
       ClearUndo c=new ClearUndo(this);c.resume(savedRecord,now());
       String before=drafts.pane();drafts.switchTo("A");
-      if(c.endsOnPaneChange(before,"A"))c.commit();c.reconcile(now());return c;
+      if(c.endsOnPaneChange(before,OWNER))c.commit();c.reconcile(now());return c;
     }
   }
+  private static final String OWNER = ComposerDrafts.key("h", "A");
   static long now(){return System.currentTimeMillis();}
 
   @Test public void aDurablyAcceptedUndoSurvivesRestartAfterTheOldClearDeadline(){
     World w=new World();w.drafts.edit("draft");w.courier.add("h","A","queued");
     long t=now()-ClearUndo.QUEUE_WINDOW_MS-1000;
-    ClearUndo c=new ClearUndo(w);c.longPress("A",t);
+    ClearUndo c=new ClearUndo(w);c.longPress(OWNER,t);
     // Deterministic clock positioning: undo accepted before the deadline; restart occurs later.
     w.crashAfter="undone";
-    try{c.undo(t+100);fail("crash expected");}catch(Crash expected){}
+    try{c.undo(OWNER, t+100);fail("crash expected");}catch(Crash expected){}
     assertTrue(w.savedRecord.contains("\"undone\":true"));
     World after=w.restart();after.attach();
     assertEquals("draft",after.drafts.text());
@@ -84,12 +91,12 @@ public final class ClearRecoveryTest {
 
   @Test public void aLooseRecordingIsRecoverableIfKilledAfterItsHoldBeforeTheRecord(){
     World w=new World();String id=w.clips.record();w.drafts.edit("note");
-    ClearUndo c=new ClearUndo(w);c.tap("A",true,now()); // existing draft-level clear
+    ClearUndo c=new ClearUndo(w);c.tap(OWNER,true,now()); // existing draft-level clear
     w.crashAfter="hold";
-    try{c.tap("A",false,now());fail("crash expected");}catch(Crash expected){}
+    try{c.tap(OWNER,false,now());fail("crash expected");}catch(Crash expected){}
     assertTrue(w.clips.held(id));
     World after=w.restart();ClearUndo resumed=after.attach();
-    assertTrue(resumed.undo(now()));
+    assertTrue(resumed.undo(OWNER, now()));
     assertTrue("audio remains on disk",after.clips.audio(id));
     assertTrue("undo must restore the loose recording to waiting",after.clips.loose().contains(id));
   }
@@ -99,9 +106,9 @@ public final class ClearRecoveryTest {
     Outbox.Message gone=w.courier.add("h","B","gone-pane message");
     w.courier.ready("h",1,"boot",Collections.singleton("A"));
     assertEquals(Outbox.State.GONE,w.courier.outbox().shown("h","A",now()).get(0).state);
-    ClearUndo c=new ClearUndo(w);c.tap("A",true,now());w.crashAfter="messages";
-    try{c.tap("A",false,now());fail("crash expected");}catch(Crash expected){}
-    World after=w.restart();ClearUndo resumed=after.attach();assertTrue(resumed.undo(now()));
+    ClearUndo c=new ClearUndo(w);c.tap(OWNER,true,now());w.crashAfter="messages";
+    try{c.tap(OWNER,false,now());fail("crash expected");}catch(Crash expected){}
+    World after=w.restart();ClearUndo resumed=after.attach();assertTrue(resumed.undo(OWNER, now()));
     assertEquals("the host's GONE row must be restored to the same list",1,after.courier.outbox().shown("h","A",now()).size());
     assertEquals(gone.id,after.courier.outbox().shown("h","A",now()).get(0).id);
   }
@@ -110,11 +117,11 @@ public final class ClearRecoveryTest {
     World w=new World();w.drafts.edit("draft");
     String a=w.clips.record(),b=w.clips.record();
     Outbox.Message m=w.courier.add("h","A","queued "+DictationToken.of(a));
-    ClearUndo c=new ClearUndo(w);c.longPress("A",now());
+    ClearUndo c=new ClearUndo(w);c.longPress(OWNER,now());
     assertTrue(w.clips.held(a));assertTrue(w.clips.held(b));
     World after=w.restart();ClearUndo resumed=after.attach();assertTrue(resumed.open(now()));
-    after.failPersist=true;assertFalse(resumed.undo(now()));assertTrue(resumed.open(now()));
-    after.failPersist=false;assertTrue(resumed.undo(now()));
+    after.failPersist=true;assertFalse(resumed.undo(OWNER, now()));assertTrue(resumed.open(now()));
+    after.failPersist=false;assertTrue(resumed.undo(OWNER, now()));
     assertEquals("draft",after.drafts.text());assertEquals(m.id,after.courier.outbox().shown("h","A",now()).get(0).id);
     assertFalse(after.clips.held(a));assertFalse(after.clips.held(b));
     Outbox box=new Outbox(new File(dir.getRoot(),"dispatch.json"));
@@ -125,23 +132,23 @@ public final class ClearRecoveryTest {
   @Test public void anInterruptedOrdinaryQueuedMessageIsAdoptedAndUndone(){
     World w=new World();String id=w.clips.record();w.drafts.edit("draft");
     Outbox.Message m=w.courier.add("h","A","queued "+DictationToken.of(id));
-    ClearUndo c=new ClearUndo(w);c.tap("A",true,now());w.crashAfter="messages";
-    try{c.tap("A",false,now());fail("crash expected");}catch(Crash expected){}
-    World after=w.restart();ClearUndo resumed=after.attach();assertTrue(resumed.undo(now()));
+    ClearUndo c=new ClearUndo(w);c.tap(OWNER,true,now());w.crashAfter="messages";
+    try{c.tap(OWNER,false,now());fail("crash expected");}catch(Crash expected){}
+    World after=w.restart();ClearUndo resumed=after.attach();assertTrue(resumed.undo(OWNER, now()));
     assertEquals("draft",after.drafts.text());assertEquals(m.id,after.courier.outbox().shown("h","A",now()).get(0).id);
     assertFalse(after.clips.held(id));
   }
 
   @Test public void undoMustNotDiscardAPendingLooseClipWhoseRecoveryWriteStillFails(){
     World w=new World();String id=w.clips.record();w.drafts.edit("note");
-    ClearUndo c=new ClearUndo(w);c.tap("A",true,now());w.crashAfter="hold";
-    try{c.tap("A",false,now());fail("crash expected");}catch(Crash expected){}
+    ClearUndo c=new ClearUndo(w);c.tap(OWNER,true,now());w.crashAfter="hold";
+    try{c.tap(OWNER,false,now());fail("crash expected");}catch(Crash expected){}
     World after=w.restart();
     File blocked=new File(after.clipDir,"index-v1.json.tmp");assertTrue(blocked.mkdir());
     ClearUndo resumed=after.attach();
     assertTrue("draft undo remains offered while pending clip rollback cannot be saved",resumed.open(now()));
     assertTrue("record must still identify the clip",after.savedRecord.contains(id));
-    resumed.undo(now());
+    resumed.undo(OWNER, now());
     assertTrue(blocked.delete());
     resumed.reconcile(now());
     assertTrue("audio is still present",after.clips.audio(id));

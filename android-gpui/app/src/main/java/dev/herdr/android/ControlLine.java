@@ -30,7 +30,12 @@ final class ControlLine {
         int queued;
         String queueStyle = "info";
         boolean expanded;
+        /** The pane can take an image: "img" leads the line while the full line leaves it room. */
+        boolean attach;
     }
+
+    /** The attach control's id: it opens the image sources (library, camera, clipboard). */
+    static final String ATTACH = "attach";
 
     /** The talk slot's width in cells: its words ("talk", "stop", "…") are padded to it. */
     static final int TALK_SLOT = 4;
@@ -108,6 +113,15 @@ final class ControlLine {
         left.add(line(clear, undo, queue, null));
         left.add(line(clear, null, queue, null));
         java.util.List<java.util.List<GhostText.Control>> out = new java.util.ArrayList<>();
+        if (in.attach) {
+            // Only the fullest line carries it, ahead of its words: where that line does not fit,
+            // "img" is the first thing to go and every other rung is exactly as it was.
+            java.util.List<GhostText.Control> first = new java.util.ArrayList<>();
+            first.add(new GhostText.Control(ATTACH, "img", "dim"));
+            first.addAll(left.get(0));
+            first.addAll(slots);
+            out.add(first);
+        }
         for (java.util.List<GhostText.Control> l : left) {
             java.util.List<GhostText.Control> full = new java.util.ArrayList<>(l);
             full.addAll(slots);

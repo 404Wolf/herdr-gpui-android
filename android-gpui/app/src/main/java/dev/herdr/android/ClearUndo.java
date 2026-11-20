@@ -1,5 +1,6 @@
 package dev.herdr.android;
 
+import dev.herdr.android.ComposerDrafts.Draft;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -45,13 +46,15 @@ final class ClearUndo {
         boolean cancelDictation();
 
         /** The pane's draft. */
-        String draftText();
+        Draft draft();
+
+        String connectionRevision();
 
         /** Sets the pane's draft (in memory; {@link #persist} saves it). */
-        void setDraft(String text);
+        void setDraft(Draft draft);
 
-        /** Puts {@code text} back as the pane's draft, ahead of anything typed since (in memory). */
-        void restoreDraft(String text);
+        /** Puts the cleared draft back, ahead of anything typed since (in memory). */
+        void restoreDraft(Draft draft);
 
         /** The pane's queued messages a clear takes: all but one being sent. */
         List<String> clearable();
@@ -101,9 +104,9 @@ final class ClearUndo {
 
     private final Effects fx;
     private Level level = Level.NONE;
-    private String pane = "";
+    private String owner = "";
     private long until;
-    private String draft = "";
+    private Draft draft = Draft.EMPTY;
     private final List<String> messages = new ArrayList<>();
     private final List<String> clips = new ArrayList<>();
     /** The user undid it; the record stays until the messages and recordings are back on disk. */
@@ -128,19 +131,19 @@ final class ClearUndo {
      * ✕ tapped: the draft (and a dictation in flight); a second tap in the window, the queue too.
      * With no draft and no dictation ({@code draftClearable} false) the tap clears the queue.
      */
-    void tap(String pane, boolean draftClearable, long now) {
-        if (open(now) && level == Level.DRAFT && this.pane.equals(pane)) {
+    void tap(String owner, boolean draftClearable, long now) {
+        if (open(owner, now) && level == Level.DRAFT) {
             clearQueue(now);
             return;
         }
-        if (!begin(now) || !clearDraft(pane, now)) return;
+        if (!begin(now) || !clearDraft(owner, now)) return;
         if (!draftClearable) clearQueue(now);
     }
 
     /** ✕ long-pressed: the draft, a dictation in flight and the pane's queue at once. */
-    void longPress(String pane, long now) {
-        if (!(open(now) && level == Level.DRAFT && this.pane.equals(pane))) {
-            if (!begin(now) || !clearDraft(pane, now)) return;
+    void longPress(String owner, long now) {
+        if (!(open(owner, now) && level == Level.DRAFT)) {
+            if (!begin(now) || !clearDraft(owner, now)) return;
         }
         clearQueue(now);
     }
@@ -149,13 +152,13 @@ final class ClearUndo {
      * One queued row dropped: a message ({@code messageId}) or a recording ({@code clipId});
      * undoable for {@link #DRAFT_WINDOW_MS}. False when it could not be done durably.
      */
-    boolean dropped(String pane, String messageId, String clipId, long now) {
+    boolean dropped(String owner, String messageId, String clipId, long now) {
         if (!begin(now)) return false;
         List<String> ids = messageId == null ? Collections.emptyList() : Collections.singletonList(messageId);
         List<String> held = new ArrayList<>();
         if (messageId != null) held.addAll(DictationToken.ids(text(messageId)));
         if (clipId != null) held.add(clipId);
-        this.pane = pane;
+        this.owner = owner;
         if (!step(Level.ROW, now + DRAFT_WINDOW_MS, ids, held)) {
             fx.failed("Could not drop: storage");
             return false;
@@ -244,23 +247,23 @@ final class ClearUndo {
         return true;
     }
 
-    private boolean clearDraft(String pane, long now) {
+    private boolean clearDraft(String owner, long now) {
         cancelled = fx.cancelDictation();
-        String text = fx.draftText();
-        List<String> held = DictationToken.ids(text);
+        Draft before = fx.draft();
+        List<String> held = DictationToken.ids(before.text);
         if (!held.isEmpty() && !fx.holdClips(held)) {
             fx.failed("Could not clear: storage");
             return false;
         }
-        fx.setDraft("");
-        this.pane = pane;
+        fx.setDraft(Draft.EMPTY);
+        this.owner = owner;
         level = Level.DRAFT;
         until = now + DRAFT_WINDOW_MS;
-        draft = text;
+        draft = before;
         clips.addAll(held);
         // The record and the emptied draft, in one write.
         if (!fx.persist(encode())) {
-            fx.setDraft(text);
+            fx.setDraft(before);
             reset();
             // The draft holds its chips again: their recordings go back (now, or soon).
             if (!held.isEmpty() && !fx.releaseClips(held)) fx.retryLater();
@@ -297,13 +300,14 @@ final class ClearUndo {
      * when the restored draft could not be saved (then nothing changed, the user is told and the
      * undo stays on offer).
      */
-    boolean undo(long now) {
+    boolean undo(String owner, long now) {
+        if (!owns(owner)) return false;
         if (!open(now)) {
             if (!undone) commit();
             return false;
         }
-        String before = fx.draftText();
-        if (!draft.isEmpty()) fx.restoreDraft(draft);
+        Draft before = fx.draft();
+        if (!draft.text.isEmpty()) fx.restoreDraft(draft);
         undone = true;
         if (!fx.persist(encode())) {
             undone = false;
@@ -384,12 +388,12 @@ final class ClearUndo {
         List<String> found = new ArrayList<>();
         Set<String> held = new LinkedHashSet<>();
         long end = until;
-        String at = pane;
+        String at = owner;
         for (Outbox.Cleared c : fx.clearedMessages(now)) {
             if (messages.contains(c.id) || pendingMessages.contains(c.id)) continue;
-            if (level != Level.NONE && !pane.equals(c.pane)) continue;
-            if (at.isEmpty()) at = c.pane;
-            if (!at.equals(c.pane)) continue;
+            if (level != Level.NONE && !owner.equals(c.owner)) continue;
+            if (at.isEmpty()) at = c.owner;
+            if (!at.equals(c.owner)) continue;
             found.add(c.id);
             held.addAll(DictationToken.ids(c.text));
             end = Math.max(end, c.until);
@@ -399,14 +403,25 @@ final class ClearUndo {
         List<String> newClips = new ArrayList<>(held);
         if (!newClips.isEmpty() && !fx.holdClips(newClips)) fx.retryLater();
         if (level == Level.NONE || level == Level.DRAFT) level = Level.QUEUE;
-        pane = at;
+        owner = at;
         until = end;
         messages.addAll(found);
         clips.addAll(newClips);
         if (!fx.persist(encode())) fx.retryLater();
     }
 
-    /** Whether "undo" is on offer. */
+    /** Whether the pane on screen owns an open undo window. */
+    boolean open(String owner, long now) {
+        return owns(owner) && open(now);
+    }
+
+    private boolean owns(String owner) {
+        String revision = draft.revision();
+        return !owner.isEmpty() && this.owner.equals(owner)
+                && (revision == null || revision.equals(fx.connectionRevision()));
+    }
+
+    /** Whether the undo window is open. */
     boolean open(long now) {
         return level != Level.NONE && !undone && now < until;
     }
@@ -448,7 +463,7 @@ final class ClearUndo {
     String label(boolean narrow) {
         if (narrow) return "undo";
         switch (level) {
-            case QUEUE: return "cleared " + (messages.size() + (draft.isEmpty() ? 0 : 1)) + " · undo";
+            case QUEUE: return "cleared " + (messages.size() + (draft.text.isEmpty() ? 0 : 1)) + " · undo";
             case ROW: return "dropped · undo";
             default: return "cleared · undo";
         }
@@ -457,8 +472,8 @@ final class ClearUndo {
     /** The undo record, as saved. */
     String encode() {
         try {
-            return new JSONObject().put("pane", pane).put("level", level.name()).put("until", until)
-                    .put("draft", draft).put("messages", new JSONArray(messages))
+            return new JSONObject().put("pane", owner).put("level", level.name()).put("until", until)
+                    .put("draft", draft.encode()).put("messages", new JSONArray(messages))
                     .put("clips", new JSONArray(clips)).put("undone", undone)
                     .put("pendingLevel", pendingLevel.name()).put("pendingUntil", pendingUntil)
                     .put("pendingMessages", new JSONArray(pendingMessages))
@@ -478,10 +493,12 @@ final class ClearUndo {
         try {
             JSONObject o = new JSONObject(record);
             reset();
-            pane = o.optString("pane", "");
+            // The persisted field also held bare pane IDs before clears were host-scoped.
+            // Those records can finish queue/clip cleanup, but can't match a host-qualified owner.
+            owner = o.optString("pane", "");
             level = Level.valueOf(o.optString("level", "NONE"));
             until = o.optLong("until", 0);
-            draft = o.optString("draft", "");
+            draft = Draft.decode(o.opt("draft"));
             undone = o.optBoolean("undone", false);
             JSONArray m = o.optJSONArray("messages");
             for (int i = 0; m != null && i < m.length(); i++) messages.add(m.getString(i));
@@ -509,19 +526,14 @@ final class ClearUndo {
      * no switch, so a clear resumed from before the restart stays on offer.
      */
     boolean endsOnPaneChange(String previous, String next) {
-        return !previous.isEmpty() && !pane.equals(next);
-    }
-
-    /** The pane the window belongs to. */
-    String pane() {
-        return pane;
+        return !previous.isEmpty() && !owns(next);
     }
 
     private void reset() {
         level = Level.NONE;
-        pane = "";
+        owner = "";
         until = 0;
-        draft = "";
+        draft = Draft.EMPTY;
         messages.clear();
         clips.clear();
         undone = false;
