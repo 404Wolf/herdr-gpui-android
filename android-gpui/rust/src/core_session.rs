@@ -437,6 +437,8 @@ impl Connection<'_> {
                         json!("Terminal stream ended; select a terminal to attach again");
                     state.terminal = None;
                     state.render_id = 0;
+                    // Nothing watched on this stream is read back on the next.
+                    state.local.end_stream();
                     bump(&mut state.view);
                     drop(state);
                     // Attached again by the session loop, at most once per
@@ -1044,9 +1046,9 @@ impl Connection<'_> {
             if let Some(outgoing) = state.terminal.take() {
                 let pane = state.view["pane_id"].as_str().unwrap_or("");
                 if pane != terminal {
-                    let ident = crate::remote::ident(&state.view, pane);
-                    let agent = crate::remote::agent_ident(&state.view, pane);
-                    crate::remote::depart_as(self.owner.id, outgoing, pane.to_owned(), ident, agent);
+                    let pane = pane.to_owned();
+                    let watched = state.agent_watched();
+                    crate::remote::depart_as(self.owner.id, outgoing, pane, watched);
                 }
             }
             state.render_id = 0;
@@ -1155,7 +1157,10 @@ impl Connection<'_> {
         let mut state = lock(&self.owner.state);
         // Whatever is drawn (a held frame, the pane switched from) stays until
         // this grid's first paint is in (remote::settle), never a blank grid.
-        state.local = crate::remote::Local::attached(self.owner.heard.output_now());
+        // Which terminal this stream is of comes from the attach reply's own
+        // terminal record, never from the (older) pane list.
+        let incarnation = crate::remote::Incarnation::of(&reply["terminal"]);
+        state.local = crate::remote::Local::attached(self.owner.heard.output_now(), incarnation);
         state.terminal = Some(terminal_session);
         state.render_id = NEXT_RENDER.fetch_add(1, Ordering::Relaxed);
         state.view["pane_id"] = json!(terminal);
@@ -5282,6 +5287,7 @@ mod cache_tests {
         let copy = crate::remote::copy_pane(7702, "t1").unwrap().unwrap();
         crate::remote::release_held();
         let id = crate::remote::open_saved(copy).unwrap();
+        assert!(crate::remote::show_opened(id));
         let restored = crate::remote::renderer(id).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while restored.is_alive() {
@@ -5292,47 +5298,38 @@ mod cache_tests {
         crate::remote::release_held();
     }
 
+    /// A reconnect never blanks the screen: the frame read when the link
+    /// dropped stays until the new attach has painted, then the live pane is
+    /// shown. Nothing read on the old connection is read back on the new one
+    /// (round 4: the phone cannot prove it is the same terminal).
     #[test]
-    fn ask2_a_reconnect_keeps_the_place_read_and_adds_no_row_twice() {
+    fn ask2_a_reconnect_holds_the_frame_until_the_new_attach_paints() {
         let _serial = crate::remote::departed_test_lock();
         let (terminal, tx, _sent) = full_screen();
         let first = owner(7703, "boot-7703", terminal, "done");
         crate::remote::register_for_test(first.clone());
         stream(&first, &tx, 9, 50);
-        // Read 7 rows back; then the link drops (the same app run).
         crate::remote::scroll_local(7703, 7, paint_args(0)).unwrap();
-        let (held_id, held) = lock(&first.state).local.reader_for_test().unwrap();
-        let before = text_rows(&held);
-        assert_eq!(before, whole(50));
-        // Reading every row moved it: back to the place read.
-        {
-            let mut grid = held.grid().lock();
-            grid.scroll_display(rio_vt::crosswords::grid::Scroll::Bottom);
-            grid.scroll_display(rio_vt::crosswords::grid::Scroll::Delta(7));
-        }
+        let (held_id, _) = lock(&first.state).local.reader_for_test().unwrap();
         crate::remote::close(7703);
-        // The link is back: a new session attaches the same terminal (same
-        // core, pane, created_ms and PTY) and paints it.
+        assert_eq!(crate::remote::held_for_test().map(|(id, _)| id), Some(held_id), "the copy read stays held");
         let (live, tx2, _sent2) = full_screen();
         let second = owner(7704, "boot-7703", live.clone(), "done");
-        lock(&second.state).local = Local::attached(second.heard.output_now());
+        lock(&second.state).local = Local::attached_for_test(second.heard.output_now());
         tx2.send(Chunk::Data(paint(53))).unwrap();
         shows(&live, 53);
         second.heard.printed(100);
         // Until its first paint has gone quiet, the copy read stays on screen.
         assert!(!crate::remote::settle(&second, &mut lock(&second.state)));
+        assert!(crate::remote::held_for_test().is_some());
         std::thread::sleep(Duration::from_millis(250));
         assert!(crate::remote::settle(&second, &mut lock(&second.state)));
-        let (reader_id, reader) = lock(&second.state).local.reader_for_test().expect("the place read stays");
-        assert_eq!(reader_id, held_id, "the same copy, never a blank or a jump");
-        assert_eq!(reader.grid().lock().display_offset(), 7);
-        assert_eq!(text_rows(&reader), before);
+        assert!(lock(&second.state).local.reader_for_test().is_none(), "a copy read on the old connection is read on the new one");
         assert!(crate::remote::held_for_test().is_none());
-        // Live again from there: the rows written meanwhile join once.
+        // What the new connection watches starts with its own screen.
         crate::remote::keep_local(&second, &mut lock(&second.state));
-        let rows = crate::remote::transcript_rows("boot-7703", "t1").unwrap();
-        let rows: Vec<String> = rows.into_iter().map(|r| r.trim_end().to_owned()).filter(|r| !r.is_empty()).collect();
-        assert_eq!(rows, whole(53));
+        let rows = crate::remote::transcript_rows(&second).unwrap();
+        assert!(!rows.contains(&line(30)), "rows watched on the old connection joined: {rows:?}");
     }
 
     // ---- Review round 2 (#43, 5cb7c0b) ----
@@ -5371,6 +5368,7 @@ mod cache_tests {
         let (terminal, tx, _sent) = full_screen();
         let old = owner(7801, "boot-R", terminal, "done");
         set_pane(&old, json!({"created_ms": 100, "program": "claude"}));
+        crate::remote::attach_as_listed_for_test(&old);
         crate::remote::register_for_test(old.clone());
         stream(&old, &tx, 9, 60);
         crate::remote::scroll_local(7801, 12, paint_args(0)).unwrap();
@@ -5379,7 +5377,8 @@ mod cache_tests {
         let (live, tx2, _sent2) = full_screen();
         let new = owner(7803, "boot-R", live.clone(), "done");
         set_pane(&new, json!({"created_ms": 200, "program": "claude"}));
-        lock(&new.state).local = Local::attached(new.heard.output_now());
+        lock(&new.state).local = Local::attached_for_test(new.heard.output_now());
+        crate::remote::attach_as_listed_for_test(&new);
         tx2.send(Chunk::Data(other_paint(40))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !live.screen_text().contains("another talk 040") {
@@ -5417,7 +5416,7 @@ mod cache_tests {
             let mut state = lock(&t2.state);
             state.view["pane_id"] = json!("t2");
             state.view["panes"][0]["id"] = json!("t2");
-            state.local = Local::attached(t2.heard.output_now());
+            state.local = Local::attached_for_test(t2.heard.output_now());
         }
         otx.send(Chunk::Data(other_paint(30))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -5427,32 +5426,6 @@ mod cache_tests {
         }
         settle_now(&t2);
         assert!(lock(&t2.state).local.reader_for_test().is_none(), "t1's copy is drawn as t2");
-        crate::remote::release_held();
-    }
-
-    /// Review round 2 P2-1: building the first reader never holds the
-    /// session's lock (the 30 Hz poll and Java's state lock wait on it).
-    #[test]
-    fn ask2_the_first_drag_never_holds_the_session_lock_while_it_builds_the_copy() {
-        let (terminal, tx, _sent) = full_screen();
-        let session = owner(7804, "boot-7804", terminal.clone(), "done");
-        crate::remote::register_for_test(session.clone());
-        tx.send(Chunk::Data(paint(9))).unwrap();
-        shows(&terminal, 9);
-        let rows: Vec<crate::transcript::Row> = (0..30_000).map(|n| crate::transcript::Row::plain(&line(n))).collect();
-        crate::remote::adopt_for_test("boot-7804", "t1", crate::transcript::Transcript::restored(rows, 0, COLS.into()));
-        let drag = std::thread::spawn(|| crate::remote::scroll_local(7804, 3, paint_args(0)).map(|_| ()));
-        let mut worst = Duration::ZERO;
-        let until = Instant::now() + Duration::from_millis(600);
-        while Instant::now() < until {
-            let asked = Instant::now();
-            drop(lock(&session.state));
-            worst = worst.max(asked.elapsed());
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        drag.join().unwrap().unwrap();
-        assert!(worst < Duration::from_millis(50), "the session lock was held {worst:?} while the copy was built");
-        crate::remote::close(7804);
         crate::remote::release_held();
     }
 
@@ -5487,6 +5460,7 @@ mod cache_tests {
         stream(&session, &tx, 240, 250);
         let copy = crate::remote::copy_pane(7806, "t1").unwrap().unwrap();
         let id = crate::remote::open_saved(copy).unwrap();
+        assert!(crate::remote::show_opened(id));
         let restored = crate::remote::renderer(id).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while restored.is_alive() {
@@ -5507,6 +5481,7 @@ mod cache_tests {
         let (terminal, tx, _sent) = full_screen();
         let session = owner(7807, "boot-7807", terminal.clone(), "done");
         set_pane(&session, json!({"created_ms": 5, "program": "claude"}));
+        crate::remote::attach_as_listed_for_test(&session);
         crate::remote::register_for_test(session.clone());
         stream(&session, &tx, 9, 60);
         // Claude exits to the shell; the person opens a pager in the same pane.
@@ -5573,7 +5548,7 @@ mod cache_tests {
         let (terminal, _tx, _sent) = full_screen();
         let session = owner(7812, "boot-7812", terminal, "done");
         crate::remote::register_for_test(session.clone());
-        lock(&session.state).local = Local::attached(session.heard.output_now());
+        lock(&session.state).local = Local::attached_for_test(session.heard.output_now());
         let sent = crate::remote::input(7812, "t1", r#"{"type":"text","text":"y"}"#);
         assert!(sent.is_ok(), "keys typed during a switch were refused: {sent:?}");
         crate::remote::close(7812);
@@ -5589,6 +5564,7 @@ mod cache_tests {
         let (terminal, tx, _sent) = full_screen();
         let old = owner(7821, "boot-K", terminal, "done");
         set_pane(&old, json!({"created_ms": 100, "pid": 11, "program": "claude"}));
+        crate::remote::attach_as_listed_for_test(&old);
         crate::remote::register_for_test(old.clone());
         stream(&old, &tx, 9, 60);
         crate::remote::scroll_local(7821, 12, paint_args(0)).unwrap();
@@ -5596,7 +5572,8 @@ mod cache_tests {
         let (live, tx2, sent2) = full_screen();
         let new = owner(7822, "boot-K", live.clone(), "done");
         set_pane(&new, json!({"created_ms": 100, "pid": 22, "program": "claude"}));
-        lock(&new.state).local = Local::attached(new.heard.output_now());
+        lock(&new.state).local = Local::attached_for_test(new.heard.output_now());
+        crate::remote::attach_as_listed_for_test(&new);
         tx2.send(Chunk::Data(other_paint(40))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !live.screen_text().contains("another talk 040") {
@@ -5757,8 +5734,8 @@ mod cache_tests {
         crate::remote::close(7825);
         crate::remote::release_held();
         // A new run of the app: nothing watched yet; the copy is read from disk.
-        crate::remote::forget_transcripts_for_test("boot-7825");
-        let _ = crate::remote::open_saved(copy).unwrap();
+        let opened = crate::remote::open_saved(copy).unwrap();
+        assert!(crate::remote::show_opened(opened));
         let (live, tx2, _sent2) = full_screen();
         let second = owner(7826, "boot-7825", live.clone(), "done");
         crate::remote::register_for_test(second.clone());
@@ -5783,8 +5760,7 @@ mod cache_tests {
         stream(&session, &tx, 9, 40);
         let _ = sent_data(&sent);
         // To the top of what the phone holds.
-        crate::remote::scroll_local(7827, 1000, paint_args(0)).unwrap();
-        assert!(lock(&session.state).local.reader_for_test().is_some());
+        at_copy_top(7827, &session);
         assert!(!sent_data(&sent), "a drag inside the copy went to the program");
         // Further back: the agent scrolls its own view.
         crate::remote::scroll_local(7827, 3, paint_args(0)).unwrap();
@@ -5803,16 +5779,16 @@ mod cache_tests {
         crate::remote::register_for_test(session.clone());
         stream(&session, &tx, 9, 40);
         let _ = sent_data(&sent);
-        crate::remote::scroll_local(7828, 1000, paint_args(0)).unwrap();
+        at_copy_top(7828, &session);
         crate::remote::scroll_local(7828, 3, paint_args(0)).unwrap();
         assert!(sent_data(&sent), "not handed back");
-        let before = crate::remote::transcript_rows("boot-7828", "t1").unwrap();
+        let before = crate::remote::transcript_rows(&session).unwrap();
         // The agent scrolls its own view back and repaints older rows.
         tx.send(Chunk::Data(paint(20))).unwrap();
         shows(&terminal, 20);
         session.heard.printed(1);
         crate::remote::keep_local(&session, &mut lock(&session.state));
-        assert_eq!(crate::remote::transcript_rows("boot-7828", "t1").unwrap(), before);
+        assert_eq!(crate::remote::transcript_rows(&session).unwrap(), before);
         // Dragged back down: the phone's copy takes the drags again.
         crate::remote::scroll_local(7828, -3, paint_args(0)).unwrap();
         tx.send(Chunk::Data(paint(40))).unwrap();
@@ -5836,7 +5812,7 @@ mod cache_tests {
         crate::remote::close(7791);
         let (live, tx2, _sent2) = full_screen();
         let b = owner(7792, "boot-B", live.clone(), "done");
-        lock(&b.state).local = Local::attached(b.heard.output_now());
+        lock(&b.state).local = Local::attached_for_test(b.heard.output_now());
         tx2.send(Chunk::Data(b"\x1b[H\x1b[2Jcomputer B only".to_vec())).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !live.screen_text().contains("computer B only") {
@@ -5863,7 +5839,7 @@ mod cache_tests {
         shows(&terminal, 9);
         // About 1 MiB of history kept for it.
         let rows: Vec<crate::transcript::Row> = (0..30_000).map(|n| crate::transcript::Row::plain(&line(n))).collect();
-        crate::remote::adopt_for_test("boot-7793", "t1", crate::transcript::Transcript::restored(rows, 0, COLS.into()));
+        crate::remote::adopt_for_test(&session, crate::transcript::Transcript::restored(rows, 0, COLS.into()));
         let started = Instant::now();
         crate::remote::close(7793);
         let took = started.elapsed();

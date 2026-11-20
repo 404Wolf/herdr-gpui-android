@@ -370,6 +370,15 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_holdNote(
         }
     }
 }
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_showOpened(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+) -> jboolean {
+    u8::from(remote::show_opened(u64::try_from(id).unwrap_or(0)))
+}
 /// A copy handed over from Java, bounded before it is copied out.
 fn copy_bytes(env: &mut JNIEnv<'_>, bytes: &JByteArray<'_>) -> Option<Vec<u8>> {
     if bytes.is_null() {

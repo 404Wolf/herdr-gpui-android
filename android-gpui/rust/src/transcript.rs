@@ -18,9 +18,10 @@
 //! - **Gaps.** When the screen changed by more than it holds between two
 //!   looks (or was resized), rows were missed: a mark stands there.
 //!
-//! Only what the phone watched, in this run of the app: nothing is read
-//! from the core (its stitched read freezes the pane on every screen) or
-//! from a saved copy. The phone scrolls this history itself
+//! Only what the phone watched on one attach stream: nothing is read from
+//! the core (its stitched read freezes the pane on every screen), from a
+//! saved copy, or from another stream of the same pane (the phone cannot
+//! prove a reattached pane is the same terminal). The phone scrolls this history itself
 //! ([`Transcript::reader_rows`]) and saves it, so nothing waits on the link.
 use rio_vt::crosswords::Crosswords;
 use rio_vt::crosswords::pos::{Column, Line, Pos};
@@ -349,12 +350,6 @@ impl Transcript {
             out.push(gap_row());
         }
         out
-    }
-
-    /// The screen last looked at.
-    #[cfg(test)]
-    pub(crate) fn screen(&self) -> &[Row] {
-        &self.screen
     }
 }
 

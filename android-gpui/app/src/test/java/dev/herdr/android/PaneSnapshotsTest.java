@@ -130,6 +130,20 @@ public final class PaneSnapshotsTest {
         assertEquals(Collections.singletonList(-1L), shown);
     }
 
+    /**
+     * Review round 4 P1-1: a reconnect resumes the frame, pane list and unsent
+     * input of the computer shown only at the same connection revision.
+     */
+    @Test public void ask2AnEditedProfileIsANewConnectionNeverAResume() {
+        String a = PaneSnapshots.computer("profile", "revision-a");
+        String b = PaneSnapshots.computer("profile", "revision-b");
+        assertTrue(PaneSnapshots.resumes(true, a, PaneSnapshots.computer("profile", "revision-a")));
+        assertFalse("an edited profile resumed the old computer's session", PaneSnapshots.resumes(true, a, b));
+        assertFalse(PaneSnapshots.resumes(true, a, null));
+        assertFalse(PaneSnapshots.resumes(true, null, null));
+        assertFalse(PaneSnapshots.resumes(false, a, a));
+    }
+
     /** Review P2-6: opening a copy must not change the time it says it was saved. */
     @Test public void ask2AnOfflineCopyKeepsItsSaveTimeOverEveryOpen() throws Exception {
         File folder = dir.newFolder("panes");

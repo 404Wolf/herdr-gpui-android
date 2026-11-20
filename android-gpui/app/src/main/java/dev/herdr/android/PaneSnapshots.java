@@ -68,6 +68,16 @@ final class PaneSnapshots {
         return host == null ? null : computer(host.id, host.connectionRevision);
     }
 
+    /**
+     * Whether a new session to {@code key} resumes the one shown for
+     * {@code shownKey} (keeping its frame, pane list and unsent input): only
+     * the same profile at the same connection revision. An edited profile is
+     * another computer.
+     */
+    static boolean resumes(boolean hadSession, String shownKey, String key) {
+        return hadSession && key != null && key.equals(shownKey);
+    }
+
     static String computer(String profile, String revision) {
         if (profile == null || profile.isEmpty() || revision == null || revision.isEmpty()) return null;
         return profile + "\u0000" + revision;

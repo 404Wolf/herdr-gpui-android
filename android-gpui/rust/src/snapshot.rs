@@ -20,6 +20,8 @@
 use crate::remote::{Error, Result};
 use rio_vt::crosswords::Crosswords;
 use rio_vt::crosswords::formatter::write_sgr;
+use rio_vt::crosswords::grid::Grid;
+use rio_vt::crosswords::square::{Hyperlink, Square};
 use rio_vt::crosswords::pos::{Column, Line};
 use rio_vt::crosswords::style::Style;
 use rio_vt::event::EventListener;
@@ -28,9 +30,10 @@ use std::{fmt::Write as _, io, sync::Arc};
 #[cfg(test)]
 use std::{fs, io::Read, path::Path};
 
-/// The most a saved pane may take (Wolf's budget: 1 MiB a pane); the oldest
-/// history rows give way first.
-pub(crate) const MAX_BYTES: usize = crate::transcript::MAX_BYTES;
+/// The most a saved pane may take, as on phone-feedback (a plain shell keeps
+/// 4 MiB of scrollback); the oldest history rows give way first. An agent's
+/// transcript is at most transcript::MAX_BYTES.
+pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 /// The most a copy read back may be: version 1 copies were up to 4 MiB.
 const MAX_READ: usize = 4 * 1024 * 1024;
 const MAX_HEADER: usize = 4096;
@@ -59,18 +62,11 @@ pub(crate) struct Rows {
 }
 
 impl Rows {
-    /// The grid's own history and screen.
+    /// The grid's own history and screen (formatted with the grid locked:
+    /// tests and short grids; a save copies [`Cells`] instead).
+    #[cfg(test)]
     pub(crate) fn of_grid<U: EventListener>(grid: &Crosswords<U>) -> Self {
-        let (lines, cols) = (grid.screen_lines(), grid.columns());
-        let history = grid.history_size();
-        let rows = if lines == 0 || cols == 0 {
-            Vec::new()
-        } else {
-            (-(history as i32)..lines as i32)
-                .map(|line| Arc::new(crate::transcript::Row { text: String::new(), vt: row(grid, line, cols) }))
-                .collect()
-        };
-        Self { cols, lines, rows, history, tail: tail(grid), full_screen: full_screen(grid) }
+        Cells::of(grid).rows()
     }
 
     /// A full-screen program's: the phone's `transcript` of it, then
@@ -127,6 +123,43 @@ impl Screen {
     /// None when the grid is not on the alternate screen.
     pub(crate) fn of<U: EventListener>(grid: &Crosswords<U>) -> Option<Self> {
         full_screen(grid).then(|| Self { rows: crate::transcript::screen_rows(grid), cols: grid.columns(), tail: tail(grid) })
+    }
+}
+
+/// A grid's cells, copied while it is locked (its rows, styles and links
+/// as they are), so the rows are formatted with the lock released.
+pub(crate) struct Cells {
+    grid: Grid<Square>,
+    cols: usize,
+    lines: usize,
+    history: usize,
+    tail: String,
+    full_screen: bool,
+}
+
+impl Cells {
+    pub(crate) fn of<U: EventListener>(grid: &Crosswords<U>) -> Self {
+        Self {
+            grid: grid.grid.clone(),
+            cols: grid.columns(),
+            lines: grid.screen_lines(),
+            history: grid.history_size(),
+            tail: tail(grid),
+            full_screen: full_screen(grid),
+        }
+    }
+
+    /// Its history and screen as rows, formatted now.
+    pub(crate) fn rows(self) -> Rows {
+        let (lines, cols, history) = (self.lines, self.cols, self.history);
+        let rows = if lines == 0 || cols == 0 {
+            Vec::new()
+        } else {
+            (-(history as i32)..lines as i32)
+                .map(|line| Arc::new(crate::transcript::Row { text: String::new(), vt: row_of(&self.grid, line, cols) }))
+                .collect()
+        };
+        Rows { cols, lines, rows, history, tail: self.tail, full_screen: self.full_screen }
     }
 }
 
@@ -254,13 +287,27 @@ fn strip_sgr(vt: &str) -> String {
 /// One row, self-contained: it starts and ends in the default style, so any
 /// prefix of history can be dropped. Trailing blanks that draw nothing are left out.
 pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize) -> String {
+    row_of(&grid.grid, line, cols)
+}
+
+/// The link a cell is in, if any.
+fn link_of(grid: &Grid<Square>, line: i32, col: usize) -> Option<Hyperlink> {
+    let cell = &grid[Line(line)][Column(col)];
+    if !cell.has_hyperlink() {
+        return None;
+    }
+    grid.extras_table.get(cell.extras_id()?).and_then(|extras| extras.hyperlink.clone())
+}
+
+/// [`row`] of a grid's cells.
+fn row_of(grid: &Grid<Square>, line: i32, cols: usize) -> String {
     #[cfg(test)]
     probe::hit("format");
-    let cells = &grid.grid[Line(line)];
+    let cells = &grid[Line(line)];
     let last = (0..cols).rev().find(|&col| {
         let square = &cells[Column(col)];
         let c = square.c();
-        (c != ' ' && c != '\0') || grid.grid.style_of(square).renders_on_blank()
+        (c != ' ' && c != '\0') || grid.style_of(square).renders_on_blank()
     });
     let mut out = String::new();
     let Some(last) = last else {
@@ -276,8 +323,7 @@ pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize
             col += 1;
             continue;
         }
-        let link = grid
-            .cell_hyperlink(Line(line), Column(col))
+        let link = link_of(grid, line, col)
             .filter(|l| l.uri().len() <= MAX_LINK && l.id().len() <= MAX_LINK)
             .map(|l| (clean_osc(l.id()), clean_osc(l.uri())));
         if link != linked {
@@ -289,7 +335,7 @@ pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize
             }
             linked = link;
         }
-        let style = grid.grid.style_of(square);
+        let style = grid.style_of(square);
         if style != current {
             write_sgr(&mut out, &style);
             current = style;

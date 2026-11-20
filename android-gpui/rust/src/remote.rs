@@ -205,14 +205,17 @@ pub(crate) struct State {
     pub(crate) local: Local,
 }
 
-/// The pane on screen, as the phone itself keeps it: the copy being read
-/// back instead of the live grid, and when the live grid's first paint is in.
+/// The pane on screen, as the phone itself keeps it, for one attach stream
+/// only: the copy being read back instead of the live grid, what the phone
+/// watched of an agent's full screen, and when the live grid's first paint
+/// is in. A new attach (a switch, a reattach after the stream ended, a new
+/// connection) starts empty: nothing watched on one stream is ever read back
+/// on another, since the phone cannot prove it is still the same terminal.
 #[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct Local {
-    /// The phone's own copy scrolled instead of the live grid (a full-screen
-    /// program's transcript, or the copy read while the link was down): its
-    /// render id and terminal. Back at its newest row the live grid returns.
+    /// The phone's own copy scrolled instead of the live grid: its render
+    /// id and terminal. Back at its newest row the live grid returns.
     reader: Option<(u64, Arc<gpui_rio::Session>)>,
     /// When the pane on screen attached, and the output count then.
     attached: Option<(std::time::Instant, u64)>,
@@ -230,16 +233,107 @@ pub(crate) struct Local {
     /// The computer the UI shows this session as (the poll's host): the
     /// phone's copy of a pane carries it with the pane, for its links.
     host: String,
-    /// Rows dragged past the top of the phone's copy, sent to the program as
-    /// wheel input: it scrolls its own view back that far. Drags go to it
-    /// until they bring it back down; then the phone's copy takes them again.
+    /// Wheel reports sent to the program for drags past the top of the
+    /// phone's copy (it scrolls its own view back): drags go to it until as
+    /// many come back down, or it is at its newest row again.
     wheeled: i64,
+    /// The terminal this stream is of, from the attach reply: its PTY's
+    /// process and its created_ms. None: not reported, nothing is watched.
+    incarnation: Option<Incarnation>,
+    /// What the phone watched of the agent's full screen on this stream.
+    watched: Option<Shared>,
+    /// The pane list stopped agreeing with the attach (its process went
+    /// missing or changed): what was watched is gone, and nothing is watched
+    /// again on this stream, even if the same process id shows up again.
+    lost: bool,
+    /// The status marker and program last seen for the agent (see is_agent).
+    seen: Option<(String, String)>,
 }
 
 impl Local {
-    /// A pane just attached, with `output` bytes heard so far.
-    pub(crate) fn attached(output: u64) -> Self {
-        Self { attached: Some((std::time::Instant::now(), output)), output, captured: output, ..Self::default() }
+    /// A pane just attached, with `output` bytes heard so far; `incarnation`
+    /// from the attach reply's terminal record.
+    pub(crate) fn attached(output: u64, incarnation: Option<Incarnation>) -> Self {
+        Self {
+            attached: Some((std::time::Instant::now(), output)),
+            output,
+            captured: output,
+            incarnation,
+            ..Self::default()
+        }
+    }
+
+    /// The stream ended (the core's CLOSE): nothing watched on it is read back.
+    pub(crate) fn end_stream(&mut self) {
+        self.lose();
+    }
+
+    fn lose(&mut self) {
+        self.reader = None;
+        self.watched = None;
+        self.lost = true;
+        self.wheeled = 0;
+    }
+}
+
+/// Which terminal an attach stream is of, from the attach reply's terminal
+/// record: its PTY's process id (a new one on every spawn, kept recovery
+/// included) and its created_ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Incarnation {
+    pid: u64,
+    born: u64,
+}
+
+impl Incarnation {
+    /// None when the record names no process.
+    pub(crate) fn of(terminal: &Value) -> Option<Self> {
+        let pid = terminal["pid"].as_u64().filter(|pid| *pid != 0)?;
+        Some(Self { pid, born: terminal["created_ms"].as_u64().unwrap_or(0) })
+    }
+
+    /// Whether the pane list's entry still names this terminal.
+    #[cfg(any(feature = "android-ui", test))]
+    fn listed(self, entry: Option<&Value>) -> bool {
+        entry.is_some_and(|e| e["pid"].as_u64() == Some(self.pid) && e["created_ms"].as_u64().unwrap_or(0) == self.born)
+    }
+}
+
+/// What the phone watched of an agent's full screen on one attach stream:
+/// the rows that left its top, and the last screen it looked at (live, never
+/// the program's own scrolled view).
+#[derive(Default)]
+pub(crate) struct Watched {
+    transcript: crate::transcript::Transcript,
+    last: Option<crate::snapshot::Screen>,
+}
+
+impl Watched {
+    /// Its copy: the rows, then the last screen watched. None before a look.
+    fn rows(&self) -> Option<crate::snapshot::Rows> {
+        self.last.as_ref().map(|last| crate::snapshot::Rows::of_transcript(last, &self.transcript))
+    }
+}
+
+/// Shared by the poll (which adds to it) and the first drag or a save
+/// (which copy it, off the session's lock).
+pub(crate) type Shared = Arc<Mutex<Watched>>;
+
+impl State {
+    /// Whether the pane on screen runs an agent now (see is_agent).
+    fn agent(&mut self) -> bool {
+        let pane = self.view["pane_id"].as_str().unwrap_or("").to_owned();
+        let Self { view, local, .. } = self;
+        !pane.is_empty() && is_agent(view, &pane, &mut local.seen)
+    }
+
+    /// What was watched of the pane on screen, if it still runs the agent:
+    /// whose copy is that pane's copy.
+    pub(crate) fn agent_watched(&mut self) -> Option<Shared> {
+        if self.local.lost || !self.agent() {
+            return None;
+        }
+        self.local.watched.clone()
     }
 }
 
@@ -489,42 +583,36 @@ pub fn close(id: u64) {
     // (Mailbox::hold): keep its grid too, so the conversation still scrolls.
     let mut state = lock(&owner.state);
     let reading = state.local.reader.take();
+    let watched = state.agent_watched();
     if let Some(terminal) = state.terminal.take() {
         let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-        let me = ident(&state.view, &pane);
-        let agent = agent_ident(&state.view, &pane);
         // This grid is newer than any copy of the same pane kept on a switch.
         lock(departed()).retain(|kept| !kept.from(id, &pane));
-        *lock(closed()) = Some(Kept {
-            session: id,
-            terminal: terminal.clone(),
-            pane: pane.clone(),
-            ident: me.clone(),
-            agent: agent.clone(),
-        });
+        *lock(closed()) = Some(Kept { session: id, terminal: terminal.clone(), pane, watched: watched.clone() });
         let shown = state.render_id;
         drop(state);
-        // Only a terminal known by its PTY is ever matched again.
-        let key = me.known().then_some(me);
         match reading {
             // Being read back already: it stays, at the same row.
-            Some((reader, copy)) => hold_as(reader, copy, key),
+            Some((reader, copy)) => hold_as(reader, copy),
             None => {
                 // The live grid at once; this runs on the UI thread.
-                hold_as(shown, terminal.clone(), key.clone());
-                if let Some(agent) = agent {
-                    // An agent's full screen: the phone's transcript of it
-                    // replaces that frame once it is built, so the conversation
-                    // still scrolls with no link (not one screen).
+                hold_as(shown, terminal);
+                if let Some(watched) = watched {
+                    // An agent's full screen: the phone's copy of it replaces
+                    // that frame once it is built, so the conversation still
+                    // scrolls with no link (not one screen).
                     let slot = held();
                     std::thread::spawn(move || {
-                        let Some(copy) = reader_for(&agent, &terminal) else {
+                        let Some(rows) = lock(&watched).rows() else {
+                            return;
+                        };
+                        let Some(copy) = read_back(rows, "") else {
                             return;
                         };
                         let mut held = lock(slot);
                         if held.as_ref().is_some_and(|h| h.id == shown) {
                             let reader = crate::core_session::next_render_id();
-                            *held = Some(Held { id: reader, terminal: copy, key });
+                            *held = Some(Held { id: reader, terminal: copy });
                             drop(held);
                             show_render(None, reader, Some(shown), None);
                         }
@@ -534,83 +622,39 @@ pub fn close(id: u64) {
         }
     }
 }
-/// Which terminal a pane is, by what the core reports that changes when it
-/// is replaced: the core (its boot id), the pane, its `created_ms`, and its
-/// PTY's process id (a kept terminal recovered, or a restored registry, has
-/// the same address and `created_ms` but a new PTY). What the phone watched
-/// of a terminal is only ever joined to that same terminal, in this run of
-/// the app; a terminal whose PTY is not reported is never joined at all.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct Ident {
-    pub boot: String,
-    pub pane: String,
-    pub born: u64,
-    pub pid: u64,
-}
-
-impl Ident {
-    /// Whether this terminal can be told apart from one that replaced it.
-    pub(crate) fn known(&self) -> bool {
-        !self.boot.is_empty() && !self.pane.is_empty() && self.pid != 0
-    }
-}
 
 fn pane_entry<'a>(view: &'a Value, pane: &str) -> Option<&'a Value> {
     view["panes"].as_array().and_then(|panes| panes.iter().find(|p| p["id"] == pane))
 }
 
-/// `pane` of the session whose view this is.
-pub(crate) fn ident(view: &Value, pane: &str) -> Ident {
-    let entry = pane_entry(view, pane);
-    Ident {
-        boot: view["boot_id"].as_str().unwrap_or("").to_owned(),
-        pane: pane.to_owned(),
-        born: entry.and_then(|e| e["created_ms"].as_u64()).unwrap_or(0),
-        pid: entry.and_then(|e| e["pid"].as_u64()).unwrap_or(0),
-    }
-}
-
-/// The program an agent was seen running as, per terminal, with the status
-/// marker it had then: a status reported again (a new marker) shows the
-/// agent is what runs now; the same marker with another program is that
-/// program (a pager after the agent left) under the agent's old status.
-type Agents = HashMap<Ident, (String, String)>;
-fn agents() -> &'static Mutex<Agents> {
-    static AGENTS: OnceLock<Mutex<Agents>> = OnceLock::new();
-    AGENTS.get_or_init(Mutex::default)
-}
-const AGENTS_MAX: usize = 256;
-
-/// `pane`, when it runs an agent (Claude Code, Codex): one that reports its
+/// Whether `pane` runs an agent (Claude Code, Codex): one that reports its
 /// status, or that Herdr labelled an agent, and is still the program that
-/// did. Only an agent's full screen is a conversation the phone keeps and
-/// reads back itself; any other full-screen program (vim, less, htop)
-/// scrolls itself, with the drag as wheel input.
-pub(crate) fn agent_ident(view: &Value, pane: &str) -> Option<Ident> {
-    let entry = pane_entry(view, pane)?;
+/// did. `seen` is the status marker and program this attach last saw for
+/// it: a status reported again (a new marker) shows the agent is what runs
+/// now; the same marker with another program is that program (a pager after
+/// the agent left) under the agent's old status. Only an agent's full screen
+/// is a conversation the phone keeps and reads back itself; any other
+/// full-screen program (vim, less, htop) scrolls itself, with the drag as
+/// wheel input.
+fn is_agent(view: &Value, pane: &str, seen: &mut Option<(String, String)>) -> bool {
+    let Some(entry) = pane_entry(view, pane) else {
+        return false;
+    };
     let reports = entry["status"].as_str().is_some_and(|s| !s.is_empty());
     let labelled = entry["kind"].as_str().is_some_and(|k| !k.is_empty());
     if !reports && !labelled {
-        return None;
-    }
-    let me = ident(view, pane);
-    if !me.known() {
-        return None;
+        return false;
     }
     let program = entry["program"].as_str().unwrap_or("").to_owned();
     let marker = marker(view, pane);
-    let mut seen = lock(agents());
-    match seen.get(&me) {
-        Some((at, was)) if *at == marker && *was != program => return None,
-        Some((at, _)) if *at == marker => {}
+    match seen {
+        Some((at, was)) if *at == marker && *was != program => false,
+        Some((at, _)) if *at == marker => true,
         _ => {
-            if seen.len() >= AGENTS_MAX {
-                seen.clear();
-            }
-            seen.insert(me.clone(), (marker, program));
+            *seen = Some((marker, program));
+            true
         }
     }
-    Some(me)
 }
 /// Draws render id `id` (for `generation`, else the UI's current one), only
 /// while `instead_of` is drawn when given. It shows `target` (host, pane);
@@ -646,19 +690,12 @@ fn departed() -> &'static Mutex<std::collections::VecDeque<Kept>> {
 /// for saving. Only the grid object moves here; nothing is sent and no size
 /// changes.
 #[cfg(test)]
-pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: String, boot: String) {
-    let ident = Ident { boot, pane: pane.clone(), ..Ident::default() };
-    depart_as(session, terminal, pane, ident, None);
+pub(crate) fn depart(session: u64, terminal: Arc<gpui_rio::Session>, pane: String, _boot: String) {
+    depart_as(session, terminal, pane, None);
 }
-/// [`depart`] of the terminal `ident`, which ran `agent` if any (its
-/// transcript is its copy).
-pub(crate) fn depart_as(
-    session: u64,
-    terminal: Arc<gpui_rio::Session>,
-    pane: String,
-    ident: Ident,
-    agent: Option<Ident>,
-) {
+/// [`depart`], with what was watched of the agent it ran, if it ran one
+/// (its copy is that, not its grid).
+pub(crate) fn depart_as(session: u64, terminal: Arc<gpui_rio::Session>, pane: String, watched: Option<Shared>) {
     if pane.is_empty() {
         return;
     }
@@ -671,7 +708,7 @@ pub(crate) fn depart_as(
     }
     let mut kept = lock(departed());
     kept.retain(|other| !other.from(session, &pane));
-    kept.push_back(Kept { session, terminal, pane, ident, agent });
+    kept.push_back(Kept { session, terminal, pane, watched });
     while kept.len() > DEPARTED_MAX {
         kept.pop_front();
     }
@@ -690,7 +727,7 @@ pub(crate) fn departed_test_lock() -> MutexGuard<'static, ()> {
 /// attaches (the save runs on a worker, maybe after that attach).
 #[cfg(test)]
 pub(crate) fn closed_for_test(session: u64, terminal: Arc<gpui_rio::Session>, pane: &str) {
-    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into(), ident: Ident::default(), agent: None });
+    *lock(closed()) = Some(Kept { session, terminal, pane: pane.into(), watched: None });
 }
 fn closed() -> &'static Mutex<Option<Kept>> {
     static CLOSED: OnceLock<Mutex<Option<Kept>>> = OnceLock::new();
@@ -703,10 +740,8 @@ struct Kept {
     session: u64,
     terminal: Arc<gpui_rio::Session>,
     pane: String,
-    /// The terminal it is (its copy says so), and the agent it ran when
-    /// kept, if it ran one: whose transcript is its copy.
-    ident: Ident,
-    agent: Option<Ident>,
+    /// What was watched of the agent it ran, when it ran one: its copy.
+    watched: Option<Shared>,
 }
 impl Kept {
     fn from(&self, session: u64, pane: &str) -> bool {
@@ -715,22 +750,17 @@ impl Kept {
 }
 #[cfg(test)]
 pub(crate) fn hold(terminal: Arc<gpui_rio::Session>) {
-    hold_as(crate::core_session::next_render_id(), terminal, None);
+    hold_as(crate::core_session::next_render_id(), terminal);
 }
 /// Makes `terminal` the held frame, drawn under render id `id`.
-fn hold_as(id: u64, terminal: Arc<gpui_rio::Session>, key: Option<Ident>) {
-    *lock(held()) = Some(Held { id, terminal, key });
+fn hold_as(id: u64, terminal: Arc<gpui_rio::Session>) {
+    *lock(held()) = Some(Held { id, terminal });
 }
 /// The grid the held frame draws.
 #[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
 struct Held {
     id: u64,
     terminal: Arc<gpui_rio::Session>,
-    /// The terminal it shows, when known: a live attach of the same terminal
-    /// keeps the place it was read at. Pane ids repeat across computers
-    /// (every core has a t1) and within one core whose registry was restored,
-    /// so the pane alone is never enough.
-    key: Option<Ident>,
 }
 /// The terminal of the last closed session (or a saved pane read back), which
 /// the held frame draws.
@@ -764,17 +794,33 @@ fn cached() -> &'static Mutex<Cached> {
     }
     CACHED.with(|cached| *cached)
 }
+/// A saved pane (or an uncached pane's note) read and not drawn yet: the
+/// phone first checks it is still the pick ([`show_opened`]).
+#[cfg(not(test))]
+fn opened() -> &'static Mutex<Cached> {
+    static OPENED: OnceLock<Mutex<Cached>> = OnceLock::new();
+    OPENED.get_or_init(Mutex::default)
+}
+/// Per thread in tests, like [`held`].
+#[cfg(test)]
+fn opened() -> &'static Mutex<Cached> {
+    thread_local! {
+        static OPENED: &'static Mutex<Cached> = Box::leak(Box::default());
+    }
+    OPENED.with(|opened| *opened)
+}
 /// A new pane attached: its live grid is the one to scroll and draw now.
 #[cfg(test)]
 pub(crate) fn release_held() {
     lock(held()).take();
     lock(cached()).take();
+    lock(opened()).take();
 }
 
 /// The live grid of a fresh attach is shown once its first paint is in (its
-/// bytes went quiet) or SETTLE_MAX passed, never blank before. Then a held
-/// frame of the same pane that was being read back stays as the reader, at
-/// the same row (a reconnect never jumps); any other held frame lets go.
+/// bytes went quiet) or SETTLE_MAX passed, never blank before. Then the held
+/// frame (the last one, a saved pane, a copy being read) lets go: nothing
+/// read on another stream is carried onto this one.
 #[cfg(any(feature = "android-ui", test))]
 pub(crate) fn settle(owner: &Session, state: &mut State) -> bool {
     let local = &mut state.local;
@@ -795,91 +841,42 @@ pub(crate) fn settle(owner: &Session, state: &mut State) -> bool {
         return false;
     }
     local.settled = true;
-    let pane = state.view["pane_id"].as_str().unwrap_or("");
-    let me = ident(&state.view, pane);
-    if let Some(held) = lock(held()).take()
-        && me.known()
-        && held.key.as_ref() == Some(&me)
-        && held.terminal.grid().lock().display_offset() > 0
-    {
-        state.local.reader = Some((held.id, held.terminal));
-    }
+    lock(held()).take();
     lock(cached()).take();
     true
 }
 
-/// What the phone watched of one agent's full screen, in this run of the
-/// app, by the terminal it is of (never read back from a saved copy).
-#[cfg_attr(not(any(feature = "android-ui", test)), allow(dead_code))]
-struct Transcribed {
-    ident: Ident,
-    transcript: crate::transcript::Transcript,
-    used: u64,
-}
-impl Transcribed {
-    fn is(&self, ident: &Ident) -> bool {
-        self.ident == *ident
-    }
-}
-/// Transcripts kept in memory at once (each at most transcript::MAX_BYTES).
-#[cfg(any(feature = "android-ui", test))]
-const TRANSCRIPTS: usize = 6;
-fn transcripts() -> &'static Mutex<Vec<Transcribed>> {
-    static KEPT: OnceLock<Mutex<Vec<Transcribed>>> = OnceLock::new();
-    KEPT.get_or_init(Mutex::default)
-}
-#[cfg(any(feature = "android-ui", test))]
-static USED: AtomicU64 = AtomicU64::new(1);
-/// `ident`'s transcript, made if there is none; the least recently used goes beyond TRANSCRIPTS.
-#[cfg(any(feature = "android-ui", test))]
-fn transcribed<'a>(store: &'a mut Vec<Transcribed>, ident: &Ident) -> &'a mut Transcribed {
-    let used = USED.fetch_add(1, Ordering::Relaxed);
-    let at = match store.iter().position(|kept| kept.is(ident)) {
-        Some(at) => at,
-        None => {
-            if store.len() >= TRANSCRIPTS
-                && let Some(oldest) = (0..store.len()).min_by_key(|i| store[*i].used)
-            {
-                store.remove(oldest);
-            }
-            store.push(Transcribed { ident: ident.clone(), transcript: crate::transcript::Transcript::default(), used });
-            store.len() - 1
-        }
-    };
-    store[at].used = used;
-    &mut store[at]
-}
-/// The phone's copy of a full-screen program to read back: its transcript
-/// then its screen now, in a terminal of its own at the newest row. The
-/// transcript first looks at that very screen, so the two join without a
-/// row missed or doubled. None when `terminal` is not full screen or no
-/// history was kept yet. Only the rows are copied under the transcript's
-/// and the grid's locks (which the poll takes too); encoding and parsing run
-/// with no lock held, never under the session's lock.
-fn reader_for(ident: &Ident, terminal: &gpui_rio::Session) -> Option<Arc<gpui_rio::Session>> {
-    if !ident.known() {
-        return None;
-    }
-    // The screen first (the grid's lock only), then the transcript's.
-    let screen = crate::snapshot::Screen::of(&terminal.grid().lock())?;
-    let rows = {
-        let mut store = lock(transcripts());
-        let kept = store.iter_mut().find(|kept| kept.is(ident))?;
-        if kept.transcript.rows() == 0 {
-            return None;
-        }
-        kept.transcript.observe(screen.rows.clone(), screen.cols);
-        crate::snapshot::Rows::of_transcript(&screen, &kept.transcript)
-    };
+/// Draws `rows` (a copy) in a terminal of its own at the newest row, for
+/// reading back. Encodes and parses with no lock held.
+fn read_back(rows: crate::snapshot::Rows, pane: &str) -> Option<Arc<gpui_rio::Session>> {
     let (cols, lines) = (u16::try_from(rows.cols).ok()?, u16::try_from(rows.lines).ok()?);
     let (bytes, _) = rows.encode(crate::snapshot::MAX_BYTES);
-    let reader = crate::snapshot::restore(crate::snapshot::Saved::of(cols, lines, &ident.pane, bytes)).ok()?;
+    let reader = crate::snapshot::restore(crate::snapshot::Saved::of(cols, lines, pane, bytes)).ok()?;
     // Parsed on its own thread: the first drag scrolls a whole copy.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while reader.is_alive() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
     Some(reader)
+}
+
+/// The phone's copy of an agent's full screen to read back: what it
+/// watched, then the screen now, looked at first so the two join without a
+/// row missed or doubled. None when `terminal` is not full screen or nothing
+/// was watched yet. The transcript's lock, then the grid's (only to copy
+/// the screen), in the poll's order; never under the session's lock.
+fn reader_for(watched: &Shared, terminal: &gpui_rio::Session, pane: &str) -> Option<Arc<gpui_rio::Session>> {
+    let rows = {
+        let mut watched = lock(watched);
+        if watched.transcript.rows() == 0 {
+            return None;
+        }
+        let screen = crate::snapshot::Screen::of(&terminal.grid().lock())?;
+        watched.transcript.observe(screen.rows.clone(), screen.cols);
+        watched.last = Some(screen);
+        watched.rows()?
+    };
+    read_back(rows, pane)
 }
 
 /// The pane's status marker as the list has it: it moves whenever the
@@ -891,70 +888,81 @@ fn marker(view: &Value, pane: &str) -> String {
     format!("{}/{}/{}", entry["status"].as_str().unwrap_or(""), entry["status_ms"], entry["turn"])
 }
 
-/// Keeps the transcript of the agent's full screen on screen: each new
-/// screen is aligned with the last one and the rows that left its top are
-/// kept. Nothing is asked of the core.
+/// Keeps what the phone watches of the agent's full screen on screen: each
+/// new screen is aligned with the last one and the rows that left its top
+/// are kept. Only while the pane list agrees with the attach on which
+/// terminal this is; once it does not, everything watched on this stream is
+/// dropped, for good. Nothing is asked of the core.
 #[cfg(any(feature = "android-ui", test))]
 pub(crate) fn keep_local(owner: &Session, state: &mut State) {
-    if !state.local.settled {
+    if !state.local.settled || state.local.lost {
         return;
     }
     let Some(terminal) = state.terminal.clone() else {
         return;
     };
     let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-    // Only an agent's conversation is kept (see agent_ident).
-    let Some(agent) = (!pane.is_empty()).then(|| agent_ident(&state.view, &pane)).flatten() else {
+    let listed = state.local.incarnation.is_some_and(|me| me.listed(pane_entry(&state.view, &pane)));
+    if !listed {
+        let reading = state.local.reader.is_some();
+        state.local.lose();
+        if reading {
+            show_render(None, state.render_id, None, None);
+        }
         return;
-    };
+    }
+    // Only an agent's conversation is kept (see is_agent).
+    if !state.agent() {
+        return;
+    }
     let output = owner.heard.output();
     // Handed back to the program's own scrolling: its view is its history,
-    // not new rows; looked at again once it is dragged back down.
+    // not new rows; looked at again once it is back at its newest row.
     if output == state.local.captured || state.local.wheeled > 0 {
         return;
     }
+    let shared = state.local.watched.get_or_insert_with(Shared::default).clone();
     // The poll never waits while a copy is being taken (a first drag, a
     // save): this look is skipped, and the next poll looks again.
-    let mut store = match transcripts().try_lock() {
-        Ok(store) => store,
+    let mut watched = match shared.try_lock() {
+        Ok(watched) => watched,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return,
     };
-    let screen = {
-        let grid = terminal.grid().lock();
-        if !grid.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN) {
-            return;
-        }
-        (crate::transcript::screen_rows(&grid), grid.columns())
+    let Some(screen) = crate::snapshot::Screen::of(&terminal.grid().lock()) else {
+        return;
     };
     state.local.captured = output;
-    transcribed(&mut store, &agent).transcript.observe(screen.0, screen.1);
+    watched.transcript.observe(screen.rows.clone(), screen.cols);
+    watched.last = Some(screen);
 }
 
 #[cfg(test)]
-pub(crate) fn transcript_rows(boot: &str, pane: &str) -> Option<Vec<String>> {
-    let store = lock(transcripts());
-    let kept = store.iter().find(|kept| kept.ident.boot == boot && kept.ident.pane == pane)?;
-    Some(kept.transcript.reader_rows(kept.transcript.screen()).map(|r| r.text.clone()).collect())
+pub(crate) fn transcript_rows(owner: &Session) -> Option<Vec<String>> {
+    let watched = lock(&owner.state).local.watched.clone()?;
+    let watched = lock(&watched);
+    let last = watched.last.as_ref()?;
+    Some(watched.transcript.reader_rows(&last.rows).map(|r| r.text.clone()).collect())
 }
 /// `pane`'s copy, as session `id` last showed it: the phone's copy of that
 /// conversation, for reading it later with no link (the phone seals it and
 /// writes it). The grid is the newest that session left: its live one while
 /// it shows `pane`, else the one kept when a switch left it (freed once
 /// copied), else the one kept when it closed. Grids of other sessions never
-/// count, even for the same pane id. A full-screen program's copy is the
-/// phone's transcript of it, then its screen. None when there is none. The
-/// grid is copied under its lock, never on the UI thread.
+/// count, even for the same pane id. An agent's full screen's copy is what
+/// the phone watched of it, then the last screen it watched (never the
+/// program's own scrolled view); a save changes nothing of what is watched.
+/// Only rows are copied under the locks; formatting and the file are built
+/// with none held, never on the UI thread.
 pub fn copy_pane(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
     if pane.is_empty() {
         return Ok(None);
     }
     let live = lock(sessions()).get(&id).cloned().and_then(|owner| {
-        let state = lock(&owner.state);
+        let mut state = lock(&owner.state);
         if state.view["pane_id"] == pane {
-            let me = ident(&state.view, pane);
-            let agent = agent_ident(&state.view, pane);
-            state.terminal.clone().map(|terminal| (terminal, me, agent))
+            let watched = state.agent_watched();
+            state.terminal.clone().map(|terminal| (terminal, watched))
         } else {
             None
         }
@@ -962,36 +970,24 @@ pub fn copy_pane(id: u64, pane: &str) -> Result<Option<Vec<u8>>> {
     let switched = || {
         let mut kept = lock(departed());
         let at = kept.iter().position(|kept| kept.from(id, pane))?;
-        kept.remove(at).map(|kept| (kept.terminal, kept.ident, kept.agent))
+        kept.remove(at).map(|kept| (kept.terminal, kept.watched))
     };
     let last_closed = || {
-        lock(closed())
-            .as_ref()
-            .filter(|kept| kept.from(id, pane))
-            .map(|kept| (kept.terminal.clone(), kept.ident.clone(), kept.agent.clone()))
+        lock(closed()).as_ref().filter(|kept| kept.from(id, pane)).map(|kept| (kept.terminal.clone(), kept.watched.clone()))
     };
-    let Some((terminal, mut me, agent)) = live.or_else(switched).or_else(last_closed) else {
+    let Some((terminal, watched)) = live.or_else(switched).or_else(last_closed) else {
         return Ok(None);
     };
-    if me.pane.is_empty() {
-        me.pane = pane.to_owned();
-    }
-    // Only the transcript of the agent this grid ran is its copy: never
-    // another terminal's, nor an agent's under the pager that followed it.
-    // The rows are copied under the locks; the file is built with none held.
-    let screen = agent.as_ref().and_then(|_| crate::snapshot::Screen::of(&terminal.grid().lock()));
-    let transcribed = screen.zip(agent).and_then(|(screen, agent)| {
-        let mut store = lock(transcripts());
-        let kept = store.iter_mut().find(|kept| kept.is(&agent))?;
-        // The very screen copied, so history and screen join exactly.
-        kept.transcript.observe(screen.rows.clone(), screen.cols);
-        Some(crate::snapshot::Rows::of_transcript(&screen, &kept.transcript))
-    });
-    let rows = match transcribed {
+    let watched = watched.and_then(|watched| lock(&watched).rows());
+    let rows = match watched {
         Some(rows) => rows,
-        None => crate::snapshot::Rows::of_grid(&terminal.grid().lock()),
+        None => {
+            // The grid guard drops before the owned cells are formatted.
+            let cells = crate::snapshot::Cells::of(&terminal.grid().lock());
+            cells.rows()
+        }
     };
-    Ok(Some(rows.file(&me.pane)?))
+    Ok(Some(rows.file(pane)?))
 }
 /// Test stand-in for the phone's save: [`copy_pane`] written to `path`.
 #[cfg(test)]
@@ -1002,26 +998,27 @@ pub(crate) fn save_pane(id: u64, pane: &str, path: &str) -> Result<bool> {
     crate::snapshot::write(&copy, std::path::Path::new(path))?;
     Ok(true)
 }
-/// Test stand-in for the phone's open: [`open_saved`] of `path`'s bytes.
+/// Test stand-in for the phone's open: [`open_saved`] of `path`'s bytes, drawn.
 #[cfg(test)]
 pub(crate) fn open_saved_file(path: &str) -> Result<u64> {
-    open_saved(std::fs::read(path)?)
+    let id = open_saved(std::fs::read(path)?)?;
+    show_opened(id);
+    Ok(id)
 }
-/// Reads a saved pane (its file's bytes, opened by the phone) and makes it
-/// the held frame, drawn under a new render id (returned) until a live pane
-/// attaches. It scrolls like any held frame. It is for reading with no link
-/// only: the live pane replaces it once it paints, and nothing in it is
-/// ever joined to the live pane's history. Never on the UI thread.
+/// Reads a saved pane (its file's bytes, opened by the phone) into a
+/// terminal of its own, drawn under a new render id (returned) once the
+/// phone has checked it is still the pick ([`show_opened`]); then it is the
+/// held frame until a live pane attaches. It is for reading with no link
+/// only: nothing in it is ever joined to a live pane. Never on the UI thread.
 pub fn open_saved(bytes: Vec<u8>) -> Result<u64> {
     let terminal = crate::snapshot::restore(crate::snapshot::parse(bytes)?)?;
     let id = crate::core_session::next_render_id();
-    *lock(cached()) = Some((id, terminal.clone()));
-    hold_as(id, terminal, None);
+    *lock(opened()) = Some((id, terminal));
     Ok(id)
 }
-/// Makes `pane`'s stand-in the held frame when it has no saved copy: `title`
-/// and one dim `note` line on a `cols`×`rows` grid, drawn under a new render id
-/// (returned) until a live pane attaches. Never touches a session or the disk.
+/// Makes `pane`'s stand-in when it has no saved copy: `title` and one dim
+/// `note` line on a `cols`×`rows` grid, drawn under a new render id
+/// (returned) once shown ([`show_opened`]). Never touches a session or the disk.
 pub fn hold_note(pane: &str, title: &str, note: &str, cols: u16, rows: u16) -> Result<u64> {
     let terminal = crate::snapshot::restore(crate::snapshot::Saved::of(
         cols.clamp(20, 400),
@@ -1030,9 +1027,19 @@ pub fn hold_note(pane: &str, title: &str, note: &str, cols: u16, rows: u16) -> R
         crate::snapshot::note(title, note),
     ))?;
     let id = crate::core_session::next_render_id();
-    *lock(cached()) = Some((id, terminal.clone()));
-    hold_as(id, terminal, None);
+    *lock(opened()) = Some((id, terminal));
     Ok(id)
+}
+/// The phone checked the pane opened as `id` is still the pick: it becomes
+/// the held frame (until a live pane attaches). False when a later open
+/// replaced it (nothing changes then).
+pub fn show_opened(id: u64) -> bool {
+    let Some((opened, terminal)) = lock(opened()).take_if(|(opened, _)| *opened == id) else {
+        return false;
+    };
+    *lock(cached()) = Some((opened, terminal.clone()));
+    hold_as(opened, terminal);
+    true
 }
 /// Scrolls the held frame's own history, with no link: `delta` rows back
 /// (positive) or forward, or back to the newest line when `latest`. Never sends
@@ -1220,31 +1227,28 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     let scroll = rio_vt::crosswords::grid::Scroll::Delta(delta);
     let _ = (paint.title, paint.status, paint.shortcuts);
     let local = || Ok(json!({"queued":true,"local":true}).to_string());
-    let (terminal, agent, render_id) = {
+    let wheel = || Ok(json!({"queued":true}).to_string());
+    let (terminal, watched, render_id) = {
         let mut state = lock(&owner.state);
         // Being read back: the phone's own copy scrolls, nothing is sent; at
         // its newest row the live grid is drawn again.
-        if let Some((_, reader)) = &state.local.reader {
-            let (before, offset) = {
+        if let Some((_, reader)) = state.local.reader.clone() {
+            let (before, after) = {
                 let mut grid = reader.grid().lock();
                 let before = grid.display_offset();
                 grid.scroll_display(scroll);
                 (before, grid.display_offset())
             };
-            if offset == 0 && delta < 0 {
+            if after == 0 && delta < 0 {
                 state.local.reader = None;
                 show_render(Some(paint.generation), state.render_id, None, None);
-            } else if delta > 0 && offset == before {
-                // At the top of what the phone has: older rows are the
-                // program's own, so the drag goes on there (wheel input), on
-                // the live grid. Never a dead end.
-                state.local.reader = None;
-                show_render(Some(paint.generation), state.render_id, None, None);
-                if let Some(terminal) = state.terminal.clone() {
-                    if terminal.wheel(delta) {
-                        state.local.wheeled = i64::from(delta);
-                    }
-                    return Ok(json!({"queued":true}).to_string());
+            } else if delta > 0 {
+                // Past the top of what the phone has: the rest of the drag
+                // goes on in the program's own view (wheel input).
+                let rest = delta - i32::try_from(after.saturating_sub(before)).unwrap_or(delta);
+                if rest > 0 {
+                    hand_back(&mut state, rest, paint.generation);
+                    return wheel();
                 }
             }
             return local();
@@ -1255,38 +1259,41 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
             return local();
         }
         let Some(terminal) = state.terminal.clone() else {
-            return Ok(json!({"queued":true}).to_string());
+            return wheel();
         };
         // Handed back to the program's own scrolling: it gets the drags until
-        // they bring its view back down.
+        // they bring its view back down, or it is at its newest row already.
         if state.local.wheeled > 0 {
-            if terminal.wheel(delta) {
-                state.local.wheeled = (state.local.wheeled + i64::from(delta)).max(0);
-            } else {
+            if delta < 0 && at_newest(&state, &terminal) {
                 state.local.wheeled = 0;
+                return local();
             }
-            return Ok(json!({"queued":true}).to_string());
+            let sent = wheel_reports(&terminal, delta);
+            state.local.wheeled = (state.local.wheeled + sent).max(0);
+            return wheel();
         }
-        let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
         // A full-screen agent (Claude Code) keeps its history to itself:
-        // dragging back scrolls the phone's transcript of it, at once and
-        // with no round trip (item 77, ask 2). Without one yet, it gets wheel
-        // input as before; plain output scrolls the attach's local history.
-        let agent = (delta > 0).then(|| agent_ident(&state.view, &pane)).flatten();
-        if agent.is_some() {
+        // dragging back scrolls the phone's copy of what it watched, at once
+        // and with no round trip (item 77, ask 2). Without one yet, it gets
+        // wheel input as before; plain output scrolls the attach's history.
+        let watched = if delta > 0 { state.agent_watched() } else { None };
+        if watched.is_some() {
             state.local.building = Some(0);
         }
-        (terminal, agent, state.render_id)
+        (terminal, watched, state.render_id)
     };
-    if let Some(agent) = agent {
+    if let Some(watched) = watched {
+        let pane = lock(&owner.state).view["pane_id"].as_str().unwrap_or("").to_owned();
         // Built with the session's lock released: the poll (and the UI
         // waiting on it) never waits for the copy to be encoded and parsed.
-        let built = reader_for(&agent, &terminal);
+        let built = reader_for(&watched, &terminal, &pane);
         // Scrolled before the session's lock is taken again: its grid can
         // still be busy with the copy's last bytes.
-        if let Some(reader) = &built {
-            reader.grid().lock().scroll_display(scroll);
-        }
+        let rest = built.as_ref().map(|reader| {
+            let mut grid = reader.grid().lock();
+            grid.scroll_display(scroll);
+            delta - i32::try_from(grid.display_offset()).unwrap_or(delta)
+        });
         let mut state = lock(&owner.state);
         // A later attach has its own Local: this build's state is not its.
         if state.render_id != render_id {
@@ -1296,15 +1303,20 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
         if state.local.reader.is_some() || state.terminal.is_none() {
             return local();
         }
-        if let Some(reader) = built {
+        if let (Some(reader), Some(rest)) = (built, rest) {
+            if rest > 0 {
+                // Longer than the whole copy: the program's own view goes on.
+                hand_back(&mut state, rest.saturating_add(pending.max(0)), paint.generation);
+                return wheel();
+            }
             let shown = crate::core_session::next_render_id();
             let host = state.local.host.clone();
-            state.local.reader = Some((shown, reader.clone()));
-            show_render(Some(paint.generation), shown, None, Some((&host, &agent.pane)));
+            state.local.reader = Some((shown, reader));
+            show_render(Some(paint.generation), shown, None, Some((&host, &pane)));
             drop(state);
             // The rows dragged while it was built.
             if pending != 0 {
-                reader.grid().lock().scroll_display(rio_vt::crosswords::grid::Scroll::Delta(pending));
+                return scroll_local(id, i64::from(pending), paint);
             }
             return local();
         }
@@ -1312,7 +1324,43 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     if !terminal.wheel(delta) {
         terminal.grid().lock().scroll_display(scroll);
     }
-    Ok(json!({"queued":true}).to_string())
+    wheel()
+}
+
+/// Leaves the phone's copy for the program's own view of the agent (the
+/// live grid), and sends it `rows` more to scroll back.
+fn hand_back(state: &mut State, rows: i32, generation: i64) {
+    state.local.reader = None;
+    show_render(Some(generation), state.render_id, None, None);
+    if let Some(terminal) = state.terminal.clone() {
+        state.local.wheeled = wheel_reports(&terminal, rows).max(0);
+    }
+}
+
+/// Sends `rows` of wheel input (positive: back); the reports really sent,
+/// signed (at most 30 a drag), 0 when the program takes none.
+fn wheel_reports(terminal: &gpui_rio::Session, rows: i32) -> i64 {
+    if rows == 0 || !terminal.wheel(rows) {
+        return 0;
+    }
+    i64::from(rows.signum()) * i64::from(rows.unsigned_abs().min(30))
+}
+
+/// Whether the program's own view is at its newest row: its screen is the
+/// last one the phone watched, or later (it moved up from it, with output).
+fn at_newest(state: &State, terminal: &gpui_rio::Session) -> bool {
+    let Some(watched) = &state.local.watched else {
+        return true;
+    };
+    let Ok(watched) = watched.try_lock() else {
+        return false;
+    };
+    let (Some(last), Some(now)) = (watched.last.as_ref(), crate::snapshot::Screen::of(&terminal.grid().lock())) else {
+        return true;
+    };
+    let last: Vec<&str> = last.rows.iter().map(|r| r.text.as_str()).collect();
+    let now: Vec<&str> = now.rows.iter().map(|r| r.text.as_str()).collect();
+    matches!(crate::transcript::moved(&last, &now), crate::transcript::Moved::Still | crate::transcript::Moved::Up(_))
 }
 pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
     let owner = session(id)?;
@@ -1378,22 +1426,25 @@ pub(crate) fn register_for_test(owner: Arc<Session>) {
 /// attach reply's terminal record.
 #[cfg(test)]
 pub(crate) fn reattach_for_test(owner: &Session, terminal: &Value) {
-    let _ = terminal;
-    lock(&owner.state).local = Local::attached(owner.heard.output_now());
+    lock(&owner.state).local = Local::attached(owner.heard.output_now(), Incarnation::of(terminal));
 }
 /// The PTY process id the tests' panes report.
 #[cfg(test)]
 pub(crate) const TEST_PID: u64 = 4242;
-/// A new run of the app, for one core's panes: nothing watched of them.
+/// The pane on screen's attach named the terminal its list entry names now.
 #[cfg(test)]
-pub(crate) fn forget_transcripts_for_test(boot: &str) {
-    lock(transcripts()).retain(|kept| kept.ident.boot != boot);
+pub(crate) fn attach_as_listed_for_test(owner: &Session) {
+    let mut state = lock(&owner.state);
+    let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+    let entry = pane_entry(&state.view, &pane).cloned().unwrap_or_default();
+    state.local.incarnation = Incarnation::of(&entry);
 }
-/// What the phone watched of `pane` (a test pane: TEST_PID, no created_ms).
+/// What the phone watched of `owner`'s pane: `transcript`, then its screen now.
 #[cfg(test)]
-pub(crate) fn adopt_for_test(boot: &str, pane: &str, transcript: crate::transcript::Transcript) {
-    let ident = Ident { boot: boot.into(), pane: pane.into(), born: 0, pid: TEST_PID };
-    transcribed(&mut lock(transcripts()), &ident).transcript = transcript;
+pub(crate) fn adopt_for_test(owner: &Session, transcript: crate::transcript::Transcript) {
+    let mut state = lock(&owner.state);
+    let last = state.terminal.as_ref().and_then(|t| crate::snapshot::Screen::of(&t.grid().lock()));
+    state.local.watched = Some(Arc::new(Mutex::new(Watched { transcript, last })));
 }
 #[cfg(test)]
 pub(crate) fn held_for_test() -> Option<(u64, Arc<gpui_rio::Session>)> {
@@ -1401,9 +1452,13 @@ pub(crate) fn held_for_test() -> Option<(u64, Arc<gpui_rio::Session>)> {
 }
 #[cfg(test)]
 impl Local {
-    /// A pane attached and painted long ago.
+    /// A pane attached and painted long ago (its attach named TEST_PID).
     pub(crate) fn settled_for_test() -> Self {
-        Self { settled: true, ..Self::default() }
+        Self { settled: true, incarnation: Some(Incarnation { pid: TEST_PID, born: 0 }), ..Self::default() }
+    }
+    /// A pane just attached whose attach named TEST_PID.
+    pub(crate) fn attached_for_test(output: u64) -> Self {
+        Self::attached(output, Some(Incarnation { pid: TEST_PID, born: 0 }))
     }
     pub(crate) fn reader_for_test(&self) -> Option<(u64, Arc<gpui_rio::Session>)> {
         self.reader.clone()

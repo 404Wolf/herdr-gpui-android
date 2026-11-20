@@ -70,6 +70,12 @@ final class RemoteNative {
     static native long holdNote(String paneId, String title, String note, int cols, int rows);
     /** Reads a saved pane (its unsealed bytes) into the held frame; its render id for nativeAttachShell. Worker only. */
     static native long openSaved(byte[] copy);
+    /**
+     * Makes the pane {@link #openSaved} or {@link #holdNote} returned
+     * {@code renderId} for the held frame, once the caller checked it is still
+     * the pick; false when a later open replaced it. Cheap: any thread.
+     */
+    static native boolean showOpened(long renderId);
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);
     static native void close(long handle);

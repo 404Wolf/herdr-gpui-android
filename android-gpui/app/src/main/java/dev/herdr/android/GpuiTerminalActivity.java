@@ -2045,10 +2045,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             Connection previous = connection;
             connection = null;
             if (previous != null) previous.close();
-            // Resuming the same host keeps the last frame, the strip and the
-            // keyboard until the new session paints; another host starts clean.
-            boolean resume = previous != null && (previous.remoteHandle > 0 || previous.offline)
-                    && host.id.equals(currentHostId);
+            // Resuming the same computer keeps the last frame, the strip and the
+            // keyboard until the new session paints; another starts clean. The
+            // same computer is the same profile AND connection revision: a
+            // profile edited to point elsewhere is a new connection, so the old
+            // one's frame, pane list and unsent input all go.
+            String key = PaneSnapshots.computer(host);
+            boolean resume = PaneSnapshots.resumes(
+                    previous != null && (previous.remoteHandle > 0 || previous.offline), currentHostKey, key);
             checkpoint.reset();
             if (!resume) pendingInput.discardAll();
             next = new Connection(GENERATIONS.incrementAndGet(), handle);
@@ -2059,7 +2063,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             next.resumed = resume;
             next.hostId = host.id;
-            next.cacheKey = PaneSnapshots.computer(host);
+            next.cacheKey = key;
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -2071,7 +2075,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             currentHostKey = next.cacheKey;
             lastSnapshotTitle = lastSnapshotText = lastSnapshotStatus = lastSnapshotShortcuts = null;
             // A saved pane on screen stays, like a resumed frame, until this one paints.
-            if (next.resumed || host.id.equals(savedShownHost)) {
+            if (next.resumed || key != null && key.equals(savedShownKey)) {
                 nativeHold(next.generation);
                 if (imeSession > 0) nativeSetImeSession(next.generation, imeSession);
             } else nativeSetActive(next.generation, false);
@@ -2395,6 +2399,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * and when it was saved: 0 for a pane with no copy (its title and a note).
      */
     private volatile String savedShownHost;
+    /** The computer key of the saved frame on screen ({@link PaneSnapshots#computer}). */
+    private volatile String savedShownKey;
     private volatile long savedShownAt;
     /** When to checkpoint the pane on screen. Under stateLock. */
     private final PaneCheckpoint checkpoint = new PaneCheckpoint();
@@ -5211,7 +5217,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         // The strip and the rail keep the last list seen, so
                         // panes switch while the link is still down.
                         installOffline(currentHostId, currentHostKey, launch.name(), shown);
-                        showSaved(currentHostId, currentHostKey, shown);
+                        // The profile may have been edited while this screen was
+                        // away: its copy is opened under the revision stored now.
+                        showSavedAsStored(currentHostId, shown);
                         main.post(this::reconnectCurrentHost);
                         return;
                     }
@@ -6341,6 +6349,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 nativeHold(failed.generation);
                 // The frame held is the pane as of now; its copy is saved on close.
                 savedShownHost = failed.hostId;
+                savedShownKey = failed.cacheKey;
                 savedShownAt = System.currentTimeMillis();
                 // A switch the core made but the poll never confirmed: the pane left is kept natively.
                 if (failed.hostId != null && !failed.chromePane.isEmpty() && !failed.chromePane.equals(failed.paneId)) {
@@ -6364,6 +6373,44 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             cleanup.setDaemon(true);
             cleanup.start();
         } else failed.close();
+    }
+
+    /**
+     * {@link #showSaved} under {@code host}'s connection revision as the
+     * profile store has it now (read off the UI thread), never the one this
+     * screen last knew: an edited profile is another computer.
+     */
+    private void showSavedAsStored(String host, String pane) {
+        worker.execute(() -> {
+            String key = null;
+            try {
+                for (SavedRemoteHost saved : new RemoteHostStore(this).read()) {
+                    if (saved.id.equals(host)) key = PaneSnapshots.computer(saved);
+                }
+            } catch (Exception unreadable) {
+                key = null;
+            }
+            final String stored = key;
+            main.post(() -> {
+                synchronized (stateLock) {
+                    if (destroyed || !host.equals(currentHostId)) return;
+                    Connection now = connection;
+                    if (now != null && now.ready) return;
+                    if (stored == null || !stored.equals(currentHostKey)) {
+                        // Another computer now: nothing of the old one stays.
+                        currentHostKey = stored;
+                        if (now != null && now.offline) {
+                            now.cacheKey = stored;
+                            now.workspaces = null;
+                            now.tabs = null;
+                            now.panes = null;
+                        }
+                        pendingInput.discardAll();
+                    }
+                }
+                showSaved(host, stored, pane);
+            });
+        });
     }
 
     /**
@@ -6402,10 +6449,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (destroyed || !host.equals(currentHostId) || now != null && now.ready) return;
             if (key != null && !key.equals(currentHostKey)) return;
             if (now != null && !pane.equals(now.paneId)) return;
+            // Only now does the opened copy become the held frame: a stale
+            // open never displaces the frame of the pick that won.
+            if (!RemoteNative.showOpened(renderId)) return;
             long generation = now != null ? now.generation : GENERATIONS.incrementAndGet();
             nativeHold(generation);
             nativeAttachShell(generation, renderId, host, pane);
             savedShownHost = host;
+            savedShownKey = key;
             savedShownAt = savedAt;
         }
         // A copy just drawn starts at its newest line.
@@ -6584,6 +6635,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         currentHostId = host.id;
         currentHostKey = PaneSnapshots.computer(host);
         savedShownHost = null;
+        savedShownKey = null;
         savedShownAt = 0;
         if (!shown.isEmpty()) rememberHostPane(host.id, shown);
         installOffline(host.id, currentHostKey, host.name, shown);
@@ -6879,6 +6931,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** The link is back: the crumb returns to where this window is. Main thread. */
     private void showLinkUp() {
         savedShownHost = null;
+        savedShownKey = null;
         savedShownAt = 0;
         if (monitor != null) monitor.succeeded();
         linkProblem = null;
