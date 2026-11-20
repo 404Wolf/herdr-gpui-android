@@ -401,6 +401,20 @@ mod tests {
     }
 
     #[test]
+    fn every_dictation_update_the_phone_sends_passes_the_real_bridge_limits() {
+        // The Java composer writes these through its own GhostText (rust/src/testdata/dictation_ladders.jsonl);
+        // each must parse here, with the bridge's real limit on alternatives (MAX_RUNGS).
+        let lines = include_str!("testdata/dictation_ladders.jsonl");
+        let mut failures = Vec::new();
+        for (n, line) in lines.lines().filter(|l| !l.is_empty()).enumerate() {
+            if let Err(error) = parse(line) {
+                failures.push(format!("line {}: {error}", n + 1));
+            }
+        }
+        assert!(failures.is_empty(), "{} rejected:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    #[test]
     fn the_hosts_ladder_of_lines_is_kept_widest_first() {
         let json = format!(
             r#"{{"kind":"claude",{COLORS},"controls":[{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}],"rungs":[[{{"id":"clear","spans":[{{"t":"✕","s":"dim"}}]}},{{"id":"gap-type","spans":[{{"t":"────","s":"dim"}}]}},{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}],[{{"id":"talk","spans":[{{"t":"talk","s":"dim"}}]}}]]}}"#

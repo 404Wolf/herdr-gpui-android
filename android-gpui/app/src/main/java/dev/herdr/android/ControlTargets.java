@@ -186,8 +186,8 @@ final class ControlTargets {
             // place in the geometry exactly as its button would, so no neighbour's target changes
             // when it is empty; its own target takes taps and does nothing (ComposerBar).
             if (ControlLine.STATUS.equals(c.id)) continue;
-            // While recording the stop owns the corner, the reserved send slot included.
-            if (recording && ControlLine.GAP_SEND.equals(c.id)) continue;
+            // While recording "send" keeps its own target: the stop grows up to the gap before it,
+            // never over it (the boundary loop below).
             boolean talk = "talk".equals(c.id);
             float pad = talk ? TALK_PAD_DP : PAD_DP;
             float minWidth = talk ? TALK_MIN_DP : MIN_DP;

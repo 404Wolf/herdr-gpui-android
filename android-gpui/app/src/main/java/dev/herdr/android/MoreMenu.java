@@ -15,9 +15,11 @@ final class MoreMenu {
     static final int SESSION = 3;
     static final int CLOSE = 4;
     static final int GESTURES = 5;
+    /** The inline "img" can be dropped on a narrow grid; this keeps a route to attach an image. */
+    static final int ATTACH = 6;
 
     /** Every order, top to bottom as the menu shows them. */
     static int[] all() {
-        return new int[] {PANES, HOSTS, VIEW, SESSION, CLOSE, GESTURES};
+        return new int[] {PANES, HOSTS, VIEW, SESSION, CLOSE, GESTURES, ATTACH};
     }
 }

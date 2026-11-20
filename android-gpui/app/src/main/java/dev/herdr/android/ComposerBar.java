@@ -317,6 +317,13 @@ final class ComposerBar {
             appendDictation(pane, text, null);
         }
 
+        @Override public void appendDictation(String hostId, String pane, String text, int[] unverifiedCuts) {
+            // A final for the computer and pane it was spoken on, whatever is on screen now.
+            String onHost = hostId == null ? "" : hostId;
+            String draft = drafts.append(onHost, pane, text, unverifiedCuts);
+            if (onHost.equals(drafts.host()) && pane.equals(drafts.pane())) showText(draft);
+        }
+
         @Override public void appendDictation(String pane, String text, int[] unverifiedCuts) {
             // A live final for another pane: it stays in memory either way; persistNow follows.
             if (pane == null || pane.isEmpty()) pane = drafts.pane();
@@ -606,13 +613,16 @@ final class ComposerBar {
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
             // pressed in the old pane is settled with it (sent only if that pane is back).
             if (recording(dictationState)) dictation.stop();
-            drafts.dictationEnded();
+            // The partial leaves this pane's draft: its final (or, on an error, the last words
+            // heard) lands in the pane it was spoken for, once, never beside a copy of itself.
+            drafts.dictationCancelled();
         } else if (switched && dictating()) {
             // An utterance belongs to the pane it was spoken for.
             dictation.cancel();
             setDictationState(DictationEngine.State.IDLE);
             routing.forget();
-            drafts.dictationEnded();
+            // The listening partial leaves the draft it was spoken into (the session is cancelled).
+            drafts.dictationCancelled();
         }
         if (!drafts.setHost(onHost, revision, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);
@@ -1018,6 +1028,7 @@ final class ComposerBar {
         switch (id) {
             case "type": toggleTyping(); break;
             case "talk": toggleDictation(); break;
+            case ControlLine.CANCEL: cancelDictation(); break;
             case ControlLine.ATTACH: host.attachImages(); break;
             case "send": enter(); break;
             case "clear": tapClear(false); break;
@@ -1038,8 +1049,9 @@ final class ComposerBar {
     private static String describe(String id) {
         if (id.startsWith("echo-")) return "A queued message: tap for its actions";
         switch (id) {
-            case "type": return "Type a message";
+            case "type": return "Type a message, or put the keyboard away";
             case "talk": return "Dictate; tap again to stop";
+            case ControlLine.CANCEL: return "Stop and discard what was dictated; the earlier text stays";
             case ControlLine.ATTACH: return "Attach an image: photo library, camera or clipboard";
             case "row-retry": return "Send this recording to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
@@ -1088,6 +1100,7 @@ final class ComposerBar {
         in.queueStyle = queueStyle(queuedMessages, loose.size() + parkedHere().size(), linkDown);
         in.expanded = queueOpen;
         in.attach = host.canAttach();
+        in.dictating = dictating();
         in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
         if (clearing.open(drafts.owner(), wall())) {
             in.undoWide = clearing.label(false);
@@ -1155,6 +1168,12 @@ final class ComposerBar {
         // One engine for the process (#30): only the session this window started is cancelled;
         // another window's recording is its own.
         return routing.cancelForClear(dictation, dictating() && Dictation.owns(this));
+    }
+
+    /** "cancel": the dictation ends and its words leave the draft, which is as it was before it began. */
+    private void cancelDictation() {
+        if (cancelDictationForClear()) showText(drafts.text());
+        pushGhost();
     }
 
     private void tapClear(boolean longPress) {
@@ -1607,7 +1626,7 @@ final class ComposerBar {
      * queue it as one paste plus Enter; otherwise Enter goes to the program.
      */
     private void enter() {
-        switch (DictationRouting.onEnter(dictationState)) {
+        switch (routing.enterFor(dictationState)) {
             case STOP_THEN_SEND:
                 routing.sendWhenDone();
                 dictation.stop();
