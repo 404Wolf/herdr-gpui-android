@@ -138,7 +138,8 @@ launch() { a shell am force-stop "$pkg"; a shell am start -n "$pkg/dev.herdr.and
 # Device key: create it in Hosts, copy its public key, paste it into a text field to read it back.
 launch
 tap_ui 'Hosts, device key and settings' 40 || { record device-key FAIL "no overflow menu on Home"; exit 1; }
-tap_ui 'Hosts and keys' 15 || { record device-key FAIL "no Hosts and keys entry"; shot device-key-fail; exit 1; }
+# The overflow opens Remote hosts directly on this build; older ones show a menu with "Hosts and keys".
+tap_ui 'Hosts and keys' 4 || true
 tap_ui 'Create a new device SSH key' 20 || { record device-key FAIL "no Create key"; shot device-key-fail; exit 1; }
 quiet 2
 tap_ui 'Copy the device SSH public key' 15 || { record device-key FAIL "no Copy public key"; shot device-key-fail; exit 1; }
