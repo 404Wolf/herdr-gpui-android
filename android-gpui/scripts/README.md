@@ -49,6 +49,33 @@ run `./gradlew assembleDebug` after the native build. Never use a debug key for
 release distribution. The GPUI preview has a distinct application ID so it can
 coexist with the Java-native preview.
 
+## Slurm emulator smoke test
+
+Submit the smoke test from the repository root with:
+
+```sh
+lease-run --kind android --outputs ./slurm-artifacts -- scripts/emu-test.sh scripts/emu-tests/smoke.sh
+```
+
+You can also run it directly inside an x86-64 Linux Slurm emulator allocation
+with KVM:
+
+```sh
+nix develop .#android-emu -c scripts/emu-test.sh scripts/emu-tests/smoke.sh
+```
+
+The runner creates the AVD under `TMPDIR`, which Slurm puts on disk for Android
+jobs. It builds an x86-64 debug APK by default. Pass a compatible APK as the
+second argument to skip the build. The test script runs from the caller's
+working directory with `ADB_SERIAL` set to the disposable API 34 emulator and
+`EMU_APK` set to the installed APK path. Write test artifacts to `EMU_OUT`, the
+run directory printed by the runner under `$JOBRUN_OUTPUTS/emu-out/` on Slurm or
+`./emu-out/` standalone. The runner waits up to 300 seconds for boot. Set
+`EMU_BOOT_TIMEOUT_SECONDS` to override the limit. The smoke test enables the
+app's debug capture setting and waits for the splash to clear and Home to render
+before saving `home.png` alongside the device list and logs. Use a debuggable APK
+with this test.
+
 ## Isolated Linux verification APK
 
 The verification packager prefers an installed SDK when `ANDROID_HOME` (or

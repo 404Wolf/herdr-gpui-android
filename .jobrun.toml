@@ -1,0 +1,8 @@
+[dev_shell]
+attr = "devShells.x86_64-linux.ci"
+
+[dev_shell.by_kind]
+android = "devShells.x86_64-linux.android-emu"
+
+[tmp]
+disk = ["android"]
