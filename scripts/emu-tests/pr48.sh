@@ -245,13 +245,12 @@ a shell settings put global animator_duration_scale 0
 a shell input keyevent KEYCODE_WAKEUP
 a shell wm dismiss-keyguard
 launch() { a shell am force-stop "$pkg"; a shell am start -n "$pkg/dev.herdr.android.HomeActivity" > /dev/null; }
-# The throwaway AVD does not need Google's background services, and on a small guest they are what
-# makes System UI stop responding: disable the ones present (this user only, undone with the AVD).
-for svc in com.android.vending com.google.android.gms com.google.android.gsf \
-    com.google.android.googlequicksearchbox com.google.android.apps.youtube.music com.google.android.youtube; do
-    a shell pm list packages "$svc" 2> /dev/null | grep -q "package:$svc\$" \
-        && a shell pm disable-user --user 0 "$svc" > /dev/null 2>&1
-done
+# Disabling Google's services (tried in 3b66180) makes Digital Wellbeing post "Enable Google Play
+# services" as a heads-up notification that covers the top bar, so the overflow tap hit the
+# notification (run 5922). They stay enabled; heads-up notifications are turned off instead, and the
+# shade is collapsed before the steps that tap the top bar.
+a shell settings put global heads_up_notifications_enabled 0
+a shell cmd statusbar collapse > /dev/null 2>&1 || true
 # A just-booted guest is still busy (System UI ANRs on the first dumps). Wait until boot has
 # completed, the package manager answers, and 30 s pass with a fresh dump showing no "isn't
 # responding" window; each one met is dismissed with Wait and counted. Up to 150 s.
@@ -282,13 +281,27 @@ settle_ui || true
 step() {
     local tap=$1 expect=$2 tries=${3:-3} n
     for (( n = 1; n <= tries; n++ )); do
+        a shell cmd statusbar collapse > /dev/null 2>&1 || true
         wait_ui "$expect" 2 > /dev/null && return 0
         tap_ui "$tap" 20 > /dev/null || { sleep 2; continue; }
         wait_ui "$expect" 10 > /dev/null && return 0
     done
     return 1
 }
-device_key_fail() { record device-key FAIL "$1 (see device-key-fail.png, ui.xml, anr.log)"; shot device-key-fail; exit 1; }
+device_key_fail() {
+    shot device-key-fail
+    dump > /dev/null 2>&1 || true
+    {
+        echo "what the screen showed when '$1' failed (labelled nodes):"
+        [[ -s "$EMU_OUT/ui.xml" ]] && $ui list "$EMU_OUT/ui.xml"
+        echo "--- window focus:"
+        a shell dumpsys window 2> /dev/null | grep -E "mCurrentFocus|mFocusedApp" | head -3
+        echo "--- notifications on screen:"
+        a shell dumpsys notification --noredact 2> /dev/null | grep -E "NotificationRecord|android.title" | head -8
+    } > "$EMU_OUT/device-key-fail.txt" 2>&1
+    record device-key FAIL "$1 (see device-key-fail.png, device-key-fail.txt, ui.xml, anr.log)"
+    exit 1
+}
 
 # Device key: create it in Hosts, copy its public key, paste it into a text field to read it back.
 launch

@@ -62,7 +62,7 @@ are the app's content descriptions; change them there when a control's words cha
 - **Extra output.** Stop-and-Send passes when a new line of the agent's terminal is exactly the final
   text; other new lines, even ones that look wrong, on separate lines do not fail it (only a sent
   `fixture partial` does).
-- **The system image.** One API 34 google_apis guest with Google's background services disabled and
+- **The system image.** One API 34 google_apis guest with Google's services left enabled (disabling them posts a covering notification) and
   gesture navigation: the navigation-bar key check is a SKIP, other keyboards, other densities and
   physical devices are not covered.
 - **The network.** The core and sshd are loopback fixtures reached through the emulator alias and
