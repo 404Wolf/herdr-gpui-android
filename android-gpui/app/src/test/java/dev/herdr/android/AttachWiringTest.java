@@ -150,21 +150,20 @@ public final class AttachWiringTest {
         assertTrue(section(activity, "private AttachTarget attachTarget()", "private AttachTarget liveTarget")
                 .contains("ComposerBar.isAgent(agentKind(c))"));
         String done = section(activity, "private void attached(AttachTarget target", "private int askedShare");
-        assertTrue(done.contains("Objects.equals(onScreenHost, target.host)"));
-        assertTrue("the draft is only appended after the host check",
-                done.indexOf("Objects.equals(onScreenHost, target.host)") < done.indexOf("composer.appendAttachment"));
+        // Drafts are host-qualified: the path goes to the draft of the host that received the image.
+        assertTrue(done.contains("composer.appendAttachment(target.host, target.pane"));
     }
 
     @Test public void theShareTargetOpensOnlyGrantedContentUrisAndChecksTheyAreImages() throws Exception {
         String share = source("ShareTargetActivity");
-        assertTrue(share.contains("ShareUris.allowed("));
+        assertTrue(share.contains("ShareUris.filter("));
         assertTrue(share.contains("AttachImages.copyValidated("));
         assertFalse("no unchecked stream cast", share.contains("getParcelableExtra"));
         assertFalse("no unchecked list cast", share.contains("getParcelableArrayListExtra"));
         assertFalse("no popups", share.contains("Toast"));
         String copy = section(source("AttachImages"), "static File copyValidated(", "static final class Reencoder");
         assertTrue("streamed to a file, validated before it is kept",
-                copy.indexOf("FileOutputStream") < copy.indexOf("inJustDecodeBounds"));
+                copy.indexOf("FileOutputStream") < copy.indexOf("ImageDecoder.decodeBitmap("));
     }
 
     @Test public void homeShowsAWaitingShareInItsContentNotJustTheTopBar() throws Exception {
@@ -173,12 +172,11 @@ public final class AttachWiringTest {
         assertTrue(content.contains("body.addView(card"));
     }
 
-    @Test public void thePasteListenerHandsBackWhatIsNotAnImageAndCopiesBeforeItReturns() throws Exception {
+    @Test public void thePasteListenerHandsBackWhatIsNotAnImage() throws Exception {
         String listener = section(source("ComposerBar"), "private void listenForImages(", "A session that a pane switch");
-        assertTrue(listener.contains("startsWith(\"image/\")"));
+        assertTrue(listener.contains("hasMimeType(\"image/*\")"));
         assertTrue("the rest goes back to the field", listener.contains("ContentInfo.Builder(payload).setClip(rest)"));
-        assertTrue("a keyboard's grant ends on return: copied inside", listener.indexOf("copyValidated(") < listener.indexOf("return null"));
-        assertFalse("not read later from the URI", listener.contains("attachUris"));
+        assertTrue("a clip with no images is a normal paste", listener.contains("return payload;"));
     }
 
     @Test public void theCameraWritesToAPrivateFileNotThePublishedMediaStore() throws Exception {

@@ -19,8 +19,25 @@ final class ShareUris {
         if (!"content".equalsIgnoreCase(scheme)) return false;
         if ((intentFlags & GRANT_READ) == 0) return false;
         if (authority == null || authority.isEmpty()) return false;
-        String lower = authority.toLowerCase(java.util.Locale.ROOT);
+        // content://10@authority/... names the same provider for another Android user.
+        String lower = authority.substring(authority.lastIndexOf('@') + 1).toLowerCase(java.util.Locale.ROOT);
+        if (lower.isEmpty()) return false;
         String own = ownPackage.toLowerCase(java.util.Locale.ROOT);
         return !(lower.equals(own) || lower.startsWith(own + "."));
+    }
+
+    /**
+     * The indexes of {@code uris} ({scheme, authority} each) that may be opened: allowed by
+     * {@link #allowed} and also authorized on their own by {@code granted} (the per-URI check
+     * {@code checkUriPermission}), never on the intent-wide flag alone.
+     */
+    static java.util.List<Integer> filter(java.util.List<String[]> uris, int intentFlags, String ownPackage,
+            java.util.function.IntPredicate granted) {
+        java.util.List<Integer> out = new java.util.ArrayList<>();
+        for (int i = 0; i < uris.size(); i++) {
+            String[] uri = uris.get(i);
+            if (allowed(uri[0], uri[1], intentFlags, ownPackage) && granted.test(i)) out.add(i);
+        }
+        return out;
     }
 }

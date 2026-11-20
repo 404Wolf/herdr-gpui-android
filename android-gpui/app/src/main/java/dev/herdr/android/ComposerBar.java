@@ -110,8 +110,13 @@ final class ComposerBar {
         default void attachImages() { }
         /** Images the keyboard or a paste handed over: put them on the computer. */
         default void attachUris(java.util.List<android.net.Uri> uris) { }
-        /** Image files already copied to the cache (a keyboard's grant ends at once): put them, then delete them. */
+        /** Image files already copied to the cache: put them, then delete them. */
         default void attachFiles(java.util.List<java.io.File> files) { }
+        /**
+         * Images a paste or keyboard handed over. The host reads them off the UI thread and must keep
+         * {@code keepAlive} (the payload carrying their permission) referenced until it is done.
+         */
+        default void attachPasted(java.util.List<android.net.Uri> uris, Object keepAlive) { }
     }
 
     private static final String PREFS = "terminal-display";
@@ -471,16 +476,17 @@ final class ComposerBar {
      * after what is there, one after them, as the desktop's paste types them), saved at once.
      * Nothing is sent. False when the draft could not be saved (left as it was).
      */
-    boolean appendAttachment(String pane, String paths) {
+    boolean appendAttachment(String hostId, String pane, String paths) {
+        String onHost = hostId == null ? "" : hostId;
         if (pane == null || pane.isEmpty()) pane = drafts.pane();
         Object before = drafts.snapshot();
-        String draft = drafts.appendAttachment(pane, paths);
+        String draft = drafts.appendAttachment(onHost, pane, paths);
         if (!persistNow()) {
             drafts.rollback(before);
             showText(drafts.text());
             return false;
         }
-        if (pane.equals(drafts.pane())) showText(draft);
+        if (onHost.equals(drafts.host()) && pane.equals(drafts.pane())) showText(draft);
         return true;
     }
 
@@ -579,9 +585,11 @@ final class ComposerBar {
      * The pane on screen changed, or what it runs did. {@code paneKind} is the
      * program's kind ("claude", "codex", another agent's), or "" for a shell.
      */
-    void setPane(String paneId, String paneKind) {
+    void setPane(String hostId, String paneId, String paneKind) {
         String previous = drafts.pane();
-        boolean switched = !previous.equals(paneId == null ? "" : paneId);
+        String onHost = hostId == null ? "" : hostId;
+        // A pane id names a terminal on one computer only: the same id on another is another pane.
+        boolean switched = !onHost.equals(drafts.host()) || !previous.equals(paneId == null ? "" : paneId);
         if (switched && keepsAcrossPaneSwitch(dictationState)) {
             // Keep the recording and its text: offline it finds its pane's draft later, by
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
@@ -595,6 +603,7 @@ final class ComposerBar {
             routing.forget();
             drafts.dictationEnded();
         }
+        drafts.setHost(onHost);
         String text = drafts.switchTo(paneId);
         if (switched) {
             // An undo belongs to the pane it cleared; the rows to the pane on screen. The first
@@ -1472,33 +1481,32 @@ final class ComposerBar {
 
     /**
      * An image a keyboard inserts or a paste carries is attached; everything else (text, document
-     * URIs) is handed back to the field so a normal paste works. A keyboard's image permission ends
-     * when this returns, so the image is copied to the cache here (bounded and decoded-checked), not read later.
+     * URIs) is handed back to the field so a normal paste works. No I/O happens here: the clip's
+     * URIs go to {@link Host#attachPasted} with the payload itself, which the host keeps referenced
+     * (a keyboard's temporary grant lives with it) until its worker has opened and checked them.
+     * The eight-image cap applies before anything is copied.
      */
     @android.annotation.TargetApi(31)
     private void listenForImages(EditText edit) {
         edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
             android.content.ClipData clip = payload.getClip();
-            java.util.List<java.io.File> files = new java.util.ArrayList<>();
+            // Only a clip that says it holds images is ours; a text or document URI is a normal paste.
+            if (!clip.getDescription().hasMimeType("image/*")) return payload;
+            java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
             android.content.ClipData rest = null;
             for (int i = 0; i < clip.getItemCount(); i++) {
                 android.content.ClipData.Item item = clip.getItemAt(i);
-                android.net.Uri uri = item.getUri();
-                String type = uri == null ? null : context.getContentResolver().getType(uri);
-                if (type != null && type.startsWith("image/")) {
-                    try {
-                        files.add(AttachImages.copyValidated(context.getContentResolver(), uri,
-                                new java.io.File(context.getCacheDir(), "pasted")));
-                    } catch (ImageAttach.AttachException | RuntimeException unreadable) {
-                        host.notice("That image could not be attached");
-                    }
+                boolean uriOnly = item.getUri() != null && item.getText() == null && item.getHtmlText() == null
+                        && item.getIntent() == null;
+                if (uriOnly) {
+                    if (uris.size() < ImageAttach.MAX_IMAGES) uris.add(item.getUri());
                 } else if (rest == null) {
                     rest = new android.content.ClipData(clip.getDescription(), item);
                 } else {
                     rest.addItem(item);
                 }
             }
-            if (!files.isEmpty()) host.attachFiles(files);
+            if (!uris.isEmpty()) host.attachPasted(uris, payload);
             if (rest == null) return null;
             return new android.view.ContentInfo.Builder(payload).setClip(rest).build();
         });

@@ -2427,7 +2427,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
-            composer.setPane(current == null ? "" : current.paneId, kind);
+            composer.setPane(current == null ? "" : current.hostId, current == null ? "" : current.paneId, kind);
             // Agent and shell panes differ in whether the keyboard keeps its mic.
             refreshTerminalImeOptions();
             refreshQueued();
@@ -4789,6 +4789,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
             @Override public void attachUris(java.util.List<android.net.Uri> uris) { attachFrom(uris); }
 
+            @Override public void attachPasted(java.util.List<android.net.Uri> uris, Object keepAlive) {
+                AttachTarget target = attachTarget();
+                if (target == null) {
+                    note("Open an agent to attach an image");
+                    return;
+                }
+                // The payload carries a keyboard's temporary grant: held until the worker is done with it.
+                pasteKeepAlive.add(keepAlive);
+                java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                for (android.net.Uri uri : uris) sources.add(AttachImages.uriSource(getContentResolver(), uri));
+                attach(target, sources, () -> pasteKeepAlive.remove(keepAlive));
+            }
+
             @Override public void attachFiles(java.util.List<java.io.File> files) {
                 AttachTarget target = attachTarget();
                 if (target == null) {
@@ -4871,6 +4884,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return null;
     }
 
+    private final java.util.Set<Object> pasteKeepAlive = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
     private AttachTarget cameraFor;
 
     private void showAttachSources() {
@@ -4903,7 +4918,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         try {
-            CaptureFiles.clear(getCacheDir());
             cameraFile = CaptureFiles.create(getCacheDir(), System.currentTimeMillis());
             android.net.Uri target = android.net.Uri.parse(
                     "content://" + getPackageName() + ".capture/" + cameraFile.getName());
@@ -4917,10 +4931,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
+    /** A capture that never started: only its own file goes (another shot's may still be uploading). */
     private void dropCapture() {
+        java.io.File own = cameraFile;
         cameraFile = null;
         cameraFor = null;
-        CaptureFiles.clear(getCacheDir());
+        if (own != null) own.delete();
     }
 
     private void pasteImage() {
@@ -4951,12 +4967,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             cameraFile = null;
             cameraFor = null;
             if (shot == null) return;
-            if (result != RESULT_OK || target == null || shot.length() == 0) {
-                CaptureFiles.clear(getCacheDir());
+            if (result != RESULT_OK || target == null) {
+                shot.delete();
                 return;
             }
-            attach(target, java.util.Collections.singletonList(AttachImages.fileSource(shot)),
-                    () -> CaptureFiles.clear(getCacheDir()));
+            if (shot.length() == 0) {
+                shot.delete();
+                note("The camera returned no picture");
+                return;
+            }
+            attach(target, java.util.Collections.singletonList(AttachImages.fileSource(shot)), shot::delete);
         }
     }
 
@@ -5011,17 +5031,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void attached(AttachTarget target, ImageAttach.Outcome outcome) {
         if (destroyed) return;
         if (!outcome.paths.isEmpty()) {
-            // Drafts are keyed by pane id alone, so a path goes into a draft only where it is unambiguous:
-            // the host the image was put on is still the one on screen. Otherwise it is only reported.
-            String onScreenHost;
-            synchronized (stateLock) { onScreenHost = connection == null ? null : connection.hostId; }
-            if (!java.util.Objects.equals(onScreenHost, target.host)) {
-                note("Image saved on " + (outcome.paths.size() == 1 ? "" : "the computer; first: ")
-                        + outcome.paths.get(0) + " (you switched computers, so it was not typed)");
-                return;
-            }
+            // Drafts are kept per computer and pane, so the path goes to the draft of the pane it was
+            // put for, shown or not, and never under another computer's pane of the same id.
             boolean kept = composer != null
-                    && composer.appendAttachment(target.pane, ImageAttach.quotePaths(outcome.paths));
+                    && composer.appendAttachment(target.host, target.pane, ImageAttach.quotePaths(outcome.paths));
             int n = outcome.paths.size();
             note(!kept ? "The image arrived but the draft could not be saved"
                     : outcome.failures.isEmpty() ? (n == 1 ? "Image attached" : n + " images attached")
@@ -5035,18 +5048,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /**
      * Images from the share sheet wait here until the user chooses: once a live agent is on screen
-     * this asks "attach to this agent?" (once per share). Nothing is uploaded before the answer.
+     * this asks "attach to this agent?" (once per share). Nothing is uploaded before the answer, and
+     * an answer takes only the share it was asked about.
      */
     private void takeSharedImages() {
         long now = System.currentTimeMillis();
-        if (destroyed || !SharedImages.waiting(now) || askedShare == SharedImages.generation()) return;
+        if (destroyed) return;
+        if (!SharedImages.waiting(now)) {
+            // Everything refused and nothing waiting: say why, once, wherever the sender lands.
+            String why = SharedImages.takeNotice(now);
+            if (why != null) note(why);
+            return;
+        }
+        if (askedShare == SharedImages.generation()) return;
         AttachTarget target = attachTarget();
         if (target == null) {
             main.removeCallbacks(retrySharedImages);
             main.postDelayed(retrySharedImages, 1500);
             return;
         }
-        askedShare = SharedImages.generation();
+        int generation = SharedImages.generation();
+        askedShare = generation;
         int count = SharedImages.count(now);
         String where;
         synchronized (stateLock) { where = connection == null || connection.title == null ? "this agent" : connection.title; }
@@ -5057,7 +5079,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         note("That agent is not on screen any more; open it and share again");
                         return;
                     }
-                    java.util.List<java.io.File> files = SharedImages.take(System.currentTimeMillis());
+                    // A newer share replaced the one this dialog was about: it takes nothing of it.
+                    java.util.List<java.io.File> files = SharedImages.take(System.currentTimeMillis(), generation);
+                    if (files.isEmpty()) {
+                        note("A newer shared image replaced this one");
+                        return;
+                    }
                     java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
                     for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
                     attach(live, sources, () -> { for (java.io.File file : files) file.delete(); });
@@ -5420,7 +5447,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     @Override protected void onNewIntent(android.content.Intent intent) {
         super.onNewIntent(intent);
-        if (intent.getBooleanExtra(EXTRA_ATTACH_SHARED, false)) takeSharedImages();
+        if (intent.getBooleanExtra(EXTRA_ATTACH_SHARED, false)) {
+            // Every item refused: say why here; otherwise ask about the waiting images.
+            String why = SharedImages.takeNotice(System.currentTimeMillis());
+            if (why != null) note(why);
+            else takeSharedImages();
+        }
         String hostId = intent.getStringExtra(EXTRA_FOCUS_HOST);
         String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
         if (hostId == null || pane == null || destroyed) return;

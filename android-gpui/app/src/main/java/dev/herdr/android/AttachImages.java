@@ -108,6 +108,18 @@ final class AttachImages {
     }
 
     /**
+     * Decodes the whole image (the first frame of an animation), sampled so it never holds more than
+     * {@link ImageAttach#MAX_DECODE_PIXELS} pixels: a truncated or damaged body fails here, as a
+     * bounds-only read would not.
+     */
+    private static final android.graphics.ImageDecoder.OnHeaderDecodedListener WHOLE_IMAGE =
+            (decoder, info, source) -> {
+                decoder.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
+                decoder.setTargetSampleSize(ImageAttach.sampleFor(info.getSize().getWidth(),
+                        info.getSize().getHeight(), Integer.MAX_VALUE, ImageAttach.MAX_DECODE_PIXELS));
+            };
+
+    /**
      * Copies {@code uri} to a new file in {@code dir}, streaming (never held whole in memory), at
      * most {@link #MAX_READ} bytes, and keeps it only if a decoder reads it as an image.
      */
@@ -127,11 +139,10 @@ final class AttachImages {
                 }
             }
             if (total == 0) throw new ImageAttach.AttachException("That image is empty");
-            BitmapFactory.Options bounds = new BitmapFactory.Options();
-            bounds.inJustDecodeBounds = true;
-            BitmapFactory.decodeFile(file.getPath(), bounds);
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-                throw new ImageAttach.AttachException("That file is not a readable image");
+            try {
+                android.graphics.ImageDecoder.decodeBitmap(android.graphics.ImageDecoder.createSource(file), WHOLE_IMAGE).recycle();
+            } catch (IOException | RuntimeException | OutOfMemoryError unreadable) {
+                throw new ImageAttach.AttachException("That file is not a readable image", unreadable);
             }
             return file;
         } catch (IOException | SecurityException | IllegalArgumentException failed) {
@@ -151,10 +162,13 @@ final class AttachImages {
      */
     static final class Reencoder implements ImageAttach.Converter {
         @Override public boolean decodable(byte[] raw) {
-            BitmapFactory.Options bounds = new BitmapFactory.Options();
-            bounds.inJustDecodeBounds = true;
-            BitmapFactory.decodeByteArray(raw, 0, raw.length, bounds);
-            return bounds.outWidth > 0 && bounds.outHeight > 0;
+            try {
+                android.graphics.ImageDecoder.decodeBitmap(
+                        android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(raw)), WHOLE_IMAGE).recycle();
+                return true;
+            } catch (IOException | RuntimeException | OutOfMemoryError unreadable) {
+                return false;
+            }
         }
 
         @Override public byte[] reencode(byte[] raw, boolean oversized) throws ImageAttach.AttachException {

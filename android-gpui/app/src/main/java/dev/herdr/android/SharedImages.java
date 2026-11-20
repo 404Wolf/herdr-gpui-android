@@ -66,6 +66,24 @@ final class SharedImages {
         if ((!files.isEmpty() || skipped > 0) && now - offeredAt > KEEP_MS) discard();
     }
 
+    /**
+     * Hands over the waiting images of share number {@code forGeneration} only (the caller deletes
+     * each file when done): a confirmation made for an older share takes nothing of a newer one.
+     */
+    static synchronized List<File> take(long now, int forGeneration) {
+        if (forGeneration != generation) return new ArrayList<>();
+        return take(now);
+    }
+
+    /** The words about a share whose items were all refused (nothing waits), once; null otherwise. */
+    static synchronized String takeNotice(long now) {
+        expire(now);
+        if (!files.isEmpty() || skipped == 0) return null;
+        String words = notice(now);
+        skipped = 0;
+        return words;
+    }
+
     /** Hands over the waiting images (the caller deletes each file when done); none when expired. */
     static synchronized List<File> take(long now) {
         if (!waiting(now)) return new ArrayList<>();

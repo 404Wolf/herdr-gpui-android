@@ -569,7 +569,9 @@ impl Connection<'_> {
                     .ok_or_else(|| Error::Protocol("missing put path".into()))?;
                 Ok(json!({"queued":true,"path":path,"bytes":result["bytes"]}).to_string())
             }
-            // A definite refusal: nothing was written.
+            // A refusal after the bytes began to arrive can leave a partial file at the destination (the
+            // core's put.rs creates the final name before writing; its cleanup is a tracked core follow-up),
+            // so the phone reports the kind and never says the file is absent.
             Err(Error::Rpc { kind, .. }) => Ok(json!({"queued":false,"kind":kind}).to_string()),
             Err(error) => Err(error),
         }

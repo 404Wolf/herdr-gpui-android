@@ -7,7 +7,6 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.Parcelable;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,7 +23,9 @@ public final class ShareTargetActivity extends Activity {
         super.onCreate(state);
         Intent intent = getIntent();
         int[] refused = new int[1];
-        List<Uri> uris = sharedUris(intent, getPackageName(), refused);
+        List<Uri> uris = sharedUris(intent, getPackageName(), refused,
+                uri -> checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(),
+                        ShareUris.GRANT_READ) == android.content.pm.PackageManager.PERMISSION_GRANTED);
         Thread copier = new Thread(() -> {
             File dir = new File(getCacheDir(), "shared");
             File[] old = dir.listFiles();
@@ -46,32 +47,38 @@ public final class ShareTargetActivity extends Activity {
     }
 
     /**
-     * The shared URIs that may be opened: from the stream extras and the clip (every image of a
-     * multiple share, whichever carries it), malformed extras ignored, at most one attach's worth.
-     * {@code refused[0]} counts the ones that may not be (wrong scheme, no read grant, our own provider).
+     * The shared URIs that may be opened: only those Android granted with the intent (its data and
+     * ClipData), each authorized on its own by {@code granted} and the scheme/authority rules
+     * ({@link ShareUris}). A stream extra is never opened by itself: Android does not grant it when
+     * a clip is present, so one outside the grant, or malformed, is only counted in {@code refused[0]}.
      */
-    static List<Uri> sharedUris(Intent intent, String ownPackage, int[] refused) {
-        List<Uri> found = new ArrayList<>();
-        if (intent == null) return found;
-        try {
-            Object stream = intent.getExtras() == null ? null : intent.getExtras().get(Intent.EXTRA_STREAM);
-            if (stream instanceof Uri) found.add((Uri) stream);
-            if (stream instanceof List) {
-                for (Object item : (List<?>) stream) if (item instanceof Parcelable && item instanceof Uri) found.add((Uri) item);
-            }
-        } catch (RuntimeException malformed) {
-            // A bundle that cannot be read has no usable stream.
-        }
+    static List<Uri> sharedUris(Intent intent, String ownPackage, int[] refused,
+            java.util.function.Predicate<Uri> granted) {
+        List<Uri> candidates = new ArrayList<>();
+        if (intent == null) return candidates;
+        if (intent.getData() != null) candidates.add(intent.getData());
         ClipData clip = intent.getClipData();
         for (int i = 0; clip != null && i < clip.getItemCount(); i++) {
             Uri uri = clip.getItemAt(i).getUri();
-            if (uri != null && !found.contains(uri)) found.add(uri);
+            if (uri != null && !candidates.contains(uri)) candidates.add(uri);
         }
+        try {
+            Object stream = intent.getExtras() == null ? null : intent.getExtras().get(Intent.EXTRA_STREAM);
+            List<Object> entries = new ArrayList<>();
+            if (stream instanceof List) entries.addAll((List<?>) stream);
+            else if (stream != null) entries.add(stream);
+            for (Object entry : entries) {
+                if (!(entry instanceof Uri) || !candidates.contains(entry)) refused[0]++;
+            }
+        } catch (RuntimeException malformed) {
+            refused[0]++;
+        }
+        List<String[]> parts = new ArrayList<>();
+        for (Uri uri : candidates) parts.add(new String[] {uri.getScheme(), uri.getAuthority()});
+        List<Integer> ok = ShareUris.filter(parts, intent.getFlags(), ownPackage, i -> granted.test(candidates.get(i)));
+        refused[0] += candidates.size() - ok.size();
         List<Uri> allowed = new ArrayList<>();
-        for (Uri uri : found) {
-            if (ShareUris.allowed(uri.getScheme(), uri.getAuthority(), intent.getFlags(), ownPackage)) allowed.add(uri);
-            else refused[0]++;
-        }
+        for (int i : ok) allowed.add(candidates.get(i));
         if (allowed.size() > ImageAttach.MAX_IMAGES) {
             refused[0] += allowed.size() - ImageAttach.MAX_IMAGES;
             return new ArrayList<>(allowed.subList(0, ImageAttach.MAX_IMAGES));
@@ -86,9 +93,11 @@ public final class ShareTargetActivity extends Activity {
         }
         SharedImages.offer(copies, unusable, System.currentTimeMillis());
         if (GpuiTerminalActivity.isOpen()) {
+            // The terminal asks about waiting images, or says why everything was refused.
             startActivity(new Intent(this, GpuiTerminalActivity.class)
                     .putExtra(GpuiTerminalActivity.EXTRA_ATTACH_SHARED, true)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
         } else {
             startActivity(new Intent(this, HomeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
         }

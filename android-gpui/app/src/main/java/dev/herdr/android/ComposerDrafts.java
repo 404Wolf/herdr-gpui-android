@@ -32,7 +32,12 @@ final class ComposerDrafts {
             return size() > MAX_PANES;
         }
     };
+    /**
+     * The draft key of the pane on screen: {@link #key} of its host and pane id. Pane ids are only
+     * unique per computer ("t1" exists on every herdr-core), so a draft is never kept under the id alone.
+     */
     private String pane = "";
+    private String host = "";
     /** The draft before the utterance in progress, or null when not dictating. */
     private String dictationBase;
     /** At most this many marks per pane; the oldest go first. */
@@ -46,9 +51,50 @@ final class ComposerDrafts {
      */
     private java.util.List<long[]> liveMarks = new java.util.ArrayList<>();
 
-    /** Shows {@code next}'s draft, keeping the current one for later. */
-    String switchTo(String next) {
+    private static final char SEP = '\u0001';
+
+    /** The key a draft is kept under: the computer and its pane id together. */
+    static String key(String host, String pane) {
+        String p = pane == null ? "" : pane;
+        return host == null || host.isEmpty() ? p : host + SEP + p;
+    }
+
+    private static String rawPane(String key) {
+        return key.substring(key.lastIndexOf(SEP) + 1);
+    }
+
+    /**
+     * The computer whose panes are shown. Drafts saved before drafts knew their computer (a key with
+     * no host) move to the first computer shown, once; every later save keeps host and pane together.
+     */
+    void setHost(String next) {
         String target = next == null ? "" : next;
+        if (target.equals(host)) return;
+        settleCuts(true);
+        dictationBase = null;
+        if (!target.isEmpty()) migrateLegacy(target);
+        String raw = rawPane(pane);
+        host = target;
+        pane = key(host, raw);
+    }
+
+    String host() { return host; }
+
+    private void migrateLegacy(String to) {
+        java.util.List<String> legacy = new java.util.ArrayList<>();
+        for (String k : drafts.keySet()) if (k.indexOf(SEP) < 0) legacy.add(k);
+        for (String k : legacy) {
+            String text = drafts.remove(k);
+            String moved = key(to, k);
+            if (text != null && !drafts.containsKey(moved)) drafts.put(moved, text);
+            java.util.List<long[]> marks = cutMarks.remove(k);
+            if (marks != null) cutMarks.putIfAbsent(moved, marks);
+        }
+    }
+
+    /** Shows {@code next}'s draft, keeping the current one for later. */
+    String switchTo(String nextPane) {
+        String target = key(host, nextPane);
         if (target.equals(pane)) return text();
         settleCuts(true);
         dictationBase = null;
@@ -56,7 +102,7 @@ final class ComposerDrafts {
         return text();
     }
 
-    String pane() { return pane; }
+    String pane() { return rawPane(pane); }
 
     /** Every pane's draft (the dictation chips they hold must keep their recordings). */
     java.util.List<String> all() {
@@ -141,7 +187,7 @@ final class ComposerDrafts {
             }
             if (filled.isEmpty()) drafts.remove(pane);
             else draft.setValue(filled);
-            return pane;
+            return rawPane(pane);
         }
         return null;
     }
@@ -153,7 +199,7 @@ final class ComposerDrafts {
 
     /** As {@link #append(String, String)}, with the desktop's unverified cuts (offsets in {@code spoken}). */
     String append(String pane, String spoken, int[] cuts) {
-        String key = pane == null ? "" : pane;
+        String key = key(host, pane);
         String before = drafts.get(key);
         String text = join(before, spoken);
         if (text.isEmpty()) return text;
@@ -163,17 +209,29 @@ final class ComposerDrafts {
         return text;
     }
 
+    /** As {@link #appendAttachment(String, String, String)} for a pane of the computer on screen. */
+    String appendAttachment(String pane, String paths) {
+        return appendAttachment(host, pane, paths);
+    }
+
     /**
      * Adds an attachment's quoted paths (they end in a space, as the desktop types them) to the end
-     * of {@code pane}'s draft, a space after what is already there; never sent.
+     * of the draft of {@code pane} on {@code onHost}, a space after what is already there; never
+     * sent. While a dictation is in progress the paths also join its base, so the next partial or
+     * final transcript keeps them.
      */
-    String appendAttachment(String pane, String paths) {
-        String key = pane == null ? "" : pane;
+    String appendAttachment(String onHost, String pane, String paths) {
+        String key = key(onHost, pane);
         String before = drafts.get(key);
-        String gap = before == null || before.isEmpty() || Character.isWhitespace(before.charAt(before.length() - 1)) ? "" : " ";
-        String text = (before == null ? "" : before) + gap + paths;
+        String text = joinAttachment(before, paths);
         drafts.put(key, text);
+        if (key.equals(this.pane) && dictationBase != null) dictationBase = joinAttachment(dictationBase, paths);
         return text;
+    }
+
+    private static String joinAttachment(String before, String paths) {
+        String gap = before == null || before.isEmpty() || Character.isWhitespace(before.charAt(before.length() - 1)) ? "" : " ";
+        return (before == null ? "" : before) + gap + paths;
     }
 
     /**
