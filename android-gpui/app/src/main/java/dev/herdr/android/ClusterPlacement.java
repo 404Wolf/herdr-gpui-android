@@ -38,13 +38,13 @@ final class ClusterPlacement {
          * covers any of them ({@link ControlTargets}).
          */
         int[][] draftSpans = new int[0][];
-        /** The draft's rows as spread (RowGeometry in the renderer): first row, row count, gap in dp. */
+        /** The draft's rows as spread (RowGeometry in the renderer): first row, row count, gap and scroll in dp. */
         int blockFirst, blockRows;
-        float rowGap;
+        float rowGap, rowShift;
 
         /** Where each row's top is, with a multi-line draft's rows spread. */
         ControlTargets.Rows rows() {
-            return new ControlTargets.Rows(top, cellHeight, blockFirst, blockRows, rowGap);
+            return new ControlTargets.Rows(top, cellHeight, blockFirst, blockRows, rowGap, rowShift);
         }
 
         Hint(float left, float top, float cellWidth, float cellHeight, int cols, int rows,
@@ -121,9 +121,10 @@ final class ClusterPlacement {
                 hint.targetsTop = Math.max(0, Math.min(rows, o.optInt("targetsTop", rows)));
                 hint.draftShown = o.optBoolean("draftShown");
                 int blockRows = o.optInt("blockRows", 0), blockFirst = o.optInt("blockFirst", 0);
-                double rowGap = o.optDouble("rowGap", 0);
+                double rowGap = o.optDouble("rowGap", 0), rowShift = o.optDouble("rowShift", 0);
                 if (blockRows >= 2 && blockFirst >= 0 && blockFirst + blockRows <= rows && rowGap >= 0
-                        && rowGap < cellHeight * 2) {
+                        && rowGap < cellHeight * 2 && rowShift >= 0 && rowShift <= cellHeight * rows) {
+                    hint.rowShift = (float) rowShift;
                     hint.blockFirst = blockFirst;
                     hint.blockRows = blockRows;
                     hint.rowGap = (float) rowGap;

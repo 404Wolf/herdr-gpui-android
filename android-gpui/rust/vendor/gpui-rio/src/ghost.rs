@@ -274,6 +274,16 @@ pub struct DraftRun {
 pub const MAX_DRAFT_RUNS: usize = 4096;
 
 /// The rows the draft is drawn on, first to last, or None when none of it is.
+/// The first row below the prompt's caret that holds the program's own text: the draft's
+/// free rows (blank ones and the box's rules, see [`place_all`]) end before it.
+pub fn draft_limit(screen: &[Vec<char>], anchor: Anchor) -> usize {
+    let free = screen[(anchor.row + 1).min(screen.len())..]
+        .iter()
+        .take_while(|cells| rule(cells) || cells.iter().all(|c| c.is_whitespace()))
+        .count();
+    anchor.row + 1 + free
+}
+
 pub fn draft_block(placed: &[Placed]) -> Option<(usize, usize)> {
     let mut rows = placed.iter().filter(|p| p.source.is_some()).map(|p| p.row);
     let first = rows.next()?;

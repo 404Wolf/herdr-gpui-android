@@ -734,7 +734,7 @@ final class ComposerBar {
     private int cursorAt(float x, float y) {
         if (layout == null || Float.isNaN(x) || Float.isNaN(y) || layout.draftRuns.length == 0) return -1;
         float col = (x / density - layout.left) / layout.cellWidth;
-        int row = layout.rows().rowAt(y / density);
+        int row = layout.rows().draftRowAt(y / density);
         int drawn = DraftTaps.drawnAt(layout.draftRuns, row, col);
         return DraftTaps.fieldIndex(GhostText.fieldOffsets(drafts.text(), drafts.cuts(), clipLengths, parkedIds()),
                 drawn);

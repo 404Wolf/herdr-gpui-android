@@ -1,44 +1,47 @@
-//! Where each grid row sits vertically when a multi-line draft is shown.
+//! Where grid rows and a multi-line draft's lines sit vertically.
 //!
-//! The draft's rows are grid rows painted at the font's own line height, which leaves
-//! tall glyphs touching the next line. Rather than add leading to every row (it would
-//! take rows from a small screen and move all of Claude's output), only the rows the
-//! draft occupies are spread: each extra line adds a fixed `leading`, up to
-//! [`MAX_GROWN_LINES`] lines, and past that the same total is shared out so the box
-//! stops growing and the draft scrolls as before. The growth is taken from the rows
-//! above, so the rows below the draft (Claude's status line and the host's bottom
-//! bar) never move.
+//! The draft is painted over Claude's prompt box as ghost text, one line per grid row,
+//! at the font's own line height. Each extra line now adds a fixed `leading`, up to
+//! [`MAX_GROWN_LINES`] lines (then the same total is shared out and the draft scrolls
+//! as before). The room comes first from the blank rows below the draft inside the box;
+//! only the rest scrolls Claude's output up, by whole rows, so no row is ever half hidden
+//! and the box grows upward. Every grid row below the prompt row (the box's lower rule
+//! with the host's controls, Claude's status line) never moves, whatever the draft's
+//! length.
 
 /// The leading added per extra draft line, as a fraction of the cell height.
 pub const LEADING_RATIO: f32 = 0.25;
 /// Extra lines that each add a full leading; the box stops growing after these.
 pub const MAX_GROWN_LINES: usize = 4;
 
-/// The leading one extra draft line adds, in whole pixels so rows stay crisp.
+/// The leading one extra draft line adds, in whole pixels so lines stay crisp.
 pub fn leading(cell_height: f32) -> f32 {
     (cell_height * LEADING_RATIO).round().max(1.)
 }
 
-/// Row tops for a pane: uniform, or with a spread block of draft rows.
+/// Row tops for a pane: uniform, or with a spread multi-line draft.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowGeometry {
     pub cell_height: f32,
-    /// First row of the spread block (meaningless when `rows` is 0).
+    /// The draft's first grid row (meaningless when `rows` is 0).
     pub first: usize,
-    /// Rows in the block; 0 when nothing is spread.
+    /// Lines in the draft; 0 when nothing is spread.
     pub rows: usize,
-    /// Extra space under each block row but the last.
+    /// Extra space under each draft line but the last.
     pub gap: f32,
+    /// How far the grid rows up to and including `first` are scrolled up: whole rows.
+    pub shift: f32,
 }
 
 impl RowGeometry {
     /// Every row `cell_height` apart.
     pub fn uniform(cell_height: f32) -> Self {
-        Self { cell_height, first: 0, rows: 0, gap: 0. }
+        Self { cell_height, first: 0, rows: 0, gap: 0., shift: 0. }
     }
 
-    /// The geometry for a draft drawn on rows `first..=last` (`None`: no draft shown).
-    pub fn for_draft(cell_height: f32, block: Option<(usize, usize)>) -> Self {
+    /// The geometry for a draft drawn on grid rows `first..=last` of a prompt box whose
+    /// free rows end before row `limit` (the first row of the program's own text below).
+    pub fn for_draft(cell_height: f32, block: Option<(usize, usize)>, limit: usize) -> Self {
         let Some((first, last)) = block else {
             return Self::uniform(cell_height);
         };
@@ -47,48 +50,67 @@ impl RowGeometry {
             return Self::uniform(cell_height);
         }
         let grown = (rows - 1).min(MAX_GROWN_LINES) as f32 * leading(cell_height);
-        Self { cell_height, first, rows, gap: grown / (rows - 1) as f32 }
+        let room = limit.saturating_sub(first).saturating_sub(rows) as f32 * cell_height;
+        let shift = ((grown - room).max(0.) / cell_height).ceil() * cell_height;
+        Self { cell_height, first, rows, gap: grown / (rows - 1) as f32, shift }
     }
 
-    /// How much taller the block is than its rows alone.
-    pub fn growth(&self) -> f32 {
-        if self.rows < 2 { 0. } else { self.gap * (self.rows - 1) as f32 }
+    fn spread(&self) -> bool {
+        self.rows >= 2
     }
 
-    /// Top of `row`, from the pane's top. Rows above the block move up by its growth.
-    pub fn top(&self, row: usize) -> f32 {
+    /// Top of grid row `row`, from the pane's top: rows up to the draft's first row are
+    /// scrolled up by `shift`, every row below stays where it always was.
+    pub fn grid_top(&self, row: usize) -> f32 {
         let plain = row as f32 * self.cell_height;
-        if self.rows < 2 || row < self.first {
-            plain - self.growth()
-        } else if row < self.first + self.rows {
-            plain - self.growth() + (row - self.first) as f32 * self.gap
-        } else {
-            plain
-        }
+        if self.spread() && row <= self.first { plain - self.shift } else { plain }
     }
 
-    /// The row at `y` from the pane's top; a gap belongs to the row above it. May be
-    /// negative or past the last row.
-    pub fn row_at(&self, y: f32) -> i32 {
-        let h = self.cell_height;
-        if self.rows < 2 {
-            return (y / h).floor() as i32;
+    /// Top of the draft line drawn on grid row `row` (within the draft's rows).
+    pub fn draft_top(&self, row: usize) -> f32 {
+        if !self.spread() || row < self.first {
+            return self.grid_top(row);
         }
-        let block_top = self.top(self.first);
-        let block_end = self.top(self.first + self.rows - 1) + h;
-        if y < block_top {
-            ((y + self.growth()) / h).floor() as i32
-        } else if y < block_end {
-            let i = ((y - block_top) / (h + self.gap)).floor() as i32;
-            self.first as i32 + i.min(self.rows as i32 - 1)
-        } else {
-            (y / h).floor() as i32
-        }
+        self.grid_top(self.first) + (row - self.first) as f32 * (self.cell_height + self.gap)
     }
 
-    /// Whether `row` is drawn inside the pane (its top not above the pane's).
+    /// Whether grid row `row` is drawn inside the pane. Scrolled-off rows are whole rows.
     pub fn visible(&self, row: usize) -> bool {
-        self.top(row) >= 0.
+        self.grid_top(row) >= 0.
+    }
+
+    /// The grid row at `y` from the pane's top, or None above the pane. The band between
+    /// the (scrolled) first draft row and the next belongs to the first one; a scrolled-off
+    /// row is never returned.
+    pub fn grid_row_at(&self, y: f32) -> Option<usize> {
+        if y.is_nan() || y < 0. {
+            return None;
+        }
+        let h = self.cell_height;
+        if !self.spread() {
+            return Some((y / h).floor() as usize);
+        }
+        let edge = (self.first + 1) as f32 * h;
+        if y < edge - self.shift {
+            Some(((y + self.shift) / h).floor() as usize)
+        } else if y < edge {
+            Some(self.first)
+        } else {
+            Some((y / h).floor() as usize)
+        }
+    }
+
+    /// The draft line's grid row at `y` (a line includes the gap under it), if `y` is on one.
+    pub fn draft_row_at(&self, y: f32) -> Option<usize> {
+        if !self.spread() {
+            return self.grid_row_at(y);
+        }
+        let top = self.draft_top(self.first);
+        if y.is_nan() || y < top {
+            return None;
+        }
+        let i = ((y - top) / (self.cell_height + self.gap)).floor() as usize;
+        (i < self.rows).then_some(self.first + i)
     }
 }
 
@@ -98,80 +120,115 @@ mod tests {
 
     const H: f32 = 40.;
 
-    fn block(first: usize, last: usize) -> RowGeometry {
-        RowGeometry::for_draft(H, Some((first, last)))
+    /// A draft of `lines` lines starting at row 20 in a box with `free` free rows below
+    /// its first row (the controls' rule is the first of them).
+    fn draft(lines: usize, free: usize) -> RowGeometry {
+        RowGeometry::for_draft(H, Some((20, 20 + lines - 1)), 21 + free)
     }
 
     #[test]
     fn one_line_or_no_draft_is_uniform() {
-        for g in [RowGeometry::for_draft(H, None), block(20, 20)] {
-            assert_eq!(g.growth(), 0.);
-            assert_eq!(g.top(7), 7. * H);
-            assert_eq!(g.row_at(7. * H + 1.), 7);
+        for g in [RowGeometry::for_draft(H, None, 0), draft(1, 1)] {
+            assert_eq!(g.shift, 0.);
+            assert_eq!(g.grid_top(7), 7. * H);
+            assert_eq!(g.grid_row_at(7. * H + 1.), Some(7));
         }
     }
 
     #[test]
-    fn each_extra_line_adds_one_leading() {
+    fn each_extra_line_adds_one_leading_up_to_the_cap() {
         let lead = leading(H);
         assert_eq!(lead, 10.);
-        for lines in 1..=5usize {
-            let g = block(20, 20 + lines - 1);
-            assert_eq!(g.growth(), (lines - 1) as f32 * lead, "{lines} lines");
+        for lines in 2..=5usize {
+            let g = draft(lines, 8);
+            assert_eq!(g.draft_top(20 + 1) - g.draft_top(20), H + lead, "{lines} lines");
+            assert_eq!(g.gap * (lines - 1) as f32, (lines - 1) as f32 * lead);
         }
-    }
-
-    #[test]
-    fn lines_are_spaced_by_the_leading_not_touching() {
-        let g = block(20, 22);
-        assert_eq!(g.top(21) - g.top(20), H + leading(H));
-        assert_eq!(g.top(22) - g.top(21), H + leading(H));
-    }
-
-    #[test]
-    fn growth_stops_at_the_cap_and_lines_close_up() {
-        let capped = block(20, 20 + MAX_GROWN_LINES);
-        let more = block(20, 20 + MAX_GROWN_LINES + 6);
-        assert_eq!(capped.growth(), MAX_GROWN_LINES as f32 * leading(H));
-        assert_eq!(more.growth(), capped.growth());
+        let capped = draft(5, 12);
+        let more = draft(11, 20);
+        assert_eq!(capped.gap * 4., more.gap * 10.);
         assert!(more.gap < capped.gap && more.gap > 0.);
     }
 
     #[test]
-    fn the_rows_below_the_draft_and_its_last_row_never_move() {
+    fn the_rows_below_the_prompt_row_never_move_for_any_length() {
         for lines in 1..=9usize {
-            let g = block(20, 20 + lines - 1);
-            assert!((g.top(20 + lines - 1) - (20 + lines - 1) as f32 * H).abs() < 1e-3);
-            assert_eq!(g.top(30), 30. * H);
-        }
-    }
-
-    #[test]
-    fn rows_above_move_up_together_by_the_growth() {
-        let g = block(20, 23);
-        for row in [0, 5, 19] {
-            assert_eq!(g.top(row), row as f32 * H - g.growth());
-        }
-    }
-
-    #[test]
-    fn row_at_inverts_top_including_gaps() {
-        let g = block(20, 24);
-        for row in 0..40usize {
-            if !g.visible(row) && row < 20 {
-                continue;
+            for free in [1, 2, 4, 8] {
+                let g = draft(lines, free);
+                for row in 21..45 {
+                    assert_eq!(g.grid_top(row), row as f32 * H, "{lines} lines, {free} free, row {row}");
+                }
             }
-            assert_eq!(g.row_at(g.top(row) + 1.), row as i32, "top of {row}");
-            assert_eq!(g.row_at(g.top(row) + H - 1.), row as i32, "bottom of {row}");
         }
-        // The gap under a draft line belongs to that line.
-        assert_eq!(g.row_at(g.top(21) - 1.), 20);
     }
 
     #[test]
-    fn a_first_row_pushed_above_the_pane_is_not_visible() {
-        let g = block(1, 5);
+    fn blank_rows_below_take_the_growth_before_anything_scrolls() {
+        // Four lines need 30 px; two free rows below the draft's rows have 80.
+        let g = draft(4, 6);
+        assert_eq!(g.shift, 0.);
+        assert_eq!(g.grid_top(20), 20. * H);
+        assert_eq!(g.grid_top(3), 3. * H);
+    }
+
+    #[test]
+    fn without_room_the_output_scrolls_by_whole_rows_only() {
+        for lines in 2..=9usize {
+            let g = draft(lines, lines - 1);
+            assert!(g.shift > 0., "{lines} lines");
+            assert_eq!(g.shift % H, 0.);
+            for row in 0..=20usize {
+                assert_eq!(g.grid_top(row), row as f32 * H - g.shift);
+                // A row is wholly on screen or wholly scrolled off.
+                assert!(g.grid_top(row) >= 0. || g.grid_top(row) + H <= 0., "row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_draft_always_ends_inside_the_boxs_free_rows() {
+        for lines in 2..=9usize {
+            for free in 1..=9usize {
+                let g = RowGeometry::for_draft(H, Some((20, 20 + lines - 1)), 20 + free.max(lines));
+                let end = g.draft_top(20 + lines - 1) + H;
+                assert!(end <= (20 + free.max(lines)) as f32 * H + 1e-3, "{lines} lines, {free} free");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tap_reaches_the_row_that_was_painted_there() {
+        // The review's probe: 40 px cells, five draft lines, no room: output scrolled a row.
+        let g = draft(5, 4);
+        assert_eq!(g.shift, H);
+        assert_eq!(g.grid_row_at(g.grid_top(18) + 5.), Some(18));
+        for row in 1..45usize {
+            if g.visible(row) {
+                assert_eq!(g.grid_row_at(g.grid_top(row) + 1.), Some(row), "top of {row}");
+                assert_eq!(g.grid_row_at(g.grid_top(row) + H - 1.), Some(row), "bottom of {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_scrolled_off_row_is_never_returned() {
+        let g = draft(5, 4);
+        // Row 0 is above the pane; the pane's top is row 1.
         assert!(!g.visible(0));
-        assert!(g.visible(5));
+        assert_eq!(g.grid_row_at(0.), Some(1));
+        assert_eq!(g.grid_row_at(-1.), None);
+        assert_eq!(g.grid_row_at(f32::NAN), None);
+    }
+
+    #[test]
+    fn draft_lines_are_found_by_their_own_tops_gaps_included() {
+        let g = draft(3, 8);
+        for k in 0..3usize {
+            let top = g.draft_top(20 + k);
+            assert_eq!(g.draft_row_at(top + 1.), Some(20 + k));
+            assert_eq!(g.draft_row_at(top + H + g.gap - 1.), Some(20 + k));
+        }
+        assert_eq!(g.draft_row_at(g.draft_top(20) - 1.), None);
+        assert_eq!(g.draft_row_at(g.draft_top(22) + H + g.gap + 1.), None);
     }
 }

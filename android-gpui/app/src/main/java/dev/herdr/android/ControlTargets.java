@@ -63,54 +63,61 @@ final class ControlTargets {
     private ControlTargets() { }
 
     /**
-     * Where each grid row's top is, in dp, when a multi-line draft spreads the rows it covers
-     * (the renderer's {@code RowGeometry}): rows above the block move up by its growth, the
-     * block's rows are {@code gap} further apart each, rows below stay put.
+     * Where each grid row's top is, in dp, when a multi-line draft is spread (the renderer's
+     * {@code RowGeometry}): the grid rows up to the draft's first are scrolled up by {@code shift}
+     * (whole rows), every row below stays put; the draft's own lines are {@code gap} further apart.
      */
     static final class Rows {
         final float top, cell;
         final int first, count;
-        final float gap;
+        final float gap, shift;
 
-        Rows(float top, float cell, int first, int count, float gap) {
+        Rows(float top, float cell, int first, int count, float gap, float shift) {
             this.top = top;
             this.cell = cell;
             this.first = first;
             this.count = count < 2 ? 0 : count;
             this.gap = this.count == 0 ? 0 : gap;
+            this.shift = this.count == 0 ? 0 : shift;
         }
 
         static Rows uniform(float top, float cell) {
-            return new Rows(top, cell, 0, 0, 0);
+            return new Rows(top, cell, 0, 0, 0, 0);
         }
 
-        float growth() {
-            return count < 2 ? 0 : gap * (count - 1);
-        }
-
+        /** Top of grid row {@code row}. */
         float top(int row) {
-            float plain = row * cell;
-            if (count < 2 || row < first) return top + plain - growth();
-            if (row < first + count) return top + plain - growth() + (row - first) * gap;
-            return top + plain;
+            float plain = top + row * cell;
+            return count >= 2 && row <= first ? plain - shift : plain;
         }
 
         float bottom(int row) {
             return top(row) + cell;
         }
 
-        /** The row at {@code y} dp (same origin as {@code top}); a gap belongs to the row above. */
+        /** Top of the draft line on grid row {@code row}. */
+        float draftTop(int row) {
+            if (count < 2 || row < first) return top(row);
+            return top(first) + (row - first) * (cell + gap);
+        }
+
+        /** The grid row at {@code y} dp (same origin as {@code top}); the band under the first draft row is its own. */
         int rowAt(float y) {
             float rel = y - top;
             if (count < 2) return (int) Math.floor(rel / cell);
-            float blockTop = top(first) - top;
-            float blockEnd = top(first + count - 1) - top + cell;
-            if (rel < blockTop) return (int) Math.floor((rel + growth()) / cell);
-            if (rel < blockEnd) {
-                int i = (int) Math.floor((rel - blockTop) / (cell + gap));
-                return first + Math.min(i, count - 1);
-            }
+            float edge = (first + 1) * cell;
+            if (rel < edge - shift) return (int) Math.floor((rel + shift) / cell);
+            if (rel < edge) return first;
             return (int) Math.floor(rel / cell);
+        }
+
+        /** The draft line at {@code y} dp, or -1. */
+        int draftRowAt(float y) {
+            if (count < 2) return rowAt(y);
+            float rel = y - draftTop(first);
+            if (!(rel >= 0)) return -1;
+            int i = (int) Math.floor(rel / (cell + gap));
+            return i < count ? first + i : -1;
         }
     }
 
@@ -212,7 +219,7 @@ final class ControlTargets {
                         if (span == null || span.length < 3 || span[2] <= span[1]) continue;
                         if ((span[0] == c.row) != (pass == 0)) continue;
                         float spanLeft = left + span[1] * cellWidth, spanRight = left + span[2] * cellWidth;
-                        float spanTop = geo.top(span[0]), spanBottom = spanTop + cellHeight;
+                        float spanTop = geo.draftTop(span[0]), spanBottom = spanTop + cellHeight;
                         if (spanRight <= l || spanLeft >= r || spanBottom <= t || spanTop >= b) continue;
                         if (span[0] < c.row) {
                             t = spanBottom;
