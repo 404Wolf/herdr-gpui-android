@@ -399,8 +399,11 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     // token gives the same answer.
     let tapped = offsets[at - start];
     let angle = start > 0 && text[start - 1] == '<';
+    // Split only at a real Markdown boundary: `[text](target)` whose
+    // brackets balance, starting at the token's start. A `](` inside a URL
+    // or path belongs to it.
     let mut cuts = vec![0];
-    cuts.extend(word.match_indices("](").map(|(i, _)| i + 1));
+    cuts.extend(markdown_cut(&word));
     cuts.push(word.len());
     let (lo, hi) = cuts
         .windows(2)
@@ -458,6 +461,28 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
     })
 }
 
+/// Where `[text](target)` at the start of `word` splits: the byte offset of
+/// its `(`, when the `[` at 0 closes, balanced, right before it.
+fn markdown_cut(word: &str) -> Option<usize> {
+    if !word.starts_with('[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, c) in word.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return word[i + 1..].starts_with('(').then_some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// A token with its wrapper punctuation peeled: the byte range left, and
 /// whether a `mailto:` was peeled (an address, never a file).
 struct Peeled {
@@ -510,8 +535,13 @@ fn call_prefix(text: &str) -> Option<(usize, bool)> {
         '(' => Some((ident + 1, false)),
         ':' if text[..ident].eq_ignore_ascii_case("mailto") => Some((ident + 1, true)),
         '=' | ':' => {
+            // An explicit key (`path=main.rs`) or any key before something
+            // path-shaped (`x=src/a.rs`); never `a=b.rs`, a whole file name.
             let rest = &text[ident + 1..];
-            (!rest.starts_with("//") && rest.contains('/')).then_some((ident + 1, false))
+            let key = ["path", "file", "filename"]
+                .iter()
+                .any(|k| text[..ident].eq_ignore_ascii_case(k));
+            (!rest.starts_with("//") && (key || rest.contains('/'))).then_some((ident + 1, false))
         }
         _ => None,
     }
@@ -1076,6 +1106,17 @@ mod tests {
             ("src/a,b.rs", f("src/a,b.rs", None)),
             ("~/v/a:b.rs", f("~/v/a:b.rs", None)),
             ("path=/home/wolf/a.rs", f("/home/wolf/a.rs", None)),
+            ("path=main.rs", f("main.rs", None)),
+            ("path=Makefile", f("Makefile", None)),
+            ("file=src/a.rs:3", f("src/a.rs", Some(3))),
+            ("filename=a.rs", f("a.rs", None)),
+            ("/tmp/report](final)", f("/tmp/report](final)", None)),
+            (
+                "https://example.com/search?q=[abc](docs/readme.md)",
+                w("https://example.com/search?q=[abc](docs/readme.md)"),
+            ),
+            ("[docs/a.rs](docs/a.rs)", f("docs/a.rs", None)),
+            ("[the docs](https://x.io/d)", w("https://x.io/d")),
             ("file:/home/wolf/a.rs:4", f("/home/wolf/a.rs", Some(4))),
             ("Update(src/main.rs)", f("src/main.rs", None)),
             ("Read(/tmp/a.rs:12)", f("/tmp/a.rs", Some(12))),
