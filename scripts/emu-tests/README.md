@@ -16,8 +16,10 @@ through a job-local `adb reverse`), provisions a host at `10.0.2.2`, and creates
 the app and reads it back through the UI to authorize it.
 
 Checks, in order: the recording controls at about 46 and 100 columns (display width is calibrated
-from the columns the renderer reports); the "seed" + dictated partial + `z` Cancel case (the draft is
-sent and read back from the agent's terminal); and offline, with a saved grid: the core and sshd are
+from the columns the renderer reports; a recording only counts when the fake server has sent a
+partial, so the session is listening, and the timer visibly ticks between two screenshots); Stop-and-Send
+(Send pressed during recording must deliver the final transcript to the agent); the "seed" + dictated
+partial + `z` Cancel case (the draft is sent and read back from the agent's terminal); and offline, with a saved grid: the core and sshd are
 stopped, the app relaunched, the pane opened from Home's cached tree, then the keyboard is hidden
 with the hide control, with Back, and with the navigation-bar key.
 

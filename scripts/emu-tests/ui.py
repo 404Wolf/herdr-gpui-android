@@ -7,6 +7,8 @@
   ui.py blank PNG TOP BOTTOM  fraction (0..1) of rows between TOP% and BOTTOM% of the height that
                               are one flat colour (nothing drawn there)
   ui.py text XML REGEX        the first text/desc matching REGEX, whole
+  ui.py diff PNG PNG TOP BOTTOM  fraction (0..1) of rows between TOP% and BOTTOM% that differ
+                              between two screenshots (a ticking timer changes rows; a still screen none)
 """
 import re
 import struct
@@ -89,6 +91,18 @@ def blank_fraction(path, top, bottom):
     return flat / max(1, hi - lo)
 
 
+def diff_fraction(a, b, top, bottom):
+    wa, ha, bppa, ra = read_png(a)
+    wb, hb, bppb, rb = read_png(b)
+    assert (wa, ha, bppa) == (wb, hb, bppb), "screenshots differ in size"
+    lo, hi = int(ha * top / 100), int(ha * bottom / 100)
+    changed = 0
+    for y in range(lo, hi):
+        if ra[y] != rb[y]:
+            changed += 1
+    return changed / max(1, hi - lo)
+
+
 def main(argv):
     cmd = argv[1]
     if cmd == "find":
@@ -113,6 +127,8 @@ def main(argv):
         if last is None:
             return 1
         print(last)
+    elif cmd == "diff":
+        print("%.4f" % diff_fraction(argv[2], argv[3], float(argv[4]), float(argv[5])))
     elif cmd == "blank":
         print("%.4f" % blank_fraction(argv[2], float(argv[3]), float(argv[4])))
     else:

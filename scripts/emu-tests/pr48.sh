@@ -31,11 +31,14 @@ record() { # name status detail
     return 0
 }
 shot() { a exec-out screencap -p > "$EMU_OUT/$1.png"; }
-dump() { # -> $EMU_OUT/ui.xml (retried: uiautomator is flaky right after a transition)
-    local i
-    for i in 1 2 3; do
+dump() { # -> a FRESH $EMU_OUT/ui.xml (retried: uiautomator is flaky right after a transition)
+    # No dump, no file: a failed dump must never leave an earlier screen's XML to be read as this one.
+    rm -f "$EMU_OUT/ui.xml"
+    a shell rm -f /sdcard/ui.xml > /dev/null 2>&1
+    for _ in 1 2 3; do
         a shell uiautomator dump /sdcard/ui.xml > /dev/null 2>&1 \
-            && a pull /sdcard/ui.xml "$EMU_OUT/ui.xml" > /dev/null 2>&1 && return 0
+            && a pull /sdcard/ui.xml "$EMU_OUT/ui.xml" > /dev/null 2>&1 && [[ -s "$EMU_OUT/ui.xml" ]] && return 0
+        rm -f "$EMU_OUT/ui.xml"
         sleep 1
     done
     return 1
@@ -50,9 +53,34 @@ wait_ui() { # regex [seconds=25]  -> "x y"
     return 1
 }
 tap_ui() { # regex [seconds]
-    local hit
+    local hit x y
     hit=$(wait_ui "$1" "${2:-25}") || return 1
-    a shell input tap $hit
+    read -r x y <<< "$hit"
+    a shell input tap "$x" "$y"
+}
+# One count (grep -c prints 0 and fails on no match: never add a second 0 with ||).
+count() { # pattern file
+    local n
+    n=$(grep -c -- "$1" "$2" 2> /dev/null) || true
+    echo "${n:-0}"
+}
+partials() { count 'sent partial: fixture partial' "$EMU_OUT/dictation.log"; }
+# True once the fake server has sent a partial newer than count $1: the app's session is LISTENING
+# (a partial only exists after the server said ready), not still connecting.
+wait_partial() { # count-before [seconds=25]
+    local end=$((SECONDS + ${2:-25})) now
+    while (( SECONDS < end )); do
+        now=$(partials)
+        (( now > $1 )) && return 0
+        sleep 1
+    done
+    return 1
+}
+# The terminal screen of a named agent as the core sees it.
+agent_screen() { # name
+    local addr
+    addr=$(hc ls 2> /dev/null | NAME="$1" python3 -c 'import json,os,sys; d=json.load(sys.stdin); print(next(t["address"] for t in d["terminals"] if t.get("name")==os.environ["NAME"]))' 2> /dev/null) || return 1
+    hc read "$addr" 2> /dev/null
 }
 quiet() { sleep "${1:-2}"; }
 ime_shown() { a shell dumpsys input_method 2> /dev/null | grep -q 'mInputShown=true'; }
@@ -224,20 +252,39 @@ set_width() { # target-cols  (narrow: 44..48 is "cover-like", wide: 96..110)
     return 1
 }
 check_recording_controls() { # label
-    local label=$1 cols
+    local label=$1 cols before
     cols=$(cols_now || echo '?')
+    before=$(partials)
     tap_ui 'Dictate; tap again to stop' 20 || { record "recording-$label" FAIL "no Talk control at $cols columns"; return; }
-    quiet 5
+    # Connecting also shows cancel/send/type, so the controls prove nothing yet: wait until the fake
+    # server has sent a partial (the session is LISTENING), then require the timer to tick.
+    if ! wait_partial "$before" 25; then
+        shot "recording-$label"
+        record "recording-$label" FAIL "$cols columns: dictation never became active (no partial from the fake server; still connecting?)"
+        tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
+        quiet 2
+        return
+    fi
+    quiet 2
+    shot "recording-$label-a"
+    sleep 3
     shot "recording-$label"
-    dump
+    local moved
+    moved=$($ui diff "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" 40 100 2> /dev/null || echo 0)
     local missing=""
-    for need in 'Stop and discard what was dictated' 'Send, or press Enter' 'Type a message, or put the keyboard away'; do
-        $ui find "$EMU_OUT/ui.xml" "$need" > /dev/null || missing="$missing [$need]"
-    done
-    if [[ -z "$missing" ]]; then
-        record "recording-$label" PASS "$cols columns: cancel, send, type and stop are on the line (timer: see recording-$label.png)"
+    if dump; then
+        for need in 'Stop and discard what was dictated' 'Send, or press Enter' 'Type a message, or put the keyboard away'; do
+            $ui find "$EMU_OUT/ui.xml" "$need" > /dev/null || missing="$missing [$need]"
+        done
     else
+        missing=" [no fresh UI dump]"
+    fi
+    if [[ -n "$missing" ]]; then
         record "recording-$label" FAIL "$cols columns, missing:$missing"
+    elif python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then
+        record "recording-$label" PASS "$cols columns: recording is active (partials flowing, timer ticking: $moved of the lower rows changed in 3 s); cancel, send, type and stop are on the line"
+    else
+        record "recording-$label" FAIL "$cols columns: the controls are there but nothing moved in 3 s (no ticking timer: not recording)"
     fi
     # Cancel ends it.
     tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
@@ -278,6 +325,36 @@ else
     B_OK=0
 fi
 shot b-open
+stop_and_send() {
+    # Talk, wait until the session is active, press Send DURING recording: the app stops, waits for
+    # the final transcript and sends the draft. The final must arrive at agent-b.
+    local before
+    before=$(partials)
+    tap_ui 'Dictate; tap again to stop' 20 || { record stop-and-send FAIL "no Talk control"; return; }
+    if ! wait_partial "$before" 25; then
+        record stop-and-send FAIL "dictation never became active (no partial from the fake server); Send was not exercised"
+        tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
+        return
+    fi
+    quiet 2
+    shot stop-and-send-recording
+    tap_ui 'Send, or press Enter' 15 || { record stop-and-send FAIL "no Send control while recording"; return; }
+    local end=$((SECONDS + 30)) got=0 screen
+    while (( SECONDS < end )); do
+        screen=$(agent_screen agent-b) || screen=
+        # The echo of the sent final: a line holding "fixture partial" (the banner says "fixture B").
+        if grep -v 'Claude Code (fixture B)' <<< "$screen" | grep -q 'fixture partial'; then got=1; break; fi
+        sleep 2
+    done
+    echo "$screen" > "$EMU_OUT/stop-and-send-screen.txt"
+    shot stop-and-send-after
+    if (( got )) && grep -q 'sent final: fixture partial' "$EMU_OUT/dictation.log"; then
+        record stop-and-send PASS "Send during recording stopped it, took the final transcript and sent it: agent-b received 'fixture partial'"
+    else
+        record stop-and-send FAIL "the final transcript did not reach agent-b (see stop-and-send-screen.txt, dictation.log)"
+    fi
+}
+
 cancel_z() {
     # type 'seed', hide the keyboard with the hide control
     tap_ui 'Type a message, or put the keyboard away' 20 || { record cancel-z FAIL "no composer"; return; }
@@ -286,52 +363,59 @@ cancel_z() {
     quiet 1
     tap_ui 'Type a message, or put the keyboard away' 10   # now says hide
     quiet 2
+    shot cancel-z-pre
+    # What agent-b already shows (the stop-and-send final): only newer lines count below.
+    agent_screen agent-b > "$EMU_OUT/agent-b-before-cancel.txt" 2> /dev/null || : > "$EMU_OUT/agent-b-before-cancel.txt"
     # dictate: the fake server says "fixture", then "fixture partial"
     local before
-    before=$(grep -c 'sent partial: fixture partial' "$EMU_OUT/dictation.log" 2> /dev/null || echo 0)
+    before=$(partials)
     tap_ui 'Dictate; tap again to stop' 20 || { record cancel-z FAIL "no Talk control"; return; }
-    local end=$((SECONDS + 25)) seen=0
-    while (( SECONDS < end )); do
-        (( $(grep -c 'sent partial: fixture partial' "$EMU_OUT/dictation.log" 2> /dev/null || echo 0) > before )) && { seen=1; break; }
-        sleep 1
-    done
-    shot cancel-z-dictating
-    if (( ! seen )); then
+    if ! wait_partial "$before" 25; then
+        shot cancel-z-dictating
         record cancel-z FAIL "the fake dictation server never sent the partial (harness connectivity, see dictation.log and logcat); Cancel was not exercised"
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
     quiet 3   # the partial reaches the draft
+    shot cancel-z-dictating
+    # The CURRENT draft must hold the partial before it is edited: the control line's Talk is
+    # still recording and the draft row changed since the screenshot taken before the partial.
     # keyboard up, cursor to just before "fixture" (15 characters back), type 'z'
     tap_ui 'Type a message, or put the keyboard away' 15
     quiet 2
-    local i
-    for i in $(seq 15); do a shell input keyevent KEYCODE_DPAD_LEFT; done
+    for _ in $(seq 15); do a shell input keyevent KEYCODE_DPAD_LEFT; done
     a shell input text z
     quiet 1
     shot cancel-z-before
+    local seen
+    seen=$($ui diff "$EMU_OUT/cancel-z-pre.png" "$EMU_OUT/cancel-z-before.png" 60 100 2> /dev/null || echo 0)
+    if ! python3 -c "import sys; sys.exit(0 if float('$seen') > 0 else 1)"; then
+        record cancel-z FAIL "the draft area did not change after the partial and the typed text (no partial in the current draft); Cancel was not exercised"
+        tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
+        return
+    fi
     tap_ui 'Stop and discard what was dictated' 15 || { record cancel-z FAIL "no Cancel control"; return; }
     quiet 2
     shot cancel-z-after
     # send the draft; the agent (cat) echoes it into its terminal, which the core can read back
     tap_ui 'Send, or press Enter' 15
     quiet 4
-    local b_addr screen
-    b_addr=$(hc ls 2> /dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(t["address"] for t in d["terminals"] if t.get("name")=="agent-b"))' 2> /dev/null)
-    screen=$(hc read "${b_addr:-t2}" 2> /dev/null)
+    local screen body
+    screen=$(agent_screen agent-b)
     echo "$screen" > "$EMU_OUT/agent-b-screen.txt"
-    # The banner "Claude Code (fixture B)" contains the dictated word; look at the lines after it.
-    local body
-    body=$(grep -v 'Claude Code (fixture B)' <<< "$screen")
+    # Only what arrived after the draft was started, and not the banner "Claude Code (fixture B)".
+    body=$(grep -vxF -f "$EMU_OUT/agent-b-before-cancel.txt" <<< "$screen" | grep -v 'Claude Code (fixture B)')
     if grep -Eq 'seed z *$' <<< "$body" && ! grep -qi 'fixture' <<< "$body"; then
         record cancel-z PASS "draft after Cancel was 'seed z': the typed z stayed, the dictated words went"
     else
-        record cancel-z FAIL "expected a line 'seed z' and no 'fixture' (see agent-b-screen.txt, cancel-z-*.png)"
+        record cancel-z FAIL "expected a new line 'seed z' and no 'fixture' (see agent-b-screen.txt, cancel-z-*.png)"
     fi
 }
 if (( B_OK )); then
+    stop_and_send
     cancel_z
 else
+    record stop-and-send SKIP "agent-b was not the active pane"
     record cancel-z SKIP "agent-b was not the active pane"
 fi
 # the keyboard may still be up; put it away
