@@ -1,0 +1,1198 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 2841471..989dbf2 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -190,6 +190,18 @@ desktop sizing; secondary viewers remain fallback-only. Set
+ latest active desktop pane instead of fitting the group (default: `"grouped"`).
+ Secondary viewers remain fallback-only. No restart needed;
+ the setting applies on the next viewer activity, visibility change or detach.
++
++The focused window wins. Apps may opt into `focus_updates` on attach (with
++`focused`, the window's keyboard focus at attach; hello feature
++`viewer_focus`) and then send kind-8 WINDOW_FOCUS (1 focused, 0 not) on every
++channel of a window whose keyboard focus changes. Kind-4 FOCUS keeps its
++program-focus meaning. Once a focus-reporting viewer has been focused, only
++the focused visible viewer sets the grid (desktop before phone); with nothing
++focused the last focused one keeps it, and if that one is hidden or unmeasured
++the grid is held. Hidden, unfocused and non-reporting viewers (old apps,
++phones, `hc attach`, relays without the feature) only receive the grid.
++Relays forward WINDOW_FOCUS per downstream viewer and confirm `focus_updates`
++only when every hop does; `hc viewers` shows `focus=yes|no|n/a` per channel.
+ `hc viewers <t>` shows this core's attached views, verified local socket peer
+ PID when available, offered geometry, effective visibility, selector eligibility,
+ and the shared grid decision. It is local-only and read-only. Legacy viewers
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 2287d25..2770ef7 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -24,6 +24,7 @@ pub const FEATURES: &[&str] = &[
+     "queue",
+     "queue-keyed",
+     "viewer_visibility",
++    "viewer_focus",
+ ];
+ pub const FINISHED_LINES: usize = 1000;
+ /// A terminal's identity: fixed at start from whoever starts it.
+@@ -470,6 +471,8 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         resumed: p.resumed,
+         visible: !p.visibility_updates || p.visible,
+         visibility_updates: p.visibility_updates,
++        focus_updates: p.focus_updates,
++        focused: p.focus_updates && p.focused,
+         desktop_group: core.desktop_group(conn, p.desktop_group.as_deref()),
+     };
+     let channel = core.attach(conn, id, req)?;
+@@ -478,6 +481,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         terminal: Public(record(core, id)?),
+         resize_notifications: p.resize_notifications,
+         visibility_updates: p.visibility_updates,
++        focus_updates: p.focus_updates,
+         automatic_input: true,
+     })
+ }
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 45ed759..2734430 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -409,6 +409,14 @@ pub struct AttachParams {
+     #[arg(skip)]
+     #[serde(default)]
+     pub visibility_updates: bool,
++    /// The client sends WINDOW_FOCUS frames: only the focused window sizes the grid.
++    #[arg(skip)]
++    #[serde(default)]
++    pub focus_updates: bool,
++    /// With `focus_updates`: the window showing this view has keyboard focus now.
++    #[arg(skip)]
++    #[serde(default)]
++    pub focused: bool,
+     /// Scrollback lines to show first (main screen only).
+     #[arg(long, default_value_t = 0)]
+     #[serde(default)]
+@@ -447,6 +455,8 @@ pub struct AttachResult {
+     pub resize_notifications: bool,
+     /// True only when every core on the path accepts viewer visibility updates.
+     pub visibility_updates: bool,
++    /// True only when every core on the path accepts WINDOW_FOCUS (kind 8).
++    pub focus_updates: bool,
+     /// The entire attach path accepts AUTOMATIC_INPUT (kind 6). Absent means use DATA.
+     pub automatic_input: bool,
+ }
+diff --git a/crates/herdr-core/src/cli/output.rs b/crates/herdr-core/src/cli/output.rs
+index dcfa313..0adb632 100644
+--- a/crates/herdr-core/src/cli/output.rs
++++ b/crates/herdr-core/src/cli/output.rs
+@@ -241,11 +241,12 @@ pub(super) fn viewers(r: &Value) -> String {
+     );
+     let selected = r["selected_grid"].as_object().map_or_else(|| "held".into(), |_| grid(&r["selected_grid"]));
+     let mut lines = vec![format!(
+-        "{}  PTY {}  selected {}  leader {}",
++        "{}  PTY {}  selected {}  leader {}{}",
+         r["terminal"].as_str().unwrap_or("?"),
+         grid(&r["current_grid"]),
+         selected,
+-        leader
++        leader,
++        if r["focus_authority"] == true { "  (focused window decides)" } else { "" }
+     )];
+     let entries = r["viewers"].as_array().map(Vec::as_slice).unwrap_or_default();
+     if entries.is_empty() {
+@@ -263,8 +264,19 @@ pub(super) fn viewers(r: &Value) -> String {
+         let pid = v["peer_pid"].as_u64().map(|pid| format!(" pid={pid}")).unwrap_or_default();
+         let visibility = if v["visible"] == true { "visible" } else { "hidden" };
+         let eligibility = if v["size_eligible"] == true { "eligible" } else { "excluded" };
+-        let capabilities =
+-            format!("vis={} resize={}", v["visibility_updates"] == true, v["resize_notifications"] == true);
++        let focus = if v["focus_updates"] != true {
++            "n/a"
++        } else if v["focused"] == true {
++            "yes"
++        } else {
++            "no"
++        };
++        let capabilities = format!(
++            "vis={} resize={} focus={focus}",
++            v["visibility_updates"] == true,
++            v["resize_notifications"] == true
++        );
++        let focused_ago = v["focused_ms_ago"].as_u64().map(|ms| format!(", focused {ms}ms ago")).unwrap_or_default();
+         let state = if v["awaiting_size"] == true {
+             "awaiting-size"
+         } else if v["sized"] == true {
+@@ -285,7 +297,8 @@ pub(super) fn viewers(r: &Value) -> String {
+         let group = v["desktop_group"].as_object().map_or_else(String::new, |g| {
+             format!(" group={}/{}", g["line"].as_str().unwrap_or("?"), g["group"].as_str().unwrap_or("?"))
+         });
+-        let activity = v["active_ms_ago"].as_u64().map_or_else(|| "inactive".into(), |ms| format!("active {ms}ms ago"));
++        let activity = v["active_ms_ago"].as_u64().map_or_else(|| "inactive".into(), |ms| format!("active {ms}ms ago"))
++            + &focused_ago;
+         lines.push(format!(
+             "c{connection}/ch{channel}  {}{}  {} {} {}  offer={}  {}  {}{}{}",
+             origin,
+@@ -380,9 +393,33 @@ mod tests {
+                 "contributes_to_grid":true
+             }]
+         }));
+-        assert!(output.contains("vis=true resize=true"));
++        assert!(output.contains("vis=true resize=true focus=n/a"));
+         assert!(output.contains("c3/ch1  local desktop pid=42"));
+     }
++
++    #[test]
++    fn viewers_output_shows_focus_per_channel() {
++        let output = viewers(&serde_json::json!({
++            "terminal":"t1b6",
++            "current_grid":{"cols":359,"rows":74},
++            "selected_grid":{"cols":359,"rows":187},
++            "focus_authority":true,
++            "leader":{"connection_id":5,"channel":2},
++            "viewers":[
++                {"identity":{"connection_id":5,"channel":1},"origin":"relayed","peer":"small-pickle",
++                 "visible":true,"size_eligible":true,"sized":true,"visibility_updates":true,
++                 "resize_notifications":true,"focus_updates":true,"focused":false,"focused_ms_ago":90000,
++                 "offered":{"cols":218,"rows":74}},
++                {"identity":{"connection_id":5,"channel":2},"origin":"relayed","peer":"small-pickle",
++                 "visible":true,"size_eligible":true,"sized":true,"visibility_updates":true,
++                 "resize_notifications":true,"focus_updates":true,"focused":true,"focused_ms_ago":12,
++                 "offered":{"cols":359,"rows":187},"leader":true,"contributes_to_grid":true}
++            ]
++        }));
++        assert!(output.lines().next().unwrap().ends_with("(focused window decides)"), "{output}");
++        assert!(output.contains("c5/ch1  relayed via small-pickle") && output.contains("focus=no"), "{output}");
++        assert!(output.contains("focus=yes") && output.contains("focused 12ms ago"), "{output}");
++    }
+ }
+ 
+ /// An exec's output as the program wrote it, then its exit code as ours.
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index 4948ba2..121de3c 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -19,15 +19,18 @@ use tokio::sync::{mpsc, oneshot};
+ 
+ /// A viewer here that a stream there goes to: its connection and channel.
+ type Sink = (Arc<Conn>, u32);
+-/// A pending reply, its stream sink and whether resize support is required.
+-type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool, bool)>);
++/// A pending reply, its stream sink and whether resize, visibility and focus
++/// support are required.
++type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool, bool, bool)>);
+ 
+ mod viewers;
+ #[cfg(test)]
+ use viewers::automatic_input;
+ #[cfg(test)]
+ use viewers::visibility_updates;
+-use viewers::{RESIZE_LOST, VISIBILITY_LOST, negotiate_resize, reattach};
++#[cfg(test)]
++use viewers::focus_updates;
++use viewers::{FOCUS_LOST, RESIZE_LOST, VISIBILITY_LOST, negotiate_resize, reattach};
+ pub use viewers::{Relayed, attach, conn_gone, relay_in};
+ 
+ #[cfg(test)]
+@@ -70,7 +73,7 @@ impl Line {
+     /// A reply to one of our calls: to whoever waits for it.
+     fn take_reply(&self, mut reply: Value) {
+         let Some((waiter, sink)) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+-        if let (Some((sink, require_resize, require_visibility)), Some(there)) =
++        if let (Some((sink, require_resize, require_visibility, require_focus)), Some(there)) =
+             (sink, reply["result"]["channel"].as_u64())
+         {
+             if require_resize && reply["result"]["resize_notifications"] != true {
+@@ -85,6 +88,12 @@ impl Line {
+                     reply["id"].clone(),
+                     Err(RpcError::new("unavailable", VISIBILITY_LOST, "attach again")),
+                 );
++            } else if require_focus && reply["result"]["focus_updates"] != true {
++                let _ = self.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
++                reply = crate::rpc::response(
++                    reply["id"].clone(),
++                    Err(RpcError::new("unavailable", FOCUS_LOST, "attach again")),
++                );
+             } else {
+                 lock(&self.streams).insert(there as u32, sink);
+             }
+@@ -114,7 +123,7 @@ impl Line {
+         machine: &str,
+         method: &str,
+         params: Value,
+-        sink: Option<(Sink, bool, bool)>,
++        sink: Option<(Sink, bool, bool, bool)>,
+         deadline: Duration,
+     ) -> Result<Value, RpcError> {
+         let id = self.next.fetch_add(1, Ordering::Relaxed);
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index a37b1f7..053eabf 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -55,6 +55,7 @@ async fn viewer_visibility_frame_stays_ordered_with_data_and_resize_across_a_rel
+         Relayed {
+             automatic_input: false,
+             visibility_updates: true,
++            focus_updates: false,
+             line: Line::new(frames, &json!({"features": ["viewer_visibility"]})),
+             there: 9,
+             conn: conn.clone(),
+@@ -124,6 +125,7 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+             Relayed {
+                 automatic_input: true,
+                 visibility_updates: false,
++                focus_updates: false,
+                 line: Line::new(old_frames, &json!({"features": ["automatic_input"]})),
+                 there: 9,
+                 conn: conn.clone(),
+@@ -180,7 +182,7 @@ async fn reconnect_rejects_downgrade_before_mapping_fallback_data() {
+                         "relay",
+                         "terminal.attach",
+                         json!({"observe": true, "resumed": true, "resize_notifications": true}),
+-                        Some(((sink, 7), require_resize, require_visibility)),
++                        Some(((sink, 7), require_resize, require_visibility, false)),
+                         Duration::from_secs(1),
+                     )
+                     .await
+@@ -247,6 +249,7 @@ async fn failed_reattach_drains_pending_data_before_close() {
+         Relayed {
+             automatic_input: true,
+             visibility_updates: false,
++            focus_updates: false,
+             line: old_line,
+             there: 9,
+             conn: conn.clone(),
+@@ -405,3 +408,111 @@ fn peer_build_view_flags_live_differences_and_legacy_peers_and_clears_on_disconn
+     assert_eq!(current.build, None);
+     assert!(!current.build_skew);
+ }
++
++#[test]
++fn viewer_focus_requires_confirmation_from_every_hop_and_is_stripped_before_old_hops() {
++    for features in [json!([]), json!(["viewer_focus"])] {
++        let (frames, _rx) = mpsc::unbounded_channel();
++        let line = Line::new(frames, &json!({"features": features}));
++        let capable = line.features.iter().any(|f| f == "viewer_focus");
++        for reply in [json!({}), json!({"focus_updates": false}), json!({"focus_updates": true})] {
++            assert_eq!(focus_updates(&line, true, &reply), capable && reply["focus_updates"] == true);
++        }
++        assert!(!focus_updates(&line, false, &json!({"focus_updates": true})));
++        let mut params = json!({"focus_updates": true, "focused": true});
++        viewers::negotiate_focus(&line, &mut params);
++        assert_eq!(params["focus_updates"], capable, "never forward an opt-in an old hop cannot confirm");
++        assert_eq!(params["focused"], capable);
++    }
++}
++
++/// Two windows on one machine viewing a terminal on another, through this
++/// core: WINDOW_FOCUS goes through per downstream viewer, in order, and only
++/// for streams whose whole path negotiated it.
++#[tokio::test]
++async fn window_focus_is_relayed_per_downstream_viewer() {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-focus-relay-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({"features": ["viewer_visibility", "viewer_focus"]}));
++    let hidden_window = Arc::new(Conn::default());
++    let focused_window = Arc::new(Conn::default());
++    let legacy = Arc::new(Conn::default());
++    for (conn, there, focus) in [(&hidden_window, 9, true), (&focused_window, 10, true), (&legacy, 11, false)] {
++        conn.with(|out| out.open(7));
++        core.lock().relayed.insert(
++            (conn_key(conn), 7),
++            Relayed {
++                automatic_input: false,
++                visibility_updates: true,
++                focus_updates: focus,
++                line: line.clone(),
++                there,
++                conn: conn.clone(),
++                machine: "macro".into(),
++                params: json!({"visible": true, "visibility_updates": true, "focus_updates": focus, "focused": focus}),
++            },
++        );
++    }
++    assert!(relay_in(&core, &hidden_window, 7, wire::WINDOW_FOCUS, &[0]));
++    assert!(relay_in(&core, &focused_window, 7, wire::RESIZE, &[218, 0, 187, 0]));
++    assert!(relay_in(&core, &focused_window, 7, wire::WINDOW_FOCUS, &[1]));
++    assert!(relay_in(&core, &legacy, 7, wire::WINDOW_FOCUS, &[1]), "consumed, not forwarded");
++    assert!(relay_in(&core, &focused_window, 7, wire::WINDOW_FOCUS, &[2]), "malformed: dropped");
++    let mut forwarded = Vec::new();
++    while let Ok(frame) = rx.try_recv() {
++        forwarded.push(frame);
++    }
++    assert_eq!(
++        forwarded,
++        [
++            wire::encode(9, wire::WINDOW_FOCUS, &[0]),
++            wire::encode(10, wire::RESIZE, &[218, 0, 187, 0]),
++            wire::encode(10, wire::WINDOW_FOCUS, &[1]),
++        ]
++    );
++    let st = core.lock();
++    assert_eq!(st.relayed[&(conn_key(&hidden_window), 7)].params["focused"], false, "reattach carries the latest");
++    assert_eq!(st.relayed[&(conn_key(&focused_window), 7)].params["focused"], true);
++    drop(st);
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++#[tokio::test]
++async fn reconnect_rejects_a_focus_downgrade() {
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({"features": ["resize_notifications", "viewer_visibility", "viewer_focus"]}));
++    let conn = Arc::new(Conn::default());
++    conn.with(|out| out.open(7));
++    let calling = line.clone();
++    let sink = conn.clone();
++    let task = tokio::spawn(async move {
++        calling
++            .call_into(
++                "relay",
++                "terminal.attach",
++                json!({"resumed": true, "focus_updates": true}),
++                Some(((sink, 7), false, false, true)),
++                Duration::from_secs(1),
++            )
++            .await
++    });
++    let request = rx.recv().await.unwrap();
++    let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++    line.take_reply(json!({"id": request["id"], "result": {"channel": 9, "focus_updates": false}}));
++    let err = task.await.unwrap().unwrap_err();
++    assert_eq!(err.message, FOCUS_LOST);
++    assert_eq!(rx.recv().await.unwrap(), wire::encode(9, wire::CLOSE, b""), "the downgraded stream there is closed");
++}
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index 5da78ba..1e097cf 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -8,6 +8,8 @@ use super::*;
+ pub struct Relayed {
+     pub automatic_input: bool,
+     pub visibility_updates: bool,
++    /// The whole path confirmed WINDOW_FOCUS: forwarded, and required on reattach.
++    pub focus_updates: bool,
+     pub line: Arc<Line>,
+     pub there: u32,
+     pub conn: Arc<Conn>,
+@@ -19,6 +21,8 @@ pub struct Relayed {
+ pub(super) const RESIZE_LOST: &str = "resize notifications lost";
+ /// Why an opted-in stream was refused: a hop on the way lost visibility support.
+ pub(super) const VISIBILITY_LOST: &str = "viewer visibility updates lost";
++/// Why an opted-in stream was refused: a hop on the way lost window focus support.
++pub(super) const FOCUS_LOST: &str = "viewer focus updates lost";
+ 
+ /// Viewers left waiting by a dropped line to `m` get their terminal back.
+ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+@@ -36,11 +40,13 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+         params["resumed"] = true.into();
+         negotiate_resize(&line, &mut params);
+         negotiate_visibility(&line, &mut params);
++        negotiate_focus(&line, &mut params);
+         let deadline = deadline_for(&core, "terminal.attach", &params);
+-        let sink = ((r.conn.clone(), here), r.params["resize_notifications"] == true, r.visibility_updates);
++        let sink =
++            ((r.conn.clone(), here), r.params["resize_notifications"] == true, r.visibility_updates, r.focus_updates);
+         let reply = line.call_into(&m.name, "terminal.attach", params, Some(sink), deadline).await;
+         let lost_resize = matches!(&reply, Err(e) if e.message == RESIZE_LOST);
+-        let lost_visibility = matches!(&reply, Err(e) if e.message == VISIBILITY_LOST);
++        let lost_visibility = matches!(&reply, Err(e) if e.message == VISIBILITY_LOST || e.message == FOCUS_LOST);
+         let mut st = core.lock();
+         // Gone meanwhile (the viewer detached): nothing to resume.
+         if !st.relayed.contains_key(&(key, here)) {
+@@ -90,6 +96,18 @@ pub(super) fn negotiate_visibility(line: &Line, params: &mut Value) {
+     }
+ }
+ 
++/// Never forward a focus opt-in to a hop that would not confirm it.
++pub(super) fn negotiate_focus(line: &Line, params: &mut Value) {
++    if params["focus_updates"] == true && !line.features.iter().any(|f| f == "viewer_focus") {
++        params["focus_updates"] = false.into();
++        params["focused"] = false.into();
++    }
++}
++
++pub(super) fn focus_updates(line: &Line, requested: bool, reply: &Value) -> bool {
++    requested && line.features.iter().any(|f| f == "viewer_focus") && reply["focus_updates"] == true
++}
++
+ pub(super) fn visibility_updates(line: &Line, requested: bool, reply: &Value) -> bool {
+     requested && line.features.iter().any(|f| f == "viewer_visibility") && reply["visibility_updates"] == true
+ }
+@@ -104,15 +122,20 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+     if !visibility_requested {
+         params["visible"] = true.into();
+     }
++    let focus_requested = params["focus_updates"] == true;
++    if !focus_requested {
++        params["focused"] = false.into();
++    }
+     let line = line(core, m).await?;
+     let mut forwarded = params.clone();
+     negotiate_resize(&line, &mut forwarded);
+     negotiate_visibility(&line, &mut forwarded);
++    negotiate_focus(&line, &mut forwarded);
+     let here = conn.new_channel();
+     conn.with(|out| out.open_paused(here));
+     let deadline = deadline_for(core, "terminal.attach", &forwarded);
+     match line
+-        .call_into(&m.name, "terminal.attach", forwarded.clone(), Some(((conn.clone(), here), false, false)), deadline)
++        .call_into(&m.name, "terminal.attach", forwarded.clone(), Some(((conn.clone(), here), false, false, false)), deadline)
+         .await
+     {
+         Ok(mut r) => {
+@@ -121,6 +144,12 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+             let visibility_enabled = visibility_updates(&line, visibility_requested, &r);
+             r["resize_notifications"] = resize_enabled.into();
+             r["visibility_updates"] = visibility_enabled.into();
++            let focus_enabled = focus_updates(&line, focus_requested, &r);
++            r["focus_updates"] = focus_enabled.into();
++            params["focus_updates"] = focus_enabled.into();
++            if !focus_enabled {
++                params["focused"] = false.into();
++            }
+             params["resize_notifications"] = resize_enabled.into();
+             params["visibility_updates"] = visibility_enabled.into();
+             let automatic_input = automatic_input(&line, &r);
+@@ -128,6 +157,7 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+             let viewer = Relayed {
+                 automatic_input,
+                 visibility_updates: visibility_enabled,
++                focus_updates: focus_enabled,
+                 line,
+                 there,
+                 conn: conn.clone(),
+@@ -156,6 +186,13 @@ pub fn relay_in(core: &Core, conn: &Arc<Conn>, here: u32, kind: u8, payload: &[u
+             }
+             r.params["visible"] = (payload[0] == 1).into();
+         }
++        if kind == wire::WINDOW_FOCUS {
++            // Per downstream viewer, end to end; a reattach carries the latest state.
++            if !r.focus_updates || payload.len() != 1 || payload[0] > 1 {
++                return true;
++            }
++            r.params["focused"] = (payload[0] == 1).into();
++        }
+         // What a reattach after a dropped line brings back.
+         if kind == wire::RESIZE && payload.len() == 4 {
+             r.params["cols"] = u16::from_le_bytes([payload[0], payload[1]]).into();
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index e9e0bf0..ad37fd1 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -29,6 +29,8 @@ async fn keys_pressed_during_a_paste_follow_its_submit() {
+                 resize_notifications: false,
+                 visible: true,
+                 visibility_updates: false,
++                focus_updates: false,
++                focused: false,
+                 history: 0,
+                 size: (80, 24),
+                 display: Display::default(),
+diff --git a/crates/herdr-core/src/server.rs b/crates/herdr-core/src/server.rs
+index 7e2c419..bfbe562 100644
+--- a/crates/herdr-core/src/server.rs
++++ b/crates/herdr-core/src/server.rs
+@@ -366,6 +366,9 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
+             (ch, wire::VISIBILITY) if payload.len() == 1 && payload[0] <= 1 => {
+                 core.viewer_visibility(conn, ch, payload[0] == 1)
+             }
++            (ch, wire::WINDOW_FOCUS) if payload.len() == 1 && payload[0] <= 1 => {
++                core.viewer_window_focus(conn, ch, payload[0] == 1)
++            }
+             (ch, wire::FOCUS) => core.viewer_focus(conn, ch, payload.first() == Some(&1)),
+             (ch, wire::FACTS) => {
+                 if let Ok(display) = serde_json::from_slice(&payload) {
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index a790cd0..c5f96b4 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -45,6 +45,12 @@ pub struct Viewer {
+     awaiting_size: bool,
+     /// The attach path negotiated the viewer-to-core VISIBILITY frame.
+     visibility_updates: bool,
++    /// The attach path negotiated WINDOW_FOCUS: this viewer reports keyboard focus.
++    focus_updates: bool,
++    /// Its window has keyboard focus (only meaningful with `focus_updates`).
++    focused: bool,
++    /// When its window last gained focus; None: never focused while attached.
++    focused_at: Option<Instant>,
+     /// Origin is captured at attach so peer-line cleanup cannot relabel a viewer.
+     origin: ViewerOrigin,
+     peer: Option<String>,
+@@ -110,6 +116,12 @@ pub struct ViewerInfo {
+     /// Candidate in the current sizing selector (can be false while visible).
+     pub size_eligible: bool,
+     pub visibility_updates: bool,
++    /// Negotiated WINDOW_FOCUS: the viewer reports whether its window has keyboard focus.
++    pub focus_updates: bool,
++    /// Its window has keyboard focus now (false without `focus_updates`).
++    pub focused: bool,
++    /// Milliseconds since its window last gained keyboard focus; null if never.
++    pub focused_ms_ago: Option<u64>,
+     pub resize_notifications: bool,
+     pub observe: bool,
+     pub sized: bool,
+@@ -128,6 +140,9 @@ pub struct ViewerListResult {
+     pub current_grid: GridSize,
+     /// What the same selector used by the live resizer currently chooses.
+     pub selected_grid: Option<GridSize>,
++    /// A focus-reporting viewer has been focused: only the focused (or last
++    /// focused) window may set the grid; everyone else only receives it.
++    pub focus_authority: bool,
+     pub leader: Option<ViewerIdentity>,
+     pub viewers: Vec<ViewerInfo>,
+ }
+@@ -154,6 +169,8 @@ pub struct AttachRequest {
+     pub resumed: bool,
+     pub visible: bool,
+     pub visibility_updates: bool,
++    pub focus_updates: bool,
++    pub focused: bool,
+     pub desktop_group: Option<(String, String)>,
+ }
+ 
+@@ -197,6 +214,9 @@ impl Core {
+             visible: req.visible,
+             awaiting_size: req.resumed,
+             visibility_updates: req.visibility_updates,
++            focus_updates: req.focus_updates,
++            focused: req.focus_updates && req.focused,
++            focused_at: (req.focus_updates && req.focused).then(Instant::now),
+             origin,
+             peer,
+             desktop_group: req.desktop_group,
+@@ -438,6 +458,32 @@ impl Core {
+         self.apply_size(&mut st, id);
+     }
+ 
++    /// The viewer's window gained or lost keyboard focus (negotiated
++    /// WINDOW_FOCUS). The focused window decides the grid; losing focus keeps
++    /// it with this viewer until another window is focused.
++    pub fn viewer_window_focus(&self, conn: &Arc<Conn>, channel: u32, focused: bool) {
++        let mut st = self.lock();
++        let id = {
++            let Some((id, viewer)) = Self::viewer(&mut st, conn, channel) else { return };
++            if !viewer.focus_updates {
++                return;
++            }
++            if focused {
++                // Refreshed even when already focused: a repeated report from
++                // the window the person just returned to must win.
++                viewer.focused_at = Some(Instant::now());
++            } else if !viewer.focused {
++                return;
++            }
++            viewer.focused = focused;
++            if viewer.observe {
++                return;
++            }
++            id
++        };
++        self.apply_size(&mut st, id);
++    }
++
+     pub fn viewer_facts(&self, conn: &Arc<Conn>, channel: u32, display: Display) {
+         let mut st = self.lock();
+         let id = {
+@@ -519,6 +565,11 @@ impl Core {
+                 visible: viewer.visible,
+                 size_eligible: selection.candidates.contains(&index),
+                 visibility_updates: viewer.visibility_updates,
++                focus_updates: viewer.focus_updates,
++                focused: viewer.focus_updates && viewer.focused,
++                focused_ms_ago: viewer
++                    .focused_at
++                    .map(|focused| now.saturating_duration_since(focused).as_millis() as u64),
+                 resize_notifications: viewer.resize_notifications,
+                 observe: viewer.observe,
+                 sized: viewer.sized,
+@@ -536,6 +587,7 @@ impl Core {
+             terminal,
+             current_grid: GridSize { cols: current.0, rows: current.1 },
+             selected_grid: selection.size.map(|(cols, rows)| GridSize { cols, rows }),
++            focus_authority: selection.focus_authority,
+             leader: selection.leader.map(identity),
+             viewers: details,
+         }
+@@ -545,7 +597,8 @@ impl Core {
+     fn apply_size(&self, st: &mut State, id: u32) {
+         let viewers = st.viewers.get(&id).map_or(&[][..], Vec::as_slice);
+         let selection = select_sizing(viewers, self.settings().size_policy == crate::config::SizePolicy::Grouped);
+-        // Keep the holder's inherited grid while legacy relays resume. Focus,
++        // Keep the holder's inherited grid while legacy relays resume, and while
++        // the focused (or last focused) window is hidden or unmeasured. Focus,
+         // input and hidden attach placeholders cannot replace a physical offer.
+         if selection.leader.is_none() && st.viewers.get(&id).is_some_and(|vs| vs.iter().any(|v| !v.observe)) {
+             return;
+@@ -629,8 +682,52 @@ fn desktop_sizer(v: &Viewer) -> bool {
+     !v.observe && v.visible && v.desktop_group.is_some() && v.sized && !v.awaiting_size && v.size.0 > 0 && v.size.1 > 0
+ }
+ 
++/// May set the grid at all: interactive, visible and physically measured.
++fn measured(v: &Viewer) -> bool {
++    !v.observe && v.visible && v.sized && !v.awaiting_size && v.size.0 > 0 && v.size.1 > 0
++}
++
++/// Focus-reporting viewers that have been focused: once any exists, only they
++/// may set the grid (the focused window wins; the last focused keeps it).
++fn focus_reporter(v: &Viewer) -> bool {
++    !v.observe && v.focus_updates && v.focused_at.is_some()
++}
++
++/// Focused-window-wins. The leader is the focused visible viewer (desktop
++/// before phone, latest focus first), else the last focused one. A leader that
++/// is hidden or unmeasured holds the grid: nobody else takes over.
++fn select_focused(viewers: &[Viewer], grouped: bool) -> SizeSelection {
++    let candidates: Vec<usize> =
++        (0..viewers.len()).filter(|i| focus_reporter(&viewers[*i]) && measured(&viewers[*i])).collect();
++    let leader = (0..viewers.len()).filter(|i| focus_reporter(&viewers[*i])).max_by_key(|i| {
++        let v = &viewers[*i];
++        (v.focused && v.visible, v.desktop_group.is_some(), v.focused_at)
++    });
++    let Some(leader) = leader.filter(|i| measured(&viewers[*i])) else {
++        return SizeSelection { candidates, focus_authority: true, ..Default::default() };
++    };
++    let selected = &viewers[leader];
++    let contributors: Vec<usize> = if grouped && selected.focused && selected.desktop_group.is_some() {
++        candidates
++            .iter()
++            .copied()
++            .filter(|i| viewers[*i].focused && viewers[*i].desktop_group == selected.desktop_group)
++            .collect()
++    } else {
++        vec![leader]
++    };
++    let size = contributors
++        .iter()
++        .map(|index| viewers[*index].size)
++        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
++        .unwrap_or(selected.size);
++    SizeSelection { candidates, leader: Some(leader), contributors, size: Some(size), focus_authority: true }
++}
++
+ #[derive(Default)]
+ struct SizeSelection {
++    /// Focus-reporting viewers decide (see `select_focused`).
++    focus_authority: bool,
+     candidates: Vec<usize>,
+     leader: Option<usize>,
+     contributors: Vec<usize>,
+@@ -638,6 +735,9 @@ struct SizeSelection {
+ }
+ 
+ fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
++    if viewers.iter().any(focus_reporter) {
++        return select_focused(viewers, grouped);
++    }
+     let awaiting_size = viewers.iter().any(|v| !v.observe && v.visible && v.awaiting_size);
+     // A measured visible desktop owns the sizing device. Phone and legacy
+     // viewers are fallback leaders only until such a desktop is available.
+@@ -683,7 +783,7 @@ fn select_sizing(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+     } else {
+         (vec![leader], selected.size)
+     };
+-    SizeSelection { candidates, leader: Some(leader), contributors, size: Some(size) }
++    SizeSelection { candidates, leader: Some(leader), contributors, size: Some(size), ..Default::default() }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index f10e2fb..6ae8dc2 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -25,6 +25,9 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+         sized: true,
+         awaiting_size: false,
+         visibility_updates: true,
++        focus_updates: false,
++        focused: false,
++        focused_at: None,
+         origin: if conn.local_desktop { ViewerOrigin::LocalDesktop } else { ViewerOrigin::LocalClient },
+         peer: None,
+         desktop_group: conn.local_desktop.then(|| ("local".into(), "desktop".into())),
+@@ -196,6 +199,8 @@ fn resumed_viewers_hold_the_inherited_grid_until_a_physical_size_arrives() {
+             resize_notifications: notifications,
+             visible: true,
+             visibility_updates: true,
++            focus_updates: false,
++            focused: false,
+             history: 0,
+             size,
+             display: Display::default(),
+@@ -238,6 +243,8 @@ fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement(
+         resize_notifications: true,
+         visible,
+         visibility_updates: true,
++        focus_updates: false,
++        focused: false,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -305,6 +312,8 @@ fn viewer_diagnostics_track_visibility_group_min_and_disconnect() {
+         resize_notifications: true,
+         visible: true,
+         visibility_updates,
++        focus_updates: false,
++        focused: false,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -380,6 +389,8 @@ fn legacy_viewer_stays_visible_and_eligible_until_detach() {
+                 resize_notifications: false,
+                 visible: true,
+                 visibility_updates: false,
++                focus_updates: false,
++                focused: false,
+                 history: 0,
+                 size: (100, 40),
+                 display: Display::default(),
+@@ -423,6 +434,8 @@ async fn relayed_viewer_origin_and_pid_mask_survive_peer_line_cleanup() {
+                 resize_notifications: true,
+                 visible: true,
+                 visibility_updates: true,
++                focus_updates: false,
++                focused: false,
+                 history: 0,
+                 size: (80, 24),
+                 display: Display::default(),
+@@ -456,6 +469,8 @@ async fn fresh_same_size_reoffers_do_not_ping_pong_between_desktop_groups() {
+         resize_notifications: true,
+         visible: true,
+         visibility_updates: true,
++        focus_updates: false,
++        focused: false,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -528,6 +543,8 @@ fn wider_desktop_viewer_wraps_inline_redraw_at_the_shared_width() {
+         resize_notifications: true,
+         visible: true,
+         visibility_updates: true,
++        focus_updates: false,
++        focused: false,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -577,6 +594,8 @@ fn larger_desktop_viewers_keep_only_the_shared_scrolling_grid() {
+         resize_notifications: false,
+         visible: true,
+         visibility_updates: true,
++        focus_updates: false,
++        focused: false,
+         history: 0,
+         size,
+         display: Display::default(),
+@@ -635,6 +654,8 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
+         resize_notifications,
+         visible: true,
+         visibility_updates: false,
++        focus_updates: false,
++        focused: false,
+         history: 0,
+         size: (80, 24),
+         display: Display::default(),
+@@ -694,3 +715,128 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++fn focus_request(size: (u16, u16), group: Option<(&str, &str)>, focus_updates: bool, focused: bool) -> AttachRequest {
++    AttachRequest {
++        observe: false,
++        resize_notifications: true,
++        visible: true,
++        visibility_updates: true,
++        focus_updates,
++        focused,
++        history: 0,
++        size,
++        display: Display::default(),
++        resumed: false,
++        desktop_group: group.map(|(line, group)| (line.into(), group.into())),
++    }
++}
++
++/// 2026-11-13: macro/t1b6 viewed from small-pickle through its core (one
++/// line, one desktop group). A hidden 2158x1510 window (218x74, previously
++/// focused, still claiming visible: special workspaces report nothing) and the
++/// focused 2158x3821 window (218x187). The grid was the group min, 218x74; it
++/// must follow the focused window, whatever the hidden one says.
++#[test]
++fn incident_2026_11_13_relayed_hidden_window_cannot_shrink_the_focused_one() {
++    for hidden_reports in [false, true] {
++        let (core, id, root) = core_with_screen(218, 74);
++        let line = Arc::new(Conn::default()); // the small-pickle core's line into macro
++        let group = Some(("small-pickle", "small-pickle"));
++        let grid = || core.lock().screens[&id].size();
++        let hidden = core.attach(&line, id, focus_request((218, 74), group, true, true)).unwrap();
++        core.viewer_resize(&line, hidden, 218, 74);
++        assert_eq!(grid(), (218, 74));
++        // Wolf switches to special:15: the hidden window loses focus, the
++        // portrait window attaches focused through the same relay.
++        core.viewer_window_focus(&line, hidden, false);
++        if hidden_reports {
++            core.viewer_visibility(&line, hidden, false);
++        }
++        let focused = core.attach(&line, id, focus_request((218, 187), group, true, true)).unwrap();
++        core.viewer_resize(&line, focused, 218, 187);
++        assert_eq!(grid(), (218, 187), "the focused window decides (hidden reports={hidden_reports})");
++        // Activity and fresh offers from the hidden window change nothing.
++        core.viewer_focus(&line, hidden, true);
++        core.viewer_input(&line, hidden, b"", false);
++        core.viewer_resize(&line, hidden, 218, 73);
++        assert_eq!(grid(), (218, 187), "an unfocused window never shrinks the grid");
++        let list = core.viewer_list(id, "t1b6".into());
++        assert!(list.focus_authority);
++        assert_eq!(list.leader.map(|l| l.channel), Some(focused));
++        assert!(list.viewers.iter().any(|v| v.identity.channel == focused && v.focused && v.leader));
++        assert!(list.viewers.iter().any(|v| v.identity.channel == hidden && !v.focused && !v.contributes_to_grid));
++        // Nothing focused (Wolf in a browser): the last focused window keeps it.
++        core.viewer_window_focus(&line, focused, false);
++        assert_eq!(grid(), (218, 187), "the last focused viewer keeps the grid");
++        // Back to the other window: it decides again.
++        core.viewer_visibility(&line, hidden, true);
++        core.viewer_resize(&line, hidden, 218, 74);
++        core.viewer_window_focus(&line, hidden, true);
++        assert_eq!(grid(), (218, 74), "focusing the other window hands it the grid");
++        drop(core);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++}
++
++#[test]
++fn old_viewers_phones_and_non_forwarding_relays_never_win_over_focus() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let old_app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let old_relay = Arc::new(Conn::default()); // a relay without viewer_focus: no opt-in arrives
++    let grid = || core.lock().screens[&id].size();
++    let local = Some(("test", "test"));
++    let a = core.attach(&app, id, focus_request((120, 50), local, true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    assert_eq!(grid(), (120, 50));
++    let o = core.attach(&old_app, id, focus_request((80, 24), local, false, false)).unwrap();
++    core.viewer_resize(&old_app, o, 80, 24);
++    core.viewer_focus(&old_app, o, true);
++    // A legacy client cannot claim focus through the new frame.
++    core.viewer_window_focus(&old_app, o, true);
++    assert_eq!(grid(), (120, 50), "an old desktop viewer only receives the grid");
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (120, 50), "a phone never wins over a focused desktop");
++    let r = core.attach(&old_relay, id, focus_request((60, 20), Some(("pickle", "pickle")), false, false)).unwrap();
++    core.viewer_resize(&old_relay, r, 60, 20);
++    core.viewer_input(&old_relay, r, b"x", false);
++    assert_eq!(grid(), (120, 50), "a relay that cannot forward focus is non-reporting");
++    // The focused window goes away for good: previous rules resume.
++    core.detach(&app, None);
++    assert_ne!(grid(), (120, 50), "without focus history the legacy selection applies again");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn hidden_or_unmeasured_focused_window_holds_the_grid() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let line = Arc::new(Conn::default());
++    let group = Some(("pickle", "pickle"));
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&line, id, focus_request((100, 40), group, true, true)).unwrap();
++    core.viewer_resize(&line, a, 100, 40);
++    let b = core.attach(&line, id, focus_request((90, 30), group, true, false)).unwrap();
++    core.viewer_resize(&line, b, 90, 30);
++    assert_eq!(grid(), (100, 40), "a never-focused reporter does not constrain");
++    core.viewer_window_focus(&line, a, false);
++    core.viewer_visibility(&line, a, false);
++    assert_eq!(grid(), (100, 40), "the hidden last-focused window holds; nobody else takes over");
++    core.viewer_window_focus(&line, b, true);
++    assert_eq!(grid(), (90, 30));
++    // Focused but its window went hidden (workspace switch without a focus
++    // event yet): hold rather than fall back to an older window.
++    core.viewer_visibility(&line, a, true);
++    core.viewer_visibility(&line, b, false);
++    assert_eq!(grid(), (90, 30), "hidden focused window holds");
++    // Two panes of the same focused window share the smaller grid.
++    core.viewer_visibility(&line, b, true);
++    core.viewer_window_focus(&line, a, true);
++    assert_eq!(grid(), (90, 30), "same focused window, same group: min");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
+diff --git a/crates/herdr-core/src/wire.rs b/crates/herdr-core/src/wire.rs
+index 2583b65..84f4585 100644
+--- a/crates/herdr-core/src/wire.rs
++++ b/crates/herdr-core/src/wire.rs
+@@ -24,6 +24,9 @@ pub const FACTS: u8 = 5;
+ pub const AUTOMATIC_INPUT: u8 = 6;
+ /// Viewer → core: 1 visible on an active workspace, 0 hidden/off-workspace.
+ pub const VISIBILITY: u8 = 7;
++/// Viewer → core, negotiated (`focus_updates`): 1 = the window showing this
++/// view has keyboard focus, 0 = it does not. Sizing only; FOCUS stays program focus.
++pub const WINDOW_FOCUS: u8 = 8;
+ 
+ /// Credit a stream starts with before the viewer acknowledges anything.
+ pub const WINDOW: usize = 256 * 1024;
+diff --git a/crates/herdr-core/tests/focused_window.rs b/crates/herdr-core/tests/focused_window.rs
+new file mode 100644
+index 0000000..29d9e8c
+--- /dev/null
++++ b/crates/herdr-core/tests/focused_window.rs
+@@ -0,0 +1,111 @@
++#![cfg(target_os = "linux")]
++//! Focused-window-wins, end to end through a relaying core: two app windows
++//! on one machine view a terminal owned by another machine's core.
++
++mod common;
++
++use common::framed::{Framed, desktop};
++use common::*;
++use herdr_core::wire;
++use serde_json::{Value, json};
++
++fn attach(conn: &mut Framed, terminal: &str, cols: u16, rows: u16, focus: bool, focused: bool) -> (u32, Value) {
++    let reply = conn.call(
++        "terminal.attach",
++        json!({
++            "terminal": terminal, "cols": cols, "rows": rows,
++            "resize_notifications": true, "visibility_updates": true, "visible": true,
++            "focus_updates": focus, "focused": focused
++        }),
++    );
++    let channel = reply["result"]["channel"].as_u64().unwrap_or_else(|| panic!("attach failed: {reply}")) as u32;
++    let size = [cols.to_le_bytes(), rows.to_le_bytes()].concat();
++    conn.send(channel, wire::RESIZE, &size);
++    (channel, reply)
++}
++
++fn grid(owner: &Session, t: &str) -> (u64, u64) {
++    let r = owner.json(&["get", t]);
++    (r["cols"].as_u64().unwrap(), r["rows"].as_u64().unwrap())
++}
++
++/// 2026-11-13, macro/t1b6 from small-pickle: hidden 2158x1510 window (218x74,
++/// previously focused) and the focused 2158x3821 window (218x187), both via
++/// the small-pickle core. The owner must size to the focused window.
++#[test]
++fn incident_2026_11_13_focused_window_wins_through_a_relay() {
++    let owner = Session::new();
++    let t = run(&owner, &["sleep", "100"]);
++    let mut pickle = Session::new();
++    pickle.env.push(fake_ssh(&pickle, &[("macro", &owner)]));
++    pickle.json(&["machine", "add", "macro"]);
++    let hello = Framed::open(&pickle).call("hello", json!({"framed": true}));
++    assert!(hello["result"]["features"].as_array().unwrap().iter().any(|f| f == "viewer_focus"), "{hello}");
++    let remote = format!("macro/{t}");
++    let (mut app_hidden, mut hidden) = desktop(&pickle);
++    let (mut app_focused, mut focused) = desktop(&pickle);
++
++    let (h, reply) = attach(&mut hidden, &remote, 218, 74, true, true);
++    assert_eq!(reply["result"]["focus_updates"], true, "every hop confirms: {reply}");
++    wait_until("hidden window sizes first", || grid(&owner, &t) == (218, 74));
++    // Wolf moves to the portrait window; the old one loses focus but its
++    // special workspace never reports it hidden.
++    hidden.send(h, wire::WINDOW_FOCUS, &[0]);
++    let (f, _) = attach(&mut focused, &remote, 218, 187, true, true);
++    wait_until("grid follows the focused window", || grid(&owner, &t) == (218, 187));
++    // The unfocused window's activity and offers are ignored.
++    hidden.send(h, wire::FOCUS, &[1]);
++    hidden.send(h, wire::RESIZE, &[218, 0, 70, 0]);
++    hidden.send(h, wire::DATA, b"");
++    hidden.call("terminal.get", json!({"terminal": remote}));
++    std::thread::sleep(std::time::Duration::from_millis(300));
++    assert_eq!(grid(&owner, &t), (218, 187), "an unfocused window never shrinks the grid");
++
++    let viewers = owner.json(&["viewers", &t]);
++    assert_eq!(viewers["focus_authority"], true, "{viewers}");
++    let list = viewers["viewers"].as_array().unwrap();
++    assert_eq!(list.iter().filter(|v| v["focus_updates"] == true).count(), 2, "{viewers}");
++    assert_eq!(list.iter().filter(|v| v["focused"] == true && v["leader"] == true).count(), 1, "{viewers}");
++
++    // Nothing focused: the last focused window keeps the grid.
++    focused.send(f, wire::WINDOW_FOCUS, &[0]);
++    focused.call("terminal.get", json!({"terminal": remote}));
++    std::thread::sleep(std::time::Duration::from_millis(300));
++    assert_eq!(grid(&owner, &t), (218, 187));
++    // Focusing the other window hands it the grid, through the relay.
++    hidden.send(h, wire::WINDOW_FOCUS, &[1]);
++    wait_until("refocused window decides", || grid(&owner, &t) == (218, 70));
++    drop(hidden);
++    drop(focused);
++    app_hidden.wait().unwrap();
++    app_focused.wait().unwrap();
++}
++
++/// A viewer that cannot report focus (old app or client) only receives the grid.
++#[test]
++fn non_reporting_viewer_through_a_relay_never_shrinks_the_focused_window() {
++    let owner = Session::new();
++    let t = run(&owner, &["sleep", "100"]);
++    let mut pickle = Session::new();
++    pickle.env.push(fake_ssh(&pickle, &[("macro", &owner)]));
++    pickle.json(&["machine", "add", "macro"]);
++    let remote = format!("macro/{t}");
++    let (mut app, mut window) = desktop(&pickle);
++    let (mut app_old, mut old) = desktop(&pickle);
++    attach(&mut window, &remote, 200, 60, true, true);
++    wait_until("focused window sizes", || grid(&owner, &t) == (200, 60));
++    let (o, reply) = attach(&mut old, &remote, 80, 24, false, false);
++    assert_eq!(reply["result"]["focus_updates"], false, "{reply}");
++    old.send(o, wire::WINDOW_FOCUS, &[1]); // not negotiated: the relay drops it
++    old.send(o, wire::FOCUS, &[1]);
++    old.send(o, wire::DATA, b"x");
++    old.call("terminal.get", json!({"terminal": remote}));
++    std::thread::sleep(std::time::Duration::from_millis(300));
++    assert_eq!(grid(&owner, &t), (200, 60), "old viewer only receives the grid");
++    let viewers = owner.json(&["viewers", &t]);
++    assert!(viewers["viewers"].as_array().unwrap().iter().any(|v| v["focus_updates"] == false), "{viewers}");
++    drop(window);
++    drop(old);
++    app.wait().unwrap();
++    app_old.wait().unwrap();
++}
+diff --git a/docs/commands.md b/docs/commands.md
+index e45cdd6..c322f61 100644
+--- a/docs/commands.md
++++ b/docs/commands.md
+@@ -17,6 +17,7 @@ Terminals
+   run <cmd|template> [task]   run it and wait like a shell (--bg: don't wait)
+   ls                          list live terminals (--all: finished too)
+   get <t>                     show one terminal
++  viewers <t>                 show attached viewers and local sizing decision
+   attach [t]                  put this terminal on it (ctrl+\ detaches)
+   read <t>                    print its screen and history
+   kill <t>                    end its program
+@@ -665,6 +666,21 @@ Options:
+   -h, --help             Print help
+ ```
+ 
++## hc viewers
++
++```text
++Show attached viewers and the local sizing decision for one terminal
++
++Usage: hc viewers [OPTIONS] <TERMINAL>
++
++Arguments:
++  <TERMINAL>  A local terminal: `t7` or its local name. This query never fans out to peers
++
++Options:
++      --json  JSON output even in a terminal
++  -h, --help  Print help
++```
++
+ ## hc wait
+ 
+ ```text
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 31dd75a..296ef35 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -27,6 +27,10 @@
+             "minimum": 0,
+             "type": "integer"
+           },
++          "focus_updates": {
++            "description": "True only when every core on the path accepts WINDOW_FOCUS (kind 8).",
++            "type": "boolean"
++          },
+           "resize_notifications": {
+             "description": "True only when the entire path sends RESIZE before replacement paints.\nFalse or absent means the viewer must track size changes separately.",
+             "type": "boolean"
+@@ -44,6 +48,7 @@
+           "terminal",
+           "resize_notifications",
+           "visibility_updates",
++          "focus_updates",
+           "automatic_input"
+         ],
+         "type": "object"
+@@ -1576,6 +1581,23 @@
+               }
+             ]
+           },
++          "focus_updates": {
++            "description": "Negotiated WINDOW_FOCUS: the viewer reports whether its window has keyboard focus.",
++            "type": "boolean"
++          },
++          "focused": {
++            "description": "Its window has keyboard focus now (false without `focus_updates`).",
++            "type": "boolean"
++          },
++          "focused_ms_ago": {
++            "description": "Milliseconds since its window last gained keyboard focus; null if never.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          },
+           "identity": {
+             "$ref": "#/components/schemas/ViewerIdentity"
+           },
+@@ -1632,6 +1654,8 @@
+           "visible",
+           "size_eligible",
+           "visibility_updates",
++          "focus_updates",
++          "focused",
+           "resize_notifications",
+           "observe",
+           "sized",
+@@ -1646,6 +1670,10 @@
+           "current_grid": {
+             "$ref": "#/components/schemas/GridSize"
+           },
++          "focus_authority": {
++            "description": "A focus-reporting viewer has been focused: only the focused (or last\nfocused) window may set the grid; everyone else only receives it.",
++            "type": "boolean"
++          },
+           "leader": {
+             "anyOf": [
+               {
+@@ -1680,6 +1708,7 @@
+         "required": [
+           "terminal",
+           "current_grid",
++          "focus_authority",
+           "viewers"
+         ],
+         "type": "object"
+@@ -2704,6 +2733,26 @@
+             "description": "The viewer's own colors and cell size, used to answer display queries."
+           }
+         },
++        {
++          "description": "The client sends WINDOW_FOCUS frames: only the focused window sizes the grid.",
++          "name": "focus_updates",
++          "required": false,
++          "schema": {
++            "default": false,
++            "description": "The client sends WINDOW_FOCUS frames: only the focused window sizes the grid.",
++            "type": "boolean"
++          }
++        },
++        {
++          "description": "With `focus_updates`: the window showing this view has keyboard focus now.",
++          "name": "focused",
++          "required": false,
++          "schema": {
++            "default": false,
++            "description": "With `focus_updates`: the window showing this view has keyboard focus now.",
++            "type": "boolean"
++          }
++        },
+         {
+           "description": "Scrollback lines to show first (main screen only).",
+           "name": "history",

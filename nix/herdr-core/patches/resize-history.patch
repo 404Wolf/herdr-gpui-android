@@ -1,0 +1,2267 @@
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index b7b38b8..15bdfd1 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -289,6 +289,14 @@ const DEFAULT_CELL: (u32, u32) = (10, 20);
+ /// Ghostty's default theme, answered until a viewer tells us its own colors.
+ const DEFAULT_FG: Rgb = [0xff, 0xff, 0xff];
+ const DEFAULT_BG: Rgb = [0x28, 0x2c, 0x34];
++/// How every [`Terminal::paint`] starts: the viewer's main screen, cleared,
++/// cursor home. A soft reset leaves mouse, focus, paste, sync and key modes
++/// alone: they are turned off too, so a viewer that missed their "off" (a
++/// dropped backlog) ends up with exactly the screen's own modes, replayed
++/// after it.
++pub const PAINT_RESET: &[u8] = b"\x1b[!p\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\
++\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b[?66l\x1b[?2031l\x1b[?2048l\x1b[=0;1u\
++\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J";
+ 
+ pub type Rgb = [u8; 3];
+ 
+@@ -684,7 +692,8 @@ impl Terminal {
+         (unsafe { ffi::ghostty_terminal_grid_ref(self.raw, point, &mut out) } == ffi::SUCCESS).then_some(out)
+     }
+ 
+-    fn history_rows(&self) -> u32 {
++    /// Scrollback rows above the screen.
++    pub fn history_rows(&self) -> u32 {
+         let mut bar = ffi::Scrollbar::default();
+         unsafe { ffi::ghostty_terminal_get(self.raw, ffi::DATA_SCROLLBAR, (&raw mut bar).cast()) };
+         bar.total.saturating_sub(self.size().1 as u64) as u32
+@@ -747,16 +756,11 @@ impl Terminal {
+     pub fn paint(&self, history: usize) -> Vec<u8> {
+         let (cols, rows) = self.size();
+         let last = (cols.saturating_sub(1), rows.saturating_sub(1) as u32);
+-        // A soft reset leaves mouse, focus, paste, sync and key modes alone: turn
+-        // them off too, so a viewer that missed their "off" (a dropped backlog)
+-        // ends up with exactly the screen's own modes, replayed below.
+-        let mut out = b"\x1b[!p\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\
+-\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?1l\x1b[?66l\x1b[?2031l\x1b[?2048l\x1b[=0;1u\
+-\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[H\x1b[2J"
+-            .to_vec();
++        let mut out = PAINT_RESET.to_vec();
+         let available = self.history_rows();
+         if history > 0 && available > 0 && !self.alt_screen() {
+-            let from = available.saturating_sub(history as u32);
++            // Saturating: a count past u32 must not wrap to "no history".
++            let from = available.saturating_sub(u32::try_from(history).unwrap_or(u32::MAX));
+             if let Some(sel) = self.select(ffi::POINT_HISTORY, (0, from), (last.0, available - 1)) {
+                 // Let the viewer wrap history itself so it can reflow on resize.
+                 out.extend(self.format_with(ffi::FORMAT_VT, Some(&sel), false, true));
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 2770ef7..dc30d5d 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -25,6 +25,7 @@ pub const FEATURES: &[&str] = &[
+     "queue-keyed",
+     "viewer_visibility",
+     "viewer_focus",
++    "resize_history",
+ ];
+ pub const FINISHED_LINES: usize = 1000;
+ /// A terminal's identity: fixed at start from whoever starts it.
+@@ -466,6 +467,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         observe: p.observe,
+         resize_notifications: p.resize_notifications,
+         history: p.history,
++        resize_history: p.resize_history,
+         size: (p.cols, p.rows),
+         display: p.display,
+         resumed: p.resumed,
+@@ -482,6 +484,11 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         resize_notifications: p.resize_notifications,
+         visibility_updates: p.visibility_updates,
+         focus_updates: p.focus_updates,
++        resize_history: if p.resize_notifications {
++            p.resize_history.min(crate::viewers::MAX_RESIZE_HISTORY)
++        } else {
++            0
++        },
+         automatic_input: true,
+     })
+ }
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 2734430..1a4fcf8 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -421,6 +421,14 @@ pub struct AttachParams {
+     #[arg(long, default_value_t = 0)]
+     #[serde(default)]
+     pub history: usize,
++    /// With `resize_notifications`: scrollback lines each repaint after a RESIZE
++    /// carries (main screen only), after `ESC[3J` so they replace the viewer's
++    /// history. 0: the repaint is the screen only. At most 100000 (more counts
++    /// as 100000). If the whole of it would be over 2 MiB, that repaint is the
++    /// screen only, without `ESC[3J`.
++    #[arg(skip)]
++    #[serde(default)]
++    pub resize_history: usize,
+     /// The viewer's size in cells.
+     #[arg(skip)]
+     pub cols: u16,
+@@ -457,6 +465,11 @@ pub struct AttachResult {
+     pub visibility_updates: bool,
+     /// True only when every core on the path accepts WINDOW_FOCUS (kind 8).
+     pub focus_updates: bool,
++    /// The `resize_history` the owner applies, 0 unless every core on the
++    /// path has the `resize_history` feature (and `resize_notifications`
++    /// holds). Absent: 0.
++    #[serde(default)]
++    pub resize_history: usize,
+     /// The entire attach path accepts AUTOMATIC_INPUT (kind 6). Absent means use DATA.
+     pub automatic_input: bool,
+ }
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index 121de3c..0b0a60f 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -21,7 +21,10 @@ use tokio::sync::{mpsc, oneshot};
+ type Sink = (Arc<Conn>, u32);
+ /// A pending reply, its stream sink and whether resize, visibility and focus
+ /// support are required.
+-type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool, bool, bool)>);
++/// The sink an attach reply opens, and what the reply must confirm before
++/// it does: resize notifications, visibility, focus, and a `resize_history`.
++type Required = (Sink, bool, bool, bool, u64);
++type Waiting = (oneshot::Sender<Value>, Option<Required>);
+ 
+ mod viewers;
+ #[cfg(test)]
+@@ -30,7 +33,7 @@ use viewers::automatic_input;
+ use viewers::visibility_updates;
+ #[cfg(test)]
+ use viewers::focus_updates;
+-use viewers::{FOCUS_LOST, RESIZE_LOST, VISIBILITY_LOST, negotiate_resize, reattach};
++use viewers::{FOCUS_LOST, HISTORY_LOST, RESIZE_LOST, VISIBILITY_LOST, negotiate_resize, reattach};
+ pub use viewers::{Relayed, attach, conn_gone, relay_in};
+ 
+ #[cfg(test)]
+@@ -73,7 +76,7 @@ impl Line {
+     /// A reply to one of our calls: to whoever waits for it.
+     fn take_reply(&self, mut reply: Value) {
+         let Some((waiter, sink)) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+-        if let (Some((sink, require_resize, require_visibility, require_focus)), Some(there)) =
++        if let (Some((sink, require_resize, require_visibility, require_focus, require_history)), Some(there)) =
+             (sink, reply["result"]["channel"].as_u64())
+         {
+             if require_resize && reply["result"]["resize_notifications"] != true {
+@@ -94,6 +97,14 @@ impl Line {
+                     reply["id"].clone(),
+                     Err(RpcError::new("unavailable", FOCUS_LOST, "attach again")),
+                 );
++            } else if require_history > 0
++                && viewers::resize_history(self, require_history, &reply["result"]) != require_history
++            {
++                let _ = self.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
++                reply = crate::rpc::response(
++                    reply["id"].clone(),
++                    Err(RpcError::new("unavailable", HISTORY_LOST, "attach again")),
++                );
+             } else {
+                 lock(&self.streams).insert(there as u32, sink);
+             }
+@@ -123,7 +134,7 @@ impl Line {
+         machine: &str,
+         method: &str,
+         params: Value,
+-        sink: Option<(Sink, bool, bool, bool)>,
++        sink: Option<Required>,
+         deadline: Duration,
+     ) -> Result<Value, RpcError> {
+         let id = self.next.fetch_add(1, Ordering::Relaxed);
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index 053eabf..b0b2761 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -182,7 +182,7 @@ async fn reconnect_rejects_downgrade_before_mapping_fallback_data() {
+                         "relay",
+                         "terminal.attach",
+                         json!({"observe": true, "resumed": true, "resize_notifications": true}),
+-                        Some(((sink, 7), require_resize, require_visibility, false)),
++                        Some(((sink, 7), require_resize, require_visibility, false, 0)),
+                         Duration::from_secs(1),
+                     )
+                     .await
+@@ -504,7 +504,7 @@ async fn reconnect_rejects_a_focus_downgrade() {
+                 "relay",
+                 "terminal.attach",
+                 json!({"resumed": true, "focus_updates": true}),
+-                Some(((sink, 7), false, false, true)),
++                Some(((sink, 7), false, false, true, 0)),
+                 Duration::from_secs(1),
+             )
+             .await
+@@ -516,3 +516,301 @@ async fn reconnect_rejects_a_focus_downgrade() {
+     assert_eq!(err.message, FOCUS_LOST);
+     assert_eq!(rx.recv().await.unwrap(), wire::encode(9, wire::CLOSE, b""), "the downgraded stream there is closed");
+ }
++
++#[test]
++fn resize_history_is_stripped_before_old_hops_and_needs_the_owners_echo() {
++    for features in [json!(["resize_notifications"]), json!(["resize_notifications", "resize_history"])] {
++        let (frames, _rx) = mpsc::unbounded_channel();
++        let line = Line::new(frames, &json!({"features": features}));
++        let capable = line.features.iter().any(|f| f == "resize_history");
++        let mut params = json!({"resize_notifications": true, "resize_history": 500});
++        viewers::negotiate_resize_history(&line, &mut params);
++        assert_eq!(params["resize_history"], if capable { 500 } else { 0 }, "never ask a hop that cannot confirm");
++        let mut params = json!({"resize_notifications": false, "resize_history": 500});
++        viewers::negotiate_resize_history(&line, &mut params);
++        assert_eq!(params["resize_history"], 0, "history rides on RESIZE");
++        // An old owner behind a new hop never echoes it: 0, not what was asked.
++        assert_eq!(viewers::resize_history(&line, 500, &json!({})), 0);
++        assert_eq!(viewers::resize_history(&line, 500, &json!({"resize_history": 500})), if capable { 500 } else { 0 });
++        assert_eq!(
++            viewers::resize_history(&line, 500, &json!({"resize_history": 9000})),
++            if capable { 500 } else { 0 }
++        );
++    }
++}
++
++/// A new relay in front of an old owner: the old owner ignores
++/// `resize_history` and never echoes it, so the relay must not confirm it
++/// (nor ask a hop whose hello lacks it). In front of a new owner it confirms
++/// exactly what the owner did.
++#[tokio::test]
++async fn a_relay_confirms_resize_history_only_when_the_owner_did() {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-history-relay-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let machine = Machine {
++        name: "owner".into(),
++        target: "owner".into(),
++        via: false,
++        temporary: false,
++        session: None,
++        id: "owner-id".into(),
++        host: "owner".into(),
++        version: "0.1.18".into(),
++    };
++    let old = json!(["resize_notifications", "viewer_visibility", "viewer_focus", "automatic_input"]);
++    let new = json!(["resize_notifications", "viewer_visibility", "viewer_focus", "automatic_input", "resize_history"]);
++    // (owner hello, what the owner's reply says, what the relay must confirm, what it must forward)
++    for (features, echo, confirmed, forwarded) in
++        [(&old, json!(null), 0, 0), (&new, json!(1000), 1000, 1000), (&new, json!(null), 0, 1000)]
++    {
++        let (frames, mut rx) = mpsc::unbounded_channel();
++        let line = Line::new(frames, &json!({"features": features}));
++        core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone()));
++        let conn = Arc::new(Conn::default());
++        let (c, k, m) = (core.clone(), conn.clone(), machine.clone());
++        let task = tokio::spawn(async move {
++            let params =
++                json!({"terminal": "t1", "cols": 80, "rows": 24, "resize_notifications": true, "resize_history": 1000});
++            viewers::attach(&c, &k, &m, params).await
++        });
++        let request = rx.recv().await.unwrap();
++        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++        assert_eq!(request["params"]["resize_history"], forwarded, "{features}: {request}");
++        let mut result = json!({"channel": 9, "terminal": {"address": "t1"}, "resize_notifications": true,
++            "visibility_updates": false, "focus_updates": false, "automatic_input": true});
++        if !echo.is_null() {
++            result["resize_history"] = echo;
++        }
++        line.take_reply(json!({"id": request["id"], "result": result}));
++        let reply = task.await.unwrap().unwrap();
++        assert_eq!(reply["resize_history"], confirmed, "{features} echo {:?}: {reply}", result["resize_history"]);
++        let st = core.lock();
++        let relayed = st.relayed.values().find(|r| Arc::ptr_eq(&r.conn, &conn)).unwrap();
++        assert_eq!(relayed.params["resize_history"], confirmed, "a reattach requires only what was confirmed");
++    }
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++/// A relayed stream that was confirmed `resize_history` comes back after a
++/// dropped line only with it confirmed again; an owner that lost it (old
++/// hello, or no echo) closes the stream instead of resuming screen-only.
++#[tokio::test]
++async fn reconnect_rejects_a_resize_history_downgrade() {
++    for (feature, echo) in [(false, false), (true, false), (true, true)] {
++        let root = std::path::PathBuf::from(format!(
++            "/var/tmp/hc-history-reattach-{}-{}",
++            std::process::id(),
++            crate::platform::random_hex()
++        ));
++        let paths = Paths {
++            socket: root.join("core.sock"),
++            holder_socket: root.join("holder.sock"),
++            state: root.clone(),
++            config: root.join("config.toml"),
++        };
++        paths.create_dirs().unwrap();
++        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++        let machine = Machine {
++            name: "away".into(),
++            target: "away".into(),
++            via: false,
++            temporary: false,
++            session: None,
++            id: "remote".into(),
++            host: "away".into(),
++            version: "test".into(),
++        };
++        let conn = Arc::new(Conn::default());
++        conn.with(|out| out.open(7));
++        let (old_frames, _old_rx) = mpsc::unbounded_channel();
++        core.lock().relayed.insert(
++            (conn_key(&conn), 7),
++            Relayed {
++                automatic_input: false,
++                visibility_updates: false,
++                focus_updates: false,
++                line: Line::new(old_frames, &json!({"features": ["resize_notifications", "resize_history"]})),
++                there: 9,
++                conn: conn.clone(),
++                machine: machine.id.clone(),
++                params: json!({"terminal": "t1", "resize_notifications": true, "resize_history": 1000}),
++            },
++        );
++        let (frames, mut rx) = mpsc::unbounded_channel();
++        let features =
++            if feature { vec!["resize_notifications", "resize_history"] } else { vec!["resize_notifications"] };
++        let line = Line::new(frames, &json!({"features": features}));
++        let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
++        let request = rx.recv().await.unwrap();
++        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++        assert_eq!(request["params"]["resize_history"], if feature { 1000 } else { 0 }, "{request}");
++        let mut result = json!({"channel": 10, "resize_notifications": true});
++        if echo {
++            result["resize_history"] = 1000.into();
++        }
++        line.take_reply(json!({"id": request["id"], "result": result}));
++        task.await.unwrap();
++        if feature && echo {
++            assert!(core.lock().relayed.contains_key(&(conn_key(&conn), 7)), "confirmed again: resumed");
++        } else {
++            assert!(!core.lock().relayed.contains_key(&(conn_key(&conn), 7)));
++            assert!(!lock(&line.streams).contains_key(&10));
++            assert_eq!(rx.recv().await.unwrap(), wire::encode(10, wire::CLOSE, b""));
++            let close = conn.outbox().next_frame().unwrap();
++            assert_eq!(close[4], wire::CLOSE, "the viewer attaches again and renegotiates");
++        }
++        drop(core);
++        let _ = std::fs::remove_dir_all(root);
++    }
++}
++
++/// Review v3 (3), the reviewer's probe: the receiving task may read the reply
++/// and the next frames before the reattach task resumes. A downgraded owner's
++/// stream must never be connected here at all.
++#[tokio::test]
++async fn a_resize_history_downgrade_is_refused_before_any_frame_is_forwarded() {
++    for (feature, echo) in [(false, false), (true, false), (true, true)] {
++        let root = std::path::PathBuf::from(format!(
++            "/var/tmp/hc-history-reattach-{}-{}",
++            std::process::id(),
++            crate::platform::random_hex()
++        ));
++        let paths = Paths {
++            socket: root.join("core.sock"),
++            holder_socket: root.join("holder.sock"),
++            state: root.clone(),
++            config: root.join("config.toml"),
++        };
++        paths.create_dirs().unwrap();
++        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++        let machine = Machine {
++            name: "away".into(),
++            target: "away".into(),
++            via: false,
++            temporary: false,
++            session: None,
++            id: "remote".into(),
++            host: "away".into(),
++            version: "test".into(),
++        };
++        let conn = Arc::new(Conn::default());
++        conn.with(|out| out.open(7));
++        let (old_frames, _old_rx) = mpsc::unbounded_channel();
++        core.lock().relayed.insert(
++            (conn_key(&conn), 7),
++            Relayed {
++                automatic_input: false,
++                visibility_updates: false,
++                focus_updates: false,
++                line: Line::new(old_frames, &json!({"features": ["resize_notifications", "resize_history"]})),
++                there: 9,
++                conn: conn.clone(),
++                machine: machine.id.clone(),
++                params: json!({"terminal": "t1", "resize_notifications": true, "resize_history": 1000}),
++            },
++        );
++        let (frames, mut rx) = mpsc::unbounded_channel();
++        let features =
++            if feature { vec!["resize_notifications", "resize_history"] } else { vec!["resize_notifications"] };
++        let line = Line::new(frames, &json!({"features": features}));
++        let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
++        let request = rx.recv().await.unwrap();
++        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++        assert_eq!(request["params"]["resize_history"], if feature { 1000 } else { 0 }, "{request}");
++        let mut result = json!({"channel": 10, "resize_notifications": true});
++        if echo {
++            result["resize_history"] = 1000.into();
++        }
++        line.take_reply(json!({"id": request["id"], "result": result}));
++        // Reproduce the receiving task reading the reply and the next DATA
++        // frame before the separate reattach task runs. Current-thread Tokio
++        // makes that valid scheduling order deterministic here.
++        let mut leaked = Vec::new();
++        if let Some((sink, here)) = lock(&line.streams).get(&10) {
++            sink.with(|out| {
++                out.ordered_resize(*here, &[80, 0, 24, 0]);
++                out.data(*here, b"\x18\x1b[H\x1b[2Jold-owner-screen-only");
++                while let Some(frame) = out.next_frame() {
++                    leaked.push(frame);
++                }
++            });
++        }
++        task.await.unwrap();
++        if feature && echo {
++            assert!(core.lock().relayed.contains_key(&(conn_key(&conn), 7)), "confirmed again: resumed");
++        } else {
++            assert!(!core.lock().relayed.contains_key(&(conn_key(&conn), 7)));
++            assert!(!lock(&line.streams).contains_key(&10));
++            assert_eq!(rx.recv().await.unwrap(), wire::encode(10, wire::CLOSE, b""));
++            let close = conn.outbox().next_frame().unwrap();
++            assert_eq!(close[4], wire::CLOSE, "the viewer attaches again and renegotiates");
++        }
++        drop(core);
++        let _ = std::fs::remove_dir_all(root);
++        if !feature || !echo {
++            assert!(
++                leaked.is_empty(),
++                "downgraded history stream delivered a RESIZE and screen-only DATA before closing"
++            );
++        }
++    }
++}
++// The #88 v3 reviewer's probe: a missing or lower echo is refused before mapping.
++
++#[tokio::test]
++async fn reviewer_v3_missing_and_lower_echo_are_rejected_before_mapping() {
++    for (feature, echo, accepted) in [
++        (true, Value::Null, false),
++        (true, json!(0), false),
++        (true, json!(999), false),
++        (true, json!(1000), true),
++        (true, json!(1001), true),
++        (true, json!("1000"), false),
++        (false, json!(1000), false),
++    ] {
++        let (frames, mut rx) = mpsc::unbounded_channel();
++        let line = Line::new(
++            frames,
++            &json!({"features":if feature{vec!["resize_notifications","resize_history"]}else{vec!["resize_notifications"]}}),
++        );
++        let sink = Arc::new(Conn::default());
++        sink.with(|out| out.open(7));
++        let task = {
++            let line = line.clone();
++            tokio::spawn(async move {
++                line.call_into(
++                    "away",
++                    "terminal.attach",
++                    json!({"resize_history":1000}),
++                    Some(((sink, 7), true, false, false, 1000)),
++                    Duration::from_secs(2),
++                )
++                .await
++            })
++        };
++        let request = rx.recv().await.unwrap();
++        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
++        line.take_reply(
++            json!({"id":request["id"],"result":{"channel":10,"resize_notifications":true,"resize_history":echo}}),
++        );
++        assert_eq!(lock(&line.streams).contains_key(&10), accepted, "feature={feature} echo={echo}");
++        let reply = task.await.unwrap();
++        assert_eq!(reply.is_ok(), accepted);
++        if !accepted {
++            assert_eq!(reply.unwrap_err().message, HISTORY_LOST);
++            assert_eq!(rx.recv().await.unwrap(), wire::encode(10, wire::CLOSE, b""));
++        }
++    }
++}
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index 1e097cf..c889f52 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -23,6 +23,8 @@ pub(super) const RESIZE_LOST: &str = "resize notifications lost";
+ pub(super) const VISIBILITY_LOST: &str = "viewer visibility updates lost";
+ /// Why an opted-in stream was refused: a hop on the way lost window focus support.
+ pub(super) const FOCUS_LOST: &str = "viewer focus updates lost";
++/// Why an opted-in stream was refused: the path no longer confirms its `resize_history`.
++pub(super) const HISTORY_LOST: &str = "resize history lost";
+ 
+ /// Viewers left waiting by a dropped line to `m` get their terminal back.
+ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+@@ -41,12 +43,21 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+         negotiate_resize(&line, &mut params);
+         negotiate_visibility(&line, &mut params);
+         negotiate_focus(&line, &mut params);
++        negotiate_resize_history(&line, &mut params);
++        let wanted_history = r.params["resize_history"].as_u64().unwrap_or(0);
+         let deadline = deadline_for(&core, "terminal.attach", &params);
+-        let sink =
+-            ((r.conn.clone(), here), r.params["resize_notifications"] == true, r.visibility_updates, r.focus_updates);
++        // Checked in `take_reply`, before the stream there is connected here.
++        let sink = (
++            (r.conn.clone(), here),
++            r.params["resize_notifications"] == true,
++            r.visibility_updates,
++            r.focus_updates,
++            wanted_history,
++        );
+         let reply = line.call_into(&m.name, "terminal.attach", params, Some(sink), deadline).await;
+         let lost_resize = matches!(&reply, Err(e) if e.message == RESIZE_LOST);
+-        let lost_visibility = matches!(&reply, Err(e) if e.message == VISIBILITY_LOST || e.message == FOCUS_LOST);
++        let lost_visibility =
++            matches!(&reply, Err(e) if [VISIBILITY_LOST, FOCUS_LOST, HISTORY_LOST].contains(&e.message.as_str()));
+         let mut st = core.lock();
+         // Gone meanwhile (the viewer detached): nothing to resume.
+         if !st.relayed.contains_key(&(key, here)) {
+@@ -104,6 +115,22 @@ pub(super) fn negotiate_focus(line: &Line, params: &mut Value) {
+     }
+ }
+ 
++/// Never ask a hop without `resize_history` for it: it would paint screen-only.
++pub(super) fn negotiate_resize_history(line: &Line, params: &mut Value) {
++    if params["resize_notifications"] != true || !line.features.iter().any(|f| f == "resize_history") {
++        params["resize_history"] = 0.into();
++    }
++}
++
++/// What the path there confirmed: the owner's echo, and only through a hop
++/// that has the feature (an old core never echoes it).
++pub(super) fn resize_history(line: &Line, requested: u64, reply: &Value) -> u64 {
++    if !line.features.iter().any(|f| f == "resize_history") {
++        return 0;
++    }
++    reply["resize_history"].as_u64().unwrap_or(0).min(requested)
++}
++
+ pub(super) fn focus_updates(line: &Line, requested: bool, reply: &Value) -> bool {
+     requested && line.features.iter().any(|f| f == "viewer_focus") && reply["focus_updates"] == true
+ }
+@@ -131,11 +158,12 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+     negotiate_resize(&line, &mut forwarded);
+     negotiate_visibility(&line, &mut forwarded);
+     negotiate_focus(&line, &mut forwarded);
++    negotiate_resize_history(&line, &mut forwarded);
+     let here = conn.new_channel();
+     conn.with(|out| out.open_paused(here));
+     let deadline = deadline_for(core, "terminal.attach", &forwarded);
+     match line
+-        .call_into(&m.name, "terminal.attach", forwarded.clone(), Some(((conn.clone(), here), false, false, false)), deadline)
++        .call_into(&m.name, "terminal.attach", forwarded.clone(), Some(((conn.clone(), here), false, false, false, 0)), deadline)
+         .await
+     {
+         Ok(mut r) => {
+@@ -152,6 +180,11 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+             }
+             params["resize_notifications"] = resize_enabled.into();
+             params["visibility_updates"] = visibility_enabled.into();
++            let requested = forwarded["resize_history"].as_u64().unwrap_or(0);
++            let history = if resize_enabled { resize_history(&line, requested, &r) } else { 0 };
++            r["resize_history"] = history.into();
++            // A reattach asks for what was confirmed, and requires it again.
++            params["resize_history"] = history.into();
+             let automatic_input = automatic_input(&line, &r);
+             r["automatic_input"] = automatic_input.into();
+             let viewer = Relayed {
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index ad37fd1..008f333 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -32,6 +32,7 @@ async fn keys_pressed_during_a_paste_follow_its_submit() {
+                 focus_updates: false,
+                 focused: false,
+                 history: 0,
++                resize_history: 0,
+                 size: (80, 24),
+                 display: Display::default(),
+                 resumed: false,
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 2fc9784..4e9a070 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -33,6 +33,8 @@ pub struct Viewer {
+     pub channel: u32,
+     pub observe: bool,
+     resize_notifications: bool,
++    /// Scrollback rows each repaint after a RESIZE carries; 0: screen only.
++    resize_history: usize,
+     repaint_pending: bool,
+     size: (u16, u16),
+     /// None: not active since it came back after a dropped line.
+@@ -164,6 +166,8 @@ pub struct AttachRequest {
+     pub observe: bool,
+     pub resize_notifications: bool,
+     pub history: usize,
++    /// Scrollback rows each repaint after a RESIZE carries; 0: screen only.
++    pub resize_history: usize,
+     pub size: (u16, u16),
+     pub display: Display,
+     pub resumed: bool,
+@@ -207,6 +211,8 @@ impl Core {
+             channel,
+             observe: req.observe,
+             resize_notifications: req.resize_notifications,
++            // Only RESIZE-confirmed viewers get resize paints with history.
++            resize_history: if req.resize_notifications { req.resize_history.min(MAX_RESIZE_HISTORY) } else { 0 },
+             repaint_pending: false,
+             size: req.size,
+             active_at: (!req.resumed).then(Instant::now),
+@@ -224,7 +230,19 @@ impl Core {
+             recovering,
+         });
+         self.apply_size(&mut st, id);
+-        let paint = first_paint(&st, id, req.history);
++        // Back after a dropped line with `resize_history`: a history
++        // replacement may have been cut there after its ESC[3J, and nothing
++        // here knows how far it got. The drop is the loss: the stream owes a
++        // complete replacement until one is out whole (through an alternate
++        // screen, or a repair dropped before it went out). Otherwise the
++        // first paint as before.
++        let resize_history = st.viewers[&id].last().unwrap().resize_history;
++        let lost = req.resumed && resize_history > 0;
++        let (paint, clears) = if lost {
++            resize_paint_for(&st, id, resize_history, true)
++        } else {
++            (first_paint(&st, id, req.history), false)
++        };
+         st.viewers.get_mut(&id).unwrap().last_mut().unwrap().repaint_pending = false;
+         conn.with(|out| {
+             out.open_paused(channel);
+@@ -233,7 +251,11 @@ impl Core {
+                 let size = [t.cols.to_le_bytes(), t.rows.to_le_bytes()].concat();
+                 out.resize(channel, &size);
+             }
+-            out.data(channel, &paint);
++            // Whole, never refused (a large `history` must not vanish).
++            out.paint(channel, &paint, clears);
++            if lost {
++                out.mark_history_lost(channel);
++            }
+         });
+         Ok(channel)
+     }
+@@ -284,10 +306,18 @@ impl Core {
+             (paint, bounded)
+         });
+         let mut behind = Vec::new();
++        let main_screen = !full_screen;
+         for (index, v) in st.viewers.get_mut(&id).into_iter().flatten().enumerate().filter(|_| !scrolling) {
+             if v.repaint_pending {
+                 continue;
+             }
++            // Owed a history repair (it was deferred while the program was on
++            // the alternate screen): back on the main screen, repaint instead.
++            if v.resize_history > 0 && main_screen && v.conn.outbox().repair_owed(v.channel) {
++                v.repaint_pending = true;
++                v.conn.wake.notify_one();
++                continue;
++            }
+             let taller =
+                 !v.resize_notifications && !v.observe && v.sized && v.desktop_group.is_some() && v.size.1 > rows;
+             let bytes = if v.recovering {
+@@ -305,6 +335,19 @@ impl Core {
+                 }
+             });
+         }
++        // A viewer with `resize_history` may have been cut off in the middle
++        // of a history replacement (after its ESC[3J): it gets a complete one
++        // again, serialized when it has credit, like a resize paint.
++        if let Some(viewers) = st.viewers.get_mut(&id) {
++            behind.retain(|index| {
++                let v = &mut viewers[*index];
++                if v.resize_history > 0 {
++                    v.repaint_pending = true;
++                    v.conn.wake.notify_one();
++                }
++                v.resize_history == 0
++            });
++        }
+         if !behind.is_empty() {
+             let paint = first_paint(st, id, 0);
+             let recovering = st.screens[&id].continuation().is_none();
+@@ -650,14 +693,25 @@ impl Core {
+         if !st.viewers.get(&id).into_iter().flatten().any(ready) {
+             return;
+         }
+-        let paint = first_paint(st, id, 0);
++        // One paint per distinct (`resize_history`, history lost): viewers
++        // without it share the screen-only paint, as before.
++        let lost = |v: &Viewer| v.resize_history > 0 && v.conn.outbox().history_lost(v.channel);
++        let mut paints: Vec<((usize, bool), (Vec<u8>, bool))> = Vec::new();
++        for key in st.viewers[&id].iter().filter(|v| ready(v)).map(|v| (v.resize_history, lost(v))) {
++            if !paints.iter().any(|(k, _)| *k == key) {
++                paints.push((key, resize_paint_for(st, id, key.0, key.1)));
++            }
++        }
+         let recovering = st.screens[&id].continuation().is_none();
+         for v in st.viewers.get_mut(&id).into_iter().flatten().filter(|v| ready(v)) {
++            let key = (v.resize_history, lost(v));
++            let (paint, clears) = &paints.iter().find(|(k, _)| *k == key).expect("built above").1;
++            // Queued whole, never refused: the RESIZE is always followed by its paint.
+             v.conn.with(|out| {
+                 if !v.observe && v.desktop_group.is_some() {
+-                    out.repaint(v.channel, &paint);
++                    out.repaint_clearing(v.channel, paint, *clears);
+                 } else {
+-                    out.data(v.channel, &paint);
++                    out.paint(v.channel, paint, *clears);
+                 }
+             });
+             v.repaint_pending = false;
+@@ -834,10 +888,52 @@ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u
+ /// must see them too; a viewer repainted after falling behind gets the mode
+ /// either way).
+ pub(crate) fn first_paint(st: &State, id: u32, history: usize) -> Vec<u8> {
++    let screen = &st.screens[&id];
++    finish_paint(st, id, screen.paint(history))
++}
++
++/// The repaint after a RESIZE for a viewer that asked for `history` rows of
++/// it, and whether it clears the viewer's history. With `history > 0` on the
++/// main screen it is CAN, the screen's reset (ending `ESC[H ESC[2J`), then
++/// `ESC[3J`, so the history that follows replaces the viewer's, then the
++/// screen. Only when all of it fits [`RESIZE_PAINT_BUDGET`] (all `history`
++/// rows, or every row there is): otherwise, and on the alternate screen
++/// (whose paint carries no history), it is the screen-only paint without
++/// `ESC[3J`, so the viewer keeps its own history rather than losing rows.
++/// `force`: a history-clearing paint was cut short, so the viewer's history
++/// may be gone; it gets the whole history whatever the size. 0: exactly
++/// [`first_paint`] without history.
++pub(crate) fn resize_paint_for(st: &State, id: u32, history: usize, force: bool) -> (Vec<u8>, bool) {
++    let screen = &st.screens[&id];
++    if history > 0 && !screen.alt_screen() {
++        let mut painted = screen.paint(history.min(MAX_RESIZE_HISTORY));
++        let at = ghostty_vt::PAINT_RESET.len();
++        debug_assert!(painted.starts_with(ghostty_vt::PAINT_RESET));
++        painted.splice(at..at, *b"\x1b[3J");
++        let paint = finish_paint(st, id, painted);
++        if force || paint.len() <= RESIZE_PAINT_BUDGET {
++            return (paint, true);
++        }
++    }
++    (first_paint(st, id, 0), false)
++}
++
++/// [`resize_paint_for`]'s bytes, not forced.
++pub(crate) fn resize_paint(st: &State, id: u32, history: usize) -> Vec<u8> {
++    resize_paint_for(st, id, history, false).0
++}
++
++/// Most history rows a resize paint carries (`resize_history` above it is this).
++pub const MAX_RESIZE_HISTORY: usize = 100_000;
++/// Largest history-replacing resize paint: half the stream backlog limit
++/// ([`crate::wire::MAX_PENDING`]), so output that follows it still fits.
++pub const RESIZE_PAINT_BUDGET: usize = crate::wire::MAX_PENDING / 2;
++
++fn finish_paint(st: &State, id: u32, painted: Vec<u8>) -> Vec<u8> {
+     #[cfg(test)]
+     tests::PAINTS.with(|n| n.set(n.get() + 1));
+     let screen = &st.screens[&id];
+-    let mut paint = paint_state(st, id, screen.paint(history));
++    let mut paint = paint_state(st, id, painted);
+     if let Some(continuation) = screen.continuation() {
+         paint.extend(continuation);
+     }
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index e1dc9fd..bab76c0 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -18,6 +18,7 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+         channel: 1,
+         observe: false,
+         resize_notifications: false,
++        resize_history: 0,
+         repaint_pending: false,
+         size,
+         active_at,
+@@ -202,6 +203,7 @@ fn resumed_viewers_hold_the_inherited_grid_until_a_physical_size_arrives() {
+             focus_updates: false,
+             focused: false,
+             history: 0,
++            resize_history: 0,
+             size,
+             display: Display::default(),
+             resumed,
+@@ -246,6 +248,7 @@ fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement(
+         focus_updates: false,
+         focused: false,
+         history: 0,
++        resize_history: 0,
+         size,
+         display: Display::default(),
+         resumed,
+@@ -315,6 +318,7 @@ fn viewer_diagnostics_track_visibility_group_min_and_disconnect() {
+         focus_updates: false,
+         focused: false,
+         history: 0,
++        resize_history: 0,
+         size,
+         display: Display::default(),
+         resumed: false,
+@@ -392,6 +396,7 @@ fn legacy_viewer_stays_visible_and_eligible_until_detach() {
+                 focus_updates: false,
+                 focused: false,
+                 history: 0,
++                resize_history: 0,
+                 size: (100, 40),
+                 display: Display::default(),
+                 resumed: false,
+@@ -437,6 +442,7 @@ async fn relayed_viewer_origin_and_pid_mask_survive_peer_line_cleanup() {
+                 focus_updates: false,
+                 focused: false,
+                 history: 0,
++                resize_history: 0,
+                 size: (80, 24),
+                 display: Display::default(),
+                 resumed: false,
+@@ -472,6 +478,7 @@ async fn fresh_same_size_reoffers_do_not_ping_pong_between_desktop_groups() {
+         focus_updates: false,
+         focused: false,
+         history: 0,
++        resize_history: 0,
+         size,
+         display: Display::default(),
+         resumed,
+@@ -546,6 +553,7 @@ fn wider_desktop_viewer_wraps_inline_redraw_at_the_shared_width() {
+         focus_updates: false,
+         focused: false,
+         history: 0,
++        resize_history: 0,
+         size,
+         display: Display::default(),
+         resumed: false,
+@@ -597,6 +605,7 @@ fn larger_desktop_viewers_keep_only_the_shared_scrolling_grid() {
+         focus_updates: false,
+         focused: false,
+         history: 0,
++        resize_history: 0,
+         size,
+         display: Display::default(),
+         resumed: false,
+@@ -657,6 +666,7 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
+         focus_updates: false,
+         focused: false,
+         history: 0,
++        resize_history: 0,
+         size: (80, 24),
+         display: Display::default(),
+         resumed: false,
+@@ -725,6 +735,7 @@ fn focus_request(size: (u16, u16), group: Option<(&str, &str)>, focus_updates: b
+         focus_updates,
+         focused,
+         history: 0,
++        resize_history: 0,
+         size,
+         display: Display::default(),
+         resumed: false,
+@@ -930,3 +941,841 @@ fn a_visible_focused_desktop_wins_over_a_phone() {
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++/// A phone-like viewer: interactive, no desktop group, gets RESIZE frames.
++fn history_request(resize_history: usize) -> AttachRequest {
++    AttachRequest {
++        observe: false,
++        resize_notifications: true,
++        visible: true,
++        visibility_updates: false,
++        focus_updates: false,
++        focused: false,
++        history: 0,
++        resize_history,
++        size: (20, 4),
++        display: Display::default(),
++        resumed: false,
++        desktop_group: None,
++    }
++}
++
++/// 12 lines on a 20x4 grid: `row00`..`row08` in history, the rest on screen.
++fn core_with_history() -> (Arc<Core>, u32, std::path::PathBuf, Arc<Conn>, u32) {
++    let (core, id, root) = core_with_screen(20, 4);
++    let text: String = (0..12).map(|n| format!("row{n:02}\r\n")).collect();
++    core.lock().screens.get_mut(&id).unwrap().write(text.as_bytes());
++    let desktop = desktop_conn();
++    let mut req = focus_request((20, 4), Some(("line", "desktop")), false, false);
++    req.resize_notifications = false;
++    let channel = core.attach(&desktop, id, req).unwrap();
++    core.viewer_resize(&desktop, channel, 20, 4);
++    (core, id, root, desktop, channel)
++}
++
++/// Every frame queued on `channel` since the last call: (kind, payload).
++fn frames(conn: &Arc<Conn>, channel: u32) -> Vec<(u8, Vec<u8>)> {
++    let mut got = Vec::new();
++    conn.with(|out| {
++        out.resume(channel);
++        got.extend(std::iter::from_fn(|| out.next_frame()).map(|f| (f[4], f[wire::HEADER..].to_vec())));
++    });
++    got
++}
++
++/// The RESIZE then the one paint a resize sent this viewer.
++fn resize_and_paint(conn: &Arc<Conn>, channel: u32) -> Vec<u8> {
++    let got = frames(conn, channel);
++    assert_eq!(got.len(), 2, "RESIZE then one paint: {:?}", got.iter().map(|f| f.0).collect::<Vec<_>>());
++    assert_eq!(got[0], (wire::RESIZE, vec![30, 0, 4, 0]));
++    assert_eq!(got[1].0, wire::DATA);
++    got[1].1.clone()
++}
++
++fn has(paint: &[u8], text: &str) -> bool {
++    paint.windows(text.len()).any(|w| w == text.as_bytes())
++}
++
++#[test]
++fn a_resize_history_viewer_gets_its_last_n_history_rows_after_clearing_its_own() {
++    let (core, id, root, desktop, leader) = core_with_history();
++    let phone = Arc::new(Conn::default());
++    let channel = core.attach(&phone, id, history_request(3)).unwrap();
++    frames(&phone, channel); // RESIZE + first paint at attach
++    core.viewer_resize(&desktop, leader, 30, 4);
++    core.queue_resize_paints(&mut core.lock(), id, None);
++    let paint = resize_and_paint(&phone, channel);
++    let mut start = vec![0x18];
++    start.extend(ghostty_vt::PAINT_RESET);
++    start.extend(b"\x1b[3J");
++    assert!(paint.starts_with(&start), "CAN, the screen reset, then ESC[3J: {:?}", String::from_utf8_lossy(&paint));
++    assert!(has(&paint, "row06") && has(&paint, "row07") && has(&paint, "row08"), "the last 3 history rows");
++    assert!(!has(&paint, "row05"), "only the last 3");
++    assert!(has(&paint, "row11"), "and the screen");
++    // Replayed on a viewer with history of its own, the history is the core's.
++    let mut screen = ghostty_vt::Terminal::new(30, 4, 1 << 20);
++    screen.write(b"old1\r\nold2\r\nold3\r\nold4\r\nold5\r\nold6\r\n");
++    screen.write(&paint);
++    let all = screen.plain_text();
++    assert!(!all.contains("old"), "ESC[3J dropped the viewer's own history: {all:?}");
++    assert!(all.starts_with("row06\nrow07\nrow08\n") && all.ends_with("row09\nrow10\nrow11"), "{all:?}");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn a_viewer_without_resize_history_gets_the_screen_only_paint_byte_for_byte() {
++    let params: crate::api::AttachParams =
++        serde_json::from_value(serde_json::json!({"terminal": "t1", "cols": 20, "rows": 4})).unwrap();
++    assert_eq!(params.resize_history, 0, "absent means 0");
++    let (core, id, root, desktop, leader) = core_with_history();
++    let phone = Arc::new(Conn::default());
++    let channel = core.attach(&phone, id, history_request(params.resize_history)).unwrap();
++    frames(&phone, channel);
++    core.viewer_resize(&desktop, leader, 30, 4);
++    core.queue_resize_paints(&mut core.lock(), id, None);
++    let paint = resize_and_paint(&phone, channel);
++    assert_eq!(paint, first_paint(&core.lock(), id, 0), "today's screen-only paint");
++    assert!(!has(&paint, "\x1b[3J") && !has(&paint, "row08"));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn viewers_with_different_resize_history_each_get_their_own_paint_built_once() {
++    let (core, id, root, desktop, leader) = core_with_history();
++    let views: Vec<(usize, Arc<Conn>, u32)> = [0, 0, 2, 5, 5]
++        .into_iter()
++        .map(|n| {
++            let conn = Arc::new(Conn::default());
++            let channel = core.attach(&conn, id, history_request(n)).unwrap();
++            frames(&conn, channel);
++            (n, conn, channel)
++        })
++        .collect();
++    core.viewer_resize(&desktop, leader, 30, 4);
++    PAINTS.set(0);
++    core.queue_resize_paints(&mut core.lock(), id, None);
++    assert_eq!(PAINTS.get(), 3, "one paint per distinct resize_history (0, 2, 5)");
++    let paints: Vec<(usize, Vec<u8>)> =
++        views.iter().map(|(n, conn, channel)| (*n, resize_and_paint(conn, *channel))).collect();
++    assert_eq!(paints[0].1, paints[1].1);
++    assert_eq!(paints[3].1, paints[4].1);
++    let st = core.lock();
++    assert_eq!(paints[0].1, first_paint(&st, id, 0));
++    assert_eq!(paints[2].1, resize_paint(&st, id, 2));
++    assert_eq!(paints[3].1, resize_paint(&st, id, 5));
++    let p2 = &paints[2].1;
++    assert!(has(p2, "\x1b[3J") && has(p2, "row07") && has(p2, "row08") && !has(p2, "row06"));
++    let p5 = &paints[3].1;
++    assert!(has(p5, "\x1b[3J") && has(p5, "row04") && has(p5, "row08") && !has(p5, "row03"));
++    drop(st);
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// `wire` frames of one stream, as a viewer reads them: RESIZE, then the
++/// paint's bytes in order however they were split.
++fn read_resize_and_paint(conn: &Arc<Conn>, channel: u32) -> (Vec<u8>, Vec<u8>, usize) {
++    let mut got = frames(conn, channel).into_iter();
++    let (kind, size) = got.next().expect("a RESIZE");
++    assert_eq!(kind, wire::RESIZE);
++    let mut paint = Vec::new();
++    let mut count = 0;
++    for (kind, payload) in got {
++        assert_eq!(kind, wire::DATA, "nothing but the paint after the RESIZE");
++        paint.extend(payload);
++        count += 1;
++    }
++    (size, paint, count)
++}
++
++/// Every cell changes color: thousands of rows format to megabytes.
++fn core_with_heavy_history(rows: usize) -> (Arc<Core>, u32, std::path::PathBuf, Arc<Conn>, u32) {
++    let (core, id, root) = core_with_screen(200, 4);
++    let mut screen = ghostty_vt::Terminal::new(200, 4, 256 << 20);
++    for n in 0..rows {
++        let cells: String = (0..196)
++            .map(|c| {
++                let (r, g) = ((n * 7 + c) % 256, (n * 13 + c * 3) % 256);
++                format!("\x1b[38;2;{r};{g};{c}m\x1b[48;2;{g};{c};{r}mx")
++            })
++            .collect();
++        screen.write(format!("{n:04}{cells}\r\n").as_bytes());
++    }
++    core.lock().screens.insert(id, screen);
++    let desktop = desktop_conn();
++    let mut req = focus_request((200, 4), Some(("line", "desktop")), false, false);
++    req.resize_notifications = false;
++    let leader = core.attach(&desktop, id, req).unwrap();
++    core.viewer_resize(&desktop, leader, 200, 4);
++    (core, id, root, desktop, leader)
++}
++
++fn phone_on(core: &Arc<Core>, id: u32, resize_history: usize) -> (Arc<Conn>, u32) {
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(resize_history);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    // Plenty of credit: the whole paint comes out now, in 16 KiB frames.
++    phone.with(|out| out.credit(channel, 64 << 20));
++    frames(&phone, channel);
++    (phone, channel)
++}
++
++/// Review v3 (4): when the whole requested history does not fit the budget,
++/// the paint is the screen only, without ESC[3J: never fewer rows after a
++/// clear, which would delete the viewer's older rows.
++#[test]
++fn a_history_paint_over_the_budget_is_the_screen_only_paint_without_clearing() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(4000);
++    let (phone, channel) = phone_on(&core, id, 1000);
++    core.viewer_resize(&desktop, leader, 210, 4);
++    {
++        let st = core.lock();
++        let full = finish_paint(&st, id, st.screens[&id].paint(1000)).len();
++        assert!(full > RESIZE_PAINT_BUDGET, "the test needs a paint over the budget: {full}");
++    }
++    core.queue_resize_paints(&mut core.lock(), id, None);
++    let (size, paint, _) = read_resize_and_paint(&phone, channel);
++    assert_eq!(size, vec![210, 0, 4, 0]);
++    assert_eq!(paint, first_paint(&core.lock(), id, 0), "the screen-only paint");
++    assert!(!has(&paint, "\x1b[3J") && !has(&paint, "3996"));
++    // Within the budget, the same pane gets its whole history replaced.
++    let (phone, channel) = phone_on(&core, id, 200);
++    core.viewer_resize(&desktop, leader, 200, 4);
++    core.queue_resize_paints(&mut core.lock(), id, None);
++    let (_, paint, _) = read_resize_and_paint(&phone, channel);
++    assert!(paint.len() <= RESIZE_PAINT_BUDGET);
++    assert!(has(&paint, "\x1b[3J") && has(&paint, "3797") && has(&paint, "3996") && !has(&paint, "3796"));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Review v3 (1): live output overflows the backlog while a history
++/// replacement is only partly out (its ESC[3J already delivered). The viewer
++/// must get a complete replacement again, never the screen-only recovery.
++#[test]
++fn a_history_replacement_cut_by_live_output_is_sent_again_whole() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(4000);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(200);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    frames(&phone, channel);
++    // No credit left, like a slow phone.
++    phone.with(|out| {
++        assert!(out.data(channel, &vec![b'x'; wire::WINDOW * 2]));
++        while out.next_frame().is_some() {}
++    });
++    core.viewer_resize(&desktop, leader, 210, 4);
++    phone.with(|out| out.credit(channel, 64 * 1024));
++    core.prepare_repaints(&phone);
++    let full = resize_paint(&core.lock(), id, 200);
++    let prefix: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(has(&prefix, "\x1b[3J") && prefix.len() < full.len(), "a partial history replacement");
++    let mut viewer = ghostty_vt::Terminal::new(210, 4, 64 << 20);
++    viewer.write(b"old1\r\nold2\r\nold3\r\nold4\r\nold5\r\n");
++    viewer.write(&prefix);
++    // SGR-only output changes no text, but overflows the backlog behind the paint (over 4 MiB).
++    let sgr = b"\x1b[0m".repeat(8 * 1024);
++    for _ in 0..140 {
++        core.output(&mut core.lock(), id, &sgr);
++    }
++    phone.with(|out| out.credit(channel, 64 << 20));
++    core.prepare_repaints(&phone);
++    let rest: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(rest.starts_with(&[0x18]) && has(&rest, "\x1b[3J"), "a complete replacement again");
++    viewer.write(&rest);
++    let got = viewer.plain_text();
++    assert!(got.contains("3797") && got.contains("3996"), "every replaced row is back");
++    // Delivered whole: the next resize is the normal policy again.
++    assert!(!phone.outbox().history_lost(channel));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// A pane whose every cell has its own colors: `printed` lines of `cols`.
++fn dense_core(cols: u16, rows: u16, printed: u32) -> (Arc<Core>, u32, std::path::PathBuf, Arc<Conn>, u32) {
++    let (core, id, root) = core_with_screen(cols, rows);
++    let mut screen = ghostty_vt::Terminal::new(cols, rows, 64 << 20);
++    let mut text = Vec::new();
++    for row in 0..printed {
++        for col in 0..u32::from(cols) {
++            let x = row * u32::from(cols) + col;
++            let (a, b, c, d) = (x % 251, (x / 251) % 251, (x / 17) % 251, (x / 79) % 251);
++            text.extend(format!("\x1b[38;2;{a};{b};123;48;2;45;{c};{d}mX").as_bytes());
++        }
++        text.extend(b"\r\n");
++    }
++    screen.write(&text);
++    core.lock().screens.insert(id, screen);
++    let desktop = desktop_conn();
++    let mut req = focus_request((cols, rows), Some(("line", "desktop")), false, false);
++    req.resize_notifications = false;
++    let leader = core.attach(&desktop, id, req).unwrap();
++    core.viewer_resize(&desktop, leader, cols, rows);
++    (core, id, root, desktop, leader)
++}
++
++/// Review v3 (2): a screen bigger than the whole backlog limit is still
++/// delivered after its RESIZE, and so is a phone's large first paint.
++#[test]
++fn paints_over_the_backlog_limit_are_delivered_not_dropped() {
++    let (core, id, root, desktop, leader) = dense_core(200, 600, 610);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.size = (200, 600);
++    let channel = core.attach(&phone, id, req).unwrap();
++    phone.with(|out| out.credit(channel, 64 << 20));
++    frames(&phone, channel);
++    core.viewer_resize(&desktop, leader, 201, 600);
++    let screen = first_paint(&core.lock(), id, 0);
++    assert!(screen.len() > wire::MAX_PENDING, "the test needs a screen over the limit: {}", screen.len());
++    core.prepare_repaints(&phone);
++    let (size, paint, _) = read_resize_and_paint(&phone, channel);
++    assert_eq!(size, vec![201, 0, 88, 2]);
++    assert_eq!(paint, screen, "the whole screen-only paint (no history fits)");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++
++    let (core, id, root, _, _) = dense_core(200, 4, 1100);
++    let first = first_paint(&core.lock(), id, 1000);
++    assert!(first.len() > wire::MAX_PENDING, "{}", first.len());
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.history = 1000;
++    let channel = core.attach(&phone, id, req).unwrap();
++    phone.with(|out| out.credit(channel, 64 << 20));
++    let got: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert_eq!(got, first, "the phone's first paint with 1000 history rows arrives whole");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// The phone relies on ESC[3J coming after the reset's ED 2, however the
++/// paint is cut into frames: CAN, PAINT_RESET (ending ESC[H ESC[2J), ESC[3J,
++/// the history, then the screen, and nothing else between.
++#[test]
++fn a_split_history_paint_keeps_can_reset_clear_history_screen_order_on_the_wire() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(300);
++    let (phone, channel) = phone_on(&core, id, 50);
++    core.viewer_resize(&desktop, leader, 210, 4);
++    core.queue_resize_paints(&mut core.lock(), id, None);
++    let (_, paint, count) = read_resize_and_paint(&phone, channel);
++    assert!(count > 1, "the test needs a paint split across frames: {} bytes", paint.len());
++    assert_eq!(paint, resize_paint(&core.lock(), id, 50), "frames reassemble to the paint, in order");
++    let at = |text: &[u8], from: usize| {
++        from + paint[from..].windows(text.len()).position(|w| w == text).unwrap_or_else(|| panic!("{text:?}"))
++    };
++    assert_eq!(paint[0], 0x18, "CAN first");
++    assert_eq!(&paint[1..1 + ghostty_vt::PAINT_RESET.len()], ghostty_vt::PAINT_RESET);
++    assert!(ghostty_vt::PAINT_RESET.ends_with(b"\x1b[H\x1b[2J"), "the reset ends with its ED 2");
++    let clear = 1 + ghostty_vt::PAINT_RESET.len();
++    assert_eq!(&paint[clear..clear + 4], b"\x1b[3J", "ESC[3J right after the reset's ED 2");
++    assert_eq!(paint.windows(4).filter(|w| w == b"\x1b[3J").count(), 1);
++    let first = at(b"0247", clear);
++    // Then the oldest of the 50 history rows, with nothing before it but its style (SGR).
++    let mut rest = &paint[clear + 4..first];
++    while let Some(sgr) = rest.strip_prefix(b"\x1b[") {
++        let end = sgr.iter().position(|b| !b.is_ascii_digit() && *b != b';').unwrap();
++        assert_eq!(sgr[end], b'm', "only SGR before the first history row");
++        rest = &sgr[end + 1..];
++    }
++    assert!(rest.is_empty(), "only SGR before the first history row: {rest:?}");
++    assert!(!has(&paint[..first], "0246"));
++    let newest = at(b"0296", first);
++    let screen = at(b"0297", newest);
++    assert!(at(b"\x1b[H\x1b[2J", newest) < screen, "history pushed up, screen painted after");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn resize_history_is_capped_and_a_huge_count_never_wraps_to_none() {
++    let (core, id, root, desktop, leader) = core_with_history();
++    for asked in [MAX_RESIZE_HISTORY + 1, 1 << 32, usize::MAX] {
++        let (phone, channel) = {
++            let phone = Arc::new(Conn::default());
++            let channel = core.attach(&phone, id, history_request(asked)).unwrap();
++            frames(&phone, channel);
++            (phone, channel)
++        };
++        let st = core.lock();
++        let v = st.viewers[&id].iter().find(|v| Arc::ptr_eq(&v.conn, &phone)).unwrap();
++        assert_eq!(v.resize_history, MAX_RESIZE_HISTORY, "clamped at attach");
++        drop(st);
++        let paint = resize_paint(&core.lock(), id, asked);
++        assert!(has(&paint, "\x1b[3J") && has(&paint, "row00") && has(&paint, "row08"), "all history, not none");
++        drop((phone, channel));
++    }
++    // ghostty itself saturates instead of wrapping (the attach `history` path).
++    let paint = core.lock().screens[&id].paint(1 << 32);
++    assert!(has(&paint, "row00"));
++    drop((desktop, leader));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn resize_history_needs_resize_notifications() {
++    let (core, id, root, desktop, leader) = core_with_history();
++    let viewer = Arc::new(Conn::default());
++    let mut req = history_request(3);
++    req.resize_notifications = false;
++    let channel = core.attach(&viewer, id, req).unwrap();
++    let st = core.lock();
++    let v = st.viewers[&id].iter().find(|v| v.channel == channel && Arc::ptr_eq(&v.conn, &viewer)).unwrap();
++    assert_eq!(v.resize_history, 0, "no RESIZE frames, so no history repaints");
++    drop(st);
++    drop((desktop, leader));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++// The #88 reviewers' probes (v2 and v3 reviews), kept as regression tests.
++
++fn reviewer_dense(cols: u16, rows: u16, printed: u32) -> (Arc<Core>, u32, std::path::PathBuf, Arc<Conn>, u32) {
++    let (core, id, root) = core_with_screen(cols, rows);
++    let mut screen = ghostty_vt::Terminal::new(cols, rows, 64 << 20);
++    let mut text = Vec::new();
++    for row in 0..printed {
++        for col in 0..u32::from(cols) {
++            let x = row * u32::from(cols) + col;
++            text.extend(
++                format!(
++                    "\x1b[38;2;{};{};{};48;2;{};{};{}mX",
++                    x % 251,
++                    (x / 251) % 251,
++                    123,
++                    45,
++                    (x / 17) % 251,
++                    (x / 79) % 251
++                )
++                .as_bytes(),
++            );
++        }
++        text.extend(b"\r\n");
++    }
++    screen.write(&text);
++    core.lock().screens.insert(id, screen);
++    let desktop = desktop_conn();
++    let mut req = focus_request((cols, rows), Some(("line", "desktop")), false, false);
++    req.resize_notifications = false;
++    let leader = core.attach(&desktop, id, req).unwrap();
++    core.viewer_resize(&desktop, leader, cols, rows);
++    (core, id, root, desktop, leader)
++}
++
++#[test]
++fn reviewer_eight_mb_history_is_capped_and_ordered_across_frames() {
++    let (core, id, root, desktop, leader) = reviewer_dense(200, 4, 1100);
++    let phone = Arc::new(Conn::default());
++    let channel = core.attach(&phone, id, history_request(1000)).unwrap();
++    phone.with(|out| out.credit(channel, 64 << 20));
++    frames(&phone, channel);
++    core.viewer_resize(&desktop, leader, 201, 4);
++    let full = first_paint(&core.lock(), id, 1000);
++    let expected = resize_paint(&core.lock(), id, 1000);
++    eprintln!("8MB fixture: full={} capped={} budget={}", full.len(), expected.len(), RESIZE_PAINT_BUDGET);
++    assert!(full.len() > wire::MAX_PENDING);
++    assert!(expected.len() <= RESIZE_PAINT_BUDGET);
++    assert_eq!(expected, first_paint(&core.lock(), id, 0));
++    core.prepare_repaints(&phone);
++    core.output(&mut core.lock(), id, b"after-paint");
++    let got = frames(&phone, channel);
++    assert_eq!(got[0], (wire::RESIZE, vec![201, 0, 4, 0]));
++    assert!(got.len() > 2);
++    assert!(got[1..].iter().all(|(k, b)| *k == wire::DATA && b.len() <= 16 * 1024));
++    let bytes: Vec<u8> = got[1..].iter().flat_map(|(_, b)| b.clone()).collect();
++    assert_eq!(&bytes[..expected.len()], expected);
++    assert_eq!(&bytes[expected.len()..], b"after-paint");
++    assert_eq!(bytes[0], 0x18);
++    assert_eq!(&bytes[1..1 + ghostty_vt::PAINT_RESET.len()], ghostty_vt::PAINT_RESET);
++    assert!(!has(&bytes, "\x1b[3J"));
++
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn reviewer_large_screen_fallback_must_deliver_or_remain_pending() {
++    let (core, id, root, desktop, leader) = reviewer_dense(200, 600, 610);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.size = (200, 600);
++    let channel = core.attach(&phone, id, req).unwrap();
++    phone.with(|out| out.credit(channel, 64 << 20));
++    frames(&phone, channel);
++    core.viewer_resize(&desktop, leader, 201, 600);
++    let painted = resize_paint(&core.lock(), id, 1000).len();
++    let screen = first_paint(&core.lock(), id, 0).len();
++    core.prepare_repaints(&phone);
++    let queued = phone.outbox().queued(channel);
++    let pending = core.lock().viewers[&id].iter().find(|v| Arc::ptr_eq(&v.conn, &phone)).unwrap().repaint_pending;
++    eprintln!("large screen: resize={painted} screen_fallback={screen} queued={queued} repaint_pending={pending}");
++    let got = frames(&phone, channel);
++    eprintln!("large screen frames before later output={}", got.len());
++    core.output(&mut core.lock(), id, b"unrelated-live-output");
++    let late = frames(&phone, channel);
++    eprintln!("large screen frames after later output={late:?}");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(queued > 0 || pending, "both initial resize paint and fallback disappeared");
++}
++
++#[test]
++fn reviewer_eight_mb_attach_history_must_not_disappear() {
++    let (core, id, root, _, _) = reviewer_dense(200, 4, 1100);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.history = 1000;
++    let len = first_paint(&core.lock(), id, 1000).len();
++    let channel = core.attach(&phone, id, req).unwrap();
++    let queued = phone.outbox().queued(channel);
++    let pending = core.lock().viewers[&id].iter().find(|v| Arc::ptr_eq(&v.conn, &phone)).unwrap().repaint_pending;
++    eprintln!("8MB initial attach: paint={len} queued={queued} repaint_pending={pending}");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(queued > 0 || pending, "initial phone attach still ignores oversized history paint refusal");
++}
++
++#[test]
++fn reviewer_v3_cut_paint_then_same_capability_reconnect_must_restore_history() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(4000);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(200);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    frames(&phone, channel);
++    phone.with(|out| {
++        assert!(out.data(channel, &vec![b'x'; wire::WINDOW * 2]));
++        while out.next_frame().is_some() {}
++    });
++    core.viewer_resize(&desktop, leader, 210, 4);
++    phone.with(|out| out.credit(channel, 64 * 1024));
++    core.prepare_repaints(&phone);
++    let full = resize_paint(&core.lock(), id, 200);
++    let prefix: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(has(&prefix, "\x1b[3J") && prefix.len() < full.len());
++    let mut viewer = ghostty_vt::Terminal::new(210, 4, 64 << 20);
++    viewer.write(&prefix);
++    // The owner sees its old core-line connection go away. The relaying core
++    // keeps the viewer open, and reattach requests history=0,resumed=true.
++    core.detach(&phone, Some(channel));
++    let returned = Arc::new(Conn::default());
++    let mut req = history_request(200);
++    req.size = (200, 4);
++    req.resumed = true;
++    req.history = 0;
++    let new_channel = core.attach(&returned, id, req).unwrap();
++    returned.with(|out| out.credit(new_channel, 64 << 20));
++    let rest: Vec<u8> =
++        frames(&returned, new_channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    viewer.write(&rest);
++    let got = viewer.plain_text();
++    eprintln!(
++        "same-capability reconnect: full={} prefix={} resumed={} resumed_ED3={} core_has_3996={} viewer_has_3996={}",
++        full.len(),
++        prefix.len(),
++        rest.len(),
++        has(&rest, "\x1b[3J"),
++        core.lock().screens[&id].plain_text().contains("3996"),
++        got.contains("3996")
++    );
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(
++        got.contains("3996"),
++        "a confirmed history replacement was cut at line loss; same-capability reattach only repaints the screen"
++    );
++}
++
++#[test]
++fn reviewer_v3_forced_recovery_over_budget_keeps_all_rows_and_latest_resize() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(100);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    frames(&phone, channel);
++    phone.with(|out| {
++        assert!(out.data(channel, &vec![b'x'; wire::WINDOW * 2]));
++        while out.next_frame().is_some() {}
++    });
++    core.viewer_resize(&desktop, leader, 201, 4);
++    phone.with(|out| out.credit(channel, 64 * 1024));
++    core.prepare_repaints(&phone);
++    let prefix: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(has(&prefix, "\x1b[3J"));
++    let mut text = Vec::new();
++    for n in 100..650 {
++        text.extend(format!("{n:04}").as_bytes());
++        for c in 0..196 {
++            text.extend(
++                format!(
++                    "\x1b[38;2;{};{};{};48;2;{};{};{}mx",
++                    n % 251,
++                    c % 251,
++                    (n + c) % 251,
++                    c % 251,
++                    (n * 7 + c) % 251,
++                    123
++                )
++                .as_bytes(),
++            );
++        }
++        text.extend(b"\r\n");
++    }
++    for chunk in text.chunks(32 * 1024) {
++        core.output(&mut core.lock(), id, chunk);
++    }
++    core.viewer_resize(&desktop, leader, 202, 4);
++    core.viewer_resize(&desktop, leader, 203, 4);
++    assert!(phone.outbox().history_lost(channel));
++    let (expected, clears) = resize_paint_for(&core.lock(), id, 1000, true);
++    assert!(clears && expected.len() > RESIZE_PAINT_BUDGET);
++    let fallback = resize_paint(&core.lock(), id, 1000);
++    assert!(!has(&fallback, "\x1b[3J"));
++    phone.with(|out| out.credit(channel, 64 << 20));
++    core.prepare_repaints(&phone);
++    let (size, actual, _) = read_resize_and_paint(&phone, channel);
++    assert_eq!(size, vec![203, 0, 4, 0]);
++    assert_eq!(actual, expected);
++    assert!(!phone.outbox().history_lost(channel));
++    PAINTS.set(0);
++    core.prepare_repaints(&phone);
++    assert_eq!(PAINTS.get(), 0, "completed repair must not repeat");
++    core.viewer_resize(&desktop, leader, 204, 4);
++    core.prepare_repaints(&phone);
++    let (_, fresh, _) = read_resize_and_paint(&phone, channel);
++    assert!(!has(&fresh, "\x1b[3J"), "fresh oversized resize returns to screen-only policy");
++    eprintln!("forced whole recovery: {} bytes, fallback {} bytes, one latest RESIZE", actual.len(), fallback.len());
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn reviewer_v3_initial_history_paint_survives_live_output_before_writer() {
++    let (core, id, root, _, _) = reviewer_dense(200, 4, 1100);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.history = 1000;
++    let expected = first_paint(&core.lock(), id, 1000);
++    let channel = core.attach(&phone, id, req).unwrap();
++    // Output can run before the separate connection writer sends the first
++    // paint. A tiny write should fit the bounded live backlog behind it.
++    core.output(&mut core.lock(), id, b"\x1b[0m");
++    phone.with(|out| out.resume(channel));
++    core.prepare_repaints(&phone);
++    phone.with(|out| out.credit(channel, 64 << 20));
++    let got: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    eprintln!(
++        "initial whole paint plus live output: expected={} got={} ED3={}",
++        expected.len(),
++        got.len(),
++        has(&got, "\x1b[3J")
++    );
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(
++        got.starts_with(&expected),
++        "ordinary live output discarded the whole attach history paint before the writer could send it"
++    );
++}
++
++#[test]
++fn reviewer_v3_cut_history_then_alt_screen_must_recover_on_main_screen_return() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(4000);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(200);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    frames(&phone, channel);
++    phone.with(|out| {
++        assert!(out.data(channel, &vec![b'x'; wire::WINDOW * 2]));
++        while out.next_frame().is_some() {}
++    });
++    core.viewer_resize(&desktop, leader, 210, 4);
++    phone.with(|out| out.credit(channel, 64 * 1024));
++    core.prepare_repaints(&phone);
++    let prefix: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(has(&prefix, "\x1b[3J"));
++    let mut viewer = ghostty_vt::Terminal::new(210, 4, 64 << 20);
++    viewer.write(&prefix);
++    let sgr = b"\x1b[0m".repeat(8 * 1024);
++    for _ in 0..140 {
++        core.output(&mut core.lock(), id, &sgr);
++    }
++    core.output(&mut core.lock(), id, b"\x1b[?1049halternate");
++    phone.with(|out| out.credit(channel, 64 << 20));
++    core.prepare_repaints(&phone);
++    let alt: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    viewer.write(&alt);
++    assert!(viewer.alt_screen() && phone.outbox().history_lost(channel));
++    core.output(&mut core.lock(), id, b"\x1b[?1049l");
++    core.prepare_repaints(&phone);
++    let back: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    viewer.write(&back);
++    assert!(!viewer.alt_screen());
++    let got = viewer.plain_text();
++    let pending = core.lock().viewers[&id].iter().find(|v| Arc::ptr_eq(&v.conn, &phone)).unwrap().repaint_pending;
++    eprintln!(
++        "alt-screen recovery: alt={} back={} history_lost={} pending={pending} core_has_3996={} viewer_has_3996={}",
++        alt.len(),
++        back.len(),
++        phone.outbox().history_lost(channel),
++        core.lock().screens[&id].plain_text().contains("3996"),
++        got.contains("3996")
++    );
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(
++        got.contains("3996"),
++        "alternate-screen retry consumed repaint_pending without restoring the cut main-screen history on return"
++    );
++}
++
++#[test]
++fn reviewer_v3_n1000_live_backpressure_uses_screen_only_without_clearing() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(4000);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    frames(&phone, channel);
++    phone.with(|out| {
++        assert!(out.data(channel, &vec![b'x'; wire::WINDOW * 2]));
++        while out.next_frame().is_some() {}
++    });
++    core.viewer_resize(&desktop, leader, 210, 4);
++    phone.with(|out| out.credit(channel, 64 * 1024));
++    core.prepare_repaints(&phone);
++    let prefix: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert_eq!(prefix, first_paint(&core.lock(), id, 0));
++    assert!(!has(&prefix, "\x1b[3J"));
++    let sgr = b"\x1b[0m".repeat(8 * 1024);
++    for _ in 0..140 {
++        core.output(&mut core.lock(), id, &sgr);
++    }
++    phone.with(|out| out.credit(channel, 64 << 20));
++    core.prepare_repaints(&phone);
++    let after: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert_eq!(after, first_paint(&core.lock(), id, 0));
++    assert!(!has(&after, "\x1b[3J"));
++    eprintln!(
++        "N1000 oversized history: first {} bytes, recovery {} bytes, both screen-only without ED3",
++        prefix.len(),
++        after.len()
++    );
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn reviewer_live_backpressure_must_not_replace_partial_history_with_screen_only() {
++    let (core, id, root, desktop, leader) = core_with_heavy_history(4000);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(200);
++    req.size = (200, 4);
++    let channel = core.attach(&phone, id, req).unwrap();
++    frames(&phone, channel);
++    // Leave no credit, like a slow phone; the next resize drops this filler.
++    phone.with(|out| {
++        assert!(out.data(channel, &vec![b'x'; wire::WINDOW * 2]));
++        while out.next_frame().is_some() {}
++    });
++    core.viewer_resize(&desktop, leader, 210, 4);
++    phone.with(|out| out.credit(channel, 64 * 1024));
++    core.prepare_repaints(&phone);
++    let full = resize_paint(&core.lock(), id, 200);
++    let partial = frames(&phone, channel);
++    let prefix: Vec<u8> = partial.iter().filter(|(k, _)| *k == wire::DATA).flat_map(|(_, b)| b.clone()).collect();
++    assert!(has(&prefix, "\x1b[3J"));
++    assert!(prefix.len() < full.len());
++    let mut viewer = ghostty_vt::Terminal::new(210, 4, 64 << 20);
++    viewer.write(b"old1\r\nold2\r\nold3\r\nold4\r\nold5\r\n");
++    viewer.write(&prefix);
++    // Ordinary SGR output changes no text/history, but fills the unsent
++    // backlog in bounded PTY-sized writes while the phone is out of credit.
++    let sgr = b"\x1b[0m".repeat(8 * 1024);
++    for _ in 0..100 {
++        core.output(&mut core.lock(), id, &sgr);
++    }
++    phone.with(|out| out.credit(channel, 64 << 20));
++    core.prepare_repaints(&phone);
++    let later = frames(&phone, channel);
++    let suffix: Vec<u8> = later.iter().filter(|(k, _)| *k == wire::DATA).flat_map(|(_, b)| b.clone()).collect();
++    viewer.write(&suffix);
++    let got = viewer.plain_text();
++    let retained = core.lock().screens[&id].plain_text().contains("3996");
++    eprintln!(
++        "pressure: full={} prefix={} remaining={} replacement_has_ED3={} core_retains_3996={retained} viewer_retains_3996={}",
++        full.len(),
++        prefix.len(),
++        suffix.len(),
++        has(&suffix, "\x1b[3J"),
++        got.contains("3996")
++    );
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(retained);
++    assert!(
++        got.contains("3996"),
++        "live-output overflow superseded the unsent history paint with a screen-only paint after ED3 had already cleared the phone"
++    );
++}
++
++/// Review v4 (b), at the owner: a stream resumed after a dropped line owes
++/// a whole replacement (here over 2 MiB) from the start. If output
++/// overflows the backlog behind it before any of it went out (the stream is
++/// still paused for the attach reply), the repair is still owed, and what
++/// arrives is the whole replacement, never the screen-only paint.
++#[test]
++fn a_resumed_repair_dropped_before_it_went_out_is_still_owed() {
++    let (core, id, root, _, _) = reviewer_dense(200, 4, 1100);
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(1000);
++    req.resumed = true;
++    let channel = core.attach(&phone, id, req).unwrap();
++    assert!(phone.outbox().history_lost(channel), "the dropped line is the loss");
++    let sgr = b"\x1b[0m".repeat(8 * 1024);
++    for _ in 0..140 {
++        core.output(&mut core.lock(), id, &sgr);
++    }
++    let (expected, clears) = resize_paint_for(&core.lock(), id, 1000, true);
++    assert!(clears && expected.len() > RESIZE_PAINT_BUDGET);
++    phone.with(|out| {
++        out.resume(channel);
++        out.credit(channel, 64 << 20);
++    });
++    core.prepare_repaints(&phone);
++    let got: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(got.starts_with(&expected), "the whole replacement: {} of {} bytes", got.len(), expected.len());
++    assert!(!phone.outbox().history_lost(channel), "repaid once it is out whole");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Review v4 (a), at the owner: resumed on the alternate screen, the repair
++/// stays owed and goes out when the program is back on the main screen.
++#[test]
++fn a_resumed_stream_on_the_alternate_screen_is_repaired_on_return() {
++    let (core, id, root, _, _) = core_with_heavy_history(400);
++    core.output(&mut core.lock(), id, b"\x1b[?1049halt");
++    let phone = Arc::new(Conn::default());
++    let mut req = history_request(200);
++    req.size = (200, 4);
++    req.resumed = true;
++    let channel = core.attach(&phone, id, req).unwrap();
++    phone.with(|out| out.credit(channel, 64 << 20));
++    let alt: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert!(!has(&alt, "\x1b[3J"), "no history on the alternate screen");
++    assert!(phone.outbox().repair_owed(channel));
++    core.output(&mut core.lock(), id, b"\x1b[?1049l");
++    core.prepare_repaints(&phone);
++    let back: Vec<u8> = frames(&phone, channel).into_iter().filter(|f| f.0 == wire::DATA).flat_map(|f| f.1).collect();
++    assert_eq!(back, resize_paint_for(&core.lock(), id, 200, true).0, "the whole replacement");
++    assert!(!phone.outbox().history_lost(channel));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
+diff --git a/crates/herdr-core/src/wire.rs b/crates/herdr-core/src/wire.rs
+index 84f4585..270faee 100644
+--- a/crates/herdr-core/src/wire.rs
++++ b/crates/herdr-core/src/wire.rs
+@@ -178,6 +178,37 @@ struct Stream {
+     credit: usize,
+     /// The program ended: CLOSE (with this reason) once `pending` is out.
+     ending: Option<Vec<u8>>,
++    /// The authoritative paint at the front of `pending`: its length, and
++    /// how much of it is still unsent.
++    paint_len: usize,
++    paint_left: usize,
++    /// That paint clears the viewer's history (ESC[3J) before replacing it.
++    paint_clears: bool,
++    /// A history-clearing paint was cut short after it started going out:
++    /// the viewer may have lost its history, so its next paint must carry
++    /// all of it. Cleared once such a paint is out whole.
++    history_lost: bool,
++}
++
++impl Stream {
++    /// Unsent bytes are about to go: note a history-clearing paint cut short.
++    fn drop_pending(&mut self) {
++        if self.paint_clears && self.paint_left > 0 && self.paint_left < self.paint_len {
++            self.history_lost = true;
++        }
++        self.pending.clear();
++        self.paint_len = 0;
++        self.paint_left = 0;
++        self.paint_clears = false;
++    }
++
++    fn start_paint(&mut self, bytes: &[u8], clears_history: bool) {
++        self.drop_pending();
++        self.pending.extend(bytes);
++        self.paint_len = bytes.len();
++        self.paint_left = bytes.len();
++        self.paint_clears = clears_history;
++    }
+ }
+ 
+ /// What one connection still has to send. Control frames always go first;
+@@ -209,7 +240,17 @@ impl Outbox {
+     pub fn open(&mut self, channel: u32) {
+         self.streams.insert(
+             channel,
+-            Stream { pending: VecDeque::new(), resizes: VecDeque::new(), paused: false, credit: WINDOW, ending: None },
++            Stream {
++                pending: VecDeque::new(),
++                resizes: VecDeque::new(),
++                paused: false,
++                credit: WINDOW,
++                ending: None,
++                paint_len: 0,
++                paint_left: 0,
++                paint_clears: false,
++                history_lost: false,
++            },
+         );
+     }
+ 
+@@ -233,7 +274,7 @@ impl Outbox {
+     /// A partly delivered escape sequence is cancelled by the repaint's CAN.
+     pub fn resize(&mut self, channel: u32, size: &[u8]) {
+         if let Some(s) = self.streams.get_mut(&channel) {
+-            s.pending.clear();
++            s.drop_pending();
+             s.resizes.clear();
+             s.resizes.push_back((0, size.to_vec()));
+         }
+@@ -249,12 +290,49 @@ impl Outbox {
+     /// Replace obsolete bytes with a self-contained paint, without a RESIZE
+     /// frame: legacy desktop clients keep their own pane geometry.
+     pub fn repaint(&mut self, channel: u32, bytes: &[u8]) {
++        self.repaint_clearing(channel, bytes, false);
++    }
++
++    /// `repaint` for a paint that may clear the viewer's history first.
++    pub fn repaint_clearing(&mut self, channel: u32, bytes: &[u8], clears_history: bool) {
+         if let Some(s) = self.streams.get_mut(&channel) {
+-            s.pending.clear();
+-            s.pending.extend(bytes);
++            s.start_paint(bytes, clears_history);
++        }
++    }
++
++    /// Queues an authoritative paint in place of unsent output, after any
++    /// RESIZE already queued. Never refused: a paint is one snapshot, not a
++    /// backlog, so `MAX_PENDING` does not apply to it (output after it does).
++    pub fn paint(&mut self, channel: u32, bytes: &[u8], clears_history: bool) {
++        if let Some(s) = self.streams.get_mut(&channel) {
++            let latest = s.resizes.pop_back();
++            s.resizes.clear();
++            if let Some((_, size)) = latest {
++                s.resizes.push_back((0, size));
++            }
++            s.start_paint(bytes, clears_history);
+         }
+     }
+ 
++    /// A history-clearing paint to this viewer was cut short: its next paint
++    /// must carry the whole history again.
++    pub fn history_lost(&self, channel: u32) -> bool {
++        self.streams.get(&channel).is_some_and(|s| s.history_lost)
++    }
++
++    /// The viewer's history may be gone (a stream resumed after a dropped
++    /// line): owed a whole clearing paint until one is out whole.
++    pub fn mark_history_lost(&mut self, channel: u32) {
++        if let Some(s) = self.streams.get_mut(&channel) {
++            s.history_lost = true;
++        }
++    }
++
++    /// History was lost and no clearing paint is on its way to repair it.
++    pub fn repair_owed(&self, channel: u32) -> bool {
++        self.streams.get(&channel).is_some_and(|s| s.history_lost && !(s.paint_clears && s.paint_left > 0))
++    }
++
+     /// Ends a stream now (the viewer detached): whatever is queued is dropped.
+     pub fn close(&mut self, channel: u32, reason: &[u8]) {
+         self.streams.remove(&channel);
+@@ -271,11 +349,12 @@ impl Outbox {
+     }
+ 
+     /// Queues stream output. Returns false (and drops the backlog) when the
+-    /// viewer is too far behind: the caller replaces it with a repaint.
++    /// viewer is too far behind: the caller replaces it with a repaint. Only
++    /// output counts: an unsent paint at the front is not backlog.
+     pub fn data(&mut self, channel: u32, bytes: &[u8]) -> bool {
+         let Some(s) = self.streams.get_mut(&channel) else { return true };
+-        if s.pending.len() + bytes.len() > MAX_PENDING {
+-            s.pending.clear();
++        if s.pending.len() - s.paint_left + bytes.len() > MAX_PENDING {
++            s.drop_pending();
+             let latest = s.resizes.pop_back();
+             s.resizes.clear();
+             if let Some((_, size)) = latest {
+@@ -341,6 +420,12 @@ impl Outbox {
+             *at -= n;
+         }
+         s.credit -= n;
++        if s.paint_left > 0 {
++            s.paint_left -= n.min(s.paint_left);
++            if s.paint_left == 0 && s.paint_clears {
++                s.history_lost = false;
++            }
++        }
+         let chunk: Vec<u8> = s.pending.drain(..n).collect();
+         Some(encode(channel, DATA, &chunk))
+     }
+@@ -350,6 +435,34 @@ impl Outbox {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn paints_are_never_refused_and_a_cut_history_paint_is_remembered_until_one_is_out_whole() {
++        let mut out = Outbox::default();
++        out.open(1);
++        out.credit(1, 64 << 20);
++        let big = vec![b'p'; MAX_PENDING + 1];
++        out.resize(1, &[80, 0, 24, 0]);
++        out.paint(1, &big, false);
++        assert_eq!(out.queued(1), big.len(), "a paint over MAX_PENDING is queued, not dropped");
++        while out.next_frame().is_some() {}
++        // A clearing paint cut short after its first bytes went out...
++        out.paint(1, &vec![b'h'; 3 * CHUNK], true);
++        out.next_frame().unwrap();
++        out.resize(1, &[81, 0, 24, 0]);
++        assert!(out.history_lost(1));
++        // ...stays remembered through screen-only paints, until a clearing one is out whole.
++        out.paint(1, b"screen", false);
++        while out.next_frame().is_some() {}
++        assert!(out.history_lost(1));
++        out.paint(1, &vec![b'h'; 3 * CHUNK], true);
++        while out.next_frame().is_some() {}
++        assert!(!out.history_lost(1));
++        // Cut before any byte went out: nothing reached the viewer, nothing lost.
++        out.paint(1, b"clearing", true);
++        out.resize(1, &[82, 0, 24, 0]);
++        assert!(!out.history_lost(1));
++    }
++
+     #[test]
+     fn resize_replaces_stalled_and_partially_sent_paints_atomically() {
+         let mut out = Outbox::default();
+@@ -506,3 +619,75 @@ mod tests {
+         assert!(!out.data(1, &vec![b'b'; MAX_PENDING]));
+     }
+ }
++// The #88 v3 reviewer's outbox probes, kept as regression tests.
++
++#[cfg(test)]
++mod reviewer_v3_wire {
++    use super::*;
++    #[test]
++    fn reviewer_v3_paint_queues_stay_bounded_across_viewers_and_resizes() {
++        let mut out = Outbox::default();
++        let paint = vec![b'p'; MAX_PENDING + 1024];
++        for ch in 1..=6 {
++            out.open(ch);
++        }
++        for round in 0..100 {
++            for ch in 1..=6 {
++                out.resize(ch, &[80 + (round % 20) as u8, 0, 24, 0]);
++                out.paint(ch, &paint, round % 2 == 0);
++                assert_eq!(out.queued(ch), paint.len());
++                assert_eq!(out.streams[&ch].resizes.len(), 1);
++                assert!(out.streams[&ch].pending.capacity() <= 2 * paint.len());
++            }
++            assert_eq!(out.streams.values().map(|s| s.pending.len()).sum::<usize>(), 6 * paint.len());
++        }
++        eprintln!(
++            "6 viewers x 100 large resizes: queued={} capacity={}",
++            out.streams.values().map(|s| s.pending.len()).sum::<usize>(),
++            out.streams.values().map(|s| s.pending.capacity()).sum::<usize>()
++        );
++    }
++    #[test]
++    fn reviewer_v3_max_pending_should_bound_output_behind_whole_paint() {
++        let mut out = Outbox::default();
++        out.open(1);
++        let paint = vec![b'p'; MAX_PENDING + 1];
++        out.paint(1, &paint, false);
++        assert!(
++            out.data(1, b"live"),
++            "MAX_PENDING includes the whole paint instead of only bounding live output behind it"
++        );
++        assert_eq!(out.queued(1), paint.len() + 4);
++    }
++}
++
++#[cfg(test)]
++mod reviewer_v3_repair_loop {
++    use super::*;
++    #[test]
++    fn reviewer_v3_one_loss_must_not_restart_oversized_repair_on_every_tiny_write() {
++        let mut out = Outbox::default();
++        out.open(1);
++        out.paint(1, &vec![b'h'; 3 * CHUNK], true);
++        out.next_frame().unwrap();
++        out.resize(1, &[80, 0, 24, 0]);
++        assert!(out.history_lost(1));
++        let repair = vec![b'r'; MAX_PENDING + 1];
++        let mut copies = 1;
++        out.paint(1, &repair, true);
++        for _ in 0..5 {
++            // One and the same loss; no repair byte goes out between writes.
++            if !out.data(1, b"\x1b[0m") {
++                out.paint(1, &repair, true);
++                copies += 1;
++            }
++        }
++        eprintln!(
++            "one history loss, zero repair bytes sent, five 4-byte writes: {copies} full repair copies queued successively"
++        );
++        assert!(
++            copies <= 1,
++            "count the live backlog separately: a whole pending repair must not be repeatedly discarded and reserialized by tiny writes"
++        );
++    }
++}
+diff --git a/crates/herdr-core/tests/resize_history.rs b/crates/herdr-core/tests/resize_history.rs
+new file mode 100644
+index 0000000..6418324
+--- /dev/null
++++ b/crates/herdr-core/tests/resize_history.rs
+@@ -0,0 +1,211 @@
++#![cfg(target_os = "linux")]
++//! `resize_history` end to end, here and through a relaying core: the attach
++//! reply confirms the N the owner applies, and the repaint after a RESIZE
++//! clears the viewer's history (ESC[3J) and carries the owner's.
++
++mod common;
++
++use common::framed::{Framed, Viewer};
++use common::*;
++use herdr_core::wire;
++use serde_json::json;
++use std::time::Duration;
++
++fn has(raw: &[u8], text: &[u8]) -> bool {
++    raw.windows(text.len()).any(|w| w == text)
++}
++
++#[test]
++fn resize_history_is_confirmed_here_and_through_a_relay_and_repaints_carry_history() {
++    let owner = Session::new();
++    let t = run(&owner, &["sh", "-c", "seq 1 40; exec sleep 100"]);
++    wait_until("output", || owner.json(&["read", &t])["text"].as_str().is_some_and(|s| s.contains("40")));
++    let mut pickle = Session::new();
++    pickle.env.push(fake_ssh(&pickle, &[("macro", &owner)]));
++    pickle.json(&["machine", "add", "macro"]);
++    let hello = Framed::open(&pickle).call("hello", json!({"framed": true}));
++    assert!(hello["result"]["features"].as_array().unwrap().iter().any(|f| f == "resize_history"), "{hello}");
++    let remote = format!("macro/{t}");
++
++    // Without resize_notifications nothing is applied, here or there.
++    for (session, terminal) in [(&owner, t.as_str()), (&pickle, remote.as_str())] {
++        let reply = Framed::open(session).call(
++            "terminal.attach",
++            json!({"terminal": terminal, "cols": 30, "rows": 10, "observe": true, "resize_history": 5}),
++        );
++        assert_eq!(reply["result"]["resize_history"], 0, "{reply}");
++        let reply = Framed::open(session).call(
++            "terminal.attach",
++            json!({"terminal": terminal, "cols": 30, "rows": 10, "resize_notifications": true, "resize_history": 5}),
++        );
++        assert_eq!(reply["result"]["resize_history"], 5, "confirmed: {reply}");
++    }
++
++    let extra = json!({"resize_notifications": true, "resize_history": 5});
++    let mut phone = Viewer::attach_on(Framed::open(&pickle), &remote, 30, 10, extra);
++    phone.conn.send(phone.channel, wire::RESIZE, &[30, 0, 10, 0]);
++    phone.until("first paint", |v| v.screen.plain_text().contains("40"));
++    phone.raw.clear();
++    phone.conn.send(phone.channel, wire::RESIZE, &[35, 0, 10, 0]);
++    phone.until("history repaint", |v| has(&v.raw, b"\x1b[3J") && has(&v.raw, b"40"));
++    let at = phone.raw.windows(4).position(|w| w == b"\x1b[3J").unwrap();
++    let after = &phone.raw[at..];
++    // 32..40 and the cursor row are the screen: 27..31 are the last 5 history rows.
++    assert!(after.starts_with(b"\x1b[3J27\r\n28\r\n29\r\n30\r\n31"), "{:?}", String::from_utf8_lossy(after));
++    assert!(!has(after, b"26"), "only the last 5 history rows");
++}
++
++/// Heavy rows (`R0000`..), each with many color changes: about 3 KB of VT
++/// per history row, so 300 rows are more than one 256 KiB credit window but
++/// within 2 MiB, and 1000 rows are over 2 MiB.
++fn heavy_rows(rows: usize) -> Vec<u8> {
++    let mut text = Vec::new();
++    for n in 0..rows {
++        text.extend(format!("R{n:04}").as_bytes());
++        for c in 0..97u32 {
++            let c = c as usize;
++            let (a, b) = ((n + c) % 251, (n * 3 + c) % 251);
++            text.extend(format!("\x1b[38;2;{a};{b};{};48;2;{b};{};{a}mxy", c * 2, c + 50).as_bytes());
++        }
++        text.extend(b"\x1b[0m\r\n");
++    }
++    text
++}
++
++/// An owner terminal that prints `rows` heavy rows, then on a line `alt`
++/// enters the alternate screen, `main` leaves it, `flood` prints 5 MiB of
++/// SGR-only output (no text, no history change).
++fn owner_terminal(owner: &Session, rows: usize) -> String {
++    std::fs::write(owner.root.join("rows.vt"), heavy_rows(rows)).unwrap();
++    std::fs::write(owner.root.join("sgr.vt"), b"\x1b[0m".repeat(5 << 18)).unwrap();
++    let r = owner.root.display();
++    let script = format!(
++        "cat {r}/rows.vt; while read l; do case $l in alt) printf '\\033[?1049hALT';; \
++         main) printf '\\033[?1049l';; flood) cat {r}/sgr.vt;; esac; done"
++    );
++    let t = run(owner, &["sh", "-c", &script]);
++    let last = format!("R{:04}", rows - 1);
++    wait_until("rows", || owner.json(&["read", &t])["text"].as_str().is_some_and(|s| s.contains(&last)));
++    t
++}
++
++/// Ends the relay's line to `owner` for real: kills that line's own
++/// `herdr-core connect` bridge (found by its HOME, the owner's root), with
++/// redials blocked until `restore_line`.
++fn cut_line(relay: &Session, owner: &Session) {
++    std::fs::write(relay.root.join("down"), "").unwrap();
++    let home = format!("HOME={}", owner.root.display());
++    let mut killed = 0;
++    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
++        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
++        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
++        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
++        let is_bridge = cmdline.split(|b| *b == 0).any(|a| a == b"connect")
++            && environ.split(|b| *b == 0).any(|e| e == home.as_bytes());
++        if is_bridge {
++            let _ = std::process::Command::new("/bin/sh").args(["-c", &format!("kill -9 {pid}")]).status();
++            killed += 1;
++        }
++    }
++    assert!(killed > 0, "no line bridge to {} found", owner.root.display());
++    wait_until("line down", || relay.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
++}
++
++fn restore_line(relay: &Session) {
++    std::fs::remove_file(relay.root.join("down")).unwrap();
++}
++
++/// A phone-like viewer through `relay`, with a big scrollback of its own:
++/// attached on 200x10 (which sizes the grid), then resized to 201x10 (a
++/// resize paint), not crediting yet.
++fn slow_phone(relay: &Session, terminal: &str, resize_history: u64) -> Viewer {
++    let extra = json!({"resize_notifications": true, "resize_history": resize_history});
++    let mut phone = Viewer::attach_on(Framed::open(relay), terminal, 200, 10, extra);
++    phone.screen = ghostty_vt::Terminal::new(200, 10, 256 << 20);
++    phone.credit = false;
++    phone.conn.send(phone.channel, wire::RESIZE, &[200, 0, 10, 0]);
++    phone.drain(Duration::from_millis(300));
++    phone.conn.send(phone.channel, wire::RESIZE, &[201, 0, 10, 0]);
++    phone
++}
++
++/// Credits again like a well-behaved viewer: one window now, then as bytes
++/// arrive (so the relay never holds more than a window for it).
++fn credit(phone: &mut Viewer) {
++    phone.credit = true;
++    phone.conn.send(phone.channel, wire::CREDIT, &(wire::WINDOW as u32).to_le_bytes());
++}
++
++fn relay_to(owner: &Session) -> Session {
++    let mut relay = Session::new();
++    relay.env.push(fake_ssh(&relay, &[("owner", owner)]));
++    relay.env.push(("HC_RECONNECT_MS".into(), "200".into()));
++    relay.json(&["machine", "add", "owner"]);
++    relay
++}
++
++/// Review v4 (a), the real relay path: a history replacement is cut by the
++/// line dropping (after its ESC[3J), the program is on the alternate screen
++/// when the relay reattaches, and comes back to the main screen later. The
++/// reconnect is the loss: the main-screen repair is owed until it is out.
++#[test]
++fn a_line_dropped_mid_replacement_is_repaired_after_an_alternate_screen() {
++    let owner = Session::new();
++    let t = owner_terminal(&owner, 400);
++    let relay = relay_to(&owner);
++    let remote = format!("owner/{t}");
++    let mut phone = slow_phone(&relay, &remote, 300);
++    phone.until("a replacement cut by the credit window", |v| has(&v.raw, b"\x1b[3J") && v.received > 200_000);
++    phone.drain(Duration::from_millis(300));
++    assert!(!phone.screen.plain_text().contains("R0385"), "the replacement's newest rows did not arrive");
++    cut_line(&relay, &owner);
++    owner.json(&["send", &t, "alt"]);
++    wait_until("alternate screen", || owner.json(&["read", &t])["text"].as_str().is_some_and(|s| s.contains("ALT")));
++    restore_line(&relay);
++    credit(&mut phone);
++    phone.until("reattached on the alternate screen", |v| v.screen.alt_screen());
++    phone.drain(Duration::from_millis(500));
++    phone.raw.clear();
++    owner.json(&["send", &t, "main"]);
++    phone.until("back on the main screen with history", |v| {
++        !v.screen.alt_screen() && v.screen.plain_text().contains("R0385")
++    });
++    assert!(has(&phone.raw, b"\x1b[3J"), "the repair is a whole replacement");
++    let text = phone.screen.plain_text();
++    assert!(text.contains("R0110") && text.contains("R0380"), "the 300 history rows are back");
++}
++
++/// Review v4 (b), the real relay path: the repair a reattach owes (over
++/// 2 MiB, N = 1000) is not out yet when more than 4 MiB of output overflows
++/// the backlog behind it. It must still arrive whole, never screen-only.
++#[test]
++fn an_oversized_reconnect_repair_overflowed_by_output_still_arrives_whole() {
++    let owner = Session::new();
++    let t = owner_terminal(&owner, 1100);
++    let relay = relay_to(&owner);
++    let remote = format!("owner/{t}");
++    let mut phone = slow_phone(&relay, &remote, 1000);
++    phone.credit = true;
++    phone.until("the screen", |v| v.screen.plain_text().contains("R1099"));
++    phone.drain(Duration::from_millis(300));
++    assert!(!has(&phone.raw, b"\x1b[3J"), "over the budget: resize paints are screen-only");
++    phone.credit = false;
++    cut_line(&relay, &owner);
++    phone.drain(Duration::from_millis(300));
++    phone.raw.clear();
++    phone.received = 0;
++    restore_line(&relay);
++    // The repair starts out (one credit window at most), then output overflows behind it.
++    phone.until("the repair starts", |v| has(&v.raw, b"\x1b[3J"));
++    owner.json(&["send", &t, "flood"]);
++    std::thread::sleep(Duration::from_millis(1500));
++    credit(&mut phone);
++    // What the owner itself still keeps (its scrollback budget may have let the oldest go).
++    let kept = owner.json(&["read", &t, "--lines", "2000"])["text"].as_str().unwrap().to_string();
++    let oldest = kept.lines().find(|l| l.starts_with('R')).unwrap()[..5].to_string();
++    phone.until("the whole history", |v| {
++        let text = v.screen.plain_text();
++        text.contains(&oldest) && text.contains("R1080")
++    });
++    assert!(phone.received > 2 << 20, "an oversized repair: {} bytes since the reattach", phone.received);
++}
+diff --git a/schema/README.md b/schema/README.md
+index f8c017f..b506ebe 100644
+--- a/schema/README.md
++++ b/schema/README.md
+@@ -100,6 +100,32 @@ serialized only when the observer has credit. The attach reply precedes stream
+ frames, including on core-to-core relays and reconnects.
+ Without this opt-in, existing event-driven observers keep their previous output
+ behavior: no additional resize paints or RESIZE frames.
++A viewer with `resize_notifications` may also pass `resize_history: N`
++(default 0) when the core advertises `resize_history` in `hello.features`.
++Each paint after a RESIZE then carries the last N scrollback rows (main screen
++only), and right after the paint's screen reset (`CAN`, then the reset that
++ends `ESC[H ESC[2J`) it sends `ESC[3J`, so the viewer's history is replaced by
++the core's rather than added to. On the alternate screen the paint carries no
++history and no `ESC[3J`. N = 0 is the screen-only paint above, byte for byte.
++It needs `resize_notifications`. The attach reply confirms `resize_history: N`
++only when every core on the path has the feature (relays strip it before an
++older hop, and an older owner never echoes it); 0 or absent means screen-only
++paints, so keep the client's own fallback. N is at most 100000 (larger
++values count as 100000). History is replaced only whole: when the paint
++with all N rows (or every row the core has) would be over 2 MiB, it is the
++screen-only paint without `ESC[3J` instead, and the viewer keeps its own
++history. On the wire the order is fixed, however the frames split it: CAN,
++the reset ending `ESC[H ESC[2J`, `ESC[3J`, history, then the screen. Paints
++(first paints too) are never dropped for size, and only output queued
++behind a paint counts toward the backlog limit. If part of a history
++replacement went out and the rest was dropped (output overflowed the
++backlog), the viewer gets one complete replacement again, whatever its
++size, once it has credit; on the alternate screen that waits until the
++program is back on the main screen. A stream resumed after a dropped line
++(`resumed`) with `resize_history` owes a complete replacement too, since a
++replacement may have been cut with the line: it starts with one (on the
++alternate screen, once the program is back on the main screen), and keeps
++owing it until one is out whole.
+ 
+ Desktop viewers may request `visibility_updates: true` on `terminal.attach`.
+ The optional `visible` value means the view is compositor-visible on an active
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 296ef35..56ad557 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -31,6 +31,13 @@
+             "description": "True only when every core on the path accepts WINDOW_FOCUS (kind 8).",
+             "type": "boolean"
+           },
++          "resize_history": {
++            "default": 0,
++            "description": "The `resize_history` the owner applies, 0 unless every core on the\npath has the `resize_history` feature (and `resize_notifications`\nholds). Absent: 0.",
++            "format": "uint",
++            "minimum": 0,
++            "type": "integer"
++          },
+           "resize_notifications": {
+             "description": "True only when the entire path sends RESIZE before replacement paints.\nFalse or absent means the viewer must track size changes separately.",
+             "type": "boolean"
+@@ -2775,6 +2782,18 @@
+             "type": "boolean"
+           }
+         },
++        {
++          "description": "With `resize_notifications`: scrollback lines each repaint after a RESIZE\ncarries (main screen only), after `ESC[3J` so they replace the viewer's\nhistory. 0: the repaint is the screen only. At most 100000 (more counts\nas 100000). If the whole of it would be over 2 MiB, that repaint is the\nscreen only, without `ESC[3J`.",
++          "name": "resize_history",
++          "required": false,
++          "schema": {
++            "default": 0,
++            "description": "With `resize_notifications`: scrollback lines each repaint after a RESIZE\ncarries (main screen only), after `ESC[3J` so they replace the viewer's\nhistory. 0: the repaint is the screen only. At most 100000 (more counts\nas 100000). If the whole of it would be over 2 MiB, that repaint is the\nscreen only, without `ESC[3J`.",
++            "format": "uint",
++            "minimum": 0,
++            "type": "integer"
++          }
++        },
+         {
+           "description": "Viewer understands core-to-viewer RESIZE before replacement paints.",
+           "name": "resize_notifications",

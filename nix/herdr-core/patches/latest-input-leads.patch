@@ -1,0 +1,2032 @@
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 989dbf2..56f6b6b 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -191,15 +191,19 @@ latest active desktop pane instead of fitting the group (default: `"grouped"`).
+ Secondary viewers remain fallback-only. No restart needed;
+ the setting applies on the next viewer activity, visibility change or detach.
+ 
+-The focused window wins. Apps may opt into `focus_updates` on attach (with
+-`focused`, the window's keyboard focus at attach; hello feature
+-`viewer_focus`) and then send kind-8 WINDOW_FOCUS (1 focused, 0 not) on every
+-channel of a window whose keyboard focus changes. Kind-4 FOCUS keeps its
+-program-focus meaning. Once a focus-reporting viewer has been focused, only
+-the focused visible viewer sets the grid (desktop before phone); with nothing
+-focused the last focused one keeps it, and if that one is hidden or unmeasured
+-the grid is held. Hidden, unfocused and non-reporting viewers (old apps,
+-phones, `hc attach`, relays without the feature) only receive the grid.
++The device used last wins (hello feature `focus_by_use`). Apps may opt into
++`focus_updates` on attach (with `focused`, the window's keyboard focus at
++attach, and `idle_ms` for an attach nobody caused just now; hello feature
++`viewer_focus`) and then send kind-8 WINDOW_FOCUS (1 focused or used again,
++0 not) on every channel of a window whose keyboard focus changes; a phone
++also sends 1 on resume and on a touch. Kind-4 FOCUS keeps its program-focus
++meaning. Once a focus-reporting viewer has been focused, the one used last
++sets the grid with its own size: its latest WINDOW_FOCUS(1) or real input
++(typed, clicked, pasted; never output, terminal replies or AUTOMATIC_INPUT),
++or for a phone that sends no focus, its latest activity. If that one is
++hidden or unmeasured, the focused visible one used last leads; otherwise the
++grid is held. Old desktop apps and relays without the feature only receive
++the grid while a reporter decides.
+ Relays forward WINDOW_FOCUS per downstream viewer and confirm `focus_updates`
+ only when every hop does; `hc viewers` shows `focus=yes|no|n/a` per channel.
+ `hc viewers <t>` shows this core's attached views, verified local socket peer
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index 45a08a6..b106ea7 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -27,6 +27,7 @@ pub const FEATURES: &[&str] = &[
+     "viewer_focus",
+     "resize_history",
+     "attach_credit",
++    "focus_by_use",
+ ];
+ pub const FINISHED_LINES: usize = 1000;
+ /// A terminal's identity: fixed at start from whoever starts it.
+@@ -476,6 +477,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         visibility_updates: p.visibility_updates,
+         focus_updates: p.focus_updates,
+         focused: p.focus_updates && p.focused,
++        idle_ms: p.idle_ms,
+         desktop_group: core.desktop_group(conn, p.desktop_group.as_deref()),
+     };
+     let channel = core.attach(conn, id, req)?;
+@@ -496,6 +498,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+             0
+         },
+         automatic_input: true,
++        focus_by_use: p.focus_updates,
+     })
+ }
+ 
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 89774e3..11232cc 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -417,6 +417,16 @@ pub struct AttachParams {
+     #[arg(skip)]
+     #[serde(default)]
+     pub focused: bool,
++    /// Milliseconds since the view was last used (a person's input or, with
++    /// `focus_updates`, focus there), for an attach nobody caused just now (a
++    /// reconnect, a reattach), focused or not. Without `focus_updates` it
++    /// dates the view's last real input. At or above a year
++    /// (31536000000; send i64::MAX for "never"): never used, no focus
++    /// history. Absent: a `focused` attach is itself the use; an unfocused
++    /// one has not been used.
++    #[arg(skip)]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub idle_ms: Option<u64>,
+     /// Scrollback lines to show first (main screen only).
+     #[arg(long, default_value_t = 0)]
+     #[serde(default)]
+@@ -478,6 +488,11 @@ pub struct AttachResult {
+     pub resize_history: usize,
+     /// The entire attach path accepts AUTOMATIC_INPUT (kind 6). Absent means use DATA.
+     pub automatic_input: bool,
++    /// With `focus_updates`: the owner sizes by use (`focus_by_use`): the
++    /// viewer used last leads, so WINDOW_FOCUS(1) on each use (a touch, a
++    /// resume) matters. Absent: false (older owner: focused desktop first).
++    #[serde(default)]
++    pub focus_by_use: bool,
+ }
+ 
+ fn visible_by_default() -> bool {
+diff --git a/crates/herdr-core/src/input.rs b/crates/herdr-core/src/input.rs
+index 779202f..3de00de 100644
+--- a/crates/herdr-core/src/input.rs
++++ b/crates/herdr-core/src/input.rs
+@@ -95,6 +95,240 @@ pub fn drafting(mut draft: bool, bytes: &[u8]) -> bool {
+     draft
+ }
+ 
++/// Whether `bytes` is only a terminal's answers to a program's queries, sent
++/// as DATA by a path without AUTOMATIC_INPUT: device attributes
++/// (`CSI ? .. c`, `CSI > .. c`), status and cursor reports (`CSI .. n`,
++/// `CSI r ; c R`, `CSI ? r ; c R`), mode reports (`CSI .. $ y`), window
++/// reports (`CSI 4|6|8|48 ; .. t`), keyboard flags (`CSI ? .. u`), focus
++/// reports (`CSI I`, `CSI O`), and OSC, DCS and APC strings. No key a person
++/// presses is one of these, except a cursor report shaped like a modified F3
++/// (`CSI 1 ; 5 R`): that key alone then does not count as use. Empty: no.
++pub fn terminal_reply(bytes: &[u8]) -> bool {
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] != 0x1b {
++            return false;
++        }
++        let rest = &bytes[i..];
++        let reply = match rest.get(1) {
++            Some(b'[') => match escape(rest) {
++                (_, Some((params, final_byte))) => csi_reply(params, final_byte),
++                _ => false,
++            },
++            Some(b']' | b'P' | b'_') => string_end(rest).is_some(),
++            _ => false,
++        };
++        if !reply {
++            return false;
++        }
++        i += match rest.get(1) {
++            Some(b'[') => escape(rest).0,
++            _ => string_end(rest).unwrap_or(rest.len()),
++        };
++    }
++    !bytes.is_empty()
++}
++
++/// Classifies one viewer's DATA frames as terminal replies (see
++/// [`terminal_reply`]), across frame boundaries: a reply a path cut in two
++/// (`ESC [ 2 4 ;` then `8 0 R`) is still a reply. An escape sequence still
++/// open at a frame's end, even a lone ESC, is kept back and judged with the
++/// next frame. So an Escape key pressed alone counts as use only with the
++/// next key: a reply cut right after its ESC must never count.
++#[derive(Default, Debug, Clone)]
++pub struct Replies {
++    carry: Vec<u8>,
++    /// A resumed stream (after a dropped line): what came so far that may
++    /// still be the tail of a reply whose start went out on the old stream,
++    /// and when its first byte came. None: not resumed, or settled.
++    tail: Option<(Vec<u8>, Option<std::time::Instant>)>,
++}
++
++/// Starts a reply could have had, to judge a resumed stream's first frames
++/// as its tail ("" too: the tail may begin with a whole reply).
++const REPLY_STARTS: &[&[u8]] = &[
++    b"",
++    b"\x1b",
++    b"\x1b[",
++    b"\x1b[1;",
++    b"\x1b[1;1",
++    b"\x1b[?",
++    b"\x1b[?1;",
++    b"\x1b[8;",
++    b"\x1b]",
++    b"\x1b]\x1b",
++    b"\x1bP",
++    b"\x1b_",
++];
++
++/// A possible reply tail is given up (and counts as use) past this...
++const TAIL_MAX: usize = 64;
++/// ...or once its first byte is this old.
++const TAIL_TIME: std::time::Duration = std::time::Duration::from_secs(1);
++
++enum Tail {
++    /// Finishes a reply (and any whole replies after it).
++    Done,
++    /// Can still finish one: more is to come.
++    Open,
++    /// Cannot: a person.
++    Not,
++}
++
++impl Replies {
++    /// For a resumed stream (after a dropped line): see `tail`.
++    pub fn resumed() -> Self {
++        Replies { carry: Vec::new(), tail: Some((Vec::new(), None)) }
++    }
++
++    /// Whether this frame is only terminal replies (or the start of one, kept
++    /// back until it ends). Empty: no.
++    ///
++    /// On a resumed stream, the frames up to the first that settles it are
++    /// judged together as the possible tail of a reply cut by the reconnect
++    /// (`ESC[24;` before the drop; `8`, `0R` after): not use while every byte
++    /// can still finish a reply, settled as a reply when one is finished, and
++    /// use the moment a byte proves it cannot be one. Bounded: past
++    /// [`TAIL_MAX`] bytes or [`TAIL_TIME`] the frame is judged on its own. A
++    /// person's first keys after a reconnect that could still be a reply's
++    /// tail (visible characters with no space, Enter or control key) count
++    /// once the bound or such a byte decides.
++    pub fn only_replies(&mut self, bytes: &[u8]) -> bool {
++        if bytes.is_empty() {
++            return false;
++        }
++        if let Some((tail, since)) = &mut self.tail {
++            tail.extend_from_slice(bytes);
++            let since = *since.get_or_insert_with(std::time::Instant::now);
++            let state = if tail.len() > TAIL_MAX || since.elapsed() > TAIL_TIME { Tail::Not } else { reply_tail(tail) };
++            match state {
++                Tail::Open => return true,
++                Tail::Done => {
++                    self.tail = None;
++                    return true;
++                }
++                Tail::Not => self.tail = None,
++            }
++        }
++        let mut all = std::mem::take(&mut self.carry);
++        all.extend_from_slice(bytes);
++        let open = open_tail(&all);
++        if let Some(at) = open
++            && all.len() - at <= MAX_REPLY
++        {
++            self.carry = all.split_off(at);
++        }
++        if all.is_empty() {
++            return true;
++        }
++        terminal_reply(&all)
++    }
++}
++
++/// Whether `tail` can be what follows some start of a reply: whole replies,
++/// ending in one still open that can still finish (see [`viable`]).
++fn reply_tail(tail: &[u8]) -> Tail {
++    let mut open = false;
++    for start in REPLY_STARTS {
++        let all = [*start, tail].concat();
++        let (whole, rest) = match open_tail(&all) {
++            Some(at) => all.split_at(at),
++            None => (&all[..], &all[..0]),
++        };
++        if !whole.is_empty() && !terminal_reply(whole) {
++            continue;
++        }
++        if rest.is_empty() {
++            return Tail::Done;
++        }
++        open |= viable(rest);
++    }
++    if open { Tail::Open } else { Tail::Not }
++}
++
++/// An open sequence that can still become a reply: a lone ESC; a CSI with
++/// only parameter bytes so far; an OSC, DCS or APC with only visible bytes
++/// so far, no space (and maybe the ESC of its terminator).
++fn viable(open: &[u8]) -> bool {
++    match open.get(1) {
++        None => open == b"\x1b",
++        Some(b'[') => open[2..].iter().all(|b| b.is_ascii_digit() || matches!(b, b';' | b'?' | b'>' | b'=' | b'$')),
++        Some(b']' | b'P' | b'_') => {
++            let body = open[2..].strip_suffix(b"\x1b").unwrap_or(&open[2..]);
++            body.iter().all(|b| (0x21..0x7f).contains(b))
++        }
++        _ => false,
++    }
++}
++
++/// Longer than this, an unfinished sequence is not a reply being cut.
++const MAX_REPLY: usize = 512;
++
++/// Where an escape sequence still open at the end of `bytes` begins.
++fn open_tail(bytes: &[u8]) -> Option<usize> {
++    let mut i = 0;
++    let mut open = None;
++    while i < bytes.len() {
++        if bytes[i] != 0x1b {
++            i += 1;
++            continue;
++        }
++        let rest = &bytes[i..];
++        let len = match rest.get(1) {
++            Some(b'[') => {
++                let end = rest[2..].iter().position(|b| (0x40..=0x7e).contains(b));
++                end.map(|n| n + 3)
++            }
++            Some(b']' | b'P' | b'_') => string_end(rest),
++            Some(_) => Some(2),
++            None => None,
++        };
++        match len {
++            Some(n) => {
++                i += n;
++                open = None;
++            }
++            None => {
++                open = Some(i);
++                break;
++            }
++        }
++    }
++    open
++}
++
++/// A CSI only terminals send back: see [`terminal_reply`].
++fn csi_reply(params: &[u8], final_byte: u8) -> bool {
++    let digits = |p: &[u8]| !p.is_empty() && p.iter().all(|b| b.is_ascii_digit() || *b == b';');
++    match final_byte {
++        b'c' => matches!(params.first(), Some(b'?' | b'>' | b'=')) && params.len() > 1,
++        b'n' => digits(params),
++        b'R' => {
++            let p = params.strip_prefix(b"?").unwrap_or(params);
++            digits(p) && p.contains(&b';')
++        }
++        b'y' => {
++            params.ends_with(b"$")
++                && digits(params.strip_prefix(b"?").unwrap_or(params).strip_suffix(b"$").unwrap_or(b""))
++        }
++        b't' => digits(params) && [&b"4;"[..], b"6;", b"8;", b"48;"].iter().any(|p| params.starts_with(p)),
++        b'u' => params.first() == Some(&b'?') && (params.len() == 1 || digits(&params[1..])),
++        b'I' | b'O' => params.is_empty(),
++        _ => false,
++    }
++}
++
++/// The length of a complete OSC, DCS or APC string at the start of `bytes`
++/// (ended by BEL, or ST: `ESC \`); None: unterminated.
++fn string_end(bytes: &[u8]) -> Option<usize> {
++    let body = &bytes[2..];
++    body.iter().enumerate().find_map(|(n, b)| match b {
++        0x07 if bytes[1] == b']' => Some(n + 3),
++        0x1b if body.get(n + 1) == Some(&b'\\') => Some(n + 4),
++        _ => None,
++    })
++}
++
+ /// The length of the escape sequence `bytes` starts with, and for a CSI its
+ /// parameters and final byte.
+ fn escape(bytes: &[u8]) -> (usize, Option<(&[u8], u8)>) {
+@@ -458,6 +692,109 @@ impl Core {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_resumed_stream_judges_a_reply_tail_across_frames() {
++        // Tails of a CPR, DA, DECRPM, window report and OSC, whole or cut
++        // again after the reconnect: never use.
++        for frames in [
++            &[&b"80R"[..]][..],
++            &[b"24;80R"],
++            &[b"8", b"0R"],
++            &[b"4;", b"8", b"0R"],
++            &[b"[?62;22c"],
++            &[b"62", b";22", b"c"],
++            &[b"2004;1$y"],
++            &[b"24;", b"80t"],
++            &[b"11;rgb:00", b"00/0000/0000\x1b", b"\\"],
++            &[b"0000/0000\x07"],
++            &[b"\\"],
++            &[b"80R\x1b[?62c"],
++        ] {
++            let mut r = Replies::resumed();
++            for frame in frames {
++                assert!(r.only_replies(frame), "{frames:?}");
++            }
++            assert!(!r.only_replies(b"x"), "settled: the next key is a person ({frames:?})");
++        }
++        // A person's keys count within the frame that proves it.
++        for key in [&b"ls\r"[..], b"\x1b[A", b"hello world", b"\r", b"\x03"] {
++            assert!(!Replies::resumed().only_replies(key), "{:?}", String::from_utf8_lossy(key));
++        }
++        let mut r = Replies::resumed();
++        assert!(r.only_replies(b"12"), "could still be a reply's tail");
++        assert!(!r.only_replies(b" "), "no reply goes on so: a person");
++        // Bounded: past TAIL_MAX bytes it is judged on its own.
++        let mut r = Replies::resumed();
++        assert!(r.only_replies(&[b'a'; TAIL_MAX]), "an OSC body could still be this long");
++        assert!(!r.only_replies(b"b"), "past the bound: a person");
++        // Only until settled: later frames are judged as usual.
++        let mut r = Replies::resumed();
++        assert!(!r.only_replies(b"ls\r"));
++        assert!(!r.only_replies(b"80R"));
++    }
++
++    #[test]
++    fn replies_cut_across_frames_are_still_replies() {
++        let mut r = Replies::default();
++        assert!(r.only_replies(b"\x1b[24;"), "an open reply is held back, not use");
++        assert!(r.only_replies(b"80R"));
++        assert!(r.only_replies(b"\x1b]11;rgb:0000/"));
++        assert!(r.only_replies(b"0000/0000\x1b"));
++        assert!(r.only_replies(b"\\"));
++        assert!(r.only_replies(b"\x1b"), "a lone ESC is held back: a reply may follow");
++        assert!(r.only_replies(b"[?62;22c"), "and it did");
++        assert!(r.only_replies(b"\x1b"));
++        assert!(!r.only_replies(b"x"), "ESC then a key is a person (alt+x)");
++        assert!(r.only_replies(b"\x1b[1"));
++        assert!(!r.only_replies(b"A"), "an arrow key cut in two is a key");
++        assert!(!r.only_replies(b"ab\x1b[2"), "text before an open sequence is a person");
++        assert!(!r.only_replies(b""));
++    }
++
++    #[test]
++    fn terminal_replies_are_told_from_what_a_person_types() {
++        for reply in [
++            &b"\x1b[?62;22c"[..],
++            b"\x1b[>1;10;0c",
++            b"\x1b[0n",
++            b"\x1b[24;80R",
++            b"\x1b[?24;80;1R",
++            b"\x1b[?2004;1$y",
++            b"\x1b[8;24;80t",
++            b"\x1b[4;480;640t",
++            b"\x1b[48;24;80;480;640t",
++            b"\x1b[?1u",
++            b"\x1b[I",
++            b"\x1b[O",
++            b"\x1b]11;rgb:0000/0000/0000\x07",
++            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
++            b"\x1bP1+r544e=787465726d\x1b\\",
++            b"\x1b_Gi=1;OK\x1b\\",
++            b"\x1b[24;80R\x1b[?62c",
++        ] {
++            assert!(terminal_reply(reply), "{:?}", String::from_utf8_lossy(reply));
++        }
++        for typed in [
++            &b""[..],
++            b"x",
++            b"\r",
++            b"\x1b",
++            b"\x1b[A",
++            b"\x1b[1;5A",
++            b"\x1b[3~",
++            b"\x1b[200~hi\x1b[201~",
++            b"\x1b[<0;10;5M",
++            b"\x1b[<64;10;5M",
++            b"\x1b[97;5u",
++            b"\x1bOP",
++            b"\x1b[15~",
++            b"\x1b[24;80Rx",
++            b"\x1b]11;?",
++        ] {
++            assert!(!terminal_reply(typed), "{:?}", String::from_utf8_lossy(typed));
++        }
++    }
++
+     #[test]
+     fn automatic_replies_preserve_the_human_quiet_gate() {
+         let mut gate = Gate::default();
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index 7e16bed..36f247f 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -56,6 +56,9 @@ async fn viewer_visibility_frame_stays_ordered_with_data_and_resize_across_a_rel
+             automatic_input: false,
+             visibility_updates: true,
+             focus_updates: false,
++            used_at: None,
++            replies: Default::default(),
++            focus_by_use: false,
+             line: Line::new(frames, &json!({"features": ["viewer_visibility"]})),
+             there: 9,
+             conn: conn.clone(),
+@@ -127,6 +130,9 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
+                 automatic_input: true,
+                 visibility_updates: false,
+                 focus_updates: false,
++                used_at: None,
++                replies: Default::default(),
++                focus_by_use: false,
+                 line: Line::new(old_frames, &json!({"features": ["automatic_input"]})),
+                 there: 9,
+                 conn: conn.clone(),
+@@ -253,6 +259,9 @@ async fn failed_reattach_drains_pending_data_before_close() {
+             automatic_input: true,
+             visibility_updates: false,
+             focus_updates: false,
++            used_at: None,
++            replies: Default::default(),
++            focus_by_use: false,
+             line: old_line,
+             there: 9,
+             conn: conn.clone(),
+@@ -462,6 +471,9 @@ async fn window_focus_is_relayed_per_downstream_viewer() {
+                 automatic_input: false,
+                 visibility_updates: true,
+                 focus_updates: focus,
++                used_at: None,
++                replies: Default::default(),
++                focus_by_use: false,
+                 line: line.clone(),
+                 there,
+                 conn: conn.clone(),
+@@ -491,7 +503,22 @@ async fn window_focus_is_relayed_per_downstream_viewer() {
+     let st = core.lock();
+     assert_eq!(st.relayed[&(conn_key(&hidden_window), 7)].params["focused"], false, "reattach carries the latest");
+     assert_eq!(st.relayed[&(conn_key(&focused_window), 7)].params["focused"], true);
++    // Item 71: the reattach says how long ago the viewer was last used, so a
++    // dropped line never looks like fresh use at the owner.
++    let used = st.relayed[&(conn_key(&focused_window), 7)].used_at.expect("WINDOW_FOCUS(1) is use");
++    assert!(viewers::idle_ms(&st.relayed[&(conn_key(&hidden_window), 7)]).is_none(), "unfocused: nothing to say");
++    assert!(viewers::idle_ms(&st.relayed[&(conn_key(&legacy), 7)]).is_none(), "no focus path: nothing to say");
+     drop(st);
++    std::thread::sleep(Duration::from_millis(20));
++    // A terminal reply sent as DATA is not use; typing is.
++    assert!(relay_in(&core, &focused_window, 7, wire::DATA, b"\x1b[24;80R"));
++    let r = core.lock().relayed[&(conn_key(&focused_window), 7)].clone();
++    assert_eq!(r.used_at, Some(used), "a reply is not use");
++    assert!(viewers::idle_ms(&r).unwrap() >= 20, "the age since the last use");
++    assert!(relay_in(&core, &focused_window, 7, wire::DATA, b"x"));
++    let r = core.lock().relayed[&(conn_key(&focused_window), 7)].clone();
++    assert!(r.used_at > Some(used), "typing is use");
++    assert!(viewers::idle_ms(&r).unwrap() < 20);
+     drop(core);
+     let _ = std::fs::remove_dir_all(root);
+ }
+@@ -647,6 +674,9 @@ async fn reconnect_rejects_a_resize_history_downgrade() {
+                 automatic_input: false,
+                 visibility_updates: false,
+                 focus_updates: false,
++                used_at: None,
++                replies: Default::default(),
++                focus_by_use: false,
+                 line: Line::new(old_frames, &json!({"features": ["resize_notifications", "resize_history"]})),
+                 there: 9,
+                 conn: conn.clone(),
+@@ -722,6 +752,9 @@ async fn a_resize_history_downgrade_is_refused_before_any_frame_is_forwarded() {
+                 automatic_input: false,
+                 visibility_updates: false,
+                 focus_updates: false,
++                used_at: None,
++                replies: Default::default(),
++                focus_by_use: false,
+                 line: Line::new(old_frames, &json!({"features": ["resize_notifications", "resize_history"]})),
+                 there: 9,
+                 conn: conn.clone(),
+@@ -853,6 +886,9 @@ async fn a_relay_backlog_overflow_closes_the_stream_instead_of_dropping_silently
+             automatic_input: false,
+             visibility_updates: false,
+             focus_updates: false,
++            used_at: None,
++            replies: Default::default(),
++            focus_by_use: false,
+             line: line.clone(),
+             there: 9,
+             conn: conn.clone(),
+@@ -939,6 +975,9 @@ async fn credit_during_a_reattach_reaches_the_new_stream_exactly_once() {
+             automatic_input: false,
+             visibility_updates: false,
+             focus_updates: false,
++            used_at: None,
++            replies: Default::default(),
++            focus_by_use: false,
+             line: Line::new(old_frames, &json!({})),
+             there: 9,
+             conn: conn.clone(),
+@@ -1016,6 +1055,9 @@ fn held_viewer(name: &str) -> (Arc<Core>, Machine, Arc<Conn>, std::path::PathBuf
+             automatic_input: false,
+             visibility_updates: false,
+             focus_updates: false,
++            used_at: None,
++            replies: Default::default(),
++            focus_by_use: false,
+             line: Line::new(old_frames, &json!({})),
+             there: 9,
+             conn: conn.clone(),
+@@ -1199,3 +1241,147 @@ async fn a_later_viewer_in_a_pass_attaches_with_its_current_state() {
+     drop(core);
+     let _ = std::fs::remove_dir_all(root);
+ }
++
++/// Item 71 (#94 review): a relay keeps when a viewer that reports focus was
++/// last used, focused or not, and only a person's use moves it: an empty
++/// frame or a reply cut across frames does not. A reattach then carries
++/// that age even for an unfocused viewer, so the owner keeps its history.
++#[tokio::test]
++async fn a_relay_keeps_the_last_use_of_a_viewer_focused_or_not() {
++    let root = std::path::PathBuf::from(format!(
++        "/var/tmp/hc-use-relay-{}-{}",
++        std::process::id(),
++        crate::platform::random_hex()
++    ));
++    let paths = Paths {
++        socket: root.join("core.sock"),
++        holder_socket: root.join("holder.sock"),
++        state: root.clone(),
++        config: root.join("config.toml"),
++    };
++    paths.create_dirs().unwrap();
++    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
++    let (frames, _rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({"features": ["viewer_visibility", "viewer_focus", "focus_by_use"]}));
++    let window = Arc::new(Conn::default());
++    window.with(|out| out.open(7));
++    core.lock().relayed.insert(
++        (conn_key(&window), 7),
++        Relayed {
++            automatic_input: false,
++            visibility_updates: true,
++            focus_updates: true,
++            used_at: None,
++            replies: Default::default(),
++            focus_by_use: false,
++            line,
++            there: 9,
++            conn: window.clone(),
++            machine: "macro".into(),
++            params: json!({"visible": true, "visibility_updates": true, "focus_updates": true, "focused": false}),
++            attempt: None,
++        },
++    );
++    let entry = || core.lock().relayed[&(conn_key(&window), 7)].clone();
++    assert!(viewers::idle_ms(&entry()).is_none(), "never focused, never used: nothing to say");
++    assert!(relay_in(&core, &window, 7, wire::WINDOW_FOCUS, &[1]));
++    let used = entry().used_at.expect("WINDOW_FOCUS(1) is use");
++    std::thread::sleep(Duration::from_millis(20));
++    for piece in [&b""[..], b"\x1b[24;", b"80R", b"\x1b", b"[?62c"] {
++        assert!(relay_in(&core, &window, 7, wire::DATA, piece));
++    }
++    assert_eq!(entry().used_at, Some(used), "empty frames and replies in pieces are not use");
++    assert!(relay_in(&core, &window, 7, wire::WINDOW_FOCUS, &[0]));
++    let idle = viewers::idle_ms(&entry()).expect("unfocused, but used: its age goes along");
++    assert!(idle >= 20, "{idle}");
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
++
++// t218's probes from the #94 review (hm-pr94-artifacts), kept as regression tests.
++#[test]
++fn reviewer94_relay_empty_data_must_not_refresh_last_use() {
++    let (core, _machine, conn, root) = held_viewer("review94-empty");
++    let key = (conn_key(&conn), 7);
++    let before = std::time::Instant::now() - Duration::from_secs(3600);
++    {
++        let mut st = core.lock();
++        let r = st.relayed.get_mut(&key).unwrap();
++        r.focus_updates = true;
++        r.params["focused"] = true.into();
++        r.used_at = Some(before);
++    }
++    assert!(relay_in(&core, &conn, 7, wire::DATA, b""));
++    let got = core.lock().relayed[&key].used_at;
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++    assert_eq!(got, Some(before), "empty DATA must remain idle on reattach as on owner");
++}
++
++#[test]
++fn reviewer94_relay_unfocused_last_use_must_survive_reattach() {
++    let (core, _machine, conn, root) = held_viewer("review94-unfocus");
++    let key = (conn_key(&conn), 7);
++    {
++        let mut st = core.lock();
++        let r = st.relayed.get_mut(&key).unwrap();
++        r.focus_updates = true;
++        r.params["focused"] = false.into();
++        r.used_at = Some(std::time::Instant::now() - Duration::from_secs(3600));
++    }
++    let r = core.lock().relayed[&key].clone();
++    let got = viewers::idle_ms(&r);
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++    assert!(got.is_some(), "last-focused use is valid selection history while focused=false; reconnect must carry it");
++}
++
++/// Item 71 (#94 review, live repros): a relay keeps a viewer's input
++/// recency also when it sends no focus (an old phone), for its reattach; a
++/// reply cut across frames is not use there; and every frame goes on with
++/// its own kind and bytes (sizing judgement only).
++#[tokio::test]
++async fn a_relay_carries_a_legacy_viewers_input_and_never_rewrites_a_frame() {
++    let (core, _machine, conn, root) = held_viewer("use-legacy");
++    let key = (conn_key(&conn), 7);
++    let (frames, mut rx) = mpsc::unbounded_channel();
++    let line = Line::new(frames, &json!({"features": ["automatic_input"]}));
++    {
++        let mut st = core.lock();
++        let r = st.relayed.get_mut(&key).unwrap();
++        r.automatic_input = true;
++        r.focus_updates = false;
++        r.used_at = None;
++        r.line = line;
++        r.there = 9;
++    }
++    assert!(viewers::idle_ms(&core.lock().relayed[&key]).is_none(), "never typed into: nothing to say");
++    assert!(relay_in(&core, &conn, 7, wire::DATA, b"x"));
++    let used = core.lock().relayed[&key].used_at.expect("typing is use");
++    std::thread::sleep(Duration::from_millis(20));
++    // A cursor report cut in two, the line dropping between its halves: the
++    // relay's parse carries over, so the tail is not use here either.
++    assert!(relay_in(&core, &conn, 7, wire::DATA, b"\x1b[24;"));
++    assert!(relay_in(&core, &conn, 7, wire::DATA, b"80R"));
++    let r = core.lock().relayed[&key].clone();
++    assert_eq!(r.used_at, Some(used), "a reply is not use");
++    assert!(viewers::idle_ms(&r).unwrap() >= 20, "the legacy viewer's input age goes along on a reattach");
++    // A lone Escape a person pressed goes on as DATA: the kind is never
++    // rewritten, so the owner's agent-input gate sees a person.
++    assert!(relay_in(&core, &conn, 7, wire::DATA, b"\x1b"));
++    let mut forwarded = Vec::new();
++    while let Ok(frame) = rx.try_recv() {
++        forwarded.push(frame);
++    }
++    assert_eq!(
++        forwarded,
++        [
++            wire::encode(9, wire::DATA, b"x"),
++            wire::encode(9, wire::DATA, b"\x1b[24;"),
++            wire::encode(9, wire::DATA, b"80R"),
++            wire::encode(9, wire::DATA, b"\x1b"),
++        ]
++    );
++    drop(core);
++    let _ = std::fs::remove_dir_all(root);
++}
+diff --git a/crates/herdr-core/src/remote/viewers.rs b/crates/herdr-core/src/remote/viewers.rs
+index 93be1ff..2ec58c9 100644
+--- a/crates/herdr-core/src/remote/viewers.rs
++++ b/crates/herdr-core/src/remote/viewers.rs
+@@ -10,6 +10,15 @@ pub struct Relayed {
+     pub visibility_updates: bool,
+     /// The whole path confirmed WINDOW_FOCUS: forwarded, and required on reattach.
+     pub focus_updates: bool,
++    /// With `focus_updates`: when the viewer was last used (WINDOW_FOCUS(1)
++    /// or DATA a person sent). A reattach tells the owner how long ago
++    /// (`idle_ms`), so a dropped line never looks like fresh use.
++    pub used_at: Option<std::time::Instant>,
++    /// A terminal reply cut across DATA frames is still a reply.
++    pub replies: crate::input::Replies,
++    /// The path confirmed the owner sizes by use (`focus_by_use`); required
++    /// again on reattach, like `focus_updates`.
++    pub focus_by_use: bool,
+     pub line: Arc<Line>,
+     pub there: u32,
+     pub conn: Arc<Conn>,
+@@ -91,6 +100,9 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+         params["history"] = 0.into();
+         params["resumed"] = true.into();
+         params["credit"] = room.into();
++        if let Some(idle) = idle_ms(&r) {
++            params["idle_ms"] = idle.into();
++        }
+         negotiate_resize(&line, &mut params);
+         negotiate_visibility(&line, &mut params);
+         negotiate_focus(&line, &mut params);
+@@ -122,7 +134,8 @@ pub(super) async fn reattach(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+             }
+             continue;
+         }
+-        if r.automatic_input && reply.as_ref().is_some_and(|reply| !automatic_input(&line, reply)) {
++        let lost_by_use = r.focus_by_use && reply.as_ref().is_some_and(|reply| !focus_by_use(&line, reply));
++        if lost_by_use || r.automatic_input && reply.as_ref().is_some_and(|reply| !automatic_input(&line, reply)) {
+             st.relayed.remove(&(key, here));
+             if let Some(there) = reply.as_ref().and_then(|reply| reply["channel"].as_u64()) {
+                 lock(&line.streams).remove(&(there as u32));
+@@ -174,6 +187,26 @@ async fn reattach_gate(ok: bool) {
+     }
+ }
+ 
++/// What a reattach tells the owner about a viewer: how long ago it was last
++/// used here, focused or not, reporting focus or not (at least 1 ms: never
++/// "just now", the line dropped meanwhile). None: nothing to say.
++pub(super) fn idle_ms(r: &Relayed) -> Option<u64> {
++    if !r.focus_updates {
++        // A viewer that sends no focus: how long since it was typed into.
++        return r.used_at.map(|used| (used.elapsed().as_millis() as u64).max(1));
++    }
++    match r.used_at {
++        Some(used) => Some((used.elapsed().as_millis() as u64).max(1)),
++        // Focused but never seen used here: as old as anything can be.
++        None => (r.params["focused"] == true).then_some(u64::MAX),
++    }
++}
++
++/// The owner sizes by use, as the path there confirms.
++pub(super) fn focus_by_use(line: &Line, reply: &Value) -> bool {
++    line.features.iter().any(|f| f == "focus_by_use") && reply["focus_by_use"] == true
++}
++
+ pub(super) fn automatic_input(line: &Line, reply: &Value) -> bool {
+     line.features.iter().any(|f| f == "automatic_input") && reply["automatic_input"] == true
+ }
+@@ -270,10 +303,20 @@ pub async fn attach(core: &Core, conn: &Arc<Conn>, m: &Machine, mut params: Valu
+             params["resize_history"] = history.into();
+             let automatic_input = automatic_input(&line, &r);
+             r["automatic_input"] = automatic_input.into();
++            // Only the owner's word, through a hop that knows the rule.
++            let by_use = focus_enabled && focus_by_use(&line, &r);
++            r["focus_by_use"] = by_use.into();
++            let used_at = match params["idle_ms"].as_u64() {
++                Some(ms) => crate::viewers::used_ago(Some(ms)),
++                None => (focus_enabled && params["focused"] == true).then(std::time::Instant::now),
++            };
+             let viewer = Relayed {
+                 automatic_input,
+                 visibility_updates: visibility_enabled,
+                 focus_updates: focus_enabled,
++                used_at,
++                replies: Default::default(),
++                focus_by_use: by_use,
+                 line,
+                 there,
+                 conn: conn.clone(),
+@@ -309,6 +352,15 @@ pub fn relay_in(core: &Core, conn: &Arc<Conn>, here: u32, kind: u8, payload: &[u
+                 return true;
+             }
+             r.params["focused"] = (payload[0] == 1).into();
++            if payload[0] == 1 {
++                r.used_at = Some(std::time::Instant::now());
++            }
++        }
++        // Use, for any viewer (one that sends no focus leads by input alone).
++        // Judged for sizing only: the frame goes on as it came, kind and bytes
++        // (the owner's agent-input gate must see a person's DATA as DATA).
++        if kind == wire::DATA && !payload.is_empty() && !r.replies.only_replies(payload) {
++            r.used_at = Some(std::time::Instant::now());
+         }
+         // What a reattach after a dropped line brings back.
+         if kind == wire::RESIZE && payload.len() == 4 {
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index 008f333..247889f 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -31,6 +31,7 @@ async fn keys_pressed_during_a_paste_follow_its_submit() {
+                 visibility_updates: false,
+                 focus_updates: false,
+                 focused: false,
++                idle_ms: None,
+                 history: 0,
+                 resize_history: 0,
+                 size: (80, 24),
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 4e9a070..04e7f22 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -10,7 +10,7 @@ use ghostty_vt::Rgb;
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ use std::sync::Arc;
+-use std::time::Instant;
++use std::time::{Duration, Instant};
+ 
+ #[cfg(test)]
+ mod tests;
+@@ -53,6 +53,12 @@ pub struct Viewer {
+     focused: bool,
+     /// When its window last gained focus; None: never focused while attached.
+     focused_at: Option<Instant>,
++    /// Its last real input (DATA a person typed, clicked or pasted; never a
++    /// terminal reply, AUTOMATIC_INPUT, output, CREDIT or a size offer).
++    /// With `focused_at`, when a focus reporter was last used.
++    input_at: Option<Instant>,
++    /// A terminal reply cut across DATA frames is still a reply.
++    replies: crate::input::Replies,
+     /// Origin is captured at attach so peer-line cleanup cannot relabel a viewer.
+     origin: ViewerOrigin,
+     peer: Option<String>,
+@@ -131,6 +137,10 @@ pub struct ViewerInfo {
+     pub desktop_group: Option<ViewerDesktopGroup>,
+     /// Milliseconds since last focus/input/size/visibility activity.
+     pub active_ms_ago: Option<u64>,
++    /// Milliseconds since its last real input (typed, clicked, pasted DATA;
++    /// never terminal replies or AUTOMATIC_INPUT). With `focused_ms_ago`,
++    /// when a focus reporter was last used; the latest used decider leads.
++    pub input_ms_ago: Option<u64>,
+     pub leader: bool,
+     /// Included in the selected group's min-grid, or the selected fallback size.
+     pub contributes_to_grid: bool,
+@@ -175,6 +185,10 @@ pub struct AttachRequest {
+     pub visibility_updates: bool,
+     pub focus_updates: bool,
+     pub focused: bool,
++    /// With `focus_updates`: how long ago the view was last used (an
++    /// automatic reattach or reconnect, focused or not); None: a focused
++    /// attach is the use, an unfocused one was not used.
++    pub idle_ms: Option<u64>,
+     pub desktop_group: Option<(String, String)>,
+ }
+ 
+@@ -222,7 +236,19 @@ impl Core {
+             visibility_updates: req.visibility_updates,
+             focus_updates: req.focus_updates,
+             focused: req.focus_updates && req.focused,
+-            focused_at: (req.focus_updates && req.focused).then(Instant::now),
++            // A reattach of a viewer used before but not focused now still
++            // says when it was last used (`idle_ms`): its history stays.
++            focused_at: if !req.focus_updates {
++                None
++            } else if req.focused || req.idle_ms.is_some() {
++                used_ago(req.idle_ms)
++            } else {
++                None
++            },
++            // A viewer that sends no focus, back after a dropped line (a
++            // relay's reattach): its input recency comes along.
++            input_at: if req.focus_updates { None } else { req.idle_ms.and_then(|ms| used_ago(Some(ms))) },
++            replies: if req.resumed { crate::input::Replies::resumed() } else { Default::default() },
+             origin,
+             peer,
+             desktop_group: req.desktop_group,
+@@ -437,13 +463,27 @@ impl Core {
+ 
+     pub fn viewer_input(&self, conn: &Arc<Conn>, channel: u32, bytes: &[u8], automatic: bool) {
+         let mut st = self.lock();
++        // A terminal's answer to a program's query is not a person: a path
++        // that cannot send AUTOMATIC_INPUT (old app, old relay) still sends
++        // it as DATA, and it must not count as use (or the idle device would
++        // take the grid back each time the program asks).
++        // Sizing only: the agent-input gate still sees what the path said.
++        let human = !automatic;
++        let automatic =
++            automatic || Self::viewer(&mut st, conn, channel).is_some_and(|(_, v)| v.replies.only_replies(bytes));
+         let id = if automatic {
+             Self::viewer(&mut st, conn, channel).filter(|(_, v)| !v.observe).map(|(id, _)| id)
+         } else {
+-            self.touch(&mut st, conn, channel, |_| {})
++            // Empty DATA (a client's keepalive) keeps today's activity meaning
++            // but is no one's input.
++            self.touch(&mut st, conn, channel, |v| {
++                if !bytes.is_empty() {
++                    v.input_at = Some(Instant::now());
++                }
++            })
+         };
+         if let Some(id) = id {
+-            let now = st.gates.entry(id).or_default().viewer(bytes, !automatic);
++            let now = st.gates.entry(id).or_default().viewer(bytes, human);
+             if let Some(link) = st.link(id) {
+                 link.input(id, &now);
+             }
+@@ -622,6 +662,7 @@ impl Core {
+                     .as_ref()
+                     .map(|(line, group)| ViewerDesktopGroup { line: line.clone(), group: group.clone() }),
+                 active_ms_ago: viewer.active_at.map(|active| now.saturating_duration_since(active).as_millis() as u64),
++                input_ms_ago: viewer.input_at.map(|input| now.saturating_duration_since(input).as_millis() as u64),
+                 leader: selection.leader == Some(index),
+                 contributes_to_grid: selection.contributors.contains(&index),
+             })
+@@ -741,52 +782,72 @@ fn measured(v: &Viewer) -> bool {
+     !v.observe && v.visible && v.sized && !v.awaiting_size && v.size.0 > 0 && v.size.1 > 0
+ }
+ 
+-/// Focus-reporting viewers that have been focused: once any exists, only they
++/// Focus-reporting viewers that have been focused or typed into: once any exists, only they
+ /// may set the grid (the focused window wins; the last focused keeps it).
+ fn focus_reporter(v: &Viewer) -> bool {
+-    !v.observe && v.focus_updates && v.focused_at.is_some()
++    // Item 71: real input is use like a focus report, so it is history too
++    // (a phone attached as never used, then typed into, decides).
++    !v.observe && v.focus_updates && (v.focused_at.is_some() || v.input_at.is_some())
++}
++
++/// `idle_ms` at or above this (a year) means never used: no focus history at
++/// all. Clients send i64::MAX or u64::MAX for "never". (On Linux
++/// `Instant::checked_sub` of such an age does not fail: it gives an instant
++/// far in the past, which would still be focus history.)
++pub(crate) const NEVER_USED_MS: u64 = 365 * 24 * 60 * 60 * 1000;
++
++/// `idle_ms` ago (None: now). At or above [`NEVER_USED_MS`], or older than
++/// this machine's clock can say: None, never used.
++pub(crate) fn used_ago(idle_ms: Option<u64>) -> Option<Instant> {
++    let now = Instant::now();
++    match idle_ms {
++        None | Some(0) => Some(now),
++        Some(ms) if ms >= NEVER_USED_MS => None,
++        Some(ms) => now.checked_sub(Duration::from_millis(ms)),
++    }
++}
++
++/// May decide the grid under focus authority: a focus reporter that was
++/// focused, or a phone-like viewer (no desktop group, no focus reports) that
++/// a person typed, tapped or pasted into. Legacy desktops (a group, no focus
++/// reports) are rule 6's.
++fn decider(v: &Viewer) -> bool {
++    !v.observe && (focus_reporter(v) || (!v.focus_updates && v.desktop_group.is_none() && v.input_at.is_some()))
+ }
+ 
+-/// Focused-window-wins. The leader is the focused visible viewer (desktop
+-/// before phone, latest focus first), else the last focused one. A leader that
+-/// is hidden or unmeasured holds the grid, unless a visible measured phone (no
+-/// desktop group; phones send no focus) was used after that leader was last
+-/// focused: then the person is on the phone, and the latest such phone leads.
++/// When a decider was last used: a reporter's latest focus or real input; a
++/// phone that sends no focus, its latest real input only (a size change,
++/// being shown, an empty frame or an attach is not a person using it).
++fn last_use(v: &Viewer) -> Option<Instant> {
++    if v.focus_updates { v.focused_at.max(v.input_at) } else { v.input_at }
++}
++
++/// Latest-used-wins (item 71). The decider used last leads with its own
++/// size: a phone being used takes the grid from an idle focused desktop,
++/// and the desktop takes it back on its next input or focus. Only a person's
++/// input moves it: output, terminal replies, credit and size offers never do.
++/// If the latest-used decider is hidden or unmeasured (a phone in a pocket,
++/// a window on another workspace), the latest-used focused, visible and
++/// measured reporter leads (the window Wolf is looking at); else the grid is
++/// held (a hidden desktop used after the phone keeps its grid).
+ fn select_focused(viewers: &[Viewer], grouped: bool) -> SizeSelection {
+-    let mut candidates: Vec<usize> =
+-        (0..viewers.len()).filter(|i| focus_reporter(&viewers[*i]) && measured(&viewers[*i])).collect();
+-    let leader = (0..viewers.len()).filter(|i| focus_reporter(&viewers[*i])).max_by_key(|i| {
++    let deciders: Vec<usize> = (0..viewers.len()).filter(|i| decider(&viewers[*i])).collect();
++    let candidates: Vec<usize> = deciders.iter().copied().filter(|i| measured(&viewers[*i])).collect();
++    // Ties (one report touching every pane of a window): focused and visible first.
++    let rank = |i: &usize| {
+         let v = &viewers[*i];
+-        (v.focused && v.visible, v.desktop_group.is_some(), v.focused_at)
+-    });
+-    let leader = match leader {
+-        Some(i) if measured(&viewers[i]) => i,
+-        held => {
+-            let since = held.and_then(|i| viewers[i].focused_at);
+-            let phones: Vec<usize> = (0..viewers.len())
+-                .filter(|i| {
+-                    let v = &viewers[*i];
+-                    measured(v) && v.desktop_group.is_none() && v.active_at.is_some() && v.active_at > since
+-                })
+-                .collect();
+-            let Some(phone) = phones.iter().copied().max_by_key(|i| viewers[*i].active_at) else {
+-                return SizeSelection { candidates, focus_authority: true, ..Default::default() };
+-            };
+-            for i in phones {
+-                if !candidates.contains(&i) {
+-                    candidates.push(i);
+-                }
+-            }
+-            let size = viewers[phone].size;
+-            return SizeSelection {
+-                candidates,
+-                leader: Some(phone),
+-                contributors: vec![phone],
+-                size: Some(size),
+-                focus_authority: true,
+-            };
++        (last_use(v), v.focused && v.visible)
++    };
++    let latest = deciders.iter().copied().max_by_key(rank);
++    let leader = match latest {
++        Some(i) if measured(&viewers[i]) => Some(i),
++        _ => {
++            candidates.iter().copied().filter(|i| focus_reporter(&viewers[*i]) && viewers[*i].focused).max_by_key(rank)
+         }
+     };
++    let Some(leader) = leader else {
++        return SizeSelection { candidates, focus_authority: true, ..Default::default() };
++    };
+     let selected = &viewers[leader];
+     let contributors: Vec<usize> = if grouped && selected.focused && selected.desktop_group.is_some() {
+         candidates
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index bab76c0..ae0187c 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -29,6 +29,8 @@ fn viewer(conn: &Arc<Conn>, size: (u16, u16), active_at: Option<Instant>) -> Vie
+         focus_updates: false,
+         focused: false,
+         focused_at: None,
++        input_at: None,
++        replies: Default::default(),
+         origin: if conn.local_desktop { ViewerOrigin::LocalDesktop } else { ViewerOrigin::LocalClient },
+         peer: None,
+         desktop_group: conn.local_desktop.then(|| ("local".into(), "desktop".into())),
+@@ -202,6 +204,7 @@ fn resumed_viewers_hold_the_inherited_grid_until_a_physical_size_arrives() {
+             visibility_updates: true,
+             focus_updates: false,
+             focused: false,
++            idle_ms: None,
+             history: 0,
+             resize_history: 0,
+             size,
+@@ -247,6 +250,7 @@ fn visibility_updates_recompute_the_grid_and_resumed_views_wait_for_measurement(
+         visibility_updates: true,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size,
+@@ -317,6 +321,7 @@ fn viewer_diagnostics_track_visibility_group_min_and_disconnect() {
+         visibility_updates,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size,
+@@ -395,6 +400,7 @@ fn legacy_viewer_stays_visible_and_eligible_until_detach() {
+                 visibility_updates: false,
+                 focus_updates: false,
+                 focused: false,
++                idle_ms: None,
+                 history: 0,
+                 resize_history: 0,
+                 size: (100, 40),
+@@ -441,6 +447,7 @@ async fn relayed_viewer_origin_and_pid_mask_survive_peer_line_cleanup() {
+                 visibility_updates: true,
+                 focus_updates: false,
+                 focused: false,
++                idle_ms: None,
+                 history: 0,
+                 resize_history: 0,
+                 size: (80, 24),
+@@ -477,6 +484,7 @@ async fn fresh_same_size_reoffers_do_not_ping_pong_between_desktop_groups() {
+         visibility_updates: true,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size,
+@@ -552,6 +560,7 @@ fn wider_desktop_viewer_wraps_inline_redraw_at_the_shared_width() {
+         visibility_updates: true,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size,
+@@ -604,6 +613,7 @@ fn larger_desktop_viewers_keep_only_the_shared_scrolling_grid() {
+         visibility_updates: true,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size,
+@@ -665,6 +675,7 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
+         visibility_updates: false,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size: (80, 24),
+@@ -734,6 +745,7 @@ fn focus_request(size: (u16, u16), group: Option<(&str, &str)>, focus_updates: b
+         visibility_updates: true,
+         focus_updates,
+         focused,
++        idle_ms: None,
+         history: 0,
+         resize_history: 0,
+         size,
+@@ -791,12 +803,11 @@ fn incident_2026_11_13_relayed_hidden_window_cannot_shrink_the_focused_one() {
+ }
+ 
+ #[test]
+-fn old_viewers_phones_and_non_forwarding_relays_never_win_over_focus() {
++fn old_desktops_never_win_over_focus_and_a_phone_wins_by_use() {
+     let (core, id, root) = core_with_screen(100, 40);
+     let app = desktop_conn();
+     let old_app = desktop_conn();
+     let phone = Arc::new(Conn::default());
+-    let old_relay = Arc::new(Conn::default()); // a relay without viewer_focus: no opt-in arrives
+     let grid = || core.lock().screens[&id].size();
+     let local = Some(("test", "test"));
+     let a = core.attach(&app, id, focus_request((120, 50), local, true, true)).unwrap();
+@@ -808,14 +819,18 @@ fn old_viewers_phones_and_non_forwarding_relays_never_win_over_focus() {
+     // A legacy client cannot claim focus through the new frame.
+     core.viewer_window_focus(&old_app, o, true);
+     assert_eq!(grid(), (120, 50), "an old desktop viewer only receives the grid");
++    // Item 71: a phone (no group, no focus reports) used after the desktop
++    // leads; the desktop takes it back on its next input.
+     let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
+     core.viewer_resize(&phone, p, 40, 10);
+     core.viewer_input(&phone, p, b"x", false);
+-    assert_eq!(grid(), (120, 50), "a phone never wins over a focused desktop");
+-    let r = core.attach(&old_relay, id, focus_request((60, 20), Some(("pickle", "pickle")), false, false)).unwrap();
+-    core.viewer_resize(&old_relay, r, 60, 20);
+-    core.viewer_input(&old_relay, r, b"x", false);
+-    assert_eq!(grid(), (120, 50), "a relay that cannot forward focus is non-reporting");
++    assert_eq!(grid(), (40, 10), "the phone used last leads over an idle focused desktop");
++    core.viewer_input(&app, a, b"x", false);
++    assert_eq!(grid(), (120, 50), "the desktop's next input takes it back");
++    // A legacy desktop (a group, no focus) never leads while a reporter decides.
++    core.viewer_input(&old_app, o, b"x", false);
++    assert_eq!(grid(), (120, 50), "an old desktop viewer only receives the grid, even typing");
++    core.detach(&phone, None);
+     // The focused window goes away for good: previous rules resume.
+     core.detach(&app, None);
+     assert_ne!(grid(), (120, 50), "without focus history the legacy selection applies again");
+@@ -849,9 +864,13 @@ fn hidden_or_unmeasured_focused_window_holds_the_grid() {
+     let phone = Arc::new(Conn::default());
+     let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
+     core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (90, 30), "attached and sized is not use (item 71)");
++    core.viewer_input(&phone, p, b"x", false);
+     assert_eq!(grid(), (40, 10), "the phone leads while the focused window is hidden");
+     core.viewer_visibility(&line, b, true);
+-    assert_eq!(grid(), (90, 30), "the shown focused window takes the grid back");
++    assert_eq!(grid(), (40, 10), "shown again is not use: the phone was used last (item 71)");
++    core.viewer_window_focus(&line, b, true);
++    assert_eq!(grid(), (90, 30), "the shown window takes the grid back once focused (or typed into)");
+     core.detach(&phone, None);
+     // Two panes of the same focused window share the smaller grid.
+     core.viewer_window_focus(&line, a, true);
+@@ -877,6 +896,7 @@ fn incident_2026_11_13_hidden_reporter_does_not_lock_out_a_visible_desktop() {
+     assert_eq!(grid(), (263, 96));
+     let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
+     core.viewer_resize(&phone, p, 40, 10);
++    core.viewer_input(&phone, p, b"x", false);
+     // The laptop window is hidden and the phone was used since it was last
+     // focused: the phone leads (it sends no focus).
+     core.viewer_window_focus(&app, a, false);
+@@ -901,43 +921,262 @@ fn incident_2026_11_13_hidden_reporter_does_not_lock_out_a_visible_desktop() {
+     // as last focused) and the non-reporter only receives it.
+     core.viewer_visibility(&app, a, true);
+     core.viewer_resize(&app, a, 263, 96);
+-    assert_eq!(grid(), (263, 96), "a shown reporter with focus history decides again");
++    assert!(core.viewer_list(id, "t6k".into()).focus_authority, "focus authority is back");
++    assert_eq!(grid(), (40, 10), "the phone was used after the reporter's last focus (item 71)");
++    core.viewer_window_focus(&app, a, true);
++    assert_eq!(grid(), (263, 96), "a shown reporter with focus history decides again once used");
+     assert!(core.viewer_list(id, "t6k".into()).focus_authority);
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
+ 
+-/// Desktop first: the phone leads only while the focused window is hidden or
+-/// unmeasured and it was used after that window was last focused.
++/// Item 71, Wolf's t16b at 14:07 (`hc viewers t16b`): the desktop window is
++/// visible and focused but idle for 1 h 41 min, offering 58x132, while the
++/// phone is in use (active 98 ms ago), offering 160x72. The phone used last
++/// leads with its own size; the desktop's next input takes the grid back.
++#[test]
++fn wolfs_t16b_the_phone_in_use_leads_over_an_idle_focused_desktop() {
++    let base = Instant::now();
++    // The listing's ages, oldest first: an instant that many ms before "now".
++    let at = |ms_ago: u64| Some(base + Duration::from_millis(6_124_505 - ms_ago));
++    let relayed = Arc::new(Conn::default());
++    let mut air = viewer(&relayed, (116, 76), None);
++    air.channel = 21;
++    air.visibility_updates = false;
++    air.sized = false;
++    air.awaiting_size = true;
++    let mut desktop = viewer(&relayed, (58, 132), at(6_100_726));
++    desktop.channel = 24;
++    desktop.resize_notifications = true;
++    desktop.desktop_group = Some(("820feff3".into(), "820feff3".into()));
++    desktop.focus_updates = true;
++    desktop.focused = true;
++    desktop.focused_at = at(6_100_407);
++    let mut tab = viewer(&relayed, (0, 0), at(6_124_505));
++    tab.channel = 82;
++    tab.resize_notifications = true;
++    tab.desktop_group = desktop.desktop_group.clone();
++    tab.focus_updates = true;
++    tab.visible = false;
++    tab.sized = false;
++    let mut pickle = viewer(&relayed, (91, 108), at(6_048_787));
++    pickle.channel = 6;
++    pickle.resize_notifications = true;
++    pickle.desktop_group = Some(("a5453d9c".into(), "a5453d9c".into()));
++    pickle.focus_updates = true;
++    pickle.focused = true;
++    pickle.focused_at = at(157_683);
++    pickle.visible = false;
++    pickle.sized = false;
++    let phone_conn = Arc::new(Conn::default());
++    let mut phone = viewer(&phone_conn, (160, 72), at(98));
++    phone.input_at = at(98);
++    phone.channel = 2;
++    phone.resize_notifications = true;
++    let mut vs = vec![air, desktop, tab, pickle, phone];
++    for grouped in [true, false] {
++        let selection = select_sizing(&vs, grouped);
++        assert!(selection.focus_authority);
++        assert_eq!(selection.leader, Some(4), "the phone in use leads (grouped={grouped})");
++        assert_eq!(selection.contributors, vec![4]);
++        assert_eq!(selection.size, Some((160, 72)), "the phone's own size");
++    }
++    // What the core did then, without the phone: the small-pickle window was
++    // focused later but is hidden, so the shown focused desktop leads.
++    let without_phone = &vs[..4];
++    assert_eq!(select_sizing(without_phone, true).leader, Some(1));
++    assert_eq!(select_sizing(without_phone, true).size, Some((58, 132)));
++    // Wolf types on the desktop: it takes the grid back.
++    vs[1].input_at = Some(base + Duration::from_millis(6_124_506));
++    for grouped in [true, false] {
++        let selection = select_sizing(&vs, grouped);
++        assert_eq!(selection.leader, Some(1), "the desktop's input wins (grouped={grouped})");
++        assert_eq!(selection.size, Some((58, 132)));
++    }
++}
++
++/// Item 71: whichever device was used last leads, and only use moves it: a
++/// person's input, WINDOW_FOCUS(1) (a window gaining focus, a phone touched
++/// or resumed), or an attach a person caused.
+ #[test]
+-fn a_visible_focused_desktop_wins_over_a_phone() {
++fn the_device_used_last_leads_and_the_other_takes_it_back_by_use() {
+     let (core, id, root) = core_with_screen(100, 40);
+     let app = desktop_conn();
+     let phone = Arc::new(Conn::default());
+     let grid = || core.lock().screens[&id].size();
+-    let local = Some(("test", "test"));
+-    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
+-    core.viewer_resize(&phone, p, 40, 10);
+-    let a = core.attach(&app, id, focus_request((120, 50), local, true, true)).unwrap();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
+     core.viewer_resize(&app, a, 120, 50);
+     assert_eq!(grid(), (120, 50));
+-    // Phone input while the desktop is visible and measured, focused or not.
+-    core.viewer_input(&phone, p, b"x", false);
+-    assert_eq!(grid(), (120, 50), "a phone never wins over a visible focused desktop");
++    // A phone that reports focus, attached without it (prefetched, hidden).
++    let p = core.attach(&phone, id, focus_request((40, 10), None, true, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (120, 50), "a reporter never focused does not decide");
++    core.viewer_window_focus(&phone, p, true);
++    assert_eq!(grid(), (40, 10), "the phone is touched: it leads with its own size");
++    core.viewer_input(&app, a, b"x", false);
++    assert_eq!(grid(), (120, 50), "typing on the desktop takes it back");
++    core.viewer_window_focus(&phone, p, true);
++    assert_eq!(grid(), (40, 10), "a repeated WINDOW_FOCUS(1) is the phone used again");
+     core.viewer_window_focus(&app, a, false);
+-    core.viewer_input(&phone, p, b"x", false);
+-    assert_eq!(grid(), (120, 50), "nor over the visible last focused desktop");
+-    // Hidden, but the phone was last used before the window was focused again.
+     core.viewer_window_focus(&app, a, true);
+-    core.viewer_visibility(&app, a, false);
+-    assert_eq!(grid(), (120, 50), "a phone idle since the last focus does not take over");
+-    core.viewer_input(&phone, p, b"x", false);
+-    assert_eq!(grid(), (40, 10), "a phone used since leads while the desktop is hidden");
+-    core.viewer_visibility(&app, a, true);
++    assert_eq!(grid(), (120, 50), "the desktop window gaining focus is use");
++    core.viewer_input(&phone, p, b"y", false);
++    assert_eq!(grid(), (40, 10), "typing on the phone");
++    let list = core.viewer_list(id, "t1".into());
++    assert!(list.focus_authority);
++    // Channels are per connection: name a viewer by both.
++    let of = |conn: &Arc<Conn>, channel| ViewerIdentity { connection_id: conn.id, channel };
++    assert_eq!(list.leader, Some(of(&phone, p)));
++    assert!(list.viewers.iter().any(|v| v.identity == of(&phone, p) && v.input_ms_ago.is_some()));
++    assert!(list.viewers.iter().any(|v| v.identity == of(&app, a) && v.input_ms_ago.is_some()));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71, no flapping: an idle desktop whose program keeps asking the
++/// terminal things never takes the grid back from the phone in use. The
++/// core answers DSR itself (viewers never see the query); a reply a viewer
++/// sends as AUTOMATIC_INPUT, or as DATA on a path without it, is not use;
++/// neither are identical size offers, visibility flips or program focus out.
++#[test]
++fn an_idle_desktop_whose_program_asks_dsr_never_takes_the_grid_back() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
+     core.viewer_resize(&app, a, 120, 50);
+-    assert_eq!(grid(), (120, 50), "the desktop shown again wins");
++    // Today's phone: no focus reports; its attach, size and typing are use.
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    core.viewer_input(&phone, p, b"ls\r", false);
++    assert_eq!(grid(), (40, 10));
++    for cycle in 0..20 {
++        {
++            // Claude asks for the cursor every 2 s.
++            let mut st = core.lock();
++            core.output(&mut st, id, b"\x1b[6n");
++        }
++        core.viewer_input(&app, a, b"\x1b[24;80R", true);
++        core.viewer_input(&app, a, b"\x1b[24;80R", false);
++        core.viewer_input(&app, a, b"\x1b[?62;22c\x1b]11;rgb:0000/0000/0000\x1b\\", false);
++        core.viewer_resize(&app, a, 120, 50);
++        core.viewer_visibility(&app, a, false);
++        core.viewer_visibility(&app, a, true);
++        core.viewer_resize(&app, a, 120, 50);
++        core.viewer_focus(&app, a, false);
++        assert_eq!(grid(), (40, 10), "cycle {cycle}: the idle desktop never takes it back");
++    }
++    core.viewer_input(&app, a, b"x", false);
++    assert_eq!(grid(), (120, 50), "a key on the desktop does");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71: a phone in a pocket (VISIBILITY 0) never leads, whatever it
++/// sends; the shown focused desktop leads at once. Out of the pocket and
++/// touched, the phone leads again.
++#[test]
++fn a_pocketed_phone_never_leads_and_the_shown_desktop_leads_at_once() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    let p = core.attach(&phone, id, focus_request((40, 10), None, true, true)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (40, 10), "opening the pane on the phone is use");
++    core.viewer_window_focus(&phone, p, false);
++    core.viewer_visibility(&phone, p, false);
++    assert_eq!(grid(), (120, 50), "pocketed: the shown focused desktop leads at once");
+     core.viewer_input(&phone, p, b"x", false);
+-    assert_eq!(grid(), (120, 50), "phone input changes nothing while it is shown");
++    core.viewer_window_focus(&phone, p, true);
++    core.viewer_resize(&phone, p, 40, 11);
++    assert_eq!(grid(), (120, 50), "a hidden phone never leads, whatever it sends");
++    core.viewer_visibility(&phone, p, true);
++    core.viewer_window_focus(&phone, p, true);
++    assert_eq!(grid(), (40, 11), "shown and touched, it leads with its new size");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71 with two desktops: the latest used leads; when it is hidden, the
++/// shown focused one leads; when neither is shown and focused, the grid is
++/// held.
++#[test]
++fn two_desktops_the_latest_used_leads_and_a_hidden_one_hands_over_to_the_shown_one() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let laptop = desktop_conn();
++    let line = Arc::new(Conn::default()); // another machine's window, through its core
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&laptop, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&laptop, a, 120, 50);
++    let b = core.attach(&line, id, focus_request((90, 30), Some(("pickle", "pickle")), true, true)).unwrap();
++    core.viewer_resize(&line, b, 90, 30);
++    assert_eq!(grid(), (90, 30), "the window attached focused last");
++    core.viewer_input(&laptop, a, b"x", false);
++    assert_eq!(grid(), (120, 50), "input on the laptop");
++    core.viewer_input(&line, b, b"x", false);
++    assert_eq!(grid(), (90, 30), "input on the other desktop");
++    core.viewer_visibility(&line, b, false);
++    assert_eq!(grid(), (120, 50), "the latest used is hidden: the shown focused one leads");
++    core.viewer_window_focus(&laptop, a, false);
++    assert_eq!(grid(), (120, 50), "neither shown and focused: held");
++    core.viewer_visibility(&line, b, true);
++    assert_eq!(grid(), (90, 30), "the latest used, shown again, leads");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71: observers never lead or contribute, whatever they send.
++#[test]
++fn observers_never_lead_whatever_they_send() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let watcher = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    let o = core
++        .attach(&watcher, id, AttachRequest { observe: true, ..focus_request((40, 10), None, true, true) })
++        .unwrap();
++    core.viewer_resize(&watcher, o, 40, 10);
++    core.viewer_input(&watcher, o, b"x", false);
++    core.viewer_window_focus(&watcher, o, true);
++    core.viewer_focus(&watcher, o, true);
++    core.viewer_visibility(&watcher, o, true);
++    assert_eq!(grid(), (120, 50));
++    let list = core.viewer_list(id, "t1".into());
++    let seen =
++        list.viewers.iter().find(|v| v.identity == ViewerIdentity { connection_id: watcher.id, channel: o }).unwrap();
++    assert!(!seen.leader && !seen.contributes_to_grid && !seen.size_eligible);
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71: an attach nobody caused just now (a reconnect, a reattach) says
++/// how long ago the view was last used (`idle_ms`): older than the desktop's
++/// last input, it takes nothing over. An attach a person caused is use.
++#[test]
++fn an_automatic_reattach_with_its_idle_age_takes_nothing_over() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    std::thread::sleep(Duration::from_millis(5));
++    core.viewer_input(&app, a, b"x", false);
++    let p = core
++        .attach(&phone, id, AttachRequest { idle_ms: Some(60_000), ..focus_request((40, 10), None, true, true) })
++        .unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (120, 50), "a reconnect idle for a minute does not take over");
++    core.detach(&phone, None);
++    let p = core.attach(&phone, id, focus_request((40, 10), None, true, true)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (40, 10), "an attach a person caused is use");
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
+@@ -951,6 +1190,7 @@ fn history_request(resize_history: usize) -> AttachRequest {
+         visibility_updates: false,
+         focus_updates: false,
+         focused: false,
++        idle_ms: None,
+         history: 0,
+         resize_history,
+         size: (20, 4),
+@@ -1779,3 +2019,477 @@ fn a_resumed_stream_on_the_alternate_screen_is_repaired_on_return() {
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++/// Item 71 (t1jf's decision on #94's review): a phone that sends no focus
++/// leads only by real input. After the desktop's input, none of these takes
++/// the grid: a changed size, being shown again, an empty frame, a fresh
++/// reconnect, a resumed size. Typing on it does.
++#[test]
++fn a_legacy_phone_takes_the_grid_only_by_real_input() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (40, 10), "typed on: the phone leads");
++    core.viewer_input(&app, a, b"x", false);
++    assert_eq!(grid(), (120, 50), "the desktop's input takes it back");
++    core.viewer_resize(&phone, p, 41, 10);
++    assert_eq!(grid(), (120, 50), "a changed size is not use");
++    core.viewer_visibility(&phone, p, false);
++    core.viewer_visibility(&phone, p, true);
++    assert_eq!(grid(), (120, 50), "shown again is not use");
++    core.viewer_input(&phone, p, b"", false);
++    assert_eq!(grid(), (120, 50), "an empty frame is not use");
++    core.detach(&phone, None);
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (120, 50), "a fresh reconnect is not use");
++    core.detach(&phone, None);
++    let p = core
++        .attach(&phone, id, AttachRequest { resumed: true, ..focus_request((40, 10), None, false, false) })
++        .unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (120, 50), "a resumed size is not use");
++    // (A resumed stream's first keys are judged as a possible reply tail
++    // until a byte decides: Enter does, within the frame.)
++    core.viewer_input(&phone, p, b"y\r", false);
++    assert_eq!(grid(), (40, 10), "typing on it is");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71: a terminal reply cut across DATA frames (a path split the
++/// write) is still a reply, not use; a key that follows is use.
++#[test]
++fn a_reply_cut_across_frames_is_still_not_use() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    let p = core.attach(&phone, id, focus_request((40, 10), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (40, 10));
++    for cut in
++        [&[&b"\x1b[24;"[..], b"80R"][..], &[b"\x1b", b"[?62;22c"], &[b"\x1b]11;rgb:0000/", b"0000/0000\x1b", b"\\"]]
++    {
++        for piece in cut {
++            core.viewer_input(&app, a, piece, false);
++        }
++        assert_eq!(grid(), (40, 10), "a reply in pieces is not use: {cut:?}");
++    }
++    core.viewer_input(&app, a, b"\x1b", false);
++    assert_eq!(grid(), (40, 10), "a lone ESC waits: a reply may follow it");
++    core.viewer_input(&app, a, b"x", false);
++    assert_eq!(grid(), (120, 50), "the next key makes it use");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71 (#94 review): `idle_ms` at or above a year, such as the phone's
++/// i64::MAX "never used" sentinel or a relay's u64::MAX, is no focus history
++/// at all, also on Linux where `Instant::checked_sub` of it does not fail.
++/// Such a phone gains no focus authority: an old legacy desktop keeps
++/// leading, and the phone leads only once used.
++#[test]
++fn a_never_used_idle_age_is_no_focus_history() {
++    for never in [NEVER_USED_MS, i64::MAX as u64, u64::MAX] {
++        assert_eq!(used_ago(Some(never)), None, "{never}");
++    }
++    let (core, id, root) = core_with_screen(100, 40);
++    let old = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    // An old desktop app: a group, no focus reports.
++    let d = core.attach(&old, id, focus_request((120, 50), Some(("test", "test")), false, false)).unwrap();
++    core.viewer_resize(&old, d, 120, 50);
++    assert_eq!(grid(), (120, 50));
++    for never in [i64::MAX as u64, u64::MAX] {
++        let p = core
++            .attach(&phone, id, AttachRequest { idle_ms: Some(never), ..focus_request((40, 10), None, true, true) })
++            .unwrap();
++        core.viewer_resize(&phone, p, 40, 10);
++        let list = core.viewer_list(id, "t1".into());
++        assert!(!list.focus_authority, "a never-used phone has no focus history ({never})");
++        assert!(list.viewers.iter().all(|v| v.focused_ms_ago.is_none()));
++        assert_eq!(grid(), (120, 50), "the old desktop keeps leading");
++        core.detach(&phone, None);
++    }
++    let p = core
++        .attach(&phone, id, AttachRequest { idle_ms: Some(1_000), ..focus_request((40, 10), None, true, true) })
++        .unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert!(core.viewer_list(id, "t1".into()).focus_authority, "used a second ago: history");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++// t218's probes from the #94 review (hm-pr94-artifacts), kept as regression tests.
++
++#[test]
++fn reviewer94_exact_case_and_alternating_real_use() {
++    let (core, id, root) = core_with_screen(200, 120);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let a = core.attach(&app, id, focus_request((58, 132), Some(("desktop", "main")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 58, 132);
++    {
++        let mut st = core.lock();
++        let v = &mut st.viewers.get_mut(&id).unwrap()[0];
++        v.focused_at = Instant::now().checked_sub(Duration::from_secs(6060));
++    }
++    let p = core.attach(&phone, id, focus_request((160, 72), None, false, false)).unwrap();
++    core.viewer_resize(&phone, p, 160, 72);
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(core.lock().screens[&id].size(), (160, 72));
++    for _ in 0..50 {
++        core.viewer_input(&app, a, b"\x1b[<0;12;3M", false);
++        assert_eq!(core.lock().screens[&id].size(), (58, 132));
++        core.viewer_input(&phone, p, b"hello\r", false);
++        assert_eq!(core.lock().screens[&id].size(), (160, 72));
++    }
++    core.viewer_visibility(&phone, p, false);
++    assert_eq!(core.lock().screens[&id].size(), (58, 132));
++    core.viewer_visibility(&app, a, false);
++    assert!(core.viewer_list(id, "t1".into()).selected_grid.is_none());
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn reviewer94_reporter_output_and_automatic_noise_do_not_flap() {
++    let (core, id, root) = core_with_screen(200, 120);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let a = core.attach(&app, id, focus_request((58, 132), Some(("desktop", "main")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 58, 132);
++    let p = core.attach(&phone, id, focus_request((160, 72), None, true, true)).unwrap();
++    core.viewer_resize(&phone, p, 160, 72);
++    for n in 0..100 {
++        {
++            let mut st = core.lock();
++            core.output(&mut st, id, b"busy output\r\n\x1b[6n\x1b[c\x1b]11;?\x07");
++        }
++        core.viewer_input(&app, a, b"\x1b[2;4R", false);
++        core.viewer_input(&app, a, b"\x1b[?1;2c\x1b]11;rgb:ffff/0000/0000\x07", false);
++        core.viewer_input(&app, a, b"\x1b[2;4R", true);
++        core.viewer_input(&app, a, b"", false);
++        core.viewer_resize(&app, a, 58 + (n % 2), 132);
++        core.viewer_visibility(&app, a, false);
++        core.viewer_visibility(&app, a, true);
++        assert_eq!(core.lock().screens[&id].size(), (160, 72), "cycle {n}");
++    }
++    core.viewer_input(&app, a, b"\r", false);
++    assert_eq!(core.lock().screens[&id].size(), (59, 132));
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++#[test]
++fn reviewer94_legacy_automatic_events_must_not_take_over() {
++    let mut stolen = Vec::new();
++    for event in ["resize", "show", "empty-data", "automatic-reconnect", "resumed-resize"] {
++        let (core, id, root) = core_with_screen(200, 120);
++        let app = desktop_conn();
++        let phone = Arc::new(Conn::default());
++        let a = core.attach(&app, id, focus_request((58, 132), Some(("desktop", "main")), true, true)).unwrap();
++        core.viewer_resize(&app, a, 58, 132);
++        let mut p = core.attach(&phone, id, focus_request((160, 72), None, false, false)).unwrap();
++        core.viewer_resize(&phone, p, 160, 72);
++        if event == "show" {
++            core.viewer_visibility(&phone, p, false);
++        }
++        core.viewer_input(&app, a, b"x", false);
++        assert_eq!(core.lock().screens[&id].size(), (58, 132));
++        match event {
++            "resize" => core.viewer_resize(&phone, p, 161, 72),
++            "show" => core.viewer_visibility(&phone, p, true),
++            "empty-data" => core.viewer_input(&phone, p, b"", false),
++            "automatic-reconnect" | "resumed-resize" => {
++                core.detach(&phone, None);
++                p = core
++                    .attach(
++                        &phone,
++                        id,
++                        AttachRequest {
++                            resumed: event == "resumed-resize",
++                            idle_ms: Some(60_000),
++                            ..focus_request((160, 72), None, false, false)
++                        },
++                    )
++                    .unwrap();
++                core.viewer_resize(&phone, p, 160, 72);
++            }
++            _ => unreachable!(),
++        }
++        let grid = core.lock().screens[&id].size();
++        if grid != (58, 132) {
++            stolen.push((event, grid));
++        }
++        drop(core);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++    assert!(stolen.is_empty(), "automatic legacy phone takeovers: {stolen:?}");
++}
++
++#[test]
++fn reviewer94_fragmented_cpr_must_not_take_over() {
++    let (core, id, root) = core_with_screen(200, 120);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let a = core.attach(&app, id, focus_request((58, 132), Some(("desktop", "main")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 58, 132);
++    let p = core.attach(&phone, id, focus_request((160, 72), None, true, true)).unwrap();
++    core.viewer_resize(&phone, p, 160, 72);
++    core.viewer_input(&app, a, b"\x1b[24;80R", false);
++    assert_eq!(core.lock().screens[&id].size(), (160, 72));
++    core.viewer_input(&app, a, b"\x1b[24;", false);
++    core.viewer_input(&app, a, b"80R", false);
++    let got = core.lock().screens[&id].size();
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert_eq!(got, (160, 72), "same CPR divided between DATA frames is still automatic");
++}
++
++#[test]
++fn reviewer94_never_used_and_multi_day_idle_ordering() {
++    let never = used_ago(Some(i64::MAX as u64));
++    let oldest = used_ago(Some(u64::MAX));
++    let days = used_ago(Some(5 * 24 * 60 * 60 * 1000));
++    assert!(never < days && oldest < days, "never={never:?}, u64max={oldest:?}, days={days:?}");
++    let conn = Arc::new(Conn::default());
++    let mut desktop = viewer(&conn, (58, 132), days);
++    desktop.focus_updates = true;
++    desktop.focused = true;
++    desktop.focused_at = days;
++    desktop.desktop_group = Some(("d".into(), "d".into()));
++    let mut phone = viewer(&conn, (160, 72), never);
++    phone.focus_updates = true;
++    phone.focused = true;
++    phone.focused_at = never;
++    assert_eq!(select_sizing(&[desktop, phone], true).size, Some((58, 132)));
++    eprintln!("safe idle sentinel: i64MAX={never:?}, u64MAX={oldest:?}, 5days={days:?}");
++}
++
++#[test]
++fn reviewer94_modified_f3_ambiguity_is_wider_than_ctrl_only() {
++    for modifier in 2..=16 {
++        let key = format!("\x1b[1;{modifier}R");
++        assert!(crate::input::terminal_reply(key.as_bytes()), "modifier {modifier}");
++    }
++    assert!(!crate::input::terminal_reply(b"\x1bOR"));
++    assert!(!crate::input::terminal_reply(b"\x1b[1;5Rx"));
++}
++
++#[test]
++fn reviewer94_five_viewers_loaded_from_wolfs_actual_capture() {
++    let captured: serde_json::Value = serde_json::from_str(include_str!("wolf-t16b-1407.json")).unwrap();
++    let now = Instant::now();
++    let at = |value: &serde_json::Value| value.as_u64().and_then(|ms| now.checked_sub(Duration::from_millis(ms)));
++    let mut vs: Vec<Viewer> = captured["viewers"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|raw| {
++            let conn = Arc::new(Conn::default());
++            let mut v = viewer(
++                &conn,
++                (raw["offered"]["cols"].as_u64().unwrap() as u16, raw["offered"]["rows"].as_u64().unwrap() as u16),
++                at(&raw["active_ms_ago"]),
++            );
++            v.channel = raw["identity"]["channel"].as_u64().unwrap() as u32;
++            v.focus_updates = raw["focus_updates"] == true;
++            v.focused = raw["focused"] == true;
++            v.focused_at = at(&raw["focused_ms_ago"]);
++            // The capture predates input_ms_ago. The phone was in Wolf's hands,
++            // so a viewer that sends no focus counts its activity as input.
++            v.input_at = at(&raw["input_ms_ago"]).or(if raw["focus_updates"] == true {
++                None
++            } else {
++                at(&raw["active_ms_ago"])
++            });
++            v.visible = raw["visible"] == true;
++            v.sized = raw["sized"] == true;
++            v.awaiting_size = raw["awaiting_size"] == true;
++            v.resize_notifications = raw["resize_notifications"] == true;
++            v.visibility_updates = raw["visibility_updates"] == true;
++            v.desktop_group = raw["desktop_group"].as_object().map(|_| {
++                (
++                    raw["desktop_group"]["line"].as_str().unwrap().into(),
++                    raw["desktop_group"]["group"].as_str().unwrap().into(),
++                )
++            });
++            v
++        })
++        .collect();
++    assert_eq!(vs.len(), 5);
++    for grouped in [false, true] {
++        let s = select_sizing(&vs, grouped);
++        assert_eq!(s.size, Some((160, 72)));
++        assert_eq!(s.leader, Some(4));
++        assert_eq!(s.contributors, vec![4]);
++    }
++    vs[1].input_at = Some(Instant::now());
++    for grouped in [false, true] {
++        let s = select_sizing(&vs, grouped);
++        assert_eq!(s.size, Some((58, 132)));
++        assert_eq!(s.leader, Some(1));
++    }
++}
++
++#[test]
++fn reviewer94_never_used_sentinel_must_not_create_focus_authority() {
++    let (core, id, root) = core_with_screen(200, 120);
++    let old = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let a = core.attach(&old, id, focus_request((58, 132), Some(("old", "old")), false, false)).unwrap();
++    core.viewer_resize(&old, a, 58, 132);
++    let p = core
++        .attach(
++            &phone,
++            id,
++            AttachRequest { idle_ms: Some(i64::MAX as u64), ..focus_request((160, 72), None, true, true) },
++        )
++        .unwrap();
++    core.viewer_resize(&phone, p, 160, 72);
++    let got = core.viewer_list(id, "t1".into());
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++    assert!(!got.focus_authority, "never used must not create focus history and exclude the old desktop");
++}
++
++/// Item 71 (#94 review): a focus-reporting phone attached as never used has
++/// no history until its next WINDOW_FOCUS(1) or real input; real input alone
++/// is enough to decide and lead.
++#[test]
++fn a_never_used_reporter_decides_once_typed_into() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let phone = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core.attach(&app, id, focus_request((120, 50), Some(("test", "test")), true, true)).unwrap();
++    core.viewer_resize(&app, a, 120, 50);
++    let p = core
++        .attach(
++            &phone,
++            id,
++            AttachRequest { idle_ms: Some(i64::MAX as u64), ..focus_request((40, 10), None, true, true) },
++        )
++        .unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    assert_eq!(grid(), (120, 50), "never used: no history");
++    core.viewer_input(&phone, p, b"", false);
++    core.viewer_input(&phone, p, b"\x1b[24;80R", false);
++    assert_eq!(grid(), (120, 50), "an empty frame or a reply is not use");
++    core.viewer_input(&phone, p, b"x", false);
++    assert_eq!(grid(), (40, 10), "typed into: it decides and leads, no WINDOW_FOCUS needed");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71 (#94 review, live repro): an old phone (no focus) typed into
++/// just before a relay's line dropped keeps that input recency through the
++/// reattach (`idle_ms`): it still leads over a desktop idle for an hour.
++/// Without an age, a resumed attach is not use.
++#[test]
++fn a_legacy_viewer_resumed_through_a_relay_keeps_its_input_recency() {
++    let (core, id, root) = core_with_screen(100, 40);
++    let app = desktop_conn();
++    let line = Arc::new(Conn::default());
++    let grid = || core.lock().screens[&id].size();
++    let a = core
++        .attach(
++            &app,
++            id,
++            AttachRequest { idle_ms: Some(3_600_000), ..focus_request((58, 132), Some(("d", "d")), true, true) },
++        )
++        .unwrap();
++    core.viewer_resize(&app, a, 58, 132);
++    let resumed = |idle_ms| AttachRequest { resumed: true, idle_ms, ..focus_request((160, 72), None, false, false) };
++    let p = core.attach(&line, id, resumed(Some(5_000))).unwrap();
++    core.viewer_resize(&line, p, 160, 72);
++    assert_eq!(grid(), (160, 72), "typed 5 s ago, before the line dropped: it still leads");
++    core.detach(&line, None);
++    let p = core.attach(&line, id, resumed(None)).unwrap();
++    core.viewer_resize(&line, p, 160, 72);
++    assert_eq!(grid(), (58, 132), "no age: a resumed attach is not use");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
++
++/// Item 71 (#94 review): a reply cut by a reconnect, its start on the old
++/// stream and its tail on the resumed one (in one frame or several), is not
++/// use; the frames are delivered as they came. A real key there still
++/// counts, within the frame that shows it.
++#[test]
++fn a_reply_tail_first_on_a_resumed_stream_is_not_use() {
++    for (tail, then) in [
++        (&[&b"80R"[..]][..], &b"x"[..]),
++        (&[b"4;8", b"0R"], b"x"),
++        (&[b"[?62;22c"], b"x"),
++        (&[b"0000/0000\x1b\\"], b"x"),
++        // t218: cut at the reconnect and split again after it.
++        (&[b"8", b"0R"], b"x"),
++        (&[b"62", b";22", b"c"], b"x"),
++        (&[b"24;", b"80t"], b"x"),
++        (&[b"11;rgb:00", b"00/0000/0000\x1b", b"\\"], b"x"),
++    ] {
++        let (core, id, root) = core_with_screen(100, 40);
++        let line = Arc::new(Conn::default());
++        let phone = Arc::new(Conn::default());
++        let grid = || core.lock().screens[&id].size();
++        let p = core.attach(&phone, id, focus_request((40, 10), None, true, true)).unwrap();
++        core.viewer_resize(&phone, p, 40, 10);
++        // The desktop, back through a relay after a dropped line, idle for an hour.
++        let a = core
++            .attach(
++                &line,
++                id,
++                AttachRequest {
++                    resumed: true,
++                    idle_ms: Some(3_600_000),
++                    ..focus_request((58, 132), Some(("d", "d")), true, true)
++                },
++            )
++            .unwrap();
++        core.viewer_resize(&line, a, 58, 132);
++        assert_eq!(grid(), (40, 10));
++        for piece in tail {
++            core.viewer_input(&line, a, piece, false);
++        }
++        assert_eq!(grid(), (40, 10), "a reply's tail after the reconnect is not use: {tail:?}");
++        core.viewer_input(&line, a, then, false);
++        assert_eq!(grid(), (58, 132), "a key after it is");
++        drop(core);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++    // A key as the first frame of a resumed stream counts at once.
++    let (core, id, root) = core_with_screen(100, 40);
++    let line = Arc::new(Conn::default());
++    let phone = Arc::new(Conn::default());
++    let p = core.attach(&phone, id, focus_request((40, 10), None, true, true)).unwrap();
++    core.viewer_resize(&phone, p, 40, 10);
++    let a = core
++        .attach(
++            &line,
++            id,
++            AttachRequest {
++                resumed: true,
++                idle_ms: Some(3_600_000),
++                ..focus_request((58, 132), Some(("d", "d")), true, true)
++            },
++        )
++        .unwrap();
++    core.viewer_resize(&line, a, 58, 132);
++    core.viewer_input(&line, a, b"ls\r", false);
++    assert_eq!(core.lock().screens[&id].size(), (58, 132), "typing first after a reconnect is use");
++    drop(core);
++    std::fs::remove_dir_all(root).unwrap();
++}
+diff --git a/crates/herdr-core/src/viewers/wolf-t16b-1407.json b/crates/herdr-core/src/viewers/wolf-t16b-1407.json
+new file mode 100644
+index 0000000..54f352a
+--- /dev/null
++++ b/crates/herdr-core/src/viewers/wolf-t16b-1407.json
+@@ -0,0 +1 @@
++{"current_grid":{"cols":58,"rows":132},"focus_authority":true,"leader":{"channel":24,"connection_id":1},"selected_grid":{"cols":58,"rows":132},"terminal":"t16b","viewers":[{"active_ms_ago":null,"awaiting_size":true,"contributes_to_grid":false,"desktop_group":null,"focus_updates":false,"focused":false,"focused_ms_ago":null,"identity":{"channel":21,"connection_id":3},"leader":false,"observe":false,"offered":{"cols":116,"rows":76},"origin":"relayed","peer":"wolfs-macbook-air","peer_pid":null,"resize_notifications":false,"size_eligible":false,"sized":false,"visibility_updates":false,"visible":true},{"active_ms_ago":6100726,"awaiting_size":false,"contributes_to_grid":true,"desktop_group":{"group":"820feff35df3c471f406a1178693aa05","line":"820feff35df3c471f406a1178693aa05"},"focus_updates":true,"focused":true,"focused_ms_ago":6100407,"identity":{"channel":24,"connection_id":1},"leader":true,"observe":false,"offered":{"cols":58,"rows":132},"origin":"relayed","peer":"desktop","peer_pid":null,"resize_notifications":true,"size_eligible":true,"sized":true,"visibility_updates":true,"visible":true},{"active_ms_ago":6124505,"awaiting_size":false,"contributes_to_grid":false,"desktop_group":{"group":"820feff35df3c471f406a1178693aa05","line":"820feff35df3c471f406a1178693aa05"},"focus_updates":true,"focused":false,"focused_ms_ago":null,"identity":{"channel":82,"connection_id":1},"leader":false,"observe":false,"offered":{"cols":0,"rows":0},"origin":"relayed","peer":"desktop","peer_pid":null,"resize_notifications":true,"size_eligible":false,"sized":false,"visibility_updates":true,"visible":false},{"active_ms_ago":6048787,"awaiting_size":false,"contributes_to_grid":false,"desktop_group":{"group":"a5453d9cf0f914df039d183d89e8c07a","line":"a5453d9cf0f914df039d183d89e8c07a"},"focus_updates":true,"focused":true,"focused_ms_ago":157683,"identity":{"channel":6,"connection_id":9},"leader":false,"observe":false,"offered":{"cols":91,"rows":108},"origin":"relayed","peer":"a5453d9cf0f914df039d183d89e8c07a","peer_pid":null,"resize_notifications":true,"size_eligible":false,"sized":false,"visibility_updates":true,"visible":false},{"active_ms_ago":98,"awaiting_size":false,"contributes_to_grid":false,"desktop_group":null,"focus_updates":false,"focused":false,"focused_ms_ago":null,"identity":{"channel":2,"connection_id":16},"leader":false,"observe":false,"offered":{"cols":160,"rows":72},"origin":"local_client","peer":null,"peer_pid":3426184,"resize_notifications":true,"size_eligible":false,"sized":true,"visibility_updates":true,"visible":true}]}
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 6cc3633..3080b70 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -27,6 +27,11 @@
+             "minimum": 0,
+             "type": "integer"
+           },
++          "focus_by_use": {
++            "default": false,
++            "description": "With `focus_updates`: the owner sizes by use (`focus_by_use`): the\nviewer used last leads, so WINDOW_FOCUS(1) on each use (a touch, a\nresume) matters. Absent: false (older owner: focused desktop first).",
++            "type": "boolean"
++          },
+           "focus_updates": {
+             "description": "True only when every core on the path accepts WINDOW_FOCUS (kind 8).",
+             "type": "boolean"
+@@ -1608,6 +1613,15 @@
+           "identity": {
+             "$ref": "#/components/schemas/ViewerIdentity"
+           },
++          "input_ms_ago": {
++            "description": "Milliseconds since its last real input (typed, clicked, pasted DATA;\nnever terminal replies or AUTOMATIC_INPUT). With `focused_ms_ago`,\nwhen a focus reporter was last used; the latest used decider leads.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          },
+           "leader": {
+             "type": "boolean"
+           },
+@@ -2786,6 +2800,20 @@
+             "type": "integer"
+           }
+         },
++        {
++          "description": "Milliseconds since the view was last used (a person's input or, with\n`focus_updates`, focus there), for an attach nobody caused just now (a\nreconnect, a reattach), focused or not. Without `focus_updates` it\ndates the view's last real input. At or above a year\n(31536000000; send i64::MAX for \"never\"): never used, no focus\nhistory. Absent: a `focused` attach is itself the use; an unfocused\none has not been used.",
++          "name": "idle_ms",
++          "required": false,
++          "schema": {
++            "description": "Milliseconds since the view was last used (a person's input or, with\n`focus_updates`, focus there), for an attach nobody caused just now (a\nreconnect, a reattach), focused or not. Without `focus_updates` it\ndates the view's last real input. At or above a year\n(31536000000; send i64::MAX for \"never\"): never used, no focus\nhistory. Absent: a `focused` attach is itself the use; an unfocused\none has not been used.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          }
++        },
+         {
+           "description": "Watch only: never type or resize.",
+           "name": "observe",

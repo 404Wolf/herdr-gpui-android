@@ -1,0 +1,317 @@
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index 15bdfd1..c31b155 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -752,8 +752,18 @@ impl Terminal {
+ 
+     /// Bytes that repaint this terminal on a fresh viewer: up to `history`
+     /// scrollback lines (main screen only), then the cursor shape, then the
+-    /// screen with its modes, cursor and title.
++    /// screen with its modes, cursor and title. For a viewer with this
++    /// terminal's rows; see [`Terminal::paint_for`].
+     pub fn paint(&self, history: usize) -> Vec<u8> {
++        self.paint_for(history, self.size().1)
++    }
++
++    /// [`Terminal::paint`] for a viewer that renders `viewer_rows` rows, which
++    /// can differ from this terminal's (a viewer never told this size): the
++    /// history goes exactly into its scrollback, with no row lost or blank row
++    /// added. The screen is this terminal's still; one taller than the viewer
++    /// overflows it.
++    pub fn paint_for(&self, history: usize, viewer_rows: u16) -> Vec<u8> {
+         let (cols, rows) = self.size();
+         let last = (cols.saturating_sub(1), rows.saturating_sub(1) as u32);
+         let mut out = PAINT_RESET.to_vec();
+@@ -764,8 +774,12 @@ impl Terminal {
+             if let Some(sel) = self.select(ffi::POINT_HISTORY, (0, from), (last.0, available - 1)) {
+                 // Let the viewer wrap history itself so it can reflow on resize.
+                 out.extend(self.format_with(ffi::FORMAT_VT, Some(&sel), false, true));
+-                // Push those lines up into the viewer's scrollback before painting the screen.
+-                out.extend(b"\x1b[0m\r\n".iter().chain(&b"\n".repeat(rows as usize)));
++                // Push those lines up into the viewer's scrollback before painting the screen:
++                // the CRLF leaves the last of them on a fresh row, and `viewer_rows - 1` more
++                // newlines take it off the viewer's top. One more would push a blank row into its
++                // scrollback too; one fewer would leave it on screen for the ED 2 to erase.
++                let advance = viewer_rows.max(1) - 1;
++                out.extend(b"\x1b[0m\r\n".iter().chain(&b"\n".repeat(advance as usize)));
+                 out.extend(b"\x1b[H\x1b[2J");
+             }
+         }
+diff --git a/crates/ghostty-vt/src/tests.rs b/crates/ghostty-vt/src/tests.rs
+index 4d463bd..4ee38f5 100644
+--- a/crates/ghostty-vt/src/tests.rs
++++ b/crates/ghostty-vt/src/tests.rs
+@@ -284,3 +284,74 @@ fn paint_leaves_the_viewers_default_cursor_when_the_program_chose_none() {
+     // The hollow marker never shows in what the core answers itself.
+     assert_eq!(decscusr(&mut Terminal::new(80, 24, 0)), "\x1bP1$r2 q\x1b\\");
+ }
++
++/// Each scrollback row of `t` as plain text, one by one: a blank row is an empty string,
++/// even the last (formatting the rows together would drop trailing blank ones).
++fn history_text(t: &Terminal) -> Vec<String> {
++    let (cols, _) = t.size();
++    (0..t.history_rows())
++        .map(|y| {
++            let sel = t.select(ffi::POINT_HISTORY, (0, y), (cols - 1, y)).unwrap();
++            String::from_utf8_lossy(&t.format_with(ffi::FORMAT_PLAIN, Some(&sel), false, false)).trim_end().to_owned()
++        })
++        .collect()
++}
++
++/// A terminal with `lines` history rows ("history 0".."history N") under a full screen
++/// ("screen 1".. and a prompt).
++fn with_history(rows: u16, lines: usize) -> Terminal {
++    let mut t = Terminal::new(20, rows, 1 << 20);
++    for i in 0..lines {
++        t.write(format!("history {i}\r\n").as_bytes());
++    }
++    for i in 1..rows {
++        t.write(format!("screen {i}\r\n").as_bytes());
++    }
++    t.write(b"prompt> ");
++    assert_eq!(t.history_rows() as usize, lines);
++    t
++}
++
++#[test]
++fn painted_history_meets_the_screen_with_no_blank_row_between() {
++    // History shorter than the screen, as tall, taller, only part of it, and a one-row screen.
++    for (rows, lines, painted) in [(4u16, 2usize, 100usize), (4, 4, 100), (4, 9, 100), (4, 9, 3), (1, 3, 100)] {
++        let t = with_history(rows, lines);
++        let mut viewer = Terminal::new(20, rows, 1 << 20);
++        viewer.write(&t.paint(painted));
++        let want: Vec<String> = (lines - painted.min(lines)..lines).map(|i| format!("history {i}")).collect();
++        let got = history_text(&viewer);
++        let blank = got.iter().filter(|r| r.is_empty()).count();
++        let case = format!("{rows} rows, {lines} history rows, {painted} painted: {got:?}");
++        // Every row counts: one blank row more than history is the seam above the screen.
++        assert_eq!((viewer.history_rows() as usize, blank), (want.len(), 0), "{case}");
++        assert_eq!(got, want, "{case}");
++        assert_eq!(viewer.screen_rows(), t.screen_rows(), "{case}");
++    }
++}
++
++#[test]
++fn painted_history_fits_a_viewer_taller_or_shorter_than_the_terminal() {
++    // A viewer never told this terminal's size (`hc attach` in a 6-row or 3-row
++    // terminal, a 4-row PTY) renders the paint in its own rows.
++    for lines in [3usize, 10] {
++        let t = with_history(4, lines);
++        let screen: Vec<String> = t.screen_rows().iter().map(|r| r.trim_end().to_owned()).collect();
++        for viewer_rows in [3u16, 4, 6] {
++            let mut viewer = Terminal::new(20, viewer_rows, 1 << 20);
++            viewer.write(&t.paint_for(100, viewer_rows));
++            let got = history_text(&viewer);
++            let shown: Vec<String> = viewer.screen_rows().iter().map(|r| r.trim_end().to_owned()).collect();
++            let case = format!("{viewer_rows}-row viewer, {lines} history rows: {got:?} | {shown:?}");
++            // Every history row, no blank one. A screen taller than the viewer
++            // overflows into its scrollback after them, as it always has.
++            let overflow = 4usize.saturating_sub(viewer_rows as usize);
++            let want: Vec<String> =
++                (0..lines).map(|i| format!("history {i}")).chain(screen[..overflow].iter().cloned()).collect();
++            assert_eq!(got, want, "{case}");
++            let mut rest = screen[overflow..].to_vec();
++            rest.resize(viewer_rows as usize, String::new());
++            assert_eq!(shown, rest, "{case}");
++        }
++    }
++}
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 130d179..580a677 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -288,10 +288,11 @@ impl Core {
+         // first paint as before.
+         let resize_history = st.viewers[&id].last().unwrap().resize_history;
+         let lost = req.resumed && resize_history > 0;
++        let rows = viewer_rows(st.viewers[&id].last().unwrap(), &st.screens[&id]);
+         let (paint, clears) = if lost {
+-            resize_paint_for(&st, id, resize_history, true)
++            resize_paint_to(&st, id, resize_history, true, rows)
+         } else {
+-            (first_paint(&st, id, req.history), false)
++            (first_paint_for(&st, id, req.history, rows), false)
+         };
+         st.viewers.get_mut(&id).unwrap().last_mut().unwrap().repaint_pending = false;
+         conn.with(|out| {
+@@ -780,18 +781,22 @@ impl Core {
+         if !st.viewers.get(&id).into_iter().flatten().any(ready) {
+             return;
+         }
+-        // One paint per distinct (`resize_history`, history lost): viewers
+-        // without it share the screen-only paint, as before.
++        // One paint per distinct (`resize_history`, history lost, viewer rows):
++        // viewers without history share the screen-only paint, as before, and
++        // the history's flush depends on the rows it is rendered in.
+         let lost = |v: &Viewer| v.resize_history > 0 && v.conn.outbox().history_lost(v.channel);
+-        let mut paints: Vec<((usize, bool), (Vec<u8>, bool))> = Vec::new();
+-        for key in st.viewers[&id].iter().filter(|v| ready(v)).map(|v| (v.resize_history, lost(v))) {
++        let screen = &st.screens[&id];
++        let key = |v: &Viewer| (v.resize_history, lost(v), viewer_rows(v, screen));
++        let mut paints: Vec<((usize, bool, u16), (Vec<u8>, bool))> = Vec::new();
++        for key in st.viewers[&id].iter().filter(|v| ready(v)).map(key) {
+             if !paints.iter().any(|(k, _)| *k == key) {
+-                paints.push((key, resize_paint_for(st, id, key.0, key.1)));
++                paints.push((key, resize_paint_to(st, id, key.0, key.1, key.2)));
+             }
+         }
+         let recovering = st.screens[&id].continuation().is_none();
+-        for v in st.viewers.get_mut(&id).into_iter().flatten().filter(|v| ready(v)) {
+-            let key = (v.resize_history, lost(v));
++        let keys: Vec<_> = st.viewers[&id].iter().map(|v| ready(v).then(|| key(v))).collect();
++        for (v, key) in st.viewers.get_mut(&id).into_iter().flatten().zip(keys) {
++            let Some(key) = key else { continue };
+             let (paint, clears) = &paints.iter().find(|(k, _)| *k == key).expect("built above").1;
+             // Queued whole, never refused: the RESIZE is always followed by its paint.
+             v.conn.with(|out| {
+@@ -995,13 +1000,33 @@ fn viewer_size(viewers: &[Viewer], grouped: bool) -> (Option<&Viewer>, Option<(u
+ /// must see them too; a viewer repainted after falling behind gets the mode
+ /// either way).
+ pub(crate) fn first_paint(st: &State, id: u32, history: usize) -> Vec<u8> {
++    first_paint_for(st, id, history, st.screens[&id].size().1)
++}
++
++/// [`first_paint`] for a viewer that renders `rows` rows ([`viewer_rows`]):
++/// its history goes exactly into that viewer's scrollback.
++pub(crate) fn first_paint_for(st: &State, id: u32, history: usize, rows: u16) -> Vec<u8> {
+     let screen = &st.screens[&id];
+-    finish_paint(st, id, screen.paint(history))
++    finish_paint(st, id, screen.paint_for(history, rows))
++}
++
++/// The rows a viewer renders this screen in: the PTY's for one told of every
++/// size (a RESIZE goes before each paint), otherwise its own reported rows (an
++/// `hc attach`, which can be taller or shorter than the PTY it does not size).
++fn viewer_rows(v: &Viewer, screen: &ghostty_vt::Terminal) -> u16 {
++    if v.resize_notifications || v.size.1 == 0 { screen.size().1 } else { v.size.1 }
++}
++
++/// [`resize_paint_to`] for a viewer with the PTY's rows.
++#[cfg(test)]
++pub(crate) fn resize_paint_for(st: &State, id: u32, history: usize, force: bool) -> (Vec<u8>, bool) {
++    resize_paint_to(st, id, history, force, st.screens[&id].size().1)
+ }
+ 
+ /// The repaint after a RESIZE for a viewer that asked for `history` rows of
+-/// it, and whether it clears the viewer's history. With `history > 0` on the
+-/// main screen it is CAN, the screen's reset (ending `ESC[H ESC[2J`), then
++/// it and renders `rows` rows ([`viewer_rows`]), and whether it clears the
++/// viewer's history. With `history > 0` on the main screen it is CAN, the
++/// screen's reset (ending `ESC[H ESC[2J`), then
+ /// `ESC[3J`, so the history that follows replaces the viewer's, then the
+ /// screen. Only when all of it fits [`RESIZE_PAINT_BUDGET`] (all `history`
+ /// rows, or every row there is): otherwise, and on the alternate screen
+@@ -1010,10 +1035,10 @@ pub(crate) fn first_paint(st: &State, id: u32, history: usize) -> Vec<u8> {
+ /// `force`: a history-clearing paint was cut short, so the viewer's history
+ /// may be gone; it gets the whole history whatever the size. 0: exactly
+ /// [`first_paint`] without history.
+-pub(crate) fn resize_paint_for(st: &State, id: u32, history: usize, force: bool) -> (Vec<u8>, bool) {
++fn resize_paint_to(st: &State, id: u32, history: usize, force: bool, rows: u16) -> (Vec<u8>, bool) {
+     let screen = &st.screens[&id];
+     if history > 0 && !screen.alt_screen() {
+-        let mut painted = screen.paint(history.min(MAX_RESIZE_HISTORY));
++        let mut painted = screen.paint_for(history.min(MAX_RESIZE_HISTORY), rows);
+         let at = ghostty_vt::PAINT_RESET.len();
+         debug_assert!(painted.starts_with(ghostty_vt::PAINT_RESET));
+         painted.splice(at..at, *b"\x1b[3J");
+@@ -1025,9 +1050,9 @@ pub(crate) fn resize_paint_for(st: &State, id: u32, history: usize, force: bool)
+     (first_paint(st, id, 0), false)
+ }
+ 
+-/// [`resize_paint_for`]'s bytes, not forced.
++/// [`resize_paint_to`]'s bytes for a viewer with the PTY's rows, not forced.
+ pub(crate) fn resize_paint(st: &State, id: u32, history: usize) -> Vec<u8> {
+-    resize_paint_for(st, id, history, false).0
++    resize_paint_to(st, id, history, false, st.screens[&id].size().1).0
+ }
+ 
+ /// Most history rows a resize paint carries (`resize_history` above it is this).
+diff --git a/crates/herdr-core/src/viewers/tests.rs b/crates/herdr-core/src/viewers/tests.rs
+index ae0187c..335a020 100644
+--- a/crates/herdr-core/src/viewers/tests.rs
++++ b/crates/herdr-core/src/viewers/tests.rs
+@@ -2493,3 +2493,84 @@ fn a_reply_tail_first_on_a_resumed_stream_is_not_use() {
+     drop(core);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++/// A first paint's history goes exactly into the viewer's scrollback in the
++/// rows the viewer renders: the PTY's for one negotiating RESIZE (its 6-row
++/// offer does not size a PTY a focused desktop leads), its own for an
++/// `hc attach` without it, taller or shorter than the PTY. No history row is
++/// lost to the ED 2 after it and no blank row comes between it and the
++/// screen; a screen taller than the viewer overflows into its scrollback.
++#[test]
++fn a_first_paints_history_fits_the_rows_the_viewer_renders() {
++    let request = |size, observe, negotiated| AttachRequest {
++        observe,
++        resize_notifications: negotiated,
++        history: 100,
++        resize_history: if negotiated { 100 } else { 0 },
++        size,
++        display: Display::default(),
++        resumed: false,
++        visible: true,
++        visibility_updates: false,
++        focus_updates: false,
++        focused: false,
++        idle_ms: None,
++        desktop_group: None,
++    };
++    // (negotiated, observe, viewer rows) -> the rows it renders.
++    for (negotiated, observe, rows, renders) in
++        [(true, false, 6, 4), (false, true, 6, 6), (false, false, 6, 6), (false, true, 3, 3), (false, true, 4, 4)]
++    {
++        let (core, id, root) = core_with_screen(20, 4);
++        let desktop = desktop_conn();
++        let leader = core
++            .attach(
++                &desktop,
++                id,
++                AttachRequest {
++                    history: 0,
++                    focus_updates: true,
++                    focused: true,
++                    desktop_group: Some(("local".into(), "desktop".into())),
++                    ..request((20, 4), false, true)
++                },
++            )
++            .unwrap();
++        core.viewer_resize(&desktop, leader, 20, 4);
++        {
++            let mut st = core.lock();
++            let screen = st.screens.get_mut(&id).unwrap();
++            for n in 0..10 {
++                screen.write(format!("H{n:02}\r\n").as_bytes());
++            }
++            screen.write(b"S1\r\nS2\r\nS3\r\nprompt> ");
++        }
++        let conn = Arc::new(Conn::default());
++        let ch = core.attach(&conn, id, request((20, rows), observe, negotiated)).unwrap();
++        assert_eq!(core.lock().screens[&id].size(), (20, 4), "the desktop keeps the PTY's size");
++        let mut viewer = ghostty_vt::Terminal::new(20, rows, 1 << 20);
++        for (kind, bytes) in frames(&conn, ch) {
++            if kind == wire::RESIZE {
++                viewer.resize(u16::from_le_bytes([bytes[0], bytes[1]]), u16::from_le_bytes([bytes[2], bytes[3]]));
++            } else if kind == wire::DATA {
++                viewer.write(&bytes);
++            }
++        }
++        let text = viewer.plain_text();
++        let mut lines: Vec<&str> = text.lines().map(str::trim_end).collect();
++        // The empty screen rows under the prompt of a taller viewer; a blank row
++        // between history and screen stays and fails.
++        while lines.last() == Some(&"") {
++            lines.pop();
++        }
++        let case = format!("negotiated {negotiated}, observe {observe}, {rows} rows: {lines:?}");
++        assert_eq!(viewer.size().1, renders, "{case}");
++        let want: Vec<String> =
++            (0..10).map(|n| format!("H{n:02}")).chain(["S1", "S2", "S3", "prompt>"].map(String::from)).collect();
++        assert_eq!(lines, want, "{case}");
++        // Every history row, no blank one; S1 too when the screen does not fit.
++        assert_eq!(viewer.history_rows() as usize, 10 + 4usize.saturating_sub(renders as usize), "{case}");
++        drop(core);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++}
