@@ -177,7 +177,7 @@ impl TerminalView {
                     // Every press here is a touch: one begun on a view this one
                     // replaced mid-tap is never this view's to click.
                     #[cfg(target_os = "android")]
-                    terminal.set_touch_presses(true);
+                    terminal.set_touch_presses(crate::android::touch_active);
                     // Every link found here carries the host and pane this
                     // renderer was attached for, fixed now: Java opens it
                     // only while that is still the selected pane.
@@ -248,7 +248,20 @@ impl TerminalView {
     /// The attached shell's element, after giving it the current theme and size.
     #[cfg(unix)]
     fn shell_element(&mut self, width: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use gpui_rio::ghost::PromptKind;
+
         let terminal = self.shell.as_ref()?.1.clone();
+        let kind = self
+            .state
+            .frame_target
+            .as_ref()
+            .filter(|_| self.state.active && !self.state.show_agent_footer)
+            .map_or(PromptKind::Other, |target| target.footer_kind);
+        terminal.update(cx, |terminal, cx| {
+            if terminal.set_footer_kind(kind) {
+                cx.notify();
+            }
+        });
         let style = self.shell_style(width);
         if self.shell_style.as_ref() != Some(&style) {
             let next = style.clone();

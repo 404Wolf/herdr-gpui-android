@@ -1,5 +1,7 @@
 //! herdr-core sessions over embedded SSH. No TUI bridge or binary projection.
 use crate::model;
+#[cfg(feature = "android-ui")]
+use gpui_rio::ghost::PromptKind;
 use herdr_remote_transport::{CancellationToken, Config, Credentials, IrohTarget, Transport};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,7 +13,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 const MAX_CONFIG: usize = 8192;
@@ -201,6 +203,7 @@ pub fn generate_identity(comment: &str) -> Result<String> {
     )?)
 }
 
+#[derive(Default)]
 pub(crate) struct State {
     pub(crate) view: Value,
     pub(crate) terminal: Option<Arc<gpui_rio::Session>>,
@@ -209,7 +212,105 @@ pub(crate) struct State {
     pub(crate) render_id: u64,
     /// Whether this attach's stream has delivered its first paint.
     pub(crate) painted: bool,
+    #[cfg(feature = "android-ui")]
+    footer_foreground: Option<ForegroundObservation>,
 }
+
+impl State {
+    pub(crate) fn new(view: Value) -> Self {
+        Self { view, ..Self::default() }
+    }
+}
+
+#[cfg(feature = "android-ui")]
+struct ForegroundObservation {
+    renderer: u64,
+    pid: u64,
+    name: Box<str>,
+    kind: PromptKind,
+    first: Instant,
+    latest: Instant,
+}
+
+#[cfg(feature = "android-ui")]
+impl State {
+    /// Only core replies extend an observation. Repeated UI polls of a
+    /// cached reply cannot confirm that a foreground process is still there.
+    pub(crate) fn observe_footer_foreground(&mut self, terminal: Option<&Value>, at: Instant) {
+        let Some((pid, name, kind)) = terminal.filter(|_| self.render_id != 0).and_then(foreground_agent)
+        else {
+            self.invalidate_footer_foreground();
+            return;
+        };
+        if let Some(previous) = &mut self.footer_foreground
+            && previous.renderer == self.render_id
+            && previous.pid == pid
+            && previous.name.as_ref() == name
+            && previous.kind == kind
+        {
+            previous.latest = at;
+            return;
+        }
+        self.invalidate_footer_foreground();
+        self.footer_foreground = Some(ForegroundObservation {
+            renderer: self.render_id,
+            pid,
+            name: name.into(),
+            kind,
+            first: at,
+            latest: at,
+        });
+    }
+
+    pub(crate) fn footer_foreground_changed(&mut self, report: &Value) {
+        // The core also emits foreground events for cwd changes. Those still
+        // describe the same foreground process.
+        if self.footer_foreground.as_ref().is_some_and(|seen| {
+            report["pid"].as_u64() != Some(seen.pid)
+                || report["name"].as_str() != Some(seen.name.as_ref())
+        }) {
+            self.invalidate_footer_foreground();
+        }
+    }
+
+    pub(crate) fn invalidate_footer_foreground(&mut self) {
+        if self.footer_foreground.take().is_some() {
+            model::mailbox().clear_footer_kind(self.render_id);
+        }
+    }
+
+    fn footer_kind(&self) -> PromptKind {
+        self.footer_foreground.as_ref().map_or(PromptKind::Other, |seen| {
+            if seen.renderer == self.render_id && seen.latest.duration_since(seen.first) >= Duration::from_secs(1) {
+                seen.kind
+            } else {
+                PromptKind::Other
+            }
+        })
+    }
+}
+
+#[cfg(feature = "android-ui")]
+fn foreground_agent(terminal: &Value) -> Option<(u64, &str, PromptKind)> {
+    if terminal["state"] != "live" {
+        return None;
+    }
+    let foreground = &terminal["foreground"];
+    let pid = foreground["pid"].as_u64().filter(|&pid| pid > 0)?;
+    let name = foreground["name"].as_str()?;
+    let agent = terminal["labels"]["agent.kind"].as_str()?;
+    let matches = |names: &[&str]| names.iter().any(|program| name.eq_ignore_ascii_case(program));
+    let claude = agent.eq_ignore_ascii_case("claude") || agent.eq_ignore_ascii_case("claude-code");
+    let kind = if claude && matches(&["claude", "claude-code", "claude.exe", "claude-code.exe"]) {
+        PromptKind::Claude
+    } else if agent.eq_ignore_ascii_case("codex") && matches(&["codex", "codex.exe"]) {
+        PromptKind::Codex
+    } else {
+        return None;
+    };
+    Some((pid, name, kind))
+}
+
 pub(crate) struct Session {
     /// This session's handle (the phone's id for it): a kept grid remembers
     /// which session showed it, since every core numbers its panes t1, t2…
@@ -220,7 +321,7 @@ pub(crate) struct Session {
     /// The latest window switch asked for and not yet made. A slot, not the
     /// queue: a switch can never be refused because terminal output filled
     /// the queue, and quick taps collapse into the last one.
-    pub(crate) focus: Mutex<Option<(String, std::time::Instant)>>,
+    pub(crate) focus: Mutex<Option<(String, Instant)>>,
     /// When herdr-core last sent any byte, for the phone's liveness check.
     pub(crate) heard: Heard,
     /// Whether the phone shows this session: only a visible viewer may size
@@ -238,7 +339,7 @@ pub(crate) struct Session {
 /// is refreshed every two seconds, so a long silence means the path is dead
 /// (a subway tunnel), which TCP alone would report only after many seconds.
 pub(crate) struct Heard {
-    born: std::time::Instant,
+    born: Instant,
     at_ms: AtomicU64,
     /// Bytes of pane output received so far (every pane this session showed):
     /// the phone checkpoints the pane on screen only while this moves.
@@ -247,7 +348,7 @@ pub(crate) struct Heard {
 impl Default for Heard {
     fn default() -> Self {
         Self {
-            born: std::time::Instant::now(),
+            born: Instant::now(),
             at_ms: AtomicU64::new(0),
             output: AtomicU64::new(0),
         }
@@ -391,12 +492,7 @@ pub fn connect_credentials_grid(
     let (tx, rx) = mpsc::sync_channel(4096);
     let owner = Arc::new(Session {
         id,
-        state: Mutex::new(State {
-            view: json!({"state":"connecting","status":"Connecting to herdr-core over SSH","boot_id":"","pane_id":"","focused_pane":"","panes":[],"workspaces":[],"tabs":[],"title":"Herdr Core","token":1,"chrome_token":1,"revision":1,"fetch":null,"scroll":{"offset":0,"max":0,"rows":0}}),
-            terminal: None,
-            render_id: 0,
-            painted: false,
-        }),
+        state: Mutex::new(State::new(json!({"state":"connecting","status":"Connecting to herdr-core over SSH","boot_id":"","pane_id":"","focused_pane":"","panes":[],"workspaces":[],"tabs":[],"title":"Herdr Core","token":1,"chrome_token":1,"revision":1,"fetch":null,"scroll":{"offset":0,"max":0,"rows":0}}))),
         cancel: CancellationToken::new(),
         commands: tx,
         focus: Mutex::new(None),
@@ -410,6 +506,8 @@ pub fn connect_credentials_grid(
         .spawn(move || {
             if let Err(error) = run(&worker, config, credentials, cols, rows, active, rx) {
                 let mut state = lock(&worker.state);
+                #[cfg(feature = "android-ui")]
+                state.invalidate_footer_foreground();
                 state.view["state"] = json!("closed");
                 state.view["status"] = json!(error.to_string());
                 bump(&mut state.view);
@@ -443,7 +541,7 @@ pub fn used() {
 /// The phone's last use, process-wide: whatever Wolf touched, the pane on
 /// screen is the one he chose.
 pub(crate) struct LastUse {
-    born: OnceLock<std::time::Instant>,
+    born: OnceLock<Instant>,
     /// Milliseconds after `born` of the last use, plus one (0: never).
     at_ms: AtomicU64,
     /// Uses so far: a session sees a new one by a change.
@@ -458,7 +556,7 @@ impl LastUse {
         }
     }
     fn now_ms(&self) -> u64 {
-        let born = self.born.get_or_init(std::time::Instant::now);
+        let born = self.born.get_or_init(Instant::now);
         u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
     pub(crate) fn mark(&self) {
@@ -722,7 +820,10 @@ pub fn poll_terminal(
         // for, under the same lock that installs it.
         if state.render_id != 0 || !mailbox.state().held {
             let pane = state.view["pane_id"].as_str().unwrap_or("");
-            let target = model::FrameTarget::new(host, pane);
+            let target = model::FrameTarget {
+                footer_kind: state.footer_kind(),
+                ..model::FrameTarget::new(host, pane)
+            };
             mailbox.set_shell(generation, state.render_id, Some(target));
         }
     }
@@ -768,7 +869,7 @@ pub fn focus(id: u64, terminal: &str) -> Result<String> {
     // Not checked against the view: the phone's list may be newer or older
     // than this copy. A window that is gone fails its attach, which the
     // session recovers from by staying on the window it was showing.
-    *lock(&owner.focus) = Some((terminal.into(), std::time::Instant::now()));
+    *lock(&owner.focus) = Some((terminal.into(), Instant::now()));
     Ok(json!({"queued":true}).to_string())
 }
 pub fn focus_tab(id: u64, tab: &str) -> Result<String> {
@@ -981,7 +1082,7 @@ mod last_use_tests {
     fn a_reconnect_after_two_days_keeps_two_days_of_idle_age() {
         let uses = LastUse::new();
         uses.born
-            .set(std::time::Instant::now().checked_sub(Duration::from_secs(172_800)).unwrap())
+            .set(Instant::now().checked_sub(Duration::from_secs(172_800)).unwrap())
             .unwrap();
         uses.at_ms.store(1, Ordering::Relaxed);
         uses.count.store(1, Ordering::Relaxed);
@@ -995,5 +1096,145 @@ mod last_use_tests {
         let uses = LastUse::new();
         assert_eq!(uses.idle_ms(), NEVER_USED_MS);
         assert_eq!(json!(uses.idle_ms()).as_i64(), Some(i64::MAX));
+    }
+}
+
+#[cfg(all(test, feature = "android-ui"))]
+mod footer_tests {
+    use super::*;
+    use gpui_rio::footer::hidden_on_screen;
+    use rio_vt::{
+        ansi::CursorShape,
+        crosswords::{Crosswords, CrosswordsSize},
+        event::{VoidListener, WindowId},
+        performer::handler::Processor,
+    };
+
+    const TRANSCRIPT: &str = concat!(
+        "\x1b[4;1H",
+        "────────────────────────────────────────\r\n",
+        "❯ Inspect the saved transcript\r\n",
+        "────────────────────────────────────────\r\n",
+        "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell · 3 agents\r\n",
+        "Open https://example.com/after",
+        "\x1b[5;3H",
+    );
+
+    fn grid() -> Crosswords<VoidListener> {
+        Crosswords::new(
+            CrosswordsSize::new(96, 8),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            0,
+        )
+    }
+
+    fn attached() -> State {
+        State { render_id: u64::MAX, ..State::default() }
+    }
+
+    fn terminal(agent: &str, program: &str, pid: u64) -> Value {
+        json!({"address":"t1","state":"live","labels":{"agent.kind":agent},"foreground":{"name":program,"pid":pid}})
+    }
+
+    fn confirm(state: &mut State, terminal: &Value, first: Instant) -> Instant {
+        let latest = first + Duration::from_secs(1);
+        state.observe_footer_foreground(Some(terminal), first);
+        state.observe_footer_foreground(Some(terminal), latest);
+        latest
+    }
+
+    #[test]
+    fn editor_output_before_the_foreground_update_keeps_the_transcript() {
+        let mut state = attached();
+        let claude = terminal("claude", "claude", 10);
+        let exit = confirm(&mut state, &claude, Instant::now());
+        let mut grid = grid();
+        let mut parser = Processor::default();
+        parser.advance(&mut grid, TRANSCRIPT.as_bytes());
+        assert_eq!(hidden_on_screen(&grid, state.footer_kind()), Some(6..7));
+
+        // The agent exits. At 12 ms Neovim's alternate screen is here, but
+        // the core still reports the old foreground until after 500 ms.
+        parser.advance(&mut grid, b"\x1b[?1049h");
+        parser.advance(&mut grid, TRANSCRIPT.as_bytes());
+        state.observe_footer_foreground(Some(&claude), exit + Duration::from_millis(12));
+        assert_eq!(state.footer_kind(), PromptKind::Claude);
+        assert_eq!(hidden_on_screen(&grid, state.footer_kind()), None);
+        let editor = terminal("claude", "nvim", 11);
+        state.observe_footer_foreground(Some(&editor), exit + Duration::from_millis(504));
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+        assert_eq!(hidden_on_screen(&grid, state.footer_kind()), None);
+    }
+
+    #[test]
+    fn a_claude_labeled_nvim_transcript_keeps_its_mode_line_on_the_main_screen() {
+        let mut grid = grid();
+        Processor::default().advance(&mut grid, TRANSCRIPT.as_bytes());
+        assert_eq!(hidden_on_screen(&grid, PromptKind::Claude), Some(6..7));
+
+        let mut state = attached();
+        let mut at = Instant::now();
+        for (program, hidden) in [
+            ("nvim", None),
+            ("claude", Some(6..7)),
+            ("less", None),
+            ("bash", None),
+            ("codex", None),
+            ("aswap", None),
+            ("", None),
+        ] {
+            at = confirm(&mut state, &terminal("claude", program, 10), at);
+            assert_eq!(hidden_on_screen(&grid, state.footer_kind()), hidden, "{program}");
+        }
+    }
+
+    #[test]
+    fn foreground_must_be_confirmed_for_one_second_on_the_same_renderer() {
+        let mut state = attached();
+        let first = Instant::now();
+        let claude = terminal("claude", "claude", 10);
+        state.observe_footer_foreground(Some(&claude), first);
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+        state.observe_footer_foreground(Some(&claude), first + Duration::from_millis(999));
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+        let stable = first + Duration::from_secs(1);
+        state.observe_footer_foreground(Some(&claude), stable);
+        assert_eq!(state.footer_kind(), PromptKind::Claude);
+
+        let replacement = terminal("claude", "claude", 11);
+        state.observe_footer_foreground(Some(&replacement), stable);
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+        let stable = confirm(&mut state, &replacement, stable);
+        assert_eq!(state.footer_kind(), PromptKind::Claude);
+
+        state.footer_foreground_changed(&json!({"name":"claude","pid":11,"cwd":"/tmp/work"}));
+        assert_eq!(state.footer_kind(), PromptKind::Claude);
+        state.footer_foreground_changed(&json!({"name":"nvim","pid":12}));
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+        state.observe_footer_foreground(Some(&replacement), stable);
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+        confirm(&mut state, &replacement, stable);
+        assert_eq!(state.footer_kind(), PromptKind::Claude);
+
+        state.render_id -= 1;
+        assert_eq!(state.footer_kind(), PromptKind::Other);
+    }
+
+    #[test]
+    fn codex_requires_an_agent_label_and_matching_foreground_program() {
+        let mut state = attached();
+        let at = confirm(&mut state, &terminal("codex", "codex", 10), Instant::now());
+        assert_eq!(state.footer_kind(), PromptKind::Codex);
+        for report in [
+            terminal("codex", "nvim", 10),
+            terminal("", "codex", 10),
+            terminal("codex", "codex", 0),
+        ] {
+            state.observe_footer_foreground(Some(&report), at);
+            assert_eq!(state.footer_kind(), PromptKind::Other);
+        }
     }
 }

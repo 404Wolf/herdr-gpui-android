@@ -9,6 +9,8 @@
 //! with the host's controls, Claude's status line) never moves, whatever the draft's
 //! length.
 
+use crate::ghost::{self, Anchor, Layout};
+
 /// The leading added per extra draft line, as a fraction of the cell height.
 pub const LEADING_RATIO: f32 = 0.25;
 /// Extra lines that each add a full leading; the box stops growing after these.
@@ -53,6 +55,24 @@ impl RowGeometry {
         let room = limit.saturating_sub(first).saturating_sub(rows) as f32 * cell_height;
         let shift = ((grown - room).max(0.) / cell_height).ceil() * cell_height;
         Self { cell_height, first, rows, gap: grown / (rows - 1) as f32, shift }
+    }
+
+    pub fn for_layout(
+        cell_height: f32,
+        layout: &Layout,
+        anchor: Option<Anchor>,
+        screen: &[Vec<char>],
+    ) -> Self {
+        let block = ghost::draft_block(&layout.placed);
+        match (anchor, block) {
+            (Some(anchor), Some((first, _)))
+                if layout.spread_safe
+                    && layout.controls.iter().all(|control| control.row > first) =>
+            {
+                Self::for_draft(cell_height, block, ghost::draft_limit(screen, anchor))
+            }
+            _ => Self::uniform(cell_height),
+        }
     }
 
     fn spread(&self) -> bool {

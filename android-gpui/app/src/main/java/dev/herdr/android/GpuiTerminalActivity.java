@@ -298,6 +298,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             themeIndex = getSharedPreferences("terminal-display", MODE_PRIVATE).getInt("theme", 0);
             if (themeIndex < 0 || themeIndex > GpuiDisplayOptions.THEME_SYSTEM) themeIndex = 0;
             nativeStart(this);
+            nativeShowAgentFooter(showAgentFooter);
             appliedPalette = currentPalette();
             nativeSetTheme(appliedPalette);
             chrome = GpuiChrome.load(appliedPalette);
@@ -1528,13 +1529,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 ? "Control armed for next letter. Tap to cancel" : "Control modifier for the next letter");
     }
 
+    private boolean showAgentFooter;
+
     private void loadDisplayOptions() {
         SharedPreferences preferences = getSharedPreferences("terminal-display", MODE_PRIVATE);
         try {
             displayOptions = new GpuiDisplayOptions(preferences.getInt("mode", 0),
                     preferences.getInt("font", 0), preferences.getInt("alt", 0));
+            showAgentFooter = AgentFooterPreference.show(preferences);
         } catch (ClassCastException invalid) {
             displayOptions = new GpuiDisplayOptions(0, 0, 0);
+            showAgentFooter = false;
         }
     }
 
@@ -1706,6 +1711,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         Spinner alerts = optionSpinner(context, new String[]{"Off", "Notify when an agent needs me"},
                 agentAlertsOn() ? 1 : 0);
         options.addView(alerts);
+        android.widget.Switch footer = new android.widget.Switch(context);
+        footer.setText("Show agent footer");
+        footer.setChecked(showAgentFooter);
+        footer.setMinHeight(dp(48));
+        options.addView(footer);
         // One line of guidance; the host and status it used to repeat are already
         // in the header this sheet opens over.
         TextView help = optionLabel(context, "Compact keeps more rows visible. Opening this sheet cancels an unsent draft.");
@@ -1719,10 +1729,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                             font.getSelectedItemPosition() == 0 ? 0 : font.getSelectedItemPosition() + 10,
                             alt.getSelectedItemPosition());
                     themeIndex = theme.getSelectedItemPosition();
-                    getSharedPreferences("terminal-display", MODE_PRIVATE).edit()
+                    showAgentFooter = footer.isChecked();
+                    SharedPreferences.Editor editor = getSharedPreferences("terminal-display", MODE_PRIVATE).edit();
+                    AgentFooterPreference.save(editor, showAgentFooter)
                             .putInt("mode", displayOptions.mode).putInt("font", displayOptions.fontSize)
                             .putInt("alt", displayOptions.altMode).putInt("theme", themeIndex)
                             .putBoolean(AGENT_ALERTS, alerts.getSelectedItemPosition() == 1).apply();
+                    nativeShowAgentFooter(showAgentFooter);
                     applyTheme();
             // Host switching needs the saved hosts before the first rail paint.
             worker.execute(() -> {
@@ -5796,16 +5809,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (hostStarted) nativeSurfaceDestroyed();
     }
 
-    /** Where the last finger lifted on the terminal (surface pixels): a tap on the draft's words puts the cursor there. */
-    private float liftX = Float.NaN, liftY = Float.NaN;
+    /** Where the last completed touch began (surface pixels), for taps on the draft. */
+    private float tapX = Float.NaN, tapY = Float.NaN;
 
     private boolean forwardTouch(MotionEvent event) {
-        int count = event.getPointerCount();
-        if (!hostStarted || count < 1 || count > 16) return false;
+        if (!hostStarted) return false;
         int masked = event.getActionMasked();
+        if (masked == MotionEvent.ACTION_DOWN) nativeSetTerminalTouchActive(true);
+        try {
+            return dispatchTerminalTouch(event, masked);
+        } finally {
+            // Local scrolls and pinches cancel GPUI's touch before the fingers lift.
+            if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
+                nativeSetTerminalTouchActive(false);
+            }
+        }
+    }
+
+    private boolean dispatchTerminalTouch(MotionEvent event, int masked) {
+        int count = event.getPointerCount();
+        if (count < 1 || count > 16) return false;
         if (masked == MotionEvent.ACTION_UP) {
-            liftX = event.getX();
-            liftY = event.getY();
+            tapX = touchDownX;
+            tapY = touchDownY;
         }
         if (masked == MotionEvent.ACTION_DOWN) rendererTouch.down(event.getPointerId(0));
         pinchDetector().onTouchEvent(event);
@@ -6063,7 +6089,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         }
         stopConnection();
-        if (hostStarted) nativePaused();
+        if (hostStarted) {
+            claimRendererTouch();
+            nativeSetTerminalTouchActive(false);
+            nativePaused();
+        }
         super.onPause();
     }
 
@@ -6394,7 +6424,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { target = connection; }
         // An agent's pane types into the composer's draft instead.
         boolean handled = composer != null
-                ? composer.terminalTapped(clicked, liftX, liftY)
+                ? composer.terminalTapped(clicked, tapX, tapY)
                 : TerminalTap.after(outcome, false) == TerminalTap.Action.NOTHING;
         if (!handled && target != null && target.ready && terminalSurface != null) {
             final long generation = target.generation;
@@ -6848,7 +6878,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return "";
     }
 
-    /** "claude" or "codex" for the pane on screen, from its agent.kind label or title. */
+    /** "claude" or "codex" for the pane on screen, from its agent.kind label. */
     private static String agentKind(Connection current) {
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -7854,6 +7884,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             float systemFontScale);
     /** Draws the raw shell {@code handle} (0 for Herdr's pane) for this generation only. */
     private static native boolean nativeAttachShell(long generation, long handle, String host, String pane);
+    private static native void nativeShowAgentFooter(boolean show);
 
     /** Moves the terminal horizontally by this many logical pixels. */
     private static native void nativePan(float delta);
@@ -7880,6 +7911,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeSurfaceDestroyed();
     private static native void nativeResumed();
     private static native void nativePaused();
+    private static native void nativeSetTerminalTouchActive(boolean active);
     private static native boolean nativeTouch(int action, int actionIndex, int[] ids, float[] xs, float[] ys,
             long tapStamp);
     private static native boolean nativeKey(long generation, int keyCode, int action, int metaState, int unicodeCodepoint);

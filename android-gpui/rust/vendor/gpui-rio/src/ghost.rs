@@ -38,10 +38,11 @@ pub fn cells(text: &str) -> usize {
 }
 
 /// Whose prompt the screen shows, as the host knows from the pane's agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PromptKind {
     Claude,
     Codex,
+    #[default]
     Other,
 }
 
@@ -3515,6 +3516,140 @@ mod tests {
         let rows = screen(&refs, cols);
         let anchor = locate(&rows, Some((20, 2)), PromptKind::Claude).expect("anchor");
         (rows, anchor)
+    }
+
+    #[test]
+    fn a_hidden_claude_footer_and_three_line_draft_share_the_viewport() {
+        use crate::{
+            footer::{Rows, hidden_on_screen},
+            links::{Link, grid_link_at},
+            rows::RowGeometry,
+        };
+        use rio_vt::{
+            ansi::CursorShape,
+            crosswords::{
+                Crosswords, CrosswordsSize,
+                grid::Scroll,
+                pos::{Column, Line, Pos},
+            },
+            event::{VoidListener, WindowId},
+            performer::handler::Processor,
+        };
+
+        const ABOVE: &str = "https://example.com/above";
+        const BELOW: &str = "https://example.com/below";
+        const HISTORY: &str = "https://example.com/history";
+        const HEIGHT: f32 = 40.;
+        for cols in [46, 52, 98] {
+            let rule = "─".repeat(cols);
+            let mut grid = Crosswords::new(
+                CrosswordsSize::new(cols, 28),
+                CursorShape::Block,
+                VoidListener,
+                WindowId::from(0),
+                0,
+                16,
+            );
+            let screen_output = format!(
+                concat!(
+                    "\x1b[1;1H{history}\x1b[28;1H\r\n",
+                    "\x1b[18;1H{above}\x1b[20;1H{rule}\x1b[21;1H❯ ",
+                    "\x1b[22;1H{rule}\x1b[23;1H  -- INSERT --",
+                    "\x1b[25;1H{below}\x1b[21;3H",
+                ),
+                history = HISTORY,
+                above = ABOVE,
+                rule = rule,
+                below = BELOW,
+            );
+            Processor::default().advance(&mut grid, screen_output.as_bytes());
+
+            let hidden = hidden_on_screen(&grid, PromptKind::Claude);
+            assert_eq!(hidden, Some(22..23), "{cols} cols");
+            let mut rows = Rows::new(28, hidden);
+            rows.set_viewport(2, 24, 0);
+            let screen = rows.screen(&grid, cols, 0);
+            let caret = rows.projected(Line(20)).map(|row| (row, 2));
+            let anchor = locate(&screen, caret, PromptKind::Claude);
+            assert_eq!(anchor.map(|anchor| anchor.row), Some(18));
+            assert_eq!(rows.projected(Line(22)), None);
+            assert_eq!(rows.source(20), Some(Line(23)));
+            for row in 0..rows.view_len() {
+                assert_eq!(
+                    rows.source(row).and_then(|line| rows.projected(line)),
+                    Some(row)
+                );
+            }
+
+            let short = place_all(&controls(ghost(vec![text("one")])), anchor, &screen, None);
+            let short_geometry = RowGeometry::for_layout(HEIGHT, &short, anchor, &screen);
+            let draft = "x".repeat(2 * cols - 12);
+            let long = place_all(&controls(ghost(vec![text(&draft)])), anchor, &screen, None);
+            assert_eq!(draft_block(&long.placed), Some((18, 20)), "{cols} cols");
+            let geometry = RowGeometry::for_layout(HEIGHT, &long, anchor, &screen);
+            assert_eq!(geometry.rows, 3, "{cols} cols");
+            assert_eq!(geometry.shift, HEIGHT, "{cols} cols");
+            assert_eq!(long.controls, short.controls, "{cols} cols");
+            assert_eq!(long.controls.len(), 3);
+            let spans = draft_spans(&long.placed);
+            for control in &long.controls {
+                assert_eq!(rows.source(control.row), Some(Line(21)));
+                let top = geometry.grid_top(control.row);
+                assert_eq!(top, short_geometry.grid_top(control.row));
+                for &[row, start, end] in &spans {
+                    let draft_top = geometry.draft_top(row);
+                    let background_top = if row > geometry.first {
+                        draft_top - geometry.gap
+                    } else {
+                        draft_top
+                    };
+                    assert!(
+                        background_top >= top + HEIGHT
+                            || draft_top + HEIGHT <= top
+                            || end < control.start
+                            || start > control.end,
+                        "{cols} cols: draft row {row} overlaps {}",
+                        control.id,
+                    );
+                    assert_eq!(geometry.draft_row_at(draft_top + 1.), Some(row));
+                }
+            }
+            for (line, url) in [(Line(17), ABOVE), (Line(24), BELOW)] {
+                let row = rows.projected(line).expect("link still in the viewport");
+                assert!(screen[row].iter().collect::<String>().starts_with(url));
+                let y = geometry.grid_top(row) + 1.;
+                assert_eq!(geometry.draft_row_at(y), None);
+                let hit = rows.source_at(&geometry, y);
+                assert_eq!(hit, Some(line));
+                assert_eq!(
+                    hit.and_then(|line| grid_link_at(&grid, Pos::new(line, Column(2))))
+                        .map(|(_, link)| link),
+                    Some(Link::Web(url.into())),
+                );
+            }
+
+            grid.scroll_display(Scroll::Delta(1));
+            let hidden = hidden_on_screen(&grid, PromptKind::Claude);
+            assert_eq!(hidden, None);
+            assert!(rows.update(28, true, hidden));
+            rows.set_viewport(0, 24, grid.display_offset());
+            assert_eq!(
+                rows.source_at(&RowGeometry::uniform(HEIGHT), 1.),
+                Some(Line(-1))
+            );
+            assert!(
+                rows.screen(&grid, cols, 0)[0]
+                    .iter()
+                    .collect::<String>()
+                    .starts_with(HISTORY)
+            );
+            assert_eq!(rows.projected(Line(22)), Some(23));
+            grid.scroll_display(Scroll::Bottom);
+            let hidden = hidden_on_screen(&grid, PromptKind::Claude);
+            assert!(!rows.update(28, false, hidden));
+            rows.set_viewport(2, 24, grid.display_offset());
+            assert_eq!(rows.projected(Line(22)), None, "{cols} cols after Latest");
+        }
     }
 
     #[test]

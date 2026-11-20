@@ -396,6 +396,17 @@ impl Connection<'_> {
                     state.view["open_file"] = open;
                     bump(&mut state.view);
                 } else if message["method"] != "heartbeat" {
+                    #[cfg(feature = "android-ui")]
+                    if message["method"] == "missed"
+                        || (message["method"] == "event" && message["params"]["type"] == "foreground")
+                    {
+                        let mut state = lock(&self.owner.state);
+                        if message["method"] == "missed" {
+                            state.invalidate_footer_foreground();
+                        } else if message["params"]["terminal"] == state.view["pane_id"] {
+                            state.footer_foreground_changed(&message["params"]["data"]);
+                        }
+                    }
                     self.dirty = true;
                 }
             }
@@ -442,6 +453,8 @@ impl Connection<'_> {
                     state.view["state"] = json!("connecting");
                     state.view["status"] =
                         json!("Terminal stream ended; select a terminal to attach again");
+                    #[cfg(feature = "android-ui")]
+                    state.invalidate_footer_foreground();
                     state.terminal = None;
                     state.render_id = 0;
                     state.painted = false;
@@ -1061,6 +1074,15 @@ impl Connection<'_> {
         // another read. Polling also handles older cores and unlabelled workers.
         self.dirty = false;
         let list = self.call("terminal.list", json!({}))?;
+        #[cfg(feature = "android-ui")]
+        {
+            let mut state = lock(&self.owner.state);
+            let selected = state.view["pane_id"].as_str();
+            let terminal = list["terminals"].as_array().and_then(|terminals| {
+                terminals.iter().find(|terminal| selected.is_some_and(|pane| address(terminal) == Some(pane)))
+            });
+            state.observe_footer_foreground(terminal, Instant::now());
+        }
         let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
         // Wolf's order of the projects (item 62), kept in this core's doc
         // projects.order by the desktop's sidebar; the phone's project
@@ -1096,6 +1118,8 @@ impl Connection<'_> {
                     crate::remote::depart(self.owner.id, outgoing, pane.to_owned());
                 }
             }
+            #[cfg(feature = "android-ui")]
+            state.invalidate_footer_foreground();
             state.render_id = 0;
             state.painted = false;
             state.view["state"] = json!("connecting");
@@ -2918,12 +2942,7 @@ mod connection_tests {
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
             id: 0,
-            state: Mutex::new(State {
-                view: json!({"revision":0,"panes":[]}),
-                terminal: None,
-                render_id: 0,
-                painted: false,
-            }),
+            state: Mutex::new(State::new(json!({"revision":0,"panes":[]}))),
             cancel: CancellationToken::new(),
             commands,
             focus: Mutex::new(None),
@@ -3024,12 +3043,7 @@ mod connection_tests {
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
             id: 0,
-            state: Mutex::new(State {
-                view: json!({"revision":0,"panes":[]}),
-                terminal: None,
-                render_id: 0,
-                painted: false,
-            }),
+            state: Mutex::new(State::new(json!({"revision":0,"panes":[]}))),
             cancel: CancellationToken::new(),
             commands,
             focus: Mutex::new(None),
@@ -3114,12 +3128,7 @@ mod connection_tests {
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
             id: 0,
-            state: Mutex::new(State {
-                view: json!({"revision":0,"panes":[]}),
-                terminal: None,
-                render_id: 0,
-                painted: false,
-            }),
+            state: Mutex::new(State::new(json!({"revision":0,"panes":[]}))),
             cancel: CancellationToken::new(),
             commands,
             focus: Mutex::new(None),
@@ -3232,7 +3241,7 @@ mod connection_tests {
         let (commands, rx) = mpsc::sync_channel(256);
         let owner = Arc::new(Session {
             id: 0,
-            state: Mutex::new(State { view: json!({"revision":0,"panes":[]}), terminal: None, render_id: 0, painted: false }),
+            state: Mutex::new(State::new(json!({"revision":0,"panes":[]}))),
             cancel: CancellationToken::new(),
             commands: commands.clone(),
             focus: Mutex::new(None),
@@ -4162,12 +4171,7 @@ mod claim_tests {
             let (commands, rx) = mpsc::sync_channel(256);
             let owner = Arc::new(Session {
                 id: 0,
-                state: Mutex::new(State {
-                    view: json!({"revision":0,"panes":[]}),
-                    terminal: None,
-                    render_id: 0,
-                    painted: false,
-                }),
+                state: Mutex::new(State::new(json!({"revision":0,"panes":[]}))),
                 cancel: CancellationToken::new(),
                 commands,
                 focus: Mutex::new(None),
@@ -5106,12 +5110,7 @@ mod focus_review_tests {
         let (commands, _) = mpsc::sync_channel(256);
         Arc::new(Session {
             id: 0,
-            state: Mutex::new(State {
-                view: json!({"revision":0,"panes":[]}),
-                terminal: None,
-                render_id: 0,
-                painted: false,
-            }),
+            state: Mutex::new(State::new(json!({"revision":0,"panes":[]}))),
             cancel: CancellationToken::new(),
             commands,
             focus: Mutex::new(None),
