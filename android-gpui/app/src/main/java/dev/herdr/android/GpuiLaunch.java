@@ -40,7 +40,12 @@ public final class GpuiLaunch {
 
     static void launchRemote(Activity activity, SavedRemoteHost host, long handle, String paneId, String title) {
         if (handle <= 0) throw new IllegalArgumentException("Remote session is required");
-        launch(activity, host, handle, paneId, title);
+        launch(activity, host, handle, paneId, title, false);
+    }
+
+    static void launchPicked(Activity activity, SavedRemoteHost host, long handle, String paneId, String title) {
+        if (handle <= 0) throw new IllegalArgumentException("Remote session is required");
+        launch(activity, host, handle, paneId, title, true);
     }
 
     /**
@@ -48,10 +53,11 @@ public final class GpuiLaunch {
      * and connects by itself (it reconnects as after a pause).
      */
     static void launchSaved(Activity activity, SavedRemoteHost host, String paneId, String title) {
-        launch(activity, host, 0, paneId, title);
+        launch(activity, host, 0, paneId, title, true);
     }
 
-    private static void launch(Activity activity, SavedRemoteHost host, long handle, String paneId, String title) {
+    private static void launch(Activity activity, SavedRemoteHost host, long handle, String paneId, String title,
+            boolean revealFleetSelection) {
         if (activity == null || host == null) throw new IllegalArgumentException("Remote host is required");
         RemoteNative.ensureLoaded(activity);
         final Session grant;
@@ -59,7 +65,8 @@ public final class GpuiLaunch {
             discardExpired(System.nanoTime());
             if (pending != null || active != null) throw new IllegalStateException("Close the open GPUI terminal first");
             validatePane(paneId);
-            grant = new Session(host, handle, paneId, GpuiTerminalProtocol.title(title), System.nanoTime());
+            grant = new Session(host, handle, paneId, GpuiTerminalProtocol.title(title), System.nanoTime(),
+                    revealFleetSelection);
             pending = grant;
         }
         try { activity.startActivity(new Intent(activity, GpuiTerminalActivity.class)); }
@@ -136,6 +143,7 @@ public final class GpuiLaunch {
         final long createdAt;
         /** A raw SSH shell: no Herdr daemon, panes or agent status. */
         final boolean shell;
+        final boolean revealFleetSelection;
 
         Session(SavedHost host, String paneId, String title, long createdAt) {
             this.host = host;
@@ -144,9 +152,10 @@ public final class GpuiLaunch {
             this.title = title;
             this.createdAt = createdAt;
             this.shell = false;
+            this.revealFleetSelection = false;
         }
 
-        Session(SavedRemoteHost host, long handle, String paneId, String title, long now) {
+        Session(SavedRemoteHost host, long handle, String paneId, String title, long now, boolean revealFleetSelection) {
             this.host = null;
             this.remoteHost = host;
             this.remoteHandle = handle;
@@ -154,6 +163,7 @@ public final class GpuiLaunch {
             this.title = title;
             this.createdAt = now;
             this.shell = false;
+            this.revealFleetSelection = revealFleetSelection;
         }
 
         Session(SavedRemoteHost host, String title, long now) {
@@ -163,6 +173,7 @@ public final class GpuiLaunch {
             this.title = title;
             this.createdAt = now;
             this.shell = true;
+            this.revealFleetSelection = false;
         }
 
         synchronized long takeRemoteHandle() {
