@@ -164,6 +164,7 @@ public final class Review52Test {
         boolean[] draftSaves = {true};
         HeldEdit.Steps fake = new HeldEdit.Steps() {
             @Override public String text(String id) { steps.add("text"); return "held words"; }
+            @Override public boolean fits(String text) { return true; }
             @Override public boolean commitDraft(String text) { steps.add("commit " + text); return draftSaves[0]; }
             @Override public boolean take(String id) { steps.add("take"); return true; }
             @Override public void rollback() { steps.add("rollback"); }
@@ -181,6 +182,7 @@ public final class Review52Test {
         List<String> steps = new ArrayList<>();
         HeldEdit.Steps sending = new HeldEdit.Steps() {
             @Override public String text(String id) { return "being sent"; }
+            @Override public boolean fits(String text) { return true; }
             @Override public boolean commitDraft(String text) { steps.add("commit"); return true; }
             @Override public boolean take(String id) { steps.add("take"); return false; }
             @Override public void rollback() { steps.add("rollback"); }
@@ -189,6 +191,7 @@ public final class Review52Test {
         assertEquals(java.util.Arrays.asList("commit", "take", "rollback"), steps);
         assertEquals(HeldEdit.Result.GONE, HeldEdit.run("m", new HeldEdit.Steps() {
             @Override public String text(String id) { return null; }
+            @Override public boolean fits(String text) { throw new AssertionError(); }
             @Override public boolean commitDraft(String text) { throw new AssertionError(); }
             @Override public boolean take(String id) { throw new AssertionError(); }
             @Override public void rollback() { throw new AssertionError(); }
