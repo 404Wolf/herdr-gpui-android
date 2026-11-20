@@ -1373,6 +1373,12 @@ impl Mailbox {
         true
     }
 
+    /// The surface was attached or resized (the keyboard came or went): a frame that is held and
+    /// otherwise unchanging (offline) must be drawn into it again, or its new area stays black.
+    pub fn surface_changed(&mut self) {
+        self.touch();
+    }
+
     /// Wakes the view with nothing else changed, e.g. after new ghost text.
     pub fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
@@ -2052,6 +2058,20 @@ mod tests {
         assert!(box_.set_shell(10, 9003, Some(FrameTarget::new("A", "p3"))));
         box_.set_active(11, false);
         assert_eq!((box_.state().shell, box_.state().frame_target), (0, None));
+    }
+
+    #[test]
+    fn a_new_surface_wakes_a_held_view_that_nothing_else_changes() {
+        // Offline the frame is held and nothing else moves: when the keyboard shows or hides, the
+        // surface is resized and blank until the view draws into it, so it must be woken.
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        box_.set_shell(10, 7, None);
+        assert!(box_.hold(10));
+        let before = box_.state().revision;
+        box_.surface_changed();
+        assert_ne!(box_.state().revision, before);
+        assert!(box_.state().held, "the held frame stays held");
     }
 
     #[test]

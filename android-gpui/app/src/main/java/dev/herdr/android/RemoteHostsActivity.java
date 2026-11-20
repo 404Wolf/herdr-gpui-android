@@ -178,8 +178,16 @@ public final class RemoteHostsActivity extends Activity {
         // Deliberately omit view state, passwords, edit drafts and remote content.
     }
 
+    private final KeyboardHide.Swipe keyboardSwipe = new KeyboardHide.Swipe();
+
+    @Override public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        keyboardSwipe.onTouch(this, event, android.view.ViewConfiguration.get(this).getScaledTouchSlop());
+        return super.dispatchTouchEvent(event);
+    }
+
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
+        if (KeyboardHide.hideIfShown(this)) return;
         // A host check, sign-in or pane choice returns to the list, as its arrow does.
         if (backAction != null) {
             backAction.run();
