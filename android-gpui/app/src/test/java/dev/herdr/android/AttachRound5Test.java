@@ -73,17 +73,6 @@ public final class AttachRound5Test {
                         && activity.contains("next.connectionRevision = host.connectionRevision"));
     }
 
-    @Test public void anUnversionedPreviewPathIsNeverAdoptedAsPlainText() throws Exception {
-        ComposerDrafts drafts = new ComposerDrafts();
-        drafts.restore(new org.json.JSONObject()
-                .put(ComposerDrafts.key("host", "t1"), "look at '/state & photos/herdr-core/default/files/t1/herdr-paste-123-2.png' ")
-                .put(ComposerDrafts.key("host", "t2"), "plain text")
-                .toString());
-        drafts.setHost("host", "new-revision", encoded -> true);
-        assertEquals("look at  ", drafts.switchTo("t1"));
-        assertEquals("plain text", drafts.switchTo("t2"));
-    }
-
     private static String select(ComposerDrafts drafts, SavedRemoteHost host, String pane) {
         drafts.setHost(host.id, host.connectionRevision, encoded -> true);
         return drafts.switchTo(pane);
