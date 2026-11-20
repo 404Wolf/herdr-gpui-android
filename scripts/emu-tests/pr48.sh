@@ -301,7 +301,10 @@ cancel_z() {
     b_addr=$(hc ls 2> /dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(t["address"] for t in d["terminals"] if t.get("name")=="agent-b"))' 2> /dev/null)
     screen=$(hc read "${b_addr:-t2}" 2> /dev/null)
     echo "$screen" > "$EMU_OUT/agent-b-screen.txt"
-    if grep -Eq 'seed z *$' <<< "$screen" && ! grep -q 'fixture' <<< "$screen"; then
+    # The banner "Claude Code (fixture B)" contains the dictated word; look at the lines after it.
+    local body
+    body=$(grep -v 'Claude Code (fixture B)' <<< "$screen")
+    if grep -Eq 'seed z *$' <<< "$body" && ! grep -qi 'fixture' <<< "$body"; then
         record cancel-z PASS "draft after Cancel was 'seed z': the typed z stayed, the dictated words went"
     else
         record cancel-z FAIL "expected a line 'seed z' and no 'fixture' (see agent-b-screen.txt, cancel-z-*.png)"
