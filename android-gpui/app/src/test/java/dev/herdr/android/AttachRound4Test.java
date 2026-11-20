@@ -46,6 +46,17 @@ public final class AttachRound4Test {
                         "dev.wolf.herdrgpui", i -> i != 1));
     }
 
+    @Test public void nativePasteNewlinesDoNotSubmitTheDraft() throws Exception {
+        String composer = source("ComposerBar");
+        int start = composer.indexOf("ContentInfo onReceiveContent(ContentInfo payload)");
+        assertTrue("the native text field inserts a newline between clipboard items", start >= 0);
+        String receive = composer.substring(start, composer.indexOf("edit.setSaveEnabled(false)", start));
+        assertTrue("native paste must bypass the keyboard's newline-to-Enter logic",
+                receive.indexOf("insertingNewline = true") >= 0
+                        && receive.indexOf("insertingNewline = true") < receive.indexOf("super.onReceiveContent(payload)")
+                        && receive.contains("finally"));
+    }
+
     private static String source(String name) throws Exception {
         return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android", name + ".java")),
                 StandardCharsets.UTF_8);
