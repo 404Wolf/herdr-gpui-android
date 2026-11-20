@@ -3527,7 +3527,11 @@ mod tests {
         };
         use rio_vt::{
             ansi::CursorShape,
-            crosswords::{Crosswords, CrosswordsSize, grid::Scroll, pos::{Column, Line, Pos}},
+            crosswords::{
+                Crosswords, CrosswordsSize,
+                grid::Scroll,
+                pos::{Column, Line, Pos},
+            },
             event::{VoidListener, WindowId},
             performer::handler::Processor,
         };
@@ -3539,8 +3543,12 @@ mod tests {
         for cols in [46, 52, 98] {
             let rule = "─".repeat(cols);
             let mut grid = Crosswords::new(
-                CrosswordsSize::new(cols, 28), CursorShape::Block, VoidListener,
-                WindowId::from(0), 0, 16,
+                CrosswordsSize::new(cols, 28),
+                CursorShape::Block,
+                VoidListener,
+                WindowId::from(0),
+                0,
+                16,
             );
             let screen_output = format!(
                 concat!(
@@ -3549,7 +3557,10 @@ mod tests {
                     "\x1b[22;1H{rule}\x1b[23;1H  -- INSERT --",
                     "\x1b[25;1H{below}\x1b[21;3H",
                 ),
-                history = HISTORY, above = ABOVE, rule = rule, below = BELOW,
+                history = HISTORY,
+                above = ABOVE,
+                rule = rule,
+                below = BELOW,
             );
             Processor::default().advance(&mut grid, screen_output.as_bytes());
 
@@ -3563,8 +3574,15 @@ mod tests {
             assert_eq!(anchor.map(|anchor| anchor.row), Some(18));
             assert_eq!(rows.projected(Line(22)), None);
             assert_eq!(rows.source(20), Some(Line(23)));
+            for row in 0..rows.view_len() {
+                assert_eq!(
+                    rows.source(row).and_then(|line| rows.projected(line)),
+                    Some(row)
+                );
+            }
 
             let short = place_all(&controls(ghost(vec![text("one")])), anchor, &screen, None);
+            let short_geometry = RowGeometry::for_layout(HEIGHT, &short, anchor, &screen);
             let draft = "x".repeat(2 * cols - 12);
             let long = place_all(&controls(ghost(vec![text(&draft)])), anchor, &screen, None);
             assert_eq!(draft_block(&long.placed), Some((18, 20)), "{cols} cols");
@@ -3573,11 +3591,12 @@ mod tests {
             assert_eq!(geometry.shift, HEIGHT, "{cols} cols");
             assert_eq!(long.controls, short.controls, "{cols} cols");
             assert_eq!(long.controls.len(), 3);
+            let spans = draft_spans(&long.placed);
             for control in &long.controls {
                 assert_eq!(rows.source(control.row), Some(Line(21)));
                 let top = geometry.grid_top(control.row);
-                assert_eq!(top, control.row as f32 * HEIGHT);
-                for [row, start, end] in draft_spans(&long.placed) {
+                assert_eq!(top, short_geometry.grid_top(control.row));
+                for &[row, start, end] in &spans {
                     let draft_top = geometry.draft_top(row);
                     let background_top = if row > geometry.first {
                         draft_top - geometry.gap
@@ -3598,7 +3617,9 @@ mod tests {
             for (line, url) in [(Line(17), ABOVE), (Line(24), BELOW)] {
                 let row = rows.projected(line).expect("link still in the viewport");
                 assert!(screen[row].iter().collect::<String>().starts_with(url));
-                let hit = rows.source_at(&geometry, geometry.grid_top(row) + 1.);
+                let y = geometry.grid_top(row) + 1.;
+                assert_eq!(geometry.draft_row_at(y), None);
+                let hit = rows.source_at(&geometry, y);
                 assert_eq!(hit, Some(line));
                 assert_eq!(
                     hit.and_then(|line| grid_link_at(&grid, Pos::new(line, Column(2))))
@@ -3612,8 +3633,16 @@ mod tests {
             assert_eq!(hidden, None);
             assert!(rows.update(28, true, hidden));
             rows.set_viewport(0, 24, grid.display_offset());
-            assert_eq!(rows.source_at(&RowGeometry::uniform(HEIGHT), 1.), Some(Line(-1)));
-            assert!(rows.screen(&grid, cols, 0)[0].iter().collect::<String>().starts_with(HISTORY));
+            assert_eq!(
+                rows.source_at(&RowGeometry::uniform(HEIGHT), 1.),
+                Some(Line(-1))
+            );
+            assert!(
+                rows.screen(&grid, cols, 0)[0]
+                    .iter()
+                    .collect::<String>()
+                    .starts_with(HISTORY)
+            );
             assert_eq!(rows.projected(Line(22)), Some(23));
             grid.scroll_display(Scroll::Bottom);
             let hidden = hidden_on_screen(&grid, PromptKind::Claude);

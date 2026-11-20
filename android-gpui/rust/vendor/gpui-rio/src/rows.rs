@@ -66,7 +66,8 @@ impl RowGeometry {
         let block = ghost::draft_block(&layout.placed);
         match (anchor, block) {
             (Some(anchor), Some((first, _)))
-                if layout.spread_safe && layout.controls.iter().all(|control| control.row > first) =>
+                if layout.spread_safe
+                    && layout.controls.iter().all(|control| control.row > first) =>
             {
                 Self::for_draft(cell_height, block, ghost::draft_limit(screen, anchor))
             }

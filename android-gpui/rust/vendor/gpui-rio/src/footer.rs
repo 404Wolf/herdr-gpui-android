@@ -252,8 +252,7 @@ fn directory(text: &str) -> bool {
     text == "~" || text.starts_with("~/") || text.starts_with('/')
 }
 
-/// A projection of one contiguous footer out of the grid. Every other row has
-/// one visual index and the same terminal row for selection, links and input.
+/// The terminal lines in the viewport after footer collapse and local scroll.
 #[derive(Clone, Debug, Default)]
 pub struct Rows {
     len: usize,
