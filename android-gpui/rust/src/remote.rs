@@ -832,9 +832,19 @@ pub(crate) fn departed_test_lock() -> MutexGuard<'static, ()> {
 pub(crate) fn closed_for_test(session: u64, terminal: Arc<gpui_rio::Session>, pane: &str) {
     *lock(closed()) = Some(Kept { session, terminal, pane: pane.into(), watched: None });
 }
+#[cfg(not(test))]
 fn closed() -> &'static Mutex<Option<Kept>> {
     static CLOSED: OnceLock<Mutex<Option<Kept>>> = OnceLock::new();
     CLOSED.get_or_init(Mutex::default)
+}
+/// Per thread in tests, like [`held`]: another test's close (every test
+/// closes its own session on its own thread) never replaces this test's.
+#[cfg(test)]
+fn closed() -> &'static Mutex<Option<Kept>> {
+    thread_local! {
+        static CLOSED: &'static Mutex<Option<Kept>> = Box::leak(Box::default());
+    }
+    CLOSED.with(|closed| *closed)
 }
 /// A grid kept for saving after its session stopped showing it, with the
 /// session that showed it: pane ids repeat across computers (each core has
