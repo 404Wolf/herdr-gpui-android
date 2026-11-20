@@ -39,6 +39,8 @@ final class RemoteNative {
     static native String pollTerminal(long handle, long sinceRevision, long sinceChromeRevision,
             long generation, String hostId, String shortcuts);
     static native String input(long handle, String paneId, String commandJson);
+    static native String inputForAttach(long handle, String paneId, String attachIdentity, String commandJson);
+    static native void releaseHeld();
     static native String focus(long handle, String paneId);
     static native String focusTab(long handle, String tabId);
     static native String focusWorkspace(long handle, String workspaceId);

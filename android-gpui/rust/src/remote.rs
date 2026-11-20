@@ -230,13 +230,14 @@ pub(crate) struct Local {
     /// A first drag is building the phone's copy (outside the session's
     /// lock): the rows dragged meanwhile, applied when it is shown.
     building: Option<i32>,
+    /// Invalidates builders that have already left the session lock.
+    watch_generation: u64,
     /// The computer the UI shows this session as (the poll's host): the
     /// phone's copy of a pane carries it with the pane, for its links.
     host: String,
-    /// Wheel reports sent to the program for drags past the top of the
-    /// phone's copy (it scrolls its own view back): drags go to it until as
-    /// many come back down, or it is at its newest row again.
-    wheeled: i64,
+    /// While the program owns scrolling, only a newly parsed viewport can
+    /// confirm that it is back at the newest row.
+    wheel_after: Option<u64>,
     /// The terminal this stream is of, from the attach reply: its PTY's
     /// process and its created_ms. None: not reported, nothing is watched.
     incarnation: Option<Incarnation>,
@@ -269,10 +270,12 @@ impl Local {
     }
 
     fn lose(&mut self) {
+        self.watch_generation = self.watch_generation.wrapping_add(1);
         self.reader = None;
         self.watched = None;
+        self.building = None;
         self.lost = true;
-        self.wheeled = 0;
+        self.wheel_after = None;
     }
 }
 
@@ -282,20 +285,20 @@ impl Local {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Incarnation {
     pid: u64,
-    born: u64,
+    born: Option<u64>,
 }
 
 impl Incarnation {
     /// None when the record names no process.
     pub(crate) fn of(terminal: &Value) -> Option<Self> {
         let pid = terminal["pid"].as_u64().filter(|pid| *pid != 0)?;
-        Some(Self { pid, born: terminal["created_ms"].as_u64().unwrap_or(0) })
+        Some(Self { pid, born: terminal["created_ms"].as_u64() })
     }
 
     /// Whether the pane list's entry still names this terminal.
-    #[cfg(any(feature = "android-ui", test))]
     fn listed(self, entry: Option<&Value>) -> bool {
-        entry.is_some_and(|e| e["pid"].as_u64() == Some(self.pid) && e["created_ms"].as_u64().unwrap_or(0) == self.born)
+        entry.is_some_and(|e| e["pid"].as_u64() == Some(self.pid)
+            && e["created_ms"].as_u64().unwrap_or(0) == self.born.unwrap_or(0))
     }
 }
 
@@ -320,6 +323,30 @@ impl Watched {
 pub(crate) type Shared = Arc<Mutex<Watched>>;
 
 impl State {
+    pub(crate) fn validate_listed_terminal(&mut self) {
+        let Some(incarnation) = self.local.incarnation else {
+            return;
+        };
+        let pane = self.view["pane_id"].as_str().unwrap_or("");
+        if !incarnation.listed(pane_entry(&self.view, pane)) {
+            let reader = self.local.reader.as_ref().map(|(id, _)| *id);
+            self.local.lose();
+            if let Some(reader) = reader {
+                show_render(None, self.render_id, Some(reader), None);
+            }
+        }
+    }
+
+    fn attach_identity(&self) -> Option<String> {
+        if self.view["state"] != "ready" {
+            return None;
+        }
+        let core = self.view["boot_id"].as_str().filter(|id| !id.is_empty())?;
+        let pane = self.view["pane_id"].as_str().filter(|id| !id.is_empty())?;
+        let incarnation = self.local.incarnation?;
+        Some(json!([core, pane, incarnation.pid, incarnation.born?]).to_string())
+    }
+
     /// Whether the pane on screen runs an agent now (see is_agent).
     fn agent(&mut self) -> bool {
         let pane = self.view["pane_id"].as_str().unwrap_or("").to_owned();
@@ -810,11 +837,10 @@ fn opened() -> &'static Mutex<Cached> {
     OPENED.with(|opened| *opened)
 }
 /// A new pane attached: its live grid is the one to scroll and draw now.
-#[cfg(test)]
+#[cfg(any(target_os = "android", test))]
 pub(crate) fn release_held() {
     lock(held()).take();
     lock(cached()).take();
-    lock(opened()).take();
 }
 
 /// The live grid of a fresh attach is shown once its first paint is in (its
@@ -895,22 +921,13 @@ fn marker(view: &Value, pane: &str) -> String {
 /// dropped, for good. Nothing is asked of the core.
 #[cfg(any(feature = "android-ui", test))]
 pub(crate) fn keep_local(owner: &Session, state: &mut State) {
-    if !state.local.settled || state.local.lost {
+    state.validate_listed_terminal();
+    if !state.local.settled || state.local.lost || state.local.incarnation.is_none() {
         return;
     }
     let Some(terminal) = state.terminal.clone() else {
         return;
     };
-    let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
-    let listed = state.local.incarnation.is_some_and(|me| me.listed(pane_entry(&state.view, &pane)));
-    if !listed {
-        let reading = state.local.reader.is_some();
-        state.local.lose();
-        if reading {
-            show_render(None, state.render_id, None, None);
-        }
-        return;
-    }
     // Only an agent's conversation is kept (see is_agent).
     if !state.agent() {
         return;
@@ -918,7 +935,7 @@ pub(crate) fn keep_local(owner: &Session, state: &mut State) {
     let output = owner.heard.output();
     // Handed back to the program's own scrolling: its view is its history,
     // not new rows; looked at again once it is back at its newest row.
-    if output == state.local.captured || state.local.wheeled > 0 {
+    if !return_from_wheel(state, &terminal) || output == state.local.captured {
         return;
     }
     let shared = state.local.watched.get_or_insert_with(Shared::default).clone();
@@ -1060,7 +1077,10 @@ pub fn scroll_held(delta: i64, latest: bool) -> String {
 }
 pub fn poll(id: u64, _since: u64, _mirror: bool) -> Result<String> {
     let owner = session(id)?;
-    let mut view = lock(&owner.state).view.clone();
+    let state = lock(&owner.state);
+    let mut view = state.view.clone();
+    view["attach_identity"] = json!(state.attach_identity());
+    drop(state);
     view["quiet_ms"] = json!(owner.heard.quiet_ms());
     Ok(view.to_string())
 }
@@ -1115,6 +1135,7 @@ pub fn poll_terminal(
             "state": view["state"],
             "pane_id": view["pane_id"],
             "boot_id": view["boot_id"],
+            "attach_identity": state.attach_identity(),
             "scroll": view["scroll"],
             "fetch": view["fetch"],
             "local_offset": local_offset,
@@ -1124,6 +1145,7 @@ pub fn poll_terminal(
         .to_string());
     }
     let mut view = view.clone();
+    view["attach_identity"] = json!(state.attach_identity());
     view["local_offset"] = json!(local_offset);
     view["quiet_ms"] = json!(owner.heard.quiet_ms());
     view["output"] = json!(owner.heard.output());
@@ -1157,8 +1179,21 @@ fn focus_group(id: u64, field: &str, value: &str) -> Result<String> {
     focus(id, &target)
 }
 pub fn input(id: u64, terminal: &str, raw: &str) -> Result<String> {
+    send_input(id, terminal, raw, None)
+}
+
+/// Compares the attach identity and queues input under the same state lock.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn input_for_attach(id: u64, terminal: &str, raw: &str, identity: &str) -> Result<String> {
+    send_input(id, terminal, raw, Some(identity))
+}
+
+fn send_input(id: u64, terminal: &str, raw: &str, identity: Option<&str>) -> Result<String> {
     let owner = session(id)?;
     let state = lock(&owner.state);
+    if identity.is_some_and(|key| state.attach_identity().as_deref() != Some(key)) {
+        return Ok(json!({"queued":false,"stale_attach":true}).to_string());
+    }
     if state.view["pane_id"] != terminal || state.view["state"] != "ready" {
         return Err(Error::StaleTarget);
     }
@@ -1228,7 +1263,7 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     let _ = (paint.title, paint.status, paint.shortcuts);
     let local = || Ok(json!({"queued":true,"local":true}).to_string());
     let wheel = || Ok(json!({"queued":true}).to_string());
-    let (terminal, watched, render_id) = {
+    let (terminal, watched, render_id, watch_generation, pane) = {
         let mut state = lock(&owner.state);
         // Being read back: the phone's own copy scrolls, nothing is sent; at
         // its newest row the live grid is drawn again.
@@ -1261,68 +1296,70 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
         let Some(terminal) = state.terminal.clone() else {
             return wheel();
         };
-        // Handed back to the program's own scrolling: it gets the drags until
-        // they bring its view back down, or it is at its newest row already.
-        if state.local.wheeled > 0 {
-            if delta < 0 && at_newest(&state, &terminal) {
-                state.local.wheeled = 0;
-                return local();
-            }
-            let sent = wheel_reports(&terminal, delta);
-            state.local.wheeled = (state.local.wheeled + sent).max(0);
+        // Reverse reports still go to the program until a new viewport
+        // confirms the program is back at the newest row.
+        let owned = state.local.wheel_after.is_some();
+        if !return_from_wheel(&mut state, &terminal) {
+            program_wheel(&mut state.local, &terminal, delta);
             return wheel();
+        }
+        if owned && delta < 0 {
+            return local();
         }
         // A full-screen agent (Claude Code) keeps its history to itself:
         // dragging back scrolls the phone's copy of what it watched, at once
         // and with no round trip (item 77, ask 2). Without one yet, it gets
         // wheel input as before; plain output scrolls the attach's history.
         let watched = if delta > 0 { state.agent_watched() } else { None };
-        if watched.is_some() {
-            state.local.building = Some(0);
-        }
-        (terminal, watched, state.render_id)
+        let Some(watched) = watched else {
+            if !terminal.wheel(delta) {
+                terminal.grid().lock().scroll_display(scroll);
+            }
+            return wheel();
+        };
+        state.local.building = Some(0);
+        let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+        (terminal, watched, state.render_id, state.local.watch_generation, pane)
     };
-    if let Some(watched) = watched {
-        let pane = lock(&owner.state).view["pane_id"].as_str().unwrap_or("").to_owned();
-        // Built with the session's lock released: the poll (and the UI
-        // waiting on it) never waits for the copy to be encoded and parsed.
-        let built = reader_for(&watched, &terminal, &pane);
-        // Scrolled before the session's lock is taken again: its grid can
-        // still be busy with the copy's last bytes.
-        let rest = built.as_ref().map(|reader| {
-            let mut grid = reader.grid().lock();
-            grid.scroll_display(scroll);
-            delta - i32::try_from(grid.display_offset()).unwrap_or(delta)
-        });
-        let mut state = lock(&owner.state);
-        // A later attach has its own Local: this build's state is not its.
-        if state.render_id != render_id {
-            return local();
-        }
-        let pending = state.local.building.take().unwrap_or(0);
-        if state.local.reader.is_some() || state.terminal.is_none() {
-            return local();
-        }
-        if let (Some(reader), Some(rest)) = (built, rest) {
-            if rest > 0 {
-                // Longer than the whole copy: the program's own view goes on.
-                hand_back(&mut state, rest.saturating_add(pending.max(0)), paint.generation);
-                return wheel();
-            }
-            let shown = crate::core_session::next_render_id();
-            let host = state.local.host.clone();
-            state.local.reader = Some((shown, reader));
-            show_render(Some(paint.generation), shown, None, Some((&host, &pane)));
-            drop(state);
-            // The rows dragged while it was built.
-            if pending != 0 {
-                return scroll_local(id, i64::from(pending), paint);
-            }
-            return local();
-        }
+    // Built with the session's lock released: the poll (and the UI
+    // waiting on it) never waits for the copy to be encoded and parsed.
+    let built = reader_for(&watched, &terminal, &pane);
+    // Scrolled before the session's lock is taken again: its grid can
+    // still be busy with the copy's last bytes.
+    let rest = built.as_ref().map(|reader| {
+        let mut grid = reader.grid().lock();
+        grid.scroll_display(scroll);
+        delta - i32::try_from(grid.display_offset()).unwrap_or(delta)
+    });
+    let mut state = lock(&owner.state);
+    // A later attach has its own Local: this build's state is not its.
+    if state.render_id != render_id || state.local.watch_generation != watch_generation {
+        return local();
     }
-    if !terminal.wheel(delta) {
-        terminal.grid().lock().scroll_display(scroll);
+    let pending = state.local.building.take().unwrap_or(0);
+    if state.local.reader.is_some() || state.terminal.is_none() {
+        return local();
+    }
+    if let (Some(reader), Some(rest)) = (built, rest) {
+        if rest > 0 {
+            // Longer than the whole copy: the program's own view goes on.
+            hand_back(&mut state, rest.saturating_add(pending.max(0)), paint.generation);
+            return wheel();
+        }
+        let shown = crate::core_session::next_render_id();
+        let host = state.local.host.clone();
+        state.local.reader = Some((shown, reader));
+        show_render(Some(paint.generation), shown, None, Some((&host, &pane)));
+        drop(state);
+        // The rows dragged while it was built.
+        if pending != 0 {
+            return scroll_local(id, i64::from(pending), paint);
+        }
+        return local();
+    }
+    let rows = delta.saturating_add(pending);
+    if !program_wheel(&mut state.local, &terminal, rows) {
+        terminal.grid().lock().scroll_display(rio_vt::crosswords::grid::Scroll::Delta(rows));
     }
     wheel()
 }
@@ -1333,31 +1370,46 @@ fn hand_back(state: &mut State, rows: i32, generation: i64) {
     state.local.reader = None;
     show_render(Some(generation), state.render_id, None, None);
     if let Some(terminal) = state.terminal.clone() {
-        state.local.wheeled = wheel_reports(&terminal, rows).max(0);
+        program_wheel(&mut state.local, &terminal, rows);
     }
 }
 
-/// Sends `rows` of wheel input (positive: back); the reports really sent,
-/// signed (at most 30 a drag), 0 when the program takes none.
-fn wheel_reports(terminal: &gpui_rio::Session, rows: i32) -> i64 {
+fn program_wheel(local: &mut Local, terminal: &gpui_rio::Session, rows: i32) -> bool {
+    let before = terminal.parsed_output();
     if rows == 0 || !terminal.wheel(rows) {
-        return 0;
+        return false;
     }
-    i64::from(rows.signum()) * i64::from(rows.unsigned_abs().min(30))
+    local.wheel_after = Some(before);
+    true
 }
 
-/// Whether the program's own view is at its newest row: its screen is the
-/// last one the phone watched, or later (it moved up from it, with output).
-fn at_newest(state: &State, terminal: &gpui_rio::Session) -> bool {
-    let Some(watched) = &state.local.watched else {
+/// A viewport parsed before the last wheel report cannot confirm its effect.
+fn return_from_wheel(state: &mut State, terminal: &gpui_rio::Session) -> bool {
+    let Some(after) = state.local.wheel_after else {
         return true;
+    };
+    if terminal.parsed_output() == after || !at_newest(state, terminal, after) {
+        return false;
+    }
+    state.local.wheel_after = None;
+    true
+}
+
+fn at_newest(state: &State, terminal: &gpui_rio::Session, after: u64) -> bool {
+    let Some(watched) = &state.local.watched else {
+        return false;
     };
     let Ok(watched) = watched.try_lock() else {
         return false;
     };
-    let (Some(last), Some(now)) = (watched.last.as_ref(), crate::snapshot::Screen::of(&terminal.grid().lock())) else {
+    let grid = terminal.grid().lock();
+    if terminal.parsed_output() == after {
+        return false;
+    }
+    let (Some(last), Some(now)) = (watched.last.as_ref(), crate::snapshot::Screen::of(&grid)) else {
         return true;
     };
+    drop(grid);
     let last: Vec<&str> = last.rows.iter().map(|r| r.text.as_str()).collect();
     let now: Vec<&str> = now.rows.iter().map(|r| r.text.as_str()).collect();
     matches!(crate::transcript::moved(&last, &now), crate::transcript::Moved::Still | crate::transcript::Moved::Up(_))
@@ -1454,11 +1506,11 @@ pub(crate) fn held_for_test() -> Option<(u64, Arc<gpui_rio::Session>)> {
 impl Local {
     /// A pane attached and painted long ago (its attach named TEST_PID).
     pub(crate) fn settled_for_test() -> Self {
-        Self { settled: true, incarnation: Some(Incarnation { pid: TEST_PID, born: 0 }), ..Self::default() }
+        Self { settled: true, incarnation: Some(Incarnation { pid: TEST_PID, born: Some(0) }), ..Self::default() }
     }
     /// A pane just attached whose attach named TEST_PID.
     pub(crate) fn attached_for_test(output: u64) -> Self {
-        Self::attached(output, Some(Incarnation { pid: TEST_PID, born: 0 }))
+        Self::attached(output, Some(Incarnation { pid: TEST_PID, born: Some(0) }))
     }
     pub(crate) fn reader_for_test(&self) -> Option<(u64, Arc<gpui_rio::Session>)> {
         self.reader.clone()

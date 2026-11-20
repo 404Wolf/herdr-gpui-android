@@ -39,10 +39,22 @@ final class HomeCache {
         /** FleetTree.parseGitLook's input, or "" when git was never asked. */
         final String git;
         final boolean gitTruncated;
+        /** The profile and revision that produced the list, or null for an older cache. */
+        final String computer;
+
         Entry(JSONObject view, String git, boolean gitTruncated) {
+            this(view, git, gitTruncated, null);
+        }
+
+        Entry(JSONObject view, String git, boolean gitTruncated, String computer) {
             this.view = view;
             this.git = git == null ? "" : git;
             this.gitTruncated = gitTruncated;
+            this.computer = computer;
+        }
+
+        boolean matches(String key) {
+            return key != null && key.equals(computer);
         }
 
         FleetTree.GitLook look() {
@@ -89,7 +101,7 @@ final class HomeCache {
             Entry entry = e.getValue();
             if (!hasTree(entry.view)) continue;
             hosts.put(e.getKey(), new JSONObject().put("view", treeOf(entry.view))
-                    .put("git", entry.git).put("git_truncated", entry.gitTruncated));
+                    .put("git", entry.git).put("git_truncated", entry.gitTruncated).put("computer", entry.computer));
         }
         return new JSONObject().put("version", 1).put("hosts", hosts).toString();
     }
@@ -107,7 +119,8 @@ final class HomeCache {
                 JSONObject host = hosts.optJSONObject(id);
                 JSONObject view = host == null ? null : host.optJSONObject("view");
                 if (!hasTree(view)) continue;
-                out.put(id, new Entry(view, host.optString("git", ""), host.optBoolean("git_truncated", false)));
+                out.put(id, new Entry(view, host.optString("git", ""), host.optBoolean("git_truncated", false),
+                        host.has("computer") ? host.optString("computer", null) : null));
             }
         } catch (JSONException | RuntimeException unreadable) {
             out.clear();
@@ -178,8 +191,8 @@ final class HomeCache {
         for (Map.Entry<String, Entry> e : entries.entrySet()) {
             Entry entry = e.getValue();
             Entry before = all.get(e.getKey());
-            if (entry.git.isEmpty() && before != null && !before.git.isEmpty()) {
-                entry = new Entry(entry.view, before.git, before.gitTruncated);
+            if (entry.git.isEmpty() && before != null && !before.git.isEmpty() && java.util.Objects.equals(entry.computer, before.computer)) {
+                entry = new Entry(entry.view, before.git, before.gitTruncated, entry.computer);
             }
             if (hasTree(entry.view)) all.put(e.getKey(), entry);
         }
@@ -228,8 +241,8 @@ final class HomeCache {
         if (host == null || entry == null || !hasTree(entry.view)) return;
         Map<String, Entry> all = readSealed(sealed, null, seal);
         Entry before = all.get(host);
-        if (entry.git.isEmpty() && before != null && !before.git.isEmpty()) {
-            entry = new Entry(entry.view, before.git, before.gitTruncated);
+        if (entry.git.isEmpty() && before != null && !before.git.isEmpty() && java.util.Objects.equals(entry.computer, before.computer)) {
+            entry = new Entry(entry.view, before.git, before.gitTruncated, entry.computer);
         }
         all.put(host, entry);
         try {

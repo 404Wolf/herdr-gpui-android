@@ -92,6 +92,7 @@ pub struct Session {
     grid: Arc<FairMutex<Crosswords<Listener>>>,
     input: mpsc::SyncSender<Input>,
     dirty: Arc<AtomicBool>,
+    parsed_output: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
     /// Input sent so far (keys, typed and pasted text), counted so a view
@@ -227,12 +228,14 @@ impl Session {
                 source,
             })?;
         let alive = Arc::new(AtomicBool::new(true));
+        let parsed_output = Arc::new(AtomicU64::new(0));
         let reader = Reader {
             grid: grid.clone(),
             replies,
             shared: shared.clone(),
             input: input_queue.clone(),
             dirty: dirty.clone(),
+            parsed_output: parsed_output.clone(),
             alive: alive.clone(),
         };
         thread::Builder::new()
@@ -246,6 +249,7 @@ impl Session {
             grid,
             input: input_queue,
             dirty,
+            parsed_output,
             alive,
             shared,
             inputs: AtomicU64::new(0),
@@ -460,6 +464,11 @@ impl Session {
         self.write(bytes)
     }
 
+    /// Changes after the parser applies output, before it releases the grid lock.
+    pub fn parsed_output(&self) -> u64 {
+        self.parsed_output.load(Ordering::Relaxed)
+    }
+
     /// Input returns the view to the live screen and drops any selection.
     /// A touch scroll of `lines` (positive = back in history) as the program
     /// wants it: wheel reports when it asked for mouse events (Claude Code,
@@ -543,6 +552,7 @@ struct Reader {
     shared: Arc<Shared>,
     input: mpsc::SyncSender<Input>,
     dirty: Arc<AtomicBool>,
+    parsed_output: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
 }
 
@@ -594,6 +604,9 @@ impl Reader {
             let mut grid = self.grid.lock();
             processor.advance(&mut *grid, &buffer[..read]);
             self.answer(&grid);
+            if processor.sync_timeout().sync_timeout().is_none() {
+                self.parsed_output.fetch_add(1, Ordering::Relaxed);
+            }
             drop(grid);
             self.dirty.store(true, Ordering::Release);
         }

@@ -162,7 +162,7 @@ public final class PaneSnapshotsTest {
         assertEquals(t0 / 1000, savedAt.get(1) / 1000);
     }
 
-    @Test public void ask2TheCapIsEnforcedOldestOutPinnedPanesLastNothingPastTwoWeeks() throws Exception {
+    @Test public void ask2TheCapIsEnforcedOldestOutPinnedPanesLast() throws Exception {
         long now = 100L * 24 * 60 * 60 * 1000;
         List<File> files = new ArrayList<>();
         for (int i = 0; i < 6; i++) {
@@ -174,17 +174,11 @@ public final class PaneSnapshotsTest {
         }
         // Beyond the count: the oldest go.
         assertEquals(Arrays.asList(files.get(2), files.get(1), files.get(0)),
-                PaneSnapshots.stale(files, Collections.emptySet(), 3, 10_000, now, PaneSnapshots.MAX_AGE_MS));
+                PaneSnapshots.stale(files, Collections.emptySet(), 3, 10_000));
         // Past the bytes: the oldest go; a pinned pane (the Deacon, oldest) stays and counts first.
         HashSet<String> pinned = new HashSet<>(Collections.singletonList("p0.snap2"));
         assertEquals(Arrays.asList(files.get(2), files.get(1)),
-                PaneSnapshots.stale(files, pinned, 48, 450, now, PaneSnapshots.MAX_AGE_MS));
-        // Older than two weeks: gone unless pinned.
-        assertTrue(files.get(3).setLastModified(now - PaneSnapshots.MAX_AGE_MS - 1));
-        assertTrue(files.get(0).setLastModified(now - PaneSnapshots.MAX_AGE_MS - 1));
-        assertEquals(Collections.singletonList(files.get(3)),
-                PaneSnapshots.stale(files, pinned, 48, 10_000, now, PaneSnapshots.MAX_AGE_MS));
-        // Wolf's budget.
+                PaneSnapshots.stale(files, pinned, 48, 450));
         assertEquals(64L * 1024 * 1024, PaneSnapshots.MAX_TOTAL_BYTES);
         assertEquals(48, PaneSnapshots.MAX_FILES);
     }
@@ -212,7 +206,7 @@ public final class PaneSnapshotsTest {
         SecretKey key = CacheSeal.newKey();
         FakeNative natives = new FakeNative();
         PaneSnapshots snapshots = snapshots(folder, key, natives);
-        snapshots.migrate(old);
+        snapshots.migrate(old, () -> Collections.singletonMap("server", "revision"));
         assertFalse(plain.exists());
         assertFalse(old.exists());
         List<Long> shown = new ArrayList<>();
@@ -230,9 +224,10 @@ public final class PaneSnapshotsTest {
         Files.write(plain.toPath(), saved);
         SecretKey key = CacheSeal.newKey();
         FakeNative natives = new FakeNative();
-        snapshots(folder, key, natives).migrate(old);
-        // Reopen the store, as after a process restart with no network.
+        snapshots(folder, key, natives).migrate(old, () -> Collections.singletonMap("host", "revision-a"));
+        // Reopen the store after an edit and process restart with no network.
         PaneSnapshots after = snapshots(folder, key, natives);
+        after.migrate(old, () -> Collections.singletonMap("host", "revision-b"));
         List<Long> shown = new ArrayList<>();
         after.open(PaneSnapshots.computer("host", "revision-a"), "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
         assertEquals("the adopted copy should open offline", Collections.singletonList(41L), shown);
@@ -240,6 +235,29 @@ public final class PaneSnapshotsTest {
         shown.clear();
         after.open(PaneSnapshots.computer("host", "revision-b"), "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
         assertEquals("an edit must not readopt the copy for the new revision", Collections.singletonList(-1L), shown);
+        assertFalse(plain.exists());
+    }
+
+    @Test public void ask2AnUnreadableProfileStoreLeavesTheLegacyCopyForTheNextLaunch() throws Exception {
+        File old = dir.newFolder("old-panes");
+        File folder = dir.newFolder("sealed-panes");
+        File plain = new File(old, PaneSnapshots.name("host", "t1").replace(".snap2", ".snap"));
+        Files.write(plain.toPath(), TRANSCRIPT);
+        FakeNative natives = new FakeNative();
+        SecretKey key = CacheSeal.newKey();
+        PaneSnapshots first = snapshots(folder, key, natives);
+        first.migrate(old, () -> { throw new java.io.IOException("profiles unavailable"); });
+        String computer = PaneSnapshots.computer("host", "revision-a");
+        List<Long> shown = new ArrayList<>();
+        first.open(computer, "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        assertEquals(Collections.singletonList(-1L), shown);
+        assertTrue(plain.isFile());
+
+        PaneSnapshots after = snapshots(folder, key, natives);
+        after.migrate(old, () -> Collections.singletonMap("host", "revision-a"));
+        shown.clear();
+        after.open(computer, "t1", s -> shown.add(s.renderId), () -> shown.add(-1L));
+        assertEquals(Collections.singletonList(41L), shown);
         assertFalse(plain.exists());
     }
 

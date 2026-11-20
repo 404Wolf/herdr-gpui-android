@@ -7,9 +7,11 @@ final class HomeNavigation {
     /** A newer choice supersedes pending opens, even when the old host remains connected. */
     long begin() { return ++epoch; }
 
+    boolean current(long intent) { return intent == epoch; }
+
     /** The same intent can span a session action followed by focusing its returned terminal. */
     boolean complete(long intent, long handle, long currentHandle, Runnable action) {
-        if (intent != epoch || handle <= 0 || handle != currentHandle) return false;
+        if (!current(intent) || handle <= 0 || handle != currentHandle) return false;
         action.run();
         return true;
     }

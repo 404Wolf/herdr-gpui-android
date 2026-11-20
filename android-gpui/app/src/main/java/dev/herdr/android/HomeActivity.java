@@ -315,10 +315,15 @@ public final class HomeActivity extends Activity {
         Map<String, Machine> next = new LinkedHashMap<>();
         for (SavedRemoteHost host : hosts) {
             Machine machine = machines.remove(host.id);
+            if (machine != null && !host.matchesConnection(machine.host)) {
+                if (machine.handle > 0) RemoteNative.close(machine.handle);
+                machine.handle = 0;
+                machine = null;
+            }
             if (machine == null) machine = new Machine();
             machine.host = host;
             HomeCache.Entry entry = cached == null ? null : cached.get(host.id);
-            if (entry != null && machine.view == null) {
+            if (entry != null && entry.matches(PaneSnapshots.computer(host)) && machine.view == null) {
                 machine.view = entry.view;
                 machine.gitText = entry.git;
                 machine.gitTruncated = entry.gitTruncated;
@@ -361,7 +366,8 @@ public final class HomeActivity extends Activity {
             // Only a view a session of this process listed: one read back from
             // the cache may be older than what the terminal merged since.
             if (machine.liveHandle != 0 && HomeCache.hasTree(machine.view)) {
-                entries.put(machine.host.id, new HomeCache.Entry(machine.view, machine.gitText, machine.gitTruncated));
+                entries.put(machine.host.id, new HomeCache.Entry(machine.view, machine.gitText, machine.gitTruncated,
+                        PaneSnapshots.computer(machine.host)));
             }
         }
         if (entries.isEmpty()) return;
@@ -1970,17 +1976,29 @@ public final class HomeActivity extends Activity {
                     .putExtra(GpuiTerminalActivity.EXTRA_FOCUS_PANE, agent.id));
             return;
         }
-        if (!opening && (handle <= 0 || !"ready".equals(machine.state))
-                && PaneSnapshots.shared(this).file(machine.host.id, agent.id).isFile()) {
-            // Not reachable, but read before: open its saved conversation; the
-            // terminal connects by itself when it can.
-            try {
-                RemoteHostsActivity.rememberLastSession(this, machine.host, agent.id);
-                GpuiLaunch.launchSaved(this, machine.host, agent.id, FleetPanes.displayTitle(agent));
-            } catch (RuntimeException | LinkageError failed) {
-                note = "The terminal could not be opened";
-                render(true);
-            }
+        if (!opening && (handle <= 0 || !"ready".equals(machine.state))) {
+            SavedRemoteHost host = machine.host;
+            PaneSnapshots.shared(this).contains(PaneSnapshots.computer(host), agent.id, present ->
+                main.post(() -> {
+                    if (destroyed || stopped || !navigation.current(intent) || machines.get(host.id) != machine
+                            || !host.matchesConnection(machine.host)) return;
+                    if (live(machine)) {
+                        openAgent(agent, intent);
+                        return;
+                    }
+                    if (!present) {
+                        note = host.name + " is not connected yet";
+                        render(true);
+                        return;
+                    }
+                    try {
+                        RemoteHostsActivity.rememberLastSession(this, host, agent.id);
+                        GpuiLaunch.launchSaved(this, host, agent.id, FleetPanes.displayTitle(agent));
+                    } catch (RuntimeException | LinkageError failed) {
+                        note = "The terminal could not be opened";
+                        render(true);
+                    }
+                }));
             return;
         }
         if (opening || handle <= 0 || !"ready".equals(machine.state)) {

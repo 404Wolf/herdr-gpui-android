@@ -260,6 +260,36 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_input(
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_inputForAttach(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    pane: JString<'_>,
+    identity: JString<'_>,
+    command: JString<'_>,
+) -> jstring {
+    let Some(pane) = read(&mut env, &pane, 1024) else {
+        return std::ptr::null_mut();
+    };
+    let Some(identity) = read(&mut env, &identity, 4096) else {
+        return std::ptr::null_mut();
+    };
+    let Some(command) = read(&mut env, &command, crate::model::MAX_COMMAND_JSON) else {
+        return std::ptr::null_mut();
+    };
+    result_string(&mut env, remote::input_for_attach(handle as u64, &pane, &command, &identity))
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_releaseHeld(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    remote::release_held();
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_focus(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,

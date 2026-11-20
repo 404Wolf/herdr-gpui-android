@@ -1025,6 +1025,7 @@ impl Connection<'_> {
             .unwrap_or(Value::Null);
         let mut state = lock(&self.owner.state);
         project(&mut state.view, &list["terminals"], &doc["value"])?;
+        state.validate_listed_terminal();
         if state.view["projects_order"] != order {
             state.view["projects_order"] = order;
             bump(&mut state.view);
@@ -5940,13 +5941,21 @@ mod cache_tests {
 
     #[test]
     fn ask2_replacement_pty_has_a_different_input_target_from_its_attach() {
-        let (terminal, _tx, _sent) = full_screen();
+        let (terminal, _tx, sent) = full_screen();
         let session = owner(7925, "same-core", terminal, "done");
         crate::remote::register_for_test(session.clone());
         let poll = || serde_json::from_str::<Value>(&crate::remote::poll(7925, 0, false).unwrap()).unwrap();
         let first = poll();
         crate::remote::reattach_for_test(&session, &json!({"pid": crate::remote::TEST_PID + 1, "created_ms": 0}));
         let replacement = poll();
+        let command = r#"{"type":"text","text":"held input"}"#;
+        let old = first["attach_identity"].as_str().unwrap();
+        let stale: Value = serde_json::from_str(&crate::remote::input_for_attach(7925, "t1", command, old).unwrap()).unwrap();
+        assert_eq!(stale, json!({"queued":false,"stale_attach":true}));
+        let matched = replacement["attach_identity"].as_str().unwrap();
+        let queued: Value = serde_json::from_str(&crate::remote::input_for_attach(7925, "t1", command, matched).unwrap()).unwrap();
+        assert_eq!(queued["queued"], true);
+        assert_eq!(wheel_input(&sent), b"held input");
         crate::remote::close(7925);
         crate::remote::release_held();
         assert_eq!(first["pane_id"], replacement["pane_id"]);
@@ -6190,6 +6199,16 @@ mod cache_tests {
         at_copy_top(7908, &session);
         crate::remote::scroll_local(7908, 40, paint_args(0)).unwrap();
         assert_eq!(wheels(&sent), (30, 0));
+        let terminal = lock(&session.state).terminal.clone().unwrap();
+        let mut repainted = paint(40);
+        repainted.extend_from_slice(b"\x1b]2;repainted\x07");
+        tx.send(Chunk::Data(repainted)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while terminal.title().as_deref() != Some("repainted") {
+            assert!(Instant::now() < deadline, "the clamped program did not repaint");
+            std::thread::yield_now();
+        }
+        drop(terminal.grid().lock());
         crate::remote::scroll_local(7908, -30, paint_args(0)).unwrap();
         assert_eq!(wheels(&sent), (0, 0), "reports sent to a program already at its newest row");
         crate::remote::scroll_local(7908, 3, paint_args(0)).unwrap();

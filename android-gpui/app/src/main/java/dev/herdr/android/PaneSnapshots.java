@@ -10,7 +10,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.Set;
+import java.util.function.Consumer;
+import org.json.JSONObject;
 import java.util.concurrent.Executor;
 
 /**
@@ -36,14 +40,12 @@ import java.util.concurrent.Executor;
  * {@link #MAX_TOTAL_BYTES} in all, newest first by when each was last saved
  * or opened (a copy's mtime is when it was saved; an empty {@code .used} file
  * beside it, when it was last opened); pinned panes (the one on screen, the Deacon and PMs, panes with
- * messages waiting) go last, and nothing unpinned older than {@link
- * #MAX_AGE_MS} stays. Version 1 copies (plain, {@code no_backup/panes}) are
- * sealed into the cache once, then deleted.
+ * messages waiting) go last. Version 1 copies (plain, {@code no_backup/panes})
+ * are sealed once and adopted under the profile revisions read at upgrade.
  */
 final class PaneSnapshots {
     static final int MAX_FILES = 48;
     static final long MAX_TOTAL_BYTES = 64L * 1024 * 1024;
-    static final long MAX_AGE_MS = 14L * 24 * 60 * 60 * 1000;
     /** A copy read back is at most this (the native side bounds it again). */
     static final int MAX_FILE_BYTES = 4 * 1024 * 1024 + 8192;
     static final String SUFFIX = ".snap2";
@@ -97,7 +99,13 @@ final class PaneSnapshots {
                 return worker;
             });
             shared = new PaneSnapshots(dir, thread, () -> CacheSeal.shared(app), NATIVE);
-            shared.migrate(old);
+            shared.migrate(old, () -> {
+                Map<String, String> revisions = new LinkedHashMap<>();
+                for (SavedRemoteHost host : new RemoteHostStore(app).read()) {
+                    revisions.put(host.id, host.connectionRevision);
+                }
+                return revisions;
+            });
         }
         return shared;
     }
@@ -126,8 +134,11 @@ final class PaneSnapshots {
     private final Executor thread;
     private final Seal seal;
     private final Native natives;
+    /** Profile revisions observed on the first readable store at upgrade. Worker only. */
+    private Map<String, String> legacyRevisions = Collections.emptyMap();
+
     /** File names that go last when the cache is over its bounds. */
-    private volatile Set<String> pinned = Collections.emptySet();
+    private Set<String> pinned = Collections.emptySet();
 
     PaneSnapshots(File dir, Executor thread, Seal seal, Native natives) {
         this.dir = dir;
@@ -155,7 +166,7 @@ final class PaneSnapshots {
                 byte[] copy = natives.copy(handle, pane);
                 if (copy == null) return;
                 sealer.write(into, copy);
-                prune(System.currentTimeMillis());
+                prune();
             } catch (IOException | RuntimeException | LinkageError unsaved) {
                 // The previous copy, if any, stays.
             }
@@ -182,9 +193,14 @@ final class PaneSnapshots {
             if (pane != null && !pane.isEmpty()) thread.execute(missing::missing);
             return;
         }
-        final File saved = file(computer, pane);
         thread.execute(() -> {
+            File saved = file(computer, pane);
             byte[] copy = read(saved);
+            File legacy = legacyFile(computer, pane);
+            if (copy == null && legacy != null) {
+                copy = read(legacy);
+                if (copy != null) saved = legacy;
+            }
             if (copy == null) {
                 missing.missing();
                 return;
@@ -199,6 +215,21 @@ final class PaneSnapshots {
                 return;
             }
             if (id > 0) {
+                if (saved.equals(legacy)) {
+                    File adopted = file(computer, pane);
+                    try {
+                        CacheSeal sealer = seal.get();
+                        if (sealer != null) {
+                            sealer.write(adopted, copy);
+                            adopted.setLastModified(savedAt);
+                            saved.delete();
+                            used(saved).delete();
+                            saved = adopted;
+                        }
+                    } catch (IOException unwritable) {
+                        // The sealed fallback still belongs to the adopted revision.
+                    }
+                }
                 // Opening counts as using it, for eviction; its own time stays
                 // the time it was saved, which the pane's "cached" label shows.
                 touch(used(saved), System.currentTimeMillis());
@@ -211,11 +242,16 @@ final class PaneSnapshots {
 
     /** {@code (computer, pane)} pairs kept last when the cache is over its bounds. */
     void pin(List<String[]> panes) {
-        Set<String> names = new HashSet<>();
-        for (String[] pane : panes) {
-            if (pane.length == 2 && pane[0] != null && pane[1] != null) names.add(name(pane[0], pane[1]));
-        }
-        pinned = Collections.unmodifiableSet(names);
+        thread.execute(() -> {
+            Set<String> names = new HashSet<>();
+            for (String[] pane : panes) {
+                if (pane.length != 2 || pane[0] == null || pane[1] == null) continue;
+                names.add(name(pane[0], pane[1]));
+                File legacy = legacyFile(pane[0], pane[1]);
+                if (legacy != null) names.add(legacy.getName());
+            }
+            pinned = Collections.unmodifiableSet(names);
+        });
     }
 
     /** {@code saved}'s copy, opened; null when there is none or it cannot be read (then it is deleted). */
@@ -246,38 +282,77 @@ final class PaneSnapshots {
         }
     }
 
-    /**
-     * Seals the plain version 1 copies in {@code old} into the cache (same
-     * names, so the same panes), then deletes them and their folder. A copy
-     * that cannot be sealed is deleted all the same: plain text must not stay.
-     */
-    void migrate(File old) {
+    /** Checks after the migration already queued on this worker. */
+    void contains(String computer, String pane, Consumer<Boolean> then) {
         thread.execute(() -> {
-            File[] files = old.listFiles();
-            if (files == null) return;
-            CacheSeal sealer = seal.get();
-            for (File file : files) {
-                String base = file.getName();
-                if (sealer != null && base.endsWith(OLD_SUFFIX) && (dir.isDirectory() || dir.mkdirs())) {
-                    File into = new File(dir, base.substring(0, base.length() - OLD_SUFFIX.length()) + SUFFIX);
-                    try {
-                        if (!into.isFile()) {
-                            long savedAt = file.lastModified();
-                            sealer.write(into, CacheSeal.readBytes(file, MAX_FILE_BYTES));
-                            into.setLastModified(savedAt);
-                        }
-                    } catch (IOException tooBig) {
-                        // Deleted below, like every version 1 file.
-                    }
-                }
-                file.delete();
-            }
-            old.delete();
-            prune(System.currentTimeMillis());
+            File legacy = legacyFile(computer, pane);
+            then.accept(computer != null && (file(computer, pane).isFile() || legacy != null && legacy.isFile()));
         });
     }
 
-    private void prune(long now) {
+    private File legacyFile(String computer, String pane) {
+        int separator = computer == null ? -1 : computer.indexOf('\u0000');
+        if (separator < 1) return null;
+        String profile = computer.substring(0, separator);
+        return computer.equals(computer(profile, legacyRevisions.get(profile))) ? file(profile, pane) : null;
+    }
+
+    interface Profiles {
+        Map<String, String> revisions() throws Exception;
+    }
+
+    /**
+     * Persists the adoption before sealing or opening any legacy copy. A
+     * process interrupted mid-migration uses the original revisions again.
+     * An unreadable profile store leaves the copies for the next launch.
+     */
+    void migrate(File old, Profiles profiles) {
+        thread.execute(() -> {
+            CacheSeal sealer = seal.get();
+            if (sealer == null || !dir.isDirectory() && !dir.mkdirs()) return;
+            File binding = new File(old.getParentFile(), "pane-legacy-revisions.sealed");
+            try {
+                Map<String, String> revisions = new LinkedHashMap<>();
+                if (binding.isFile()) {
+                    byte[] sealed = CacheSeal.readBytes(binding, 8192);
+                    JSONObject stored = new JSONObject(new String(sealer.open(sealed, binding.getName()), StandardCharsets.UTF_8));
+                    for (java.util.Iterator<String> it = stored.keys(); it.hasNext();) {
+                        String profile = it.next();
+                        revisions.put(profile, stored.getString(profile));
+                    }
+                } else {
+                    revisions.putAll(profiles.revisions());
+                    sealer.write(binding, new JSONObject(revisions).toString().getBytes(StandardCharsets.UTF_8));
+                }
+                legacyRevisions = revisions;
+            } catch (Exception unavailable) {
+                return;
+            }
+            File[] files = old.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    String base = file.getName();
+                    if (base.endsWith(OLD_SUFFIX)) {
+                        File into = new File(dir, base.substring(0, base.length() - OLD_SUFFIX.length()) + SUFFIX);
+                        try {
+                            if (!into.isFile()) {
+                                long savedAt = file.lastModified();
+                                sealer.write(into, CacheSeal.readBytes(file, MAX_FILE_BYTES));
+                                into.setLastModified(savedAt);
+                            }
+                        } catch (IOException unwritable) {
+                            continue;
+                        }
+                    }
+                    file.delete();
+                }
+                old.delete();
+            }
+            prune();
+        });
+    }
+
+    private void prune() {
         File[] all = dir.listFiles();
         if (all == null) return;
         List<File> files = new ArrayList<>();
@@ -294,7 +369,7 @@ final class PaneSnapshots {
             }
         }
         Set<String> keep = pinned;
-        for (File old : stale(files, keep, MAX_FILES, MAX_TOTAL_BYTES, now, MAX_AGE_MS)) {
+        for (File old : stale(files, keep, MAX_FILES, MAX_TOTAL_BYTES)) {
             old.delete();
             used(old).delete();
         }
@@ -322,10 +397,9 @@ final class PaneSnapshots {
 
     /**
      * What goes (newest of them first): beyond the newest {@code maxFiles}, past
-     * {@code maxBytes} in all, or older than {@code maxAge}; pinned files
-     * (by name) are counted first and never go.
+     * {@code maxBytes} in all. Pinned files (by name) are counted first and never go.
      */
-    static List<File> stale(List<File> files, Set<String> pinned, int maxFiles, long maxBytes, long now, long maxAge) {
+    static List<File> stale(List<File> files, Set<String> pinned, int maxFiles, long maxBytes) {
         List<File> order = new ArrayList<>(files);
         order.sort((a, b) -> {
             boolean pa = pinned.contains(a.getName()), pb = pinned.contains(b.getName());
@@ -338,7 +412,7 @@ final class PaneSnapshots {
         for (File file : order) {
             boolean pin = pinned.contains(file.getName());
             long size = file.length();
-            boolean over = kept >= maxFiles || total + size > maxBytes || now - recency(file) > maxAge;
+            boolean over = kept >= maxFiles || total + size > maxBytes;
             if (over && !pin) {
                 out.add(file);
                 continue;
@@ -349,9 +423,9 @@ final class PaneSnapshots {
         return out;
     }
 
-    /** {@code stale} with no pins and no age limit (the version 1 bounds' shape). */
+    /** {@code stale} with no pins (the version 1 bounds' shape). */
     static List<File> stale(List<File> files, int maxFiles, long maxBytes) {
-        return stale(files, Collections.emptySet(), maxFiles, maxBytes, Long.MIN_VALUE / 2, Long.MAX_VALUE);
+        return stale(files, Collections.emptySet(), maxFiles, maxBytes);
     }
 
     /** All the cache's bytes on disk now, for the setting that shows its size. */
