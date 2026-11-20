@@ -187,6 +187,8 @@ pub struct LayoutHint {
     /// Every row's drawn draft cells, `[row, first, past last]`, one per row ([`draft_spans`]):
     /// the host keeps its control targets off all of them, above, beside or below.
     pub draft_spans: Vec<[usize; 3]>,
+    /// Where each row was drawn vertically: a multi-line draft spreads its rows.
+    pub rows_geometry: crate::rows::RowGeometry,
 }
 
 /// The program's input caret, in the rows as drawn.
@@ -270,6 +272,23 @@ pub struct DraftRun {
 /// The most draft runs a layout hint carries; the host takes as many (ClusterPlacement).
 /// Past it every row's draft is one cluster run instead, so nothing drawn goes unreported.
 pub const MAX_DRAFT_RUNS: usize = 4096;
+
+/// The rows the draft is drawn on, first to last, or None when none of it is.
+/// The first row below the prompt's caret that holds the program's own text: the draft's
+/// free rows (blank ones and the box's rules, see [`place_all`]) end before it.
+pub fn draft_limit(screen: &[Vec<char>], anchor: Anchor) -> usize {
+    let free = screen[(anchor.row + 1).min(screen.len())..]
+        .iter()
+        .take_while(|cells| rule(cells) || cells.iter().all(|c| c.is_whitespace()))
+        .count();
+    anchor.row + 1 + free
+}
+
+pub fn draft_block(placed: &[Placed]) -> Option<(usize, usize)> {
+    let mut rows = placed.iter().filter(|p| p.source.is_some()).map(|p| p.row);
+    let first = rows.next()?;
+    Some(rows.fold((first, first), |(lo, hi), row| (lo.min(row), hi.max(row))))
+}
 
 /// The rows' drawn draft cells among `placed`: `[row, first, past last]`, one per row, at most
 /// one per grid row.
@@ -502,9 +521,16 @@ fn place_with(
     out
 }
 
+/// The cells a draft line keeps beside the controls for the draft to be spread (wrap never
+/// narrows a line below 8 cells).
+const MIN_BESIDE_CONTROLS: usize = 8;
+
 /// Everything drawn over the screen in one frame, with where the controls went.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
+    /// Whether the draft's lines may be spread vertically without covering a control: the
+    /// controls' columns are kept clear on every draft row that could share their pixel band.
+    pub spread_safe: bool,
     pub placed: Vec<Placed>,
     pub controls: Vec<PlacedControl>,
     /// Where each queue row was drawn: `echo-<id>` with the host's `Ghost::echo_ids`, else
@@ -772,9 +798,25 @@ pub fn place_all(
     let has_draft = ghost.draft.iter().any(|s| !s.text.trim().is_empty());
     if let Some(anchor) = anchor {
         // The draft and the echoes, short of the controls on their row.
+        // The rows whose draft line may share a pixel band with the controls: their own row,
+        // and, when the controls sit on the box's lower rule below the caret, every later
+        // draft row from the one above them (the draft is spread over its box: see `rows`).
+        // Only while a draft line beside them keeps the cells wrap needs; on a grid where the
+        // controls take almost the whole row, the draft is not spread at all (`spread_safe`).
+        let controls_row_below = controls_row.filter(|&c| c > anchor.row);
+        let room_beside = cols.saturating_sub(len).saturating_sub(1);
+        layout.spread_safe = cols > anchor.indent
+            && (layout.controls.is_empty() || room_beside >= MIN_BESIDE_CONTROLS);
+        let spread_safe = layout.spread_safe;
+        let shares_band = |row: usize| {
+            !layout.controls.is_empty()
+                && (Some(row) == controls_row
+                    || (spread_safe
+                        && controls_row_below.is_some_and(|c| row > anchor.row && row + 1 >= c)))
+        };
         let width_of = |row: usize| {
-            // On the controls' row, the draft ends a cell short of them.
-            if Some(row) == controls_row && !layout.controls.is_empty() {
+            // Beside the controls, the draft ends a cell short of them.
+            if shares_band(row) {
                 (cols - len).saturating_sub(1)
             } else {
                 cols
@@ -811,7 +853,7 @@ pub fn place_all(
         let draft = place_with(source, Some(anchor), rows, cols, 1 + free_below, &width_of)
             .into_iter()
             .filter_map(|mut run| {
-                if Some(run.row) != controls_row || layout.controls.is_empty() {
+                if !shares_band(run.row) {
                     return Some(run);
                 }
                 let room = controls_from.saturating_sub(run.col);
@@ -1369,10 +1411,16 @@ fn wrap(
                         // Wider than a whole line: put it alone rather than loop.
                         take = 1;
                         used = grapheme_cells(rest[0]);
+                    } else if col == indent && lines.len() >= MAX_WRAP_LINES {
+                        // Nothing more can be drawn: stop rather than append empty rows.
+                        return trim_empty(lines);
                     } else {
                         lines.push(Vec::new());
                         col = indent;
                         width = width_of(lines.len() - 1);
+                        if width <= indent && lines.len() >= MAX_WRAP_LINES {
+                            return trim_empty(lines);
+                        }
                         continue;
                     }
                 }
@@ -1383,7 +1431,15 @@ fn wrap(
             }
         }
     }
-    // Trailing empty lines carry nothing; a leading one keeps row numbering.
+    trim_empty(lines)
+}
+
+/// The most visual rows a wrapped draft is laid out on: wrapping stops there, so a grid with no
+/// writable cells (two columns) cannot grow rows forever.
+const MAX_WRAP_LINES: usize = 64;
+
+/// Trailing empty lines carry nothing; a leading one keeps row numbering.
+fn trim_empty(mut lines: Vec<Vec<Located>>) -> Vec<Vec<Located>> {
     while lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
         lines.pop();
     }
@@ -1496,6 +1552,18 @@ pub fn guard_row(screen: &[Vec<char>], anchor: Option<Anchor>, placed: &[Placed]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn placed(row: usize, source: Option<usize>) -> Placed {
+        Placed { row, col: 2, text: "x".into(), style: GhostStyle::Text, source }
+    }
+
+    #[test]
+    fn the_draft_block_spans_the_rows_of_the_draft_only() {
+        let runs = [placed(30, None), placed(37, Some(0)), placed(39, Some(4)), placed(38, Some(2))];
+        assert_eq!(draft_block(&runs), Some((37, 39)));
+        assert_eq!(draft_block(&runs[..1]), None);
+        assert_eq!(draft_block(&[]), None);
+    }
 
     fn screen(lines: &[&str], cols: usize) -> Vec<Vec<char>> {
         lines
@@ -3432,5 +3500,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Claude's prompt box as the review's probe had it: the caret on row 20, the lower rule
+    /// on 21, one blank row, the status on 23.
+    fn spread_box(cols: usize) -> (Vec<Vec<char>>, Anchor) {
+        let rule = "─".repeat(cols);
+        let mut lines: Vec<String> = vec![String::new(); 24];
+        lines[19] = rule.clone();
+        lines[20] = "❯\u{a0}".into();
+        lines[21] = rule;
+        lines[23] = "  -- INSERT --".into();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let rows = screen(&refs, cols);
+        let anchor = locate(&rows, Some((20, 2)), PromptKind::Claude).expect("anchor");
+        (rows, anchor)
+    }
+
+    #[test]
+    fn a_spread_drafts_lines_never_cover_a_control_whatever_their_length_or_the_width() {
+        use crate::rows::RowGeometry;
+        let cell = (6.0f32, 40.0f32);
+        for cols in [40usize, 46, 52, 98] {
+            for lines in 1..=5usize {
+                let (rows, anchor) = spread_box(cols);
+                // A draft that wraps to about `lines` lines at this width.
+                let words: String = (0..(cols - 4) * lines).map(|i| if i % 7 == 6 { ' ' } else { 'x' }).collect();
+                let mut g = controls(ghost(vec![text(&words)]));
+                g.controls.push(control("clear", "x"));
+                let layout = place_all(&g, Some(anchor), &rows, None);
+                let block = draft_block(&layout.placed);
+                let spread = layout.spread_safe
+                    && block.is_some_and(|(first, _)| layout.controls.iter().all(|c| c.row > first));
+                let geo = if spread {
+                    RowGeometry::for_draft(cell.1, block, draft_limit(&rows, anchor))
+                } else {
+                    RowGeometry::uniform(cell.1)
+                };
+                for run in layout.placed.iter().filter(|p| p.source.is_some() && !p.text.is_empty()) {
+                    let above = if run.row > geo.first && geo.rows > 1 { geo.gap } else { 0. };
+                    let (top, bottom) = (geo.draft_top(run.row) - above, geo.draft_top(run.row) + cell.1);
+                    let (left, right) = (run.col as f32 * cell.0, (run.col + cells(&run.text)) as f32 * cell.0);
+                    for c in &layout.controls {
+                        let band = (geo.grid_top(c.row), geo.grid_top(c.row) + cell.1);
+                        // The control's hit box: its words and one cell either side.
+                        let hit = ((c.start as f32 - 1.) * cell.0, (c.end as f32 + 1.) * cell.0);
+                        let rows_overlap = top < band.1 && bottom > band.0;
+                        let cols_overlap = left < hit.1 && right > hit.0;
+                        assert!(
+                            !(rows_overlap && cols_overlap),
+                            "{cols} cols, {lines} lines: draft row {} cols {}..{} covers {} (row {} cols {}..{})",
+                            run.row,
+                            run.col,
+                            run.col + cells(&run.text),
+                            c.id,
+                            c.row,
+                            c.start,
+                            c.end
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_two_column_pane_wraps_to_a_stop_instead_of_growing_rows_forever() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for cols in [2usize, 3, 4] {
+                let rule = "─".repeat(cols);
+                let rows = screen(&["❯\u{a0}", "", &rule], cols);
+                let anchor = locate(&rows, Some((1, 1)), PromptKind::Claude);
+                assert!(anchor.is_some(), "{cols} cols");
+                let g = controls(ghost(vec![text("xx yy zz 日本語 😀😀 ")]));
+                let layout = place_all(&g, anchor, &rows, None);
+                assert!(layout.placed.len() < 1000, "{cols} cols");
+                assert!(!layout.spread_safe || cols > 2, "{cols} cols");
+            }
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(), "wrapping did not stop");
     }
 }

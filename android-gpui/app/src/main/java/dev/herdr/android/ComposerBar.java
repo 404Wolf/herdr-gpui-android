@@ -835,7 +835,7 @@ final class ComposerBar {
     private int cursorAt(float x, float y) {
         if (layout == null || Float.isNaN(x) || Float.isNaN(y) || layout.draftRuns.length == 0) return -1;
         float col = (x / density - layout.left) / layout.cellWidth;
-        int row = (int) Math.floor((y / density - layout.top) / layout.cellHeight);
+        int row = layout.rows().draftRowAt(y / density);
         int drawn = DraftTaps.drawnAt(layout.draftRuns, row, col);
         return DraftTaps.fieldIndex(GhostText.fieldOffsets(drafts.text(), drafts.cuts(), clipLengths, parkedIds()),
                 drawn);
@@ -987,7 +987,7 @@ final class ComposerBar {
         boolean drawn = !layout.controls.isEmpty();
         placeTargets(showing && drawn, left, top, surface.getHeight() / density);
         if (keysOverlay.getVisibility() == View.VISIBLE) {
-            float guardTop = top + (layout.top + layout.guard * layout.cellHeight) * density;
+            float guardTop = top + layout.rows().top(layout.guard) * density;
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(48), Gravity.TOP | Gravity.START);
             params.topMargin = Math.max(Math.round(top), Math.round(guardTop) - dp(48));
             keysOverlay.setLayoutParams(params);
@@ -1010,12 +1010,12 @@ final class ComposerBar {
             rowCells.addAll(layout.rowActions);
         }
         java.util.List<ControlTargets.Rect> rects = new java.util.ArrayList<>(ControlTargets.layout(layout.controls,
-                layout.left, layout.top, layout.cellWidth, layout.cellHeight, layout.targetsTop, surfaceBottom, right,
+                layout.rows(), layout.left, layout.cellWidth, layout.targetsTop, surfaceBottom, right,
                 recording(dictationState), layout.draftSpans, rowCells));
         // The queue's rows above the prompt, while it is open: one target per row, its full width,
         // and the selected row's actions on its right end.
-        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.left, layout.top,
-                layout.cellWidth, layout.cellHeight, layout.cols));
+        if (queueOpen) rects.addAll(ControlTargets.rows(layout.echoes, layout.rowActions, layout.rows(),
+                layout.left, layout.cellWidth, layout.cols));
         tapGuard.laid(rects, android.os.SystemClock.uptimeMillis());
         if (rects.isEmpty()) {
             targets.setVisibility(View.GONE);
