@@ -3,32 +3,30 @@ package dev.herdr.android;
 import java.io.File;
 import java.util.Set;
 import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * Carries the {@link Outbox} to the computers: loads and saves it, and sends
- * its messages one at a time on its own thread, so a send that waits seconds
- * for the core (an agent settling, a person typing elsewhere) never stalls the
- * terminal's poll.
+ * Carries the {@link Outbox}: loads and saves it, and makes the one write a tap asks for on its
+ * own thread, so a send never stalls the terminal's poll or the UI. It never sends by itself:
+ * every write starts from a tap on Send (the composer's, or a held message's in its live pane).
  *
- * <p>Every change is saved before the next step that depends on it: a message
- * is only handed to the core once its "sending" mark is on disk, so a process
- * killed mid-send leaves it unsure rather than queued (which would send it
- * twice) or missing (which would lose it).
+ * <p>Every change is saved before the step that depends on it: a message is written only once
+ * its "sending" mark is on disk, so a process killed mid-send leaves it needing the user rather
+ * than pending (which would invite a second send) or missing (which would lose it).
  */
 final class OutboxCourier {
-    /** The one call that reaches the core; {@code RemoteNative::deliver} in the app. */
+    /** The one call that types; {@code RemoteNative::compose} in the app. */
     interface Wire {
-        String deliver(long handle, String pane, String text);
+        String compose(long handle, long attach, String text);
     }
 
     private static OutboxCourier shared;
 
     /**
-     * The process's one courier. It outlives activities: a send in flight when
-     * the terminal closes still gets its answer recorded.
+     * The process's one courier. It outlives activities: a send in flight when the terminal
+     * closes still gets its answer recorded.
      */
     static synchronized OutboxCourier shared(android.content.Context context) {
         if (shared == null) {
@@ -38,7 +36,7 @@ final class OutboxCourier {
                 worker.setDaemon(true);
                 return worker;
             });
-            shared = new OutboxCourier(file, thread, RemoteNative::deliver);
+            shared = new OutboxCourier(file, thread, RemoteNative::compose);
         }
         return shared;
     }
@@ -46,9 +44,8 @@ final class OutboxCourier {
     private final Outbox outbox;
     private final Executor thread;
     private final Wire wire;
-    /** Told after anything the strip or the status line shows changed; on any thread. */
+    /** Told after anything the rows, the queue or the badge show changed; on any thread. */
     private final Set<Runnable> listeners = new java.util.concurrent.CopyOnWriteArraySet<>();
-    private final AtomicBoolean sending = new AtomicBoolean();
 
     OutboxCourier(File file, Executor thread, Wire wire) {
         this.outbox = new Outbox(file);
@@ -56,6 +53,8 @@ final class OutboxCourier {
         this.wire = wire;
         thread.execute(() -> {
             outbox.load();
+            outbox.purgeSent(System.currentTimeMillis());
+            outbox.save();
             changed();
         });
     }
@@ -76,18 +75,81 @@ final class OutboxCourier {
         return outbox;
     }
 
-    /** Queues a composer message; null keeps the draft (empty, too long, or the outbox is full). */
-    Outbox.Message add(String host, String pane, String text) {
-        Outbox.Message message = outbox.add(host, pane, text, System.currentTimeMillis());
+    /**
+     * Step 2 of the Send handoff: holds the message under its submission id and saves it before
+     * returning (fsync). Null when it cannot be held or saved: then nothing is held and the
+     * caller keeps the draft.
+     */
+    Outbox.Message add(String id, Outbox.Target target, String text, Outbox.Composed composed) {
+        // The queue on disk first (once; the startup load then does nothing): the bounds and the
+        // order apply to the whole queue, never to the part read so far.
+        outbox.load();
+        boolean known = outbox.message(id) != null;
+        Outbox.Message message = outbox.add(id, target, text, composed);
         if (message == null) return null;
-        thread.execute(outbox::save);
+        if (!outbox.save()) {
+            if (!known) outbox.take(id);
+            return null;
+        }
         changed();
         return message;
     }
 
-    /** A transcribed dictation for a queued message; true when one held its token. */
     /**
-     * A transcribed dictation for a queued message: 1 when a message held its token and the text
+     * A tap: writes message {@code id} into the pane {@code live}, on the attach {@code attach}
+     * of session {@code handle}, as {@code wireText}. The attempt is saved first; the outcome is
+     * saved, then told to {@code done} (on the courier's thread). {@code immediate}: typed at
+     * once from the composer in that live pane, so a written one leaves instead of staying as
+     * "sent · check it arrived". Null outcome: nothing was tried (it was not the lane's pending
+     * head, or the attempt could not be saved).
+     */
+    void send(String id, Outbox.Live live, long handle, long attach, String wireText, boolean immediate,
+            Consumer<Outbox.Outcome> done) {
+        thread.execute(() -> {
+            Outbox.Outcome outcome = null;
+            try {
+                if (!outbox.claim(id, live, wireText, System.currentTimeMillis(), immediate)) return;
+                if (!outbox.save()) {
+                    // Unrecorded, a write could be repeated after a crash: nothing is written.
+                    outbox.unclaim(id);
+                    return;
+                }
+                changed();
+                outcome = type(handle, attach, wireText);
+                outbox.settle(id, outcome, System.currentTimeMillis(), !immediate);
+                outbox.save();
+                changed();
+            } finally {
+                if (done != null) done.accept(outcome);
+            }
+        });
+    }
+
+    private Outbox.Outcome type(long handle, long attach, String text) {
+        String reply;
+        try {
+            reply = wire.compose(handle, attach, text);
+        } catch (IllegalArgumentException | IllegalStateException refused) {
+            // The native side refuses arguments before anything is written.
+            return Outbox.Outcome.UNWRITTEN;
+        }
+        if (reply == null) return Outbox.Outcome.UNWRITTEN;
+        try {
+            return Outbox.Outcome.parse(new JSONObject(reply).optString("outcome", ""));
+        } catch (JSONException unreadable) {
+            return Outbox.Outcome.UNSURE;
+        }
+    }
+
+    /** A direct link to {@code machine} lists these live terminals; pending ones not there are gone. */
+    void observe(MachineKey machine, java.util.Map<String, Long> terminals) {
+        if (!outbox.observe(machine, terminals)) return;
+        thread.execute(outbox::save);
+        changed();
+    }
+
+    /**
+     * A transcribed dictation for a held message: 1 when a message held its token and the text
      * is saved; 0 when none held it; -1 when the save failed, and the message is as it was (the
      * caller keeps the recording, which is offered again).
      */
@@ -102,21 +164,11 @@ final class OutboxCourier {
         return 1;
     }
 
-    /** Send again, or drop/take back, by the user's hand. */
+    /** "Send again" on a message that needs the user or was sent: pending again, a tap away. */
     void resend(String id) {
         if (!outbox.resend(id)) return;
         thread.execute(outbox::save);
         changed();
-    }
-
-    /**
-     * The composer's clear: the pane's messages, never one being sent, marked cleared until
-     * {@code until} and saved before returning; their ids, or null when the save failed (then
-     * nothing is cleared).
-     */
-    java.util.List<String> clearAll(String host, String pane, long until) {
-        java.util.List<String> ids = outbox.clearable(host, pane, System.currentTimeMillis());
-        return clear(ids, until) ? ids : null;
     }
 
     /**
@@ -159,67 +211,19 @@ final class OutboxCourier {
         changed();
     }
 
+    /** Sent rows past their hour go. */
+    void purgeSent() {
+        if (!outbox.purgeSent(System.currentTimeMillis())) return;
+        thread.execute(outbox::save);
+        changed();
+    }
+
+    /** Drop, Edit as draft, or "It arrived": the message leaves; its text, or null. */
     String take(String id) {
         String text = outbox.take(id);
         if (text == null) return null;
         thread.execute(outbox::save);
         changed();
         return text;
-    }
-
-    /**
-     * The session on {@code host} is ready with this core boot and these panes.
-     * Called on every poll; cheap when there is nothing to send.
-     */
-    void ready(String host, long handle, String boot, Set<String> panes) {
-        if (handle <= 0 || panes == null || panes.isEmpty()) return;
-        if (outbox.ready(host, boot, panes)) {
-            thread.execute(outbox::save);
-            changed();
-        }
-        if (outbox.next(host, System.currentTimeMillis()) == null) return;
-        if (!sending.compareAndSet(false, true)) return;
-        thread.execute(() -> {
-            try {
-                drain(host, handle);
-            } finally {
-                sending.set(false);
-            }
-        });
-    }
-
-    /** Sends {@code host}'s messages in order until one does not go through. Courier thread. */
-    private void drain(String host, long handle) {
-        for (Outbox.Message message; (message = outbox.next(host, System.currentTimeMillis())) != null; ) {
-            if (!outbox.sending(message.id)) return;
-            if (!outbox.save()) {
-                // Unrecorded, a send could be repeated after a crash: do not send.
-                outbox.settle(message.id, Outbox.Outcome.RETRY, System.currentTimeMillis());
-                return;
-            }
-            changed();
-            Outbox.Outcome outcome = send(handle, message);
-            outbox.settle(message.id, outcome, System.currentTimeMillis());
-            outbox.save();
-            changed();
-            if (outcome != Outbox.Outcome.SENT) return;
-        }
-    }
-
-    private Outbox.Outcome send(long handle, Outbox.Message message) {
-        String reply;
-        try {
-            reply = wire.deliver(handle, message.pane, message.text);
-        } catch (IllegalArgumentException | IllegalStateException refused) {
-            // The native side refuses arguments before anything is sent: this
-            // text can never go, so it is offered back instead of retried.
-            return Outbox.Outcome.GONE;
-        }
-        if (reply == null) return Outbox.Outcome.GONE;
-        try {
-            return Outbox.Outcome.parse(new JSONObject(reply).optString("outcome", ""));
-        } catch (JSONException unreadable) {
-            return Outbox.Outcome.UNSURE;
-        }
     }
 }

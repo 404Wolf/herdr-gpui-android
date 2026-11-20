@@ -273,6 +273,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         getWindow().getDecorView().setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         outbox = OutboxCourier.shared(this);
         outbox.listen(outboxChanged);
+        bindings = MachineBindings.shared(this);
         snapshots = PaneSnapshots.shared(this);
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
@@ -504,9 +505,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // field. The composer places each from the renderer's layout hints.
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
         column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
-        filePager.setOnShownChanged(() -> composer.setCovered(filePager.showingFile()));
+        filePager.setOnShownChanged(() -> {
+            composer.setCovered(filePager.showingFile());
+            refreshOffer();
+        });
         column.addView(composer.field(), new FrameLayout.LayoutParams(-1, ComposerBar.FIELD_HEIGHT_PX,
                 android.view.Gravity.BOTTOM));
+        // A held message's offer, under the tab row and the crumb: over the pane it is for.
+        heldOffer = new HeldOfferCard(this, chrome);
+        FrameLayout.LayoutParams offerAt = new FrameLayout.LayoutParams(-1, -2, android.view.Gravity.TOP);
+        offerAt.setMargins(dp(8), dp(54), dp(8), 0);
+        column.addView(heldOffer.view(), offerAt);
         // The sidebar rail mirrors the desktop's list of workspaces and agents.
         sidebar = new LinearLayout(this);
         sidebar.setOrientation(LinearLayout.HORIZONTAL);
@@ -2076,7 +2085,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             boolean resume = previous != null && (previous.remoteHandle > 0 || previous.offline)
                     && host.id.equals(currentHostId);
             checkpoint.reset();
-            if (!resume) pendingInput.discardAll();
             next = new Connection(GENERATIONS.incrementAndGet(), handle);
             if (resume) {
                 next.workspaces = previous.workspaces;
@@ -2086,6 +2094,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             next.resumed = resume;
             next.hostId = host.id;
             next.connectionRevision = host.connectionRevision;
+            next.fingerprint = host.expectedFingerprint;
+            next.session = host.session;
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -2409,10 +2419,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String linkProblem;
     /** Reconnects a dropped remote session while this terminal is on screen. */
     private ConnectionMonitor monitor;
-    /** Input that never left the phone, sent once the same pane is ready again. Under stateLock. */
-    private final PendingInput pendingInput = new PendingInput();
-    /** Composer messages not yet delivered, on disk; shared by every terminal activity. */
+    /** Held composer messages, on disk; shared by every terminal activity. Sent only by a tap. */
     private OutboxCourier outbox;
+    /** Which machine each profile revision reaches, proven by a direct hello. */
+    private MachineBindings bindings;
+    /** The live pane's one-tap offer: a held message for it, or a draft from before a restart. */
+    private HeldOfferCard heldOffer;
+    /** The pane whose draft offer was put off ("Later"): it stays kept and comes back elsewhere. Main thread. */
+    private String draftLater;
+    /** What the offer was last refreshed for (pane, attach, paint), so polls repaint nothing. */
+    private volatile String offerSignature = "";
     /** Each pane's last grid on disk, drawn when the terminal opens with no link. */
     private PaneSnapshots snapshots;
     /**
@@ -2814,6 +2830,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             text.append("● ").append(why);
             text.setSpan(new android.text.style.ForegroundColorSpan(
                     "error".equals(status) ? chrome.danger : chrome.warning), start, text.length(), 0);
+        }
+        long savedAt = savedShownAt;
+        if (savedShownHost != null && savedAt > 0 && !current.ready) {
+            // A saved screen is never the pane's content now: it says when it was saved.
+            text.append("   ");
+            int start = text.length();
+            text.append("◷ ").append(OfflineSwitch.saved(OfflineSwitch.when(savedAt, System.currentTimeMillis(),
+                    java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
+                    java.util.Locale.getDefault())));
+            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.warning), start, text.length(), 0);
         }
         crumb.setVisibility(View.VISIBLE);
         crumb.setTextColor(chrome.onSurfaceVariant);
@@ -4752,7 +4778,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return new ComposerBar.Host() {
             @Override public boolean queue(String commandJson) { return queueComposerInput(commandJson); }
 
-            @Override public boolean send(String text) { return sendComposerMessage(text); }
+            @Override public boolean send(String text) { return sendComposerMessage(text, java.util.UUID.randomUUID().toString()); }
+
+            @Override public boolean send(String text, String id) { return sendComposerMessage(text, id); }
 
             @Override public void typed() { markUsed(); }
 
@@ -4786,19 +4814,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (outbox != null) outbox.resend(id);
             }
 
-            /** The host and pane on screen: what the composer's clear works on. */
-            private String[] onScreen() {
-                synchronized (stateLock) {
-                    String host = connection == null ? currentHostId : connection.hostId;
-                    String pane = connection == null ? "" : connection.paneId;
-                    return new String[] {host, pane};
-                }
+            @Override public java.util.List<String> clearableQueued() {
+                // The rows the pane shows, by the same machine and terminal identity.
+                Here at = here();
+                if (outbox == null || at.host.isEmpty()) return java.util.Collections.emptyList();
+                return outbox.outbox().clearable(at.machine, at.host, at.pane, System.currentTimeMillis());
             }
 
-            @Override public java.util.List<String> clearableQueued() {
-                String[] at = onScreen();
-                if (outbox == null || at[0] == null) return java.util.Collections.emptyList();
-                return outbox.outbox().clearable(at[0], at[1], System.currentTimeMillis());
+            @Override public void act(String id) { actOnHeld(id); }
+
+            @Override public boolean queuedKnown(String id) {
+                return outbox != null && outbox.outbox().known(id);
+            }
+
+            @Override public boolean queuedEditable(String id) {
+                Outbox.Message m = outbox == null ? null : outbox.outbox().message(id);
+                return m != null && m.state != Outbox.State.SENDING;
             }
 
             @Override public String queuedText(String id) {
@@ -4822,9 +4853,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
 
             @Override public java.util.List<Outbox.Cleared> clearedQueued(long now) {
-                String[] at = onScreen();
-                if (outbox == null || at[0] == null) return java.util.Collections.emptyList();
-                return outbox.outbox().clearedOn(at[0], now);
+                Here at = here();
+                if (outbox == null || at.host.isEmpty()) return java.util.Collections.emptyList();
+                return outbox.outbox().clearedOn(at.machine, at.host, now);
             }
 
             @Override public java.util.List<String> liveQueuedTexts() {
@@ -5275,45 +5306,294 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
     }
 
-    /**
-     * A composer message: typed into the pane at once when the link is up and
-     * nothing of the pane's is still waiting, otherwise kept in the outbox,
-     * which sends it in order when the link returns. False keeps the draft.
-     */
-    private boolean sendComposerMessage(String text) {
-        String host;
-        String pane;
-        boolean live;
+    /** Where the pane on screen is, as the outbox needs it. Under stateLock. */
+    private static final class Here {
+        final Connection connection;
+        final String host, pane;
+        /** The machine its profile revision is bound to (live, or proven earlier); null when unbound. */
+        final MachineKey machine;
+        /** Attached over a direct link, first paint done, its machine proven: a tap may type here. */
+        final boolean live;
+        /** Seen through another core's relay: live only, nothing is held for it. */
+        final boolean relayed;
+        final String refusedBy;
+        final Long createdMs;
+        final String label, status;
+        /** Read once, with {@link #live}: the session handle, its attach, and its Herdr session. */
+        final long handle, attach;
+        final String session;
+
+        Here(Connection c, String host, String pane, MachineKey machine, boolean live, String refusedBy,
+                Long createdMs, String label, String status, long handle, long attach, String session) {
+            this.handle = handle;
+            this.attach = attach;
+            this.session = session == null ? "" : session;
+            this.connection = c;
+            this.host = host == null ? "" : host;
+            this.pane = pane == null ? "" : pane;
+            this.machine = machine;
+            this.live = live;
+            this.relayed = this.pane.contains("/");
+            this.refusedBy = refusedBy;
+            this.createdMs = createdMs;
+            this.label = label;
+            this.status = status;
+        }
+
+        Outbox.Live lane() {
+            return new Outbox.Live(machine, host, pane, createdMs, session);
+        }
+
+        /** Where a tap now would type: this pane, session and attach, taken together. */
+        OfferGate.Tap tap() {
+            return new OfferGate.Tap(pane, handle, attach);
+        }
+
+        boolean mayType(OfferGate.Tap tap, boolean covered) {
+            return OfferGate.mayType(tap, pane, handle, attach, live, covered);
+        }
+    }
+
+    private Here here() {
         synchronized (stateLock) {
-            Connection target = connection;
-            host = target == null ? currentHostId : target.hostId;
-            pane = target == null ? "" : target.paneId;
-            live = target != null && target.ready && !target.isClosed();
-        }
-        boolean queueable = host != null && !pane.isEmpty();
-        // A message waiting on a dictation goes through the outbox, which holds it until filled.
-        boolean awaits = DictationToken.in(text);
-        if (live && !awaits && !(queueable && outbox.outbox().holds(host, pane))) {
-            String command;
-            try {
-                command = GpuiTerminalProtocol.composeCommand(text);
-            } catch (JSONException | IllegalArgumentException invalid) {
-                note("Message is too long to send in one piece");
-                return false;
+            Connection c = connection;
+            String host = c == null ? currentHostId : c.hostId;
+            String pane = c == null ? "" : c.paneId;
+            MachineKey machine = c == null ? null : c.machine;
+            String refused = c == null ? null : c.refusedBy;
+            if (machine == null && refused == null && c != null && c.hostId != null && bindings != null) {
+                // Offline: the revision's binding from an earlier hello, never a guess.
+                machine = bindings.machine(c.hostId, c.connectionRevision);
+                MachineBindings.Binding binding = bindings.binding(c.hostId, c.connectionRevision);
+                if (binding != null && !binding.bound()) refused = binding.refusedBy;
             }
-            return queueComposerInput(command);
+            long attach = c == null ? 0 : c.attach;
+            boolean live = c != null && c.machine != null && c.ready && !c.isClosed() && !c.offline
+                    && c.painted && attach > 0 && c.remoteHandle > 0 && pane.equals(c.chromePane);
+            Long created = null;
+            String label = "", status = "";
+            JSONArray panes = c == null ? null : c.panes;
+            for (int i = 0; panes != null && i < panes.length(); i++) {
+                JSONObject item = panes.optJSONObject(i);
+                if (item == null || !pane.equals(item.optString("id"))) continue;
+                long ms = item.optLong("created_ms", 0);
+                created = ms > 0 ? ms : null;
+                label = HomeActivity.cleanTitle(item.optString("title", ""), pane);
+                status = item.optString("status", "");
+            }
+            return new Here(c, host, pane, machine, live, refused, created, label, status,
+                    c == null ? 0 : c.remoteHandle, attach, c == null ? "" : c.session);
         }
-        if (!queueable) {
-            note("Not connected; the draft is kept");
+    }
+
+    /** The phone's boot count, so an age survives no reboot; -1 when it cannot be read. */
+    private int bootCount() {
+        try {
+            return android.provider.Settings.Global.getInt(getContentResolver(),
+                    android.provider.Settings.Global.BOOT_COUNT);
+        } catch (android.provider.Settings.SettingNotFoundException | SecurityException unknown) {
+            return -1;
+        }
+    }
+
+    /**
+     * Step 2 of the Send handoff (SendHandoff): the message is held under submission {@code id}
+     * and fsynced before this returns, then acted on: typed at once when its pane is live and
+     * nothing older waits in its lane, otherwise kept for a tap in that pane. A profile with no
+     * proven machine, a refused one, or a relayed pane works live only and holds nothing. False
+     * keeps the draft.
+     */
+    private boolean sendComposerMessage(String text, String id) {
+        Here here = here();
+        boolean awaits = DictationToken.in(text);
+        if (here.machine == null || here.relayed) {
+            boolean liveHere;
+            synchronized (stateLock) {
+                Connection c = here.connection;
+                liveHere = c != null && c.ready && !c.isClosed() && !c.offline;
+            }
+            if (liveHere && !awaits) return typeLiveOnly(text);
+            note(here.relayed ? "Open that computer directly to hold messages for it; the draft is kept"
+                    : here.refusedBy != null ? "This computer reports the same Herdr as " + here.refusedBy
+                            + "; it works live only. The draft is kept"
+                    : "Not connected, and this computer was never reached from this profile; the draft is kept");
             return false;
         }
-        if (outbox.add(host, pane, text) == null) {
-            note(Outbox.sendable(text) ? "Too many messages wait already; the draft is kept"
-                    : "This message cannot be sent in one piece; the draft is kept");
+        if (here.pane.isEmpty()) {
+            note("No pane is selected; the draft is kept");
             return false;
         }
+        Outbox.Live lane = here.lane();
+        int older = outbox.outbox().waitingIn(lane);
+        String profileName;
+        String session;
+        synchronized (stateLock) {
+            Connection c = here.connection;
+            profileName = c == null ? "" : c.hostName;
+            session = c == null ? "" : c.session;
+        }
+        Outbox.Target target = new Outbox.Target(here.machine, here.host, profileName, session, here.pane,
+                here.createdMs, here.label, here.status);
+        Outbox.Composed composed = new Outbox.Composed(System.currentTimeMillis(), SystemClock.elapsedRealtime(),
+                bootCount());
+        if (outbox.add(id, target, text, composed) == null) {
+            note(!Outbox.sendable(text) ? "This message cannot be sent in one piece; the draft is kept"
+                    : "Too many messages wait already, or the phone could not save it; the draft is kept");
+            return false;
+        }
+        if (!here.live || awaits) {
+            if (!here.live) note("Held for " + HeldWords.target(target, java.util.Collections.emptyList())
+                    + "; send it from that pane once it is live");
+            return true;
+        }
+        if (older > 0) {
+            note(HeldWords.olderWaiting(older));
+            return true;
+        }
+        // Step 4 waits for the draft's clear to reach the disk (actOnHeld): typed at once in the
+        // pane on screen, on the attach on screen now, no lead.
+        // Pane, session and attach as they were at the tap (here() ran before the outbox saved):
+        // a switch while it saved can never redirect the message.
+        OfferGate.Tap tap = here.tap();
+        immediateId = id;
+        immediate = () -> {
+            Here now = here();
+            if (!now.mayType(tap, covered())) {
+                refreshOffer();
+                return;
+            }
+            outbox.send(id, lane, tap.handle, tap.attach, text, true, outcome -> {
+                if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it waits in the queue");
+                else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
+            });
+        };
         return true;
     }
+
+    /** A held message to type at once, waiting for its draft's clear to be on disk. Main thread. */
+    private String immediateId;
+    private Runnable immediate;
+
+    /** Step 4 of the Send handoff for {@code id}: its draft's clear is on disk. Main thread. */
+    private void actOnHeld(String id) {
+        Runnable run = id.equals(immediateId) ? immediate : null;
+        immediateId = null;
+        immediate = null;
+        if (run != null) run.run();
+    }
+
+    /** Whether the file page covers the terminal: then no held message is offered or typed. */
+    private boolean covered() {
+        return filePager != null && filePager.showingFile();
+    }
+
+    /** A live-only pane: typed at once through the input queue, as before stage 1; nothing held. */
+    private boolean typeLiveOnly(String text) {
+        String command;
+        try {
+            command = GpuiTerminalProtocol.composeCommand(text);
+        } catch (JSONException | IllegalArgumentException invalid) {
+            note("Message is too long to send in one piece");
+            return false;
+        }
+        return queueComposerInput(command);
+    }
+
+    /**
+     * The live pane's offer (§3.5): its lane's head, with the target as it was when typed and its
+     * age, and one Send that types it here. Without one, a draft from before a restart is offered
+     * instead. Main thread.
+     */
+    private void refreshOffer() {
+        if (heldOffer == null || destroyed || outbox == null) return;
+        if (covered()) {
+            heldOffer.hide();
+            return;
+        }
+        Here here = here();
+        Outbox.Message offer = here.live ? outbox.outbox().offer(here.lane()) : null;
+        if (offer != null) {
+            java.util.List<Outbox.Target> targets = new java.util.ArrayList<>();
+            for (Outbox.Message m : outbox.outbox().all()) targets.add(m.target);
+            java.util.TimeZone zone = java.util.TimeZone.getDefault();
+            String heading = HeldWords.offer(offer, targets, zone, android.text.format.DateFormat.is24HourFormat(this),
+                    System.currentTimeMillis(), SystemClock.elapsedRealtime(), bootCount());
+            OfferGate.Tap tap = here.tap();
+            heldOffer.show(offer.id + "@" + tap.handle + "/" + tap.attach, heading, QueuedMessages.PROMPT + offer.text,
+                    "Send here", () -> sendHeld(offer.id, tap),
+                    "Edit", () -> { if (composer != null) composer.editHeld(offer.id); },
+                    "Queue", this::showQueueScreen);
+            return;
+        }
+        ComposerDrafts.Draft draft = composer == null ? null : composer.offeredDraft();
+        String draftKey = "draft:" + here.host + "/" + here.pane;
+        if (draft != null && here.machine != null && !draftKey.equals(draftLater)) {
+            String when = draft.at > 0 ? OfflineSwitch.when(draft.at, System.currentTimeMillis(),
+                    java.util.TimeZone.getDefault(), android.text.format.DateFormat.is24HourFormat(this),
+                    java.util.Locale.getDefault()) : "before the app restarted";
+            heldOffer.show(draftKey, "draft from " + when + " · not loaded",
+                    QueuedMessages.oneLine(draft.text), "Restore", () -> {
+                        if (composer != null) composer.acceptOfferedDraft();
+                        refreshOffer();
+                    }, null, null, "Later", () -> draftLater = draftKey);
+            return;
+        }
+        heldOffer.hide();
+    }
+
+    /**
+     * The tap on a held message's Send: typed into the attach that was on screen when the offer
+     * was drawn, with the late lead for a program that reports status. Anything changed since
+     * (another pane, another attach, the link) and nothing is typed. Main thread.
+     */
+    private void sendHeld(String id, OfferGate.Tap tap) {
+        Here here = here();
+        if (!here.mayType(tap, covered())) {
+            note("The pane changed before the tap; nothing was sent");
+            refreshOffer();
+            return;
+        }
+        Outbox.Message m = outbox.outbox().offer(here.lane());
+        if (m == null || !m.id.equals(id)) {
+            refreshOffer();
+            return;
+        }
+        String wire = HeldWords.wire(m.text, m.composed.wallMs, java.util.TimeZone.getDefault(),
+                !here.status.isEmpty(), false);
+        outbox.send(id, here.lane(), tap.handle, tap.attach, wire, false, outcome -> {
+            if (outcome == Outbox.Outcome.WRITTEN) note("Sent · check it arrived");
+            else if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it still waits");
+            else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
+            main.post(this::refreshOffer);
+        });
+    }
+
+    /** The one queue, every computer and pane. Main thread. */
+    private void showQueueScreen() {
+        if (outbox == null || destroyed) return;
+        outbox.purgeSent();
+        QueueScreen.show(this, chrome, outbox, queueActions);
+    }
+
+    private final QueueScreen.Actions queueActions = new QueueScreen.Actions() {
+        @Override public boolean onScreen(Outbox.Message m) {
+            Here here = here();
+            return here.host.equals(m.host) && here.pane.equals(m.pane)
+                    && (m.target.machine == null || m.target.machine.equals(here.machine));
+        }
+
+        @Override public void open(Outbox.Message m) {
+            focusHostPane(m.host, m.pane, true);
+        }
+
+        @Override public void edit(Outbox.Message m) {
+            if (composer != null) composer.editHeld(m.id);
+        }
+
+        @Override public int boot() {
+            return bootCount();
+        }
+    };
 
     /**
      * Dictations the desktop transcribed after the fact: into the draft that
@@ -5349,15 +5629,56 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
             };
 
-    /** Pane ids in a poll's pane list. */
-    private static java.util.Set<String> paneIds(JSONArray panes) {
-        java.util.Set<String> ids = new java.util.HashSet<>();
+    /** A poll's live terminals: address to {@code created_ms} (null when the list has none). */
+    private static java.util.Map<String, Long> terminals(JSONArray panes) {
+        java.util.Map<String, Long> out = new java.util.HashMap<>();
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
             String id = pane == null ? "" : pane.optString("id", "");
-            if (!id.isEmpty()) ids.add(id);
+            long created = pane == null ? 0 : pane.optLong("created_ms", 0);
+            if (!id.isEmpty()) out.put(id, created > 0 ? created : null);
         }
-        return ids;
+        return out;
+    }
+
+    /**
+     * Binds this connection's profile revision to the machine its hello proved (core id plus the
+     * pinned host key it authenticated), once. A collision is refused: the profile works live
+     * only, and says with which computer. Poll thread, under stateLock.
+     */
+    private void bindMachine(Connection current, String coreId) {
+        if (current.machine != null || current.refusedBy != null || current.hostId == null || bindings == null) return;
+        // Not before the held messages are read: their sessions own their machines.
+        if (outbox == null || !MachineBindings.mayBind(outbox.outbox())) return;
+        MachineKey key = MachineKey.of(coreId, current.fingerprint);
+        if (key == null) return;
+        MachineBindings.Binding binding = bindings.bind(current.hostId, current.connectionRevision, current.session,
+                current.hostName, key, outbox == null ? java.util.Collections.emptyList() : outbox.outbox().all());
+        if (binding == null) return;
+        if (binding.bound()) {
+            current.machine = key;
+        } else {
+            current.refusedBy = binding.refusedBy;
+            String other = binding.refusedBy;
+            main.post(() -> note("This computer reports the same Herdr as " + other
+                    + "; it works live only, and nothing is held for it"));
+        }
+        main.post(this::refreshQueued);
+    }
+
+    /** The poll's attach on screen and its first paint; the offer follows a change. Under stateLock. */
+    private void noteAttach(Connection current, JSONObject state) {
+        long attach = state.optLong("attach", 0);
+        boolean painted = state.optBoolean("painted", false);
+        String pane = state.optString("pane_id", "");
+        String signature = current.generation + "/" + pane + "/" + attach + "/" + painted + "/" + current.ready;
+        current.attach = attach;
+        current.painted = painted;
+        // A hello the outbox was not yet read for is bound on a later poll.
+        if (current.machine == null && current.ready && current.remoteBoot != null) bindMachine(current, current.remoteBoot);
+        if (signature.equals(offerSignature)) return;
+        offerSignature = signature;
+        main.post(this::refreshOffer);
     }
 
     /** The outbox changed (any thread): the strip and the status line follow. */
@@ -5370,15 +5691,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Counts the outbox's messages for the pane on screen on Enter's badge. Main thread. */
     private void refreshQueued() {
         if (composer == null || outbox == null) return;
-        String host;
-        String pane;
-        synchronized (stateLock) {
-            host = connection == null ? currentHostId : connection.hostId;
-            pane = connection == null ? "" : connection.paneId;
-        }
-        composer.showQueued(host == null ? java.util.Collections.emptyList()
-                : outbox.outbox().shown(host, pane, System.currentTimeMillis()));
-        composer.setLinkDown(linkDownInputs());
+        Here here = here();
+        composer.showQueued(here.host.isEmpty() ? java.util.Collections.emptyList()
+                : outbox.outbox().shown(here.machine, here.host, here.pane));
+        refreshOffer();
     }
 
     /** The pane's queued messages, one row each; a row opens its actions. */
@@ -5411,13 +5727,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         switch (row.kind) {
             case MESSAGE:
                 if (message == null || message.state == Outbox.State.SENDING) return;
-                if (message.state == Outbox.State.UNSURE) {
-                    // The core may have typed it: look at the pane before sending it twice.
+                Here opened = here();
+                if (message.state == Outbox.State.PENDING && message.id.equals(offeredId()) && opened.live) {
+                    // Bound to the pane and attach on screen now: a reattach before the tap types nothing.
+                    OfferGate.Tap tap = opened.tap();
+                    sheet.add("Send here", () -> sendHeld(message.id, tap));
+                }
+                if (message.state == Outbox.State.NEEDS_YOU) {
+                    sheet.add("It arrived", () -> composer.queueCommand(row.id, "drop"));
+                }
+                if (message.state == Outbox.State.SENT
+                        || (message.state == Outbox.State.NEEDS_YOU && message.reason != Outbox.Reason.GONE)) {
+                    // It may have been typed: look at the pane before sending it twice.
                     sheet.add("Send again (check the pane first)", () -> composer.queueCommand(row.id, "again"));
                 }
-                sheet.add("Edit as draft", () -> composer.queueCommand(row.id, "edit"));
+                if (message.state != Outbox.State.SENT) {
+                    sheet.add("Edit as draft", () -> composer.queueCommand(row.id, "edit"));
+                }
                 sheet.add("Copy", () -> ActionSheet.copy(this, "Message", message.text));
-                sheet.danger("Drop", () -> composer.queueCommand(row.id, "drop"));
+                sheet.danger(message.state == Outbox.State.PENDING ? "Cancel" : "Drop",
+                        () -> composer.queueCommand(row.id, "drop"));
                 break;
             case PARKED:
                 sheet.add("Retry", () -> composer.queueCommand(row.id, "retry"));
@@ -5432,6 +5761,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         sheet.show();
     }
 
+    /** The held message the live pane offers now, or null. */
+    private String offeredId() {
+        Here here = here();
+        Outbox.Message m = here.live ? outbox.outbox().offer(here.lane()) : null;
+        return m == null ? null : m.id;
+    }
+
     /** False leaves the composer's draft in place: unlike a key, it is never lost. */
     private boolean queueComposerInput(String commandJson) {
         if (displayDialog != null && displayDialog.isShowing()) return false;
@@ -5444,12 +5780,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 main.post(() -> note(OfflineSwitch.KEYS_REFUSED));
                 return false;
             }
-            if (target != null && !target.ready && monitor != null && monitor.reconnecting()
-                    && !target.paneId.isEmpty()) {
-                // Sent once, in order, when the same pane is back.
-                if (!pendingInput.add(target.paneId, commandJson)) return false;
-                main.post(this::showLinkDown);
-                return true;
+            if (target != null && !target.ready && monitor != null && monitor.reconnecting()) {
+                // Never replayed on a later attach: a key means what the screen showed.
+                main.post(() -> note(OfflineSwitch.KEYS_REFUSED));
+                return false;
             }
             if (target == null || target.isClosed() || !target.ready) {
                 note("Not connected; the draft is kept");
@@ -5635,6 +5969,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
         if (hostId == null || pane == null || destroyed) return;
         boolean picked = intent.getBooleanExtra(EXTRA_REVEAL_FLEET, true);
+        if (!focusHostPane(hostId, pane, picked) && ACTION_OPEN_NOTICE.equals(intent.getAction())) {
+            HomeActivity.openNotice(this, hostId, pane);
+        }
+    }
+
+    /** Shows {@code pane} on saved host {@code hostId}; false when that host is not saved here. */
+    private boolean focusHostPane(String hostId, String pane, boolean picked) {
         Connection target;
         synchronized (stateLock) { target = connection; }
         if (hostId.equals(currentHostId)) {
@@ -5644,12 +5985,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             } else if (target.remoteHandle > 0 || target.offline) {
                 focusRemotePane(target, pane, picked);
             }
-            return;
+            return true;
         }
         for (SavedRemoteHost host : savedHosts) {
-            if (host.id.equals(hostId)) { switchHost(host, pane, picked); return; }
+            if (host.id.equals(hostId)) { switchHost(host, pane, picked); return true; }
         }
-        if (ACTION_OPEN_NOTICE.equals(intent.getAction())) HomeActivity.openNotice(this, hostId, pane);
+        return false;
     }
 
     static final String EXTRA_FOCUS_HOST = "focus_host", EXTRA_FOCUS_PANE = "focus_pane";
@@ -5709,6 +6050,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 next = new Connection(GENERATIONS.incrementAndGet(), remoteHandle);
                 next.hostId = currentHostId;
                 next.connectionRevision = launch.remoteHost.connectionRevision;
+                next.fingerprint = launch.remoteHost.expectedFingerprint;
+                next.session = launch.remoteHost.session;
             } else next = new Connection(GENERATIONS.incrementAndGet(), new CompanionClient(launch.host.profile));
             connection = next;
             nativeSetActive(next.generation, false);
@@ -6552,30 +6895,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void pumpRemote(Connection current) {
         boolean mutation = false;
         try {
-            // Input held across a reconnect goes first, in order, once.
-            String held = null;
-            synchronized (stateLock) {
-                if (current(current) && current.ready) {
-                    held = pendingInput.next(current.paneId);
-                    int discarded = pendingInput.takeDiscarded();
-                    if (discarded > 0) {
-                        main.post(() -> note(discarded + (discarded == 1 ? " input" : " inputs")
-                                + " for another pane not sent"));
-                    }
-                }
-            }
-            if (held != null) {
-                mutation = true;
-                String result = RemoteNative.input(current.remoteHandle, current.paneId, held);
-                if (!new JSONObject(result).optBoolean("queued", false)) throw new IOException("Held input was not queued");
-                synchronized (stateLock) {
-                    pendingInput.sent();
-                    if (current(current)) publish(current, "Input queued over SSH");
-                }
-                current.fastUntil = SystemClock.uptimeMillis() + 1500;
-                mutation = false;
-            }
-            String raw = held != null ? null : nativeTakeCommand(current.generation);
+            String raw = nativeTakeCommand(current.generation);
             if (raw != null) {
                 GpuiTerminalProtocol.Command command = GpuiTerminalProtocol.command(raw);
                 if ("close".equals(command.type)) {
@@ -6590,13 +6910,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 if (!current(current)) return;
                 if (!current.ready) {
-                    // Taken in the moment the pane stopped being ready: hold it
-                    // for the same pane rather than drop it.
-                    synchronized (stateLock) {
-                        if (!pendingInput.add(current.paneId, raw)) {
-                            main.post(() -> note("Input not sent: the terminal is reconnecting"));
-                        }
-                    }
+                    // Taken in the moment the pane stopped being ready: what a key
+                    // means depends on the screen at that moment, so it is never
+                    // replayed later (messages are held by the outbox instead).
+                    main.post(() -> note(OfflineSwitch.KEYS_REFUSED));
                     return;
                 }
                 mutation = true;
@@ -6641,6 +6958,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                                 state.optLong("output", 0), SystemClock.uptimeMillis())) {
                     snapshots.save(current.hostId, onScreen, current.remoteHandle);
                 }
+                noteAttach(current, state);
                 if (state.optBoolean("unchanged", false)) {
                     String quietPhase = state.optString("state", "");
                     String quietPane = state.optString("pane_id", "");
@@ -6696,12 +7014,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 boolean selected = "ready".equals(phase) && !pane.isEmpty() && !boot.isEmpty();
                 boolean chromeChanged;
                 if (current.remoteBoot != null && !current.remoteBoot.equals(boot)) {
-                    // Held input was meant for programs that no longer exist.
-                    pendingInput.discardAll();
                     fail(current, "Herdr restarted. Reopen the remote session before sending input");
                     return;
                 }
-                if (selected) current.remoteBoot = boot;
+                if (selected) {
+                    current.remoteBoot = boot;
+                    bindMachine(current, boot);
+                }
                 current.remotePhase = phase;
                 current.remoteRevision = state.optLong("token", state.optLong("revision", 0));
                 current.ready = selected;
@@ -6763,8 +7082,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                 }
                 current.chromePane = pane;
-                if (selected && current.hostId != null) {
-                    outbox.ready(current.hostId, current.remoteHandle, boot, paneIds(current.panes));
+                if (selected && chromeChanged && current.machine != null) {
+                    // A direct link's own list: held messages for a terminal not on it are gone.
+                    outbox.observe(current.machine, terminals(current.panes));
                 }
                 final boolean scrolledBack = state.optLong("local_offset", 0) > 0;
                 main.post(() -> showLatest(scrolledBack));
@@ -6904,6 +7224,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // A copy just drawn starts at its newest line.
         showLatest(false);
         showLinkDown();
+        refreshTabStrip();
     }
 
     /** The title a pane goes by in the strip, from the last list seen; its id when unlisted. */
@@ -7018,7 +7339,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         pickedAnotherHost();
         stopConnection();
-        synchronized (stateLock) { pendingInput.discardAll(); }
         currentHostId = host.id;
         savedShownHost = null;
         savedShownAt = 0;
@@ -7037,19 +7357,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return failed.remoteHandle > 0 && !shellMode() && currentHostId != null && monitor != null;
     }
 
-    /** Under stateLock, while the failed generation still owns the mailbox. */
+    /**
+     * Under stateLock, while the failed generation still owns the mailbox: keys taken from it are
+     * dropped and the user is told, never replayed on another attach (what a key means depends on
+     * the screen at that moment). Composer messages never pass here: the outbox holds them.
+     */
     private void holdUnsent(Connection failed) {
         if (!failed.paneId.isEmpty()) rememberHostPane(failed.paneId);
-        for (int i = 0; i < PendingInput.MAX_COMMANDS; i++) {
+        int dropped = 0;
+        for (int i = 0; i < 64; i++) {
             String raw = nativeTakeCommand(failed.generation);
             if (raw == null) break;
-            if (!holdable(raw)) continue;
-            if (!pendingInput.add(failed.paneId, raw)) break;
+            if (keyInput(raw)) dropped++;
         }
+        if (dropped > 0) main.post(() -> note(OfflineSwitch.KEYS_REFUSED));
     }
 
-    /** Input worth holding; a close means leave, not something to replay later. */
-    private static boolean holdable(String raw) {
+    /** Input that would have reached the program; a close means leave. */
+    private static boolean keyInput(String raw) {
         try {
             return !"close".equals(GpuiTerminalProtocol.command(raw).type);
         } catch (IOException | RuntimeException invalid) {
@@ -7065,17 +7390,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** The status line while the link is down; dense, in the crumb's own slot. Main thread. */
-    /** Input typed while reconnecting, waiting for the link: a row in the composer's queue. */
-    private int linkDownInputs() {
-        if (monitor == null || !monitor.reconnecting()) return 0;
-        synchronized (stateLock) {
-            return pendingInput.size();
-        }
-    }
-
     private void showLinkDown() {
-        if (composer != null) composer.setLinkDown(linkDownInputs());
         updateLinkBadge();
+        refreshOffer();
         if (monitor == null || !monitor.reconnecting() || crumb == null) return;
         // The rail's machine row says offline too.
         refreshSidebar(false);
@@ -7093,12 +7410,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // A raw shell's end, in the same corner: exited, or its connection lost.
             look = LinkBadge.shell(shellEnd, linkProblem);
         } else {
-            int waiting;
-            synchronized (stateLock) {
-                waiting = pendingInput.size();
-                String hostId = connection == null ? currentHostId : connection.hostId;
-                if (hostId != null && outbox != null) waiting += outbox.outbox().waiting(hostId);
-            }
+            // The whole queue, every computer and pane: a tap on the count opens it.
+            int waiting = outbox == null ? 0 : outbox.outbox().waiting();
             String cachedHost = savedShownHost;
             long savedAt = savedShownAt;
             String when = cachedHost != null && savedAt > 0 ? OfflineSwitch.when(savedAt, System.currentTimeMillis(),
@@ -7153,6 +7466,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Opens or closes the in-place actions; they close by themselves a few seconds later. Main thread. */
     private void toggleLinkActions() {
         if (destroyed || isFinishing()) return;
+        if (outbox != null && outbox.outbox().waiting() > 0 && !linkActions.expanded()) {
+            // "N queued": the queue first; Reconnect and Hosts are a second tap away.
+            showQueueScreen();
+            if (!linkLook.queuedOnly && linkActions.tap(linkLook.shown)) postLinkCollapse(linkActions.generation());
+            renderLinkActions();
+            return;
+        }
         if (linkActions.tap(linkLook.shown)) postLinkCollapse(linkActions.generation());
         renderLinkActions();
     }
@@ -7475,6 +7795,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         volatile String hostId;
         /** The saved revision that opened this connection, even if the profile is later edited. */
         String connectionRevision;
+        /** That revision's pinned SSH host key and Herdr session: half of the machine's key. */
+        volatile String fingerprint = "", session = "";
+        /** The machine its hello proved, once bound; null before, and for a refused binding. */
+        volatile MachineKey machine;
+        /** The profile this one's machine collides with (a refused binding), or null. */
+        volatile String refusedBy;
+        /** The attach on screen (0: none) and whether it has painted, from the poll. */
+        volatile long attach;
+        volatile boolean painted;
         volatile String paneId = launch.paneId;
         /** A pane switch asked for and not yet confirmed by the daemon, and until when to wait. */
         volatile String pendingPane = "";

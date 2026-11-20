@@ -44,11 +44,12 @@ final class RemoteNative {
     static native String focusWorkspace(long handle, String workspaceId);
     static native String sessionAction(long handle, String action);
     /**
-     * One outbox message through the core's terminal.send; blocks up to about
-     * a minute, so only the outbox's thread calls it. {"outcome":
-     * sent|blocked|gone|unsure|retry}.
+     * A held message typed into the attach {@code attach} (the AttachId the poll reported, on
+     * screen at the user's tap): its paste then Enter, on that attach's stream or not at all.
+     * Blocks until the session thread wrote it, so only the outbox's thread calls it.
+     * {"outcome": written|unwritten|unsure}; written means the bytes left, never that they arrived.
      */
-    static native String deliver(long handle, String paneId, String text);
+    static native String compose(long handle, long attach, String text);
     /**
      * Puts {@code data} (at most 8 MB) beside the pane's terminal on its machine over the core
      * connection (terminal.put), named {@code name}; types nothing. {"queued":true,"path"} or

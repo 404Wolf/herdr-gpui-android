@@ -72,24 +72,20 @@ public final class DictationTokenTest {
     private Outbox outbox() {
         Outbox outbox = new Outbox(new File(dir.getRoot(), Outbox.FILE_NAME));
         outbox.load();
-        outbox.ready("h", "boot", new HashSet<>(Arrays.asList("p", "q")));
         return outbox;
     }
 
-    @Test public void aQueuedMessageWaitsForItsDictationAndHoldsItsPaneBack() {
+    @Test public void aHeldMessageWaitsForItsDictationAndHoldsItsPaneBack() {
         Outbox outbox = outbox();
-        Outbox.Message waiting = outbox.add("h", "p", "please " + DictationToken.of(ID), 0);
-        outbox.add("h", "p", "after it", 0);
-        outbox.add("h", "q", "other pane", 0);
-        assertTrue(outbox.shown("h", "p", 0).get(0).awaitsDictation);
-        Outbox.Message next = outbox.next("h", 0);
-        assertEquals("other pane", next.text);
-        outbox.sending(next.id);
-        outbox.settle(next.id, Outbox.Outcome.SENT, 0);
-        assertNull("p waits for its dictation", outbox.next("h", 0));
+        Outbox.Message waiting = HeldFixtures.add(outbox, "h", "p", "please " + DictationToken.of(ID), 0);
+        HeldFixtures.add(outbox, "h", "p", "after it", 0);
+        HeldFixtures.add(outbox, "h", "q", "other pane", 0);
+        assertTrue(HeldFixtures.shown(outbox, "h", "p").get(0).awaitsDictation);
+        assertEquals("other pane", outbox.offer(HeldFixtures.live("h", "q")).text);
+        assertNull("p waits for its dictation", outbox.offer(HeldFixtures.live("h", "p")));
         assertFalse(outbox.fillDictation(OTHER, "x"));
         assertTrue(outbox.fillDictation(ID, "run the tests"));
-        next = outbox.next("h", 0);
+        Outbox.Message next = outbox.offer(HeldFixtures.live("h", "p"));
         assertEquals(waiting.id, next.id);
         assertEquals("please run the tests", next.text);
         assertFalse(next.awaitsDictation);
@@ -97,15 +93,14 @@ public final class DictationTokenTest {
 
     @Test public void aFilledMessageSurvivesARestartAndAnEmptyOneIsDropped() {
         Outbox outbox = outbox();
-        outbox.add("h", "p", DictationToken.of(ID), 0);
-        outbox.add("h", "p", "a " + DictationToken.of(OTHER), 0);
+        HeldFixtures.add(outbox, "h", "p", DictationToken.of(ID), 0);
+        HeldFixtures.add(outbox, "h", "p", "a " + DictationToken.of(OTHER), 0);
         assertTrue(outbox.fillDictation(ID, "  "));
         assertTrue(outbox.fillDictation(OTHER, "b"));
         assertTrue(outbox.save());
         Outbox again = new Outbox(new File(dir.getRoot(), Outbox.FILE_NAME));
         again.load();
         assertEquals(1, again.size());
-        again.ready("h", "boot", new HashSet<>(Arrays.asList("p")));
-        assertEquals("a b", again.next("h", 0).text);
+        assertEquals("a b", again.offer(HeldFixtures.live("h", "p")).text);
     }
 }

@@ -390,22 +390,21 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_openSaved(
         }
     }
 }
+/// A held message, typed into the attach `attach` only (the one on screen
+/// at Wolf's tap). Blocks: Java calls it from the outbox's thread.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_herdr_android_RemoteNative_deliver(
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_compose(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
-    terminal: JString<'_>,
+    attach: jlong,
     text: JString<'_>,
 ) -> jstring {
-    let Some(terminal) = read(&mut env, &terminal, 1024) else {
-        return std::ptr::null_mut();
-    };
     let Some(text) = read(&mut env, &text, crate::model::MAX_TEXT_BYTES) else {
         return std::ptr::null_mut();
     };
-    result_string(&mut env, remote::deliver(handle as u64, &terminal, &text))
+    result_string(&mut env, remote::compose(handle as u64, attach as u64, &text))
 }
 /// `terminal.put` for an image the phone picked, snapped or pasted: its bytes
 /// go to the terminal's machine over the core connection; the reply names the

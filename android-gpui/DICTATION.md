@@ -48,8 +48,8 @@ tap → ServerDictationEngine ── ws:// over the tailnet ──▶ dictation 
   either. A clip's audio is deleted once transcribed, and its text is kept
   until the composer has placed it.
 - In a draft, a waiting dictation is `⟦dictation <clip id>⟧` (`DictationToken`),
-  which the composer shows as a chip. A message sent with one waits at the head
-  of its pane's outbox line until the text fills it in; an empty transcription
+  which the composer shows as a chip. A message sent with one is held at the head
+  of its pane's outbox lane, and not offered for sending, until the text fills it in; an empty transcription
   removes the token.
 - The server is a home-manager module, `users/wolf/programs/dictation` in
   `~/Config/home-manager` (`mine.dictation`): whisper-server on loopback, the
@@ -204,7 +204,7 @@ A clear survives being killed at any step. Each write that makes the next step s
   - Killed after the messages: they are cleared on disk with no record. Reconcile adopts them into the window, so undo still brings them back.
 - **Undo** writes the record, marked undone, together with the restored draft. If that write fails, the undo fails, says so, and stays on offer. Then the messages and recordings come back. Until those are saved too, the record stays, and reconcile finishes it (soon, or after a restart). A new clear waits until it is done.
 - **Always:** a recording a live draft or message holds is never held, so a refused or interrupted clear never strands a chip on held audio.
-- **A message the sender picked before the clear** is refused at dispatch: `Outbox.sending` checks `clearedUntil`.
+- **A message the sender picked before the clear** is refused at dispatch: `Outbox.claim` checks `clearedUntil`.
 - **After a restart** the first pane shown is no pane switch: a resumed undo stays on offer. Past its window, the clear is finished. Expired cleared messages are dropped by reconcile, after any accepted undo was applied, not when the outbox is read.
 
 The queue UI and its gestures are described in the PR (#20) and `QueueView`/`ClearUndo`.

@@ -39,7 +39,7 @@ public final class LinkBadgeTest {
         // A cached copy on screen is never live, even before the monitor reconnects.
         assertTrue(LinkBadge.look(false, false, null, true, "14:32", 0).shown);
         assertTrue(LinkBadge.look(true, true, null, true, "14:32", 0).description
-                .contains("Showing the copy from 14:32."));
+                .contains("Showing the last saved screen, from 14:32; it may be outdated."));
     }
 
     @Test public void wolfAskOfflineCornerIndicator_countsWhatWaitsForTheLink() {
@@ -79,7 +79,7 @@ public final class LinkBadgeTest {
         assertEquals(LinkBadge.Tone.WARN, look.tone);
         assertEquals(why, look.title);
         // With no failure, the in-place actions say what the indicator means.
-        assertEquals("Offline. Showing the copy from 14:32.", LinkBadge.look(true, true, null, true, "14:32", 0).title);
+        assertEquals("Offline. Showing the last saved screen, from 14:32; it may be outdated.", LinkBadge.look(true, true, null, true, "14:32", 0).title);
         assertEquals(LinkBadge.RECONNECT, look.primary);
     }
 
@@ -120,5 +120,17 @@ public final class LinkBadgeTest {
                 "The shell's connection was lost. Nothing typed"));
         assertEquals("Why?", LinkBadge.sentence("Why?"));
         assertEquals("", LinkBadge.sentence(""));
+    }
+
+    /** Stage 1: the count is the whole queue; live, it shows alone and a tap opens the queue. */
+    @Test public void heldMessagesShowTheirCountEvenWhileLiveAndOpenTheQueue() {
+        assertFalse(LinkBadge.look(false, false, null, false, null, 0).shown);
+        LinkBadge.Look live = LinkBadge.look(false, false, null, false, null, 3);
+        assertTrue(live.shown);
+        assertTrue(live.queuedOnly);
+        assertEquals("3 queued", live.text);
+        assertEquals(LinkBadge.Tone.QUIET, live.tone);
+        assertTrue(live.description.contains("open the queue"));
+        assertFalse(LinkBadge.look(true, true, null, false, null, 3).queuedOnly);
     }
 }

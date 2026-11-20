@@ -207,7 +207,11 @@ pub fn generate_identity(comment: &str) -> Result<String> {
 pub(crate) struct State {
     pub(crate) view: Value,
     pub(crate) terminal: Option<Arc<gpui_rio::Session>>,
+    /// The attach on screen (the phone's AttachId): a new one on every
+    /// attach, 0 while none is. A held message's send is bound to it.
     pub(crate) render_id: u64,
+    /// Whether this attach's stream has delivered its first paint.
+    pub(crate) painted: bool,
     #[cfg(feature = "android-ui")]
     footer_foreground: Option<ForegroundObservation>,
 }
@@ -375,6 +379,34 @@ pub(crate) enum Operation {
     /// A file for a terminal's machine (`terminal.put`): bytes, so not an Action's bounded JSON.
     Put(PutFile, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
+    /// A held message for the attach `Compose::attach` only.
+    Compose(Compose, mpsc::SyncSender<Typed>),
+}
+/// A held message's bytes (the paste, then Enter), bound to one attach.
+pub(crate) struct Compose {
+    pub(crate) attach: u64,
+    pub(crate) parts: Vec<Vec<u8>>,
+}
+/// How far a held message got. The phone never learns more: the bytes go
+/// to a local SSH bridge, and the core may drop a retired viewer's input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Typed {
+    /// Every byte was written to the attach it was tapped over.
+    Written,
+    /// Nothing was written: that attach was gone, unpainted, or the link was.
+    Unwritten,
+    /// Some may have been written (the link failed during the write, or no
+    /// answer came): it may have been sent, or sit unsent in the input box.
+    Unsure,
+}
+impl Typed {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Unwritten => "unwritten",
+            Self::Unsure => "unsure",
+        }
+    }
 }
 /// The most one `terminal.put` takes: the core's own bound, 8 MiB raw.
 pub(crate) const MAX_PUT: usize = 8 * 1024 * 1024;
@@ -756,7 +788,13 @@ pub fn scroll_held(delta: i64, latest: bool) -> String {
 }
 pub fn poll(id: u64, _since: u64, _mirror: bool) -> Result<String> {
     let owner = session(id)?;
-    let mut view = lock(&owner.state).view.clone();
+    let mut view = {
+        let state = lock(&owner.state);
+        let mut view = state.view.clone();
+        view["attach"] = json!(state.render_id);
+        view["painted"] = json!(state.painted);
+        view
+    };
     view["quiet_ms"] = json!(owner.heard.quiet_ms());
     Ok(view.to_string())
 }
@@ -805,6 +843,8 @@ pub fn poll_terminal(
             "state": view["state"],
             "pane_id": view["pane_id"],
             "boot_id": view["boot_id"],
+            "attach": state.render_id,
+            "painted": state.painted,
             "scroll": view["scroll"],
             "fetch": view["fetch"],
             "local_offset": local_offset,
@@ -814,6 +854,8 @@ pub fn poll_terminal(
         .to_string());
     }
     let mut view = view.clone();
+    view["attach"] = json!(state.render_id);
+    view["painted"] = json!(state.painted);
     view["local_offset"] = json!(local_offset);
     view["quiet_ms"] = json!(owner.heard.quiet_ms());
     view["output"] = json!(owner.heard.output());
@@ -874,36 +916,70 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
     rx.recv_timeout(Duration::from_secs(20))
         .map_err(|_| Error::Closed)?
 }
-/// Sends one outbox message with `terminal.send`, which pastes it and presses
-/// Enter, refusing a program that waits on a dialog. Blocks the caller (the
-/// outbox's own thread) until the core answers. `{"outcome": ..}` is `sent`,
-/// `blocked`, `gone`, `unsure` (it may have been typed: never resend it
-/// unasked), or `retry` (it never left the phone: the session was gone or full,
-/// or closed before taking the request).
-pub fn deliver(id: u64, terminal: &str, text: &str) -> Result<String> {
-    let action = json!({"op":"pane.deliver","terminal":terminal,"text":text}).to_string();
-    if crate::core_session::TabEdit::parse(&action).is_none() {
+/// Types a held message into the attach `attach` (the phone's AttachId, the
+/// one on screen when Wolf tapped Send): its paste, then Enter, both on that
+/// attach's stream or not at all. Blocks the caller (the outbox's own
+/// thread) until the session thread wrote it. `{"outcome": ..}` is
+/// `written` (every byte left for that attach; nothing says it arrived),
+/// `unwritten` (nothing was written: that attach is gone or not painted,
+/// or the session is) or `unsure`.
+pub fn compose(id: u64, attach: u64, text: &str) -> Result<String> {
+    if !composable(text) {
         return Err(Error::Input(crate::Error::InvalidText));
     }
-    let retry = || json!({"outcome":"retry"}).to_string();
     let Ok(owner) = session(id) else {
-        return Ok(retry());
+        return Ok(outcome(Typed::Unwritten));
+    };
+    Ok(outcome(compose_on(&owner, attach, text, Duration::from_secs(15))))
+}
+fn outcome(typed: Typed) -> String {
+    json!({"outcome": typed.word()}).to_string()
+}
+/// A held message's text: not blank, one compose command at most, and no
+/// control but line breaks and tabs.
+fn composable(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.len() <= model::MAX_TEXT_BYTES
+        && !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+}
+pub(crate) fn compose_on(owner: &Session, attach: u64, text: &str, wait: Duration) -> Typed {
+    let parts = {
+        let state = lock(&owner.state);
+        // Checked again by the session thread just before it writes; this
+        // check only spares encoding for an attach that is already gone.
+        if attach == 0 || state.render_id != attach || !state.painted || state.view["state"] != "ready" {
+            return Typed::Unwritten;
+        }
+        let Some(terminal) = state.terminal.as_ref() else {
+            return Typed::Unwritten;
+        };
+        let enter = gpui_rio::KeyPress {
+            key: "enter".into(),
+            control: false,
+            alt: false,
+            shift: false,
+            text: None,
+        };
+        let Some(enter) = terminal.key_bytes(&enter) else {
+            return Typed::Unwritten;
+        };
+        vec![terminal.paste_bytes(text), enter]
     };
     let (tx, rx) = mpsc::sync_channel(1);
-    if owner.commands.try_send(Operation::Action(action, tx)).is_err() {
-        return Ok(retry());
+    if owner
+        .commands
+        .try_send(Operation::Compose(Compose { attach, parts }, tx))
+        .is_err()
+    {
+        return Typed::Unwritten;
     }
-    let wait = crate::core_session::DELIVER_WAIT + Duration::from_secs(15);
-    Ok(match rx.recv_timeout(wait) {
-        Ok(Ok(reply)) => reply,
-        // The connection answered with an error after taking the request.
-        Ok(Err(error)) => json!({"outcome":"unsure","why":error.to_string()}).to_string(),
-        // Taken but unanswered: it may be typing right now.
-        Err(mpsc::RecvTimeoutError::Timeout) => json!({"outcome":"unsure","why":"no answer"}).to_string(),
-        // The worker dropped the request without running it (an action
-        // always replies once it ran), so nothing was sent.
-        Err(mpsc::RecvTimeoutError::Disconnected) => retry(),
-    })
+    match rx.recv_timeout(wait) {
+        Ok(typed) => typed,
+        // Taken and not answered: it may be writing right now.
+        Err(mpsc::RecvTimeoutError::Timeout) => Typed::Unsure,
+        // The session ended with the request still queued: never run.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Typed::Unwritten,
+    }
 }
 /// Puts an image (or any file) beside `terminal` on its machine, over the
 /// session's own core connection, and returns where it landed:

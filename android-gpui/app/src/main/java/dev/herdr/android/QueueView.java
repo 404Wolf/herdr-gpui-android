@@ -90,8 +90,8 @@ final class QueueView {
         for (Outbox.Message m : messages) present.add(m.id);
         for (Outbox.Message gone : seen.values()) {
             if (present.contains(gone.id) || forgotten.remove(gone.id)) continue;
-            boolean wasSendable = gone.pane.equals(p) && !gone.awaitsDictation
-                    && (gone.state == Outbox.State.QUEUED || gone.state == Outbox.State.SENDING);
+            // Only a message typed at once leaves when written; a held one stays, "sent · check it arrived".
+            boolean wasSendable = gone.pane.equals(p) && !gone.awaitsDictation && gone.state == Outbox.State.SENDING;
             if (wasSendable) sent.add(new Sent(gone.id, gone.pane, gone.text, now + SENT_FADE_MS));
         }
         seen.clear();
@@ -120,7 +120,9 @@ final class QueueView {
     /** With recordings the desktop gave up on: they still wait (for "retry"). */
     static int count(List<Outbox.Message> messages, List<PendingClip> clips, List<PendingClip> parked,
             int linkDown) {
-        return messages.size() + clips.size() + parked.size() + (linkDown > 0 ? 1 : 0);
+        int waiting = 0;
+        for (Outbox.Message m : messages) if (m.state != Outbox.State.SENT) waiting++;
+        return waiting + clips.size() + parked.size() + (linkDown > 0 ? 1 : 0);
     }
 
     /**
@@ -164,7 +166,7 @@ final class QueueView {
         }
         int place = 0;
         for (Outbox.Message m : messages) {
-            boolean waitsInLine = m.state == Outbox.State.QUEUED && m.pane.equals(pane);
+            boolean waitsInLine = m.state == Outbox.State.PENDING && m.pane.equals(pane);
             if (waitsInLine) place++;
             all.add(new Row(m.id, Kind.MESSAGE, QueuedMessages.PROMPT + QueuedMessages.oneLine(m.text),
                     state(m, pane, place, cover), style(m), m.state != Outbox.State.SENDING, m.state));
@@ -195,23 +197,25 @@ final class QueueView {
     static String state(Outbox.Message m, String pane, int place, boolean cover) {
         switch (m.state) {
             case SENDING: return cover ? "●" : "● sending…";
-            case UNSURE: return cover ? "?" : "? may have been sent";
-            case GONE:
-                if (cover) return "✗";
-                return m.pane.equals(pane) ? "✗ not sent" : "✗ not sent · " + m.pane + " gone";
+            case SENT:
+                return cover ? "✓?" : "✓ sent " + HeldWords.time(m.sentAt, java.util.TimeZone.getDefault(), true)
+                        + " · check it arrived";
+            case NEEDS_YOU:
+                if (m.reason == Outbox.Reason.GONE) return cover ? "✗" : "✗ needs you · " + m.pane + " gone";
+                return cover ? "?" : "? may have been sent · needs you";
             default:
-                if (m.blocked) return cover ? "◌!" : "◌ waits for its dialog";
                 if (m.awaitsDictation) return cover ? "◌" : "◌ waits for desktop";
-                return cover ? "◌" + place : "◌ queued " + ordinal(place);
+                if (m.unverified()) return cover ? "◌?" : "◌ held · destination not verified";
+                return cover ? "◌" + place : "◌ held " + ordinal(place) + " · tap Send";
         }
     }
 
     private static String style(Outbox.Message m) {
         switch (m.state) {
             case SENDING: return "info";
-            case UNSURE: return "warn";
-            case GONE: return "danger";
-            default: return m.blocked ? "warn" : "tag";
+            case SENT: return "info";
+            case NEEDS_YOU: return m.reason == Outbox.Reason.GONE ? "danger" : "warn";
+            default: return "tag";
         }
     }
 

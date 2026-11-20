@@ -74,23 +74,32 @@ final class ComposerDrafts {
         static final Draft EMPTY = new Draft("", null);
         final String text;
         private final AttachmentPaths attachments;
+        /** When it was last edited (epoch ms); 0 when not known (saved by an older build). */
+        final long at;
 
         private Draft(String text, AttachmentPaths attachments) {
+            this(text, attachments, 0);
+        }
+
+        private Draft(String text, AttachmentPaths attachments, long at) {
             this.text = text;
             this.attachments = attachments != null && attachments.pattern.matcher(text).find() ? attachments : null;
+            this.at = at;
         }
 
         String revision() { return attachments == null ? null : attachments.revision; }
 
         private Draft withoutAttachments() {
             String remaining = attachments.pattern.matcher(text).replaceAll("");
-            return remaining.trim().isEmpty() ? EMPTY : new Draft(remaining, null);
+            return remaining.trim().isEmpty() ? EMPTY : new Draft(remaining, null, at);
         }
 
         Object encode() throws JSONException {
-            if (attachments == null) return text;
-            return new JSONObject().put("text", text).put("revision", revision())
-                    .put("staging", new JSONArray(attachments.directories));
+            if (attachments == null && at <= 0) return text;
+            JSONObject out = new JSONObject().put("text", text);
+            if (at > 0) out.put("at", at);
+            if (attachments == null) return out;
+            return out.put("revision", revision()).put("staging", new JSONArray(attachments.directories));
         }
 
         static Draft decode(Object value) {
@@ -99,10 +108,13 @@ final class ComposerDrafts {
             JSONObject saved = (JSONObject) value;
             Object text = saved.opt("text");
             Object revision = saved.opt("revision");
-            if (!(text instanceof String) || !(revision instanceof String)) return EMPTY;
+            long at = Math.max(0, saved.optLong("at", 0));
+            if (!(text instanceof String)) return EMPTY;
+            if (revision == null) return new Draft((String) text, null, at);
+            if (!(revision instanceof String)) return EMPTY;
             AttachmentPaths paths = AttachmentPaths.restore((String) revision, saved.optJSONArray("staging"));
             if (paths == null) return EMPTY;
-            Draft draft = new Draft((String) text, paths);
+            Draft draft = new Draft((String) text, paths, at);
             return draft.attachments == null ? EMPTY : draft;
         }
     }
@@ -116,6 +128,16 @@ final class ComposerDrafts {
     }
 
     private final Map<String, Draft> drafts = recentPanes();
+    /**
+     * Drafts found on disk at start, kept but not loaded into the composer: a restart may have
+     * changed what runs in the pane, so each is offered ("draft from 14:02") and loaded only by
+     * the user's tap ({@link #acceptOffered}). Saved with the drafts until accepted.
+     */
+    private final Map<String, java.util.List<Draft>> offered = recentPanes();
+    /** The key prefix offered drafts are saved under, each pane's as a list, apart from typed ones. */
+    private static final String OFFERED = "\u0002";
+    /** The wall clock for a draft's edit time. */
+    java.util.function.LongSupplier clock = System::currentTimeMillis;
     // Cut can remove the last path before Paste puts it back. This history lives only in memory.
     private final Map<String, AttachmentPaths> cutPaths = recentPanes();
     /**
@@ -201,6 +223,10 @@ final class ComposerDrafts {
     private boolean migrateLegacy(String to, java.util.function.Predicate<String> persist) {
         java.util.List<String> legacy = new java.util.ArrayList<>();
         for (String k : drafts.keySet()) if (k.indexOf(SEP) < 0) legacy.add(k);
+        for (String k : new java.util.ArrayList<>(offered.keySet())) {
+            java.util.List<Draft> pieces = k.indexOf(SEP) < 0 ? offered.remove(k) : null;
+            if (pieces != null) offered.putIfAbsent(key(to, k), pieces);
+        }
         if (legacy.isEmpty()) return true;
         Object before = snapshot();
         for (String k : legacy) {
@@ -234,7 +260,79 @@ final class ComposerDrafts {
     java.util.List<String> all() {
         java.util.List<String> texts = new java.util.ArrayList<>();
         for (Draft draft : drafts.values()) texts.add(draft.text);
+        for (java.util.List<Draft> pieces : offered.values()) for (Draft draft : pieces) texts.add(draft.text);
         return texts;
+    }
+
+    /**
+     * The draft offered for the pane on screen (found on disk at start), or null: its pieces (a
+     * draft typed beside an earlier offer is kept as a piece of its own) joined, oldest first.
+     */
+    Draft offered() {
+        return joined(offered.get(pane));
+    }
+
+    private static Draft joined(java.util.List<Draft> pieces) {
+        if (pieces == null || pieces.isEmpty()) return null;
+        StringBuilder text = new StringBuilder();
+        AttachmentPaths paths = null;
+        long at = 0;
+        for (Draft piece : pieces) {
+            if (text.length() > 0) text.append('\n');
+            text.append(piece.text.replaceAll("\\s+$", ""));
+            if (piece.attachments != null) paths = piece.attachments;
+            at = Math.max(at, piece.at);
+        }
+        return new Draft(text.toString(), paths, at);
+    }
+
+    /** Whether {@link #joinedBack} of {@code draft} and {@code text} can be saved whole. */
+    static boolean fits(String draft, String text) {
+        return joinedBack(draft, text).length() <= MAX_SAVED_CHARS;
+    }
+
+    /** {@code text} taken back into {@code draft}: after it, on a line of its own. */
+    static String joinedBack(String draft, String text) {
+        String base = draft == null ? "" : draft;
+        return base.trim().isEmpty() ? text : base.replaceAll("\\s+$", "") + "\n" + text;
+    }
+
+    /**
+     * The user took the offered draft: it is the pane's draft now, ahead of anything typed
+     * since. The text now in the composer; null, and nothing taken, while a dictation runs (its
+     * span would no longer match the words, and a cancel could cut restored ones).
+     */
+    String acceptOffered() {
+        if (dictationBase != null) return null;
+        Draft draft = joined(offered.remove(pane));
+        if (draft == null) return text();
+        Draft current = draft();
+        String text = current.text.trim().isEmpty() ? draft.text
+                : draft.text.replaceAll("\\s+$", "") + "\n" + current.text;
+        putDraft(pane, new Draft(text, draft.attachments != null ? draft.attachments : current.attachments, clock.getAsLong()));
+        return text();
+    }
+
+    /**
+     * Removes the draft (offered or not) under {@code key} when it still holds {@code text}: a
+     * Send whose message was held before the app stopped. True when one was removed.
+     */
+    boolean removeSent(String key, String text) {
+        String wanted = text == null ? "" : text.trim();
+        boolean removed = false;
+        Draft draft = drafts.get(key);
+        if (draft != null && draft.text.trim().equals(wanted)) {
+            drafts.remove(key);
+            cutPaths.remove(key);
+            cutMarks.remove(key);
+            removed = true;
+        }
+        java.util.List<Draft> pieces = offered.get(key);
+        if (pieces != null && pieces.removeIf(piece -> piece.text.trim().equals(wanted))) {
+            if (pieces.isEmpty()) offered.remove(key);
+            removed = true;
+        }
+        return removed;
     }
 
     Draft draft() { return drafts.getOrDefault(pane, Draft.EMPTY); }
@@ -305,7 +403,7 @@ final class ComposerDrafts {
     }
 
     private void updateDraft(String key, String text, AttachmentPaths paths) {
-        Draft draft = new Draft(text, paths);
+        Draft draft = new Draft(text, paths, clock.getAsLong());
         if (paths != null && draft.attachments == null) cutPaths.put(key, paths);
         else cutPaths.remove(key);
         putDraft(key, draft);
@@ -417,8 +515,20 @@ final class ComposerDrafts {
                 if (inBase != null) dictationBase = inBase;
             }
             if (filled.isEmpty()) drafts.remove(pane);
-            else draft.setValue(new Draft(filled, draft.getValue().attachments));
+            else draft.setValue(new Draft(filled, draft.getValue().attachments, draft.getValue().at));
             return rawPane(pane);
+        }
+        for (Map.Entry<String, java.util.List<Draft>> entry : offered.entrySet()) {
+            java.util.List<Draft> pieces = entry.getValue();
+            for (int i = 0; i < pieces.size(); i++) {
+                Draft piece = pieces.get(i);
+                String filled = DictationToken.fill(piece.text, clipId, spoken);
+                if (filled == null) continue;
+                if (filled.isEmpty()) pieces.remove(i);
+                else pieces.set(i, new Draft(filled, piece.attachments, piece.at));
+                if (pieces.isEmpty()) offered.remove(entry.getKey());
+                return rawPane(entry.getKey());
+            }
         }
         return null;
     }
@@ -636,6 +746,15 @@ final class ComposerDrafts {
                 Draft draft = entry.getValue();
                 if (draft.text.length() <= MAX_SAVED_CHARS) out.put(entry.getKey(), draft.encode());
             }
+            // Offered drafts apart, each piece a record of its own: a draft typed beside an offer
+            // is never merged into it, so a Send of one never leaves its words in the other.
+            for (Map.Entry<String, java.util.List<Draft>> entry : offered.entrySet()) {
+                JSONArray pieces = new JSONArray();
+                for (Draft piece : entry.getValue()) {
+                    if (piece.text.length() <= MAX_SAVED_CHARS) pieces.put(piece.encode());
+                }
+                if (pieces.length() > 0) out.put(OFFERED + entry.getKey(), pieces);
+            }
         } catch (JSONException impossible) {
             return "{}";
         }
@@ -653,7 +772,7 @@ final class ComposerDrafts {
         java.util.List<long[]> live = new java.util.ArrayList<>();
         for (long[] m : liveMarks) live.add(m.clone());
         return new Object[] {new LinkedHashMap<>(drafts), dictationBase, marks, live, new LinkedHashMap<>(cutPaths),
-            new int[] {spanStart, spanEnd, spanTainted ? 1 : 0, spanSeparator ? 1 : 0}};
+            new int[] {spanStart, spanEnd, spanTainted ? 1 : 0, spanSeparator ? 1 : 0}, copyOffered(offered)};
     }
 
     @SuppressWarnings("unchecked")
@@ -675,6 +794,14 @@ final class ComposerDrafts {
         liveMarks = copy((java.util.List<long[]>) s[3]);
         cutPaths.clear();
         cutPaths.putAll((Map<String, AttachmentPaths>) s[4]);
+        offered.clear();
+        offered.putAll(copyOffered((Map<String, java.util.List<Draft>>) s[6]));
+    }
+
+    private static Map<String, java.util.List<Draft>> copyOffered(Map<String, java.util.List<Draft>> from) {
+        Map<String, java.util.List<Draft>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, java.util.List<Draft>> e : from.entrySet()) out.put(e.getKey(), new java.util.ArrayList<>(e.getValue()));
+        return out;
     }
 
     private static java.util.List<long[]> copy(java.util.List<long[]> marks) {
@@ -685,12 +812,33 @@ final class ComposerDrafts {
 
     /** Restores what {@link #encode} saved, under drafts already typed since; a damaged value restores nothing. */
     void restore(String saved) {
+        restore(saved, false);
+    }
+
+    /**
+     * As {@link #restore(String)} at the app's start: the drafts are offered, not loaded into the
+     * composer (a restart may have changed what runs in the pane): see {@link #offered()}.
+     */
+    void restoreOffered(String saved) {
+        restore(saved, true);
+    }
+
+    private void restore(String saved, boolean offer) {
         if (saved == null || saved.isEmpty()) return;
         Map<String, Draft> typed = new LinkedHashMap<>(drafts);
         try {
             JSONObject in = new JSONObject(saved);
             for (java.util.Iterator<String> keys = in.keys(); keys.hasNext(); ) {
                 String key = keys.next();
+                if (key.startsWith(OFFERED)) {
+                    JSONArray pieces = in.optJSONArray(key);
+                    String pane = key.substring(OFFERED.length());
+                    for (int i = 0; pieces != null && i < pieces.length() && !pane.isEmpty(); i++) {
+                        Draft piece = Draft.decode(pieces.opt(i));
+                        if (!piece.text.isEmpty() && piece.text.length() <= MAX_SAVED_CHARS) offer(pane, piece);
+                    }
+                    continue;
+                }
                 Draft draft = Draft.decode(in.opt(key));
                 if (key.isEmpty() || draft.text.length() > MAX_SAVED_CHARS) continue;
                 if (draft.attachments != null) {
@@ -699,12 +847,22 @@ final class ComposerDrafts {
                         draft = draft.withoutAttachments();
                     }
                 }
-                if (!draft.text.isEmpty()) drafts.put(key, draft);
+                if (draft.text.isEmpty()) continue;
+                // A key with no computer is from an older build: adopted, as before.
+                if (!offer || key.indexOf(SEP) < 0) drafts.put(key, draft);
+                else if (!typed.containsKey(key)) offer(key, draft);
             }
         } catch (JSONException damaged) {
             return;
         }
         drafts.putAll(typed);
+    }
+
+    /** Adds a piece to {@code key}'s offer, kept in the order the pieces were typed. */
+    private void offer(String key, Draft piece) {
+        java.util.List<Draft> pieces = offered.computeIfAbsent(key, k -> new java.util.ArrayList<>());
+        pieces.add(piece);
+        pieces.sort((a, b) -> Long.compare(a.at, b.at));
     }
 
     static String join(String base, String utterance) {
