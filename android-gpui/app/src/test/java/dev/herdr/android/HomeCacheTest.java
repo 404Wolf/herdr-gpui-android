@@ -173,4 +173,31 @@ public final class HomeCacheTest {
         assertTrue(HomeCache.readSealed(sealed, legacy, null).isEmpty());
         assertFalse(legacy.exists());
     }
+
+    /**
+     * Review round 6 P2-1: an upgrade with the link down keeps the route to the
+     * adopted copy. phone-feedback's plain Fleet list (no revision) is bound to
+     * the same one-time revision the adopted pane copies were bound to, so Home
+     * and the rail accept it under that revision, and under no other.
+     */
+    @Test public void ask2AnUpgradedFleetListOpensTheAdoptedCopyOffline() throws Exception {
+        File dir = Files.createTempDirectory("fleet-upgrade").toFile();
+        File legacy = new File(dir, HomeCache.FILE_NAME);
+        File sealed = new File(dir, "cache-v2/" + HomeCache.SEALED_NAME);
+        // phone-feedback's file, as it wrote it.
+        Files.write(legacy.toPath(), ("{\"version\":1,\"hosts\":{\"profile\":{\"view\":{\"workspaces\":[{\"id\":\"w1\"}],"
+                + "\"tabs\":[],\"panes\":[{\"id\":\"t1\"}]},\"git\":\"\",\"git_truncated\":false}}}")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        CacheSeal seal = new CacheSeal(CacheSeal.newKey());
+        // The one-time binding the pane copies were adopted under.
+        seal.write(new File(dir, "pane-legacy-revisions.sealed"),
+                new JSONObject().put("profile", "revision-a").toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String a = PaneSnapshots.computer("profile", "revision-a");
+        HomeCache.Entry entry = HomeCache.readSealed(sealed, legacy, seal).get("profile");
+        assertTrue("the upgraded Fleet list is not accepted under the adopted revision", entry != null && entry.matches(a));
+        assertFalse(entry.matches(PaneSnapshots.computer("profile", "revision-b")));
+        // Read again on a later launch (the plain file is gone by then).
+        entry = HomeCache.readSealed(sealed, legacy, seal).get("profile");
+        assertTrue(entry != null && entry.matches(a));
+    }
 }

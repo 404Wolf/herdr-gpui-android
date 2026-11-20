@@ -6376,4 +6376,150 @@ mod cache_tests {
         assert!(!free.is_empty() && free.iter().all(|unlocked| *unlocked), "rows were formatted with the grid locked");
     }
 
+
+    // ---- Review round 6 (#43, d0e6c0e): who owns a gesture ----
+
+    /// A move of drag gesture `n` (a touch down starts a new one).
+    fn gesture(n: u64) -> UiPaint<'static> {
+        let _ = n;
+        paint_args(0)
+    }
+
+    /// Round 6 P2: nothing goes to the program before the phone's first look
+    /// at the pane: a drag then never moves the view a save would copy.
+    #[test]
+    fn ask2_no_wheel_reaches_the_program_before_the_phones_first_look() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7931, "boot-7931", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        tx.send(Chunk::Data(paint(40))).unwrap();
+        shows(&terminal, 40);
+        let _ = wheels(&sent);
+        crate::remote::scroll_local(7931, 3, gesture(1)).unwrap();
+        assert_eq!(wheels(&sent), (0, 0), "wheel input reached the program before the phone's first look");
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        let copy = crate::remote::copy_pane(7931, "t1").unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&copy).contains(&line(40)));
+        crate::remote::close(7931);
+        crate::remote::release_held();
+    }
+
+    /// Round 6: a gesture's owner is decided at its start: a drag that reaches
+    /// the top of the phone's copy stops there, nothing goes to the program.
+    #[test]
+    fn ask2_a_gesture_that_reaches_the_copys_top_stops_there() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7932, "boot-7932", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7932, &session);
+        crate::remote::scroll_local(7932, 5, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (0, 0), "the gesture changed owner at the copy's top");
+        assert!(lock(&session.state).local.reader_for_test().is_some(), "the copy went away mid-gesture");
+        crate::remote::close(7932);
+        crate::remote::release_held();
+    }
+
+    /// Round 6: a new upward gesture from the copy's top scrolls Claude itself.
+    #[test]
+    fn ask2_a_new_gesture_from_the_copys_top_scrolls_claude_itself() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7933, "boot-7933", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7933, &session);
+        crate::remote::scroll_local(7933, 3, gesture(1)).unwrap();
+        assert_eq!(wheels(&sent), (3, 0));
+        assert!(lock(&session.state).local.reader_for_test().is_none());
+        crate::remote::close(7933);
+        crate::remote::release_held();
+    }
+
+    /// Round 6 P2: once Claude scrolls itself, every drag goes to it, back and
+    /// forward, whatever it repaints (here only a title): nothing is inferred
+    /// from its screen.
+    #[test]
+    fn ask2_reverse_drags_reach_claude_whatever_it_repaints() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7934, "boot-7934", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7934, &session);
+        crate::remote::scroll_local(7934, 3, gesture(1)).unwrap();
+        assert_eq!(wheels(&sent), (3, 0));
+        // Only a title arrives; the bottom screen is still drawn.
+        tx.send(Chunk::Data(b"\x1b]2;thinking\x07".to_vec())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while terminal.title().as_deref() != Some("thinking") {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        crate::remote::scroll_local(7934, -3, gesture(2)).unwrap();
+        assert_eq!(wheels(&sent), (0, 3), "reverse reports were swallowed");
+        crate::remote::close(7934);
+        crate::remote::release_held();
+    }
+
+    /// Round 6 P2: getting back to the phone's copy is one action: tapping
+    /// Latest brings Claude's own view down (it clamps there) and gives the
+    /// next drag back to the copy, even when Claude never repaints.
+    #[test]
+    fn ask2_tapping_latest_after_claude_scrolled_itself_returns_to_the_copy() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7935, "boot-7935", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7935, &session);
+        crate::remote::scroll_local(7935, 40, gesture(1)).unwrap();
+        assert_eq!(wheels(&sent), (30, 0));
+        // Claude clamped at its own top and sent nothing back.
+        crate::remote::scroll_to(7935, 0).unwrap();
+        assert!(wheels(&sent).1 >= 30, "Latest did not bring Claude's own view down");
+        crate::remote::scroll_local(7935, 3, gesture(2)).unwrap();
+        assert_eq!(wheels(&sent), (0, 0));
+        assert!(lock(&session.state).local.reader_for_test().is_some(), "a dead end: the drag still went to Claude");
+        crate::remote::close(7935);
+        crate::remote::release_held();
+    }
+
+    /// Round 6: nothing is captured while Claude scrolls itself, nor after
+    /// Latest until its newest screen is back: never a scrolled-back view.
+    #[test]
+    fn ask2_no_capture_until_claudes_newest_screen_is_back() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7936, "boot-7936", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        let before = crate::remote::transcript_rows(&session).unwrap();
+        at_copy_top(7936, &session);
+        crate::remote::scroll_local(7936, 3, gesture(1)).unwrap();
+        tx.send(Chunk::Data(paint(20))).unwrap();
+        shows(&terminal, 20);
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        crate::remote::scroll_to(7936, 0).unwrap();
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        assert_eq!(crate::remote::transcript_rows(&session).unwrap(), before, "a scrolled-back view was captured");
+        tx.send(Chunk::Data(paint(42))).unwrap();
+        shows(&terminal, 42);
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        let copy = crate::remote::copy_pane(7936, "t1").unwrap().unwrap();
+        let text = String::from_utf8_lossy(&copy);
+        assert!(text.contains(&line(42)) && !text.contains(crate::transcript::GAP_TEXT), "the newest screen was not taken up again");
+        crate::remote::close(7936);
+        crate::remote::release_held();
+    }
+
 }
