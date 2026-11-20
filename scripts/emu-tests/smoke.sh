@@ -30,21 +30,49 @@ timeout -k 1s 60s adb -s "$ADB_SERIAL" shell am start -W -n "$component" \
 grep -q '^Status: ok' "$EMU_OUT/launch.log"
 
 deadline=$((SECONDS + 60))
-while :; do
-    if timeout -k 1s 5s adb -s "$ADB_SERIAL" shell dumpsys activity activities > "$EMU_OUT/activity.log" \
+adb_before_deadline() {
+    local remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || return 1
+    timeout -k 1s "${remaining}s" adb -s "$ADB_SERIAL" "$@"
+}
+
+home_is_rendered() {
+    local hierarchy=/data/local/tmp/herdr-smoke-home.xml
+    adb_before_deadline shell dumpsys window windows > "$EMU_OUT/windows.log" \
+        && awk -v package="$package" '
+            /^[[:space:]]*Window #[0-9]+ Window[{]/ {
+                if (starting && app) pending = 1
+                starting = tolower($0) ~ /splash screen|starting[[:space:]]*window/
+                app = index($0, package) > 0
+                window = 1
+            }
+            window && /mAttrs=|mActivityRecord=/ {
+                if (/ty=APPLICATION_STARTING/) starting = 1
+                if (index($0, package)) app = 1
+            }
+            END { exit (!window || pending || (starting && app)) }
+        ' "$EMU_OUT/windows.log" \
+        && adb_before_deadline shell "rm -f '$hierarchy' && uiautomator dump '$hierarchy'" \
+            > "$EMU_OUT/uiautomator.log" 2>&1 \
+        && adb_before_deadline exec-out cat "$hierarchy" > "$EMU_OUT/home.xml" \
+        && grep -Fq -e 'text="No hosts yet.' \
+            -e 'content-desc="Search machines, spaces and agents (Ctrl+K)"' "$EMU_OUT/home.xml"
+}
+
+# Activity resume can precede Home's first frame while the splash is still up.
+while (( SECONDS < deadline )); do
+    if adb_before_deadline shell dumpsys activity activities > "$EMU_OUT/activity.log" \
         && awk -v full="$component" -v short="$short_component" '
             /^[[:space:]]*(topResumedActivity=|mResumedActivity:|ResumedActivity:)/ {
                 if (index($0, " " full " ") || index($0, " " short " ")) resumed = 1
             }
             END { exit !resumed }
-        ' "$EMU_OUT/activity.log"; then
-        break
-    fi
-    if (( SECONDS >= deadline )); then
-        echo "Activity did not resume: $component. See activity.log." >&2
-        exit 1
+        ' "$EMU_OUT/activity.log" && home_is_rendered; then
+        timeout -k 1s 10s adb -s "$ADB_SERIAL" exec-out screencap -p > "$EMU_OUT/home.png"
+        test -s "$EMU_OUT/home.png"
+        exit 0
     fi
     sleep 1
 done
-adb -s "$ADB_SERIAL" exec-out screencap -p > "$EMU_OUT/home.png"
-test -s "$EMU_OUT/home.png"
+echo "Home was not rendered within 60s: $component. See activity.log, windows.log and the UI dump." >&2
+exit 1

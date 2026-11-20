@@ -16,6 +16,8 @@ test_script=$1
 [[ -f "$test_script" && -r "$test_script" ]] || die "Cannot read $test_script"
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 : "${ANDROID_HOME:?Enter the android-emu dev shell first}"
+boot_timeout=${EMU_BOOT_TIMEOUT_SECONDS:-300}
+[[ "$boot_timeout" =~ ^[1-9][0-9]*$ ]] || die "EMU_BOOT_TIMEOUT_SECONDS must be a positive integer."
 
 out_dir="${JOBRUN_OUTPUTS:-.}/emu-out"
 mkdir -p -- "$out_dir"
@@ -142,12 +144,12 @@ done
 export ADB_SERIAL="emulator-$port"
 export ANDROID_SERIAL="$ADB_SERIAL"
 
-boot_deadline=$((SECONDS + 180))
+boot_deadline=$((SECONDS + boot_timeout))
 while :; do
     kill -0 "$emu_pid" 2>/dev/null || die "Emulator exited. See emulator.log."
     boot=$(timeout 3s adb -s "$ADB_SERIAL" shell getprop sys.boot_completed 2>/dev/null) || boot=
     [[ "${boot//$'\r'/}" == 1 ]] && break
-    (( SECONDS < boot_deadline )) || die "Emulator boot timed out. See emulator.log and logcat.log."
+    (( SECONDS < boot_deadline )) || die "Emulator boot timed out after ${boot_timeout}s. See emulator.log and logcat.log."
     sleep 1
 done
 
