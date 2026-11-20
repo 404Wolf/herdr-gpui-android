@@ -76,4 +76,23 @@ public final class MultilineSpacingTest {
         assertEquals(1, out.size());
         assertTrue(out.get(0).top >= rows.draftTop(32) + 16 - 0.001f);
     }
+
+    @Test public void aDraftLineTouchingOnlyAControlsPaddingLeavesItsWordsTappable() {
+        // 52 columns of 6 px, 40 px rows: Clear's words at columns 23-27 on the lower rule (row 21),
+        // the third draft line (row 22) ending at column 22, just short of them.
+        ControlTargets.Rows rows = new ControlTargets.Rows(0, 40, 20, 3, 10, 0);
+        List<ControlTargets.Cells> controls = java.util.Arrays.asList(
+                new ControlTargets.Cells("clear", 21, 23, 28), new ControlTargets.Cells("send", 21, 45, 49));
+        int[][] spans = {{20, 2, 50}, {21, 2, 12}, {22, 2, 22}};
+        List<ControlTargets.Rect> out = ControlTargets.layout(controls, rows, 0, 6f, 20, 40 * 40f, 6f * 52, false,
+                spans, Collections.<ControlTargets.Cells>emptyList());
+        for (ControlTargets.Rect r : out) {
+            float cx = (r.labelLeft + r.labelRight) / 2, cy = rows.top(21) + 20;
+            assertTrue(r.id + " center", r.left <= cx && cx <= r.right && r.top <= cy && cy <= r.bottom);
+            assertTrue(r.id + " words", r.left <= r.labelLeft && r.right >= r.labelRight);
+            // And never over the draft's third line.
+            assertTrue(r.id, r.left >= 22 * 6f - 0.001f || r.bottom <= rows.draftTop(22) + 0.001f
+                    || r.top >= rows.draftTop(22) + 40);
+        }
+    }
 }

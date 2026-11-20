@@ -221,7 +221,16 @@ final class ControlTargets {
                         float spanLeft = left + span[1] * cellWidth, spanRight = left + span[2] * cellWidth;
                         float spanTop = geo.draftTop(span[0]), spanBottom = spanTop + cellHeight;
                         if (spanRight <= l || spanLeft >= r || spanBottom <= t || spanTop >= b) continue;
-                        if (span[0] < c.row) {
+                        // Touching only the target's padding (not its words): give up those columns,
+                        // not its height, so the words stay tappable along their whole box.
+                        boolean overWords = spanRight > labelLeft && spanLeft < labelRight;
+                        if (!overWords && span[0] != c.row) {
+                            if (spanRight <= labelLeft) {
+                                l = spanRight;
+                            } else {
+                                r = spanLeft;
+                            }
+                        } else if (span[0] < c.row) {
                             t = spanBottom;
                         } else if (span[0] > c.row) {
                             b = spanTop;

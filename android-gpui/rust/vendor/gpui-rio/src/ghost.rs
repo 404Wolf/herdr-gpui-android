@@ -805,7 +805,8 @@ pub fn place_all(
         // controls take almost the whole row, the draft is not spread at all (`spread_safe`).
         let controls_row_below = controls_row.filter(|&c| c > anchor.row);
         let room_beside = cols.saturating_sub(len).saturating_sub(1);
-        layout.spread_safe = layout.controls.is_empty() || room_beside >= MIN_BESIDE_CONTROLS;
+        layout.spread_safe = cols > anchor.indent
+            && (layout.controls.is_empty() || room_beside >= MIN_BESIDE_CONTROLS);
         let spread_safe = layout.spread_safe;
         let shares_band = |row: usize| {
             !layout.controls.is_empty()
@@ -1410,10 +1411,16 @@ fn wrap(
                         // Wider than a whole line: put it alone rather than loop.
                         take = 1;
                         used = grapheme_cells(rest[0]);
+                    } else if col == indent && lines.len() >= MAX_WRAP_LINES {
+                        // Nothing more can be drawn: stop rather than append empty rows.
+                        return trim_empty(lines);
                     } else {
                         lines.push(Vec::new());
                         col = indent;
                         width = width_of(lines.len() - 1);
+                        if width <= indent && lines.len() >= MAX_WRAP_LINES {
+                            return trim_empty(lines);
+                        }
                         continue;
                     }
                 }
@@ -1424,7 +1431,15 @@ fn wrap(
             }
         }
     }
-    // Trailing empty lines carry nothing; a leading one keeps row numbering.
+    trim_empty(lines)
+}
+
+/// The most visual rows a wrapped draft is laid out on: wrapping stops there, so a grid with no
+/// writable cells (two columns) cannot grow rows forever.
+const MAX_WRAP_LINES: usize = 64;
+
+/// Trailing empty lines carry nothing; a leading one keeps row numbering.
+fn trim_empty(mut lines: Vec<Vec<Located>>) -> Vec<Vec<Located>> {
     while lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
         lines.pop();
     }
@@ -3547,5 +3562,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_two_column_pane_wraps_to_a_stop_instead_of_growing_rows_forever() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for cols in [2usize, 3, 4] {
+                let rule = "─".repeat(cols);
+                let rows = screen(&["❯\u{a0}", "", &rule], cols);
+                let anchor = locate(&rows, Some((1, 1)), PromptKind::Claude);
+                assert!(anchor.is_some(), "{cols} cols");
+                let g = controls(ghost(vec![text("xx yy zz 日本語 😀😀 ")]));
+                let layout = place_all(&g, anchor, &rows, None);
+                assert!(layout.placed.len() < 1000, "{cols} cols");
+                assert!(!layout.spread_safe || cols > 2, "{cols} cols");
+            }
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(), "wrapping did not stop");
     }
 }
