@@ -393,100 +393,128 @@ fn link_in(text: &[char], at: usize) -> Option<(Range<usize>, Link)> {
             .position(|&b| b == byte)
             .unwrap_or(offsets.len() - 1)
     };
-    let tapped = at - start;
-    // URLs first: a word may hold one after other text ("(see:https://…").
+    // One token, one target: the tapped part of the word (a markdown `](`
+    // splits it in two) has its wrapper punctuation peeled off both ends
+    // repeatedly, and what is left is classified once, so every cell of the
+    // token gives the same answer.
+    let tapped = offsets[at - start];
+    let angle = start > 0 && text[start - 1] == '<';
+    let mut cuts = vec![0];
+    cuts.extend(word.match_indices("](").map(|(i, _)| i + 1));
+    cuts.push(word.len());
+    let (lo, hi) = cuts
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .find(|(lo, hi)| (*lo..*hi).contains(&tapped))?;
+    let token = &word[lo..hi];
+    let peeled = peel(token);
+    let inner = &token[peeled.start..peeled.end];
+    let span =
+        |range: Range<usize>| start + index_of(lo + range.start)..start + index_of(lo + range.end);
+    if peeled.mail || inner.is_empty() {
+        return None;
+    }
+    // A URL: the token is one, or holds one after other text.
     let mut search = 0;
     while let Some(found) = SCHEMES
         .iter()
-        .filter_map(|s| word[search..].find(s).map(|i| search + i))
+        .filter_map(|s| {
+            let lower = inner.to_ascii_lowercase();
+            lower[search..].find(s).map(|i| search + i)
+        })
         .min()
     {
-        let url = strip_stars(trim_url(&word[found..]), star_run(&word[..found]));
-        let url = trim_url(url);
-        let (first, last) = (index_of(found), index_of(found + url.len()));
-        if url.len()
-            > SCHEMES
-                .iter()
-                .find(|s| url.starts_with(**s))
-                .map_or(0, |s| s.len())
-            && (first..last).contains(&tapped)
+        let url = trim_url(&inner[found..]);
+        let scheme = SCHEMES
+            .iter()
+            .find(|s| url.to_ascii_lowercase().starts_with(**s))
+            .map_or(0, |s| s.len());
+        let range = peeled.start + found..peeled.start + found + url.len();
+        if url.len() > scheme
+            && index_of(lo + range.start) <= at - start
+            && at - start < index_of(lo + range.end)
         {
-            return Some((start + first..start + last, Link::Web(url.to_owned())));
+            return Some((span(range), Link::Web(url.to_owned())));
         }
         search = found + 1;
     }
-    if word.contains("://") {
+    if inner.contains("://") || (angle && inner.contains('@')) {
         return None;
     }
-    // A path is one target for the whole token: punctuation inside a valid
-    // file name (`icon@final.rs`, `a=b.rs`, `x[1].rs`) belongs to it. Only
-    // recognised wrapper syntax is peeled off the front (see `wrapper_ends`),
-    // latest first so `path=/a/b.rs` is `/a/b.rs`; the whole token is the
-    // fallback. A `:line:col` is cut from the end.
-    let mut leads = wrapper_ends(&word);
-    leads.reverse();
-    leads.push(0);
-    for lead in leads {
-        let body = strip_stars(trim_url(&word[lead..]), star_run(&word[..lead]));
-        let (path, line) = split_line(body);
-        if !looks_like_file(path) {
-            continue;
-        }
-        let (first, last) = (index_of(lead), index_of(lead + body.len()));
-        if (first..last).contains(&tapped) {
-            return Some((
-                start + first..start + last,
-                Link::File {
-                    path: path.to_owned(),
-                    line,
-                },
-            ));
-        }
+    let (path, line) = split_line(inner);
+    if !looks_like_file(path) {
+        return None;
     }
-    None
+    let range = peeled.start..peeled.end;
+    let range = span(range);
+    range.contains(&at).then(|| {
+        (
+            range,
+            Link::File {
+                path: path.to_owned(),
+                line,
+            },
+        )
+    })
 }
 
-/// Byte offsets in `word` just after a wrapper that may precede a path:
-/// leading punctuation (`(`, `[`, `*`, ...), a tool call's `name(` or
-/// `key=` / `key:` (an identifier, so `src/a=b.rs` is not one), and a
-/// markdown `](`. Nothing inside a path-looking prefix counts.
-fn wrapper_ends(word: &str) -> Vec<usize> {
-    let mut ends = Vec::new();
-    let leading = word
-        .find(|c: char| !matches!(c, '(' | '[' | '{' | ',' | ';' | ':' | '*'))
-        .unwrap_or(word.len());
-    // Each position inside the leading punctuation run (all ASCII).
-    ends.extend(1..=leading);
-    let rest = &word[leading..];
-    let ident = rest
+/// A token with its wrapper punctuation peeled: the byte range left, and
+/// whether a `mailto:` was peeled (an address, never a file).
+struct Peeled {
+    start: usize,
+    end: usize,
+    mail: bool,
+}
+
+/// Peels wrapper punctuation from both ends until nothing more comes off:
+/// opening `( [ { * , ; :`, a tool call's `name(` or `key=` / `key:` before a
+/// path, trailing sentence punctuation, closing brackets nothing opened, and
+/// as many closing `*` as opened one (a literal `files/*` keeps its star).
+fn peel(token: &str) -> Peeled {
+    let (mut start, mut end, mut stars, mut mail) = (0, token.len(), 0usize, false);
+    loop {
+        let before = (start, end);
+        while let Some(c) = token[start..end].chars().next() {
+            if !matches!(c, '(' | '[' | '{' | '*' | ',' | ';' | ':') {
+                break;
+            }
+            stars += usize::from(c == '*');
+            start += 1;
+        }
+        end = start + trim_url(&token[start..end]).len();
+        while stars > 0 && token[start..end].ends_with('*') {
+            end -= 1;
+            stars -= 1;
+        }
+        if let Some((len, is_mail)) = call_prefix(&token[start..end]) {
+            start += len;
+            mail |= is_mail;
+        }
+        if (start, end) == before {
+            return Peeled { start, end, mail };
+        }
+    }
+}
+
+/// The length of a leading `name(`, `mailto:`, or `key=` / `key:` that
+/// introduces a path, and whether it was `mailto:`. A key only counts before
+/// something path-shaped (`path=/a/b.rs`, not `a=b.rs`), never a `scheme://`.
+fn call_prefix(text: &str) -> Option<(usize, bool)> {
+    let ident = text
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
-        .unwrap_or(rest.len());
-    if ident > 0
-        && rest.as_bytes()[0].is_ascii_alphabetic()
-        && let Some(c) = rest[ident..].chars().next()
-        && matches!(c, '(' | '=' | ':')
-    {
-        ends.push(leading + ident + 1);
+        .unwrap_or(text.len());
+    if ident == 0 || !text.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
     }
-    for (i, _) in word.match_indices("](") {
-        ends.push(i + 2);
+    match text[ident..].chars().next()? {
+        '(' => Some((ident + 1, false)),
+        ':' if text[..ident].eq_ignore_ascii_case("mailto") => Some((ident + 1, true)),
+        '=' | ':' => {
+            let rest = &text[ident + 1..];
+            (!rest.starts_with("//") && rest.contains('/')).then_some((ident + 1, false))
+        }
+        _ => None,
     }
-    ends.sort_unstable();
-    ends.dedup();
-    ends
-}
-
-/// The `*` characters that end `prefix`: a bold or italic wrapper the path sits in.
-fn star_run(prefix: &str) -> usize {
-    prefix.len() - prefix.trim_end_matches('*').len()
-}
-
-/// Drops up to `stars` closing `*` from `body`: one that closes a wrapper
-/// opened before it, never a literal one (`files/*`).
-fn strip_stars(body: &str, stars: usize) -> &str {
-    let kept = body.trim_end_matches('*');
-    let closing = (body.len() - kept.len()).min(stars);
-    &body[..body.len() - closing]
 }
 
 /// The markdown link `[text](http…)` covering index `at` of `text`: a tap
@@ -1017,6 +1045,87 @@ mod tests {
         assert_eq!(link(&rows, 0, 12), Some(web("https://example.com/a")));
         let rows = [Row::new("see src/glob/*.rs and **src/a.rs** now", false)];
         assert_eq!(link(&rows, 0, 24), Some(file("src/a.rs", None)));
+    }
+
+    /// The property that settles every review round: a token has ONE target
+    /// (or none), whichever of its cells is tapped. Each case is a token as it
+    /// is printed and the target it must give.
+    #[test]
+    fn file_ask_every_cell_of_a_token_gives_the_same_target() {
+        let f = |p: &str, l: Option<u32>| Some(file(p, l));
+        let w = |u: &str| Some(web(u));
+        let cases: Vec<(&str, Option<Link>)> = vec![
+            (
+                "/home/wolf/proj/src/main.rs",
+                f("/home/wolf/proj/src/main.rs", None),
+            ),
+            (
+                "/home/wolf/proj/src/main.rs:42:9",
+                f("/home/wolf/proj/src/main.rs", Some(42)),
+            ),
+            ("crates/a/src/lib.rs:7", f("crates/a/src/lib.rs", Some(7))),
+            ("~/code/x.py:3", f("~/code/x.py", Some(3))),
+            ("./run.sh", f("./run.sh", None)),
+            ("README.md#L12", f("README.md", Some(12))),
+            ("src/icon@final.rs:12", f("src/icon@final.rs", Some(12))),
+            ("src/a=b.rs:12", f("src/a=b.rs", Some(12))),
+            ("a=b.rs", f("a=b.rs", None)),
+            ("a=b.rs:3", f("a=b.rs", Some(3))),
+            ("src/x[1].rs", f("src/x[1].rs", None)),
+            ("src/a;b.rs", f("src/a;b.rs", None)),
+            ("src/a,b.rs", f("src/a,b.rs", None)),
+            ("~/v/a:b.rs", f("~/v/a:b.rs", None)),
+            ("path=/home/wolf/a.rs", f("/home/wolf/a.rs", None)),
+            ("file:/home/wolf/a.rs:4", f("/home/wolf/a.rs", Some(4))),
+            ("Update(src/main.rs)", f("src/main.rs", None)),
+            ("Read(/tmp/a.rs:12)", f("/tmp/a.rs", Some(12))),
+            ("**Read(/tmp/a.rs:12)**", f("/tmp/a.rs", Some(12))),
+            ("**src/main.rs**", f("src/main.rs", None)),
+            ("**src/main.rs:5**", f("src/main.rs", Some(5))),
+            ("(src/a.rs)", f("src/a.rs", None)),
+            ("(src/a.rs:9),", f("src/a.rs", Some(9))),
+            ("[src/a.rs](src/a.rs)", f("src/a.rs", None)),
+            ("docs/Makefile", f("docs/Makefile", None)),
+            ("LICENSE", f("LICENSE", None)),
+            ("bin.dat", f("bin.dat", None)),
+            (
+                "https://example.com/files/*",
+                w("https://example.com/files/*"),
+            ),
+            ("**https://example.com/a**", w("https://example.com/a")),
+            ("**(https://example.com)**", w("https://example.com")),
+            ("(https://example.com/a).", w("https://example.com/a")),
+            ("Fetch(https://x.io/a?b=1)", w("https://x.io/a?b=1")),
+            ("see:https://x.io/a", w("https://x.io/a")),
+            ("team@vendor.zip", None),
+            ("<qa/ops@vendor.zip>", None),
+            ("mailto:qa/ops@vendor.zip", None),
+            ("mailto:team@vendor.zip", None),
+            ("v1.2.3", None),
+            ("and/or", None),
+            ("12:30", None),
+            ("e.g.", None),
+        ];
+        for (token, want) in cases {
+            let text = format!("see {token} now");
+            let rows = [Row::new(&text, false)];
+            let first = text.find(token).unwrap();
+            let mut seen = Vec::new();
+            for col in first..first + token.chars().count() {
+                if let Some(found) = link(&rows, 0, col) {
+                    seen.push((col, found));
+                }
+            }
+            assert!(
+                seen.iter().all(|(_, l)| Some(l) == want.as_ref()),
+                "{token}: {seen:?}"
+            );
+            assert_eq!(
+                !seen.is_empty(),
+                want.is_some(),
+                "{token}: no cell opens it"
+            );
+        }
     }
 
     #[test]
