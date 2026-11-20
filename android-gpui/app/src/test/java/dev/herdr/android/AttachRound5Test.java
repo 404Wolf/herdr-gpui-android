@@ -79,7 +79,7 @@ public final class AttachRound5Test {
                 .put(ComposerDrafts.key("host", "t2"), "plain text")
                 .toString());
         drafts.setHost("host", "new-revision", encoded -> true);
-        assertEquals("", drafts.switchTo("t1"));
+        assertEquals("look at  ", drafts.switchTo("t1"));
         assertEquals("plain text", drafts.switchTo("t2"));
     }
 

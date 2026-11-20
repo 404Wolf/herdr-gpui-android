@@ -169,14 +169,14 @@ final class ComposerBar {
         @Override public void setDraft(String text, String revision) {
             drafts.edit(text, revision);
             if (text.isEmpty()) transcribedOnPhone = false;
-            showText(text);
+            showText(drafts.text());
         }
 
         @Override public void restoreDraft(String text, String revision) {
             String now = drafts.text();
             String joined = now.trim().isEmpty() ? text : text.replaceAll("\\s+$", "") + " " + now;
             drafts.edit(joined, revision == null ? drafts.draftRevision() : revision);
-            showText(joined);
+            showText(drafts.text());
         }
 
         @Override public List<String> clearable() { return host.clearableQueued(); }
