@@ -592,7 +592,17 @@ cancel_z() {
         tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
         return
     fi
-    tap_ui 'Stop and discard what was dictated' 15 || { record cancel-z FAIL "no Cancel control"; return; }
+    # Put the keyboard away first (Back hides it before anything else): its window can hide the
+    # composer's controls from the accessibility dump, and Cancel must be reachable as a person would.
+    a shell input keyevent KEYCODE_BACK
+    quiet 3
+    if ! tap_ui 'Stop and discard what was dictated' 20; then
+        shot cancel-z-no-cancel
+        dump > /dev/null 2>&1 || true
+        { echo "Cancel not found; labelled nodes of a fresh dump:"; [[ -s "$EMU_OUT/ui.xml" ]] && $ui list "$EMU_OUT/ui.xml"; echo "layout: $(layout_now)"; } > "$EMU_OUT/cancel-z-no-cancel.txt" 2>&1
+        record cancel-z FAIL "no Cancel control after hiding the keyboard (see cancel-z-no-cancel.txt/.png)"
+        return
+    fi
     quiet 2
     shot cancel-z-after
     # send the draft; the agent (cat) echoes it into its terminal, which the core can read back
