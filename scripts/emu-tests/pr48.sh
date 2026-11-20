@@ -324,13 +324,15 @@ cols_now() { a logcat -d -s herdr-tap > "$EMU_OUT/herdr-tap.log" 2>&1; $ui cols 
 # renderer reports (herdr-tap layout lines) until they land in the target band; echoes the columns.
 DENSITY0=$(a shell wm density 2> /dev/null | sed -n 's/.*Physical density: *\([0-9]*\).*/\1/p' | head -1)
 DENSITY0=${DENSITY0:-420}
+DENSITY=$DENSITY0   # the density in force; global, because set_cols must not run in a subshell
+COLS_NOW=?
 set_cols() { # 46 (cover-like, band 44..48) or 98 (wide, band 96..110)
     local target=$1 lo hi d=${DENSITY:-$DENSITY0} c i
     if (( target <= 50 )); then lo=44; hi=48; else lo=96; hi=110; fi
     c=$(cols_now) || c=
     for i in 1 2 3 4 5 6; do
         if [[ "$c" =~ ^[0-9]+$ ]]; then
-            (( c >= lo && c <= hi )) && { DENSITY=$d; echo "$c"; return 0; }
+            (( c >= lo && c <= hi )) && { DENSITY=$d; COLS_NOW=$c; return 0; }
             d=$(python3 -c "print(max(120, min(900, round($d * $c / $target))))")
         fi
         a shell wm density "$d"
@@ -338,7 +340,7 @@ set_cols() { # 46 (cover-like, band 44..48) or 98 (wide, band 96..110)
         c=$(cols_now) || c=
     done
     DENSITY=$d
-    echo "${c:-?}"
+    COLS_NOW=${c:-?}
     return 1
 }
 check_recording_controls() { # label
@@ -364,7 +366,10 @@ check_recording_controls() { # label
     # App side: the renderer's own control ids. Recording has cancel, the timer (status), stop (talk), send and type.
     has_ids cancel status talk send type || state=" [the app's layout lacks cancel/status/talk/send/type: $(layout_now)]"
     # The timer's own region (from the layout hint) must change between the two screenshots.
-    moved=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" 2> /dev/null || echo none)
+    # The hint's rows are relative to the terminal surface; the controls' row on the device is read
+    # from the accessibility dump (the Send target's centre), so no surface origin is guessed.
+    dump > /dev/null 2>&1 || true
+    moved=$($ui timer "$EMU_OUT/herdr-tap.log" "$EMU_OUT/recording-$label-a.png" "$EMU_OUT/recording-$label.png" "$EMU_OUT/ui.xml" 2> /dev/null || echo none)
     if [[ "$moved" != none ]] && python3 -c "import sys; sys.exit(0 if float('$moved') > 0 else 1)"; then ticking=1; fi
     if dump; then
         for need in 'Stop and discard what was dictated' 'Send, or press Enter' 'Type a message, or put the keyboard away'; do
@@ -384,12 +389,12 @@ check_recording_controls() { # label
     tap_ui 'Stop and discard what was dictated' 10 || a shell input keyevent KEYCODE_BACK
     quiet 2
 }
-wide=$(set_cols 98) && record width-98 PASS "$wide columns (density $DENSITY)" || record width-98 FAIL "got $wide columns"
+if set_cols 98; then record width-98 PASS "$COLS_NOW columns (density $DENSITY)"; else record width-98 FAIL "got $COLS_NOW columns (density $DENSITY)"; fi
 check_recording_controls 98cols
-narrow=$(set_cols 46) && record width-46 PASS "$narrow columns (density $DENSITY)" || record width-46 FAIL "got $narrow columns"
+if set_cols 46; then record width-46 PASS "$COLS_NOW columns (density $DENSITY)"; else record width-46 FAIL "got $COLS_NOW columns (density $DENSITY)"; fi
 check_recording_controls 46cols
 a shell wm density reset
-DENSITY=
+DENSITY=$DENSITY0
 quiet 4
 
 # Which pane is on screen: the strip's active tab, "Window N, <name>, current".
@@ -426,10 +431,8 @@ stop_and_send() {
     # the final transcript and sends the draft. The fake server's final is NOT the last partial
     # ("fixture final words" vs "fixture partial"), so only an app that waits for the final and sends
     # it passes; one that sends the partial early would put "fixture partial" in the agent.
-    local before finals
-    agent_screen agent-b > "$EMU_OUT/agent-b-before-send.txt" 2> /dev/null || : > "$EMU_OUT/agent-b-before-send.txt"
+    local before
     before=$(partials)
-    finals=$(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log")
     tap_ui 'Dictate; tap again to stop' 20 || { record stop-and-send FAIL "no Talk control"; return; }
     if ! wait_partial "$before" 25; then
         record stop-and-send FAIL "dictation never became active (no partial from the fake server); Send was not exercised"
@@ -439,21 +442,27 @@ stop_and_send() {
     has_ids cancel status talk send || { record stop-and-send FAIL "the app is not in the recording state: $(layout_now)"; return; }
     quiet 2
     shot stop-and-send-recording
+    # Everything that arrives must arrive AFTER this tap: snapshot the agent and count the server's
+    # finals right before it.
+    local before_tap_finals
+    before_tap_finals=$(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log")
+    agent_screen agent-b > "$EMU_OUT/agent-b-before-send.txt" 2> /dev/null || : > "$EMU_OUT/agent-b-before-send.txt"
     tap_ui 'Send, or press Enter' 15 || { record stop-and-send FAIL "no Send control while recording"; return; }
     local end=$((SECONDS + 30)) got=0 screen="" added=""
     while (( SECONDS < end )); do
         screen=$(agent_screen agent-b) || screen=
         echo "$screen" > "$EMU_OUT/stop-and-send-screen.txt"
         added=$($ui newlines "$EMU_OUT/agent-b-before-send.txt" "$EMU_OUT/stop-and-send-screen.txt")
-        if grep -q "$FINAL_WORDS" <<< "$added"; then got=1; break; fi
+        # Exactly the final, as a line of its own (the prompt may precede it): not a longer or other text.
+        if grep -Eq "^(> )?$FINAL_WORDS *$" <<< "$added"; then got=1; break; fi
         sleep 2
     done
     echo "$added" > "$EMU_OUT/stop-and-send-new-lines.txt"
     shot stop-and-send-after
     local now_finals
     now_finals=$(count "sent final: $FINAL_WORDS" "$EMU_OUT/dictation.log")
-    if (( got )) && (( now_finals > finals )) && ! grep -q 'fixture partial' <<< "$added"; then
-        record stop-and-send PASS "Send during recording stopped it, took the final transcript and sent exactly '$FINAL_WORDS' (not the partial) to agent-b"
+    if (( got )) && (( now_finals > before_tap_finals )) && ! grep -q 'fixture partial' <<< "$added"; then
+        record stop-and-send PASS "Send during recording stopped it, took the final transcript and sent exactly '$FINAL_WORDS' (not the partial) to agent-b, after the Send tap"
     else
         record stop-and-send FAIL "expected new agent-b output '$FINAL_WORDS' from this run's final and no 'fixture partial' (see stop-and-send-new-lines.txt, dictation.log)"
     fi

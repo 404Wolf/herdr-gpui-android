@@ -49,3 +49,22 @@ Results are in `<dir>/emu-out/run.*/`:
 from logcat and measures how much of a screenshot band is one flat colour (a blank region). Its
 parsers can be tried on any saved `ui.xml` or PNG without an emulator. The selectors in `pr48.sh`
 are the app's content descriptions; change them there when a control's words change.
+
+### What this harness does not prove
+
+- **Draft text.** The app's layout hint (`herdr-tap` in logcat) reports control ids, their cells and
+  the draft's cell spans, not text. Cancel is therefore checked by the draft's length in cells before
+  and after the typed `z`, and by what the agent finally receives, not by reading the draft itself.
+- **Timer text.** The same hint has no timer text: the timer is proven by the `status` control being
+  present and its screen region (rows from the accessibility dump, columns from the hint, grid
+  assumed to fill the display width) changing between two screenshots 3 s apart. A repaint of that
+  region that is not a counting timer would also pass.
+- **The system image.** One API 34 google_apis guest with Google's background services disabled and
+  gesture navigation: the navigation-bar key check is a SKIP, other keyboards, other densities and
+  physical devices are not covered.
+- **The network.** The core and sshd are loopback fixtures reached through the emulator alias and
+  `adb reverse`; real links, Tailscale and a real Whisper server are not exercised.
+- **Offline.** The link is cut by stopping the fixtures and the app is relaunched; a link that drops
+  with a pane open and recovers is not covered.
+- **Cleanup.** Early setup failures can leave the scratch directory behind; Slurm's cgroup teardown
+  is what stops surviving processes.

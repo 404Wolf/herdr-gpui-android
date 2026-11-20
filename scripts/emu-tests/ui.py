@@ -9,7 +9,7 @@
   ui.py text XML REGEX        the first text/desc matching REGEX, whole
   ui.py layout LOGCAT         "ids: a b c | cols N | draft CELLS" of the app's last reported layout hint
                               (what the renderer actually drew, not what a screenshot happens to show)
-  ui.py timer LOGCAT PNG PNG  fraction of the recording timer's own region that changed between two
+  ui.py timer LOGCAT PNG PNG [XML]  fraction of the recording timer's own region that changed between two
                               screenshots (the "status" control of the last layout hint)
   ui.py newlines BEFORE AFTER the lines of AFTER that are not part of BEFORE, in order; repeats of an
                               earlier line still count when they are new (a sequence diff, not a set)
@@ -116,7 +116,7 @@ def draft_cells(layout):
     return sum(max(0, s[2] - s[1]) for s in layout.get("draftSpans", []) if len(s) >= 3)
 
 
-def timer_region_change(log_path, png_a, png_b):
+def timer_region_change(log_path, png_a, png_b, xml=None):
     layout = last_layout(log_path)
     status = next((c for c in (layout or {}).get("controls", []) if c["id"] == "status"), None)
     if status is None:
@@ -130,6 +130,14 @@ def timer_region_change(log_path, png_a, png_b):
     top = layout.get("top", 0.0)
     y0 = max(0, int((top + status["row"] * layout["cellHeight"]) * scale))
     y1 = min(ha, int((top + (status["row"] + 1) * layout["cellHeight"]) * scale))
+    if xml:
+        # The hint's rows are relative to the terminal surface, whose origin on the screen is not in it:
+        # take the controls' row from the accessibility dump (the Send target is drawn on that row).
+        hit = find(xml, "Send, or press Enter")
+        if hit is None:
+            return None
+        half = max(2, int(layout["cellHeight"] * scale * 0.6))
+        y0, y1 = max(0, hit[1] - half), min(ha, hit[1] + half)
     changed = total = 0
     for y in range(y0, y1):
         for x in range(x0, x1):
@@ -224,7 +232,7 @@ def main(argv):
         ids = " ".join(c["id"] for c in layout.get("controls", []))
         print("ids: %s | cols %s | draft %d" % (ids, layout.get("cols"), draft_cells(layout)))
     elif cmd == "timer":
-        fraction = timer_region_change(argv[2], argv[3], argv[4])
+        fraction = timer_region_change(argv[2], argv[3], argv[4], argv[5] if len(argv) > 5 else None)
         if fraction is None:
             return 1
         print("%.4f" % fraction)
