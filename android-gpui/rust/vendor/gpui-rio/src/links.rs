@@ -1168,9 +1168,10 @@ mod tests {
             ("e.g.", None),
         ];
         for (token, want) in cases {
-            let text = format!("see {token} now");
+            let prefix = "see ";
+            let text = format!("{prefix}{token} now");
             let rows = [Row::new(&text, false)];
-            let first = text.find(token).unwrap();
+            let first = prefix.len();
             let mut seen = Vec::new();
             for col in first..first + token.chars().count() {
                 if let Some(found) = link(&rows, 0, col) {
@@ -1217,7 +1218,10 @@ mod tests {
             format!("<{url}>"),
         ] {
             let rows = [Row::new(&text, false)];
-            let col = text.find("grafana").unwrap();
+            let Some((prefix, _)) = text.split_once("grafana") else {
+                panic!("missing hostname in fixture: {text}");
+            };
+            let col = prefix.chars().count();
             assert_eq!(link(&rows, 0, col), Some(web(url)), "{text}");
         }
     }
