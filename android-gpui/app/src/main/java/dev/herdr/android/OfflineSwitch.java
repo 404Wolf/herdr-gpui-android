@@ -108,14 +108,21 @@ final class OfflineSwitch {
     }
 
     /**
-     * The status line while a cached pane is on screen, in the crumb's slot:
-     * {@code cached 14:32 · offline} (no network), {@code cached 14:32 ·
-     * connecting} (a network, the session not back yet), {@code not cached ·
-     * offline} when the pane has no copy ({@code when} null), then how many
-     * messages wait to be sent.
+     * What a saved screen says about itself wherever it is drawn: it is the last screen this phone
+     * saved, at that time, and may be outdated. It is never presented as the pane's content now.
+     */
+    static String saved(String when) {
+        return "last saved screen · " + when + " · may be outdated";
+    }
+
+    /**
+     * The status line while a cached pane is on screen: {@code last saved screen · 14:32 · may be
+     * outdated · offline} (no network), {@code … · connecting} (a network, the session not back
+     * yet), {@code not cached · offline} when the pane has no copy ({@code when} null), then how
+     * many messages wait for the user.
      */
     static String label(String when, boolean noNetwork, int waiting) {
-        StringBuilder text = new StringBuilder(when == null ? "not cached" : "cached " + when);
+        StringBuilder text = new StringBuilder(when == null ? "not cached" : saved(when));
         text.append(noNetwork ? " · offline" : " · connecting");
         if (waiting > 0) text.append(" · ").append(waiting).append(waiting == 1 ? " waits" : " wait");
         return text.toString();

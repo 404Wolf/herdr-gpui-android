@@ -135,7 +135,7 @@ final class ActionSheet {
         clipboard.setPrimaryClip(ClipData.newPlainText(label, text));
     }
 
-    private static LinearLayout card(Context context, GpuiChrome chrome) {
+    static LinearLayout card(Context context, GpuiChrome chrome) {
         LinearLayout card = new LinearLayout(context);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(0, 0, 0, dp(context, 6));
@@ -147,7 +147,7 @@ final class ActionSheet {
         return card;
     }
 
-    private static TextView label(Context context, String text, float size, int color) {
+    static TextView label(Context context, String text, float size, int color) {
         TextView view = new TextView(context);
         view.setText(text);
         view.setTextSize(size);
@@ -156,7 +156,7 @@ final class ActionSheet {
         return view;
     }
 
-    private static TextView button(Context context, GpuiChrome chrome, String text, int color) {
+    static TextView button(Context context, GpuiChrome chrome, String text, int color) {
         TextView view = label(context, text, 14, color);
         view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         view.setGravity(Gravity.CENTER);
@@ -166,12 +166,12 @@ final class ActionSheet {
         return view;
     }
 
-    private static RippleDrawable ripple(GpuiChrome chrome) {
+    static RippleDrawable ripple(GpuiChrome chrome) {
         return new RippleDrawable(android.content.res.ColorStateList.valueOf(chrome.selected), null,
                 new ColorDrawable(0xffffffff));
     }
 
-    private static void size(Dialog dialog) {
+    static void size(Dialog dialog) {
         Window window = dialog.getWindow();
         if (window == null) return;
         window.setBackgroundDrawable(new ColorDrawable(0));
@@ -182,7 +182,7 @@ final class ActionSheet {
 
     private int dp(float value) { return dp(activity, value); }
 
-    private static int dp(Context context, float value) {
+    static int dp(Context context, float value) {
         return Math.round(value * context.getResources().getDisplayMetrics().density);
     }
 }

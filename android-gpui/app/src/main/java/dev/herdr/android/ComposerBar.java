@@ -57,6 +57,12 @@ final class ComposerBar {
          * is up, or through the outbox when it is not. False keeps the draft.
          */
         boolean send(String text);
+        /**
+         * Step 2 of the Send handoff ({@link SendHandoff}): holds {@code text} under submission
+         * {@code id} durably, then acts on it (typed at once in the live pane, or kept). False
+         * when it was not held: the draft stays.
+         */
+        default boolean send(String text, String id) { return send(text); }
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
         /** Hides the on-screen keyboard, whichever view owns it. */
@@ -367,7 +373,8 @@ final class ComposerBar {
         this.host = host;
         this.density = context.getResources().getDisplayMetrics().density;
         preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        drafts.restore(preferences.getString(DRAFTS, ""));
+        drafts.restoreOffered(preferences.getString(DRAFTS, ""));
+        handoff = SendHandoff.Record.decode(preferences.getString(SendHandoff.KEY, ""));
         // A clear made before a restart: its undo is still on offer within its window.
         clearing.resume(preferences.getString(CLEAR_RECORD, ""), wall());
         field = createField();
@@ -500,6 +507,38 @@ final class ComposerBar {
         return commitDrafts(drafts.encode());
     }
 
+    /** A Send that had not finished when the app last stopped; settled once the outbox is read. */
+    private SendHandoff.Record handoff;
+
+    /**
+     * Settles a Send the app stopped in the middle of (§3.2): its message held, the draft that
+     * still holds its text is cleared; not held, the draft stays and says so. Main thread, once
+     * the outbox has been read.
+     */
+    private void settleHandoff() {
+        SendHandoff.Record record = handoff;
+        if (record == null || !host.outboxLoaded()) return;
+        handoff = null;
+        SendHandoff.Recovery recovery = SendHandoff.reconcile(record, id -> host.queuedText(id) != null);
+        if (recovery == SendHandoff.Recovery.CLEAR_DRAFT && drafts.removeSent(record.owner, record.text)) {
+            showText(drafts.text());
+        } else if (recovery == SendHandoff.Recovery.OFFER_AGAIN) {
+            host.notice(SendHandoff.NOT_SENT);
+        }
+        preferences.edit().putString(DRAFTS, drafts.encode()).remove(SendHandoff.KEY).commit();
+    }
+
+    /** The draft found on disk at start for the pane on screen, offered but not loaded; or null. */
+    ComposerDrafts.Draft offeredDraft() {
+        return drafts.offered();
+    }
+
+    /** The user took the offered draft: it is in the composer now. */
+    void acceptOfferedDraft() {
+        showText(drafts.acceptOffered());
+        saveDraftsSoon();
+    }
+
     private boolean commitDrafts(String encoded) {
         String previous = preferences.getString(DRAFTS, "");
         if (preferences.edit().putString(DRAFTS, encoded).commit()) return true;
@@ -529,6 +568,7 @@ final class ComposerBar {
     /** The outbox's messages for the pane on screen (from {@link Outbox#shown}). */
     void showQueued(List<Outbox.Message> messages) {
         queuedMessages = messages;
+        settleHandoff();
         queue.update(drafts.pane(), messages, android.os.SystemClock.uptimeMillis());
         // The outbox changed (or was just read from disk): an interrupted clear or undo is put right.
         clearing.reconcile(wall());
@@ -1629,9 +1669,35 @@ final class ComposerBar {
             host.enterKey();
             return;
         }
-        // The draft stays until the message is queued or kept, so nothing is lost.
-        if (!host.send(outgoing)) return;
-        drafts.sent();
+        // The durable handoff (§3.2): the exact text is on disk as a draft or as a held
+        // message at every moment, never both and never neither.
+        SendHandoff.Record record = new SendHandoff.Record(java.util.UUID.randomUUID().toString(),
+                drafts.owner().isEmpty() ? drafts.pane() : drafts.owner(), outgoing);
+        SendHandoff.Result result = SendHandoff.run(record, new SendHandoff.Steps() {
+            @Override public boolean commitDraft(SendHandoff.Record r) {
+                field.removeCallbacks(saveDrafts);
+                return preferences.edit().putString(DRAFTS, drafts.encode())
+                        .putString(SendHandoff.KEY, r.encode()).commit();
+            }
+
+            @Override public boolean holdMessage(SendHandoff.Record r) {
+                return host.send(r.text, r.id);
+            }
+
+            @Override public boolean clearDraft(SendHandoff.Record r) {
+                drafts.sent();
+                return preferences.edit().putString(DRAFTS, drafts.encode()).remove(SendHandoff.KEY).commit();
+            }
+
+            @Override public void forget(SendHandoff.Record r) {
+                preferences.edit().remove(SendHandoff.KEY).commit();
+            }
+        });
+        if (result == SendHandoff.Result.DRAFT_NOT_SAVED) {
+            host.notice("Could not save the draft; nothing was sent");
+            return;
+        }
+        if (result == SendHandoff.Result.NOT_HELD) return;
         transcribedOnPhone = false;
         nothingHeard = null;
         showText("");

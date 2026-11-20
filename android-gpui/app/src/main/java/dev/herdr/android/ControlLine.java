@@ -182,7 +182,7 @@ final class ControlLine {
     /** A queued row's actions, drawn on the row while it is selected ({@link #rowRungs}). */
     static java.util.List<GhostText.Control> rowActions(QueueView.Row row) {
         java.util.List<GhostText.Control> out = new java.util.ArrayList<>();
-        if (row.kind == QueueView.Kind.MESSAGE && row.messageState == Outbox.State.UNSURE) {
+        if (row.kind == QueueView.Kind.MESSAGE && row.messageState == Outbox.State.NEEDS_YOU) {
             out.add(new GhostText.Control("row-again", "send again", "warn"));
         }
         if (row.kind == QueueView.Kind.PARKED) out.add(new GhostText.Control("row-retry", "retry", "warn"));

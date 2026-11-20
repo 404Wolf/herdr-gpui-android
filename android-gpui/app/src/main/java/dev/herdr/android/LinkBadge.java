@@ -55,8 +55,16 @@ final class LinkBadge {
         final String title;
         /** The first in-place action: {@link #RECONNECT} or {@link #NEW_SHELL}. */
         final String primary;
+        /** The link is up and only held messages show it: a tap opens the queue, nothing else. */
+        final boolean queuedOnly;
 
         Look(boolean shown, String text, String description, Tone tone, String title, String primary) {
+            this(shown, text, description, tone, title, primary, false);
+        }
+
+        Look(boolean shown, String text, String description, Tone tone, String title, String primary,
+                boolean queuedOnly) {
+            this.queuedOnly = queuedOnly;
             this.shown = shown;
             this.text = text;
             this.description = description;
@@ -74,11 +82,17 @@ final class LinkBadge {
      * @param problem a failure worth saying on tap (already human, see BannerCopy), or null
      * @param cached a held or saved copy of the pane is on screen
      * @param when that copy's age ("14:32"), null when the pane has no copy
-     * @param waiting messages and inputs that wait for the link
+     * @param waiting held messages in the whole queue, every computer and pane
      */
     static Look look(boolean down, boolean noNetwork, String problem, boolean cached, String when, int waiting) {
         boolean failed = problem != null && !problem.isEmpty();
-        if (!down && !failed && !cached) return HIDDEN;
+        if (!down && !failed && !cached) {
+            if (waiting <= 0) return HIDDEN;
+            // Live, with messages held somewhere: the count alone, and a tap opens the queue.
+            String said = waiting + (waiting == 1 ? " message waits" : " messages wait")
+                    + " for you. Tap to open the queue.";
+            return new Look(true, waiting + " queued", said, Tone.QUIET, said, RECONNECT, true);
+        }
         boolean offline = noNetwork || failed;
         String word = offline ? "offline" : "connecting";
         String age = !cached ? null : when == null ? "not cached" : when;
@@ -89,11 +103,12 @@ final class LinkBadge {
 
         StringBuilder said = new StringBuilder(offline ? "Offline." : "Connecting.");
         if (cached) {
-            said.append(when == null ? " This pane has no saved copy." : " Showing the copy from " + when + ".");
+            said.append(when == null ? " This pane has no saved copy."
+                    : " Showing the last saved screen, from " + when + "; it may be outdated.");
         }
         if (waiting > 0) {
             said.append(' ').append(waiting).append(waiting == 1 ? " message waits" : " messages wait")
-                    .append(" to be sent.");
+                    .append(" for you; tap to open the queue.");
         }
         String title = failed ? problem : said.toString();
         said.append(" Tap to reconnect or open the hosts.");

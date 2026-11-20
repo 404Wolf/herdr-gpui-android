@@ -293,13 +293,21 @@ For the optional HTTPS workflow, open **Companion hosts** and use the
 an existing terminal. That workflow still requires trusted HTTPS and a token.
 
 Closing or backgrounding this activity does not stop remote terminals. A
-composer message sent while the link is down waits in an on-device outbox
-(it survives the app being closed or killed) and goes out in order, through
-herdr-core's `terminal.send`, once that pane's computer is back. A message
-whose send was cut off is never resent automatically: it may have been typed,
-so it waits for the user to send it again or drop it. Messages for a pane that
-closed, or a core that restarted, are kept and offered back as drafts. Keys
-pressed while reconnecting are held in memory only.
+composer message is saved on the phone before its draft is cleared, under the
+computer it was typed for (its Herdr core id and SSH host key, proven by a
+direct connection) and the pane. Typed while that pane is live and nothing
+older waits for it, it goes at once. Otherwise it is held: it survives the app
+being closed or killed, is listed with its target, time and age in the queue
+(tap the corner's "N queued"), and is never sent by itself. Once its pane is
+live again, an offer above the terminal names the target it was typed for;
+one tap on **Send here** types it there, into the attach on screen only. A
+written message reads "sent HH:MM · check it arrived" for an hour, with Copy
+and Send again: the phone never claims it was delivered. A send that was cut
+off may have been typed, or may sit unsent in the input box, so it waits for
+the user's decision. A profile that reports another profile's Herdr from a
+different session works live only. Keys pressed with no live pane are refused,
+never replayed. Drafts found after a restart are offered ("draft from 14:02"),
+not loaded by themselves.
 
 The conversation stays readable with no link. While a reconnect runs, the last
 frame stays on screen, dimmed, and still scrolls through its own history on
@@ -307,8 +315,8 @@ the phone. Whenever a session closes, the pane's terminal grid (history,
 screen and cursor, up to 4 MB) is saved in the app's no-backup storage, at
 most 16 panes and 32 MB in all. Opening a pane from Home while its computer is
 unreachable, or returning to the terminal before it reconnects, draws that
-saved grid exactly as the program drew it, dimmed, with "showing HH:MM" in
-the status line, until the live pane attaches. A dispatched action may
+saved grid exactly as the program drew it, labelled "last saved screen ·
+HH:MM · may be outdated", until the live pane attaches. A dispatched action may
 already have reached the host when the connection fails. SSH semantic input is
 reported as queued and has no daemon receipt; see the remote guide.
 

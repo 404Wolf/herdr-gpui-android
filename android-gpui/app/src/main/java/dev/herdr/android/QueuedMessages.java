@@ -35,16 +35,16 @@ final class QueuedMessages {
 
     private static Urgency urgency(Outbox.Message message) {
         switch (message.state) {
-            case GONE: return Urgency.GONE;
-            case UNSURE: return Urgency.WAITING;
+            case NEEDS_YOU: return message.reason == Outbox.Reason.GONE ? Urgency.GONE : Urgency.WAITING;
             case SENDING: return Urgency.SENDING;
-            default: return message.blocked ? Urgency.WAITING : Urgency.QUEUED;
+            case SENT: return Urgency.NONE;
+            default: return Urgency.QUEUED;
         }
     }
 
     /** The sheet's title. */
     static String title(int count) {
-        return count == 1 ? "1 queued message, sent in order" : count + " queued messages, sent in order";
+        return count == 1 ? "1 held message, each sent by your tap" : count + " held messages, each sent by your tap";
     }
 
     /** One sheet row: the message on one line, then what is happening to it. */
@@ -56,9 +56,11 @@ final class QueuedMessages {
     static String label(Outbox.Message message, String pane) {
         switch (message.state) {
             case SENDING: return "sending…";
-            case UNSURE: return "may have been sent";
-            case GONE: return message.pane.equals(pane) ? "not sent" : "not sent · " + message.pane + " gone";
-            default: return message.blocked ? "waits for its dialog" : "queued";
+            case SENT: return "sent · check it arrived";
+            case NEEDS_YOU:
+                return message.reason == Outbox.Reason.GONE ? "not sent · " + message.pane + " gone"
+                        : "may have been sent";
+            default: return message.unverified() ? "held · destination not verified" : "held";
         }
     }
 
