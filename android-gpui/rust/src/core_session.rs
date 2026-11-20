@@ -552,6 +552,30 @@ impl Connection<'_> {
         }
         Ok(json!({"queued":true}).to_string())
     }
+    /// `terminal.put`: the file lands beside the terminal on its machine, in a
+    /// folder of the terminal's own, for its program to read; nothing is typed.
+    fn put(&mut self, file: &crate::remote::PutFile) -> Result<String> {
+        use base64::Engine;
+        let params = json!({
+            "terminal": file.terminal,
+            "name": file.name,
+            "data": base64::engine::general_purpose::STANDARD.encode(&file.bytes),
+        });
+        match self.call_within("terminal.put", params, PUT_WAIT) {
+            Ok(result) => {
+                let path = result["path"]
+                    .as_str()
+                    .filter(|p| p.starts_with('/') && p.len() <= 4096 && !p.chars().any(char::is_control))
+                    .ok_or_else(|| Error::Protocol("missing put path".into()))?;
+                Ok(json!({"queued":true,"path":path,"bytes":result["bytes"]}).to_string())
+            }
+            // A refusal after the bytes began to arrive can leave a partial file at the destination (the
+            // core's put.rs creates the final name before writing; its cleanup is a tracked core follow-up),
+            // so the phone reports the kind and never says the file is absent.
+            Err(Error::Rpc { kind, .. }) => Ok(json!({"queued":false,"kind":kind}).to_string()),
+            Err(error) => Err(error),
+        }
+    }
     /// This computer's deacon, as the desktop's Fleet starts one: a `deacon`
     /// space with a `deacon` tab running Claude, labelled `role=deacon` from
     /// birth. Rechecks first: an existing local deacon is returned, never a
@@ -1468,6 +1492,8 @@ fn send_refusal(error: &Error) -> Value {
 /// starting agent to settle, for a person to pause typing, then for the turn
 /// to start, each a few seconds.
 pub(crate) const DELIVER_WAIT: Duration = Duration::from_secs(60);
+/// A put sends up to 8 MiB (about 11 MB of base64) down the phone's link.
+pub(crate) const PUT_WAIT: Duration = Duration::from_secs(60);
 /// What an outbox send did, as `{"outcome": ..}`:
 /// `sent` (the core typed it), `blocked` (refused: the program waits on a
 /// dialog, nothing typed), `gone` (no such terminal, nothing typed), or
@@ -1927,6 +1953,9 @@ fn serve(
                 }
                 Ok(Operation::Action(action, reply)) => {
                     let _ = reply.send(connection.action(&action, cols, rows));
+                }
+                Ok(Operation::Put(file, reply)) => {
+                    let _ = reply.send(connection.put(&file));
                 }
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
@@ -3124,6 +3153,14 @@ mod connection_tests {
         action: &str,
         answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
     ) -> (Result<String>, Vec<(String, Value)>) {
+        operation_against(|tx| Operation::Action(action.into(), tx), answer)
+    }
+
+    /// As `action_against`, for any operation the worker takes.
+    fn operation_against(
+        make: impl FnOnce(mpsc::SyncSender<Result<String>>) -> Operation,
+        answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
+    ) -> (Result<String>, Vec<(String, Value)>) {
         let (phone, mut core) = UnixStream::pair().unwrap();
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
@@ -3176,7 +3213,7 @@ mod connection_tests {
             }
         });
         let (tx, reply) = mpsc::sync_channel(1);
-        commands.try_send(Operation::Action(action.into(), tx)).unwrap();
+        commands.try_send(make(tx)).unwrap();
         let result = reply.recv_timeout(Duration::from_secs(60)).unwrap();
         owner.cancel.cancel();
         let _ = runtime.join();
@@ -3209,6 +3246,57 @@ mod connection_tests {
         });
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(seen.iter().filter(|(m, _)| m == "doc.set").count(), 2);
+    }
+
+    #[test]
+    fn an_image_is_put_beside_its_terminal_and_its_path_comes_back() {
+        use base64::Engine;
+        let bytes = b"\x89PNG fixture".to_vec();
+        let file = crate::remote::PutFile::new("server/t7", "herdr-paste-5.png", bytes.clone()).unwrap();
+        let (result, seen) = operation_against(
+            |tx| Operation::Put(file, tx),
+            |method, _, _| match method {
+                "terminal.put" => Ok(json!({"path":"/run/herdr/t7/herdr-paste-5.png","bytes":13})),
+                m => Ok(base_answer(m)),
+            },
+        );
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(reply["path"], "/run/herdr/t7/herdr-paste-5.png");
+        assert_eq!(reply["queued"], true);
+        let put = seen.iter().find(|(m, _)| m == "terminal.put").unwrap();
+        assert_eq!(put.1["terminal"], "server/t7");
+        assert_eq!(put.1["name"], "herdr-paste-5.png");
+        // The bytes cross as base64, over the one core connection, nothing typed.
+        assert_eq!(put.1["data"], base64::engine::general_purpose::STANDARD.encode(&bytes));
+        assert!(seen.iter().all(|(m, _)| m != "terminal.send" && m != "terminal.keys"));
+    }
+
+    #[test]
+    fn a_core_that_refuses_a_put_says_why_and_a_broken_link_is_an_error() {
+        for kind in ["needs_update", "unknown_method", "not_found", "io"] {
+            let file = crate::remote::PutFile::new("t7", "a.png", vec![1, 2, 3]).unwrap();
+            let (result, _) = operation_against(
+                |tx| Operation::Put(file, tx),
+                move |method, _, _| match method {
+                    "terminal.put" => Err(kind),
+                    m => Ok(base_answer(m)),
+                },
+            );
+            let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+            assert_eq!((reply["queued"].as_bool(), reply["kind"].as_str()), (Some(false), Some(kind)));
+        }
+    }
+
+    #[test]
+    fn a_put_is_bounded_and_its_name_is_one_plain_file_name() {
+        use crate::remote::{MAX_PUT, PutFile};
+        assert!(PutFile::new("t1", "herdr-paste-1.jpg", vec![0; MAX_PUT]).is_ok());
+        assert!(matches!(PutFile::new("t1", "a.png", vec![0; MAX_PUT + 1]), Err(Error::PutBounds)));
+        assert!(matches!(PutFile::new("t1", "a.png", Vec::new()), Err(Error::PutBounds)));
+        for bad in ["", ".", "..", "../a.png", "a/b.png", "a\nb.png", &"x".repeat(129)] {
+            assert!(matches!(PutFile::new("t1", bad, vec![1]), Err(Error::PutName)), "{bad:?}");
+        }
+        assert!(matches!(PutFile::new("", "a.png", vec![1]), Err(Error::StaleTarget)));
     }
 
     #[test]

@@ -7,6 +7,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.view.ContentInfo;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -104,6 +105,17 @@ final class ComposerBar {
         void rawKeyboard();
         /** Wolf typed into the draft: he is using the phone (item 71). */
         default void typed() { }
+        /** Whether this screen can put an image on the computer ("img" leads the controls). */
+        default boolean canAttach() { return false; }
+        /** "img" was tapped: offer the image sources (library, camera, clipboard). */
+        default void attachImages() { }
+        /** Image files already copied to the cache: put them, then delete them. */
+        default void attachFiles(java.util.List<java.io.File> files) { }
+        /** Queues a candidate image paste, with native insertion if any item is not an image. */
+        @android.annotation.TargetApi(31)
+        default boolean attachPasted(ContentInfo payload, Runnable nativePaste) {
+            return false;
+        }
     }
 
     private static final String PREFS = "terminal-display";
@@ -126,6 +138,9 @@ final class ComposerBar {
      * high, never seen or touched. Its text is the draft, drawn as ghost text.
      */
     private final EditText field;
+    /** A worker can compare the stamp without looking at UI-owned draft or view state. */
+    private volatile long pasteDraftStamp;
+    private volatile long pastePaneStamp;
     /** The terminal keys, floated above the prompt while open. */
     private final KeysOverlay keysOverlay;
     /** Invisible touch targets over the controls the renderer draws in the prompt's frame. */
@@ -145,19 +160,19 @@ final class ComposerBar {
     private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
         @Override public boolean cancelDictation() { return cancelDictationForClear(); }
 
-        @Override public String draftText() { return drafts.text(); }
+        @Override public ComposerDrafts.Draft draft() { return drafts.draft(); }
 
-        @Override public void setDraft(String text) {
-            drafts.edit(text);
-            if (text.isEmpty()) transcribedOnPhone = false;
-            showText(text);
+        @Override public String connectionRevision() { return drafts.connectionRevision(); }
+
+        @Override public void setDraft(ComposerDrafts.Draft draft) {
+            drafts.setDraft(draft);
+            if (draft.text.isEmpty()) transcribedOnPhone = false;
+            showText(drafts.text());
         }
 
-        @Override public void restoreDraft(String text) {
-            String now = drafts.text();
-            String joined = now.trim().isEmpty() ? text : text.replaceAll("\\s+$", "") + " " + now;
-            drafts.edit(joined);
-            showText(joined);
+        @Override public void restoreDraft(ComposerDrafts.Draft draft) {
+            drafts.restoreDraft(draft);
+            showText(drafts.text());
         }
 
         @Override public List<String> clearable() { return host.clearableQueued(); }
@@ -459,12 +474,38 @@ final class ComposerBar {
     }
 
     /**
+     * Quoted paths of images just put on the computer join the end of {@code pane}'s draft (a space
+     * after what is there, one after them, as the desktop's paste types them), saved at once.
+     * Nothing is sent. False when the draft could not be saved (left as it was).
+     */
+    boolean appendAttachment(String hostId, String revision, String pane, java.util.List<String> paths) {
+        Object before = drafts.snapshot();
+        String draft = drafts.appendAttachment(hostId, revision, pane, paths);
+        if (draft == null) return false;
+        if (!persistNow()) {
+            drafts.rollback(before);
+            showText(drafts.text());
+            return false;
+        }
+        if (hostId.equals(drafts.host()) && pane.equals(drafts.pane())) showText(drafts.text());
+        return true;
+    }
+
+    /**
      * Saves the drafts to disk before returning: a dictation's text is stored before its
      * recording is deleted (the courier's {@code delivered}, the live engine's discard).
      */
     boolean persistNow() {
         field.removeCallbacks(saveDrafts);
-        return preferences.edit().putString(DRAFTS, drafts.encode()).commit();
+        return commitDrafts(drafts.encode());
+    }
+
+    private boolean commitDrafts(String encoded) {
+        String previous = preferences.getString(DRAFTS, "");
+        if (preferences.edit().putString(DRAFTS, encoded).commit()) return true;
+        // A failed commit can leave the new value in SharedPreferences' in-memory cache.
+        preferences.edit().putString(DRAFTS, previous).apply();
+        return false;
     }
 
     /** Where the drawn screen is busy, from the renderer after a paint that changed it. */
@@ -553,9 +594,13 @@ final class ComposerBar {
      * The pane on screen changed, or what it runs did. {@code paneKind} is the
      * program's kind ("claude", "codex", another agent's), or "" for a shell.
      */
-    void setPane(String paneId, String paneKind) {
+    void setPane(String hostId, String revision, String paneId, String paneKind) {
         String previous = drafts.pane();
-        boolean switched = !previous.equals(paneId == null ? "" : paneId);
+        String previousOwner = drafts.owner();
+        String onHost = hostId == null ? "" : hostId;
+        // A pane id names a terminal on one computer only: the same id on another is another pane.
+        boolean switched = !onHost.equals(drafts.host()) || !previous.equals(paneId == null ? "" : paneId)
+                || !java.util.Objects.equals(revision, drafts.connectionRevision());
         if (switched && keepsAcrossPaneSwitch(dictationState)) {
             // Keep the recording and its text: offline it finds its pane's draft later, by
             // target; the phone's (or a late desktop) final joins its own pane's draft. An Enter
@@ -569,11 +614,13 @@ final class ComposerBar {
             routing.forget();
             drafts.dictationEnded();
         }
+        if (!drafts.setHost(onHost, revision, this::commitDrafts)) host.notice("Could not save the older drafts");
         String text = drafts.switchTo(paneId);
         if (switched) {
+            pastePaneStamp++;
             // An undo belongs to the pane it cleared; the rows to the pane on screen. The first
             // pane after a start is no switch: a clear resumed from before it stays on offer.
-            if (clearing.endsOnPaneChange(previous, drafts.pane())) clearing.commit();
+            if (clearing.endsOnPaneChange(previousOwner, drafts.owner())) clearing.commit();
             queueOpen = false;
             selectedRow = null;
             transcribedOnPhone = false;
@@ -971,10 +1018,11 @@ final class ComposerBar {
         switch (id) {
             case "type": toggleTyping(); break;
             case "talk": toggleDictation(); break;
+            case ControlLine.ATTACH: host.attachImages(); break;
             case "send": enter(); break;
             case "clear": tapClear(false); break;
             case "undo":
-                clearing.undo(wall());
+                clearing.undo(drafts.owner(), wall());
                 pushGhost();
                 scheduleQueueRefresh();
                 break;
@@ -992,6 +1040,7 @@ final class ComposerBar {
         switch (id) {
             case "type": return "Type a message";
             case "talk": return "Dictate; tap again to stop";
+            case ControlLine.ATTACH: return "Attach an image: photo library, camera or clipboard";
             case "row-retry": return "Send this recording to the desktop again";
             case "send": return "Send, or press Enter; hold for the terminal keys";
             case "clear": return "Clear the message; tap again or hold to clear the queue too";
@@ -1038,8 +1087,9 @@ final class ComposerBar {
         in.queued = QueueView.count(queuedMessages, loose, parkedHere(), linkDown);
         in.queueStyle = queueStyle(queuedMessages, loose.size() + parkedHere().size(), linkDown);
         in.expanded = queueOpen;
+        in.attach = host.canAttach();
         in.clearable = !drafts.text().trim().isEmpty() || dictating() || in.queued > 0;
-        if (clearing.open(wall()) && clearing.pane().equals(drafts.pane())) {
+        if (clearing.open(drafts.owner(), wall())) {
             in.undoWide = clearing.label(false);
             in.undoNarrow = clearing.label(true);
         }
@@ -1110,8 +1160,8 @@ final class ComposerBar {
     private void tapClear(boolean longPress) {
         long now = wall();
         boolean draftClearable = !drafts.text().trim().isEmpty() || dictating();
-        if (longPress) clearing.longPress(drafts.pane(), now);
-        else clearing.tap(drafts.pane(), draftClearable, now);
+        if (longPress) clearing.longPress(drafts.owner(), now);
+        else clearing.tap(drafts.owner(), draftClearable, now);
         selectedRow = null;
         pushGhost();
         scheduleQueueRefresh();
@@ -1184,9 +1234,9 @@ final class ComposerBar {
             }
             case "row-drop":
                 if (r.kind == QueueView.Kind.CLIP || r.kind == QueueView.Kind.PARKED) {
-                    clearing.dropped(drafts.pane(), null, r.id, now);
+                    clearing.dropped(drafts.owner(), null, r.id, now);
                 } else if (r.kind == QueueView.Kind.MESSAGE) {
-                    clearing.dropped(drafts.pane(), r.id, null, now);
+                    clearing.dropped(drafts.owner(), r.id, null, now);
                 }
                 break;
             default:
@@ -1372,6 +1422,18 @@ final class ComposerBar {
                 super.onSelectionChanged(start, end);
                 if (typing) pushGhost();
             }
+
+            @android.annotation.TargetApi(31)
+            @Override public ContentInfo onReceiveContent(ContentInfo payload) {
+                // The platform inserts a separate newline between clipboard items.
+                boolean wasInsertingNewline = insertingNewline;
+                insertingNewline = true;
+                try {
+                    return super.onReceiveContent(payload);
+                } finally {
+                    insertingNewline = wasInsertingNewline;
+                }
+            }
         };
         edit.setSaveEnabled(false);
         edit.setTextSize(14);
@@ -1411,6 +1473,7 @@ final class ComposerBar {
             }
             @Override public void afterTextChanged(Editable s) {
                 if (updatingField) return;
+                pasteDraftStamp++;
                 host.typed();
                 // A keyboard that types "\n" for Enter: send, as the button does.
                 String withoutNewline = insertingNewline ? null
@@ -1437,7 +1500,36 @@ final class ComposerBar {
                 pushGhost();
             }
         });
+        if (android.os.Build.VERSION.SDK_INT >= 31) listenForImages(edit);
         return edit;
+    }
+
+    /** Android's field gets the original payload when either MIME check finds a mixed clip. */
+    @android.annotation.TargetApi(31)
+    private void listenForImages(EditText edit) {
+        edit.setOnReceiveContentListener(new String[] {"image/*"}, (view, payload) -> {
+            if (!AttachImages.isImageClip(payload.getClip())) return payload;
+            int start = edit.getSelectionStart();
+            int end = edit.getSelectionEnd();
+            return host.attachPasted(payload, () -> {
+                if (start != edit.getSelectionStart() || end != edit.getSelectionEnd()) {
+                    host.notice("Image paste cancelled: the selection changed");
+                    return;
+                }
+                // Go directly to the field's native handler, bypassing image classification.
+                edit.onReceiveContent(payload);
+            }) ? null : payload;
+        });
+    }
+
+    java.util.function.Supplier<String> capturePasteInterruption() {
+        long paneStamp = pastePaneStamp;
+        long draftStamp = pasteDraftStamp;
+        return () -> {
+            if (paneStamp != pastePaneStamp) return "Image paste cancelled: you switched panes";
+            if (draftStamp != pasteDraftStamp) return "Image paste cancelled: you edited the draft";
+            return null;
+        };
     }
 
     /**
@@ -1549,6 +1641,7 @@ final class ComposerBar {
     private void showText(String text) {
         saveDraftsSoon();
         if (!field.getText().toString().equals(text)) {
+            pasteDraftStamp++;
             updatingField = true;
             try {
                 field.setText(text);

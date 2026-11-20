@@ -3,15 +3,18 @@ package dev.herdr.android;
 import android.annotation.SuppressLint;
 
 import android.app.AlertDialog;
+import android.content.ClipData;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.content.res.ColorStateList;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.inputmethod.BaseInputConnection;
+import android.view.ContentInfo;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.KeyCharacterMap;
@@ -47,6 +50,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -254,6 +258,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String lastSnapshotTitle, lastSnapshotText, lastSnapshotStatus, lastSnapshotShortcuts;
 
     @Override protected void onCreate(Bundle state) {
+        open = true;
+        // A killed app's leftover camera capture, or a share's cached copies, are never kept.
+        CaptureFiles.clear(getCacheDir());
         // A restored activity cannot recover authority from Intent extras or framework saved state.
         launch = state == null ? GpuiLaunch.consume(System.nanoTime()) : null;
         super.onCreate(null);
@@ -2052,6 +2059,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             next.resumed = resume;
             next.hostId = host.id;
+            next.connectionRevision = host.connectionRevision;
             next.paneId = pane;
             next.hostName = host.name;
             scrollSeeking = false;
@@ -2424,7 +2432,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
         if (composer != null) {
             String kind = current == null || shellMode() ? "" : agentKind(current);
-            composer.setPane(current == null ? "" : current.paneId, kind);
+            composer.setPane(current == null ? "" : current.hostId,
+                    current == null ? null : current.connectionRevision,
+                    current == null ? "" : current.paneId, kind);
             // Agent and shell panes differ in whether the keyboard keeps its mic.
             refreshTerminalImeOptions();
             refreshQueued();
@@ -4780,6 +4790,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 nativeShowKeyboard(target.generation);
             }
 
+            @Override public boolean canAttach() { return true; }
+
+            @Override public void attachImages() { showAttachSources(); }
+
+            @android.annotation.TargetApi(31)
+            @Override public boolean attachPasted(ContentInfo payload, Runnable nativePaste) {
+                return queueImagePaste(payload.getClip(), nativePaste);
+            }
+
+            @Override public void attachFiles(java.util.List<java.io.File> files) {
+                AttachTarget target = attachTarget();
+                if (target == null) {
+                    for (java.io.File file : files) file.delete();
+                    note("Open an agent to attach an image");
+                    return;
+                }
+                java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
+                attach(target, sources, () -> { for (java.io.File file : files) file.delete(); });
+            }
+
             @Override public void withMicrophone(Runnable granted) {
                 if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -4791,6 +4822,373 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
         };
     }
+
+
+    // ---- Attaching images: the file lands on the host, its path goes into the composer. ----
+    private static volatile boolean open;
+    /** Whether a terminal screen exists to take a shared image (the share sheet checks). */
+    static boolean isOpen() { return open; }
+    static final String EXTRA_ATTACH_SHARED = "attach_shared";
+    private final java.util.concurrent.ExecutorService attachWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "herdr-attach");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+    /** The core session and pane an image is for, fixed when it was asked for. */
+    private static final class AttachTarget {
+        final long handle;
+        final String pane;
+        final String host;
+        final String revision;
+
+        AttachTarget(long handle, String pane, String host, String revision) {
+            this.handle = handle;
+            this.pane = pane;
+            this.host = host;
+            this.revision = revision;
+        }
+
+        boolean matches(Connection connection) {
+            return host.equals(connection.hostId) && revision.equals(connection.connectionRevision)
+                    && pane.equals(connection.paneId);
+        }
+    }
+
+    /** The live core session and the pane on screen, or null with no link (nothing to put an image on). */
+    private AttachTarget attachTarget() {
+        synchronized (stateLock) {
+            Connection c = connection;
+            if (c == null || c.offline || c.shell || !c.ready || c.isClosed() || c.remoteHandle <= 0
+                    || c.hostId == null || c.connectionRevision == null
+                    || c.paneId == null || c.paneId.isEmpty()) return null;
+            // An image's path belongs in an agent's composer; a plain shell's Enter bypasses the draft.
+            if (!ComposerBar.isAgent(agentKind(c))) return null;
+            return new AttachTarget(c.remoteHandle, c.paneId, c.hostId, c.connectionRevision);
+        }
+    }
+
+    private static boolean profileStillCurrent(AttachTarget target) {
+        return target.revision.equals(RemoteHostStore.connectionRevision(target.host));
+    }
+
+    /**
+     * The live session for {@code target}'s pane right now. Leaving for a picker or the camera can
+     * end the session and bring up a new one on return, so the handle from before is never reused:
+     * waits up to 15 s for the original profile revision and pane to be live again.
+     */
+    private AttachTarget liveTarget(AttachTarget target, Supplier<String> pasteCurrent) {
+        long until = SystemClock.elapsedRealtime() + 15_000;
+        do {
+            if (attachmentInterruption(target, pasteCurrent) != null) return null;
+            synchronized (stateLock) {
+                if (connection != null && target.matches(connection)) {
+                    AttachTarget now = attachTarget();
+                    if (now != null) return now;
+                }
+            }
+            try {
+                Thread.sleep(250);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        } while (SystemClock.elapsedRealtime() < until);
+        return null;
+    }
+
+    private AttachTarget cameraFor;
+
+    private void showAttachSources() {
+        if (attachTarget() == null) {
+            note("Connect to a computer to attach an image");
+            return;
+        }
+        new ActionSheet(this, chrome, "Attach an image")
+                .add("Photo library", this::pickImages)
+                .add("Take a photo", this::takePhoto)
+                .add("Paste image from clipboard", this::pasteImage)
+                .show();
+    }
+
+    private void pickImages() {
+        cameraFor = attachTarget();
+        try {
+            startActivityForResult(AttachImages.pickIntent(), AttachImages.PICK_REQUEST);
+        } catch (android.content.ActivityNotFoundException none) {
+            note("No photo picker on this phone");
+        }
+    }
+
+    private java.io.File cameraFile;
+
+    private void takePhoto() {
+        cameraFor = attachTarget();
+        if (cameraFor == null) {
+            note("Open an agent to attach an image");
+            return;
+        }
+        try {
+            cameraFile = CaptureFiles.create(getCacheDir(), System.currentTimeMillis());
+            android.net.Uri target = android.net.Uri.parse(
+                    "content://" + getPackageName() + ".capture/" + cameraFile.getName());
+            startActivityForResult(AttachImages.cameraIntent(target), AttachImages.CAMERA_REQUEST);
+        } catch (android.content.ActivityNotFoundException none) {
+            dropCapture();
+            note("No camera app on this phone");
+        } catch (java.io.IOException | RuntimeException failed) {
+            dropCapture();
+            note("The camera could not start");
+        }
+    }
+
+    /** A capture that never started: only its own file goes (another shot's may still be uploading). */
+    private void dropCapture() {
+        java.io.File own = cameraFile;
+        cameraFile = null;
+        cameraFor = null;
+        if (own != null) own.delete();
+    }
+
+    private void pasteImage() {
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+        if (clip == null) {
+            note("No image on the clipboard");
+            return;
+        }
+        queueImagePaste(clip, null);
+    }
+
+    /** The native fallback holds the receive-content payload and its temporary grant. */
+    private boolean queueImagePaste(ClipData clip, Runnable nativePaste) {
+        AttachTarget target = attachTarget();
+        if (composer == null || (target == null && nativePaste == null)) {
+            note("Open an agent to attach an image");
+            return true;
+        }
+        Supplier<String> draftInterruption = composer.capturePasteInterruption();
+        Supplier<String> pasteCurrent = () -> {
+            synchronized (stateLock) {
+                if (target != null && connection != null && !target.matches(connection)) {
+                    return "Image paste cancelled: you switched panes";
+                }
+                return draftInterruption.get();
+            }
+        };
+        try {
+            attachWorker.execute(() -> {
+                try {
+                    List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                    int imageCount = 0;
+                    for (int i = 0; i < clip.getItemCount(); i++) {
+                        if (attachmentInterruption(target, pasteCurrent) != null) break;
+                        Uri uri = AttachImages.imageUri(clip.getItemAt(i));
+                        if (uri == null || !isImageUri(uri)) continue;
+                        imageCount++;
+                        if (sources.size() < ImageAttach.MAX_IMAGES) {
+                            sources.add(AttachImages.uriSource(getContentResolver(), uri));
+                        }
+                    }
+                    // Classify every item before uploading, including items beyond the attach limit.
+                    boolean mixed = imageCount != clip.getItemCount();
+                    if (mixed || target == null) {
+                        main.post(() -> {
+                            if (destroyed) return;
+                            String interrupted = attachmentInterruption(target, pasteCurrent);
+                            if (interrupted != null) note(interrupted);
+                            else if (mixed && nativePaste != null) nativePaste.run();
+                            else if (mixed) note("The clipboard contains non-image items");
+                            else note("Open an agent to attach an image");
+                        });
+                    } else {
+                        attachOnWorker(target, sources, pasteCurrent);
+                    }
+                } finally {
+                    java.lang.ref.Reference.reachabilityFence(nativePaste);
+                }
+            });
+            return true;
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            return false;
+        }
+    }
+
+    @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        AttachTarget target = cameraFor;
+        if (request == AttachImages.PICK_REQUEST) {
+            cameraFor = null;
+            if (result == RESULT_OK && target != null) attachTo(target, AttachImages.pickedUris(data));
+        } else if (request == AttachImages.CAMERA_REQUEST) {
+            java.io.File shot = cameraFile;
+            cameraFile = null;
+            cameraFor = null;
+            if (shot == null) return;
+            if (result != RESULT_OK || target == null) {
+                shot.delete();
+                return;
+            }
+            if (shot.length() == 0) {
+                shot.delete();
+                note("The camera returned no picture");
+                return;
+            }
+            attach(target, java.util.Collections.singletonList(AttachImages.fileSource(shot)), shot::delete);
+        }
+    }
+
+    private void attachTo(AttachTarget target, java.util.List<android.net.Uri> uris) {
+        java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+        for (android.net.Uri uri : uris) sources.add(AttachImages.uriSource(getContentResolver(), uri));
+        attach(target, sources, null);
+    }
+
+    private boolean isImageUri(Uri uri) {
+        try {
+            return AttachImages.isImageMime(getContentResolver().getType(uri));
+        } catch (RuntimeException unavailable) {
+            return false;
+        }
+    }
+
+    /**
+     * Puts each image on the pane's computer (off the main thread, over the core connection), then
+     * types the paths into that pane's draft, shell-quoted, never sent.
+     */
+    private void attach(AttachTarget target, java.util.List<ImageAttach.Source> sources, Runnable done) {
+        if (sources.isEmpty()) return;
+        try {
+            attachWorker.execute(() -> {
+                try {
+                    attachOnWorker(target, sources, null);
+                } finally {
+                    if (done != null) done.run();
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            if (done != null) done.run();
+        }
+    }
+
+    private static String attachmentInterruption(AttachTarget target, Supplier<String> pasteCurrent) {
+        if (target != null && !profileStillCurrent(target)) {
+            return "Image attachment cancelled: the remote profile changed";
+        }
+        return pasteCurrent == null ? null : pasteCurrent.get();
+    }
+
+    private static void requireAttachmentCurrent(AttachTarget target, Supplier<String> pasteCurrent)
+            throws ImageAttach.AttachException {
+        String interrupted = attachmentInterruption(target, pasteCurrent);
+        if (interrupted != null) throw new ImageAttach.AttachException(interrupted);
+    }
+
+    private void attachOnWorker(AttachTarget target, List<ImageAttach.Source> sources, Supplier<String> pasteCurrent) {
+        if (!sources.isEmpty() && attachmentInterruption(target, pasteCurrent) == null) {
+            note(sources.size() == 1 ? "Attaching image…" : "Attaching " + sources.size() + " images…");
+        }
+        List<ImageAttach.Source> guarded = new java.util.ArrayList<>();
+        for (ImageAttach.Source source : sources.subList(0, Math.min(ImageAttach.MAX_IMAGES, sources.size()))) {
+            guarded.add(() -> {
+                requireAttachmentCurrent(target, pasteCurrent);
+                return source.read();
+            });
+        }
+        ImageAttach.Outcome outcome = ImageAttach.attach(guarded, AttachImages.CONVERTER,
+                (name, bytes) -> {
+                    AttachTarget live = liveTarget(target, pasteCurrent);
+                    requireAttachmentCurrent(target, pasteCurrent);
+                    if (live == null) {
+                        throw new ImageAttach.AttachException("The connection is down; try the image again");
+                    }
+                    try {
+                        return RemoteNative.putFile(live.handle, live.pane, name, bytes);
+                    } catch (RuntimeException dropped) {
+                        String why = dropped.getMessage();
+                        throw new ImageAttach.AttachException("The image may not have arrived (it could still be on the computer)"
+                                + (why == null || why.isEmpty() ? "" : ": " + (why.length() > 120 ? why.substring(0, 120) : why)), dropped);
+                    }
+                },
+                () -> java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(System.currentTimeMillis())
+                        + System.nanoTime() % 1_000_000L);
+        main.post(() -> attached(target, outcome, pasteCurrent));
+    }
+
+    private void attached(AttachTarget target, ImageAttach.Outcome outcome, Supplier<String> pasteCurrent) {
+        if (destroyed) return;
+        String interrupted = attachmentInterruption(target, pasteCurrent);
+        if (interrupted != null) {
+            note(interrupted);
+            return;
+        }
+        if (!outcome.paths.isEmpty()) {
+            boolean kept = composer != null
+                    && composer.appendAttachment(target.host, target.revision, target.pane, outcome.paths);
+            int n = outcome.paths.size();
+            note(!kept ? "The image arrived but the draft could not be saved"
+                    : outcome.failures.isEmpty() ? (n == 1 ? "Image attached" : n + " images attached")
+                    : n + " attached, " + outcome.failures.size() + " failed: " + outcome.failures.get(0));
+        } else if (!outcome.failures.isEmpty()) {
+            note(outcome.failures.get(0));
+        } else if (pasteCurrent != null) {
+            note("No image on the clipboard");
+        }
+    }
+
+    private int askedShare = -1;
+
+    /**
+     * Images from the share sheet wait here until the user chooses: once a live agent is on screen
+     * this asks "attach to this agent?" (once per share). Nothing is uploaded before the answer, and
+     * an answer takes only the share it was asked about.
+     */
+    private void takeSharedImages() {
+        long now = System.currentTimeMillis();
+        if (destroyed) return;
+        if (!SharedImages.waiting(now)) {
+            // Everything refused and nothing waiting: say why, once, wherever the sender lands.
+            String why = SharedImages.takeNotice(now);
+            if (why != null) note(why);
+            return;
+        }
+        if (askedShare == SharedImages.generation()) return;
+        AttachTarget target = attachTarget();
+        if (target == null) {
+            main.removeCallbacks(retrySharedImages);
+            main.postDelayed(retrySharedImages, 1500);
+            return;
+        }
+        int generation = SharedImages.generation();
+        askedShare = generation;
+        int count = SharedImages.count(now);
+        String where;
+        synchronized (stateLock) { where = connection == null || connection.title == null ? "this agent" : connection.title; }
+        new ActionSheet(this, chrome, (count == 1 ? "Attach the shared image to " : "Attach " + count + " shared images to ") + where + "?")
+                .add("Attach", () -> {
+                    AttachTarget live = attachTarget();
+                    if (live == null || !live.pane.equals(target.pane) || !live.host.equals(target.host)
+                            || !live.revision.equals(target.revision) || !profileStillCurrent(target)) {
+                        note("That agent is not on screen any more; open it and share again");
+                        return;
+                    }
+                    // A newer share replaced the one this dialog was about: it takes nothing of it.
+                    java.util.List<java.io.File> files = SharedImages.take(System.currentTimeMillis(), generation);
+                    if (files.isEmpty()) {
+                        note("A newer shared image replaced this one");
+                        return;
+                    }
+                    java.util.List<ImageAttach.Source> sources = new java.util.ArrayList<>();
+                    for (java.io.File file : files) sources.add(AttachImages.fileSource(file));
+                    attach(live, sources, () -> { for (java.io.File file : files) file.delete(); });
+                })
+                .add("Not now (pick another agent in Home)", () -> { })
+                .show();
+    }
+
+    private final Runnable retrySharedImages = this::takeSharedImages;
 
     private static final int MICROPHONE_REQUEST = 41;
     /** What the composer asked to do once the microphone is allowed; one request at a time. */
@@ -5144,6 +5542,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     @Override protected void onNewIntent(android.content.Intent intent) {
         super.onNewIntent(intent);
+        if (intent.getBooleanExtra(EXTRA_ATTACH_SHARED, false)) {
+            // Every item refused: say why here; otherwise ask about the waiting images.
+            String why = SharedImages.takeNotice(System.currentTimeMillis());
+            if (why != null) note(why);
+            else takeSharedImages();
+        }
         String hostId = intent.getStringExtra(EXTRA_FOCUS_HOST);
         String pane = intent.getStringExtra(EXTRA_FOCUS_PANE);
         if (hostId == null || pane == null || destroyed) return;
@@ -5167,6 +5571,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean firstOpen = !openedOnce;
         openedOnce = true;
         nativeResumed();
+        takeSharedImages();
         // Herdr in front is Wolf looking at it (item 71): the attach that follows says so.
         markUsed();
         if (monitor == null && !launch.shell) {
@@ -5211,6 +5616,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 next = new Connection(GENERATIONS.incrementAndGet(), remoteHandle);
                 next.hostId = currentHostId;
+                next.connectionRevision = launch.remoteHost.connectionRevision;
             } else next = new Connection(GENERATIONS.incrementAndGet(), new CompanionClient(launch.host.profile));
             connection = next;
             nativeSetActive(next.generation, false);
@@ -5280,6 +5686,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @Override protected void onDestroy() {
         destroyed = true;
+        open = false;
+        attachWorker.shutdownNow();
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
         Dictation.pending(this).setListener(null);
@@ -6428,6 +6836,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             offline.offline = true;
             offline.closed = true;
             offline.hostId = hostId;
+            offline.connectionRevision = RemoteHostStore.connectionRevision(hostId);
             offline.hostName = hostName;
             offline.title = hostName;
             offline.paneId = pane == null ? "" : pane;
@@ -6957,6 +7366,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String remoteBoot;
         /** The saved host this session belongs to, for the outbox; null for a companion or shell. */
         volatile String hostId;
+        /** The saved revision that opened this connection, even if the profile is later edited. */
+        String connectionRevision;
         volatile String paneId = launch.paneId;
         /** A pane switch asked for and not yet confirmed by the daemon, and until when to wait. */
         volatile String pendingPane = "";

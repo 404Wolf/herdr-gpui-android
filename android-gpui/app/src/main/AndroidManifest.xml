@@ -14,6 +14,10 @@
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
+        <!-- Attach > Take a photo hands the shot to the phone's own camera app. -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
     </queries>
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <uses-feature android:name="android.hardware.vulkan.level" android:version="0" android:required="false" />
@@ -45,6 +49,25 @@
             android:theme="@style/GpuiTheme"
             android:windowSoftInputMode="adjustResize" />
         <activity android:name="dev.herdr.android.DeviceDiagnosticsActivity" android:exported="false" />
+        <!-- The camera's one private capture file, granted to the camera app per shot. -->
+        <provider android:name="dev.herdr.android.CaptureProvider"
+            android:authorities="${applicationId}.capture" android:exported="false"
+            android:grantUriPermissions="true" />
+        <!-- "Share to Herdr": images from the share sheet go to the agent on screen. -->
+        <activity android:name="dev.herdr.android.ShareTargetActivity" android:exported="true"
+            android:label="Herdr" android:excludeFromRecents="true" android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
         <activity android:name="dev.herdr.android.AboutActivity" android:exported="false"
             android:theme="@style/AboutTheme" />
         <activity android:name="dev.herdr.android.GpuiTerminalActivity" android:exported="false"

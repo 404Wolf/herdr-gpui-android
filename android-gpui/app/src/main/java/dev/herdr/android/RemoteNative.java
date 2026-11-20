@@ -49,6 +49,13 @@ final class RemoteNative {
      * sent|blocked|gone|unsure|retry}.
      */
     static native String deliver(long handle, String paneId, String text);
+    /**
+     * Puts {@code data} (at most 8 MB) beside the pane's terminal on its machine over the core
+     * connection (terminal.put), named {@code name}; types nothing. {"queued":true,"path"} or
+     * {"queued":false,"kind"} (needs_update: the host's Herdr is too old). Blocks up to about a
+     * minute, so worker threads only.
+     */
+    static native String putFile(long handle, String paneId, String name, byte[] data);
     static native String scrollTo(long handle, long offsetFromBottom);
     /**
      * Scrolls the frame held on screen while the link is down (the last
