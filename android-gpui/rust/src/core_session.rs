@@ -5616,30 +5616,26 @@ mod cache_tests {
         crate::remote::release_held();
     }
 
-    /// Round 3 P2-1: the poll's own work (looking at the screen) never waits
-    /// while a first drag encodes the phone's copy.
+    /// Round 3 P2-1, made exact (round 4): while a first drag assembles the
+    /// phone's copy, the locks the poll takes are all free.
     #[test]
     fn ask2_the_poll_never_waits_for_the_first_drags_copy() {
         let (terminal, tx, _sent) = full_screen();
         let session = owner(7823, "boot-7823", terminal.clone(), "done");
         crate::remote::register_for_test(session.clone());
-        tx.send(Chunk::Data(paint(9))).unwrap();
-        shows(&terminal, 9);
-        // A full 1 MiB of short rows: the most rows a copy can hold.
-        let rows: Vec<crate::transcript::Row> = (0..250_000).map(|n| crate::transcript::Row::plain(&format!("{}", n % 10))).collect();
-        crate::remote::adopt_for_test("boot-7823", "t1", crate::transcript::Transcript::restored(rows, 0, COLS.into()));
-        let drag = std::thread::spawn(|| crate::remote::scroll_local(7823, 3, paint_args(0)).map(|_| ()));
-        let mut worst = Duration::ZERO;
-        let until = Instant::now() + Duration::from_millis(1500);
-        while Instant::now() < until {
-            let asked = Instant::now();
-            session.heard.printed(1);
-            crate::remote::keep_local(&session, &mut lock(&session.state));
-            worst = worst.max(asked.elapsed());
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        drag.join().unwrap().unwrap();
-        assert!(worst < Duration::from_millis(15), "the poll waited {worst:?} for the copy to be encoded");
+        stream(&session, &tx, 9, 60);
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let (seen, probe_session, probe_terminal) = (free.clone(), session.clone(), terminal.clone());
+        crate::snapshot::probe::set("encode", move || {
+            let state = probe_session.state.try_lock().is_ok();
+            let grid = probe_terminal.grid().try_lock_unfair().is_some();
+            lock(&seen).push((state, grid));
+        });
+        crate::remote::scroll_local(7823, 3, paint_args(0)).unwrap();
+        crate::snapshot::probe::clear();
+        let free = lock(&free).clone();
+        assert!(!free.is_empty(), "no copy was assembled");
+        assert!(free.iter().all(|(state, grid)| *state && *grid), "a lock the poll takes was held while the copy was assembled: {free:?}");
         crate::remote::close(7823);
         crate::remote::release_held();
     }
@@ -5901,4 +5897,271 @@ mod cache_tests {
         crate::remote::close(7794);
         crate::remote::release_held();
     }
+
+    // ---- Review round 4 (#43, f6c193f) ----
+
+    /// Wheel reports the pane sent the program: (back, forward).
+    fn wheels(sent: &mpsc::Receiver<Operation>) -> (usize, usize) {
+        std::thread::sleep(Duration::from_millis(100));
+        let (mut back, mut forward) = (0, 0);
+        while let Ok(operation) = sent.try_recv() {
+            if let Operation::Frame(_, 0, bytes) = operation {
+                let text = String::from_utf8_lossy(&bytes);
+                back += text.matches("\x1b[<64;").count();
+                forward += text.matches("\x1b[<65;").count();
+            }
+        }
+        (back, forward)
+    }
+
+    /// The phone's copy of `id`'s pane, read back to exactly its top row.
+    fn at_copy_top(id: u64, session: &Session) -> usize {
+        crate::remote::scroll_local(id, 1, paint_args(0)).unwrap();
+        let (_, reader) = lock(&session.state).local.reader_for_test().expect("a copy");
+        let top = reader.grid().lock().history_size();
+        crate::remote::scroll_local(id, i64::try_from(top).unwrap() - 1, paint_args(0)).unwrap();
+        assert_eq!(reader.grid().lock().display_offset(), top);
+        top
+    }
+
+    /// Round 4 P1-2: the stream ended and the pane attached again: nothing
+    /// watched on the old stream is read back on the new one.
+    #[test]
+    fn ask2_a_reattach_never_reads_back_the_ended_streams_rows() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7901, "boot-7901", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        crate::remote::scroll_local(7901, 12, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_some());
+        // The core ended the stream (a kept terminal recovered); the list still
+        // has the old process; the attach reply names the new one.
+        crate::remote::reattach_for_test(&session, &json!({"pid": crate::remote::TEST_PID + 1, "created_ms": 0}));
+        tx.send(Chunk::Data(other_paint(40))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.screen_text().contains("another talk 040") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        settle_now(&session);
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        crate::remote::scroll_local(7901, 3, paint_args(0)).unwrap();
+        if let Some((_, reader)) = lock(&session.state).local.reader_for_test() {
+            let rows = text_rows(&reader);
+            assert!(!rows.iter().any(|r| r.contains("conversation line")), "the ended stream's rows came back: {rows:?}");
+        }
+        crate::remote::close(7901);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P1-2: a pane whose process goes missing from the list loses
+    /// what the phone watched of it, and never gets it back when a process
+    /// with the same id shows up again.
+    #[test]
+    fn ask2_a_pane_whose_process_goes_missing_never_gets_its_rows_back() {
+        let (terminal, tx, _sent) = full_screen();
+        let session = owner(7902, "boot-7902", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 60);
+        set_pane(&session, json!({"pid": null}));
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        set_pane(&session, json!({"pid": crate::remote::TEST_PID}));
+        session.heard.printed(1);
+        crate::remote::keep_local(&session, &mut lock(&session.state));
+        crate::remote::scroll_local(7902, 3, paint_args(0)).unwrap();
+        if let Some((_, reader)) = lock(&session.state).local.reader_for_test() {
+            let rows = text_rows(&reader);
+            assert!(!rows.contains(&line(20)), "rows watched before the process went missing came back: {rows:?}");
+        }
+        crate::remote::close(7902);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P1-3: a new connection to the same core, the same pane with the
+    /// same process id and created_ms (a reused id after a reboot), never joins
+    /// the last connection's rows.
+    #[test]
+    fn ask2_a_new_connection_never_joins_the_last_ones_rows_even_with_the_same_pid() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, _sent) = full_screen();
+        let first = owner(7903, "boot-7903", terminal, "done");
+        crate::remote::register_for_test(first.clone());
+        stream(&first, &tx, 9, 60);
+        crate::remote::close(7903);
+        crate::remote::release_held();
+        let (live, tx2, _sent2) = full_screen();
+        let second = owner(7904, "boot-7903", live.clone(), "done");
+        crate::remote::register_for_test(second.clone());
+        for newest in [40, 42, 44] {
+            tx2.send(Chunk::Data(other_paint(newest))).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !live.screen_text().contains(&format!("another talk {newest:03}")) {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            second.heard.printed(1);
+            crate::remote::keep_local(&second, &mut lock(&second.state));
+        }
+        crate::remote::scroll_local(7904, 3, paint_args(0)).unwrap();
+        if let Some((_, reader)) = lock(&second.state).local.reader_for_test() {
+            let rows = text_rows(&reader);
+            assert!(!rows.iter().any(|r| r.contains("conversation line")), "the last connection's rows joined: {rows:?}");
+        }
+        crate::remote::close(7904);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-1: a drag that crosses the top of the phone's copy carries
+    /// the rows past it to the program.
+    #[test]
+    fn ask2_a_drag_across_the_top_of_the_copy_carries_its_rest_to_the_program() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7905, "boot-7905", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7905, &session);
+        crate::remote::scroll_local(7905, -2, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (0, 0));
+        crate::remote::scroll_local(7905, 5, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (3, 0), "the rows past the copy's top never reached the program");
+        crate::remote::close(7905);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-1: the first drag on a pane longer than its copy carries the
+    /// rest to the program too.
+    #[test]
+    fn ask2_a_first_drag_longer_than_the_copy_carries_its_rest_to_the_program() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7906, "boot-7906", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        crate::remote::scroll_local(7906, 1000, paint_args(0)).unwrap();
+        assert!(wheels(&sent).0 > 0, "a drag past everything the phone has went nowhere");
+        crate::remote::close(7906);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-1: only the wheel reports really sent are counted: 40 rows
+    /// asked are 30 reports, and 30 back bring the program down again.
+    #[test]
+    fn ask2_the_drags_handed_back_are_counted_as_the_reports_sent() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7907, "boot-7907", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7907, &session);
+        crate::remote::scroll_local(7907, 40, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (30, 0));
+        // The program scrolled its own view back.
+        tx.send(Chunk::Data(paint(25))).unwrap();
+        shows(&terminal, 25);
+        crate::remote::scroll_local(7907, -30, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (0, 30));
+        // Back at its newest row: the phone's copy takes the drags again.
+        tx.send(Chunk::Data(paint(40))).unwrap();
+        shows(&terminal, 40);
+        crate::remote::scroll_local(7907, 3, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_some(), "the drag still went to the program");
+        crate::remote::close(7907);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-1: a program that never scrolled (it was at its own top) is
+    /// at its newest row: a drag down gives the drags back to the phone's
+    /// copy, sending nothing.
+    #[test]
+    fn ask2_a_drag_down_at_the_programs_newest_row_returns_to_the_copy() {
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7908, "boot-7908", terminal, "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7908, &session);
+        crate::remote::scroll_local(7908, 40, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (30, 0));
+        crate::remote::scroll_local(7908, -30, paint_args(0)).unwrap();
+        assert_eq!(wheels(&sent), (0, 0), "reports sent to a program already at its newest row");
+        crate::remote::scroll_local(7908, 3, paint_args(0)).unwrap();
+        assert!(lock(&session.state).local.reader_for_test().is_some(), "a dead end: the drag still went to the program");
+        crate::remote::close(7908);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-2: a save while the agent scrolls its own view keeps the
+    /// newest rows the phone watched, not that older view.
+    #[test]
+    fn ask2_a_save_while_the_agent_scrolls_itself_keeps_the_newest_rows_watched() {
+        let _serial = crate::remote::departed_test_lock();
+        let (terminal, tx, sent) = full_screen();
+        let session = owner(7909, "boot-7909", terminal.clone(), "done");
+        crate::remote::register_for_test(session.clone());
+        stream(&session, &tx, 9, 40);
+        let _ = wheels(&sent);
+        at_copy_top(7909, &session);
+        crate::remote::scroll_local(7909, 3, paint_args(0)).unwrap();
+        assert!(wheels(&sent).0 > 0, "not handed back");
+        tx.send(Chunk::Data(paint(20))).unwrap();
+        shows(&terminal, 20);
+        let copy = crate::remote::copy_pane(7909, "t1").unwrap().unwrap();
+        let text = String::from_utf8_lossy(&copy);
+        assert!(text.contains(&line(40)), "the newest rows watched are not in the copy");
+        assert!(!text.contains(crate::transcript::GAP_TEXT), "the save marked a gap at the agent's own view");
+        crate::remote::close(7909);
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-4: a copy opened (or an uncached pane's note) is not drawn
+    /// before the phone has checked it is still the pick: the held frame stays.
+    #[test]
+    fn ask2_an_opened_copy_is_not_drawn_before_its_pick_is_checked() {
+        let (terminal, tx, _sent) = full_screen();
+        tx.send(Chunk::Data(paint(9))).unwrap();
+        shows(&terminal, 9);
+        crate::remote::hold(terminal);
+        let (held, _) = crate::remote::held_for_test().unwrap();
+        let copy = crate::snapshot::Rows::of_grid(&crate::snapshot::restore(crate::snapshot::Saved::of(COLS, ROWS, "t1", paint(9))).unwrap().grid().lock()).file("t1").unwrap();
+        let opened = crate::remote::open_saved(copy).unwrap();
+        assert_eq!(crate::remote::held_for_test().map(|(id, _)| id), Some(held), "the open replaced the held frame");
+        assert!(crate::remote::renderer(opened).is_none(), "the open is drawable before its checks");
+        let note = crate::remote::hold_note("t2", "t2", "not cached", COLS, ROWS).unwrap();
+        assert_eq!(crate::remote::held_for_test().map(|(id, _)| id), Some(held), "the note replaced the held frame");
+        assert!(crate::remote::renderer(note).is_none());
+        crate::remote::release_held();
+    }
+
+    /// Round 4 P2-5: a plain shell's copy formats its rows (styles, links)
+    /// with the grid unlocked: the poll never waits for it.
+    #[test]
+    fn ask2_a_plain_shells_copy_formats_its_rows_with_the_grid_unlocked() {
+        let _serial = crate::remote::departed_test_lock();
+        let mut text = String::new();
+        for n in 0..3000 {
+            text.push_str(&format!("\x1b[3{}m{n:05}\x1b[0m \x1b[1;4mstyled\x1b[0m \x1b]8;;https://example.test/{n}\x1b\\link\x1b]8;;\x1b\\\r\n", n % 8));
+        }
+        let shell = crate::snapshot::restore(crate::snapshot::Saved::of(80, 24, "t1", text.into_bytes())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shell.is_alive() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        crate::remote::closed_for_test(7910, shell.clone(), "t1");
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let (seen, grid) = (free.clone(), shell.clone());
+        crate::snapshot::probe::set("format", move || {
+            let unlocked = grid.grid().try_lock_unfair().is_some();
+            lock(&seen).push(unlocked);
+        });
+        let copy = crate::remote::copy_pane(7910, "t1").unwrap().unwrap();
+        crate::snapshot::probe::clear();
+        assert!(String::from_utf8_lossy(&copy).contains("02999"));
+        let free = lock(&free).clone();
+        assert!(!free.is_empty() && free.iter().all(|unlocked| *unlocked), "rows were formatted with the grid locked");
+    }
+
 }

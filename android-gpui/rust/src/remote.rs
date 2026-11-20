@@ -1374,6 +1374,13 @@ pub fn discover(id: u64) -> Result<String> {
 pub(crate) fn register_for_test(owner: Arc<Session>) {
     lock(sessions()).insert(owner.id, owner);
 }
+/// The pane on screen attached again (its stream ended): `terminal` is the
+/// attach reply's terminal record.
+#[cfg(test)]
+pub(crate) fn reattach_for_test(owner: &Session, terminal: &Value) {
+    let _ = terminal;
+    lock(&owner.state).local = Local::attached(owner.heard.output_now());
+}
 /// The PTY process id the tests' panes report.
 #[cfg(test)]
 pub(crate) const TEST_PID: u64 = 4242;

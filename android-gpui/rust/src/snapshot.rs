@@ -94,6 +94,8 @@ impl Rows {
     /// The bytes that draw these rows, at most `max_bytes` (the oldest
     /// history rows dropped to fit), and how many history rows were kept.
     pub(crate) fn encode(self, max_bytes: usize) -> (Vec<u8>, usize) {
+        #[cfg(test)]
+        probe::hit("encode");
         if self.cols == 0 || self.lines == 0 {
             return (Vec::new(), 0);
         }
@@ -172,6 +174,34 @@ fn assemble(lines: &[&str], history: usize, tail: &str, max_bytes: usize) -> (Ve
 
 const START: &str = "\x1b[0m";
 
+/// Test probes: a test registers what runs when the code under test reaches
+/// a named point ("format": a row is formatted; "encode": a copy's bytes are
+/// assembled), on the same thread.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    type Probes = HashMap<&'static str, Box<dyn FnMut()>>;
+    thread_local! {
+        static PROBES: RefCell<Probes> = RefCell::new(HashMap::new());
+    }
+    pub(crate) fn set(name: &'static str, f: impl FnMut() + 'static) {
+        PROBES.with(|p| p.borrow_mut().insert(name, Box::new(f)));
+    }
+    pub(crate) fn clear() {
+        PROBES.with(|p| p.borrow_mut().clear());
+    }
+    pub(crate) fn hit(name: &'static str) {
+        let f = PROBES.with(|p| p.borrow_mut().remove(name));
+        if let Some(mut f) = f {
+            f();
+            PROBES.with(|p| {
+                p.borrow_mut().entry(name).or_insert(f);
+            });
+        }
+    }
+}
+
 /// The rows of a saved copy's bytes (as [`assemble`] wrote them), each with its text.
 #[cfg(test)]
 pub(crate) fn saved_rows(bytes: &[u8]) -> Vec<crate::transcript::Row> {
@@ -224,6 +254,8 @@ fn strip_sgr(vt: &str) -> String {
 /// One row, self-contained: it starts and ends in the default style, so any
 /// prefix of history can be dropped. Trailing blanks that draw nothing are left out.
 pub(crate) fn row<U: EventListener>(grid: &Crosswords<U>, line: i32, cols: usize) -> String {
+    #[cfg(test)]
+    probe::hit("format");
     let cells = &grid.grid[Line(line)];
     let last = (0..cols).rev().find(|&col| {
         let square = &cells[Column(col)];
@@ -478,6 +510,18 @@ mod tests {
         assert!(text.contains("README.md"));
         assert!(!text.contains("a transcript row from elsewhere"));
         assert!(text.lines().next().unwrap().contains("\"full_screen\":false"));
+    }
+
+    /// Round 4 P2-3: a plain shell's copy keeps 4 MiB of scrollback, as on
+    /// phone-feedback: 6,000 rows of 240 characters are all there.
+    #[test]
+    fn ask2_a_plain_shell_copy_keeps_its_4_mib_of_scrollback() {
+        let wide = "x".repeat(232);
+        let text: String = (0..6000).map(|n| format!("{n:05} {wide}\r\n")).collect();
+        let session = parsed(text.as_bytes(), 240, 24);
+        let bytes = copy(&session.grid().lock(), "t1", None).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("00000 x"), "the oldest rows were dropped from a {} byte copy", bytes.len());
     }
 
     fn parsed(text: &[u8], cols: u16, rows: u16) -> Arc<gpui_rio::Session> {
