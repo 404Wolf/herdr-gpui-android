@@ -1,9 +1,10 @@
-//! Read-only looks the phone asks of the machine it is connected to, apart
-//! from core_session's layout edits: `{"op":"usage.look"}` runs that machine's
+//! Ops the phone asks of the machine it is connected to, apart from
+//! core_session's layout edits: `{"op":"usage.look"}` runs that machine's
 //! `aswap list --json` (cache-only: no network, no quota spent) through
-//! `machine.exec`. The core session tries [`PhoneOp::parse`] for an action it
-//! does not know and hands the op its RPC call, so this module never owns the
-//! socket.
+//! `machine.exec`; `{"op":"tab.detach",..}` closes a tab while its agents keep
+//! running, as the desktop's Park does. The core session tries
+//! [`PhoneOp::parse`] for an action it does not know and hands the op its RPC
+//! call, so this module never owns the socket.
 //!
 //! aswap's JSON is reduced here, before it reaches Java: only an account's
 //! label, provider, state and numbers pass. Anything else aswap prints (paths,
@@ -27,22 +28,53 @@ const NOT_FOUND: i64 = 127;
 const USAGE_LOOK: &str = r#"command -v aswap >/dev/null 2>&1 && exec aswap list --json
 exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 
+/// At most this many terminals in one detached tab.
+const MAX_TAB_TERMINALS: usize = 32;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PhoneOp {
     /// The selected machine's aswap accounts and their cached usage.
     UsageLook,
+    /// Close `tab` of `space` while its agents keep running: the desktop's
+    /// Park (herdr-app `TerminalChange::Park`) for each of `park` (its
+    /// herdr.space/herdr.tab labels cleared, keep off, so it lives on in the
+    /// rail under its lead and ends with its program), `kill` for the tab's
+    /// idle shells, then the tab leaves herdr-app's layout. Each id must still
+    /// be in that tab, and the tab is dropped only when nothing else is left
+    /// in it.
+    TabDetach { space: String, tab: String, park: Vec<String>, kill: Vec<String> },
 }
 
 impl PhoneOp {
     pub(crate) fn parse(action: &str) -> Option<Self> {
-        if !action.starts_with('{') || action.len() > 256 {
+        if !action.starts_with('{') || action.len() > 8192 {
             return None;
         }
         let value: Value = serde_json::from_str(action).ok()?;
+        let id = |v: &Value| {
+            v.as_str()
+                .filter(|v| !v.is_empty() && v.len() <= 128 && !v.contains('/') && !v.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        let ids = |key: &str| -> Option<Vec<String>> {
+            let all = value[key].as_array().map_or(&[][..], Vec::as_slice);
+            (all.len() <= MAX_TAB_TERMINALS).then_some(())?;
+            all.iter().map(id).collect()
+        };
         match value["op"].as_str()? {
             "usage.look" => Some(Self::UsageLook),
+            "tab.detach" => {
+                let park = ids("park")?;
+                (!park.is_empty()).then_some(())?;
+                Some(Self::TabDetach { space: id(&value["space"])?, tab: id(&value["tab"])?, park, kill: ids("kill")? })
+            }
             _ => None,
         }
+    }
+
+    /// The op changed the layout or labels, so the view must be read again.
+    pub(crate) fn edits(&self) -> bool {
+        matches!(self, Self::TabDetach { .. })
     }
 
     /// Runs the op with `call` (the core session's RPC) and returns the
@@ -55,8 +87,88 @@ impl PhoneOp {
                 let result = call("machine.exec", json!({"argv":["sh","-c",USAGE_LOOK],"timeout":10}))?;
                 Ok(usage_reply(&result)?.to_string())
             }
+            Self::TabDetach { space, tab, park, kill } => {
+                detach(&mut call, space, tab, park, kill)?;
+                Ok(json!({"queued":true,"parked":park}).to_string())
+            }
         }
     }
+}
+
+/// The live terminals the core puts in `space`/`tab`, as the view builder
+/// does: by their labels, a missing or empty one being a parked terminal's
+/// (space "loose", the tab its own id).
+fn in_tab(list: &Value, space: &str, tab: &str) -> Vec<String> {
+    let label = |t: &Value, key: &str| t["labels"][key].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
+    list["terminals"]
+        .as_array()
+        .map(|all| {
+            all.iter()
+                .filter(|t| t["state"] == "live")
+                .filter_map(|t| {
+                    let id = t["address"].as_str().or(t["id"].as_str())?;
+                    let at_space = label(t, "herdr.space").unwrap_or_else(|| "loose".into());
+                    let at_tab = label(t, "herdr.tab").unwrap_or_else(|| id.to_owned());
+                    (at_space == space && at_tab == tab).then(|| id.to_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn detach(
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+    space: &str,
+    tab: &str,
+    park: &[String],
+    kill: &[String],
+) -> Result<()> {
+    // Checked against the core's labels now, not the phone's view: a terminal
+    // that moved since the sheet opened is not parked or killed here.
+    let there = in_tab(&call("terminal.list", json!({}))?, space, tab);
+    if park.iter().chain(kill).any(|id| !there.contains(id)) {
+        return Err(Error::StaleTarget);
+    }
+    // The layout first: if it fails, nothing has changed and the phone can try
+    // again. A tab that gained a terminal since the sheet opened stays for it.
+    let whole = there.iter().all(|id| park.contains(id) || kill.contains(id));
+    if whole && space != "loose" {
+        drop_tab(call, space, tab)?;
+    }
+    for terminal in park {
+        call("terminal.label", json!({"terminal":terminal,"labels":{"herdr.space":"","herdr.tab":""}}))?;
+        call("terminal.keep", json!({"terminal":terminal,"keep":false}))?;
+    }
+    for terminal in kill {
+        call("terminal.kill", json!({"terminal":terminal}))?;
+    }
+    Ok(())
+}
+
+/// Removes `tab` from `space` in herdr-app's layout, retrying a version race.
+fn drop_tab(call: &mut impl FnMut(&str, Value) -> Result<Value>, space: &str, tab: &str) -> Result<()> {
+    for _ in 0..3 {
+        let doc = call("doc.get", json!({"name":"herdr-app"}))?;
+        let mut value = doc["value"].clone();
+        let Some(tabs) = value["spaces"]
+            .as_array_mut()
+            .and_then(|spaces| spaces.iter_mut().find(|s| s["id"] == space))
+            .and_then(|s| s["tabs"].as_array_mut())
+        else {
+            return Ok(());
+        };
+        let before = tabs.len();
+        tabs.retain(|t| t["id"] != tab);
+        if tabs.len() == before {
+            return Ok(());
+        }
+        match call("doc.set", json!({"name":"herdr-app","value":value,"version":doc["version"]})) {
+            Ok(_) => return Ok(()),
+            Err(Error::Rpc { kind, .. }) if kind == "conflict" => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::Protocol("the layout kept changing; try again".into()))
 }
 
 /// Why machine.exec's run did not finish cleanly, in words, or None for exit 0.
@@ -231,12 +343,108 @@ mod tests {
         })
     }
 
+    /// Every call a fake core saw: method and params, in order.
+    type Seen = std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>;
+
+    /// A fake core: answers by method, recording every call.
+    fn core(terminals: Value, conflicts: usize) -> (impl FnMut(&str, Value) -> Result<Value>, Seen) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let mut left = conflicts;
+        let call = move |method: &str, params: Value| {
+            log.borrow_mut().push((method.to_owned(), params));
+            match method {
+                "terminal.list" => Ok(json!({"terminals": terminals.clone()})),
+                "doc.get" => Ok(json!({"version":7,"value":{"spaces":[{"id":"s1","tabs":[{"id":"a"},{"id":"b"}]}]}})),
+                "doc.set" if left > 0 => {
+                    left -= 1;
+                    Err(Error::Rpc { kind: "conflict".into(), message: "version".into() })
+                }
+                _ => Ok(json!({})),
+            }
+        };
+        (call, seen)
+    }
+
+    fn live(id: &str, space: &str, tab: &str) -> Value {
+        json!({"address":id,"state":"live","labels":{"herdr.space":space,"herdr.tab":tab,"parent":"t1"}})
+    }
+
+    #[test]
+    fn detach_parks_agents_like_the_desktop_kills_idle_shells_and_drops_the_tab() {
+        let op = PhoneOp::parse(r#"{"op":"tab.detach","space":"s1","tab":"a","park":["t5"],"kill":["t6"]}"#);
+        let Some(op) = op else { panic!("tab.detach did not parse") };
+        assert!(op.edits());
+        let (call, seen) = core(json!([live("t5", "s1", "a"), live("t6", "s1", "a"), live("t7", "s1", "b")]), 1);
+        let reply = op.run(call).ok().and_then(|r| serde_json::from_str::<Value>(&r).ok()).unwrap_or_default();
+        assert_eq!(reply, json!({"queued":true,"parked":["t5"]}));
+        let seen = seen.borrow();
+        let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        // The layout first (so a failure there changes nothing), then the terminals.
+        assert_eq!(
+            methods,
+            ["terminal.list", "doc.get", "doc.set", "doc.get", "doc.set", "terminal.label", "terminal.keep", "terminal.kill"]
+        );
+        // Only tab a leaves the layout; the retry after the version race writes it again.
+        assert_eq!(seen[4].1["value"]["spaces"][0]["tabs"], json!([{"id":"b"}]));
+        assert_eq!(seen[4].1["version"], 7);
+        assert_eq!(seen[5].1, json!({"terminal":"t5","labels":{"herdr.space":"","herdr.tab":""}}));
+        assert_eq!(seen[6].1, json!({"terminal":"t5","keep":false}));
+        assert_eq!(seen[7].1, json!({"terminal":"t6"}));
+    }
+
+    #[test]
+    fn detach_refuses_a_terminal_that_left_the_tab_and_keeps_a_tab_with_a_newcomer() {
+        let op = PhoneOp::TabDetach { space: "s1".into(), tab: "a".into(), park: vec!["t5".into()], kill: vec![] };
+        let (call, seen) = core(json!([live("t5", "s1", "b")]), 0);
+        assert!(matches!(op.run(call), Err(Error::StaleTarget)));
+        assert_eq!(seen.borrow().len(), 1, "nothing changed");
+        // A terminal the sheet did not know about is still in the tab: park ours, keep the tab.
+        let (call, seen) = core(json!([live("t5", "s1", "a"), live("t9", "s1", "a")]), 0);
+        assert!(op.run(call).is_ok());
+        assert!(!seen.borrow().iter().any(|(m, _)| m == "doc.set" || m == "terminal.kill"));
+    }
+
+    #[test]
+    fn a_layout_that_keeps_failing_leaves_every_terminal_as_it_was() {
+        let op = PhoneOp::TabDetach { space: "s1".into(), tab: "a".into(), park: vec!["t5".into()], kill: vec![] };
+        let (call, seen) = core(json!([live("t5", "s1", "a")]), 3);
+        assert!(matches!(op.run(call), Err(Error::Protocol(_))));
+        assert!(!seen.borrow().iter().any(|(m, _)| m.starts_with("terminal.label") || m == "terminal.keep" || m == "terminal.kill"));
+        // So the same detach can simply be tried again.
+        let (call, _) = core(json!([live("t5", "s1", "a")]), 0);
+        assert!(op.run(call).is_ok());
+    }
+
+    #[test]
+    fn a_parked_terminal_shown_loose_can_be_detached_again_without_a_layout_edit() {
+        // Parked by the desktop: empty labels, so the view shows it as loose, its own tab.
+        let parked = json!({"address":"t5","state":"live","labels":{"herdr.space":"","herdr.tab":"","parent":"t1"}});
+        let op = PhoneOp::TabDetach { space: "loose".into(), tab: "t5".into(), park: vec!["t5".into()], kill: vec![] };
+        let (call, seen) = core(json!([parked]), 0);
+        assert!(op.run(call).is_ok());
+        assert!(!seen.borrow().iter().any(|(m, _)| m.starts_with("doc.")));
+    }
+
+    #[test]
+    fn detach_needs_something_to_park_and_plain_local_ids() {
+        assert_eq!(PhoneOp::parse(r#"{"op":"tab.detach","space":"s1","tab":"a","park":[]}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"tab.detach","space":"s1","tab":"a"}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"tab.detach","space":"s1","tab":"a","park":["laptop/t5"]}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"tab.detach","space":"","tab":"a","park":["t5"]}"#), None);
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"tab.detach","space":"s1","tab":"a","park":["t5"]}"#),
+            Some(PhoneOp::TabDetach { space: "s1".into(), tab: "a".into(), park: vec!["t5".into()], kill: vec![] })
+        );
+        assert!(!PhoneOp::UsageLook.edits());
+    }
+
     #[test]
     fn parses_only_its_own_ops() {
         assert_eq!(PhoneOp::parse(r#"{"op":"usage.look"}"#), Some(PhoneOp::UsageLook));
         assert_eq!(PhoneOp::parse(r#"{"op":"tab.rename"}"#), None);
         assert_eq!(PhoneOp::parse("usage.look"), None);
-        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"usage.look","pad":"{}"}}"#, "x".repeat(300))), None);
+        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"usage.look","pad":"{}"}}"#, "x".repeat(9000))), None);
     }
 
     #[test]
