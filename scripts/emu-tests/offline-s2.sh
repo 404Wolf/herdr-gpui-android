@@ -376,17 +376,49 @@ else
     record transcript-open FAIL "tapping the button did not open the transcript (transcript-open-fail.png)"
 fi
 
-# (3) Another pane: B's transcript, if read in the background, is B's alone; A's is never shown for B.
+# (3) A pending switch: B's tab is tapped and, before B's lookup can answer, the place where A's
+# button was is tapped at once. A's transcript must never open for B (review of #55, finding 1).
+abtn=$(find_ui 'transcript · as of') || abtn=""
+btab=$(find_ui "Window [0-9]+, agent-b[.,]") || btab=""
+if [[ -n "$abtn" && -n "$btab" ]]; then
+    read -r ax ay <<< "$abtn"
+    read -r bx by <<< "$btab"
+    a shell "input tap $bx $by; input tap $ax $ay; input tap $ax $ay"
+    quiet 3
+    shot pending-switch
+    if pane_is agent-b && find_ui 'transcript line 299' > /dev/null; then
+        record pending-switch FAIL "agent-a's transcript opened with agent-b selected (pending-switch.png)"
+    elif find_ui 'transcript line 299' > /dev/null; then
+        record pending-switch PASS "the tap landed before the switch: agent-a's own transcript, with agent-a still selected"
+    else
+        record pending-switch PASS "no agent-a transcript after a tap during the switch to agent-b"
+    fi
+    # Close whatever opened, without opening the rail when nothing did.
+    find_ui 'transcript as of .* may be outdated' > /dev/null && a shell input keyevent KEYCODE_BACK
+    quiet 2
+else
+    record pending-switch SKIP "no A button or B tab on screen to tap (offline-button.png)"
+fi
+
+# (4) Another pane: B's transcript, if read in the background, is B's alone; A's is never shown
+# for B. B's dialog must carry B's title and fixture text and none of A's.
 if switch_to agent-b; then
     quiet 4
     shot offline-b
     if find_ui 'transcript · as of' > /dev/null; then
-        a shell input keyevent KEYCODE_BACK
-        tap_ui 'transcript · as of' 5 > /dev/null && wait_ui 'agent-b|fixture B' 10 > /dev/null \
-            && ! find_ui 'transcript line 299' > /dev/null \
-            && record other-pane PASS "agent-b's own transcript (offline-b.png)" \
-            || record other-pane FAIL "agent-b shows a transcript that is not its own (offline-b.png)"
-        a shell input keyevent KEYCODE_BACK
+        if tap_ui 'transcript · as of' 5 > /dev/null && wait_ui 'agent-b · transcript as of .* may be outdated' 10 > /dev/null; then
+            shot b-dialog
+            cp "$EMU_OUT/ui.xml" "$EMU_OUT/b-dialog.xml"
+            if find_ui 'fixture B' > /dev/null && ! find_ui 'transcript line 299' > /dev/null; then
+                record other-pane PASS "B's dialog with fixture B text and none of A's (b-dialog.png)"
+            else
+                record other-pane FAIL "B's dialog lacks fixture B text or shows A's (b-dialog.png, b-dialog.xml)"
+            fi
+            a shell input keyevent KEYCODE_BACK
+        else
+            shot other-pane-fail
+            record other-pane FAIL "B's offer did not open a dialog titled for agent-b (other-pane-fail.png)"
+        fi
     else
         record other-pane PASS "no transcript offered for agent-b (none read for it)"
     fi
