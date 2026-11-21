@@ -105,6 +105,11 @@ struct Connection<'a> {
     /// answers to the program's queries go as AUTOMATIC_INPUT, which the
     /// core never counts as someone using the pane (item 71).
     automatic_input: bool,
+    /// The core's hello offered `read-bounded` and `incarnation`: a transcript
+    /// read is bounded and says which program it read. Without both, the
+    /// phone reads nothing and caches nothing (an old core keeps today's
+    /// behaviour).
+    transcripts: bool,
     /// What this viewer told the core about Wolf using it (item 71).
     focus: Focus,
     /// The attached stream has delivered output since its attach: the view
@@ -590,6 +595,25 @@ impl Connection<'_> {
         }
         let _ = reply.send(Typed::Written);
         Ok(())
+    }
+    /// One bounded transcript read (see `remote::read_transcript`). Never on a
+    /// core without `read-bounded` and `incarnation`: its read formats the
+    /// whole history under its lock and may scroll a full-screen program.
+    fn read_transcript(&mut self, request: &crate::remote::ReadRequest) -> Result<String> {
+        if !self.transcripts {
+            return Ok(json!({"supported":false}).to_string());
+        }
+        let params = json!({
+            "terminal": request.terminal,
+            "lines": request.lines,
+            "max_bytes": request.max_bytes,
+            "stitch": false,
+        });
+        match self.call_within("terminal.read", params, READ_WAIT) {
+            Ok(result) => Ok(transcript_reply(&result, request.max_bytes)?.to_string()),
+            Err(Error::Rpc { kind, .. }) => Ok(json!({"supported":true,"error":kind}).to_string()),
+            Err(error) => Err(error),
+        }
     }
     /// `terminal.put`: the file lands beside the terminal on its machine, in a
     /// folder of the terminal's own, for its program to read; nothing is typed.
@@ -1525,6 +1549,31 @@ fn send_refusal(error: &Error) -> Value {
         _ => json!({"queued":false,"error":error.to_string()}),
     }
 }
+/// How long a bounded transcript read may take: the core formats only the
+/// rows asked for, so this is generous.
+pub(crate) const READ_WAIT: Duration = Duration::from_secs(10);
+/// A bounded read's answer as the phone keeps it: the text (within the bound
+/// asked for, else a protocol error), whether the core cut it, and the
+/// incarnation it read, or null when the core could not say (then the phone
+/// keeps nothing of it).
+fn transcript_reply(result: &Value, max_bytes: usize) -> Result<Value> {
+    let text = result["text"]
+        .as_str()
+        .ok_or_else(|| Error::Protocol("missing read text".into()))?;
+    // The bound is on JSON-escaped bytes, which are never fewer than the raw ones.
+    if text.len() > max_bytes {
+        return Err(Error::Protocol("read past its bound".into()));
+    }
+    let incarnation = result["incarnation"]
+        .as_str()
+        .filter(|i| !i.is_empty() && i.len() <= 64 && i.chars().all(|c| c.is_ascii_alphanumeric()));
+    Ok(json!({
+        "supported": true,
+        "text": text,
+        "truncated": result["truncated"].as_bool().unwrap_or(false),
+        "incarnation": incarnation,
+    }))
+}
 /// A put sends up to 8 MiB (about 11 MB of base64) down the phone's link.
 pub(crate) const PUT_WAIT: Duration = Duration::from_secs(60);
 /// The phone's git look, one `sh -c` over the folders it shows (see git_look).
@@ -1893,7 +1942,15 @@ pub(crate) fn run(
     if hello["id"] != 0 || hello["result"]["generation"] != 1 {
         return Err(Error::Protocol("incompatible herdr-core handshake".into()));
     }
-    lock(&owner.state).view["boot_id"] = hello["result"]["core"]["id"].clone();
+    {
+        let mut state = lock(&owner.state);
+        state.view["boot_id"] = hello["result"]["core"]["id"].clone();
+        // What the phone may rely on from this core, for its offline transcripts.
+        state.view["features"] = json!({
+            "read_bounded": offers(&hello, "read-bounded"),
+            "incarnation": offers(&hello, "incarnation"),
+        });
+    }
     let mut connection = Connection {
         socket,
         decoder: Decoder::default(),
@@ -1914,6 +1971,7 @@ pub(crate) fn run(
         reattached_at: None,
         ended: None,
         automatic_input: offers(&hello, "automatic_input"),
+        transcripts: offers(&hello, "read-bounded") && offers(&hello, "incarnation"),
         focus: Focus {
             offered: offers(&hello, "viewer_focus") && offers(&hello, "focus_by_use"),
             ..Focus::default()
@@ -1979,6 +2037,9 @@ fn serve(
                     let _ = reply.send(connection.put(&file));
                 }
                 Ok(Operation::Compose(compose, reply)) => connection.compose(compose, &reply)?,
+                Ok(Operation::Read(request, reply)) => {
+                    let _ = reply.send(connection.read_transcript(&request));
+                }
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
                     // current size, not the size it connected with.
@@ -2202,6 +2263,11 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "status_ms": terminal["status_ms"].as_u64().unwrap_or(0),
             // Picks the canonical deacon when a computer has several candidates.
             "created_ms": terminal["created_ms"].as_u64().unwrap_or(0),
+            // Which program runs in it (feature `incarnation`): a transcript
+            // is shown offline only for the incarnation it was read from.
+            "incarnation": terminal["incarnation"]
+                .as_str()
+                .filter(|i| !i.is_empty() && i.len() <= 64 && i.chars().all(|c| c.is_ascii_alphanumeric())),
             // What runs in it now: a deacon whose claude ended is a kept shell.
             "program": terminal["foreground"]["name"].as_str().unwrap_or(""),
         }));
@@ -3236,6 +3302,15 @@ mod connection_tests {
         make: impl FnOnce(mpsc::SyncSender<Result<String>>) -> Operation,
         answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
     ) -> (Result<String>, Vec<(String, Value)>) {
+        operation_against_with(&[], make, answer)
+    }
+
+    /// As [`operation_against`], with a core whose hello offers `features`.
+    fn operation_against_with(
+        features: &'static [&'static str],
+        make: impl FnOnce(mpsc::SyncSender<Result<String>>) -> Operation,
+        answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
+    ) -> (Result<String>, Vec<(String, Value)>) {
         let (phone, mut core) = UnixStream::pair().unwrap();
         core.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let (commands, rx) = mpsc::sync_channel(256);
@@ -3256,7 +3331,10 @@ mod connection_tests {
         let peer = std::thread::spawn(move || {
             let mut hello = String::new();
             read_hello(&core, &mut hello);
-            core.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"generation\":1,\"core\":{\"id\":\"fixture\"},\"framed\":true}}\n").unwrap();
+            let mut answer_hello = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":0,"result":{
+                "generation":1,"core":{"id":"fixture"},"framed":true,"features":features}})).unwrap();
+            answer_hello.push(b'\n');
+            core.write_all(&answer_hello).unwrap();
             let mut decoder = Decoder::default();
             let mut counts: HashMap<String, usize> = HashMap::new();
             loop {
@@ -3321,6 +3399,89 @@ mod connection_tests {
         });
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(seen.iter().filter(|(m, _)| m == "doc.set").count(), 2);
+    }
+
+    /// Stage 2: a transcript is read only from a core that offers
+    /// `read-bounded` and `incarnation`, as one bounded, never-stitched
+    /// `terminal.read`; an old core is asked nothing.
+    #[test]
+    fn a_transcript_read_is_bounded_never_stitched_and_only_where_the_core_offers_it() {
+        use crate::remote::ReadRequest;
+        let request = || ReadRequest::new("t7", 2000, 65536).unwrap();
+        // An old core: nothing is asked, nothing is cached.
+        let (result, seen) = operation_against(
+            |tx| Operation::Read(request(), tx),
+            |method, _, _| match method {
+                "terminal.read" => panic!("an old core is never read"),
+                m => Ok(base_answer(m)),
+            },
+        );
+        assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap(), json!({"supported":false}));
+        assert!(seen.iter().all(|(m, _)| m != "terminal.read"));
+        // One of the two features alone is not enough.
+        let (result, _) = operation_against_with(&["read-bounded"], |tx| Operation::Read(request(), tx), |method, _, _| {
+            assert_ne!(method, "terminal.read");
+            Ok(base_answer(method))
+        });
+        assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["supported"], false);
+        // A core that offers both: one bounded read that never scrolls a full-screen program.
+        let both: &[&str] = &["read-bounded", "incarnation"];
+        let (result, seen) = operation_against_with(both, |tx| Operation::Read(request(), tx), |method, _, _| match method {
+            "terminal.read" => Ok(json!({"text":"a\nb","complete":false,"how":"history","truncated":true,"incarnation":"0a1b2c3d4e5f6a7b"})),
+            m => Ok(base_answer(m)),
+        });
+        let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(reply, json!({"supported":true,"text":"a\nb","truncated":true,"incarnation":"0a1b2c3d4e5f6a7b"}));
+        let read = seen.iter().find(|(m, _)| m == "terminal.read").unwrap();
+        assert_eq!(read.1, json!({"terminal":"t7","lines":2000,"max_bytes":65536,"stitch":false}));
+        assert!(seen.iter().all(|(m, _)| m != "terminal.send" && m != "terminal.keys"));
+        // No incarnation in the answer: the phone gets none, and keeps nothing.
+        let (result, _) = operation_against_with(both, |tx| Operation::Read(request(), tx), |method, _, _| match method {
+            "terminal.read" => Ok(json!({"text":"x","truncated":false,"incarnation":null})),
+            m => Ok(base_answer(m)),
+        });
+        assert!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["incarnation"].is_null());
+        // A refusal says why; text past the bound asked for is a broken core, never kept.
+        let (result, _) = operation_against_with(both, |tx| Operation::Read(request(), tx), |method, _, _| match method {
+            "terminal.read" => Err("not_found"),
+            m => Ok(base_answer(m)),
+        });
+        assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["error"], "not_found");
+        let (result, _) = operation_against_with(
+            both,
+            |tx| Operation::Read(ReadRequest::new("t7", 10, 4).unwrap(), tx),
+            |method, _, _| match method {
+                "terminal.read" => Ok(json!({"text":"far too long","truncated":false,"incarnation":"ab"})),
+                m => Ok(base_answer(m)),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_transcript_read_is_of_a_direct_terminal_within_its_bounds() {
+        use crate::remote::{MAX_READ_BYTES, MAX_READ_LINES, ReadRequest};
+        assert!(ReadRequest::new("t7", MAX_READ_LINES, MAX_READ_BYTES).is_ok());
+        assert!(matches!(ReadRequest::new("macro/t7", 10, 10), Err(Error::StaleTarget)));
+        assert!(matches!(ReadRequest::new("", 10, 10), Err(Error::StaleTarget)));
+        assert!(matches!(ReadRequest::new("t7", 0, 10), Err(Error::Config)));
+        assert!(matches!(ReadRequest::new("t7", MAX_READ_LINES + 1, 10), Err(Error::Config)));
+        assert!(matches!(ReadRequest::new("t7", 10, MAX_READ_BYTES + 1), Err(Error::Config)));
+    }
+
+    #[test]
+    fn the_pane_list_carries_each_programs_incarnation_when_the_core_has_one() {
+        let mut view = json!({"pane_id":"t1","panes":[],"workspaces":[],"tabs":[],"revision":0,"token":0,"chrome_token":0});
+        let terminals = json!([
+            {"address":"t1","state":"live","labels":{},"incarnation":"0123456789abcdef"},
+            {"address":"t2","state":"live","labels":{}},
+            {"address":"t3","state":"live","labels":{},"incarnation":"bad value!"}
+        ]);
+        project(&mut view, &terminals, &json!({})).unwrap();
+        let incarnation = |id: &str| view["panes"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["incarnation"].clone();
+        assert_eq!(incarnation("t1"), "0123456789abcdef");
+        assert!(incarnation("t2").is_null());
+        assert!(incarnation("t3").is_null());
     }
 
     #[test]
@@ -5147,6 +5308,7 @@ mod focus_review_tests {
             reattached_at: None,
             ended: None,
             automatic_input: true,
+            transcripts: false,
             focus: Focus {
                 offered: true,
                 frames: true,

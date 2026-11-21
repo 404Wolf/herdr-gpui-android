@@ -82,6 +82,9 @@ let
       ./patches/draft-flag-expiry.patch
       ./patches/repaint-seam.patch
       ./patches/paint-hyperlinks.patch
+      # Stage 3 core features (incarnation, guarded send, bounded read), as home-manager-conf
+      # 8be530a (#151) adds them: the offline-s2 emulator test reads transcripts with them.
+      ./patches/guarded-send.patch
     ];
     cargoDeps = rustPlatform.importCargoLock { lockFile = "${src}/Cargo.lock"; };
     nativeBuildInputs = [

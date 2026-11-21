@@ -56,6 +56,13 @@ final class RemoteNative {
      * {"queued":false,"kind"} (needs_update: the host's Herdr is too old). Blocks up to about a
      * minute, so worker threads only.
      */
+    /**
+     * A bounded transcript of {@code paneId} for reading offline (terminal.read with max_bytes
+     * and stitch false), only from a core whose hello offers read-bounded and incarnation:
+     * {"supported":false} otherwise, else {"supported":true,"text","truncated","incarnation"} or
+     * {"supported":true,"error"}. Blocks up to about ten seconds: worker threads only.
+     */
+    static native String readTranscript(long handle, String paneId, int lines, int maxBytes);
     static native String putFile(long handle, String paneId, String name, byte[] data);
     static native String scrollTo(long handle, long offsetFromBottom);
     /**

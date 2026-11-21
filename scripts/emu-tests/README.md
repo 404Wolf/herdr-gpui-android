@@ -76,3 +76,25 @@ are the app's content descriptions; change them there when a control's words cha
   that drops with a pane open and recovers is not covered.
 - **Cleanup.** Early setup failures can leave the scratch directory behind; Slurm's cgroup teardown
   is what stops surviving processes.
+
+## offline-s2.sh: offline transcripts (stage 2 of the offline design)
+
+```sh
+lease-run --kind android --outputs <dir> -- scripts/emu-test.sh scripts/emu-tests/offline-s2.sh
+```
+
+Same fixtures as `pr48.sh` (scratch core and sshd in the job, a provisioned host at `10.0.2.2`, the
+device key authorized through the UI), with a core built with `guarded-send.patch` so it offers
+`read-bounded` and `incarnation` (checked first: `core-features`). Agent A prints 300 numbered lines.
+
+Checks: `transcript-read` (while A is live its transcript is kept under
+`no_backup/transcripts-v1/`, holding its last line and headed with A's incarnation as `hc ls` reports
+it), `live-hides` (no transcript button while live), then with sshd and the core stopped:
+`offline-offer` (the button reads "transcript · as of HH:MM"), `offline-indicator`,
+`transcript-open` (the screen is titled "transcript as of HH:MM · may be outdated" and holds the newest
+line), `transcript-scroll` (swiping changes what is on screen; the kept text starts at line 000), and
+`other-pane` (agent B never shows A's transcript).
+
+Not covered here: an old core (it is never read; the JVM and Rust tests cover the gate), a program
+replaced on the same address (the JVM tests cover the incarnation proof), and a cold start with the
+core down (Home then has no agents to open).
