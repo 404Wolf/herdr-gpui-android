@@ -1,7 +1,7 @@
 //! The host's ghost text (unsent words drawn at the program's caret, see
 //! `gpui_rio::ghost`), handed over as JSON and kept for the renderer.
 //!
-//! JSON: `{"kind":"claude"|"codex"|"other","reserve":N,"reserveFrom":ROW,
+//! JSON: `{"kind":"claude"|"codex"|"gemini"|"other","reserve":N,"reserveFrom":ROW,
 //! "colors":{"text":RGB,"dim":RGB,"warn":RGB,"background":RGB},
 //! "draft":[{"t":"..","s":"text"|"partial"|"chip"|"selected"|"dim"}, {"t":"","s":"caret"}],
 //! "echoes":[[{"t":"..","s":"echo"|"tag"|"warn"|"chip"|"bright"|"info"|"danger"}]],
@@ -130,6 +130,7 @@ pub(crate) fn parse(json: &str) -> Result<Ghost> {
     let kind = match wire.kind.as_str() {
         "claude" => PromptKind::Claude,
         "codex" => PromptKind::Codex,
+        "gemini" => PromptKind::Gemini,
         "other" => PromptKind::Other,
         _ => return Err(Error::InvalidCommand),
     };

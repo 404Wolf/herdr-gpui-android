@@ -63,10 +63,11 @@ final class GhostText {
 
     private GhostText() { }
 
-    /** The prompt kind the renderer looks for: "claude", "codex" or "other". */
+    /** The prompt kind the renderer looks for: "claude", "codex", "gemini" or "other". */
     static String kind(String agent) {
         if ("claude".equals(agent)) return "claude";
         if ("codex".equals(agent)) return "codex";
+        if ("gemini".equals(agent)) return "gemini";
         return "other";
     }
 
