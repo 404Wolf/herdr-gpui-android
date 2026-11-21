@@ -3280,7 +3280,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (!hFolded) {
                 for (FleetTree.Member helper : tree.helpers) {
-                    railAgent(host, live, current, helper, null, "", FleetTree.railAgentPadding(1, false),
+                    railAgent(host, live, current, helper, null, "", FleetTree.railAgentPadding(1, true),
                             null, false, 0, false, selectedPane, order, keep);
                 }
             }
@@ -3513,26 +3513,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String shownSub = sub + (changes.isEmpty() ? "" : (sub.isEmpty() ? "" : " · ") + changes);
         row.foldKey = foldKey;
         row.worktrees = null;
-        String mark = lead == null ? null : foldKey == null ? "" : folded
-                ? workerRows > 0 ? "▸" + workerRows : "▸" : "▾";
-        int markWidth = dp(workerRows > 0 ? FleetTree.PM_CHEVRON_DP : FleetTree.RAIL_DEPTH_DP);
-        if (row.mark.getLayoutParams().width != markWidth) {
-            row.mark.getLayoutParams().width = markWidth;
-            row.mark.requestLayout();
-        }
-        row.mark.setVisibility(mark == null ? View.GONE : View.VISIBLE);
-        if (mark != null && !mark.contentEquals(row.mark.getText())) row.mark.setText(mark);
-        // The chevron is the row's only fold control, so a screen reader gets it as its own button.
-        String under = "deacon".equals(m.role) && "Deacon".equals(lead) ? "the Deacon's helpers" : "workers under " + lead;
-        String foldSays = foldKey == null ? null : workerRows == 0 ? (folded ? "Show " : "Hide ") + under
-                : (folded ? "Show " : "Hide ") + workerRows + (workerRows == 1 ? " row under " : " rows under ") + lead;
-        row.mark.setImportantForAccessibility(foldSays == null ? View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                : View.IMPORTANT_FOR_ACCESSIBILITY_YES);
-        row.mark.setFocusable(foldSays != null);
-        row.mark.setContentDescription(foldSays);
-        if (android.os.Build.VERSION.SDK_INT >= 30) {
-            row.mark.setStateDescription(foldSays == null ? null : folded ? "collapsed" : "expanded");
-        }
+        // A lead row's fold column (RailDisclosure): its own button, empty when nothing folds.
+        String foldSays = FleetTree.foldSays(lead, "deacon".equals(m.role) && "Deacon".equals(lead),
+                workerRows, folded, foldKey);
+        row.mark.setVisibility(lead == null ? View.GONE : View.VISIBLE);
+        row.mark.bind(foldSays != null, folded, foldSays);
+        row.row.setMinimumHeight(dp(lead == null ? FleetTree.AGENT_ROW_DP : FleetTree.LEAD_ROW_DP));
         if (!shownSub.contentEquals(row.sub.getText())) row.sub.setText(shownSub);
         row.sub.setVisibility(shownSub.isEmpty() ? View.GONE : View.VISIBLE);
         if (row.lead != (lead != null)) {
@@ -4305,17 +4291,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row.setSaveFromParentEnabled(false);
         holder.row.setBackground(railBackground(false));
         // A Deacon or PM row's chevron: it folds, the rest of the row focuses the agent.
-        holder.mark = railText("", 12, chrome.onSurfaceVariant);
-        holder.mark.setTypeface(railMono(false));
-        holder.mark.setGravity(android.view.Gravity.CENTER);
-        holder.mark.setMinHeight(dp(28));
-        holder.mark.setBackground(railBackground(false));
+        holder.mark = new RailDisclosure(this, chrome);
         holder.mark.setVisibility(View.GONE);
+        // Folds only; an empty column (nothing to fold) is the row, so it focuses.
         holder.mark.setOnClickListener(v -> {
             if (holder.foldKey != null) toggleRepo(holder.foldKey);
             else holder.row.performClick();
         });
-        holder.row.addView(holder.mark, new LinearLayout.LayoutParams(dp(FleetTree.RAIL_DEPTH_DP), -2));
+        holder.mark.offerOn(holder.row);
+        LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
+        markParams.setMarginEnd(dp(6));
+        holder.row.addView(holder.mark, markParams);
         // Status as a small square mark (no ovals in the boxy rail).
         holder.dot = new View(this);
         holder.dot.setBackgroundColor(chrome.onSurfaceVariant);
@@ -4448,7 +4434,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static final class RailPaneRow {
         LinearLayout row;
         View dot;
-        TextView mark, title, sub;
+        RailDisclosure mark;
+        TextView title, sub;
         TextView state;
         /** What a Deacon or PM row's chevron folds, or null. */
         String foldKey;
