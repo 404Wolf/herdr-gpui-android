@@ -797,7 +797,27 @@ final class FleetTree {
     }
 
     static final int RAIL_DEPTH_DP = 18;
-    static final int PM_CHEVRON_DP = 36;
+    /** The Deacon's and a PM's fold column ({@link RailDisclosure}): a 48dp touch target. */
+    static final int PM_CHEVRON_DP = 48;
+    /** Row heights: a Deacon or PM row meets the 48dp touch minimum; agents under it 40dp. */
+    static final int LEAD_ROW_DP = 48, AGENT_ROW_DP = 40;
+
+    /**
+     * What a screen reader hears for a lead row's fold control, or null when
+     * the row folds nothing ({@code foldKey} null). {@code deaconHelpers} is the
+     * Deacon's own row, whose fold holds its helpers.
+     */
+    static String foldSays(String lead, boolean deaconHelpers, int workerRows, boolean folded, String foldKey) {
+        if (foldKey == null || lead == null) return null;
+        String verb = folded ? "Show " : "Hide ";
+        if (workerRows == 0) return verb + (deaconHelpers ? "the Deacon's helpers" : "workers under " + lead);
+        return verb + workerRows + (workerRows == 1 ? " row under " : " rows under ") + lead;
+    }
+
+    /** The fold's spoken state: "collapsed" or "expanded". */
+    static String foldState(boolean folded) {
+        return folded ? "collapsed" : "expanded";
+    }
 
     static int railAgentPadding(int depth, boolean underPm) {
         // A worker has no chevron of its own. Account for the PM's wider chevron before indenting it.
