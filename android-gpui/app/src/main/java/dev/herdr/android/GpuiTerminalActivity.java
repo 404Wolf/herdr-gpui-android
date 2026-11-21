@@ -1200,9 +1200,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             menu.getMenu().add(0, 6, MoreMenu.GESTURES, "Gestures");
         }
         if (attachTarget() != null) menu.getMenu().add(0, 7, MoreMenu.ATTACH, "Attach image");
+        if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, "Usage").setIcon(R.drawable.ic_bar_usage).setIconTintList(tint);
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 7) showAttachSources();
+            if (item.getItemId() == 8) showUsage();
+            else if (item.getItemId() == 7) showAttachSources();
             else if (item.getItemId() == 1) showDisplayOptions();
             else if (item.getItemId() == 2) showSessionActions();
             else if (item.getItemId() == 4) showPanes();
@@ -1214,6 +1216,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return true;
         });
         menu.show();
+    }
+
+    /** The connected machine's aswap accounts (UsageView); each look asks that same machine's core. */
+    private void showUsage() {
+        Connection opened;
+        synchronized (stateLock) { opened = connection; }
+        if (opened == null || opened.isClosed() || opened.remoteHandle <= 0 || opened.hostId == null) {
+            note("Usage needs a connected machine");
+            return;
+        }
+        String hostId = opened.hostId;
+        UsageView.show(this, chrome, hostId, opened.hostName, () -> {
+            Connection now;
+            synchronized (stateLock) { now = connection; }
+            if (now == null || now.isClosed() || !hostId.equals(now.hostId)) throw new HostSwitched();
+            return RemoteNative.sessionAction(now.remoteHandle, "{\"op\":\"usage.look\"}");
+        }, actionWorker);
     }
 
     /** A 48 dp icon button; its label is a tooltip and the overflow menu's text. */
