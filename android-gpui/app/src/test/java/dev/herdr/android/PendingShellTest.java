@@ -33,42 +33,58 @@ public final class PendingShellTest {
         assertNull(shell.pill());
     }
 
-    @Test public void tenSecondsWithoutATerminalOrARefusalFailsItWithWhy() {
+    @Test public void tenSecondsWithoutATerminalIsSlowNotFailedAndALateShellStillEndsIt() {
         PendingShell shell = new PendingShell();
         shell.start("h1", panes("t1"), 1000);
         assertFalse(shell.observe("h1", panes("t1"), 1000 + PendingShell.TIMEOUT_MS - 1));
         assertTrue(shell.observe("h1", panes("t1"), 1000 + PendingShell.TIMEOUT_MS));
-        assertEquals("shell ✕", shell.pill());
-        assertEquals("no terminal after 10 s", shell.reason());
-        assertTrue(shell.described("demo").startsWith("Couldn't start a shell on demo: no terminal after 10 s"));
-        // A terminal arriving late no longer flips a failed pill back.
-        assertFalse(shell.observe("h1", panes("t1", "t5"), 20_000));
-        shell.clear();
+        assertEquals(PendingShell.State.SLOW, shell.state());
+        assertEquals("shell ◌ slow", shell.pill());
+        assertTrue(shell.described("demo").startsWith("Still starting a shell on demo"));
+        assertFalse(shell.observe("h1", panes("t1"), 20_000));
+        // The core was only slow: the shell shows up, and the pill goes (no second shell is offered).
+        assertTrue(shell.observe("h1", panes("t1", "t5"), 30_000));
         assertNull(shell.pill());
+    }
 
+    @Test public void onlyTheCoresRefusalFailsItWithWhy() {
+        PendingShell shell = new PendingShell();
         shell.start("h1", panes(), 0);
         shell.failed("terminal.run: denied");
         assertEquals(PendingShell.State.FAILED, shell.state());
+        assertEquals("shell ✕", shell.pill());
         assertEquals("terminal.run: denied", shell.reason());
+        assertTrue(shell.described("demo").startsWith("Couldn't start a shell on demo: terminal.run: denied"));
         shell.failed("later");
         assertEquals("terminal.run: denied", shell.reason());
+        // A failed start is over: a terminal that arrives later does not touch it.
+        assertFalse(shell.observe("h1", panes("t9"), 5000));
+        shell.clear();
+        assertNull(shell.pill());
+        // Slow, then refused: failed.
+        shell.start("h1", panes(), 0);
+        shell.observe("h1", panes(), PendingShell.TIMEOUT_MS);
+        shell.failed("gone");
+        assertEquals(PendingShell.State.FAILED, shell.state());
     }
 
-    @Test public void theStripShowsItAndTheBarIsOneLayoutAtEveryWidth() throws IOException {
-        String rail = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
+    @Test public void theStripShowsItAndItsTimerLeavesOtherHostsAlone() throws IOException {
+        String rail = source();
         int start = rail.indexOf("private void refreshTabStrip(");
         String strip = rail.substring(start, rail.indexOf("private boolean tabCompact;", start));
         assertTrue(strip.contains("+ \"|\" + pending"));
         assertTrue(strip.indexOf("pendingShell.pill()") < strip.indexOf("windowChip(\"+\""));
-        int bar = rail.indexOf("private View createShortcutBar(");
-        String shortcut = rail.substring(bar, rail.indexOf("LinearLayout keys = new LinearLayout(this);", bar));
-        assertFalse(shortcut.contains("ic_bar_panes"));
-        assertFalse(shortcut.contains("ic_bar_view"));
-        assertTrue(shortcut.contains("ic_bar_more"));
-        assertFalse(shortcut.contains("if (compact)"));
-        int more = rail.indexOf("private void showMoreActions(");
-        String menu = rail.substring(more, rail.indexOf("menu.setForceShowIcon(true);", more));
-        assertTrue(menu.indexOf("\"Spaces & panes\"") < menu.indexOf("if (navigation && !shellMode())"));
+        // Only new shells end the wait; the pill is never drawn as the active window.
+        assertTrue(strip.contains("paneIds(current, true)"));
+        assertTrue(strip.contains("windowChip(pending, false, \"\", false)"));
+        assertTrue(strip.contains("announceForAccessibility"));
+        int quick = rail.indexOf("private void startQuickShell(");
+        String timer = rail.substring(quick, rail.indexOf("private void showPendingShellFailure(", quick));
+        assertTrue(timer.contains("if (destroyed || host == null || !host.equals(currentHostId)) return;"));
+    }
+
+    static String source() throws IOException {
+        return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
+                StandardCharsets.UTF_8);
     }
 }
