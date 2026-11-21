@@ -18,6 +18,8 @@ pub mod shell;
 mod snapshot;
 #[cfg(all(feature = "remote", unix))]
 mod ghost_bridge;
+#[cfg(all(feature = "remote", unix))]
+mod phone_ops;
 /// Wolf's ask: scrolling keeps working offline, on held and cached panes.
 #[cfg(all(test, feature = "remote", unix))]
 mod offline_scroll_tests;

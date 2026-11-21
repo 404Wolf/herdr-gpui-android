@@ -558,7 +558,10 @@ impl Connection<'_> {
                     .to_string());
                 }
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
-                None => return Err(Error::StaleTarget),
+                None => match crate::phone_ops::PhoneOp::parse(action) {
+                    Some(op) => return op.run(|method, params| self.call(method, params)),
+                    None => return Err(Error::StaleTarget),
+                },
             },
         }
         Ok(json!({"queued":true}).to_string())
