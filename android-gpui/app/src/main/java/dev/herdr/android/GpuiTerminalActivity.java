@@ -535,6 +535,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railControls = createRailControls();
         railBody.addView(railControls, new LinearLayout.LayoutParams(-1, dp(48)));
         railBody.addView(sidebarScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        // A PM's beads drill in over the list; Back or its ‹ pops one level (BeadsRail).
+        beadsRail = new BeadsRail(this, chrome, actionWorker, this::openBeadsAgent, () -> {
+            sidebarScroll.setVisibility(beadsRail.isOpen() ? View.GONE : View.VISIBLE);
+            refreshSidebar(true);
+        });
+        railBody.addView(beadsRail.view(), new LinearLayout.LayoutParams(-1, 0, 1));
         railFrame.addView(railBody, new android.widget.FrameLayout.LayoutParams(-1, -1));
         railFade = new View(this);
         railFade.setLayoutParams(new android.widget.FrameLayout.LayoutParams(
@@ -704,6 +710,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (shellMode()) leaveByBack(); else showRailOverlay();
             }, () -> {
                 if (composer != null && composer.hideKeyboard()) return;
+                if (sidebarOpen && beadsRail != null && beadsRail.back()) return;
                 if (filePager == null || !filePager.hide()) leaveByBack();
             });
         } else {
@@ -754,6 +761,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Back puts the composer's keyboard away first (and any other keyboard that is up).
         if (composer != null && composer.hideKeyboard()) return;
         if (KeyboardHide.hideIfShown(this)) return;
+        if (sidebarOpen && beadsRail != null && beadsRail.back()) return;
         if (sidebarOpen && railAsDrawer()) {
             hideSidebar();
             return;
@@ -1952,6 +1960,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void switchHost(SavedRemoteHost host, String pane, boolean picked) {
         if (host == null || switchingHost || host.id.equals(currentHostId)) return;
+        if (beadsRail != null && beadsRail.isOpen()) beadsRail.close();
         if (host.expectedFingerprint.isEmpty()) {
             note("Trust " + host.name + " from Remote hosts first");
             return;
@@ -3283,6 +3292,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         java.util.List<FleetTree.Member> members = FleetPanes.members(workspaces, tabs, panes, FleetTree.Member::new);
         railSpaceOf.clear();
         for (FleetTree.Member m : members) railSpaceOf.put(m.id, m.space);
+        if (live) {
+            // With the factory's issue/task/helper labels, so agents join their beads.
+            railMembers = BeadsModel.terms(workspaces, tabs, panes);
+            if (beadsRail != null) beadsRail.members(railMembers);
+        }
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
         FleetTree.PmTree tree = FleetTree.pmTree(fleet);
@@ -3438,7 +3452,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void railPm(SavedRemoteHost host, boolean live, Connection current,
             FleetTree.PmRow pm, int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
         String key = pm.foldKey(host.id);
-        boolean folded = railFolds().folded(key);
+        // A PM with no workers has nothing to fold, so it is never folded: its Beads row shows.
+        boolean folded = pm.workerRows > 0 && railFolds().folded(key);
         String foldKey = pm.workerRows == 0 ? null : key;
         if (!pm.labelledPm()) {
             // Live and idle projects without a labelled PM keep a dimmed, direct terminal target.
@@ -3464,11 +3479,42 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 row.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
             }
         }
+        // The open rail reads this machine's beads (at most once a minute), folded or not, so a
+        // folded PM's ☰!k is current; the drill-in reads more often while it shows.
+        if (live && current != null && pm.labelledPm() && beadsRail != null) beadsRail.want(host.id, beadsLook(host.id));
         if (folded) return;
         int workerPadding = FleetTree.railAgentPadding(depth + 1, pm.labelledPm());
         for (FleetTree.AgentNode node : pm.workers) {
             railAgentTree(host, live, current, node, workerPadding, selectedPane, order, keep);
         }
+        // After its agents, the PM's beads: one row that drills in (factory-setup.21).
+        if (live && current != null && pm.labelledPm() && beadsRail != null) {
+            String said = BeadsRail.row(host.id, pm.name(), railMembers);
+            String project = pm.name();
+            // Lined up with the PM's workers' titles (their padding, then the status mark's 14dp).
+            railNoteAt(host, "beads:" + project, said == null ? "☰ Beads · reading…" : said + "  ›", chrome.primary,
+                    FleetTree.railAgentPadding(depth + 1, true) + 14,
+                    () -> beadsRail.open(host.id, project, railMembers, beadsLook(host.id)), order, keep);
+        }
+    }
+
+    /** A beads op for the live machine's core; refused once the phone has switched machines. */
+    private java.util.function.Function<String, String> beadsLook(String hostId) {
+        return op -> {
+            Connection now;
+            synchronized (stateLock) { now = connection; }
+            if (now == null || now.isClosed() || !hostId.equals(now.hostId)) throw new HostSwitched();
+            return RemoteNative.sessionAction(now.remoteHandle, op);
+        };
+    }
+
+    /** An agent tapped in the beads view: the rail's own focus. */
+    private void openBeadsAgent(String paneId) {
+        Connection now;
+        synchronized (stateLock) { now = connection; }
+        if (now == null) return;
+        focusRemotePane(now, paneId);
+        closeRailDrawer();
     }
 
     private void selectRailHeader(RailWorkspaceRow holder, boolean selected) {
@@ -3654,6 +3700,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** A one-line rail action or state, reused by key. */
     private void railNote(SavedRemoteHost host, String id, String text, int color, int depth, Runnable action,
             java.util.List<View> order, java.util.Set<String> keep) {
+        railNoteAt(host, id, text, color, 10 + 12 * depth, action, order, keep);
+    }
+
+    /** A rail note starting {@code startDp} in; one with an action is a full row's tap target. */
+    private void railNoteAt(SavedRemoteHost host, String id, String text, int color, int startDp, Runnable action,
+            java.util.List<View> order, java.util.Set<String> keep) {
         String key = "fleetnote:" + host.id + "/" + id;
         keep.add(key);
         TextView note = railNotes.get(key);
@@ -3671,7 +3723,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             note.setContentDescription(text);
         }
         note.setTextColor(color);
-        note.setPadding(dp(10 + 12 * depth), dp(1), dp(6), dp(1));
+        note.setPadding(dp(startDp), dp(1), dp(6), dp(1));
+        note.setMinHeight(dp(action == null ? 28 : FleetTree.AGENT_ROW_DP));
         note.setOnClickListener(action == null ? null : v -> action.run());
         note.setClickable(action != null);
         order.add(note);
@@ -3685,6 +3738,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private final java.util.Set<String> railWorktreeOpening = new java.util.HashSet<>();
     /** Each terminal's space, for the rail's header long-press menus. */
     private final java.util.Map<String, String> railSpaceOf = new java.util.HashMap<>();
+    /** The live machine's members as the rail last read them, for its PMs' beads (BeadsRail). */
+    private java.util.List<? extends FleetTree.Member> railMembers = java.util.Collections.emptyList();
+    private BeadsRail beadsRail;
     private final java.util.Map<String, String> railDeaconPending = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Map<String, Long> railDeaconPendingAt = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Set<String> railDeaconBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
