@@ -3539,10 +3539,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, FleetTree.railAgentPadding(depth, false),
                     foldKey, folded, pm.workerRows, folded && pm.blocked(), selectedPane, order, keep);
             if (row != null) {
-                row.state.setText(pm.countsLabel());
-                row.state.setTextColor(pm.blocked() ? chrome.danger : chrome.onSurfaceVariant);
+                // Folded, the PM row carries its beads' needs-you too, from the last read (BeadsRail).
+                int beadsNeed = folded && live ? BeadsRail.needsYou(host.id, pm.name(), railMembers) : 0;
+                row.state.setText(pm.countsLabel() + BeadsRail.badge(beadsNeed));
+                row.state.setTextColor(pm.blocked() || beadsNeed > 0 ? chrome.danger : chrome.onSurfaceVariant);
                 row.row.setContentDescription("Open " + pm.name() + ", " + pm.countsLabel()
-                        + (pm.blocked() ? ", needs attention" : ""));
+                        + (pm.blocked() ? ", needs attention" : "")
+                        + (beadsNeed > 0 ? ", " + beadsNeed + (beadsNeed == 1 ? " bead needs you" : " beads need you") : ""));
             }
             if (row != null && live && !pm.catalogs.isEmpty()) {
                 row.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);

@@ -52,6 +52,15 @@ public final class BeadsRailTest {
         assertTrue(BeadsRail.ROW_POLL_MS >= 4 * BeadsRail.POLL_MS);
     }
 
+    @Test public void aFoldedPmCarriesItsBeadsNeedsYou() throws IOException {
+        assertTrue(BeadsRail.badge(0).isEmpty());
+        assertTrue(BeadsRail.badge(2).equals(" ☰!2"));
+        String rail = source("GpuiTerminalActivity");
+        String pm = section(rail, "private void railPm(", "private void selectRailHeader(");
+        assertTrue(pm.contains("folded && live ? BeadsRail.needsYou(host.id, pm.name(), railMembers)"));
+        assertTrue(pm.contains("BeadsRail.badge(beadsNeed)"));
+    }
+
     @Test public void aPmWithoutWorkersIsNeverFoldedSoItsBeadsShow() throws IOException {
         String pm = section(source("GpuiTerminalActivity"), "private void railPm(", "private void selectRailHeader(");
         assertTrue(pm.contains("boolean folded = pm.workerRows > 0 && railFolds().folded(key);"));
