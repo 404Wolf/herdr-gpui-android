@@ -45,9 +45,14 @@ final class StillPress implements View.OnTouchListener {
         }
     }
 
-    /** True when the press that just ended did not travel past the touch slop. */
+    /**
+     * True when the press that just ended did not travel past the touch slop.
+     * Read once per click: a later click with no touch (a key, TalkBack) counts.
+     */
     boolean still() {
-        return !moved;
+        boolean still = !moved;
+        moved = false;
+        return still;
     }
 
     /** For tests: a guard with a fixed slop and no view. */
