@@ -2,7 +2,9 @@
 //! core_session's layout edits: `{"op":"usage.look"}` runs that machine's
 //! `aswap list --json` (cache-only: no network, no quota spent) through
 //! `machine.exec`; `{"op":"tab.detach",..}` closes a tab while its agents keep
-//! running, as the desktop's Park does. The core session tries
+//! running, as the desktop's Park does; `beads.stores` and `beads.detail` read
+//! the machine's beads stores with the desktop Work panel's own scripts. The
+//! core session tries
 //! [`PhoneOp::parse`] for an action it does not know and hands the op its RPC
 //! call, so this module never owns the socket.
 //!
@@ -28,6 +30,24 @@ const NOT_FOUND: i64 = 127;
 const USAGE_LOOK: &str = r#"command -v aswap >/dev/null 2>&1 && exec aswap list --json
 exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 
+/// The desktop factory mod's scripts (home-manager-conf
+/// users/wolf/programs/herdr-core/app/factory/src/feed.ts STORES_SH and
+/// DETAIL_SH at 5e6c79eb), byte for byte, so the phone reads beads exactly as
+/// the Work panel does; BeadsModel parses their output. Both are read-only.
+const STORES_SH: &str = include_str!("beads/stores.sh");
+/// Runs a vendored script ($1) with bd on that machine's login PATH when the
+/// core's own PATH lacks it (a service environment without the Nix profile),
+/// as USAGE_LOOK does for aswap; the scripts themselves stay byte for byte.
+const WITH_LOGIN_PATH: &str = r#"command -v bd >/dev/null 2>&1 || PATH=$("${SHELL:-/bin/sh}" -lc 'printf %s "$PATH"' 2>/dev/null)
+script=$1; shift
+exec sh -c "$script" sh "$@""#;
+const DETAIL_SH: &str = include_str!("beads/detail.sh");
+/// Where the stores are on that machine: the beads module's defaults.
+const STORE_ROOT: &str = "~/beads";
+const REPOS_FILE: &str = "~/.config/beads/repos.json";
+/// At most this many known `project=fingerprint` args (stores skipped when unchanged).
+const MAX_KNOWN: usize = 256;
+
 /// At most this many terminals in one detached tab.
 const MAX_TAB_TERMINALS: usize = 32;
 
@@ -43,11 +63,17 @@ pub(crate) enum PhoneOp {
     /// be in that tab, and the tab is dropped only when nothing else is left
     /// in it.
     TabDetach { space: String, tab: String, park: Vec<String>, kill: Vec<String> },
+    /// Every beads store's list (STORES_SH); `known` are `project=fingerprint`
+    /// pairs from the last read, whose unchanged stores are not listed again.
+    BeadsStores { known: Vec<String> },
+    /// One bead's `bd show` and `bd comments` (DETAIL_SH), from the store of
+    /// `project` (a store name, or `repo:<name>`'s project).
+    BeadsDetail { project: String, id: String },
 }
 
 impl PhoneOp {
     pub(crate) fn parse(action: &str) -> Option<Self> {
-        if !action.starts_with('{') || action.len() > 8192 {
+        if !action.starts_with('{') || action.len() > 32 * 1024 {
             return None;
         }
         let value: Value = serde_json::from_str(action).ok()?;
@@ -63,6 +89,17 @@ impl PhoneOp {
         };
         match value["op"].as_str()? {
             "usage.look" => Some(Self::UsageLook),
+            "beads.stores" => {
+                let all = value["known"].as_array().map_or(&[][..], Vec::as_slice);
+                (all.len() <= MAX_KNOWN).then_some(())?;
+                let known = all.iter().map(|v| v.as_str().filter(|k| known_pair(k)).map(str::to_owned)).collect::<Option<_>>()?;
+                Some(Self::BeadsStores { known })
+            }
+            "beads.detail" => {
+                let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
+                let id = value["id"].as_str().filter(|i| bead_id(i))?.to_owned();
+                Some(Self::BeadsDetail { project, id })
+            }
             "tab.detach" => {
                 let park = ids("park")?;
                 (!park.is_empty()).then_some(())?;
@@ -91,8 +128,72 @@ impl PhoneOp {
                 detach(&mut call, space, tab, park, kill)?;
                 Ok(json!({"queued":true,"parked":park}).to_string())
             }
+            Self::BeadsStores { known } => {
+                let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(STORES_SH), json!(STORE_ROOT), json!(REPOS_FILE)];
+                argv.extend(known.iter().map(|k| json!(k)));
+                let result = call("machine.exec", json!({"argv":argv,"timeout":20}))?;
+                Ok(script_reply(&result)?.to_string())
+            }
+            Self::BeadsDetail { project, id } => {
+                let argv = json!(["sh", "-c", WITH_LOGIN_PATH, "sh", DETAIL_SH, STORE_ROOT, REPOS_FILE, project, id]);
+                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                Ok(script_reply(&result)?.to_string())
+            }
         }
     }
+}
+
+/// A store's name as STORES_SH prints it: a folder under the root, or `repo:<name>`.
+fn store_name(name: &str) -> bool {
+    let bare = name.strip_prefix("repo:").unwrap_or(name);
+    !bare.is_empty()
+        && name.len() <= 128
+        && bare != "."
+        && bare != ".."
+        && bare.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// A bead id: `factory-setup.21`, `bd-a1b2`.
+fn bead_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && !id.starts_with('-') && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// `project=fingerprint` (a find -printf %T@ time).
+fn known_pair(pair: &str) -> bool {
+    pair.split_once('=').is_some_and(|(project, fp)| {
+        store_name(project) && !fp.is_empty() && fp.len() <= 32 && fp.chars().all(|c| c.is_ascii_digit() || c == '.')
+    })
+}
+
+/// A script's stdout for BeadsModel: `{"queued":true,"text":..,"truncated":..}`,
+/// or why it failed. The scripts exit 0 and frame their own errors, so another
+/// exit is the exec itself failing (a timeout).
+fn script_reply(result: &Value) -> Result<Value> {
+    if let Some(why) = exec_failure(result, "the beads read") {
+        return Ok(json!({"queued":true,"error":why}));
+    }
+    Ok(json!({"queued":true,"text":exec_text(result)?,"truncated":result["truncated"] == true}))
+}
+
+/// Why machine.exec's run did not finish cleanly, in words, or None for exit 0.
+/// A timeout and a signal are the exec's, not the program's: they say so.
+fn exec_failure(result: &Value, what: &str) -> Option<String> {
+    if result["timed_out"] == true {
+        return Some(format!("{what} timed out on the machine"));
+    }
+    match result["code"].as_i64() {
+        Some(0) => None,
+        Some(code) => Some(format!("{what} exited with {code}")),
+        None => Some(format!("{what} was stopped before it finished")),
+    }
+}
+
+fn exec_text(result: &Value) -> Result<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(result["stdout"].as_str().unwrap_or(""))
+        .map_err(|_| Error::Protocol("invalid command output".into()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The live terminals the core puts in `space`/`tab`, as the view builder
@@ -169,19 +270,6 @@ fn drop_tab(call: &mut impl FnMut(&str, Value) -> Result<Value>, space: &str, ta
         }
     }
     Err(Error::Protocol("the layout kept changing; try again".into()))
-}
-
-/// Why machine.exec's run did not finish cleanly, in words, or None for exit 0.
-/// A timeout and a signal are the exec's, not the program's: they say so.
-fn exec_failure(result: &Value, what: &str) -> Option<String> {
-    if result["timed_out"] == true {
-        return Some(format!("{what} timed out on the machine"));
-    }
-    match result["code"].as_i64() {
-        Some(0) => None,
-        Some(code) => Some(format!("{what} exited with {code}")),
-        None => Some(format!("{what} was stopped before it finished")),
-    }
 }
 
 fn usage_reply(result: &Value) -> Result<Value> {
@@ -440,11 +528,71 @@ mod tests {
     }
 
     #[test]
+    fn beads_ops_take_only_plain_names_ids_and_fingerprints() {
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.detail","project":"repo:herdr","id":"factory-setup.21"}"#),
+            Some(PhoneOp::BeadsDetail { project: "repo:herdr".into(), id: "factory-setup.21".into() })
+        );
+        for bad in [r#""project":"../x","id":"a-1""#, r#""project":"a/b","id":"a-1""#, r#""project":"x","id":"--all""#,
+            r#""project":"x","id":"a 1""#, r#""project":"","id":"a-1""#] {
+            assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.detail",{bad}}}"#)), None, "{bad}");
+        }
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.stores","known":["factory=1795296364.1234"]}"#),
+            Some(PhoneOp::BeadsStores { known: vec!["factory=1795296364.1234".into()] })
+        );
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.stores"}"#), Some(PhoneOp::BeadsStores { known: vec![] }));
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.stores","known":["factory=$(rm)"]}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.stores","known":["factory"]}"#), None);
+        assert!(!PhoneOp::BeadsStores { known: vec![] }.edits());
+    }
+
+    #[test]
+    fn beads_reads_pass_the_scripts_args_as_argv_and_their_text_back() {
+        let mut seen = Vec::new();
+        let reply = PhoneOp::BeadsDetail { project: "factory".into(), id: "factory-setup.21".into() }
+            .run(|method, params| {
+                seen.push((method.to_owned(), params));
+                Ok(exec(0, "\u{1e}{\"id\":\"factory-setup.21\"}\n\u{1d}[]\n\u{1f}ok\n"))
+            })
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .unwrap_or_default();
+        assert_eq!(reply["text"], "\u{1e}{\"id\":\"factory-setup.21\"}\n\u{1d}[]\n\u{1f}ok\n");
+        let argv = &seen[0].1["argv"];
+        // The vendored script runs as it is, under the login-PATH wrapper, with its own args after it.
+        assert_eq!(argv[2], WITH_LOGIN_PATH);
+        assert_eq!(argv[4], DETAIL_SH);
+        assert_eq!(argv.as_array().map(|a| a[5..].to_vec()), Some(vec![json!(STORE_ROOT), json!(REPOS_FILE), json!("factory"), json!("factory-setup.21")]));
+        let stores = PhoneOp::BeadsStores { known: vec!["a=1".into()] }
+            .run(|_, params| {
+                assert_eq!(params["argv"].as_array().and_then(|a| a.last().cloned()), Some(json!("a=1")));
+                Ok(exec(124, ""))
+            })
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .unwrap_or_default();
+        assert_eq!(stores["error"], "the beads read exited with 124");
+    }
+
+    #[test]
+    fn the_beads_scripts_only_read() {
+        for script in [STORES_SH, DETAIL_SH] {
+            assert!(script.contains("--json"));
+            for write in ["bd update", "bd close", "bd create", "bd comment ", "bd delete", "bd sync", "rm "] {
+                assert!(!script.contains(write), "{write}");
+            }
+        }
+        // The desktop's framing, which BeadsModel parses.
+        assert!(STORES_SH.contains("\\036%s\\n\\034%s\\n") && DETAIL_SH.contains("\\037missing"));
+    }
+
+    #[test]
     fn parses_only_its_own_ops() {
         assert_eq!(PhoneOp::parse(r#"{"op":"usage.look"}"#), Some(PhoneOp::UsageLook));
         assert_eq!(PhoneOp::parse(r#"{"op":"tab.rename"}"#), None);
         assert_eq!(PhoneOp::parse("usage.look"), None);
-        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"usage.look","pad":"{}"}}"#, "x".repeat(9000))), None);
+        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"usage.look","pad":"{}"}}"#, "x".repeat(40_000))), None);
     }
 
     #[test]
