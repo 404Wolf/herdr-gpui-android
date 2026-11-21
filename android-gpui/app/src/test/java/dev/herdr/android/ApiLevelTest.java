@@ -48,4 +48,22 @@ public final class ApiLevelTest {
         }
         assertTrue("calls newer than minSdk 29:\n" + String.join("\n", found), found.isEmpty());
     }
+
+    /** View.setStateDescription is API 30: every call sits behind an SDK_INT >= 30 check (on its line or just above). */
+    @Test public void stateDescriptionIsGuardedForApi29() throws Exception {
+        List<String> found = new ArrayList<>();
+        for (String root : new String[] {"src/main/java", "../../android/app/src/main/java"}) {
+            try (Stream<Path> files = Files.walk(Paths.get(root))) {
+                for (Path f : (Iterable<Path>) files.filter(p -> p.toString().endsWith(".java"))::iterator) {
+                    List<String> lines = Files.readAllLines(f, StandardCharsets.UTF_8);
+                    for (int i = 0; i < lines.size(); i++) {
+                        if (!lines.get(i).replaceAll("//.*", "").contains("setStateDescription(")) continue;
+                        String near = String.join("\n", lines.subList(Math.max(0, i - 2), i + 1));
+                        if (!near.matches("(?s).*SDK_INT >= (30|Build\\.VERSION_CODES\\.R).*")) found.add(f + ":" + (i + 1));
+                    }
+                }
+            }
+        }
+        assertTrue("setStateDescription without an API 30 guard:\n" + String.join("\n", found), found.isEmpty());
+    }
 }
