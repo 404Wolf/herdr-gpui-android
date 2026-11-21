@@ -110,6 +110,10 @@ struct Connection<'a> {
     /// phone reads nothing and caches nothing (an old core keeps today's
     /// behaviour).
     transcripts: bool,
+    /// An operation taken off the queue while a transcript read waited, that
+    /// needs the RPC slot or the size: it runs first after the read, and
+    /// nothing after it was taken, so the queue's order holds.
+    held: Option<Operation>,
     /// What this viewer told the core about Wolf using it (item 71).
     focus: Focus,
     /// The attached stream has delivered output since its attach: the view
@@ -355,6 +359,17 @@ impl Connection<'_> {
         self.call_within(method, params, Duration::from_secs(15))
     }
     fn call_within(&mut self, method: &str, params: Value, wait: Duration) -> Result<Value> {
+        self.call_pumping(method, params, wait, None)
+    }
+    /// As `call_within`; with `commands`, what Wolf types keeps going out
+    /// while the reply is awaited (see `pump`).
+    fn call_pumping(
+        &mut self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+        commands: Option<&mpsc::Receiver<Operation>>,
+    ) -> Result<Value> {
         self.serial += 1;
         let id = self.serial;
         write_frame(
@@ -365,6 +380,9 @@ impl Connection<'_> {
         )?;
         let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
+            if let Some(commands) = commands {
+                self.pump(commands)?;
+            }
             let Some(frame) = self.read()? else { continue };
             if frame.channel == 0 && frame.kind == 0 {
                 let reply: Value = serde_json::from_slice(&frame.bytes)?;
@@ -385,6 +403,30 @@ impl Connection<'_> {
             self.deliver(frame)?;
         }
         Err(Error::Protocol(format!("{method} timed out")))
+    }
+    /// While a slow RPC (a transcript read) waits for its reply: keystrokes,
+    /// output credit and other frames for the attached pane, held messages and
+    /// focus still go out, in queue order, since they are only frames. The
+    /// first operation that needs the RPC slot or changes the size (a RESIZE,
+    /// which may reattach) is held, and with it everything queued after it,
+    /// until the reply is in.
+    fn pump(&mut self, commands: &mpsc::Receiver<Operation>) -> Result<()> {
+        for _ in 0..64 {
+            if self.held.is_some() {
+                break;
+            }
+            let Ok(operation) = commands.try_recv() else { break };
+            match operation {
+                Operation::Frame(channel, kind, bytes)
+                    if channel == self.channel && channel != 0 && kind != RESIZE =>
+                {
+                    write_frame(&mut self.socket, channel, kind, &bytes)?
+                }
+                Operation::Compose(compose, reply) => self.compose(compose, &reply)?,
+                other => self.held = Some(other),
+            }
+        }
+        self.sync_focus()
     }
     fn deliver(&mut self, frame: Frame) -> Result<()> {
         if frame.channel == self.events && frame.kind == 0 {
@@ -599,7 +641,11 @@ impl Connection<'_> {
     /// One bounded transcript read (see `remote::read_transcript`). Never on a
     /// core without `read-bounded` and `incarnation`: its read formats the
     /// whole history under its lock and may scroll a full-screen program.
-    fn read_transcript(&mut self, request: &crate::remote::ReadRequest) -> Result<String> {
+    fn read_transcript(
+        &mut self,
+        request: &crate::remote::ReadRequest,
+        commands: &mpsc::Receiver<Operation>,
+    ) -> Result<String> {
         if !self.transcripts {
             return Ok(json!({"supported":false}).to_string());
         }
@@ -609,7 +655,7 @@ impl Connection<'_> {
             "max_bytes": request.max_bytes,
             "stitch": false,
         });
-        match self.call_within("terminal.read", params, READ_WAIT) {
+        match self.call_pumping("terminal.read", params, READ_WAIT, Some(commands)) {
             Ok(result) => Ok(transcript_reply(&result, request.max_bytes)?.to_string()),
             Err(Error::Rpc { kind, .. }) => Ok(json!({"supported":true,"error":kind}).to_string()),
             Err(error) => Err(error),
@@ -1972,6 +2018,7 @@ pub(crate) fn run(
         ended: None,
         automatic_input: offers(&hello, "automatic_input"),
         transcripts: offers(&hello, "read-bounded") && offers(&hello, "incarnation"),
+        held: None,
         focus: Focus {
             offered: offers(&hello, "viewer_focus") && offers(&hello, "focus_by_use"),
             ..Focus::default()
@@ -2026,7 +2073,8 @@ fn serve(
     let mut refreshed = Instant::now();
     while !owner.cancel.is_cancelled() {
         for _ in 0..64 {
-            match commands.try_recv() {
+            let next = connection.held.take().map_or_else(|| commands.try_recv(), Ok);
+            match next {
                 Ok(Operation::Discover(reply)) => {
                     let _ = reply.send(connection.discover());
                 }
@@ -2038,7 +2086,7 @@ fn serve(
                 }
                 Ok(Operation::Compose(compose, reply)) => connection.compose(compose, &reply)?,
                 Ok(Operation::Read(request, reply)) => {
-                    let _ = reply.send(connection.read_transcript(&request));
+                    let _ = reply.send(connection.read_transcript(&request, commands));
                 }
                 Ok(Operation::Frame(channel, kind, bytes)) if channel == connection.channel => {
                     // Later attaches and new shells start at the viewer's
@@ -4281,6 +4329,9 @@ mod claim_tests {
     enum Seen {
         Attach(Value),
         Frame(u32, u8, Vec<u8>),
+        /// A `terminal.read` asked, and its (delayed) reply written.
+        Read,
+        Replied,
     }
 
     /// How the scripted core answers beyond the defaults: whether it echoes
@@ -4294,6 +4345,8 @@ mod claim_tests {
         /// The attach reply confirms RESIZE frames (and gives a 90x40 grid).
         resizes: bool,
         refuse_from: Option<usize>,
+        /// How long the core takes to answer a `terminal.read` (it keeps reading meanwhile).
+        read_delay: Duration,
     }
 
     struct Mock {
@@ -4356,7 +4409,14 @@ mod claim_tests {
                 let mut decoder = Decoder::default();
                 let mut next_channel = 2;
                 let mut bytes = [0; 4096];
+                let mut reading: Option<(Instant, Value)> = None;
                 loop {
+                    if reading.as_ref().is_some_and(|(due, _)| Instant::now() >= *due) {
+                        let (_, id) = reading.take().unwrap();
+                        let reply = json!({"jsonrpc":"2.0","id":id,"result":{"text":"x","truncated":false,"incarnation":"ab"}});
+                        if write_frame(&mut core, 0, 0, &serde_json::to_vec(&reply).unwrap()).is_err() { return; }
+                        let _ = tx.send(Seen::Replied);
+                    }
                     while let Ok((channel, kind, bytes)) = pushed.try_recv() {
                         // The phone hung up (the test is closing): done, as on a read error.
                         if write_frame(&mut core, channel, kind, &bytes).is_err() { return; }
@@ -4383,6 +4443,11 @@ mod claim_tests {
                                 {"address":"t1","state":"live","labels":{},"cwd":"/tmp"},
                                 {"address":"t2","state":"live","labels":{},"cwd":"/tmp"}]}),
                             "doc.get" => json!({"value":null,"version":0}),
+                            "terminal.read" => {
+                                let _ = tx.send(Seen::Read);
+                                reading = Some((Instant::now() + script.read_delay, request["id"].clone()));
+                                continue;
+                            }
                             "terminal.attach" => {
                                 let asked = request["params"]["visibility_updates"] == true;
                                 let _ = tx.send(Seen::Attach(request["params"].clone()));
@@ -4469,6 +4534,35 @@ mod claim_tests {
         let mut bytes = Vec::from(cols.to_le_bytes());
         bytes.extend(rows.to_le_bytes());
         bytes
+    }
+
+    /// A transcript read the core is slow to answer never holds back typing:
+    /// keys go out while it waits; a RESIZE queued during it, and everything
+    /// queued after that, waits for the reply, in order.
+    #[test]
+    fn typing_goes_out_while_a_transcript_read_waits_and_order_holds() {
+        let script = Script { read_delay: Duration::from_millis(750), ..Script::default() };
+        let core = Mock::scripted(json!(["read-bounded", "incarnation"]), true, true, true, script);
+        assert!(matches!(core.next(), Seen::Attach(_)));
+        core.measured(2, 100, 30);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(100, 30)));
+
+        let (tx, reply) = mpsc::sync_channel(1);
+        let request = crate::remote::ReadRequest::new("t2", 2000, 65536).unwrap();
+        core.owner.commands.try_send(Operation::Read(request, tx)).unwrap();
+        assert_eq!(core.next(), Seen::Read);
+        let typed = Instant::now();
+        core.owner.commands.try_send(Operation::Frame(2, DATA, b"a".to_vec())).unwrap();
+        assert_eq!(core.next(), Seen::Frame(2, DATA, b"a".to_vec()), "a key waits for no read");
+        assert!(typed.elapsed() < Duration::from_millis(400), "{:?}", typed.elapsed());
+        core.measured(2, 80, 24);
+        core.owner.commands.try_send(Operation::Frame(2, DATA, b"b".to_vec())).unwrap();
+        assert_eq!(core.next(), Seen::Replied);
+        assert_eq!(core.next(), Seen::Frame(2, RESIZE, size(80, 24)));
+        assert_eq!(core.next(), Seen::Frame(2, DATA, b"b".to_vec()));
+        let answer: Value = serde_json::from_str(&reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()).unwrap();
+        assert_eq!(answer["text"], "x");
+        core.close();
     }
 
     #[test]
@@ -5309,6 +5403,7 @@ mod focus_review_tests {
             ended: None,
             automatic_input: true,
             transcripts: false,
+            held: None,
             focus: Focus {
                 offered: true,
                 frames: true,
