@@ -173,6 +173,6 @@ public final class UsageModelTest {
         String usage = rail.substring(start, rail.indexOf("private ImageButton iconButton(", start));
         assertTrue(usage.contains("!hostId.equals(now.hostId)"));
         assertTrue(usage.contains("actionWorker"));
-        assertTrue(rail.contains("if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, \"Usage\")"));
+        assertTrue(rail.contains("if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, \"Usage\").setIcon(R.drawable.ic_bar_usage)"));
     }
 }
