@@ -602,6 +602,27 @@ macro_rules! __bind_gpui {
                         .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen, previous))
                         .unwrap_or_default();
                     let placed = &layout.placed;
+                    // A run that is not the draft (the controls, their blanks, queue rows)
+                    // keeps the program's own tint under it: Codex's composer and Gemini's
+                    // input box are tinted, and a quad of the default background there
+                    // would read as a hole in their box (factory-setup.23/.36).
+                    let tints: Vec<Option<Hsla>> = placed
+                        .iter()
+                        .map(|run| {
+                            if run.source.is_some() || run.col >= cols {
+                                return None;
+                            }
+                            let line = self.rows.source(run.row)?;
+                            let square = grid.grid[Pos::new(line, Column(run.col + col_off))];
+                            let style = grid.grid.style_of(&square);
+                            let bg = if style.flags.contains(StyleFlags::INVERSE) {
+                                resolve_color(&grid, theme, style.fg)
+                            } else {
+                                resolve_color(&grid, theme, style.bg)
+                            };
+                            (bg != theme.background).then(|| rgb_color(bg))
+                        })
+                        .collect();
                     // Spread only at Claude's prompt (the program's own box), and only when the
                     // controls sit below the draft's first line (on the box's lower rule): the
                     // controls' rows, and Claude's status line below, never move.
@@ -760,27 +781,6 @@ macro_rules! __bind_gpui {
                         }
                     }
                     if let Some(ghost) = self.ghost.clone() {
-                        // A run that is not the draft (the controls, their blanks, queue rows)
-                        // keeps the program's own tint under it: Codex's composer and Gemini's
-                        // input box are tinted, and a quad of the default background there
-                        // would read as a hole in their box (factory-setup.23/.36).
-                        let tints: Vec<Option<Hsla>> = placed
-                            .iter()
-                            .map(|run| {
-                                if run.source.is_some() || run.col >= cols {
-                                    return None;
-                                }
-                                let line = self.rows.source(run.row)?;
-                                let square = grid.grid[Pos::new(line, Column(run.col + col_off))];
-                                let style = grid.grid.style_of(&square);
-                                let bg = if style.flags.contains(StyleFlags::INVERSE) {
-                                    resolve_color(&grid, theme, style.fg)
-                                } else {
-                                    resolve_color(&grid, theme, style.bg)
-                                };
-                                (bg != theme.background).then(|| rgb_color(bg))
-                            })
-                            .collect();
                         self.paint_ghost(&ghost, placed, &tints, bounds.origin, &font, font_size, window, cx);
                     }
                     if let Some(listener) = self.layout_listener.clone() {
