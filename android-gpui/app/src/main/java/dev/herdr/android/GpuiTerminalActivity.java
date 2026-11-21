@@ -2988,13 +2988,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String close = TabMenu.closeLabel(inTab);
         Runnable closeTab = () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
                 "space", space, "tab", tab); };
-        if (close != null && TabMenu.closeConfirms(inTab)) sheet.danger(close, closeTab);
-        else if (close != null) sheet.add(close, closeTab);
+        // A busy shell's close says what it stops, in a dialog (as End does); idle shells just close.
+        if (close != null && TabMenu.closeConfirms(inTab)) {
+            sheet.add(close, () -> sheetBuilder().setTitle(close.replace("…", "?"))
+                    .setMessage(TabMenu.stopMessage(inTab))
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Stop and close", (d, w) -> closeTab.run())
+                    .show());
+        } else if (close != null) {
+            sheet.add(close, closeTab);
+        }
+        String noClose = TabMenu.noCloseReason(inTab);
+        if (noClose != null) {
+            sheet.add("Close tab…", () -> sheetBuilder().setTitle("Close tab").setMessage(noClose)
+                    .setPositiveButton("OK", null).show());
+        }
+        java.util.List<java.util.List<String>> detach = TabMenu.detach(inTab);
+        if (detach != null) {
+            // The desktop's Park: the agents leave the tab and stay in the rail under their lead.
+            sheet.add(TabMenu.DETACH, () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.detach",
+                    "space", space, "tab", tab, "park", new JSONArray(detach.get(0)), "kill", new JSONArray(detach.get(1))); });
+        }
         for (TabMenu.Pane agent : inTab) {
             if (!agent.agent()) continue;
             // Confirmed by its own dialog, which names the agent, its state and its task.
             sheet.add(TabMenu.endLabel(agent), () -> sheetBuilder().setTitle(TabMenu.endLabel(agent))
-                    .setMessage(TabMenu.endMessage(agent))
+                    .setMessage(TabMenu.endMessage(agent, inTab.size() - 1))
                     .setNegativeButton("Cancel", null)
                     .setPositiveButton("End agent", (d, w) -> {
                         if (stillOwned(owned, label)) runEdit(target, "End " + agent.title, "op", "pane.kill", "terminal", agent.id);

@@ -87,11 +87,7 @@ final class TabMenu {
     static String closeLabel(List<Pane> panes) {
         switch (close(panes)) {
             case AGENTS: return null;
-            case STOPS: {
-                List<String> programs = new ArrayList<>();
-                for (Pane p : panes) if (p.busyShell() && !programs.contains(p.program)) programs.add(p.program);
-                return "Close tab and stop " + String.join(", ", programs);
-            }
+            case STOPS: return "Close tab and stop " + String.join(", ", busyPrograms(panes)) + "…";
             default: return "Close tab";
         }
     }
@@ -111,6 +107,47 @@ final class TabMenu {
         return label + " · shell";
     }
 
+    /** The words of a busy shell's close confirmation: what stops. */
+    static String stopMessage(List<Pane> panes) {
+        List<String> programs = busyPrograms(panes);
+        return "Closing this tab stops " + String.join(" and ", programs) + " in it. Unsaved work there is lost.";
+    }
+
+    /**
+     * Why an agent tab offers no close that keeps its agent running, or null:
+     * a shell in it runs a program that the close would stop.
+     */
+    static String noCloseReason(List<Pane> panes) {
+        if (close(panes) != Close.AGENTS || detach(panes) != null) return null;
+        return String.join(" and ", busyPrograms(panes)) + " is running in this tab, so it can't close with the agent kept. "
+                + "Stop it first, or end the agent.";
+    }
+
+    private static List<String> busyPrograms(List<Pane> panes) {
+        List<String> programs = new ArrayList<>();
+        for (Pane p : panes) if (p.busyShell() && !programs.contains(p.program)) programs.add(p.program);
+        return programs;
+    }
+
+    /** The detach row's words: it reads as the desktop's Park. */
+    static final String DETACH = "Close tab — agent keeps running in the rail";
+
+    /**
+     * What closing an agent tab while its agents keep running does
+     * (tab.detach, the desktop's Park): {@code [park, kill]}, its agents parked
+     * and its idle shells closed; null when the tab has no agent, or a shell
+     * runs a program that a close would stop.
+     */
+    static List<List<String>> detach(List<Pane> panes) {
+        List<String> park = new ArrayList<>(), kill = new ArrayList<>();
+        for (Pane p : panes) {
+            if (p.agent()) park.add(p.id);
+            else if (p.busyShell()) return null;
+            else kill.add(p.id);
+        }
+        return park.isEmpty() ? null : Arrays.asList(park, kill);
+    }
+
     /** "End factory-pm…" for an agent pane. */
     static String endLabel(Pane agent) {
         return "End " + name(agent) + "…";
@@ -118,11 +155,18 @@ final class TabMenu {
 
     /** The confirmation's words: who, doing what, and that it stops. */
     static String endMessage(Pane agent) {
+        return endMessage(agent, 0);
+    }
+
+    /** As {@link #endMessage(Pane)}, true to the tab: {@code others} panes stay in it, or the tab goes with it. */
+    static String endMessage(Pane agent, int others) {
         StringBuilder words = new StringBuilder(harness(agent.kind)).append(" in ").append(name(agent));
         if (!agent.status.isEmpty()) words.append(" is ").append(agent.status);
         words.append('.');
         if (!agent.msg.isEmpty()) words.append("\n\n").append(agent.msg);
-        words.append("\n\nEnding it stops the agent and closes its terminal. Its tab and other panes stay.");
+        words.append("\n\nEnding it stops the agent and closes its terminal.");
+        words.append(others == 0 ? " Its tab closes with it." : others == 1 ? " The other pane in its tab stays."
+                : " The other " + others + " panes in its tab stay.");
         return words.toString();
     }
 
