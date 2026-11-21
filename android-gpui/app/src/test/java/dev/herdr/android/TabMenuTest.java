@@ -83,5 +83,27 @@ public final class TabMenuTest {
         assertTrue(button.contains("newWindow(target, newWindowPlace(target), \"shell\")"));
         assertTrue(button.contains("showNewMenu(view)"));
         assertFalse(rail.contains("\"Close terminal\").setIcon"));
+        assertTrue(button.contains("!still[0].still()"));
+        assertTrue(button.contains("StillPress.on(shell)"));
+        // A host switch between the sheet and its dialog ends nothing on the new host.
+        String end = sheet.substring(sheet.indexOf("\"End agent\""));
+        assertTrue(end.indexOf("stillOwned(owned, label)") < end.indexOf("pane.kill"));
+    }
+
+    @Test public void aPressThatTravelledIsNotATap() {
+        StillPress press = StillPress.forTest(8);
+        press.track(android.view.MotionEvent.ACTION_DOWN, 10, 10, 1);
+        press.track(android.view.MotionEvent.ACTION_MOVE, 14, 12, 1);
+        press.track(android.view.MotionEvent.ACTION_UP, 15, 12, 1);
+        assertTrue(press.still());
+        press.track(android.view.MotionEvent.ACTION_DOWN, 10, 10, 1);
+        press.track(android.view.MotionEvent.ACTION_MOVE, 40, 10, 1);
+        press.track(android.view.MotionEvent.ACTION_UP, 12, 10, 1);
+        assertFalse(press.still());
+        press.track(android.view.MotionEvent.ACTION_DOWN, 10, 10, 1);
+        press.track(android.view.MotionEvent.ACTION_CANCEL, 10, 10, 1);
+        assertFalse(press.still());
+        press.track(android.view.MotionEvent.ACTION_DOWN, 10, 10, 1);
+        assertTrue(press.still());
     }
 }

@@ -1036,6 +1036,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Input controls resolve on touch-up, in order with the keys they sit by.
         synchronousTouch(keyboard);
         pinned.addView(keyboard);
+        if (!shellMode()) pinned.addView(quickShellButton());
         if (compact) {
             // A compact bar keeps frequent controls and the keys in view; the
             // rest live in one overflow menu, as platform toolbars do.
@@ -1048,8 +1049,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     shellMode() ? (debuggable() ? "Copy the screen, save a screenshot or return to the hosts"
                             : "Copy the screen or return to the hosts")
                             : "New tab, split, zoom or close this session's pane", view -> showSessionActions()));
-            pinned.addView(iconButton(R.drawable.ic_bar_close, "Close",
-                    "Close this terminal and return to the host list", view -> finish()));
+            pinned.addView(iconButton(R.drawable.ic_bar_close, "Back to hosts",
+                    "Return to the host list; terminals keep running", view -> finish()));
         }
         LinearLayout keys = new LinearLayout(this);
         keys.setOrientation(LinearLayout.HORIZONTAL);
@@ -1192,7 +1193,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         menu.getMenu().add(0, 1, MoreMenu.VIEW, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
         menu.getMenu().add(0, 2, MoreMenu.SESSION, "Session actions").setIcon(R.drawable.ic_bar_session)
                 .setIconTintList(tint);
-        menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
+        menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Back to hosts").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
         if (navigation && !shellMode()) {
             menu.getMenu().add(0, 4, MoreMenu.PANES, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
             menu.getMenu().add(0, 5, MoreMenu.HOSTS, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts)
@@ -2969,7 +2970,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 spaces.add(new String[] {item.optString("id"), chromeTitle(item.optString("label"), item.optString("id"))});
             }
         }
-        new ActionSheet(this, chrome, label)
+        java.util.List<TabMenu.Pane> inTab = TabMenu.panes(target.panes, space, tab);
+        ActionSheet sheet = new ActionSheet(this, chrome, TabMenu.title(label, inTab))
                 .add("Rename…", () -> ActionSheet.prompt(this, chrome, "Rename window", label,
                         name -> { if (stillOwned(owned, label)) runEdit(target, "Rename", "op", "tab.rename", "space", space, "tab", tab, "name", name); }))
                 .add("Split: new shell beside it", () -> { if (stillOwned(owned, label)) runEdit(target, "Split", "op", "tab.split",
@@ -2981,10 +2983,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                                 "tab", tab, "to", other[0]); });
                     }
                     pick.show();
-                })
-                .danger("Close window", () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
-                        "space", space, "tab", tab); })
-                .show();
+                });
+        // Closing a tab never ends an agent unasked: an agent tab offers only its explicit End (TabMenu).
+        String close = TabMenu.closeLabel(inTab);
+        Runnable closeTab = () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
+                "space", space, "tab", tab); };
+        if (close != null && TabMenu.closeConfirms(inTab)) sheet.danger(close, closeTab);
+        else if (close != null) sheet.add(close, closeTab);
+        for (TabMenu.Pane agent : inTab) {
+            if (!agent.agent()) continue;
+            // Confirmed by its own dialog, which names the agent, its state and its task.
+            sheet.add(TabMenu.endLabel(agent), () -> sheetBuilder().setTitle(TabMenu.endLabel(agent))
+                    .setMessage(TabMenu.endMessage(agent))
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("End agent", (d, w) -> {
+                        if (stillOwned(owned, label)) runEdit(target, "End " + agent.title, "op", "pane.kill", "terminal", agent.id);
+                    })
+                    .show());
+        }
+        sheet.show();
     }
 
     private boolean stillOwned(java.util.function.BooleanSupplier owned, String label) {
@@ -3101,22 +3118,40 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         menu.getMenu().add(0, 2, 1, "Codex");
         menu.getMenu().add(0, 3, 2, "Shell");
         menu.setOnMenuItemClickListener(item -> {
-            if (place != null) {
-                String kind = item.getItemId() == 1 ? "claude" : item.getItemId() == 2 ? "codex" : "shell";
-                if (place[2] != null && place[2].startsWith("/")) {
-                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
-                            "folder", place[2], "kind", kind);
-                } else {
-                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
-                            "kind", kind);
-                }
-                return true;
-            }
-            String action = item.getItemId() == 1 ? "agent.claude" : item.getItemId() == 2 ? "agent.codex" : "tab.new";
-            runSessionAction(target, action, "New " + item.getTitle());
+            newWindow(target, place, item.getItemId() == 1 ? "claude" : item.getItemId() == 2 ? "codex" : "shell");
             return true;
         });
         menu.show();
+    }
+
+    /** One new window of {@code kind} (claude, codex or shell), placed as "+" places it. */
+    private void newWindow(Connection target, String[] place, String kind) {
+        String label = "New " + TabMenu.harness(kind) + (target.hostName == null ? "" : " on " + target.hostName);
+        if (place != null) {
+            if (place[2] != null && place[2].startsWith("/")) {
+                runEdit(target, label, "op", "window.new", "space", place[0], "lead", place[1], "folder", place[2], "kind", kind);
+            } else {
+                runEdit(target, label, "op", "window.new", "space", place[0], "lead", place[1], "kind", kind);
+            }
+            return;
+        }
+        runSessionAction(target, "claude".equals(kind) ? "agent.claude" : "codex".equals(kind) ? "agent.codex" : "tab.new", label);
+    }
+
+    /** The toolbar's ">_": one tap, a new shell where "+" would put it; held, the same pick as "+". */
+    private ImageButton quickShellButton() {
+        StillPress[] still = new StillPress[1];
+        ImageButton shell = iconButton(R.drawable.ic_bar_shell, "New shell",
+                "New shell in a new tab. Hold for Claude or Codex", view -> {
+                    // A press that began a scroll or drag across the bar makes nothing.
+                    if (still[0] != null && !still[0].still()) return;
+                    Connection target;
+                    synchronized (stateLock) { target = connection; }
+                    if (target != null && !target.isClosed()) newWindow(target, newWindowPlace(target), "shell");
+                });
+        shell.setOnLongClickListener(view -> { showNewMenu(view); return true; });
+        still[0] = StillPress.on(shell);
+        return shell;
     }
 
     private void refreshSidebar(boolean force) {
