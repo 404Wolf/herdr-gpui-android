@@ -225,4 +225,27 @@ public final class TranscriptsTest {
         assertFalse("the core could not say", TranscriptPlanner.keep(null, INC, 3, 3));
         assertFalse(TranscriptPlanner.keep(INC, null, 3, 3));
     }
+
+    // ---- review of #55: only a connection's own list proves anything ----
+
+    @Test public void onlyAReadyConnectionsOwnListAfterItsHelloIsPublishedOncePerRevision() {
+        assertTrue(TranscriptKeeper.mayPublish(true, true, true, true, -1, 4));
+        assertFalse("published already", TranscriptKeeper.mayPublish(true, true, true, true, 4, 4));
+        assertTrue("a new revision", TranscriptKeeper.mayPublish(true, true, true, true, 4, 5));
+        assertFalse("a resumed connection's inherited list", TranscriptKeeper.mayPublish(true, true, false, true, -1, 4));
+        assertFalse("before its hello's features", TranscriptKeeper.mayPublish(true, true, true, false, -1, 4));
+        assertFalse("its machine unbound", TranscriptKeeper.mayPublish(true, false, true, true, -1, 4));
+        assertFalse("not ready", TranscriptKeeper.mayPublish(false, true, true, true, -1, 4));
+    }
+
+    /** Why the inherited list must never be published: it would delete the only valid copy. */
+    @Test public void anOlderListDeletesTheCurrentCopySoItMustNotBePublished() {
+        Transcripts store = store();
+        assertTrue(store.save(TranscriptKey.of(A, "t5", 7L, INC2), "new", false, 10));
+        store.observe(A, seen("t5", 7L, INC2), 11);
+        assertNotNull(store.proven(A, "t5"));
+        store.observe(A, seen("t5", 7L, INC), 12);
+        assertNull(store.proven(A, "t5"));
+        assertEquals(0, store.count());
+    }
 }

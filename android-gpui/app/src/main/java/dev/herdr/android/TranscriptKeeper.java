@@ -102,6 +102,17 @@ final class TranscriptKeeper {
         disk.execute(() -> store.observe(machine, seen, asOf));
     }
 
+    /**
+     * Whether a poll may publish its connection's list as transcript proof ({@link #listed}):
+     * ready ({@code selected}), its machine bound by this connection's hello, the list its own
+     * (a resumed connection starts with the previous one's, which must never delete the current
+     * copies), its hello's features known, and a list revision not yet published.
+     */
+    static boolean mayPublish(boolean selected, boolean bound, boolean ownList, boolean featuresKnown,
+            long publishedRevision, long revision) {
+        return selected && bound && ownList && featuresKnown && publishedRevision != revision;
+    }
+
     /** What one poll of a live link knows, for {@link #tick}. */
     static final class Link {
         final long handle, token;
