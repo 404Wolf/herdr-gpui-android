@@ -177,6 +177,11 @@ final class BeadsRail {
                 + (work.needsYou > 0 ? " · !" + work.needsYou : "");
     }
 
+    /** The folded PM row's suffix: " ☰!2", or "" when no bead needs you. */
+    static String badge(int needsYou) {
+        return needsYou > 0 ? " ☰!" + needsYou : "";
+    }
+
     /** The row's needs-you count, for the PM row's own badge while it is folded. */
     static int needsYou(String hostId, String project, List<? extends FleetTree.Member> members) {
         BeadsModel.Work work = work(hostId, project, members);
