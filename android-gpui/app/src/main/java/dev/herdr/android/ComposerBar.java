@@ -1660,6 +1660,18 @@ final class ComposerBar {
         return dictationState != DictationEngine.State.IDLE && dictationState != DictationEngine.State.PENDING;
     }
 
+    /** Why the user is composing here (typed or offered text, a dictation in flight), or null: the answer sheet waits. */
+    String busy() {
+        return busy(drafts.text(), drafts.offered() != null, dictationState);
+    }
+
+    static String busy(String text, boolean offered, DictationEngine.State dictation) {
+        if (text != null && !text.trim().isEmpty()) return "a draft";
+        if (offered) return "an offered draft";
+        if (dictation != DictationEngine.State.IDLE && dictation != DictationEngine.State.PENDING) return "dictation";
+        return null;
+    }
+
     private void setDictationState(DictationEngine.State state) {
         boolean wasRecording = recording(dictationState);
         dictationState = state;
