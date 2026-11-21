@@ -2208,6 +2208,10 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             // The repo a project sits under, when a label says so (item 61).
             "repo": label("repo").unwrap_or(""),
             "kind": kind.unwrap_or(""),
+            // The factory's join labels: the bead a worker is on, a helper's role (BeadsModel).
+            "issue": label("issue").unwrap_or(""),
+            "task": label("task").unwrap_or(""),
+            "helper": label("helper").unwrap_or(""),
             // What the deacon view shows under each agent: the program's own
             // status message, why it is blocked, and since when (core clock, ms).
             "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),

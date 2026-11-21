@@ -1,5 +1,7 @@
 package dev.herdr.android;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
@@ -48,6 +50,46 @@ public final class BeadsRailTest {
         assertTrue(beads.contains("OpTiming.timed(\"beads.stores\""));
         assertTrue(beads.contains("OpTiming.timed(\"beads.detail\""));
         assertTrue(BeadsRail.ROW_POLL_MS >= 4 * BeadsRail.POLL_MS);
+    }
+
+    @Test public void aPmWithoutWorkersIsNeverFoldedSoItsBeadsShow() throws IOException {
+        String pm = section(source("GpuiTerminalActivity"), "private void railPm(", "private void selectRailHeader(");
+        assertTrue(pm.contains("boolean folded = pm.workerRows > 0 && railFolds().folded(key);"));
+        // The open rail reads beads for a folded PM too (its ☰!k), before the fold returns.
+        assertTrue(pm.indexOf("beadsRail.want(host.id, beadsLook(host.id))") < pm.indexOf("if (folded) return;"));
+    }
+
+    @Test public void nothingIsReadWhileTheRailIsHiddenOrTheAppPaused() throws IOException {
+        String beads = source("BeadsRail");
+        String tick = section(beads, "private void tick()", "private void showDetail(");
+        assertTrue(tick.contains("if (!isOpen() || paused) return;"));
+        assertTrue(tick.contains("if (root.isShown())"));
+        assertTrue(beads.contains("PauseWatch.on(activity"));
+        String want = section(beads, "void want(String hostId", "/** Drills in");
+        assertTrue(want.contains("if (paused ||"));
+        // A look refused because the phone left that machine is neither news nor an error.
+        assertTrue(want.contains("catch (HostSwitched gone)"));
+    }
+
+    @Test public void theDetailsShowAllOnlyWhenSomethingIsHiddenAndMarksReadAsWords() {
+        assertEquals(0, BeadsRail.lineCount(""));
+        assertEquals(3, BeadsRail.lineCount("a\nb\nc"));
+        assertEquals("needs you", BeadsRail.markWords("needs-you"));
+        assertEquals("working", BeadsRail.markWords("working"));
+    }
+
+    @Test public void aWorkIsBuiltOncePerReadAndMembersChange() {
+        FleetTree.Member a = new FleetTree.Member();
+        a.id = "t1";
+        a.status = "idle";
+        String before = BeadsRail.membersKey(java.util.Arrays.asList(a));
+        a.status = "working";
+        assertTrue(!before.equals(BeadsRail.membersKey(java.util.Arrays.asList(a))));
+        BeadsModel.Term t = new BeadsModel.Term();
+        t.id = "t2";
+        t.issue = "x-1";
+        assertTrue(BeadsRail.membersKey(java.util.Arrays.asList(t)).contains("x-1"));
+        assertNull(BeadsRail.work("no-such-host", "p", java.util.Collections.emptyList()));
     }
 
     @Test public void itOnlyReads() throws IOException {
