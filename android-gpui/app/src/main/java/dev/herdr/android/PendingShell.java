@@ -5,16 +5,18 @@ import java.util.Set;
 
 /**
  * The quick shell's own tab while it starts (factory-setup.29): a "shell ◌"
- * pill at the end of the tab strip from the tap until a new terminal shows
- * up in the view, then nothing (the real tab takes its place). The core's
- * refusal, or {@link #TIMEOUT_MS} without a new terminal, turns it into a
- * red "shell ✕" that says why and offers Retry or Close; nothing is left
- * running by it. One per machine connection; pure, the caller gives the clock.
+ * pill at the end of the tab strip from the tap until a new shell terminal
+ * shows up in the view, then nothing (the real tab takes its place). After
+ * {@link #TIMEOUT_MS} it is still waiting, and says so ("shell ◌ slow"): the
+ * core may still start it, so nothing offers a second one. Only the core's
+ * refusal fails it: a red "shell ✕" that says why and offers Retry or Close,
+ * with nothing left running. One per machine connection; pure, the caller
+ * gives the clock.
  */
 final class PendingShell {
     static final long TIMEOUT_MS = 10_000;
 
-    enum State { NONE, STARTING, FAILED }
+    enum State { NONE, STARTING, SLOW, FAILED }
 
     private State state = State.NONE;
     private String hostId = "";
@@ -33,21 +35,21 @@ final class PendingShell {
     }
 
     /**
-     * The view's terminals on {@code hostId} at {@code now}: a new one ends the
-     * wait, a long wait fails it. Another machine's view changes nothing.
-     * True when the state changed (the strip redraws).
+     * The view's shell terminals on {@code hostId} at {@code now} (agents are
+     * left out by the caller: a new agent is not this shell): a new one ends
+     * the wait, a long wait says it is slow. Another machine's view changes
+     * nothing. True when the state changed (the strip redraws, and says so).
      */
-    boolean observe(String hostId, Set<String> panes, long now) {
-        if (state != State.STARTING || !this.hostId.equals(hostId)) return false;
-        for (String pane : panes) {
+    boolean observe(String hostId, Set<String> shells, long now) {
+        if ((state != State.STARTING && state != State.SLOW) || !this.hostId.equals(hostId)) return false;
+        for (String pane : shells) {
             if (!before.contains(pane)) {
                 state = State.NONE;
                 return true;
             }
         }
-        if (now - startedAt >= TIMEOUT_MS) {
-            state = State.FAILED;
-            reason = "no terminal after " + TIMEOUT_MS / 1000 + " s";
+        if (state == State.STARTING && now - startedAt >= TIMEOUT_MS) {
+            state = State.SLOW;
             return true;
         }
         return false;
@@ -55,7 +57,7 @@ final class PendingShell {
 
     /** The core refused the start (its words). */
     void failed(String why) {
-        if (state != State.STARTING) return;
+        if (state != State.STARTING && state != State.SLOW) return;
         state = State.FAILED;
         reason = why == null || why.isEmpty() ? "not started" : why;
     }
@@ -88,6 +90,7 @@ final class PendingShell {
     String pill() {
         switch (state) {
             case STARTING: return "shell ◌";
+            case SLOW: return "shell ◌ slow";
             case FAILED: return "shell ✕";
             default: return null;
         }
@@ -97,6 +100,7 @@ final class PendingShell {
     String described(String machine) {
         switch (state) {
             case STARTING: return "Starting a shell on " + machine;
+            case SLOW: return "Still starting a shell on " + machine + ", " + TIMEOUT_MS / 1000 + " s so far. Tap to stop waiting";
             case FAILED: return "Couldn't start a shell on " + machine + ": " + reason + ". Tap to retry or close";
             default: return "";
         }

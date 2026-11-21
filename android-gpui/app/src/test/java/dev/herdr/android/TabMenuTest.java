@@ -116,7 +116,7 @@ public final class TabMenuTest {
         assertTrue(rail.contains("if (!shellMode()) pinned.addView(quickShellButton());"));
         int quick = rail.indexOf("private ImageButton quickShellButton(");
         String button = rail.substring(quick, rail.indexOf("\n    }\n", quick));
-        assertTrue(button.contains("newWindow(target, newWindowPlace(target), \"shell\")"));
+        assertTrue(button.contains("startQuickShell(target)"));
         assertTrue(button.contains("showNewMenu(view)"));
         assertFalse(rail.contains("\"Close terminal\").setIcon"));
         assertTrue(button.contains("!still[0].still()"));
