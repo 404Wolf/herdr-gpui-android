@@ -145,7 +145,7 @@ public final class RailClicksTest {
         assertTrue(overview.contains("row.setOnClickListener(v -> pickMachine(machine))"));
         String tree = section(home, "private LinearLayout treeLine(", "private TextView chevronSlot(");
         assertTrue(tree.contains("toggle.setBackground(ripple())"));
-        String chip = section(home, "private TextView chip(", "private static boolean hasRole(");
+        String chip = section(home, "private TextView chip(", "private View agentLine(");
         assertTrue(chip.contains("RippleDrawable("));
         String space = section(rail, "private RailWorkspaceRow createRailWorkspaceRow(", "private void updateRailWorkspaceRow(");
         // Header rows fold with the same control as PM rows, full height.

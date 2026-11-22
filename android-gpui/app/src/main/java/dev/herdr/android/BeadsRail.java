@@ -145,10 +145,10 @@ final class BeadsRail {
         for (FleetTree.Member m : members) {
             key.append(m.id).append('|').append(m.role).append('|').append(m.parent).append('|')
                     .append(m.project).append('|').append(m.status).append('|').append(m.waitKind).append('|')
-                    .append(m.title);
+                    .append(m.title).append('|').append(m.name).append('|').append(m.task).append('|').append(m.helper);
             if (m instanceof BeadsModel.Term) {
                 BeadsModel.Term t = (BeadsModel.Term) m;
-                key.append('|').append(t.issue).append('|').append(t.task).append('|').append(t.helper);
+                key.append('|').append(t.issue);
             }
             key.append('\n');
         }
@@ -514,13 +514,13 @@ final class BeadsRail {
         boolean alarm = "blocked".equals(status) || "error".equals(status) || "question".equals(agent.waitKind);
         // The rail's square status mark (no ovals in the boxy rail).
         row.addView(mark(alarm ? "blocked" : status.isEmpty() ? "unknown" : status), markParams());
-        String name = agent.title.isEmpty() ? agent.id : agent.title;
-        TextView label = mono(name, 12, chrome.onSurface, false);
+        // Its name and the dot: no id, no state word (the dot says it; TalkBack hears it).
+        String name = AgentNames.of(agent);
+        TextView label = mono(name, 12, AgentNames.unnamed(agent) ? chrome.onSurfaceVariant : chrome.onSurface, false);
         label.setSingleLine(true);
         label.setEllipsize(TextUtils.TruncateAt.END);
         row.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
-        row.addView(mono((alarm ? "! " : "") + status, 11, alarm ? chrome.danger : chrome.onSurfaceVariant, false));
-        row.setContentDescription("Focus " + name + (status.isEmpty() ? "" : ", " + status));
+        row.setContentDescription("Focus " + name + ", " + AgentNames.stateWords(status, agent.waitKind));
         row.setOnClickListener(v -> openAgent.accept(agent.id));
         return row;
     }

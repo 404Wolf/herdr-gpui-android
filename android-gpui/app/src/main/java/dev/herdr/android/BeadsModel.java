@@ -598,7 +598,8 @@ final class BeadsModel {
      * {@link #labels}; a plain Member counts as having none.
      */
     static class Term extends FleetTree.Member {
-        String issue = "", task = "", helper = "";
+        /** The bead a worker is on (issue=); task and helper are every Member's. */
+        String issue = "";
     }
 
     /** The rail's members as Terms, each with its pane's join labels (the core view's panes). */
@@ -634,11 +635,11 @@ final class BeadsModel {
     }
 
     private static String task(FleetTree.Member t) {
-        return t instanceof Term ? ((Term) t).task : "";
+        return t.task;
     }
 
     private static String helper(FleetTree.Member t) {
-        return t instanceof Term ? ((Term) t).helper : "";
+        return t.helper;
     }
 
     /** An agent status (working, blocked, done, idle), or null for a plain shell. */

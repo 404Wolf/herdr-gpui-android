@@ -27,6 +27,13 @@ final class FleetTree {
     static class Member {
         String id = "", title = "", status = "", space = "", spaceName = "", tab = "";
         String role = "", project = "", parent = "", kind = "", cwd = "", msg = "", waitKind = "";
+        /**
+         * Its hc name ("phone-rail") and the factory's task= and helper= labels:
+         * what the row calls it (AgentNames), never its id.
+         */
+        String name = "", task = "", helper = "";
+        /** Tells it from another agent here with the same name: its folder, or "2" (AgentNames.disambiguate). */
+        String nameNote = "";
         /** The foreground program's name, when the core says ("" when unknown). */
         String program = "";
         long statusMs, createdMs;
@@ -1292,23 +1299,6 @@ final class FleetTree {
         String n = name == null ? "" : name.trim();
         return n.isEmpty() || GENERIC_NAMES.contains(n.toLowerCase(Locale.ROOT)) || n.matches("\\d+")
                 || RailTree.isTerminalId(n);
-    }
-
-    /** A worker's task for its badge: its own title, else a tab name that says something, else its id. */
-    static String workerTask(String title, String tabName, String id) {
-        if (!genericName(title)) return title.trim();
-        if (!genericName(tabName)) return tabName.trim();
-        return id;
-    }
-
-    /** The pane header's role badge: "PM·t19", "worker·<task>", "Deacon·t6k"; "" without a role. */
-    static String roleBadge(String role, String id, String task) {
-        switch (role == null ? "" : role) {
-            case "deacon": return "Deacon·" + id;
-            case "pm": return "PM·" + id;
-            case "worker": return "worker·" + (task == null || task.trim().isEmpty() ? id : task.trim());
-            default: return "";
-        }
     }
 
     /**
