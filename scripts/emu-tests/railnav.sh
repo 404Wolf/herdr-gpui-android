@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Tapping a worker in the rail shows its bead (factory-setup.21, PR #64), at the cover's width and
-# at the inner screen's: the cover's drawer stays open on the bead with the terminal focused behind
-# it, and one Back shows the terminal; the inner screen's docked rail shows the bead beside it.
-#   lease-run --kind android --outputs <dir> -- scripts/emu-test.sh scripts/emu-tests/beadtap.sh
-# The scratch host (lib-host.sh) runs a fake `bd` with one synthetic bead, so the bead's real path
-# (the core's beads.detail, DETAIL_SH, BeadsModel) is what is drawn. Screenshots and summary.tsv go
-# to $EMU_OUT; the exit status is 1 if any check FAILed.
+# The rail (the cover's drawer, the inner screen's docked column) as Wolf sees it: a project with a
+# PM and two workers unfolded, shot at both widths; never any beads in it; a worker's tap focuses its
+# terminal (and closes the cover's drawer), nothing more.
+#   lease-run --kind android --outputs <dir> -- scripts/emu-test.sh scripts/emu-tests/railnav.sh
+# The scratch host (lib-host.sh) runs a fake `bd` with a synthetic bead, so a bead would show if the
+# rail read one. Screenshots and summary.tsv go to $EMU_OUT; the exit status is 1 if any check FAILed.
 
-# A synthetic store: project "demo", epic demo-1 and its task demo-1.2, two comments. Read-only.
+# A synthetic store: project "demo", epic demo-1 and its task demo-1.2. Read-only.
 fake_bd() {
     mkdir -p "$work/bin" "$work/home/beads/demo/.beads"
     cat > "$work/bin/bd" << 'BD'
@@ -57,8 +56,6 @@ if tap_ui 'lobby-shell' 30 > /dev/null; then quiet 8; record connect PASS "lobby
 # The rail: open it (a drawer on the cover), unfold the demo PM, tap a worker. An agent's pane has
 # no toolbar, so the way in is its top bar's crumb ("Show it in the rail") or a shell's rail button.
 open_rail() {
-    # A bead already open in the docked rail: back to the agents first.
-    find_ui 'Back to the agents' > /dev/null 2>&1 && { tap_ui 'Back to the agents' 10 > /dev/null; quiet 2; }
     find_ui 'Focus pane agent-a|Show .* under demo|Hide .* under demo' > /dev/null 2>&1 \
         || tap_ui 'Show the host and workspace sidebar|Show it in the rail' 20 > /dev/null \
         || { shot "rail-closed-$1"; dump > /dev/null 2>&1; cp "$EMU_OUT/ui.xml" "$EMU_OUT/ui-rail-closed-$1.xml" 2> /dev/null; return 1; }
@@ -66,39 +63,38 @@ open_rail() {
     find_ui 'Focus pane agent-a' > /dev/null 2>&1 || tap_ui 'Show .* under demo' 15 > /dev/null || true
     quiet 2
 }
-# check NAME REGEX DETAIL: PASS when the screen's accessibility dump has REGEX, else FAIL.
-check() {
-    dump > /dev/null 2>&1 || true
-    if grep -Eq "$2" "$EMU_OUT/ui.xml" 2> /dev/null; then record "$1" PASS "$3"; else record "$1" FAIL "$3: not on screen (ui-$1.xml)"; cp "$EMU_OUT/ui.xml" "$EMU_OUT/ui-$1.xml" 2> /dev/null; fi
-}
-tap_worker() { # label agent expect
-    open_rail "$1" || { record "$1" FAIL "no rail (rail-closed-$1.png)"; return; }
-    if ! tap_ui "Focus pane $2" 15 > /dev/null; then shot "$1-norow"; record "$1" FAIL "no row for $2"; return; fi
-    quiet 8
+shot_rail() { # label: the drawer/rail as Wolf sees it, its demo PM unfolded
+    open_rail "$1" || { record "$1" FAIL "no rail (rail-closed-$1.png)"; return 1; }
+    quiet 2
     shot "$1"
-    check "$1" "$3" "$2's tap shows its bead view"
+    dump > /dev/null 2>&1 || true
+    cp "$EMU_OUT/ui.xml" "$EMU_OUT/ui-$1.xml" 2> /dev/null
+    # Never beads in the rail (Wolf): project and agent navigation only.
+    if grep -Eq 'Beads|Give the rail a bead view' "$EMU_OUT/ui.xml"; then record "$1-no-beads" FAIL "beads in the rail"
+    else record "$1-no-beads" PASS "no beads in the rail"; fi
+    record "$1" PASS "rail shot ($1.png)"
+}
+tap_worker() { # label agent: the tap focuses its terminal; the cover's drawer closes
+    open_rail "$1" || { record "$1" FAIL "no rail"; return; }
+    if ! tap_ui "Focus pane $2" 15 > /dev/null; then shot "$1-norow"; record "$1" FAIL "no row for $2"; return; fi
+    quiet 5
+    shot "$1"
+    dump > /dev/null 2>&1 || true
+    if grep -q "Window [0-9]*, $2, current" "$EMU_OUT/ui.xml"; then record "$1" PASS "$2's tap focused its terminal"
+    else record "$1" FAIL "$2 not the current window after its tap"; fi
+    if grep -Eq 'Give the rail a bead view|No task linked' "$EMU_OUT/ui.xml"; then record "$1-no-bead" FAIL "a bead view opened"
+    else record "$1-no-bead" PASS "no bead view"; fi
 }
 
-tap_worker cover-bead agent-a 'Give the rail a bead view'
-# No comments are shown (Wolf, via t2kg): the fixture's comments must not be on screen.
-dump > /dev/null 2>&1 || true
-if grep -q 'Second comment, also shown in full' "$EMU_OUT/ui.xml"; then record cover-no-comments FAIL "a comment is drawn"
-else record cover-no-comments PASS "no comments drawn"; fi
-check cover-terminal-behind 'Back to the agents' "the drawer stayed open on the bead"
-a shell input keyevent KEYCODE_BACK
-quiet 3
-shot cover-back
-dump > /dev/null 2>&1 || true
-if grep -q 'Give the rail a bead view' "$EMU_OUT/ui.xml"; then record cover-back FAIL "Back left the bead on screen"
-else record cover-back PASS "one Back shows the focused terminal"; fi
-tap_worker cover-notask agent-b 'No task linked'
+shot_rail rail-cover
+tap_worker cover-tap agent-a
 a shell input keyevent KEYCODE_BACK
 quiet 3
 
 a shell wm size 2208x1840
 quiet 10
-tap_worker inner-bead agent-a 'Give the rail a bead view'
-tap_worker inner-notask agent-b 'No task linked'
+shot_rail rail-inner
+tap_worker inner-tap agent-b
 a shell wm size reset
 
 if [[ -s "$EMU_OUT/anr.log" ]]; then
