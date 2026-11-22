@@ -19,6 +19,7 @@ import android.text.style.RelativeSizeSpan;
 import android.text.style.StyleSpan;
 import android.text.style.TypefaceSpan;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -76,6 +77,10 @@ final class WorkPanel {
         void closed();
         /** Shows terminal {@code id} of the machine on screen (the agent working on a bead). */
         void focus(String id);
+        /** The cover: how much of the full page shows while a finger drags it back toward the right. */
+        void coverDrag(float visible);
+        /** The cover: the drag's release settles the page open again or off screen. */
+        void coverSettled(boolean open);
     }
 
     private final Activity activity;
@@ -155,7 +160,7 @@ final class WorkPanel {
         this.host = host;
         cache = BeadCache.in(activity);
         thread.execute(cache::load);
-        root = new LinearLayout(activity);
+        root = new CoverPage(activity);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(chrome.panel);
         root.setVisibility(View.GONE);
@@ -270,7 +275,10 @@ final class WorkPanel {
     /** Shown or not (the cover opens it; the split always shows it); {@code closable}: the cover's ×. */
     void show(boolean on, boolean closable) {
         close.setVisibility(closable ? View.VISIBLE : View.GONE);
+        onCover = closable;
         if (on == shown) return;
+        // Folding, unfolding or closing keeps where this tab was read to.
+        if (!on) scrollOf[tab.ordinal()] = scroll.getScrollY();
         shown = on;
         root.setVisibility(on ? View.VISIBLE : View.GONE);
         if (on) { redraw(true); main.post(tick); }
@@ -279,6 +287,87 @@ final class WorkPanel {
 
     boolean shown() {
         return shown;
+    }
+
+    /** Shown as the cover's full page (the × shows): a sideways drag toward the right sends it away. */
+    private boolean onCover;
+
+    /**
+     * The page's own drag back toward the right, on the cover only. It takes
+     * a gesture only once it is clearly sideways and rightward past the touch
+     * slop, never while text is selected (the handles are the selection's),
+     * and never once the scroll has the gesture (it disallows our intercept
+     * from then on). A tap, a scroll and a long press are left to the content.
+     */
+    private final class CoverPage extends LinearLayout {
+        private final int slop;
+        private float downX, downY;
+        private boolean dragging;
+        private android.view.VelocityTracker speed;
+
+        CoverPage(android.content.Context context) {
+            super(context);
+            slop = android.view.ViewConfiguration.get(context).getScaledTouchSlop();
+        }
+
+        private void track(MotionEvent e) {
+            if (speed == null) speed = android.view.VelocityTracker.obtain();
+            MotionEvent raw = MotionEvent.obtain(e);
+            raw.setLocation(e.getRawX(), e.getRawY());
+            speed.addMovement(raw);
+            raw.recycle();
+        }
+
+        @Override public boolean onInterceptTouchEvent(MotionEvent e) {
+            if (!onCover || !shown) return false;
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    downX = e.getRawX();
+                    downY = e.getRawY();
+                    dragging = false;
+                    if (speed != null) speed.clear();
+                    track(e);
+                    return false;
+                case MotionEvent.ACTION_MOVE:
+                    track(e);
+                    float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
+                    if (dx > slop && dx > Math.abs(dy) * 1.5f && !SelectableText.anySelected(body)) {
+                        dragging = true;
+                        return true;
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        @android.annotation.SuppressLint("ClickableViewAccessibility")
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            if (!dragging) return super.onTouchEvent(e);
+            track(e);
+            int widthDp = Math.round(getWidth() / density());
+            float visible = WorkPanelLayout.coverDismissing((e.getRawX() - downX) / density(), widthDp);
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_MOVE:
+                    host.coverDrag(visible);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    speed.computeCurrentVelocity(1000);
+                    dragging = false;
+                    host.coverSettled(WorkPanelLayout.coverOpens(visible, speed.getXVelocity() / density()));
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    dragging = false;
+                    host.coverSettled(true);
+                    return true;
+                default:
+                    return true;
+            }
+        }
+
+        private float density() {
+            return getResources().getDisplayMetrics().density;
+        }
     }
 
     /**
