@@ -155,7 +155,7 @@ final class WorkPanel {
         tabs.addView(close, new LinearLayout.LayoutParams(dp(48), dp(48)));
         root.addView(tabs, new LinearLayout.LayoutParams(-1, -2));
         View rule = new View(activity);
-        rule.setBackgroundColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x33));
+        rule.setBackgroundColor(chrome.outline);
         root.addView(rule, new LinearLayout.LayoutParams(-1, 1));
         scroll = new ScrollView(activity);
         body = new LinearLayout(activity);

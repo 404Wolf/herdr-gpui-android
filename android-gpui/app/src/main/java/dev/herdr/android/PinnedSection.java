@@ -166,7 +166,8 @@ final class PinnedSection {
         row.setPadding(dp(10), 0, dp(8), 0);
         row.setBackground(ActionSheet.ripple(chrome));
         row.setSelected(r.selected);
-        if (r.selected) row.setBackgroundColor(GpuiChrome.withAlpha(chrome.primary, 0x26));
+        // The rail's own mark for the row on screen.
+        if (r.selected) row.setBackgroundColor(chrome.selected);
         row.setFocusable(true);
         // The rail's square status mark: the agent's state when live, dim when not.
         View dot = new View(activity);
