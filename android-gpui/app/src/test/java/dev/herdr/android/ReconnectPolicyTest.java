@@ -8,24 +8,60 @@ import org.junit.Test;
 
 public class ReconnectPolicyTest {
     @Test
-    public void the_first_attempt_is_immediate_then_quick_steps_capped_at_two_seconds() {
+    public void the_first_attempt_is_immediate_then_steps_double_up_to_eight_seconds() {
         ReconnectPolicy policy = new ReconnectPolicy();
         long[] seen = new long[8];
-        for (int i = 0; i < seen.length; i++) seen[i] = policy.next();
+        for (int i = 0; i < seen.length; i++) seen[i] = policy.next(0);
         assertEquals(0, seen[0]);
-        assertEquals(250, seen[1]);
-        assertEquals(500, seen[2]);
-        assertEquals(1000, seen[3]);
-        for (int i = 4; i < seen.length; i++) assertEquals("never slower than 2 s", 2000, seen[i]);
+        assertEquals(500, seen[1]);
+        assertEquals(1000, seen[2]);
+        assertEquals(2000, seen[3]);
+        assertEquals(4000, seen[4]);
+        for (int i = 5; i < seen.length; i++) assertEquals("never slower than 8 s", 8000, seen[i]);
     }
 
     @Test
     public void a_network_change_or_success_starts_the_ladder_again() {
         ReconnectPolicy policy = new ReconnectPolicy();
-        for (int i = 0; i < 6; i++) policy.next();
+        for (int i = 0; i < 6; i++) policy.next(0);
         policy.reset();
         assertEquals(0, policy.attempts());
-        assertEquals(0, policy.next());
+        assertEquals(0, policy.next(0));
+    }
+
+    @Test
+    public void offlineRedesign_oneEpochMakesAtMostTwelveAttempts() {
+        ReconnectPolicy policy = new ReconnectPolicy();
+        long now = 0;
+        for (int i = 0; i < ReconnectPolicy.MAX_ATTEMPTS; i++) {
+            long delay = policy.next(now);
+            assertTrue("attempt " + (i + 1) + " runs", delay >= 0);
+            now += delay;
+        }
+        assertFalse(policy.exhausted());
+        assertEquals(ReconnectPolicy.EXHAUSTED, policy.next(now));
+        assertTrue(policy.exhausted());
+        assertEquals("spent stays spent", ReconnectPolicy.EXHAUSTED, policy.next(now + 1));
+        // A network arriving, or the user's tap, starts a new epoch at once.
+        policy.reset();
+        assertFalse(policy.exhausted());
+        assertEquals(0, policy.next(now + 2));
+    }
+
+    @Test
+    public void offlineRedesign_oneEpochTriesForAtMostNinetySeconds() {
+        ReconnectPolicy policy = new ReconnectPolicy();
+        assertEquals(0, policy.next(1_000));
+        // Attempts that each hang until their deadline use the epoch up in time, not count.
+        assertTrue(policy.next(1_000 + ReconnectPolicy.MAX_EPOCH_MS - 1) >= 0);
+        assertEquals(ReconnectPolicy.EXHAUSTED, policy.next(1_000 + ReconnectPolicy.MAX_EPOCH_MS));
+        assertTrue(policy.exhausted());
+    }
+
+    @Test
+    public void offlineRedesign_anAttemptIsCutWellInsideTheEpoch() {
+        assertTrue(ReconnectPolicy.ATTEMPT_MS * 3 < ReconnectPolicy.MAX_EPOCH_MS);
+        assertEquals(10_000, ReconnectPolicy.ATTEMPT_MS);
     }
 
     @Test

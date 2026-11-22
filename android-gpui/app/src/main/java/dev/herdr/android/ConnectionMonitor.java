@@ -15,10 +15,12 @@ import java.util.Set;
  * Keeps a remote terminal connected while it is on screen.
  *
  * Watches the phone's networks and runs the reconnect attempt the activity
- * supplies on the main thread: at once when a network appears or changes, and
- * on {@link ReconnectPolicy}'s quick ladder after each failure. It never runs
- * between {@link #stop()} and {@link #start()}, so a backgrounded terminal
- * spends no battery or data.
+ * supplies on the main thread: at once when a network appears or validates,
+ * and on {@link ReconnectPolicy}'s ladder after each failure, a bounded number
+ * of times per network (an epoch). With no network at all nothing is tried:
+ * the network's return starts the next attempt. It never runs between
+ * {@link #stop()} and {@link #start()}, so a backgrounded terminal spends no
+ * battery or data.
  *
  * Two callbacks, because Tailscale is a VPN: the default network stays the
  * VPN while Wi-Fi gives way to cellular underneath it, so only the physical
@@ -33,11 +35,24 @@ final class ConnectionMonitor {
      */
     static final long GONE_GRACE_MS = 500;
 
+    /** What the monitor asks of the activity. Main thread, every one. */
+    interface Listener {
+        /** Runs one reconnect, closing any still running first; it reports {@link #succeeded()} or {@link #failed()}. */
+        void attempt();
+
+        /** Any network change: re-check a live link and the indicator. */
+        void changed();
+
+        /** No network for {@link #GONE_GRACE_MS}: a live link is dead now, without waiting for its silence. */
+        void gone();
+
+        /** The epoch's attempts are spent: nothing more runs until a network arrives or the user asks. */
+        void exhausted();
+    }
+
     private final ConnectivityManager connectivity;
     private final Handler main;
-    private final Runnable attempt;
-    private final Runnable changed;
-    private final Runnable gone;
+    private final Listener listener;
     private final ReconnectPolicy policy = new ReconnectPolicy();
     private final Set<Network> physical = new HashSet<>();
     private final Runnable fire = this::fire;
@@ -49,20 +64,13 @@ final class ConnectionMonitor {
     private boolean started;
     private boolean wanted;
     private volatile long changedAt;
+    /** When a network last arrived or validated (uptime ms), 0 for never: reconnects are timed from it. */
+    private volatile long arrivedAt;
 
-    /**
-     * @param attempt runs one reconnect; it must report back with
-     *     {@link #succeeded()} or {@link #failed()}
-     * @param changed runs on any network change, to re-check a live link
-     * @param gone runs when the phone has had no network for {@link #GONE_GRACE_MS}: a live
-     *     link is dead now, without waiting for its silence to say so
-     */
-    ConnectionMonitor(Context context, Handler main, Runnable attempt, Runnable changed, Runnable gone) {
+    ConnectionMonitor(Context context, Handler main, Listener listener) {
         this.connectivity = context.getSystemService(ConnectivityManager.class);
         this.main = main;
-        this.attempt = attempt;
-        this.changed = changed;
-        this.gone = gone;
+        this.listener = listener;
     }
 
     private final ConnectivityManager.NetworkCallback physicalCallback = new ConnectivityManager.NetworkCallback() {
@@ -71,7 +79,7 @@ final class ConnectionMonitor {
                 seenPhysical = true;
                 noNetwork = false;
                 main.removeCallbacks(goneCheck);
-                if (physical.add(network)) networkChanged();
+                if (physical.add(network)) networkChanged(true);
             });
         }
 
@@ -85,7 +93,7 @@ final class ConnectionMonitor {
                     main.removeCallbacks(goneCheck);
                     main.postDelayed(goneCheck, GONE_GRACE_MS);
                 }
-                networkChanged();
+                networkChanged(false);
             });
         }
     };
@@ -94,7 +102,7 @@ final class ConnectionMonitor {
         private boolean validated;
 
         @Override public void onAvailable(Network network) {
-            main.post(ConnectionMonitor.this::networkChanged);
+            main.post(() -> networkChanged(true));
         }
 
         @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
@@ -103,7 +111,7 @@ final class ConnectionMonitor {
             validated = now;
             // A path that just validated (the VPN found its peers again) is
             // the moment a waiting reconnect can succeed.
-            if (now) main.post(ConnectionMonitor.this::networkChanged);
+            if (now) main.post(() -> networkChanged(true));
         }
     };
 
@@ -111,6 +119,7 @@ final class ConnectionMonitor {
     void start() {
         if (started || connectivity == null) return;
         started = true;
+        policy.reset();
         try {
             connectivity.registerNetworkCallback(new NetworkRequest.Builder()
                     .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -156,13 +165,20 @@ final class ConnectionMonitor {
             wanted = true;
             policy.reset();
         }
-        schedule(policy.next());
+        next();
     }
 
-    /** An attempt failed: try again after the next step. Main thread. */
+    /** An attempt failed: try again after the next step, while the epoch lasts. Main thread. */
     void failed() {
         wanted = true;
-        schedule(policy.next());
+        next();
+    }
+
+    /** The user asked (Reconnect): a new epoch, tried at once. Main thread. */
+    void retry() {
+        wanted = true;
+        policy.reset();
+        next();
     }
 
     /** The session is back (or was replaced on purpose): stop trying. Main thread. */
@@ -177,15 +193,25 @@ final class ConnectionMonitor {
         return wanted;
     }
 
+    /** Whether this epoch's attempts are spent: the indicator offers Reconnect. Main thread. */
+    boolean exhausted() {
+        return wanted && policy.exhausted();
+    }
+
     /** Attempts made since the link was last up. */
     int attempts() {
         return policy.attempts();
     }
 
+    /** When a network last arrived or validated (uptime ms), 0 for never. Any thread. */
+    long arrivedAt() {
+        return arrivedAt;
+    }
+
     /** Whether the phone has any network to reconnect over. */
     boolean offline() {
-        return started && physical.isEmpty() && connectivity != null
-                && connectivity.getActiveNetwork() == null;
+        return started && (noNetwork || physical.isEmpty() && connectivity != null
+                && connectivity.getActiveNetwork() == null);
     }
 
     /**
@@ -205,22 +231,43 @@ final class ConnectionMonitor {
         return ReconnectPolicy.dead(quietMs, changedAt != 0 && since < CHANGE_WINDOW_MS);
     }
 
-    private void networkChanged() {
+    /**
+     * A network changed. One that arrived or validated starts a new epoch with an immediate
+     * attempt, which closes an attempt still hanging on the old path (factory-9zz.1: the
+     * return of the network was dropped while a doomed attempt ran). Main thread.
+     */
+    private void networkChanged(boolean arrived) {
         if (!started) return;
-        changedAt = SystemClock.uptimeMillis();
-        if (wanted) {
-            // A new path: the ladder starts over with an immediate attempt.
-            policy.reset();
-            schedule(policy.next());
+        long now = SystemClock.uptimeMillis();
+        changedAt = now;
+        if (arrived) {
+            arrivedAt = now;
+            android.util.Log.i("herdr-net", "network arrived or validated");
+            if (wanted) {
+                policy.reset();
+                next();
+            }
         }
-        changed.run();
+        listener.changed();
+    }
+
+    /** Schedules the epoch's next attempt, or says it is spent. Main thread. */
+    private void next() {
+        long delay = policy.next(SystemClock.uptimeMillis());
+        if (delay == ReconnectPolicy.EXHAUSTED) {
+            main.removeCallbacks(fire);
+            android.util.Log.i("herdr-reconnect", "stopped after " + policy.attempts() + " attempts");
+            listener.exhausted();
+            return;
+        }
+        schedule(delay);
     }
 
     /** Still no network after the grace: the live link is gone. Main thread. */
     private void goneCheck() {
         if (!started || !physical.isEmpty()) return;
         android.util.Log.i("herdr-net", "no network");
-        gone.run();
+        listener.gone();
     }
 
     private void schedule(long delayMs) {
@@ -229,6 +276,10 @@ final class ConnectionMonitor {
     }
 
     private void fire() {
-        if (started && wanted) attempt.run();
+        if (!started || !wanted) return;
+        // No network: nothing to try over. Its return starts the next attempt; the
+        // epoch keeps the attempts it has left.
+        if (noNetwork) return;
+        listener.attempt();
     }
 }
