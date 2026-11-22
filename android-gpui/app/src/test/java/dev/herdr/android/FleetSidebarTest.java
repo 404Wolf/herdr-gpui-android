@@ -57,13 +57,16 @@ public final class FleetSidebarTest {
     }
 
     @Test public void theLeadFoldIsATouchSizedButtonThatNamesWhatItHides() {
-        assertTrue(FleetTree.PM_CHEVRON_DP >= 48);
-        // Tighter rows (Wolf's OLED preview): each whole row is its tap target; the fold button is 48dp wide.
+        // The drawn column is 28dp, the chevron 8dp before its label (review D1); its touch reaches the
+        // screen's edge and 10dp into the label, so the target stays at least 48dp wide.
+        assertEquals(28, FleetTree.PM_CHEVRON_DP);
+        assertTrue(FleetTree.PM_CHEVRON_DP + RailDisclosure.REACH_DP + 7 >= 44);
+        assertEquals(8f, RailDisclosure.ARROW_AT_DP, 0f);
+        assertEquals(3f, RailDisclosure.ARM_DP, 0f);
+        // Rows: 36dp for leads and agents alike (30dp agent rows were easy to mis-tap).
         assertEquals(36, FleetTree.LEAD_ROW_DP);
-        assertEquals(30, FleetTree.AGENT_ROW_DP);
-        // The arrow is a bare chevron near its label; its column (the target) stays 48dp wide.
-        assertTrue(RailDisclosure.ARROW_AT_DP < FleetTree.PM_CHEVRON_DP / 2f);
-        assertTrue(RailDisclosure.ARM_DP <= 2f);
+        assertEquals(36, FleetTree.AGENT_ROW_DP);
+        assertEquals(16, FleetTree.RAIL_DEPTH_DP);
         assertTrue(RailDisclosure.SQUARE_DP <= 24);
         assertEquals("Show 3 rows under factory", FleetTree.foldSays("factory", false, 3, true, "k"));
         assertEquals("Hide 1 row under factory", FleetTree.foldSays("factory", false, 1, false, "k"));

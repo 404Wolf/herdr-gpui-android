@@ -4399,8 +4399,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
         holder.mark.offerOn(holder.row);
         LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
-        markParams.setMarginEnd(dp(6));
         holder.row.addView(holder.mark, markParams);
+        // The drawn column is narrow (the chevron near its label); its touch reaches the edge and into the label.
+        holder.mark.extendTouch(holder.row);
         holder.label = railText("", 12, chrome.primary);
         holder.label.setTypeface(railMono(false));
         holder.row.addView(holder.label, new LinearLayout.LayoutParams(0, -2, 1));
@@ -4410,11 +4411,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         LinearLayout.LayoutParams metaParams = new LinearLayout.LayoutParams(-2, -2);
         metaParams.leftMargin = dp(6);
         holder.row.addView(holder.meta, metaParams);
-        TextView chevron = railText("›", 15, chrome.onSurfaceVariant);
-        chevron.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        LinearLayout.LayoutParams chevronParams = new LinearLayout.LayoutParams(-2, -2);
-        chevronParams.leftMargin = dp(4);
-        holder.row.addView(chevron, chevronParams);
+        // No trailing "›": the fold chevron is the row's one arrow (review D5).
         holder.row.setBackground(railBackground(false));
         holder.row.setOnLongClickListener(view -> {
             // A Fleet header (project, checkout slice, group) is not a physical
@@ -4687,8 +4684,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
         holder.mark.offerOn(holder.row);
         LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
-        markParams.setMarginEnd(dp(6));
         holder.row.addView(holder.mark, markParams);
+        // The drawn column is narrow (the chevron near its label); its touch reaches the edge and into the label.
+        holder.mark.extendTouch(holder.row);
         // Status as a small square mark (no ovals in the boxy rail).
         holder.dot = new View(this);
         holder.dot.setBackgroundColor(chrome.onSurfaceVariant);
