@@ -35,6 +35,8 @@ final class UsageView {
     static final long TICK_MS = 30_000;
     /** The accounts' column, centred: wide enough for long bars, never the whole unfolded screen. */
     static final int COLUMN_DP = 560;
+    /** The sheet's inset at its sides, top and foot (Wolf: a little more air than the 16dp of the rows' own). */
+    static final int SIDE_DP = 18, TOP_DP = 10, FOOT_DP = 14;
 
     private final Activity activity;
     private final GpuiChrome chrome;
@@ -84,7 +86,7 @@ final class UsageView {
 
         LinearLayout top = column();
         top.setOrientation(LinearLayout.VERTICAL);
-        top.setPadding(dp(16), dp(8), dp(16), dp(4));
+        top.setPadding(dp(SIDE_DP), dp(TOP_DP), dp(SIDE_DP), dp(4));
         // The handle: a 48dp tap target that closes, with the usual grip drawn in it.
         android.widget.FrameLayout handle = new android.widget.FrameLayout(activity);
         View grip = new View(activity);
@@ -119,12 +121,12 @@ final class UsageView {
 
         rows = column();
         rows.setOrientation(LinearLayout.VERTICAL);
-        rows.setPadding(dp(16), 0, dp(16), dp(8));
+        rows.setPadding(dp(SIDE_DP), 0, dp(SIDE_DP), dp(8));
         ScrollView scroll = new ScrollView(activity);
         scroll.addView(rows, new android.widget.FrameLayout.LayoutParams(-1, -2, Gravity.CENTER_HORIZONTAL));
         sheet.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         footer = text("", 12, chrome.onSurfaceVariant, false);
-        footer.setPadding(dp(16), dp(6), dp(16), dp(12));
+        footer.setPadding(dp(SIDE_DP), dp(6), dp(SIDE_DP), dp(FOOT_DP));
         footer.setVisibility(View.GONE);
         LinearLayout foot = column();
         foot.addView(footer, new LinearLayout.LayoutParams(-1, -2));

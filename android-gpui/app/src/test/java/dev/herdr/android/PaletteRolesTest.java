@@ -28,6 +28,9 @@ public final class PaletteRolesTest {
         String gta = read("GpuiTerminalActivity");
         assertTrue(gta.contains("shape.setColor(active ? chrome.selected : chrome.background);"));
         assertTrue(gta.contains("chip.setTextColor(idle && !active ? chrome.onSurfaceVariant : chrome.onSurface);"));
+        // The Usage sheet's inset: a couple of dp more than its rows' 16 (Wolf), the same on every side part.
+        assertTrue(UsageView.SIDE_DP == 18 && UsageView.TOP_DP == 10 && UsageView.FOOT_DP == 14);
+        assertFalse(usage.contains("setPadding(dp(16)"));
         // No hand-mixed tints left for these surfaces.
         assertFalse(usage.contains("withAlpha(chrome.onSurfaceVariant, 0x33)"));
         assertFalse(panel.contains("withAlpha(chrome.onSurfaceVariant, 0x33)"));
