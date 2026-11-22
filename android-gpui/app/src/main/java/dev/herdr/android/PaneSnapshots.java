@@ -21,8 +21,12 @@ import java.util.concurrent.Executor;
  * computer and pane, and are written and read on this class's own thread.
  */
 final class PaneSnapshots {
-    static final int MAX_FILES = 16;
-    static final long MAX_TOTAL_BYTES = 32L * 1024 * 1024;
+    /**
+     * Saved panes kept: their share of the {@link OfflineBudget} (0.5 GiB of a full one; Wolf's
+     * steer to be generous), newest first. A copy is at most 4 MiB (snapshot.rs).
+     */
+    static final int MAX_FILES = 256;
+    static final long MAX_TOTAL_BYTES = OfflineBudget.TOTAL_BYTES / 8;
     private static final String SUFFIX = ".snap";
 
     private static PaneSnapshots shared;
