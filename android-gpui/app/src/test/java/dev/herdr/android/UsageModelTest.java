@@ -53,7 +53,7 @@ public final class UsageModelTest {
         assertEquals(UsageModel.Level.WARN, UsageModel.level(work.tightest()));
         UsageModel.Window five = work.windows.get(0);
         assertEquals("5h", UsageModel.windowName(five));
-        assertEquals("████████░░", UsageModel.bar(five.used));
+        assertEquals(0.844f, UsageModel.fill(five.used), 1e-4f);
         assertEquals("resets in 1h 05m · 11:47", UsageModel.resets(five, NOW, UTC));
         assertEquals("resets in 3d 2h · Tue 12:42", UsageModel.resets(work.windows.get(1), NOW, UTC));
         assertEquals("", UsageModel.problem(work, NOW));
@@ -111,8 +111,9 @@ public final class UsageModelTest {
         assertEquals("<1m", UsageModel.span(30));
         assertEquals("4m", UsageModel.span(240));
         assertEquals("2d", UsageModel.span(2 * 86400));
-        assertEquals("██████████", UsageModel.bar(130.0));
-        assertEquals("░░░░░░░░░░", UsageModel.bar(null));
+        assertEquals(1f, UsageModel.fill(130.0), 0f);
+        assertEquals(0f, UsageModel.fill(null), 0f);
+        assertEquals(0f, UsageModel.fill(-5.0), 0f);
         // Rounded down: 89.6 must not read as the 90% danger threshold.
         assertEquals("89%", UsageModel.percent(89.6));
         assertEquals("90m", UsageModel.windowName(new UsageModel.Window("window_90m", 1.0, 0, 90)));
@@ -122,13 +123,15 @@ public final class UsageModelTest {
     @Test public void aCachedAnswerShowsAsOldUntilThisOpensLookAnswers() {
         UsageModel.Look cached = UsageModel.parse(reply(WORK));
         UsageModel.Sheet sheet = new UsageModel.Sheet("demo");
-        assertEquals("asking…", sheet.updated(UTC));
+        assertEquals("asking…", sheet.updated(NOW * 1000));
         sheet.opened(cached, NOW * 1000 - 30 * 60_000);
         assertTrue(sheet.old());
-        assertEquals("showing 10:12 · asking…", sheet.updated(UTC));
+        // What was kept shows at once, with its age, until this open's look answers.
+        assertEquals("updated 30m ago · asking…", sheet.updated(NOW * 1000));
         sheet.answered(UsageModel.parse(reply(WORK)), false, NOW * 1000);
         assertFalse(sheet.old());
-        assertEquals("updated 10:42", sheet.updated(UTC));
+        assertEquals("updated just now", sheet.updated(NOW * 1000 + 20_000));
+        assertEquals("updated 4m ago", sheet.updated(NOW * 1000 + 4 * 60_000));
         assertEquals("", sheet.note(NOW, UTC));
     }
 
@@ -137,7 +140,7 @@ public final class UsageModelTest {
         sheet.answered(UsageModel.parse(reply(WORK)), false, NOW * 1000);
         sheet.answered(null, true, NOW * 1000 + 60_000);
         assertTrue(sheet.old());
-        assertEquals("showing 10:42", sheet.updated(UTC));
+        assertEquals("updated 1m ago", sheet.updated(NOW * 1000 + 60_000));
         assertEquals("Can't reach demo · showing 10:42", sheet.note(NOW, UTC));
         sheet.answered(UsageModel.parse("{\"queued\":true,\"missing\":true}"), false, NOW * 1000 + 120_000);
         assertEquals("aswap isn't installed on demo · showing 10:42", sheet.note(NOW, UTC));
@@ -170,12 +173,26 @@ public final class UsageModelTest {
         assertEquals("Couldn't read aswap on demo: aswap list timed out on the machine", sheet.note(NOW, UTC));
     }
 
-    @Test public void theSheetPausesWithTheAppAndClosesOnAMachineSwitch() throws java.io.IOException {
+    @Test public void dataTheRailReadMomentsAgoIsThisOpensOwn() {
+        long now = NOW * 1000;
+        assertTrue(UsageModel.Sheet.recent(now - 9_000, now));
+        assertFalse(UsageModel.Sheet.recent(now - 16_000, now));
+        assertFalse(UsageModel.Sheet.recent(now + 5_000, now));
+    }
+
+    @Test public void theSheetDrawsTheFeedAndClosesOnAMachineSwitch() throws java.io.IOException {
         String usage = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/UsageView.java")), java.nio.charset.StandardCharsets.UTF_8);
-        assertTrue(usage.contains("PauseWatch.on(activity"));
-        assertTrue(usage.contains("catch (HostSwitched gone)"));
-        assertTrue(usage.contains("if (left) { asking = false; dialog.dismiss(); return; }"));
+        String feed = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/UsageFeed.java")), java.nio.charset.StandardCharsets.UTF_8);
+        // The feed pauses with the app and asks on a thread of its own, never the terminal's action worker.
+        assertTrue(feed.contains("PauseWatch.on(activity"));
+        assertTrue(feed.contains("catch (HostSwitched gone)"));
+        assertTrue(feed.contains("new Thread(task, \"herdr-usage\")"));
+        assertTrue(usage.contains("case SWITCHED: dialog.dismiss(); return;"));
+        assertTrue(usage.contains("UsageFeed.Answer kept = feed.kept(hostId);"));
+        assertTrue(usage.indexOf("feed.kept(hostId)") < usage.indexOf("dialog.show();"));
+        assertTrue(usage.contains("feed.watch(UsageFeed.Watch.SHEET, false);"));
         assertTrue(usage.contains("note.setAccessibilityLiveRegion("));
     }
 
@@ -185,7 +202,13 @@ public final class UsageModelTest {
         int start = rail.indexOf("private void showUsage(");
         String usage = rail.substring(start, rail.indexOf("private ImageButton iconButton(", start));
         assertTrue(usage.contains("!hostId.equals(now.hostId)"));
-        assertTrue(usage.contains("actionWorker"));
+        assertTrue(usage.contains("UsageView.show(this, chrome, opened.hostId, opened.hostName, usageFeed);"));
+        assertFalse(usage.contains("actionWorker"));
+        // The feed follows the machine on screen, whether it is online, and whether the rail shows.
+        assertTrue(rail.contains("usageFeed.select(usageHost, current != null && current.ready && !current.isClosed(), () -> usageLook(usageHost));"));
+        assertTrue(rail.contains("usageFeed.watch(UsageFeed.Watch.RAIL, next.open && !next.minimized);"));
+        assertTrue(rail.contains("if (usageFeed != null) usageFeed.detach(this);"));
+        assertTrue(rail.contains("usageFeed.typing(() -> imeShown || (composer != null && composer.drafting()));"));
         assertTrue(rail.contains("if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, \"Usage\").setIcon(R.drawable.ic_bar_usage)"));
     }
 }

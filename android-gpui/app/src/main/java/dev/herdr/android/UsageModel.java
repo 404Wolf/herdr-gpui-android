@@ -223,12 +223,9 @@ final class UsageModel {
         return used == null ? "" : (long) Math.floor(used) + "%";
     }
 
-    /** A ten-cell text bar of used%: "████████░░". Over 100 fills it. */
-    static String bar(Double used) {
-        int full = used == null ? 0 : (int) Math.max(0, Math.min(10, Math.round(used / 10)));
-        StringBuilder bar = new StringBuilder(10);
-        for (int i = 0; i < 10; i++) bar.append(i < full ? '█' : '░');
-        return bar.toString();
+    /** How full a window's bar is, 0 to 1: over 100% fills it, unknown is empty. */
+    static float fill(Double used) {
+        return used == null ? 0f : (float) Math.max(0, Math.min(1, used / 100));
     }
 
     /** "3d 2h", "1h 05m", "4m", "<1m". */
@@ -353,6 +350,13 @@ final class UsageModel {
             this.machine = machine;
         }
 
+        /** Data read this recently is this open's own (the rail's look moments ago), not greyed. */
+        static final long RECENT_MS = 15_000;
+
+        static boolean recent(long atMs, long nowMs) {
+            return nowMs - atMs >= 0 && nowMs - atMs <= RECENT_MS;
+        }
+
         /** Opened with the last good answer from an earlier open, if any. */
         void opened(Look cached, long cachedAt) {
             shown = cached;
@@ -393,12 +397,16 @@ final class UsageModel {
             return shown != null && shown.kind == Kind.ACCOUNTS && !shown.accounts.isEmpty();
         }
 
-        /** The header's right-hand words: "asking…", "updated 10:42", "showing 10:12 · asking…". */
-        String updated(ZoneId zone) {
+        /**
+         * The header's right-hand words, the age of what shows: "asking…",
+         * "updated just now", "updated 4m ago", "updated 3h ago · asking…"
+         * while this open's look is out.
+         */
+        String updated(long nowMs) {
             if (shown == null) return failure == null ? "asking…" : "";
-            String at = clock(shownAt, zone);
-            if (!fresh) return "showing " + at + " · asking…";
-            return (failure != null ? "showing " : "updated ") + at;
+            long age = Math.max(0, nowMs - shownAt) / 1000;
+            String said = "updated " + (age < 60 ? "just now" : span(age) + " ago");
+            return fresh ? said : said + " · asking…";
         }
 
         /** The note under the title, or "": why it is old, a whole-sheet state, or that aswap is stale. */

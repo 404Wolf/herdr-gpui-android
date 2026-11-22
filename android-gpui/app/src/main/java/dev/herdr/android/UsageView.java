@@ -19,44 +19,39 @@ import android.widget.TextView;
 
 import java.time.ZoneId;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executor;
-import java.util.function.Supplier;
 
 /**
  * ⋮ › Usage: a full-height bottom sheet of the connected machine's aswap
  * accounts (factory-setup.32), drawn from {@link UsageModel}. Read-only: no
- * switching, login or refresh. It asks the machine on open and every
- * {@link #POLL_MS} while it is showing; relative times tick each
- * {@link #TICK_MS}; nothing runs once it is closed or while the app is paused,
- * and a switch to another machine closes it. Back, a tap outside, a tap on
- * the handle or a swipe down closes it. The raw reply is never logged.
+ * switching, login or refresh. It draws what {@link UsageFeed} kept for the
+ * machine the moment it opens, with its age, and the feed's answers as they
+ * come (it asks while the sheet shows, see its pacing); relative times tick
+ * each {@link #TICK_MS}; a switch to another machine closes it. Back, a tap
+ * outside, a tap on the handle or a swipe down closes it. The raw reply is
+ * never logged.
  */
 final class UsageView {
-    static final long POLL_MS = 60_000, TICK_MS = 30_000;
-
-    /** The last good answer per saved host, with when it came: shown greyed when a later look fails. */
-    private static final Map<String, Object[]> LAST_GOOD = new ConcurrentHashMap<>();
+    static final long TICK_MS = 30_000;
+    /** The accounts' column, centred: wide enough for long bars, never the whole unfolded screen. */
+    static final int COLUMN_DP = 560;
 
     private final Activity activity;
     private final GpuiChrome chrome;
     private final String hostId, machine;
-    private final Supplier<String> look;
-    private final Executor worker;
+    private final UsageFeed feed;
+    private final java.util.function.Consumer<UsageFeed.Answer> heard = this::heard;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Set<String> opened = new HashSet<>();
     private final Dialog dialog;
     private final TextView updated, note, footer;
     private final LinearLayout rows;
     private final UsageModel.Sheet state;
-    private final PauseWatch pauses;
-    private boolean asking, closed, paused;
-    /** Retries in a row of a busy machine, for the backoff. */
-    private int busyTries;
+    private boolean closed;
+    /** When the sheet opened (elapsed clock), and whether its first fresh rows were logged. */
+    private long openedAt;
+    private boolean drewFresh;
 
-    private final Runnable poll = this::ask;
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             if (closed) return;
@@ -65,25 +60,18 @@ final class UsageView {
         }
     };
 
-    /**
-     * Opens the sheet for the machine {@code machine} (saved host {@code hostId}).
-     * {@code look} sends {@code {"op":"usage.look"}} to that machine's core and
-     * returns its reply; it blocks, so it only ever runs on {@code worker}.
-     */
-    static void show(Activity activity, GpuiChrome chrome, String hostId, String machine,
-            Supplier<String> look, Executor worker) {
+    /** Opens the sheet for the machine {@code machine} (saved host {@code hostId}, the feed's selected one). */
+    static void show(Activity activity, GpuiChrome chrome, String hostId, String machine, UsageFeed feed) {
         if (activity.isFinishing()) return;
-        new UsageView(activity, chrome, hostId, machine, look, worker).open();
+        new UsageView(activity, chrome, hostId, machine, feed).open();
     }
 
-    private UsageView(Activity activity, GpuiChrome chrome, String hostId, String machine,
-            Supplier<String> look, Executor worker) {
+    private UsageView(Activity activity, GpuiChrome chrome, String hostId, String machine, UsageFeed feed) {
         this.activity = activity;
         this.chrome = chrome;
         this.hostId = hostId;
         this.machine = machine;
-        this.look = look;
-        this.worker = worker;
+        this.feed = feed;
         dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout sheet = new LinearLayout(activity);
@@ -94,7 +82,7 @@ final class UsageView {
         shape.setCornerRadii(new float[] {r, r, r, r, 0, 0, 0, 0});
         sheet.setBackground(shape);
 
-        LinearLayout top = new LinearLayout(activity);
+        LinearLayout top = column();
         top.setOrientation(LinearLayout.VERTICAL);
         top.setPadding(dp(16), dp(8), dp(16), dp(4));
         // The handle: a 48dp tap target that closes, with the usual grip drawn in it.
@@ -127,33 +115,28 @@ final class UsageView {
         note.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         top.addView(note);
         swipeToClose(top);
-        sheet.addView(top, new LinearLayout.LayoutParams(-1, -2));
+        sheet.addView(top, centred());
 
-        rows = new LinearLayout(activity);
+        rows = column();
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(16), 0, dp(16), dp(8));
         ScrollView scroll = new ScrollView(activity);
-        scroll.addView(rows);
+        scroll.addView(rows, new android.widget.FrameLayout.LayoutParams(-1, -2, Gravity.CENTER_HORIZONTAL));
         sheet.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         footer = text("", 12, chrome.onSurfaceVariant, false);
         footer.setPadding(dp(16), dp(6), dp(16), dp(12));
         footer.setVisibility(View.GONE);
-        sheet.addView(footer);
+        LinearLayout foot = column();
+        foot.addView(footer, new LinearLayout.LayoutParams(-1, -2));
+        sheet.addView(foot, centred());
 
         dialog.setContentView(sheet);
         state = new UsageModel.Sheet(machine);
-        // Nothing asks while the app is paused; it asks again on resume.
-        pauses = PauseWatch.on(activity, () -> {
-            paused = true;
-            main.removeCallbacks(poll);
-        }, () -> {
-            paused = false;
-            if (!closed) ask();
-        });
         dialog.setOnDismissListener(d -> {
             closed = true;
             main.removeCallbacksAndMessages(null);
-            pauses.stop(activity);
+            feed.unlisten(heard);
+            feed.watch(UsageFeed.Watch.SHEET, false);
         });
     }
 
@@ -165,62 +148,44 @@ final class UsageView {
             int height = Math.round(activity.getResources().getDisplayMetrics().heightPixels * 0.88f);
             window.setLayout(WindowManager.LayoutParams.MATCH_PARENT, height);
         }
-        Object[] cached = LAST_GOOD.get(hostId);
-        if (cached != null) state.opened((UsageModel.Look) cached[0], (Long) cached[1]);
+        openedAt = android.os.SystemClock.elapsedRealtime();
+        UsageFeed.Answer kept = feed.kept(hostId);
+        if (kept != null) showKept(kept);
+        // Kept data the rail read moments ago is this open's own: its rows are fresh at once.
+        drewFresh = kept != null && state.fresh;
+        UsageTiming.log(UsageTiming.drawn(kept == null ? "no" : drewFresh ? "fresh kept" : "kept", 0));
         render();
         dialog.show();
-        ask();
+        feed.listen(heard);
+        // Watching asks at once unless a look is out or the last one is under the feed's cadence old.
+        feed.watch(UsageFeed.Watch.SHEET, true);
         main.postDelayed(tick, TICK_MS);
     }
 
-    private void ask() {
-        if (closed || asking || paused) return;
-        asking = true;
-        worker.execute(() -> {
-            UsageModel.Look answer = null;
-            boolean unreachable = false, switched = false, busy = false;
-            try {
-                answer = UsageModel.parse(OpTiming.timed("usage.look", look));
-            } catch (HostSwitched gone) {
-                switched = true;
-            } catch (RuntimeException e) {
-                // A busy core is retried, not called unreachable (its exec slots can all be taken).
-                if (OpTiming.busy(OpTiming.reason("usage.look", e))) busy = true;
-                else unreachable = true;
-            } catch (LinkageError e) {
-                unreachable = true;
-            }
-            UsageModel.Look result = answer;
-            boolean lost = unreachable, left = switched, wait = busy;
-            main.post(() -> {
-                // The phone is on another machine now: this sheet's machine is no longer the selected one.
-                if (left) { asking = false; dialog.dismiss(); return; }
-                if (wait) { waited(); return; }
-                busyTries = 0;
-                answered(result, lost);
-            });
-        });
+    /** What the feed kept: fresh when the rail asked moments ago, else shown greyed until this open's answer. */
+    private void showKept(UsageFeed.Answer kept) {
+        if (UsageModel.Sheet.recent(kept.atMs, System.currentTimeMillis())) state.answered(kept.look, false, kept.atMs);
+        else state.opened(kept.look, kept.atMs);
     }
 
-    /** The machine was busy: keep what shows, say so, and ask again after a growing wait. */
-    private void waited() {
-        asking = false;
-        if (closed) return;
-        state.busy();
+    private void heard(UsageFeed.Answer answer) {
+        if (closed || !hostId.equals(answer.hostId)) return;
+        long heardAt = android.os.SystemClock.elapsedRealtime();
+        switch (answer.outcome) {
+            // The phone is on another machine now: this sheet's machine is no longer the selected one.
+            case SWITCHED: dialog.dismiss(); return;
+            case KEPT: if (state.shown == null) showKept(answer); break;
+            case BUSY: state.busy(); break;
+            case UNREACHABLE: state.answered(null, true, answer.atMs); break;
+            default: state.answered(answer.look, false, answer.atMs); break;
+        }
         render();
-        main.removeCallbacks(poll);
-        if (!paused) main.postDelayed(poll, OpTiming.busyBackoff(busyTries++));
-    }
-
-    private void answered(UsageModel.Look answer, boolean unreachable) {
-        asking = false;
-        if (closed) return;
-        long now = System.currentTimeMillis();
-        state.answered(answer, unreachable, now);
-        if (answer != null && answer.kind == UsageModel.Kind.ACCOUNTS) LAST_GOOD.put(hostId, new Object[] {answer, now});
-        render();
-        main.removeCallbacks(poll);
-        if (!paused) main.postDelayed(poll, POLL_MS);
+        if (!drewFresh && answer.outcome == UsageFeed.Outcome.DATA) {
+            drewFresh = true;
+            long drawn = android.os.SystemClock.elapsedRealtime();
+            UsageTiming.log(UsageTiming.drawn("fresh", drawn - openedAt) + UsageTiming.onMain(
+                    answer.postedMs > 0 ? heardAt - answer.postedMs : -1, drawn - heardAt));
+        }
     }
 
     /** Redraws every row from the state; the focused row (by its key) keeps focus. */
@@ -231,7 +196,7 @@ final class UsageView {
         Object focusKey = focused == null ? null : focused.getTag();
         rows.removeAllViews();
         boolean old = state.old();
-        updated.setText(state.updated(zone));
+        updated.setText(state.updated(System.currentTimeMillis()));
         String noteText = state.note(now, zone);
         if (!noteText.contentEquals(note.getText())) note.setText(noteText);
         note.setVisibility(noteText.isEmpty() ? View.GONE : View.VISIBLE);
@@ -280,10 +245,7 @@ final class UsageView {
         if (tight != null) said.append(", ").append(UsageModel.percent(tight)).append(" used");
         for (UsageModel.Window w : a.windows) {
             String resets = UsageModel.resets(w, now, zone);
-            String line = UsageModel.windowName(w) + "  " + UsageModel.bar(w.used) + "  "
-                    + (w.used == null ? "–" : UsageModel.percent(w.used));
-            row.addView(mono(line, color(UsageModel.level(w.used))));
-            if (!resets.isEmpty()) row.addView(mono("    " + resets, chrome.onSurfaceVariant));
+            row.addView(window(w, resets));
             said.append(", ").append(UsageModel.windowName(w)).append(' ')
                     .append(w.used == null ? "unknown" : UsageModel.percent(w.used))
                     .append(resets.isEmpty() ? "" : ", " + resets);
@@ -316,6 +278,87 @@ final class UsageView {
             render();
         });
         return row;
+    }
+
+    /**
+     * The sheet's parts share one centred column, at most {@link #COLUMN_DP}
+     * wide: on the unfolded screen the bars stay readable, not stretched.
+     */
+    private LinearLayout column() {
+        LinearLayout column = new LinearLayout(activity) {
+            @Override protected void onMeasure(int width, int height) {
+                int most = dp(COLUMN_DP);
+                if (MeasureSpec.getSize(width) > most) width = MeasureSpec.makeMeasureSpec(most, MeasureSpec.EXACTLY);
+                super.onMeasure(width, height);
+            }
+        };
+        column.setOrientation(LinearLayout.VERTICAL);
+        return column;
+    }
+
+    private static LinearLayout.LayoutParams centred() {
+        LinearLayout.LayoutParams at = new LinearLayout.LayoutParams(-1, -2);
+        at.gravity = Gravity.CENTER_HORIZONTAL;
+        return at;
+    }
+
+    /**
+     * One window: its short name, a bar across the row's width in its level's
+     * colour, its used%, and when it resets under the bar. TalkBack hears the
+     * row's own description instead.
+     */
+    private View window(UsageModel.Window w, String resets) {
+        int level = color(UsageModel.level(w.used));
+        LinearLayout block = new LinearLayout(activity);
+        block.setOrientation(LinearLayout.VERTICAL);
+        block.setPadding(0, dp(4), 0, 0);
+        block.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        LinearLayout line = new LinearLayout(activity);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        TextView name = mono(UsageModel.windowName(w), chrome.onSurfaceVariant);
+        name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        line.addView(name, new LinearLayout.LayoutParams(dp(WINDOW_NAME_DP), -2));
+        line.addView(new Bar(UsageModel.fill(w.used), level), new LinearLayout.LayoutParams(0, dp(8), 1));
+        TextView used = mono(w.used == null ? "–" : UsageModel.percent(w.used), level);
+        used.setGravity(Gravity.END);
+        line.addView(used, new LinearLayout.LayoutParams(dp(48), -2));
+        block.addView(line);
+        if (!resets.isEmpty()) {
+            TextView when = mono(resets, chrome.onSurfaceVariant);
+            when.setPadding(dp(WINDOW_NAME_DP), 0, 0, 0);
+            block.addView(when);
+        }
+        return block;
+    }
+
+    /** A window's name column ("7d sonnet" fits); the bar starts after it. */
+    static final int WINDOW_NAME_DP = 72;
+
+    /** A rounded bar: the track dim, the used part in its level's colour. */
+    private final class Bar extends View {
+        private final float fill;
+        private final android.graphics.Paint track = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Paint used = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.RectF box = new android.graphics.RectF();
+
+        Bar(float fill, int color) {
+            super(activity);
+            this.fill = fill;
+            track.setColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x33));
+            used.setColor(color);
+            setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+        }
+
+        @Override protected void onDraw(android.graphics.Canvas canvas) {
+            float r = getHeight() / 2f;
+            box.set(0, 0, getWidth(), getHeight());
+            canvas.drawRoundRect(box, r, r, track);
+            if (fill <= 0) return;
+            // At least a dot, so 1% still shows.
+            box.right = Math.max(getHeight(), getWidth() * fill);
+            canvas.drawRoundRect(box, r, r, used);
+        }
     }
 
     /** "4m ago", "in 2m", "never". */

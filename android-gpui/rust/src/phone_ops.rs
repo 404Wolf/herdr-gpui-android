@@ -122,12 +122,20 @@ impl PhoneOp {
     /// Runs the op with `call` (the core session's RPC) and returns the
     /// action reply the app reads: `{"queued":true,"usage":{..}}`,
     /// `{"queued":true,"missing":true}` when the machine has no aswap, or
-    /// `{"queued":true,"error":".."}` when aswap failed.
+    /// `{"queued":true,"error":".."}` when aswap failed; a look's reply also
+    /// carries `timing` (`rpc_ms`, the core's `exec_ms`) for the timing log.
     pub(crate) fn run(&self, mut call: impl FnMut(&str, Value) -> Result<Value>) -> Result<String> {
         match self {
             Self::UsageLook => {
+                let asked = std::time::Instant::now();
                 let result = call("machine.exec", json!({"argv":["sh","-c",USAGE_LOOK],"timeout":10}))?;
-                Ok(usage_reply(&result)?.to_string())
+                let mut reply = usage_reply(&result)?;
+                // Where the wait went, for the phone's timing log: the round trip, and the core's own run of aswap.
+                reply["timing"] = json!({
+                    "rpc_ms": u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "exec_ms": result["ms"].as_u64(),
+                });
+                Ok(reply.to_string())
             }
             Self::TabDetach { space, tab, park, kill } => {
                 detach(&mut call, space, tab, park, kill)?;
@@ -698,7 +706,8 @@ mod tests {
                 .and_then(|r| serde_json::from_str::<Value>(&r).ok())
                 .unwrap_or_default()
         };
-        assert_eq!(say(127, ""), json!({"queued":true,"missing":true}));
+        let missing = say(127, "");
+        assert_eq!((missing["queued"].clone(), missing["missing"].clone()), (json!(true), json!(true)));
         assert_eq!(say(1, "secret stderr")["error"], "aswap list exited with 1");
         assert_eq!(say(0, "not json")["error"], "couldn't read aswap's output");
         // The exec's own end, not aswap's: a timeout or a signal says so.
@@ -712,6 +721,17 @@ mod tests {
         assert_eq!(timed(json!({"code":null,"timed_out":true,"stdout":""}))["error"], "aswap list timed out on the machine");
         assert_eq!(timed(json!({"code":127,"timed_out":true,"stdout":""}))["error"], "aswap list timed out on the machine");
         assert_eq!(timed(json!({"code":null,"signal":9,"stdout":""}))["error"], "aswap list was stopped before it finished");
+        // Every reply says where its time went: the round trip, and the core's own run (its `ms`).
+        let mut timed_exec = exec(0, &sample().to_string());
+        timed_exec["ms"] = json!(73);
+        let reply: Value = PhoneOp::UsageLook
+            .run(|_, _| Ok(timed_exec.clone()))
+            .ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default();
+        assert_eq!(reply["timing"]["exec_ms"], 73);
+        assert!(reply["timing"]["rpc_ms"].is_u64());
+        assert!(say(127, "")["timing"]["exec_ms"].is_null());
         let failed = PhoneOp::UsageLook.run(|_, _| Err(Error::Closed));
         assert!(matches!(failed, Err(Error::Closed)));
     }

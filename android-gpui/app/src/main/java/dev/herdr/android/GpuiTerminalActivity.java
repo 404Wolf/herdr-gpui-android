@@ -467,6 +467,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabRow.addView(linkBox, badgeAt);
         // The pin of the agent on screen, top right (factory-9zz.2): PinsRail keeps it and the rail's Pinned section.
         pinsRail = new PinsRail(this, chrome, Pins.shared(this), this::openPin, () -> refreshSidebar(true), this::note);
+        usageFeed = UsageFeed.shared(this).attach(this);
+        usageFeed.watch(UsageFeed.Watch.RAIL, sidebarOpen && !railMinimized);
+        // Each look holds the core session's one worker, so typing would wait behind the rail's prefetch.
+        usageFeed.typing(() -> imeShown || (composer != null && composer.drafting()));
         tabRow.addView(pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
@@ -633,6 +637,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void setRailShown(RailPanel.Shown next) {
         if (sidebarOpen != next.open) sidebarSignature = null;
+        if (usageFeed != null) usageFeed.watch(UsageFeed.Watch.RAIL, next.open && !next.minimized);
         sidebarOpen = next.open;
         railOverlay = next.overlay;
         railMinimized = next.minimized;
@@ -1216,21 +1221,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         menu.show();
     }
 
-    /** The connected machine's aswap accounts (UsageView); each look asks that same machine's core. */
+    /** The usage feed of the machine on screen (UsageFeed): kept answers, one look at a time. */
+    private UsageFeed usageFeed;
+
+    /** The connected machine's aswap accounts (UsageView), drawn from the feed of that same machine. */
     private void showUsage() {
         Connection opened;
         synchronized (stateLock) { opened = connection; }
-        if (opened == null || opened.isClosed() || opened.remoteHandle <= 0 || opened.hostId == null) {
+        if (opened == null || opened.isClosed() || opened.remoteHandle <= 0 || opened.hostId == null || usageFeed == null) {
             note("Usage needs a connected machine");
             return;
         }
-        String hostId = opened.hostId;
-        UsageView.show(this, chrome, hostId, opened.hostName, () -> {
-            Connection now;
-            synchronized (stateLock) { now = connection; }
-            if (now == null || now.isClosed() || !hostId.equals(now.hostId)) throw new HostSwitched();
-            return RemoteNative.sessionAction(now.remoteHandle, "{\"op\":\"usage.look\"}");
-        }, actionWorker);
+        UsageView.show(this, chrome, opened.hostId, opened.hostName, usageFeed);
+    }
+
+    /** One usage look at {@code hostId}'s core; blocks (the feed's own thread). Another machine on screen: HostSwitched. */
+    private String usageLook(String hostId) {
+        Connection now;
+        synchronized (stateLock) { now = connection; }
+        if (hostId == null || now == null || now.isClosed() || !hostId.equals(now.hostId)) throw new HostSwitched();
+        return RemoteNative.sessionAction(now.remoteHandle, "{\"op\":\"usage.look\"}");
     }
 
     /** A 48 dp icon button; its label is a tooltip and the overflow menu's text. */
@@ -2488,6 +2498,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
+        if (usageFeed != null) {
+            String usageHost = current == null ? null : current.hostId;
+            usageFeed.select(usageHost, current != null && current.ready && !current.isClosed(), () -> usageLook(usageHost));
+        }
         if (pinsRail != null) {
             JSONObject shown = current == null ? null : PinsRail.paneOf(current.panes, current.paneId);
             boolean agent = shown != null && !shellMode()
@@ -6292,6 +6306,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         attachWorker.shutdownNow();
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
+        if (usageFeed != null) usageFeed.detach(this);
         Dictation.pending(this).setListener(null);
         stopHostSampling();
         stopConnection();
