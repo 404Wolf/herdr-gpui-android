@@ -1327,6 +1327,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int right = layout.shown && !layout.overlay ? width : 0;
         if (railColumns.getPaddingRight() != right) railColumns.setPadding(0, 0, right, 0);
         workPanel.show(layout.shown, layout.overlay);
+        placeTopRight(layout.shown && !layout.overlay);
         if (workButton != null) {
             workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
             workButton.setSelected(layout.shown);
@@ -1335,6 +1336,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private View root() {
         return (View) railColumns.getParent();
+    }
+
+    /**
+     * The pin and ⋮ belong at the far right of the whole screen (Wolf): in the
+     * docked panel's header beside the terminal, else at the end of the tab row.
+     * Moving the same views keeps their state, listeners and accessibility.
+     */
+    private void placeTopRight(boolean docked) {
+        View pin = pinsRail.button().view();
+        android.view.ViewGroup to = docked ? workPanel.trailing() : tabRow;
+        if (pin.getParent() == to) return;
+        for (View v : new View[] {pin, tabMenu}) {
+            android.view.ViewGroup from = (android.view.ViewGroup) v.getParent();
+            if (from != null) from.removeView(v);
+        }
+        int height = docked ? dp(40) : -1;
+        to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), height));
+        to.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), height));
     }
 
     /** The cover's Work button and the panel's ×. */
@@ -2899,7 +2918,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabActive = activeId;
         tabStrip.removeAllViews();
         final Connection target = current;
-        tabStrip.addView(projectChip(project, target));
+        tabStrip.addView(projectChip(project));
         if (repo != null) {
             TextView crumbText = new TextView(this);
             crumbText.setText(ProjectBar.crumbText(repo));
@@ -3048,7 +3067,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * a tap lists this computer's projects (the desktop's switcher); it never
      * changes which windows the bar lists (item 78).
      */
-    private TextView projectChip(ProjectModel.Project project, Connection target) {
+    private TextView projectChip(ProjectModel.Project project) {
         TextView chip = new TextView(this);
         // ProjectBar.projectChipText, styled: the name bold, the waiting count in blocked's colour.
         String drawn = ProjectBar.projectChipText(project);
@@ -3065,8 +3084,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
         chip.setPadding(dp(4), 0, dp(8), 0);
         chip.setContentDescription("Project " + (project == null ? "none" : project.name)
-                + (project != null && project.waiting > 0 ? ", " + project.waiting + " need you" : "") + ". Switch project");
-        chip.setOnClickListener(v -> showProjectSwitcher(target));
+                + (project != null && project.waiting > 0 ? ", " + project.waiting + " need you" : ""));
+        // A label only (Wolf, 11-22): the rail switches projects; the chip opened a redundant list.
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
         params.setMarginEnd(dp(2));
         chip.setLayoutParams(params);
@@ -3108,38 +3127,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** What git said of this computer's folders: folder -> its repo's name and whether it is a linked worktree. */
     private java.util.Map<String, ProjectModel.GitName> gitNames() {
         return ProjectModel.gitNames(currentHostId == null ? null : FleetPanes.LOOKS.get(currentHostId));
-    }
-
-    /**
-     * The project switcher: this computer's projects as the desktop's sidebar
-     * orders them (the deacon, then each repo's projects by birth with Wolf's
-     * order from the core's projects.order over it, then those in no repo),
-     * each with how many of its agents wait on Wolf. A tap shows its lead.
-     */
-    private void showProjectSwitcher(Connection target) {
-        java.util.List<ProjectModel.Project> all = ProjectModel.projects(target.workspaces, target.tabs, target.panes);
-        ProjectModel.Groups groups = ProjectModel.groups(all, gitNames(), ProjectModel.repoLabels(target.panes),
-                target.projectsOrder);
-        ActionSheet sheet = new ActionSheet(this, chrome, "Projects on " + target.hostName);
-        java.util.List<ProjectModel.Project> listed = new java.util.ArrayList<>(groups.deacons);
-        java.util.List<String> labels = new java.util.ArrayList<>();
-        for (ProjectModel.Project p : groups.deacons) labels.add("◆ deacon");
-        for (ProjectModel.Repo repo : groups.repos) {
-            for (ProjectModel.Project p : repo.projects) {
-                listed.add(p);
-                labels.add((repo.name == null ? "" : repo.name + " › ") + p.name);
-            }
-        }
-        for (int i = 0; i < listed.size(); i++) {
-            ProjectModel.Project p = listed.get(i);
-            String label = labels.get(i) + (p.waiting > 0 ? "   ! " + p.waiting + " need you" : "");
-            sheet.add(label, () -> {
-                ProjectModel.Window lead = p.lead;
-                if (lead != null && lead.terminal != null) focusRemotePane(target, lead.terminal);
-                else note(p.name + " has nothing running to show");
-            });
-        }
-        sheet.show();
     }
 
     /** "! N need you": the next waiting agent after the one shown, round all of them. */
@@ -3683,6 +3670,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (live) {
             // With the factory's issue/task/helper labels, so agents join their beads.
             railMembers = BeadsModel.terms(workspaces, tabs, panes);
+            MachineKey machine = current == null ? null : current.machine;
+            if (machine != null && current.ownList) {
+                java.util.Map<String, String> names = new java.util.HashMap<>();
+                for (FleetTree.Member m : railMembers) if (!AgentNames.unnamed(m)) names.put(m.id, AgentNames.of(m));
+                Pins.shared(this).relabel(machine, names);
+            }
         }
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
@@ -4129,8 +4122,47 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             closeRailDrawer();
             return;
         }
-        note(pin.label.isEmpty() ? "That pin is on " + pin.machineName + ": open it there for now"
-                : pin.label + " is on " + pin.machineName + ": open it there for now");
+        // Another machine's pin (Wolf: macro's deacon pin "never loads"; it only said "open it there").
+        // Its profile is a hint; the machine that profile is bound to decides, and the terminal is
+        // checked again on arrival (pinArriving), never another one in its place.
+        SavedRemoteHost host = pinHost(pin);
+        if (host == null) {
+            note((pin.label.isEmpty() ? "That pin" : pin.label) + " is on " + pin.machineName
+                    + ", which this phone has no confirmed profile for");
+            return;
+        }
+        switchHost(host, pin.key.address);
+        // Only a switch that started waits for its list (one already under way keeps its own target).
+        pinArriving = switchingHost && host.id.equals(switchingTo) ? pin : null;
+        closeRailDrawer();
+    }
+
+    /** A pin opened on another machine, to verify against that machine's first own list. */
+    private volatile Pins.Pin pinArriving;
+
+    /** The saved profile bound to the pin's machine (the pin's own profile first), or null. */
+    private SavedRemoteHost pinHost(Pins.Pin pin) {
+        if (bindings == null) return null;
+        SavedRemoteHost found = null;
+        for (SavedRemoteHost h : savedHosts) {
+            if (!pin.key.machine.equals(bindings.machine(h.id, h.connectionRevision))) continue;
+            if (h.id.equals(pin.profile)) return h;
+            if (found == null) found = h;
+        }
+        return found;
+    }
+
+    /** Poll thread, under stateLock: the first own list of the machine a pin was opened on. */
+    private void checkPinArrival(Connection current) {
+        Pins.Pin pin = pinArriving;
+        if (pin == null || current.machine == null || !pin.key.machine.equals(current.machine)) return;
+        pinArriving = null;
+        Pins.Verify verdict = Pins.verify(pin.key, current.remoteBoot, current.fingerprint, current.panes);
+        main.post(() -> {
+            if (destroyed) return;
+            if (verdict == Pins.Verify.GO) Pins.shared(this).opened(pin.key);
+            else note(PinsRail.refusal(verdict, pin));
+        });
     }
 
     /** The live machine's members as the rail last read them, with their names and labels (AgentNames). */
@@ -7816,7 +7848,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
-                        if (selected && current.ownList && pinsRail != null && current.machine != null) Pins.shared(this).observe(current.machine, current.panes);
+                        if (selected && current.ownList && pinsRail != null && current.machine != null) {
+                            Pins.shared(this).observe(current.machine, current.panes);
+                            checkPinArrival(current);
+                        }
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or

@@ -476,6 +476,7 @@ pub fn screen_rows<U: EventListener>(grid: &Crosswords<U>) -> Option<Vec<Row>> {
         let Some(row) = rows.last_mut() else {
             continue;
         };
+        let start = row.text.len();
         for column in 0..columns {
             let square = &cells[Column(column)];
             // A wide character's second cell holds no glyph of its own.
@@ -491,9 +492,21 @@ pub fn screen_rows<U: EventListener>(grid: &Crosswords<U>) -> Option<Vec<Row>> {
             });
             row.marked.push(grid.grid.style_of(square).renders_on_blank());
         }
-        continues = columns > 0 && wraps(cells[Column(columns - 1)].wrapline(), cells[Column(columns - 1)].c());
+        continues = columns > 0
+            && wraps(cells[Column(columns - 1)].wrapline(), cells[Column(columns - 1)].c())
+            && !rule_only(&row.text[start.min(row.text.len())..]);
     }
     Some(rows)
+}
+
+/// A screen row that is only a rule (Claude's full-width `─` above a dialog). It never runs
+/// on into the next row, even when the terminal marked it wrapped: an agent that draws a rule
+/// to the last column and then its question puts the question on a wrapped row, and joining
+/// them made the question `────…What do you want to do?` and let the transcript above in as
+/// the dialog's context (Wolf's out-of-usage dialog, 2026-11-22).
+fn rule_only(text: &[char]) -> bool {
+    text.iter().filter(|c| !c.is_whitespace()).count() >= 3
+        && text.iter().all(|&c| c.is_whitespace() || c == '\0' || matches!(c, '─' | '╌' | '━' | '▄' | '▀'))
 }
 
 /// Whether a row runs on into the next: the terminal marked it wrapped, or (a pane

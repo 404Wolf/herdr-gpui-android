@@ -127,6 +127,8 @@ final class WorkPanel {
         }
     };
 
+    private final LinearLayout trailing;
+
     WorkPanel(Activity activity, GpuiChrome chrome, Host host) {
         this.activity = activity;
         this.chrome = chrome;
@@ -153,6 +155,10 @@ final class WorkPanel {
         close.setContentDescription("Close the work panel");
         close.setOnClickListener(v -> host.closed());
         tabs.addView(close, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        // The app's own top-right controls (pin, ⋮) when the panel is docked: the far right of the whole screen.
+        trailing = new LinearLayout(activity);
+        trailing.setGravity(Gravity.CENTER_VERTICAL);
+        tabs.addView(trailing, new LinearLayout.LayoutParams(-2, dp(40)));
         root.addView(tabs, new LinearLayout.LayoutParams(-1, -2));
         View rule = new View(activity);
         rule.setBackgroundColor(chrome.outline);
@@ -167,6 +173,11 @@ final class WorkPanel {
 
     View view() {
         return root;
+    }
+
+    /** Where the activity docks its top-right controls while the panel sits beside the terminal. */
+    LinearLayout trailing() {
+        return trailing;
     }
 
     /** Follows {@code activity}'s pauses: nothing reads while it is not in front. */

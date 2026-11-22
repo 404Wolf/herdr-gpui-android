@@ -10,8 +10,8 @@ import android.widget.ImageButton;
 
 /**
  * The pin at the top right of an agent's view (factory-9zz.2, P3): a small
- * pushpin glyph, no text or tooltip, dim outline when the agent is not pinned
- * and filled in the accent colour when it is. It is 48dp wide; the strip it
+ * pushpin glyph, no text or tooltip, drawn in the text colour (white on the
+ * OLED palette): an outline when the agent is not pinned, filled when it is. It is 48dp wide; the strip it
  * sits in is 30dp tall, so its touch target is extended down to 48dp with a
  * TouchDelegate over the crumb below. TalkBack hears "Pin
  * <name> on <machine>" or "Unpin …" and the pressed state.
@@ -29,6 +29,8 @@ final class PinButton {
     private final GpuiChrome chrome;
     private final ImageButton button;
     private boolean pinned;
+    /** The strip whose crumb extends its target; elsewhere it has no extension. */
+    private View home;
 
     PinButton(Activity activity, GpuiChrome chrome, Runnable toggle) {
         this.activity = activity;
@@ -45,6 +47,11 @@ final class PinButton {
         return button;
     }
 
+    /** Its glyph's colour for the text colour {@code onSurface}: the same either way, pinned or not. */
+    static int tint(int onSurface) {
+        return onSurface;
+    }
+
     /**
      * Shown on an agent's pane only ({@code show}); {@code cant} says why it
      * can't pin yet (an unproven machine), and dims it.
@@ -55,8 +62,8 @@ final class PinButton {
         boolean changed = this.pinned != pinned;
         this.pinned = pinned;
         button.setImageResource(pinned ? R.drawable.ic_pin_filled : R.drawable.ic_pin_outline);
-        int tint = pinned ? chrome.primary : GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0xB0);
-        button.setImageTintList(ColorStateList.valueOf(tint));
+        // Wolf: white, not grey; the outline/filled shape keeps pinned apart from not pinned.
+        button.setImageTintList(ColorStateList.valueOf(tint(chrome.onSurface)));
         boolean able = cant == null || cant.isEmpty();
         button.setEnabled(able);
         button.setAlpha(able ? 1f : 0.4f);
@@ -76,13 +83,15 @@ final class PinButton {
      * consults first, so the crumb's own tap keeps the rest of its width.
      */
     void extendTouch(View below) {
+        home = (View) button.getParent();
         below.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extend(below));
         button.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extend(below));
     }
 
     private void extend(View below) {
         View strip = (View) button.getParent();
-        if (button.getVisibility() != View.VISIBLE || strip == null) {
+        // Docked in the work panel's header (the unfolded split), the crumb is not under it.
+        if (button.getVisibility() != View.VISIBLE || strip == null || strip != home) {
             below.setTouchDelegate(null);
             return;
         }

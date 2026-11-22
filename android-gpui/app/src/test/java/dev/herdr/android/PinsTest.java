@@ -88,6 +88,19 @@ public final class PinsTest {
         assertTrue(pins.get(k).ended());
     }
 
+    @Test public void aPinsNameFollowsTheRowsNameOnItsOwnMachineOnly() throws Exception {
+        Pins pins = fresh();
+        Pins.Key k = key(A, "t5", 7);
+        pin(pins, k);
+        String before = pins.get(k).label;
+        pins.relabel(B, java.util.Collections.singletonMap("t5", "deacon"));
+        assertEquals("another machine's names never touch it", before, pins.get(k).label);
+        pins.relabel(A, java.util.Collections.singletonMap("t5", AgentNames.UNNAMED));
+        assertEquals(before, pins.get(k).label);
+        pins.relabel(A, java.util.Collections.singletonMap("t5", "deacon"));
+        assertEquals("deacon", pins.get(k).label);
+    }
+
     @Test public void aTerminalMissingFromAProvenListIsEnded() throws Exception {
         Pins pins = fresh();
         Pins.Key k = key(A, "t5", 7);

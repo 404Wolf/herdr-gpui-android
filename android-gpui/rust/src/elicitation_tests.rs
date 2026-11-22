@@ -1057,3 +1057,41 @@ fn lines_replayed_without_wrap_marks_are_read_whole() {
     let dialog = parse(&screen_rows(&session.grid().lock()).expect("rows"), PromptKind::Codex).expect("dialog");
     assert_eq!(dialog.choices[2].description, "Optionally, add details in notes (tab)");
 }
+
+/// Claude Code's out-of-usage menu as it stood on Wolf's phone (2026-11-22 03:47), the
+/// transcript above it and the full-width rule between them.
+const CLAUDE_LIMIT: &str = "\
+* Churned for 0s · done 3:40 AM
+
+> <hc>t2x8 remote-builds is blocked (waiting). See: hc read t2x8</hc>
+────────────────────────────────────────────────────────────────────────
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Nov 27, 3am
+   3. Switch to usage credits
+
+ Enter to confirm · Esc to cancel";
+
+#[test]
+fn claudes_usage_limit_menu_asks_its_own_question_without_the_transcript() {
+    let dialog = parse(&screen(CLAUDE_LIMIT, &[]), PromptKind::Claude).expect("dialog");
+    assert_eq!(dialog.question, "What do you want to do?");
+    assert!(dialog.detail.is_empty(), "{:?}", dialog.detail);
+    assert_eq!(dialog.choices.len(), 3);
+    assert_eq!(dialog.choices[1].label, "Wait here, then continue automatically at Nov 27, 3am");
+}
+
+/// A rule drawn to the last column never runs on into the next row, even with the
+/// terminal's wrap mark: joined, the question read `────…What do you want to do?`.
+#[test]
+fn a_rule_row_never_joins_the_row_under_it() {
+    let rule: Vec<char> = "─".repeat(72).chars().collect();
+    assert!(rule_only(&rule));
+    assert!(rule_only(&"  ╌╌╌╌  ".chars().collect::<Vec<_>>()));
+    assert!(!rule_only(&"── a".chars().collect::<Vec<_>>()));
+    assert!(!rule_only(&"──".chars().collect::<Vec<_>>()));
+    assert!(!rule_only(&"   ".chars().collect::<Vec<_>>()));
+    // The renderer's own wrap rule still joins a wrapped option's text.
+    assert!(wraps(true, 'x') && wraps(false, 'x') && !wraps(false, '─'));
+}

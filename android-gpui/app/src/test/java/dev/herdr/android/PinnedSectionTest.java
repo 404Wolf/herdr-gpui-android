@@ -117,6 +117,20 @@ public final class PinnedSectionTest {
         assertEquals(FleetTree.LEAD_ROW_DP, PinnedSection.ROW_DP);
     }
 
+    @Test public void thePinIsWhiteAndSitsAtTheWholeScreensRightWhenThePanelIsDocked() throws Exception {
+        // Wolf: white, not grey, pinned or not; the outline/filled glyph tells them apart.
+        assertEquals(0xFFFFFFFF, PinButton.tint(0xFFFFFFFF));
+        String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(gta.contains("placeTopRight(layout.shown && !layout.overlay);"));
+        assertTrue(gta.contains("android.view.ViewGroup to = docked ? workPanel.trailing() : tabRow;"));
+        for (String glyph : new String[] {"ic_pin_outline", "ic_pin_filled"}) {
+            String xml = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                    "../../android/app/src/main/res/drawable/" + glyph + ".xml")), java.nio.charset.StandardCharsets.UTF_8);
+            assertTrue(glyph, xml.contains("android:width=\"18dp\"") && xml.contains("android:height=\"18dp\""));
+        }
+    }
+
     @Test public void thePinNamesTheAgentFromTheListBeforeTheRailWasEverDrawn() throws Exception {
         org.json.JSONArray panes = new org.json.JSONArray("[{\"id\":\"t3qx\",\"name\":\"lobby-shell\",\"kind\":\"claude\","
                 + "\"created_ms\":1000,\"workspace_id\":\"s1\",\"tab_id\":\"a\"}]");
@@ -147,7 +161,8 @@ public final class PinnedSectionTest {
         assertTrue(seen > 0 && rail.indexOf("Pins.shared(this).observe(current.machine, current.panes)", seen) - seen < 300);
         assertTrue(rail.contains("private void openPin(Pins.Pin pin)"));
         // Only a proven list (the poll's selected: ready, pane and boot known) updates pins.
-        assertTrue(rail.contains("if (selected && current.ownList && pinsRail != null && current.machine != null) Pins.shared(this).observe("));
+        assertTrue(rail.contains("if (selected && current.ownList && pinsRail != null && current.machine != null) {"));
+        assertTrue(rail.contains("Pins.shared(this).observe(current.machine, current.panes);\n                            checkPinArrival(current);"));
         // Opening refuses an ended pin and a reused address: verified against the list now.
         int open = rail.indexOf("private void openPin(Pins.Pin pin)");
         String body = rail.substring(open, rail.indexOf("closeRailDrawer();", open));
