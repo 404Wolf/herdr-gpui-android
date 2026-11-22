@@ -91,6 +91,12 @@ final class RemoteNative {
      * report), while its link is in doubt: {"local_offset", "history", "moved"}.
      */
     static native String scrollLocalOnly(long handle, long deltaRows);
+    /**
+     * The files session {@code handle}'s pane on screen names, as a tap there would open them
+     * (paths, Markdown links, OSC 8 file targets; never URLs): {"pane", "files": [...]}, bounded.
+     * Reads the phone's own grid; nothing is sent.
+     */
+    static native String fileRefs(long handle);
     static native void close(long handle);
 
     /** A raw login shell on a remote PTY, drawn by the Rio terminal. Blocks for SSH: worker only. */

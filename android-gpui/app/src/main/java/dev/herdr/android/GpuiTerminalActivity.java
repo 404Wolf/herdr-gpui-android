@@ -71,6 +71,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private final Object stateLock = new Object();
     private final Set<Integer> capturedKeys = new HashSet<>();
     /** Scroll requests ride their own thread so a poll parse never delays them. */
+    /**
+     * Reads and keeps the files agents reference, for reading offline (PR-F): one at a time, off
+     * every thread the terminal needs, and its disk work with it.
+     */
+    private final java.util.concurrent.ExecutorService refWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "herdr-refs");
+                thread.setDaemon(true);
+                thread.setPriority(Thread.MIN_PRIORITY);
+                return thread;
+            });
+    /** Which referenced file to read next, and when. Thread-safe. */
+    private final RefPlanner refPlanner = new RefPlanner();
+    /** Copies of referenced files; null until created. Disk work on {@link #refWorker} or the file view's worker. */
+    private RefFiles refFiles;
+    /** When the poll last looked for files the pane on screen names (uptime ms). Poll thread. */
+    private long refsLookedAt;
     private final java.util.concurrent.ExecutorService actionWorker =
             java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
                 Thread thread = new Thread(task, "herdr-action");
@@ -185,7 +202,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private float touchDownY, lastTouchY, scrollFraction;
     private float scrollVelocity, flingRemainder;
     private long lastMoveAt;
-    private boolean flinging;
+    private volatile boolean flinging;
     private SurfaceView terminalSurface;
     private final Runnable flingStep = new Runnable() {
         @Override public void run() {
@@ -237,7 +254,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         jumpToLive();
         showLatest(false);
     }
-    private boolean scrolling;
+    private volatile boolean scrolling;
     /** The current drag left the slop sideways: the renderer pans it to its end. */
     private boolean panning;
     /** Locally accumulated scrollback target; polls only resync it while idle. */
@@ -275,6 +292,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         outbox.listen(outboxChanged);
         bindings = MachineBindings.shared(this);
         transcripts = TranscriptKeeper.shared(this);
+        refFiles = RefFiles.shared(this);
         snapshots = PaneSnapshots.shared(this);
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
@@ -479,7 +497,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
-        filePager = new FilePager(this, surface, chrome, this::readFile, actionWorker);
+        filePager = new FilePager(this, surface, chrome, this::readFileOrCopy, actionWorker);
         content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
         keyGrid.setPadding(dp(8), dp(8), dp(8), dp(8));
@@ -5926,6 +5944,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         // A hello the outbox was not yet read for is bound on a later poll.
         if (current.machine == null && current.ready && current.remoteBoot != null) bindMachine(current, current.remoteBoot);
+        if (current.ready && painted) prefetchRefs(current, current.machine);
         publishTranscriptProof(current, current.ready);
         if (signature.equals(offerSignature)) return;
         offerSignature = signature;
@@ -6760,15 +6779,83 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String readFile(String terminal, String path) {
         Connection target;
         synchronized (stateLock) { target = connection; }
+        return readFile(target, terminal, path, 0);
+    }
+
+    /** One {@code file.read} through {@code target}'s session; {@code limit} lines, 0 for the tap's whole read. */
+    private String readFile(Connection target, String terminal, String path, int limit) {
         if (target == null || target.remoteHandle == 0) {
             return "{\"queued\":false,\"error\":\"Not connected\"}";
         }
         try {
             JSONObject read = new JSONObject().put("op", "file.read").put("terminal", terminal).put("path", path);
+            if (limit > 0) read.put("limit", limit);
             return RemoteNative.sessionAction(target.remoteHandle, read.toString());
         } catch (JSONException impossible) {
             return "{\"queued\":false}";
         }
+    }
+
+    /**
+     * The file view's reader (on its worker). Live, the file as it is now, and a copy of it is
+     * kept for reading offline. Otherwise the copy kept for this machine, said to be one, or why
+     * there is none. A relayed pane's files are another machine's: live only (I3).
+     */
+    private String readFileOrCopy(String terminal, String path) {
+        Here here = here();
+        Connection target = here.connection;
+        boolean direct = terminal != null && !terminal.contains("/");
+        boolean live = target != null && target.ready && !target.isClosed() && !target.offline && target.remoteHandle > 0;
+        if (live) {
+            String reply = readFile(target, terminal, path, 0);
+            MachineKey machine = here.machine;
+            if (direct && machine != null && refFiles != null) {
+                long at = System.currentTimeMillis();
+                refWorker.execute(() -> refFiles.save(machine, terminal, path, reply, at));
+            }
+            return reply;
+        }
+        RefFiles.Copy copy = direct && here.machine != null && refFiles != null
+                ? refFiles.open(here.machine, terminal, path, System.currentTimeMillis()) : null;
+        if (copy != null) return copy.reply();
+        return "{\"queued\":false,\"error\":\"not_saved\"}";
+    }
+
+    /**
+     * On the poll, while the pane on screen is live: the files it names are offered to the
+     * planner every few seconds, and one is read when the planner allows (never while typing or
+     * scrolling, on a metered network, or in the background). Under stateLock, poll thread.
+     */
+    private void prefetchRefs(Connection current, MachineKey machine) {
+        if (refFiles == null || machine == null || current.remoteHandle <= 0) return;
+        long now = SystemClock.uptimeMillis();
+        String pane = current.chromePane;
+        if (pane.isEmpty() || pane.contains("/")) return;
+        if (now - refsLookedAt >= 5_000) {
+            refsLookedAt = now;
+            try {
+                JSONObject refs = new JSONObject(RemoteNative.fileRefs(current.remoteHandle));
+                JSONArray files = refs.optJSONArray("files");
+                if (files != null && pane.equals(refs.optString("pane"))) {
+                    java.util.List<String> paths = new java.util.ArrayList<>();
+                    for (int i = 0; i < files.length(); i++) paths.add(files.optString(i, ""));
+                    refPlanner.offer(current.generation, machine, pane, paths, now);
+                }
+            } catch (JSONException | RuntimeException | LinkageError ignored) {
+                return;
+            }
+        }
+        // Typing and scrolling both push fastUntil ahead: the link is busy for the person.
+        RefPlanner.Now gate = new RefPlanner.Now(now, hostResumed, current.ready && current.painted && !current.isClosed(),
+                !metered(), now < current.fastUntil || scrolling || flinging, 0);
+        RefPlanner.Ref ref = refPlanner.next(gate);
+        if (ref == null) return;
+        final Connection link = current;
+        refWorker.execute(() -> {
+            String reply = readFile(link, ref.terminal, ref.path, RefPlanner.PREFETCH_LINES);
+            refFiles.save(ref.machine, ref.terminal, ref.path, reply, System.currentTimeMillis());
+            refPlanner.done(ref, SystemClock.uptimeMillis());
+        });
     }
 
     /** Called by GPUI directly, independent of the HTTP command queue and connection health. */
