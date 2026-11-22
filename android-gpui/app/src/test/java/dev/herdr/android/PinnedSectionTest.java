@@ -127,7 +127,7 @@ public final class PinnedSectionTest {
         for (String glyph : new String[] {"ic_pin_outline", "ic_pin_filled"}) {
             String xml = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                     "../../android/app/src/main/res/drawable/" + glyph + ".xml")), java.nio.charset.StandardCharsets.UTF_8);
-            assertTrue(glyph, xml.contains("android:width=\"18dp\"") && xml.contains("android:height=\"18dp\""));
+            assertTrue(glyph, xml.contains("android:width=\"20dp\"") && xml.contains("android:height=\"20dp\""));
         }
     }
 
