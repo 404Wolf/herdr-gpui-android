@@ -196,7 +196,9 @@ final class WorkPanel {
         age.setSingleLine(true);
         age.setVisibility(View.GONE);
         // "updated …" to the pin's glyph: the same small gap as the pin to the ⋮ (Wolf 11-22).
-        LinearLayout.LayoutParams ageAt = new LinearLayout.LayoutParams(-2, -2);
+        // As tall as the strip and centred in its drawn bar, like the pin and the ⋮ beside it (Wolf 11-22).
+        LinearLayout.LayoutParams ageAt = new LinearLayout.LayoutParams(-2, -1);
+        age.setGravity(Gravity.CENTER_VERTICAL);
         ageAt.setMarginEnd(dp(PinButton.GLYPH_GAP_DP - (PinButton.WIDTH_DP - 20) / 2));
         tabs.addView(age, ageAt);
         close = ActionSheet.label(activity, "×", 20, chrome.onSurfaceVariant);
@@ -221,7 +223,7 @@ final class WorkPanel {
         band.setLayerInset(0, 0, 0, 0, reach - bar);
         band.setLayerInset(1, 0, bar, 0, reach - bar - 1);
         tabs.setBackground(band);
-        for (View v : new View[] {overviewTab, tasksTab, close}) v.setPadding(v.getPaddingLeft(), 0, v.getPaddingRight(), reach - bar);
+        for (View v : new View[] {overviewTab, tasksTab, close, age}) v.setPadding(v.getPaddingLeft(), 0, v.getPaddingRight(), reach - bar);
         stack = new FrameLayout(activity);
         root.addView(stack, new LinearLayout.LayoutParams(-1, 0, 1));
         scroll = new ScrollView(activity);
@@ -623,6 +625,12 @@ final class WorkPanel {
     private TextView tab(String label, PanelModel.Tab which) {
         TextView view = ActionSheet.label(activity, label, TAB_SP, chrome.onSurfaceVariant);
         view.setGravity(Gravity.CENTER);
+        // A very narrow panel clips its labels on one line (even part of "Tasks"), never wraps
+        // them or grows the bar (Wolf 11-22).
+        view.setSingleLine(true);
+        view.setMaxLines(1);
+        view.setEllipsize(null);
+        view.setHorizontallyScrolling(true);
         view.setOnClickListener(v -> {
             if (tab == which) return;
             scrollOf[tab.ordinal()] = scroll.getScrollY();

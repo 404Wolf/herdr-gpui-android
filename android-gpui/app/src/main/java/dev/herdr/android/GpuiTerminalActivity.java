@@ -2078,8 +2078,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Folded and unfolded keep their own pinch, so each screen stays as set. */
     private String pinchKey() { return compactDisplay ? "pinch_compact" : "pinch_standard"; }
 
+    /**
+     * A pinched size the renderer takes: 11 to 24 (the renderer refuses below 11, and a pinch to
+     * 9 or 10 crashed the app in applyDisplayOptions). 0 stays "not pinched".
+     */
+    static float pinchClamp(float size) {
+        if (!(size > 0) || Float.isNaN(size)) return 0f;
+        return Math.max(PINCH_MIN, Math.min(PINCH_MAX, size));
+    }
+
+    static final float PINCH_MIN = 11f, PINCH_MAX = 24f;
+
     private float pinchedFont() {
-        return getSharedPreferences("terminal-display", MODE_PRIVATE).getFloat(pinchKey(), 0f);
+        // A size kept by an older build (it allowed 9) is read back within the bounds.
+        return pinchClamp(getSharedPreferences("terminal-display", MODE_PRIVATE).getFloat(pinchKey(), 0f));
     }
 
     private android.view.ScaleGestureDetector pinch;
@@ -2097,7 +2109,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         return true;
                     }
                     @Override public boolean onScale(android.view.ScaleGestureDetector detector) {
-                        float next = Math.max(9f, Math.min(24f, pinchFont * detector.getScaleFactor()));
+                        float next = pinchClamp(pinchFont * detector.getScaleFactor());
                         // Whole half-points only: every step reflows the grid.
                         next = Math.round(next * 2f) / 2f;
                         if (next != pinchFont) {
