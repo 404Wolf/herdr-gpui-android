@@ -822,6 +822,76 @@ pub fn grid_link_at<U: EventListener>(grid: &Crosswords<U>, pos: Pos) -> Option<
     Some((spans, found.link))
 }
 
+/// The files a reader could open from `rows`, in the order first seen, at most
+/// `max`: every target a tap there would open as a file (a written path, a
+/// Markdown link, an OSC 8 `file://` target the caller passes in `hyperlinks`),
+/// never a URL. The same rules as a tap ([`link_at`]), so what the phone keeps
+/// for reading offline is exactly what a tap opens.
+pub fn files_in(rows: &[Row], hyperlinks: &[String], max: usize) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let keep = |path: String, found: &mut Vec<String>| {
+        if found.len() < max && !found.contains(&path) {
+            found.push(path);
+        }
+    };
+    for uri in hyperlinks {
+        if let Some(Link::File { path, .. }) = Link::from_uri(uri) {
+            keep(path, &mut found);
+        }
+    }
+    for (row, text) in rows.iter().enumerate() {
+        let mut col = 0;
+        while col < text.chars.len() && found.len() < max {
+            if !part_of_link(text.chars[col]) {
+                col += 1;
+                continue;
+            }
+            let at = col;
+            // The rest of this token: one look per token, not per cell.
+            while col < text.chars.len() && part_of_link(text.chars[col]) {
+                col += 1;
+            }
+            // A Markdown link's target sits after its text in the same token.
+            for probe in [at, col.saturating_sub(1)] {
+                if let Some(Found { link: Link::File { path, .. }, .. }) = link_at(rows, row, probe) {
+                    keep(path, &mut found);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// [`files_in`] over `grid`'s screen and up to `history` rows above it, with
+/// its OSC 8 targets.
+pub fn grid_files<U: EventListener>(grid: &Crosswords<U>, history: usize, max: usize) -> Vec<String> {
+    let columns = grid.columns();
+    let top = -(grid.history_size().min(history) as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    let mut hyperlinks: Vec<String> = Vec::new();
+    let rows: Vec<Row> = (top..=bottom)
+        .map(|row| {
+            let cells = &grid.grid[Line(row)];
+            for col in 0..columns {
+                if let Some(link) = grid.cell_hyperlink(Line(row), Column(col)) {
+                    let uri = link.uri();
+                    if hyperlinks.len() < max && !hyperlinks.iter().any(|seen| seen == uri) {
+                        hyperlinks.push(uri.to_owned());
+                    }
+                }
+            }
+            Row {
+                chars: (0..columns)
+                    .map(|col| cells[Column(col)].c())
+                    .map(|c| if c == '\0' { ' ' } else { c })
+                    .collect(),
+                wrapped: columns > 0 && cells[Column(columns - 1)].wrapline(),
+            }
+        })
+        .collect();
+    files_in(&rows, &hyperlinks, max)
+}
+
 /// The first column of `row` holding text (not blank, not a box border).
 fn first_text<U: EventListener>(grid: &Crosswords<U>, row: Line, columns: usize) -> usize {
     let cells = &grid.grid[row];
@@ -978,6 +1048,28 @@ mod tests {
         assert_eq!(link(&rows, 0, 3), Some(file("README.md", Some(12))));
         assert_eq!(link(&rows, 0, 22), Some(file("Cargo.toml", None)));
         assert_eq!(link(&rows, 0, 34), Some(file("~/x/y", None)));
+    }
+
+    #[test]
+    fn the_files_on_rows_are_what_taps_open_once_each_and_never_urls() {
+        // Padded to the grid's width, as real rows are: a row whose text runs to its edge
+        // continues on the next (a program's own wrap), which these are not.
+        let row = |text: &str| Row::new(&format!("{text:<80}"), false);
+        let rows = [
+            row("Wrote docs/PLAN.md and see ~/notes/x.md:4 for more"),
+            row("Read [spec](SPEC.md), https://example.com/a.md and docs/PLAN.md"),
+            row("nothing here but words."),
+        ];
+        let files = files_in(&rows, &["file:///etc/hosts.txt".into(), "https://x.dev/b.md".into()], 16);
+        assert_eq!(files, ["/etc/hosts.txt", "docs/PLAN.md", "~/notes/x.md", "SPEC.md"]);
+        // Bounded.
+        assert_eq!(files_in(&rows, &[], 2), ["docs/PLAN.md", "~/notes/x.md"]);
+    }
+
+    #[test]
+    fn a_path_the_program_wrapped_is_one_file() {
+        let rows = [Row::new("see /home/wolf/proj/src/ma", true), Row::new("in.rs now", false)];
+        assert_eq!(files_in(&rows, &[], 8), ["/home/wolf/proj/src/main.rs"]);
     }
 
     /// How agents really print a file: bare, in a tool call's parentheses,

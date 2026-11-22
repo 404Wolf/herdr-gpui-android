@@ -165,7 +165,12 @@ final class FilePager extends FrameLayout {
     private void setDocument(FileDocument next) {
         document = next;
         title.setText(next.path);
-        if (next.error != null) {
+        if (next.savedAtMs > 0) {
+            // A copy read while the link was up (offline redesign PR-F): never the file now.
+            String when = OfflineSwitch.when(next.savedAtMs, System.currentTimeMillis(), java.util.TimeZone.getDefault(),
+                    android.text.format.DateFormat.is24HourFormat(getContext()), java.util.Locale.getDefault());
+            where.setText(FileDocument.savedNote(when, next));
+        } else if (next.error != null) {
             where.setText(next.error);
         } else {
             String count = next.total > next.lines.size()

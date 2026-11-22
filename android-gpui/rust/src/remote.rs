@@ -1101,6 +1101,23 @@ pub fn scroll_local_only(id: u64, delta: i64) -> Result<String> {
     });
     Ok(answer.to_string())
 }
+/// Most files one look at a pane names, and the history rows above its screen
+/// it reads: a look is cheap and bounded, whatever the pane printed.
+pub(crate) const FILE_REFS_MAX: usize = 64;
+pub(crate) const FILE_REFS_HISTORY: usize = 400;
+/// The files session `id`'s pane on screen names (paths, Markdown links,
+/// OSC 8 `file://` targets: what a tap there would open), for the phone to
+/// keep copies to read offline: `{"pane": its id, "files": [...]}`. Reads the
+/// phone's own grid; nothing is sent.
+pub fn file_refs(id: u64) -> Result<String> {
+    let owner = session(id)?;
+    let state = lock(&owner.state);
+    let pane = state.view["pane_id"].as_str().unwrap_or("").to_owned();
+    let files = state.terminal.as_ref().map_or_else(Vec::new, |terminal| {
+        gpui_rio::links::grid_files(&terminal.grid().lock(), FILE_REFS_HISTORY, FILE_REFS_MAX)
+    });
+    Ok(json!({"pane": pane, "files": files}).to_string())
+}
 pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
     let owner = session(id)?;
     if offset == 0

@@ -361,6 +361,23 @@ doubt, that the agent scrolls when the link is back. A transcript read without
 stitching is a full-screen program's screen only, and its title says "screen
 only".
 
+Files agents mention are kept for reading offline. While the pane on screen is
+live, the phone looks every few seconds for the files it names: written paths,
+Markdown links, and OSC 8 `file://` targets, exactly what a tap would open,
+never URLs and never links inside those files. It reads one at a time from that
+agent's own machine with the file view's `file.read`, the first 2,000 lines,
+at most one every 2 s. It reads only in the foreground, on an unmetered
+network, and never within 1.5 s of typing or while scrolling. Each file is read
+at most every 10 minutes, and again after a reconnect. A file opened in the file
+view while live is kept whole, up to 8 MB. Copies are kept per machine and
+resolved path; two agents naming one file share a copy. The budget is 1 GB in
+all and 20,000 files, least recently used first out. A copy is dropped after 30
+days unopened and unmentioned, and nothing is written while the phone has under
+8 GB free. Offline, tapping a mentioned path opens its copy, headed "saved copy
+· as of HH:MM · may be outdated", with how much was kept. When there is no copy
+the view says why: no such file, not a text file, permission denied, or not
+saved yet. A relayed pane's files are another machine's and are not kept.
+
 See [../android/VALIDATION.md](../android/VALIDATION.md) for the previous native
 preview's checks. GPUI-specific build and runtime evidence belongs in
 `VALIDATION.md` in this directory; the earlier Java APK's validation is not proof

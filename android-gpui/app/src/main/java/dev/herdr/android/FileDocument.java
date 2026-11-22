@@ -21,19 +21,40 @@ final class FileDocument {
     final int line;
     /** Why it could not be shown, or null. */
     final String error;
+    /** When the phone's saved copy was read (wall ms), or 0 for a live read. */
+    final long savedAtMs;
 
     private FileDocument(String path, List<String> lines, List<List<SyntaxHighlighter.Span>> spans,
-            int total, int line, String error) {
+            int total, int line, String error, long savedAtMs) {
         this.path = path;
         this.lines = lines;
         this.spans = spans;
         this.total = total;
         this.line = line;
         this.error = error;
+        this.savedAtMs = savedAtMs;
     }
 
     static FileDocument failed(String path, int line, String error) {
-        return new FileDocument(path, Collections.emptyList(), Collections.emptyList(), 0, line, error);
+        return failed(path, line, error, 0);
+    }
+
+    private static FileDocument failed(String path, int line, String error, long savedAtMs) {
+        return new FileDocument(path, Collections.emptyList(), Collections.emptyList(), 0, line, error, savedAtMs);
+    }
+
+    /** No copy of the file was kept for reading offline. */
+    static final String NOT_SAVED = "Not saved for offline reading yet";
+
+    /**
+     * What the header says of a saved copy, offline: "saved copy · as of 14:02 · may be outdated",
+     * with why there is no text, or how much of the file was kept.
+     */
+    static String savedNote(String when, FileDocument copy) {
+        String note = "saved copy · as of " + when + " · may be outdated";
+        if (copy.error != null) return note + " · " + copy.error.toLowerCase(java.util.Locale.ROOT);
+        if (copy.total > copy.lines.size()) return note + " · first " + copy.lines.size() + " of " + copy.total + " lines";
+        return note + " · " + copy.total + " lines";
     }
 
     /** Parses core_session's reply: {@code {"queued":true,"path","text","lines"}} or an error. */
@@ -45,12 +66,13 @@ final class FileDocument {
             return failed(requested, line, "unreadable reply");
         }
         String path = reply.optString("path", requested);
-        if (!reply.optBoolean("queued", false)) return failed(path, line, reason(reply.optString("error", "")));
+        long saved = reply.optLong("saved_as_of_ms", 0);
+        if (!reply.optBoolean("queued", false)) return failed(path, line, reason(reply.optString("error", "")), saved);
         String text = reply.optString("text", "");
         List<String> lines = split(text);
         int total = Math.max(reply.optInt("lines", lines.size()), lines.size());
         return new FileDocument(path, lines,
-                SyntaxHighlighter.highlight(SyntaxHighlighter.forPath(path), lines), total, line, null);
+                SyntaxHighlighter.highlight(SyntaxHighlighter.forPath(path), lines), total, line, null, saved);
     }
 
     /** Lines without their ends, tabs as four spaces; a final line end starts no extra line. */
@@ -69,6 +91,7 @@ final class FileDocument {
 
     /** herdr-core's error kinds, as a person reads them. */
     static String reason(String error) {
+        if (error.contains("not_saved")) return NOT_SAVED;
         if (error.contains("not_found")) return "No such file";
         if (error.contains("not_text")) return "Not a text file";
         if (error.contains("machine_unknown") || error.contains("unavailable")) return "That computer is not reachable";

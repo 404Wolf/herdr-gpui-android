@@ -571,8 +571,8 @@ impl Connection<'_> {
                     return self.start_deacon(&machine, cols, rows);
                 }
                 Some(TabEdit::GitLook { paths }) => return self.git_look(&paths),
-                Some(TabEdit::FileRead { terminal, path }) => {
-                    return Ok(match self.read_file(&view, &terminal, &path) {
+                Some(TabEdit::FileRead { terminal, path, limit }) => {
+                    return Ok(match self.read_file(&view, &terminal, &path, limit) {
                         Ok(reply) => reply,
                         Err(error) => json!({"queued":false,"error":error.to_string()}),
                     }
@@ -815,8 +815,8 @@ impl Connection<'_> {
     }
     /// A text file for the file view, read on the machine `terminal` runs on:
     /// a relative path from that terminal's folder, `~/` from its home.
-    /// Bounded to the first FILE_LINES lines (and file.read's 8 MB).
-    fn read_file(&mut self, view: &Value, terminal: &str, path: &str) -> Result<Value> {
+    /// Bounded to the first `limit` lines, at most FILE_LINES (and file.read's 8 MB).
+    fn read_file(&mut self, view: &Value, terminal: &str, path: &str, limit: u64) -> Result<Value> {
         let machine = terminal.rsplit_once('/').map(|(machine, _)| machine);
         let cwd = view["panes"]
             .as_array()
@@ -836,7 +836,7 @@ impl Connection<'_> {
             }
             None => (path.to_owned(), cwd),
         };
-        let mut params = json!({"path":path,"offset":1,"limit":FILE_LINES});
+        let mut params = json!({"path":path,"offset":1,"limit":limit.min(FILE_LINES)});
         if let Some(cwd) = &cwd {
             params["cwd"] = json!(cwd);
         }
@@ -1337,7 +1337,8 @@ pub(crate) enum TabEdit {
     Kill { terminal: String },
     DeaconStart { machine: String },
     GitLook { paths: Vec<String> },
-    FileRead { terminal: String, path: String },
+    /// `limit`: lines to read, at most FILE_LINES (the phone's offline copies ask for fewer).
+    FileRead { terminal: String, path: String, limit: u64 },
     SpaceOpen { folder: String },
     Send { terminal: String, text: String },
 }
@@ -1436,6 +1437,10 @@ impl TabEdit {
                     .as_str()
                     .filter(|p| !p.is_empty() && p.len() <= 4096 && !p.chars().any(char::is_control))
                     .map(str::to_owned)?,
+                limit: match &value["limit"] {
+                    Value::Null => FILE_LINES,
+                    limit => limit.as_u64().filter(|l| (1..=FILE_LINES).contains(l))?,
+                },
             },
             "space.open" => Self::SpaceOpen { folder: folder(&value["folder"])? },
             "pane.send" => Self::Send {
@@ -2693,8 +2698,16 @@ mod tests {
     fn file_reads_parse_a_terminal_and_a_bounded_path() {
         assert_eq!(
             TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":"src/a.rs"}"#),
-            Some(TabEdit::FileRead { terminal: "t3".into(), path: "src/a.rs".into() })
+            Some(TabEdit::FileRead { terminal: "t3".into(), path: "src/a.rs".into(), limit: FILE_LINES })
         );
+        // The phone's offline copies ask for fewer lines; never more than a tap reads.
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":"a.md","limit":2000}"#),
+            Some(TabEdit::FileRead { terminal: "t3".into(), path: "a.md".into(), limit: 2000 })
+        );
+        assert_eq!(TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":"a.md","limit":0}"#), None);
+        let over = format!(r#"{{"op":"file.read","terminal":"t3","path":"a.md","limit":{}}}"#, FILE_LINES + 1);
+        assert_eq!(TabEdit::parse(&over), None);
         assert_eq!(TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":""}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"file.read","path":"/a"}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"file.read","terminal":"t3","path":"/a
