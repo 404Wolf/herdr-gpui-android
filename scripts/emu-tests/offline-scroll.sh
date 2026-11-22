@@ -276,20 +276,42 @@ open_agent() { # name
     quiet 2
     tap_ui "$1" 30
 }
-pane_is() { dump && $ui find "$EMU_OUT/ui.xml" "Window [0-9]+, $1, current" > /dev/null; }
-# Another terminal: its tab (retried), else through the overflow menu's Panes; asserts it is now on
-# screen, so nothing later runs against the wrong pane.
-switch_to() { # name
-    local n
-    pane_is "$1" && return 0
-    for n in 1 2 3; do
-        tap_ui "Window [0-9]+, $1([.,]|$)" 8 || tap_ui "^[0-9]+ $1$" 8 || true
-        quiet 4
+pane_is() { dump && $ui find "$EMU_OUT/ui.xml" "Window [0-9]+, $1, (blocked, )?current" > /dev/null; }
+switched() { # name: up to 10 s
+    local end=$((SECONDS + 10))
+    while (( SECONDS < end )); do
         pane_is "$1" && return 0
+        sleep 1
     done
-    tap_ui 'Panes, hosts and terminal actions' 10 && tap_ui '^Panes$' 10 && { quiet 1; tap_ui "$1" 15; }
-    quiet 4
-    pane_is "$1"
+    return 1
+}
+# The overflow menu or its pane list left open hides the main window from the dump: close it.
+close_menu() {
+    local n
+    for n in 1 2; do
+        find_ui '^(Spaces & panes|Panes)$|^Hosts and keys$' > /dev/null 2>&1 || return 0
+        a shell input keyevent KEYCODE_BACK
+        quiet 1
+    done
+}
+# Another terminal, as elicit.sh switches: the tab chip, the rail row, then the overflow's list of
+# panes ('Spaces & panes', 'Panes' in older builds), each waited for before the next; a menu it
+# opened is closed again, and the labelled nodes are kept when it fails.
+switch_to() { # name
+    pane_is "$1" && return 0
+    tap_ui "Window [0-9]+, $1([.,]|$)" 8 > /dev/null && switched "$1" && return 0
+    tap_ui "Focus pane $1" 5 > /dev/null && switched "$1" && return 0
+    if tap_ui 'Panes, hosts and terminal actions' 10 > /dev/null \
+        && tap_ui '^(Spaces & panes|Panes)$' 10 > /dev/null; then
+        quiet 2
+        if tap_ui "$1" 15 > /dev/null && switched "$1"; then close_menu; return 0; fi
+        close_menu
+    fi
+    # One more tab tap: a busy guest can drop the first.
+    tap_ui "Window [0-9]+, $1([.,]|$)" 8 > /dev/null && switched "$1" && return 0
+    shot "switch-$1-fail"
+    $ui list "$EMU_OUT/ui.xml" > "$EMU_OUT/switch-$1-fail.txt" 2>&1
+    return 1
 }
 
 
@@ -465,10 +487,14 @@ fi
 # (E-R2) The network is up but the host is down: the attempts are bounded, then the indicator
 # offers Reconnect, which works once the host is back. Stopping the core ends the live link
 # (stopping sshd alone leaves an open session up); with sshd down every attempt is refused.
+close_menu
 mark_log
 stop_sshd
 hc server stop > /dev/null 2>&1
-if wait_ui 'offline · tap to reconnect' 150 > /dev/null; then
+stopped_badge() { close_menu; find_ui 'offline · tap to reconnect'; }
+end=$((SECONDS + 150)); badge=
+while (( SECONDS < end )); do badge=$(stopped_badge) && break; sleep 3; done
+if [[ -n "$badge" ]]; then
     shot stopped
     app_log > "$EMU_OUT/app-stopped.log"
     tries=$(count 'attempt [0-9]* failed' "$EMU_OUT/app-stopped.log")
