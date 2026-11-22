@@ -571,6 +571,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         workPanel = new WorkPanel(this, chrome, workPanelHost());
         root.addView(workPanel.view(), new FrameLayout.LayoutParams(0, -1, android.view.Gravity.END));
         workPanel.attach();
+        panelDivider = new PanelDivider(this, chrome, this::choosePanel);
+        root.addView(panelDivider.divider(), new FrameLayout.LayoutParams(dp(PanelDivider.TOUCH_DP), -1, android.view.Gravity.START));
+        root.addView(panelDivider.preview(), new FrameLayout.LayoutParams(dp(2), -1, android.view.Gravity.START));
+        root.addView(panelDivider.edge(), new FrameLayout.LayoutParams(dp(WorkPanelLayout.EDGE_DP), dp(WorkPanelLayout.EDGE_TALL_DP),
+                android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL));
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
@@ -635,7 +640,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** No room to dock the rail: the cover, or the unfolded screen while the work panel takes its half. */
     private boolean railCompact() {
-        return compactWindow() || WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode());
+        return compactWindow() || WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode(),
+                panelChoice().hidden);
     }
 
     /** Opens the rail as a drawer over the terminal, never narrowing it. */
@@ -1257,9 +1263,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void applyWorkPanel() {
         if (workPanel == null || terminalRoot == null) return;
         int widthDp = getResources().getConfiguration().screenWidthDp;
-        WorkPanelLayout layout = WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen);
+        WorkPanelLayout.Choice choice = panelChoice();
+        WorkPanelLayout layout = WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen, choice);
         int rootWidth = root().getWidth();
-        int width = layout.overlay ? -1 : Math.max(dp(WorkPanelLayout.MIN_DP), Math.round(rootWidth * layout.share));
+        // Docked, Wolf's divider sets the share (each side keeps its minimum: WorkPanelLayout.clamp).
+        int width = layout.overlay ? -1 : Math.round(rootWidth * layout.share);
         FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) workPanel.view().getLayoutParams();
         if (at.width != (layout.shown ? width : 0)) {
             at.width = layout.shown ? width : 0;
@@ -1268,6 +1276,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int right = layout.shown && !layout.overlay ? width : 0;
         if (railColumns.getPaddingRight() != right) railColumns.setPadding(0, 0, right, 0);
         workPanel.show(layout.shown, layout.overlay);
+        if (panelDivider != null) {
+            int[] origin = new int[2];
+            root().getLocationOnScreen(origin);
+            panelDivider.place(!compactWindow(), layout, choice, rootWidth - (layout.shown ? width : 0), rootWidth, origin[0]);
+        }
         if (workButton != null) {
             workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
             workButton.setSelected(layout.shown);
@@ -1276,6 +1289,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private View root() {
         return (View) railColumns.getParent();
+    }
+
+    /** The terminal | panel divider (PanelDivider), and Wolf's split per orientation (factory-9zz.9). */
+    private PanelDivider panelDivider;
+
+    private String panelChoiceKey() {
+        return "work_panel_" + (getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                ? "land" : "port");
+    }
+
+    private WorkPanelLayout.Choice panelChoice() {
+        return WorkPanelLayout.Choice.parse(getSharedPreferences("terminal-display", MODE_PRIVATE).getString(panelChoiceKey(), ""));
+    }
+
+    /** A drag's release, the restoring edge swipe or TalkBack: kept, then one relayout (one terminal resize). */
+    private void choosePanel(WorkPanelLayout.Choice next) {
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit().putString(panelChoiceKey(), next.stored()).apply();
+        applySidebarWidth();
+        refreshSidebar(true);
+        if (next.hidden) note("Work panel hidden · swipe in from the right edge to bring it back");
     }
 
     /** The cover's Work button and the panel's ×. */

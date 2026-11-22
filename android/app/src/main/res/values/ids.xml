@@ -2,4 +2,6 @@
 <resources>
     <!-- A pinned agent's row offers Unpin to TalkBack as an action of its own (PinnedSection). -->
     <item name="pin_unpin_action" type="id" />
+    <!-- The work panel's divider offers Hide to TalkBack (PanelDivider). -->
+    <item name="panel_hide_action" type="id" />
 </resources>
