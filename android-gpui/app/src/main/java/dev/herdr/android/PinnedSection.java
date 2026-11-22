@@ -21,7 +21,7 @@ import java.util.function.Consumer;
 
 /**
  * The compact "Pinned" section at the top of the rail (factory-9zz.2, P3): one
- * 48dp row per pinned agent, the one-tap way to an agent on any machine. A row
+ * 40dp row per pinned agent, the one-tap way to an agent on any machine. A row
  * is the state dot, the agent's name (never an id), a compact dim machine tag,
  * always shown, and a dim state word when it is not live ("offline · 14:02");
  * live is the dot alone. A tap opens the pin; a long-press offers Unpin. No
@@ -30,8 +30,8 @@ import java.util.function.Consumer;
 final class PinnedSection {
     /** The machine tag's length: a compact name, cut with "…". */
     static final int MACHINE_CHARS = 12;
-    /** Pin rows are a full touch target. */
-    static final int ROW_DP = 48;
+    /** As tight as the rail's lead rows (Wolf's OLED preview); the whole row is the tap target. */
+    static final int ROW_DP = 40;
 
     /** One drawn row. */
     static final class Row {
