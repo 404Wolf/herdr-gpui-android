@@ -117,6 +117,15 @@ final class WorkPanelLayout {
         return new Choice(c == null ? 0 : c.share, false);
     }
 
+    /** A release this near the middle (the Fold's hinge) lands on it. */
+    static final int SNAP_DP = 16;
+
+    /** The divider's x, snapped to the middle of the window (the hinge) within {@link #SNAP_DP}. */
+    static float snapped(float dividerXDp, int widthDp) {
+        float middle = widthDp / 2f;
+        return Math.abs(dividerXDp - middle) <= SNAP_DP ? middle : dividerXDp;
+    }
+
     /** An inward swipe from the right edge of {@code dxDp} (negative: leftward) brings a hidden panel back. */
     static boolean restores(float dxDp, float dyDp) {
         return dxDp <= -RESTORE_DP && Math.abs(dxDp) > Math.abs(dyDp) * 1.5f;
