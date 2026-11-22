@@ -498,7 +498,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         usageFeed = UsageFeed.shared(this).attach(this);
         usageFeed.watch(UsageFeed.Watch.RAIL, sidebarOpen && !railMinimized);
         // Each look holds the core session's one worker, so typing would wait behind the rail's prefetch.
-        usageFeed.typing(() -> imeShown || (composer != null && composer.drafting()));
+        usageFeed.typing(() -> imeShown || (composer != null && composer.busy() != null));
         tabRow.addView(pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
@@ -7670,7 +7670,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
-                        if (selected && pinsRail != null && current.machine != null) Pins.shared(this).observe(current.machine, current.panes);
+                        if (selected && current.ownList && pinsRail != null && current.machine != null) Pins.shared(this).observe(current.machine, current.panes);
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
