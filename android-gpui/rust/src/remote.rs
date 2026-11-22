@@ -66,6 +66,72 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
 }
+/// What kind of failure a remote error is, for the phone to act and word it by (audit E): a
+/// closed set, never matched on display text. The Java side reads it from `RemoteError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Wrong configuration, credentials or arguments from the phone itself.
+    Invalid,
+    /// The session ended; reconnecting is the way on.
+    Closed,
+    /// The session is up but working on earlier requests; this one did not run.
+    Busy,
+    /// The core did not answer in time; the request may still finish there.
+    Timeout,
+    /// A queue or session limit was reached.
+    Capacity,
+    /// The core answered with a refusal (its own kind is `core_kind`).
+    Refused,
+    /// The core said something the phone could not read.
+    Protocol,
+    /// The network or the transport failed.
+    Network,
+    /// A local failure: the terminal engine, a saved pane, the disk.
+    Local,
+}
+
+impl ErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Closed => "closed",
+            Self::Busy => "busy",
+            Self::Timeout => "timeout",
+            Self::Capacity => "capacity",
+            Self::Refused => "refused",
+            Self::Protocol => "protocol",
+            Self::Network => "network",
+            Self::Local => "local",
+        }
+    }
+}
+
+impl Error {
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Config | Self::Credentials | Self::StaleTarget | Self::PutBounds | Self::PutName | Self::Input(_) => {
+                ErrorKind::Invalid
+            }
+            Self::Closed => ErrorKind::Closed,
+            Self::Busy => ErrorKind::Busy,
+            Self::Timeout { .. } => ErrorKind::Timeout,
+            Self::Capacity => ErrorKind::Capacity,
+            Self::Rpc { .. } | Self::WindowNotPlaced(_) => ErrorKind::Refused,
+            Self::Protocol(_) | Self::Json(_) => ErrorKind::Protocol,
+            Self::Transport(_) | Self::IrohTarget(_) | Self::Io(_) => ErrorKind::Network,
+            Self::Snapshot | Self::Terminal(_) => ErrorKind::Local,
+        }
+    }
+
+    /// The core's own kind of a refusal ("unavailable" when its exec slots are full, ...).
+    pub fn core_kind(&self) -> Option<&str> {
+        match self {
+            Self::Rpc { kind, .. } if !kind.is_empty() => Some(kind),
+            _ => None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1197,6 +1263,21 @@ pub fn discover(id: u64) -> Result<String> {
 #[allow(clippy::unwrap_used)]
 mod last_use_tests {
     use super::*;
+
+    #[test]
+    fn every_error_has_one_kind_for_the_phone_to_word() {
+        assert_eq!(Error::Closed.kind().as_str(), "closed");
+        assert_eq!(Error::Busy.kind().as_str(), "busy");
+        assert_eq!(Error::Timeout { method: "terminal.attach".into() }.kind(), ErrorKind::Timeout);
+        assert_eq!(Error::Capacity.kind(), ErrorKind::Capacity);
+        assert_eq!(Error::Protocol("x".into()).kind(), ErrorKind::Protocol);
+        assert_eq!(Error::Config.kind(), ErrorKind::Invalid);
+        assert_eq!(Error::Io(io::Error::other("x")).kind(), ErrorKind::Network);
+        let refused = Error::Rpc { kind: "unavailable".into(), message: "16 execs are running already".into() };
+        assert_eq!((refused.kind(), refused.core_kind()), (ErrorKind::Refused, Some("unavailable")));
+        assert_eq!(Error::Rpc { kind: String::new(), message: "x".into() }.core_kind(), None);
+        assert_eq!(Error::Busy.core_kind(), None);
+    }
 
     #[test]
     fn a_busy_session_is_busy_and_only_an_ended_one_is_closed() {

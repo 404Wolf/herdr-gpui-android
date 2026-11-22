@@ -290,7 +290,8 @@ final class UsageFeed {
             } catch (HostSwitched gone) {
                 outcome = Outcome.SWITCHED;
             } catch (RuntimeException e) {
-                outcome = OpTiming.busy(OpTiming.reason("usage.look", e)) ? Outcome.BUSY : Outcome.UNREACHABLE;
+                OpTiming.reason("usage.look", e);
+                outcome = RemoteError.busy(e) ? Outcome.BUSY : Outcome.UNREACHABLE;
             } catch (LinkageError e) {
                 outcome = Outcome.UNREACHABLE;
             }
