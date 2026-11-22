@@ -1565,6 +1565,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
             }
             @Override public boolean typing() { return imeShown || (composer != null && composer.busy() != null); }
+            @Override public MachineKey machine() {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                return now == null || now.isClosed() ? null : PanelSync.keyFor(now.machine, now.refusedBy != null, now.hostId);
+            }
             @Override public void closed() { toggleWorkPanel(false); }
             @Override public void coverDrag(float visible) { GpuiTerminalActivity.this.coverDrag(visible); }
             @Override public void coverSettled(boolean open) { coverSettle(open); }

@@ -34,9 +34,9 @@ final class PanelModel {
             return DocModel.nameFor(role, project, name);
         }
 
-        /** The deacon has no project, so no Tasks. */
+        /** An agent with a project has its project's Tasks; the deacon has every machine's (factory-9zz.14). */
         boolean hasTasks() {
-            return !"deacon".equals(role) && project != null && !project.isEmpty();
+            return "deacon".equals(role) || project != null && !project.isEmpty();
         }
 
         /** The same agent, doc and bead: nothing to read again. */
