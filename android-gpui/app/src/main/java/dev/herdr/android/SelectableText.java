@@ -10,6 +10,7 @@ import android.os.Looper;
 import android.os.PersistableBundle;
 import android.text.Selection;
 import android.text.Spannable;
+import android.text.Spanned;
 import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -34,21 +35,20 @@ import java.util.function.Consumer;
 final class SelectableText extends TextView {
     private static final int QUOTE = 0x5e1ec7;
 
+    /** Quote: the selected range [start, end) of the text. */
+    interface Quote { void quote(int start, int end); }
+
     private final Consumer<String> note;
-    private final Consumer<String> quote;
+    private Quote quote;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final SelectionCopy.Settle settle = new SelectionCopy.Settle();
     private final Runnable copySettled = this::copySettled;
     private boolean modeUp;
 
-    /**
-     * {@code note} shows the crumb's short note; {@code quote} puts text in
-     * the composer's draft (null: no Quote item).
-     */
-    SelectableText(Context context, Consumer<String> note, Consumer<String> quote) {
+    /** {@code note} shows the crumb's short note. */
+    SelectableText(Context context, Consumer<String> note) {
         super(context);
         this.note = note;
-        this.quote = quote;
         setTextIsSelectable(true);
         setCustomSelectionActionModeCallback(new ActionMode.Callback() {
             @Override public boolean onCreateActionMode(ActionMode mode, Menu menu) {
@@ -63,8 +63,8 @@ final class SelectableText extends TextView {
 
             @Override public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
                 if (item.getItemId() != QUOTE) return false;
-                String selected = selected();
-                if (!selected.isEmpty()) SelectableText.this.quote.accept(selected);
+                int start = Math.min(getSelectionStart(), getSelectionEnd()), end = Math.max(getSelectionStart(), getSelectionEnd());
+                if (end > start) SelectableText.this.quote.quote(start, end);
                 mode.finish();
                 return true;
             }
@@ -76,6 +76,40 @@ final class SelectableText extends TextView {
             }
         });
     }
+
+    /** Adds Quote to the toolbar: it hands the selected range to {@code quote} (which never sends). */
+    void setQuote(Quote quote) {
+        this.quote = quote;
+    }
+
+    /**
+     * A tap on a link opens it; with selectable text Android would only move
+     * the cursor. Not while a selection is up, and not after a drag or a hold.
+     */
+    // TalkBack reaches links through its own links menu; this is only the finger's tap on one.
+    @android.annotation.SuppressLint("ClickableViewAccessibility")
+    @Override public boolean onTouchEvent(android.view.MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == android.view.MotionEvent.ACTION_DOWN) {
+            downX = event.getX();
+            downY = event.getY();
+            downAt = event.getEventTime();
+        } else if (action == android.view.MotionEvent.ACTION_UP && !hasSelection() && !modeUp
+                && Math.hypot(event.getX() - downX, event.getY() - downY) < android.view.ViewConfiguration.get(getContext()).getScaledTouchSlop()
+                && event.getEventTime() - downAt < android.view.ViewConfiguration.getLongPressTimeout()
+                && getText() instanceof Spanned) {
+            int at = getOffsetForPosition(event.getX(), event.getY());
+            android.text.style.ClickableSpan[] links = ((Spanned) getText()).getSpans(at, at, android.text.style.ClickableSpan.class);
+            if (links.length > 0 && at < getText().length()) {
+                links[0].onClick(this);
+                return true;
+            }
+        }
+        return super.onTouchEvent(event);
+    }
+
+    private float downX, downY;
+    private long downAt;
 
     @Override protected void onSelectionChanged(int start, int end) {
         super.onSelectionChanged(start, end);
