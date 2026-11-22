@@ -14,16 +14,18 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The composer's buttons as real app buttons (factory-9zz.3, Wolf 11-22): one compact row at the
- * very bottom right of the whole app, under the terminal and the work panel. Only the draft stays
- * at the harness's own prompt. The row shows the widest of {@link ControlLine}'s lines that fits
- * its width: the same controls, ids and taps as the words it replaces, so the composer's state
- * machine is unchanged. A status control ("rec 0:05", "offline") is a quiet label at the row's
- * left, never a button; reserved gaps are dropped (the buttons are anchored at the right edge, so
- * nothing slides under a finger).
+ * The composer's controls as app icon buttons (factory-9zz.3, Wolf 11-22): one cluster of equal
+ * icon buttons at the very bottom right of the whole app, overlaying the work panel (or, with no
+ * panel, the terminal), never a strip that takes height. Only the draft stays at the harness's own
+ * prompt. Five fixed slots, Clear Img Type Talk Send, whose icons change in place (Talk becomes
+ * Stop; Clear becomes Cancel while dictating or Undo after a clear); the queue and the status words
+ * ("rec 0:05") are small labels left of them. The ids and taps are ControlLine's, so the composer's
+ * state machine is unchanged. Icons: Material Symbols vectors (res/drawable/ic_act_*).
  */
 final class ActionBar {
-    static final int HEIGHT_DP = 44, BUTTON_DP = 34, GAP_DP = 6, PAD_DP = 8, TEXT_SP = 13;
+    static final int BUTTON_DP = 40, TARGET_DP = 48, GAP_DP = 2, MARGIN_DP = 8, TEXT_SP = 12;
+    /** The cluster's width: five equal slots. */
+    static final int SLOTS_WIDTH_DP = 5 * TARGET_DP + 4 * GAP_DP;
 
     /** One button or label as the row draws it: pure, for tests. */
     static final class Item {
@@ -42,9 +44,18 @@ final class ActionBar {
         }
     }
 
-    /** A line of controls as the row's items: gaps dropped, the status words a label, words trimmed. */
+    /** The fixed slots, left to right, at the row's right edge (t42y A1b): nothing moves between states. */
+    static final String[] SLOTS = {"clear", ControlLine.ATTACH, "type", "talk", "send"};
+
+    /**
+     * A line of controls as the row's items: first what comes and goes (the queue button, the
+     * status words), then the five fixed slots {@link #SLOTS}, whose labels change in place:
+     * Clear becomes Cancel while dictating (one discard button, never two) or Undo after a
+     * clear; Talk becomes Stop. A slot that does not apply is there, disabled.
+     */
     static List<Item> items(List<GhostText.Control> line) {
-        List<Item> out = new ArrayList<>();
+        java.util.Map<String, Item> byId = new java.util.LinkedHashMap<>();
+        Item status = null;
         for (GhostText.Control c : line) {
             if (c.id.startsWith("gap-")) continue;
             StringBuilder text = new StringBuilder();
@@ -55,12 +66,38 @@ final class ActionBar {
             }
             String label = text.toString().trim();
             if (label.isEmpty()) continue;
-            if ("clear".equals(c.id) && "✕".equals(label)) label = "clear";
-            if (ControlLine.ATTACH.equals(c.id)) label = "img";
-            out.add(new Item(c.id, label, style, ControlLine.tappable(c.id)));
+            if (ControlLine.STATUS.equals(c.id)) {
+                if (status == null) status = new Item(c.id, label, style, false);
+                continue;
+            }
+            byId.putIfAbsent(c.id, new Item(c.id, label, style, true));
         }
+        List<Item> out = new ArrayList<>();
+        Item queue = byId.get("queue");
+        if (queue != null) out.add(queue);
+        if (status != null) out.add(status);
+        Item cancel = byId.get(ControlLine.CANCEL), undo = byId.get("undo"), clear = byId.get("clear");
+        out.add(cancel != null ? new Item(cancel.id, "Cancel", "warn", true)
+                : undo != null ? new Item(undo.id, capital(undo.label), undo.style, true)
+                : clear != null ? new Item("clear", "Clear", "warn", true)
+                : new Item("clear", "Clear", DISABLED, true));
+        Item img = byId.get(ControlLine.ATTACH);
+        out.add(new Item(ControlLine.ATTACH, "Img", img != null ? img.style : DISABLED, true));
+        Item type = byId.get("type");
+        out.add(new Item("type", type == null ? "Type" : capital(type.label), type == null ? DISABLED : type.style, true));
+        Item talk = byId.get("talk");
+        if (talk != null) out.add(new Item("talk", capital(talk.label), talk.style, true));
+        else out.add(new Item("talk", "Talk", DISABLED, true));
+        out.add(new Item("send", "Send", "bright", true));
         return out;
     }
+
+    private static String capital(String label) {
+        return label.isEmpty() ? label : label.substring(0, 1).toUpperCase(java.util.Locale.ROOT) + label.substring(1);
+    }
+
+    /** The style of a reserved, disabled button. */
+    static final String DISABLED = "disabled";
 
     /** The first line of {@code ladder} (widest first) whose items fit {@code width}, else the last. */
     static int pick(List<List<GhostText.Control>> ladder, int width, java.util.function.ToIntFunction<List<Item>> measure) {
@@ -96,14 +133,7 @@ final class ActionBar {
         row = new LinearLayout(context);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
-        row.setPadding(dp(PAD_DP), 0, dp(PAD_DP), 0);
-        // A 1 dp hairline on top (t42y review), the app's background below it.
-        android.graphics.drawable.LayerDrawable back = new android.graphics.drawable.LayerDrawable(
-                new android.graphics.drawable.Drawable[] {
-                        new android.graphics.drawable.ColorDrawable(chrome.outline),
-                        new android.graphics.drawable.ColorDrawable(chrome.background)});
-        back.setLayerInset(1, 0, Math.max(1, dp(1)), 0, 0);
-        row.setBackground(back);
+        row.setPadding(0, 0, 0, 0);
         row.setVisibility(View.GONE);
         row.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             if (r - l != or - ol) v.post(this::redraw);
@@ -126,7 +156,8 @@ final class ActionBar {
             if (!drawn.isEmpty()) { row.removeAllViews(); drawn = ""; }
             return;
         }
-        int width = row.getWidth() - row.getPaddingLeft() - row.getPaddingRight();
+        View parent = (View) row.getParent();
+        int width = parent == null ? 0 : parent.getWidth() - 2 * dp(MARGIN_DP);
         if (width <= 0) width = Integer.MAX_VALUE;
         List<Item> items = items(ladder.get(pick(ladder, width, this::measure)));
         StringBuilder key0 = new StringBuilder();
@@ -135,42 +166,92 @@ final class ActionBar {
         if (key.equals(drawn)) return;
         drawn = key;
         row.removeAllViews();
+        // One compact group at the bottom right in every state: the labels, then the five slots.
         for (int n = 0; n < items.size(); n++) {
             Item item = items.get(n);
-            TextView view = item.button ? button(item) : label(item);
-            LinearLayout.LayoutParams at = new LinearLayout.LayoutParams(-2, item.button ? dp(BUTTON_DP) : -2);
+            boolean slot = item.button && isSlot(item.id);
+            LinearLayout.LayoutParams at = slot ? new LinearLayout.LayoutParams(dp(TARGET_DP), dp(TARGET_DP))
+                    : new LinearLayout.LayoutParams(-2, -2);
             if (n > 0) at.setMarginStart(dp(GAP_DP));
-            if (!item.button) at.weight = 1;
-            row.addView(view, at);
+            if (!slot) at.setMarginEnd(dp(4));
+            row.addView(slot ? button(item) : pill(item), at);
         }
     }
 
-    /** Its width in pixels, as {@link #redraw} would lay it out. */
+    /** Its width in pixels, as {@link #redraw} would lay it out: the labels, then the slots. */
     private int measure(List<Item> items) {
-        int total = 0;
-        for (int n = 0; n < items.size(); n++) {
-            Item item = items.get(n);
-            total += Math.round(paint.measureText(item.label)) + (item.button ? 2 * dp(12) : 0);
-            if (n > 0) total += dp(GAP_DP);
+        int total = dp(SLOTS_WIDTH_DP);
+        for (Item item : items) {
+            if (isSlot(item.id)) continue;
+            total += Math.round(paint.measureText(item.label)) + 2 * dp(10) + dp(GAP_DP);
         }
         return total;
     }
 
-    private TextView button(Item item) {
-        TextView b = text(item.label, color(item));
-        b.setGravity(Gravity.CENTER);
-        b.setPadding(dp(12), 0, dp(12), 0);
-        b.setMinWidth(dp(48));
+    static boolean isSlot(String id) {
+        return "clear".equals(id) || "undo".equals(id) || ControlLine.CANCEL.equals(id) || ControlLine.ATTACH.equals(id)
+                || "type".equals(id) || "talk".equals(id) || "send".equals(id);
+    }
+
+    /** The icon for a slot in its state. */
+    static int icon(Item item) {
+        switch (item.id) {
+            case "undo": return R.drawable.ic_act_undo;
+            case "clear":
+            case ControlLine.CANCEL: return R.drawable.ic_act_close;
+            case ControlLine.ATTACH: return R.drawable.ic_act_image;
+            case "type": return item.label.equalsIgnoreCase("hide") ? R.drawable.ic_act_keyboard_hide : R.drawable.ic_act_keyboard;
+            case "talk":
+                if (item.label.equalsIgnoreCase("stop") || "danger".equals(item.style) || "warn".equals(item.style)) {
+                    return R.drawable.ic_act_stop;
+                }
+                return item.label.equalsIgnoreCase("talk") ? R.drawable.ic_act_mic : R.drawable.ic_act_busy;
+            default: return R.drawable.ic_act_send;
+        }
+    }
+
+    private View button(Item item) {
+        android.widget.ImageButton b = new android.widget.ImageButton(context);
+        b.setImageResource(icon(item));
+        b.setScaleType(android.widget.ImageView.ScaleType.CENTER);
+        boolean recording = "talk".equals(item.id) && icon(item) == R.drawable.ic_act_stop;
+        int tint = recording ? 0xFFFFFFFF : "send".equals(item.id) ? chrome.onSurface
+                : ControlLine.CANCEL.equals(item.id) || "warn".equals(item.style) ? chrome.warning : chrome.onSurface;
+        b.setImageTintList(android.content.res.ColorStateList.valueOf(tint));
+        // A 40 dp visual inside the 48 dp target; opaque, so it reads over the panel's text.
         GradientDrawable shape = new GradientDrawable();
-        shape.setCornerRadius(dp(8));
-        shape.setStroke(Math.max(1, dp(1)), "send".equals(item.id) ? chrome.onSurfaceVariant : chrome.outline);
-        shape.setColor(0x00000000);
+        shape.setCornerRadius(dp(10));
+        // Talk is the one filled slot (the palette's selected role); Stop is filled red.
+        shape.setColor(recording ? chrome.danger : "talk".equals(item.id) ? chrome.selected : chrome.raised);
+        shape.setStroke(Math.max(1, dp(1)), chrome.outline);
+        int inset = dp((TARGET_DP - BUTTON_DP) / 2);
+        android.graphics.drawable.InsetDrawable visual = new android.graphics.drawable.InsetDrawable(shape, inset);
         b.setBackground(new android.graphics.drawable.RippleDrawable(
-                android.content.res.ColorStateList.valueOf(GpuiChrome.withAlpha(chrome.onSurface, 0x33)), shape, shape));
+                android.content.res.ColorStateList.valueOf(GpuiChrome.withAlpha(chrome.onSurface, 0x33)), visual, null));
+        if (DISABLED.equals(item.style)) {
+            b.setEnabled(false);
+            b.setAlpha(0.38f);
+        }
         b.setContentDescription(act.describe(item.id));
+        if (android.os.Build.VERSION.SDK_INT >= 26) b.setTooltipText(item.label);
         b.setOnClickListener(v -> act.tap(item.id));
         if ("send".equals(item.id) || "clear".equals(item.id)) b.setOnLongClickListener(v -> act.hold(item.id));
         return b;
+    }
+
+    /** A small opaque pill for a label (the queue's count, the status words). */
+    private View pill(Item item) {
+        TextView t = label(item);
+        t.setPadding(dp(10), dp(4), dp(10), dp(4));
+        GradientDrawable shape = new GradientDrawable();
+        shape.setCornerRadius(dp(10));
+        shape.setColor(chrome.raised);
+        t.setBackground(shape);
+        if (item.button) {
+            t.setContentDescription(act.describe(item.id));
+            t.setOnClickListener(v -> act.tap(item.id));
+        }
+        return t;
     }
 
     private TextView label(Item item) {

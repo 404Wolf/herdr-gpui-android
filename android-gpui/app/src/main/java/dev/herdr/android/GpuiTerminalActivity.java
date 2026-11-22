@@ -515,8 +515,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         workButton.setOnClickListener(v -> toggleWorkPanel(!workPanelOpen));
         tabRow.addView(workButton, new LinearLayout.LayoutParams(dp(56), -1));
         tabRow.addView(rail.pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
-        tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
-        content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
+        tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(48), -1));
+        content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(WorkPanelLayout.TOP_BAR_DP)));
         // Where this window is: machine › repo › worktree › window, and why
         // it wants Wolf. Tapping it shows the window's row in the rail.
         crumb = new TextView(this);
@@ -610,12 +610,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         root.addView(panelDivider.divider(), new FrameLayout.LayoutParams(dp(PanelDivider.TOUCH_DP), -1, android.view.Gravity.START));
         root.addView(panelDivider.edge(), new FrameLayout.LayoutParams(dp(WorkPanelLayout.EDGE_DP), dp(WorkPanelLayout.EDGE_TALL_DP),
                 android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL));
-        // The composer's buttons (ActionBar): one row at the very bottom right of the whole app,
-        // under the terminal and the panel; the root's padding already keeps it above the
-        // navigation bar and the keyboard. Both panes end above it while it shows.
+        // The composer's icons (ActionBar): a cluster at the very bottom right of the whole app,
+        // over the panel (or the terminal), never a strip that takes height; the root's padding
+        // keeps it above the navigation bar and the keyboard.
         View actionBar = composer.actionBar();
-        root.addView(actionBar, new FrameLayout.LayoutParams(-1, dp(ActionBar.HEIGHT_DP), android.view.Gravity.BOTTOM));
-        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> fitAboveActionBar(actionBar));
+        FrameLayout.LayoutParams clusterAt = new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.BOTTOM | android.view.Gravity.END);
+        clusterAt.setMargins(0, 0, dp(ActionBar.MARGIN_DP), dp(ActionBar.MARGIN_DP));
+        root.addView(actionBar, clusterAt);
+        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> fitAroundCluster(actionBar));
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
@@ -1367,17 +1369,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return (View) railColumns.getParent();
     }
 
-    /** The terminal (with the rail) and the panel end above the action bar while it shows. */
-    private void fitAboveActionBar(View bar) {
-        int below = bar.getVisibility() == View.VISIBLE ? dp(ActionBar.HEIGHT_DP) : 0;
-        for (View pane : new View[] {railColumns, workPanel == null ? null : workPanel.view(),
-                panelDivider == null ? null : panelDivider.divider()}) {
-            if (pane == null) continue;
-            FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) pane.getLayoutParams();
-            if (at.bottomMargin == below) continue;
-            at.bottomMargin = below;
-            pane.setLayoutParams(at);
+    /**
+     * Room for the icon cluster where it covers something, and nowhere else (Wolf: no strip):
+     * docked, the panel's text scrolls clear of it; on the cover or with the panel hidden it sits
+     * over the terminal, so the draft keeps clear of its width on the prompt row.
+     */
+    private void fitAroundCluster(View cluster) {
+        boolean shows = cluster.getVisibility() == View.VISIBLE;
+        int height = shows ? cluster.getHeight() + dp(ActionBar.MARGIN_DP) : 0;
+        boolean overPanel = workPanel != null && workPanel.view().getVisibility() == View.VISIBLE
+                && cluster.getLeft() >= workPanel.view().getLeft();
+        if (workPanel != null) workPanel.clearBottom(overPanel ? height : 0);
+        int cells = 0;
+        if (shows && !overPanel && terminalSurface != null && terminalSurface.getWidth() > 0 && composer != null) {
+            int cols = composer.columns();
+            if (cols > 0) {
+                float cell = terminalSurface.getWidth() / (float) cols;
+                cells = (int) Math.ceil((cluster.getWidth() + dp(ActionBar.MARGIN_DP)) / cell);
+            }
         }
+        if (composer != null) composer.reserveCells(cells);
     }
 
     /**
@@ -1393,9 +1404,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             android.view.ViewGroup from = (android.view.ViewGroup) v.getParent();
             if (from != null) from.removeView(v);
         }
-        int height = docked ? dp(40) : -1;
-        to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), height));
-        to.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), height));
+        // Both bars are TOP_BAR_DP tall; 48 dp targets reach below them (PinButton.extendTouch,
+        // WorkPanel.extendTargets), never by making the bar taller.
+        to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
+        to.addView(tabMenu, new LinearLayout.LayoutParams(dp(48), -1));
     }
 
     /** The terminal | panel divider (PanelDivider), and Wolf's split per orientation (factory-9zz.9). */

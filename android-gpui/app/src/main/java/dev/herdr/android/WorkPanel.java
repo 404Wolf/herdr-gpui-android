@@ -149,8 +149,8 @@ final class WorkPanel {
         tabs.setPadding(dp(12), 0, dp(4), 0);
         overviewTab = tab("Overview", PanelModel.Tab.OVERVIEW);
         tasksTab = tab("Tasks", PanelModel.Tab.TASKS);
-        tabs.addView(overviewTab, new LinearLayout.LayoutParams(-2, dp(40)));
-        LinearLayout.LayoutParams second = new LinearLayout.LayoutParams(-2, dp(40));
+        tabs.addView(overviewTab, new LinearLayout.LayoutParams(-2, -1));
+        LinearLayout.LayoutParams second = new LinearLayout.LayoutParams(-2, -1);
         second.setMarginStart(dp(16));
         tabs.addView(tasksTab, second);
         tabs.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
@@ -163,12 +163,15 @@ final class WorkPanel {
         close.setBackground(ActionSheet.ripple(chrome));
         close.setContentDescription("Close the work panel");
         close.setOnClickListener(v -> host.closed());
-        tabs.addView(close, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        tabs.addView(close, new LinearLayout.LayoutParams(dp(48), -1));
         // The app's own top-right controls (pin, ⋮) when the panel is docked: the far right of the whole screen.
         trailing = new LinearLayout(activity);
         trailing.setGravity(Gravity.CENTER_VERTICAL);
-        tabs.addView(trailing, new LinearLayout.LayoutParams(-2, dp(40)));
-        root.addView(tabs, new LinearLayout.LayoutParams(-1, -2));
+        tabs.addView(trailing, new LinearLayout.LayoutParams(-2, -1));
+        // Exactly the terminal's tab row (WorkPanelLayout.TOP_BAR_DP): both bars end on one line.
+        root.addView(tabs, new LinearLayout.LayoutParams(-1, dp(WorkPanelLayout.TOP_BAR_DP)));
+        // The bar's buttons keep 48 dp targets by reaching below it, not by making it taller.
+        tabs.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extendTargets());
         View rule = new View(activity);
         rule.setBackgroundColor(chrome.outline);
         root.addView(rule, new LinearLayout.LayoutParams(-1, 1));
@@ -186,6 +189,74 @@ final class WorkPanel {
 
     View view() {
         return root;
+    }
+
+    /**
+     * Gives the header's buttons (the tabs, the cover's ×, the docked pin and ⋮) 48 dp tall
+     * targets that reach below the 30 dp bar into the panel's first rows: one delegate on the
+     * panel finds the button whose extended rect the finger is in.
+     */
+    private void extendTargets() {
+        java.util.List<View> buttons = new java.util.ArrayList<>();
+        for (View v : new View[] {overviewTab, tasksTab, close}) if (v != null) buttons.add(v);
+        for (int i = 0; i < trailing.getChildCount(); i++) buttons.add(trailing.getChildAt(i));
+        int reach = Math.max(0, dp(48) - tabs.getHeight());
+        root.setTouchDelegate(new TallTargets(buttons, tabs, reach));
+    }
+
+    /** One TouchDelegate for several buttons of a bar, each reaching {@code reach} px below it. */
+    static final class TallTargets extends android.view.TouchDelegate {
+        private final java.util.List<View> buttons;
+        private final View bar;
+        private final int reach;
+        private View target;
+
+        TallTargets(java.util.List<View> buttons, View bar, int reach) {
+            super(new android.graphics.Rect(), bar);
+            this.buttons = buttons;
+            this.bar = bar;
+            this.reach = reach;
+        }
+
+        @Override public boolean onTouchEvent(android.view.MotionEvent event) {
+            int x = (int) event.getX(), y = (int) event.getY();
+            if (event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+                target = null;
+                // Only the strip just below the bar: inside it, the buttons take their own touches.
+                if (y < bar.getBottom() || y >= bar.getBottom() + reach) return false;
+                for (View b : buttons) {
+                    if (b.getVisibility() != View.VISIBLE || !b.isEnabled()) continue;
+                    int[] at = offset(b);
+                    if (x >= at[0] && x < at[0] + b.getWidth()) { target = b; break; }
+                }
+            }
+            if (target == null) return false;
+            View t = target;
+            if (event.getActionMasked() == android.view.MotionEvent.ACTION_UP
+                    || event.getActionMasked() == android.view.MotionEvent.ACTION_CANCEL) target = null;
+            int[] at = offset(t);
+            event.setLocation(t.getWidth() / 2f, Math.min(t.getHeight() - 1, Math.max(0, y - at[1])));
+            return t.dispatchTouchEvent(event);
+        }
+
+        /** {@code b}'s left and top within the bar's parent. */
+        private int[] offset(View b) {
+            int left = 0, top = 0;
+            for (View v = b; v != null && v != bar.getParent(); v = v.getParent() instanceof View ? (View) v.getParent() : null) {
+                left += v.getLeft();
+                top += v.getTop();
+            }
+            return new int[] {left, top};
+        }
+    }
+
+    /** Room at the bottom of the panel's text for the composer's icon cluster floating over it. */
+    void clearBottom(int px) {
+        // The scroll's own padding (review A6): the cluster's measured height while it covers the
+        // panel, else the fixed default; never added to the body's (no double padding).
+        int bottom = px > 0 ? px : dp(BOTTOM_DP);
+        if (scroll.getPaddingBottom() == bottom) return;
+        scroll.setPadding(0, 0, 0, bottom);
     }
 
     /** Where the activity docks its top-right controls while the panel sits beside the terminal. */
