@@ -46,12 +46,14 @@ import java.util.concurrent.Executors;
  * here), and a worker's own bead opens first. All text is selectable
  * ({@link SelectableText}) and copied by itself; Quote hands it to the draft.
  *
- * <p>Reads go through the core one at a time on a thread of their own, only
- * while the panel shows, the app is in front and Wolf is not typing (each
- * read holds the core session's worker, and typing waits behind it): the doc
- * every {@link #DOC_MS} (an unchanged doc costs no text), the stores every
- * {@link #STORES_MS} while Tasks shows. A redraw waits while text is
- * selected, so a selection is never pulled out from under a finger.
+ * <p>Its reads go through {@link PanelSync} (the sync engine, factory-9zz.14):
+ * the machine's whole beads mirror and the agent's doc are kept on disk, drawn
+ * at once and refreshed in the background, what shows first; a cold screen
+ * reads even while Wolf types, background reads wait for him. Only a bead the
+ * mirror does not have yet is read alone, as before, while the panel shows,
+ * the app is in front and Wolf is not typing. The deacon's Tasks list every
+ * machine's projects. A redraw waits while text is selected, so a selection
+ * is never pulled out from under a finger.
  */
 final class WorkPanel {
     static final long DOC_MS = 10_000, STORES_MS = 30_000, TICK_MS = 1_000;
@@ -72,6 +74,12 @@ final class WorkPanel {
         void openLink(String url);
         /** The keyboard is up or a draft is in the composer. */
         boolean typing();
+        /**
+         * The machine on screen as the sync engine keys it (PanelSync.keyFor): proven by its
+         * connection, live-only for a refused profile, null until proven. Asked every tick, as
+         * the proof can come after the panes were drawn.
+         */
+        MachineKey machine();
         /** The cover's panel was closed (× or Back). */
         void closed();
         /** Shows terminal {@code id} of the machine on screen (the agent working on a bead). */
@@ -115,13 +123,21 @@ final class WorkPanel {
 
     // What was read, per machine and agent (doc) or project (stores).
     private final Map<String, DocModel.Read> docs = new HashMap<>();
-    private final Map<String, Long> docAt = new HashMap<>();
     private final Map<String, String> docErrors = new HashMap<>();
     private Map<String, BeadsModel.Store> stores = new HashMap<>();
     private String storesHost = "", storesError;
     private long storesAt = -1;
+    /** When the beads drawn were read, while that is old enough to say (wall clock; 0: fresh). */
+    private long storesKeptAt;
     /** Each bead's last read (plan and comments together), kept across opens and restarts. */
     private final BeadCache cache;
+    /** The sync engine's view of the panel's machine: its beads mirror and its agents' docs. */
+    private final PanelSync sync;
+    /** The machine's beads as last asked of the engine (null before the first ask). */
+    private PanelSync.Beads beadsNow;
+    /** The deacon's Tasks: projects unfolded, and beads opened or folded, per machine and project. */
+    private final Set<String> deaconProjects = new HashSet<>();
+    private final Map<String, Set<String>> deaconOpen = new HashMap<>(), deaconFolded = new HashMap<>();
     /** Beads read this open, beads confirmed with bd, and the one being read. */
     private final Set<String> refreshed = new HashSet<>(), confirmed = new HashSet<>();
     private String reading = "";
@@ -152,6 +168,8 @@ final class WorkPanel {
         this.host = host;
         cache = BeadCache.in(activity);
         thread.execute(cache::load);
+        sync = PanelSync.create(activity, host::op, host::typing);
+        sync.onChange(() -> redraw(false));
         root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(chrome.panel);
@@ -282,13 +300,15 @@ final class WorkPanel {
     /** Follows {@code activity}'s pauses: nothing reads while it is not in front. */
     void attach() {
         if (pauses != null) return;
-        pauses = PauseWatch.on(activity, () -> paused = true, () -> { paused = false; main.post(tick); });
+        pauses = PauseWatch.on(activity, () -> { paused = true; sync.paused(true); },
+                () -> { paused = false; sync.paused(false); main.post(tick); });
     }
 
     void detach() {
         if (pauses != null) pauses.stop(activity);
         pauses = null;
         shown = false;
+        sync.paused(true);
         main.removeCallbacksAndMessages(null);
         thread.shutdownNow();
     }
@@ -313,6 +333,7 @@ final class WorkPanel {
      */
     void select(PanelModel.Agent next, String hostId, String machine, List<? extends FleetTree.Member> members) {
         this.members = members == null ? java.util.Collections.emptyList() : members;
+        sync.select(host.machine(), machine);
         String was = agent == null ? "" : agent.key() + this.hostId;
         String now = next == null ? "" : next.key() + (hostId == null ? "" : hostId);
         this.machine = machine == null ? "" : machine;
@@ -322,6 +343,7 @@ final class WorkPanel {
             storesAt = -1;
             storesKeptAt = 0;
             storesError = null;
+            beadsNow = null;
             visible.clear();
             refreshed.clear();
             confirmed.clear();
@@ -346,19 +368,20 @@ final class WorkPanel {
         return agent == null || agent.doc() == null ? null : hostId + "\n" + agent.doc();
     }
 
-    /** One read at a time: what is due, in order of what shows. */
+    /**
+     * The engine's reads (it gates them itself: what shows first, a cold screen
+     * even while Wolf types), then, one at a time and never while he types, a
+     * bead the mirror does not have yet.
+     */
     private void step() {
-        if (inFlight || paused || agent == null || host.typing()) return;
-        long now = SystemClock.elapsedRealtime();
-        String key = docKey();
-        if (tab == PanelModel.Tab.OVERVIEW && key != null && due(docAt.get(key), DOC_MS, now)) {
-            readDoc(key, agent.doc());
-            return;
-        }
-        if (tab == PanelModel.Tab.TASKS && agent.hasTasks()) {
-            useKeptStores();
-            if (storesAt < 0 || !hostId.equals(storesHost) || due(storesAt, STORES_MS, now)) { readStores(); return; }
+        if (agent == null) return;
+        sync.select(host.machine(), machine);
+        syncReads();
+        sync.tick();
+        if (inFlight || paused || host.typing()) return;
+        if (PanelModel.tab(tab, agent) == PanelModel.Tab.TASKS && !deacon()) {
             for (String id : open) {
+                if (mirrored(id)) continue;
                 String bead = beadKey(id);
                 BeadCache.Entry kept = cache.get(bead);
                 String fp = storeFp(id);
@@ -372,6 +395,7 @@ final class WorkPanel {
             // Then the beads in view, one at a time, so a tap on one finds it read: each once per open,
             // and only when its kept read is older than PREFETCH_MS.
             for (String id : visible) {
+                if (mirrored(id)) continue;
                 String bead = beadKey(id);
                 BeadCache.Entry kept = cache.get(bead);
                 if (refreshed.contains(bead) || kept != null && System.currentTimeMillis() - kept.atMs < PREFETCH_MS) continue;
@@ -382,60 +406,55 @@ final class WorkPanel {
         }
     }
 
-    private static boolean due(Long at, long every, long now) {
-        return at == null || at < 0 || now - at >= every;
+    /** What shows is asked of the engine as VISIBLE, the other tab as PREFETCH, so a switch lands warm. */
+    private void syncReads() {
+        boolean overview = PanelModel.tab(tab, agent) == PanelModel.Tab.OVERVIEW;
+        String name = agent.doc(), key = docKey();
+        if (name != null) {
+            PanelSync.Doc d = sync.doc(name, overview ? SyncEngine.Priority.VISIBLE : SyncEngine.Priority.PREFETCH);
+            if (d.read != null) docs.put(key, d.read);
+            if (d.error != null) docErrors.put(key, d.error);
+            else docErrors.remove(key);
+        }
+        if (!agent.hasTasks()) return;
+        SyncEngine.Priority beads = overview ? SyncEngine.Priority.PREFETCH : SyncEngine.Priority.VISIBLE;
+        if (deacon()) sync.everywhere(beads);
+        else syncStores(beads);
     }
 
-    private void readDoc(String key, String name) {
-        DocModel.Read last = docs.get(key);
-        JSONObject op = json("doc.read");
-        put(op, "name", name);
-        if (last != null && last.key != null) put(op, "key", last.key);
-        run(op, reply -> {
-            docAt.put(key, SystemClock.elapsedRealtime());
-            String text = textOf(reply);
-            if (text == null) { docErrors.put(key, errorOf(reply)); return; }
-            DocModel.Read read = DocModel.parse(text);
-            if (read.error != null) { docErrors.put(key, read.error); return; }
-            docErrors.remove(key);
-            if (read.same && last != null) { last.now = read.now; return; }
-            docs.put(key, read);
-        });
+    private boolean deacon() {
+        return agent != null && "deacon".equals(agent.role);
     }
 
-    /** The kept listing, while this open has not read one yet: drawn at once, with its age. */
-    private long storesKeptAt;
+    /** How old kept beads may be before they say their age. */
+    static final long BEADS_AGE_SHOWN_MS = 2 * SyncEngine.Kind.BEADS.ttlMs;
 
-    private void useKeptStores() {
-        if (!stores.isEmpty() || storesAt >= 0) return;
-        BeadCache.Entry kept = cache.get(BeadCache.storesKey(hostId));
-        if (kept == null) return;
-        BeadsModel.Stores read = BeadsModel.parseStores(kept.text);
-        if (read.missing) return;
-        stores = BeadsModel.merge(new HashMap<>(), read);
+    /**
+     * The machine's beads from the engine's mirror, into the fields the tree
+     * draws from; nothing changes while nothing is kept and nothing is wrong
+     * (the skeleton's rule).
+     */
+    private void syncStores(SyncEngine.Priority priority) {
+        PanelSync.Beads b = sync.beads(PanelSync.HERE, priority);
+        beadsNow = b;
+        if (b.loading()) return;
+        stores = b.stores();
         storesHost = hostId;
-        storesKeptAt = kept.atMs;
+        storesAt = 0;
+        storesError = b.error;
+        // Kept beads say how old they are once they are older than a fresh read would be.
+        storesKeptAt = b.atMs > 0 && System.currentTimeMillis() - b.atMs > BEADS_AGE_SHOWN_MS ? b.atMs : 0;
     }
 
-    private void readStores() {
-        JSONObject op = json("beads.stores");
-        if (hostId.equals(storesHost)) put(op, "known", new JSONArray(BeadsModel.knownArgs(stores)));
-        String asked = hostId;
-        run(op, reply -> {
-            storesAt = SystemClock.elapsedRealtime();
-            String text = textOf(reply);
-            if (text == null) { storesError = errorOf(reply); return; }
-            BeadsModel.Stores read = BeadsModel.parseStores(text);
-            if (read.missing) { storesError = "bd isn't installed on " + machine; return; }
-            stores = BeadsModel.merge(asked.equals(storesHost) ? stores : new HashMap<>(), read);
-            storesHost = asked;
-            storesError = null;
-            storesKeptAt = 0;
-            // Kept whole, so the tree draws at once after a restart.
-            BeadCache.Entry was = cache.get(BeadCache.storesKey(asked));
-            cache.put(BeadCache.storesKey(asked), new BeadCache.Entry(BeadCache.keepStores(was == null ? null : was.text, text),
-                    System.currentTimeMillis(), ""), thread);
-        });
+    /** The mirror has this bead: it opens with no read of its own. */
+    private boolean mirrored(String id) {
+        return beadsNow != null && beadsNow.bead(storeOf(id), id) != null;
+    }
+
+    /** A bead's plan and comments: from the machine's mirror, else the last read of it alone. */
+    private BeadCache.Entry kept(String id) {
+        BeadCache.Entry m = beadsNow == null ? null : beadsNow.bead(storeOf(id), id);
+        return m != null ? m : cache.get(beadKey(id));
     }
 
     /** A kept read this young is not read again on open. */
@@ -582,6 +601,8 @@ final class WorkPanel {
         DocModel.Read d = key == null ? null : docs.get(key);
         if (d != null) s.append('|').append(d.key).append('|').append(DocModel.freshness(d).text);
         if (key != null) s.append('|').append(docErrors.get(key));
+        // Anything the engine changed (the deacon's other machines too).
+        s.append('|').append(sync.version()).append(deaconProjects).append(deaconOpen).append(deaconFolded);
         if (now == PanelModel.Tab.TASKS) {
             for (Map.Entry<String, BeadsModel.Store> e : stores.entrySet()) s.append('|').append(e.getKey()).append(e.getValue().fp);
             // storesAt too: a read that answers with no stores and no error still ends the skeleton (t46v).
@@ -589,7 +610,7 @@ final class WorkPanel {
             long nowMs = System.currentTimeMillis();
             for (String id : open) {
                 String bead = beadKey(id);
-                BeadCache.Entry kept = cache.get(bead);
+                BeadCache.Entry kept = kept(id);
                 s.append('|').append(kept == null ? "-" : kept.atMs + BeadCache.age(kept.atMs, nowMs));
                 s.append(reading.equals(bead)).append(beadErrors.get(bead));
             }
@@ -639,8 +660,9 @@ final class WorkPanel {
     }
 
     private void tasks() {
-        // The kept listing first, so its beads (not "No epics or beads") draw on the first frame (t46v).
-        useKeptStores();
+        if (deacon()) { deaconTasks(); return; }
+        // The kept mirror first, so its beads (not "No epics or beads") draw on the first frame (t46v).
+        syncStores(SyncEngine.Priority.VISIBLE);
         Map<String, BeadsModel.ProjectBeads> byProject = BeadsModel.projectBeads(stores);
         BeadsModel.ProjectBeads mine = byProject.get(agent.project);
         if (stores.isEmpty() && storesAt < 0 && storesError == null) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
@@ -664,10 +686,10 @@ final class WorkPanel {
         visible.clear();
         for (PanelModel.Row r : PanelModel.rows(roots, folded, open)) {
             if (!"closed".equals(r.node.bead.status) && !r.epic && visible.size() < PREFETCH) visible.add(r.node.bead.id);
-            View row = row(r);
+            View row = row(r, here());
             body.addView(row);
             if (r.node.bead.id.equals(own)) ownRow = row;
-            if (r.open) body.addView(plan(r));
+            if (r.open) body.addView(plan(r, here()));
             if (r.closedAfter > 0) {
                 TextView closed = dim(r.closedAfter + " closed");
                 closed.setPadding(dp(INDENT_DP * (r.depth + 1) + TITLE_AT_DP), 0, 0, dp(TASK_PAD_DP));
@@ -678,7 +700,35 @@ final class WorkPanel {
         if (target != null && scrollOf[1] == 0) scroll.post(() -> scroll.scrollTo(0, target.getTop()));
     }
 
-    private View row(PanelModel.Row r) {
+    /**
+     * Where a row's bead is: its project, the open and folded sets it toggles,
+     * the live agents who may work on it, and how its plan is found (its mirror,
+     * else a read of it alone). The agent's own project is {@link #here}; the
+     * deacon's Tasks make one per machine and project.
+     */
+    private static final class Where {
+        final String project;
+        final Set<String> open, folded;
+        final List<? extends FleetTree.Member> members;
+        final java.util.function.Function<String, BeadCache.Entry> kept;
+        final java.util.function.Function<String, String> key;
+
+        Where(String project, Set<String> open, Set<String> folded, List<? extends FleetTree.Member> members,
+                java.util.function.Function<String, BeadCache.Entry> kept, java.util.function.Function<String, String> key) {
+            this.project = project;
+            this.open = open;
+            this.folded = folded;
+            this.members = members;
+            this.kept = kept;
+            this.key = key;
+        }
+    }
+
+    private Where here() {
+        return new Where(agent.project, open, folded, members, this::kept, this::beadKey);
+    }
+
+    private View row(PanelModel.Row r, Where at) {
         LinearLayout row = new LinearLayout(activity);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setMinimumHeight(dp(TASK_ROW_DP));
@@ -710,14 +760,14 @@ final class WorkPanel {
         row.setBackground(ActionSheet.ripple(chrome));
         String id = r.node.bead.id;
         boolean kids = !r.node.children.isEmpty() || r.node.closed > 0;
-        List<FleetTree.Member> on = PanelModel.assignees(members, id, agent.project);
+        List<FleetTree.Member> on = PanelModel.assignees(at.members, id, at.project);
         row.setContentDescription(r.node.bead.title + ", " + status.replace('_', ' ')
                 + (r.progress.isEmpty() ? "" : ", " + r.progress)
                 + (r.open ? ". Tap to close it" : ". Tap to open its plan" + (kids && r.folded ? " and its beads" : "")
                         + (on.size() == 1 ? " and show the agent on it" : "")));
         // The title opens it (its plan, and its beads), and the same tap again closes it.
         row.setOnClickListener(v -> {
-            if (PanelModel.toggle(id, kids, open, folded)) {
+            if (PanelModel.toggle(id, kids, at.open, at.folded)) {
                 // Timed from this tap (its first draw after the tap is logged).
                 openedAt.put(id, SystemClock.elapsedRealtime());
                 loggedPlan.remove(id);
@@ -732,15 +782,15 @@ final class WorkPanel {
         return row;
     }
 
-    private View plan(PanelModel.Row r) {
+    private View plan(PanelModel.Row r, Where at) {
         LinearLayout box = new LinearLayout(activity);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(INDENT_DP * r.depth + TITLE_AT_DP), dp(2), 0, dp(8));
-        String id = r.node.bead.id, key = beadKey(id);
+        String id = r.node.bead.id, key = at.key.apply(id);
         // Who works on it, when it is more than one: named, each a tap away (one is focused on the tap itself).
-        List<FleetTree.Member> on = PanelModel.assignees(members, id, agent.project);
+        List<FleetTree.Member> on = PanelModel.assignees(at.members, id, at.project);
         if (on.size() > 1) box.addView(workedOnBy(on));
-        BeadCache.Entry kept = cache.get(key);
+        BeadCache.Entry kept = at.kept.apply(id);
         if (kept == null) {
             String error = beadErrors.get(key);
             box.addView(error != null ? warn("Can't read it: " + error) : new Skeleton(activity, chrome, 3, TEXT_SHAPE));
@@ -768,6 +818,85 @@ final class WorkPanel {
                 + (d.maybeStale ? " · from the store's export" : "");
         box.addView(dim(age));
         return box;
+    }
+
+    /**
+     * The deacon's Tasks (Wolf, 11-22: "every task everywhere"): each machine
+     * its core reaches, then each project there with open work, folded to one
+     * row until tapped; unfolded, that project's tree as Tasks draws it, every
+     * bead opening from that machine's mirror.
+     */
+    private void deaconTasks() {
+        List<PanelSync.Beads> all = sync.everywhere(SyncEngine.Priority.VISIBLE);
+        if (all.get(0).loading()) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
+        long nowMs = System.currentTimeMillis();
+        for (int i = 0; i < all.size(); i++) {
+            PanelSync.Beads b = all.get(i);
+            body.addView(heading(b.machine.isEmpty() ? machine : b.machine));
+            if (b.loading()) { body.addView(new Skeleton(activity, chrome, 2, TASK_SHAPE)); continue; }
+            if (b.error != null) body.addView(warn("Can't read its beads now: " + b.error + (b.mirror.isEmpty() ? "" : " · showing the last read")));
+            else if (b.atMs > 0 && nowMs - b.atMs > BEADS_AGE_SHOWN_MS) body.addView(dim("beads from " + BeadCache.age(b.atMs, nowMs)));
+            Map<String, BeadsModel.Store> machineStores = b.stores();
+            // Only the machine on screen has live members to show on a bead.
+            List<? extends FleetTree.Member> who = i == 0 ? members : java.util.Collections.<FleetTree.Member>emptyList();
+            int shown = 0;
+            for (Map.Entry<String, BeadsModel.ProjectBeads> p : BeadsModel.projectBeads(machineStores).entrySet()) {
+                List<BeadsModel.Bead> beads = p.getValue().beads;
+                int live = 0, working = 0;
+                for (BeadsModel.Bead bead : beads) {
+                    if (!BeadsModel.isClosed(bead)) live++;
+                    if ("in_progress".equals(bead.status)) working++;
+                }
+                if (live == 0 && p.getValue().error == null) continue;
+                shown++;
+                String scope = b.machine + "\n" + p.getKey();
+                boolean unfolded = deaconProjects.contains(scope);
+                body.addView(projectRow(p.getKey(), live + " open" + (working > 0 ? " · " + working + " in progress" : ""), unfolded, scope));
+                if (!unfolded) continue;
+                if (p.getValue().error != null) body.addView(warn(p.getValue().error));
+                String project = p.getKey();
+                Where at = new Where(project, deaconOpen.computeIfAbsent(scope, k -> new HashSet<>()),
+                        deaconFolded.computeIfAbsent(scope, k -> new HashSet<>()), who,
+                        id -> b.bead(storeIn(project, id, machineStores), id),
+                        id -> scope + "\n" + id);
+                for (PanelModel.Row r : PanelModel.rows(BeadsModel.beadTree(beads), at.folded, at.open)) {
+                    PanelModel.Row deeper = new PanelModel.Row(r.node, r.depth + 1, r.epic, r.folded, r.open, r.progress, r.closedAfter);
+                    body.addView(row(deeper, at));
+                    if (r.open) body.addView(plan(deeper, at));
+                }
+            }
+            if (shown == 0) body.addView(dim("No open beads on " + (b.machine.isEmpty() ? machine : b.machine) + "."));
+        }
+    }
+
+    private static String storeIn(String project, String id, Map<String, BeadsModel.Store> stores) {
+        String store = BeadsModel.storeOf(project, id, stores);
+        return store == null ? project : store;
+    }
+
+    /** A project of the deacon's Tasks: its name and open work; a tap unfolds or folds its tree. */
+    private View projectRow(String project, String progress, boolean unfolded, String scope) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setMinimumHeight(dp(TASK_ROW_DP));
+        row.setPadding(0, dp(TASK_PAD_DP), 0, dp(TASK_PAD_DP));
+        LinearLayout words = new LinearLayout(activity);
+        words.setOrientation(LinearLayout.VERTICAL);
+        TextView title = ActionSheet.label(activity, project, 14, chrome.onSurface);
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        words.addView(title);
+        TextView sub = dim(progress);
+        sub.setPadding(0, 0, 0, 0);
+        words.addView(sub);
+        row.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
+        row.setBackground(ActionSheet.ripple(chrome));
+        row.setContentDescription(project + ", " + progress + (unfolded ? ". Tap to fold it" : ". Tap to show its beads"));
+        row.setOnClickListener(v -> {
+            if (!deaconProjects.remove(scope)) deaconProjects.add(scope);
+            redraw(true);
+            main.post(tick);
+        });
+        return row;
     }
 
     private View workedOnBy(List<FleetTree.Member> on) {

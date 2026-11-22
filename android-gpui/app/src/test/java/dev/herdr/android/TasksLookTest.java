@@ -36,11 +36,11 @@ public final class TasksLookTest {
 
     @Test public void tasksHaveRoundMarkersNoTrianglesAndSmallEqualSides() throws IOException {
         String panel = source("WorkPanel");
-        String row = panel.substring(panel.indexOf("private View row(PanelModel.Row r) {"), panel.indexOf("private View plan(PanelModel.Row r) {"));
+        String row = panel.substring(panel.indexOf("private View row(PanelModel.Row r, Where at) {"), panel.indexOf("private View plan(PanelModel.Row r, Where at) {"));
         assertFalse(panel.contains("RailDisclosure"));
         assertFalse(row.contains("\"▴\""));
         assertTrue(row.contains("dot.setShape(android.graphics.drawable.GradientDrawable.OVAL);"));
-        assertTrue(row.contains("PanelModel.toggle(id, kids, open, folded)"));
+        assertTrue(row.contains("PanelModel.toggle(id, kids, at.open, at.folded)"));
         assertEquals(12, WorkPanel.TASKS_SIDE_DP);
         assertTrue(panel.contains("body.setPadding(side, body.getPaddingTop(), side, body.getPaddingBottom());"));
         // Dense (Wolf: the gaps about 30% of before): a 24 dp row with 2 dp above and below,
@@ -53,8 +53,10 @@ public final class TasksLookTest {
 
     @Test public void keptBeadsDrawFirstAndAnEmptyReadEndsTheSkeleton() throws IOException {
         String panel = source("WorkPanel");
-        String tasks = panel.substring(panel.indexOf("private void tasks() {"), panel.indexOf("private View row(PanelModel.Row r) {"));
-        assertTrue(tasks.indexOf("useKeptStores();") < tasks.indexOf("BeadsModel.projectBeads(stores)"));
+        String tasks = panel.substring(panel.indexOf("private void tasks() {"), panel.indexOf("private static final class Where {"));
+        // The engine's kept mirror (factory-9zz.14) before anything is drawn from the stores.
+        assertTrue(tasks.indexOf("syncStores(SyncEngine.Priority.VISIBLE);") < tasks.indexOf("BeadsModel.projectBeads(stores)"));
+        assertTrue(panel.contains("if (b.loading()) return;"));
         String sig = panel.substring(panel.indexOf("private String signature("), panel.indexOf("private void styleTab("));
         assertTrue(sig.contains(".append(storesKeptAt).append('|').append(storesAt);"));
     }
