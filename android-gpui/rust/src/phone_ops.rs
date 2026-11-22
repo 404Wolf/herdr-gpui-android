@@ -30,11 +30,22 @@ const NOT_FOUND: i64 = 127;
 const USAGE_LOOK: &str = r#"command -v aswap >/dev/null 2>&1 && exec aswap list --json
 exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 
-/// The desktop factory mod's scripts (home-manager-conf
-/// users/wolf/programs/herdr-core/app/factory/src/feed.ts STORES_SH and
-/// DETAIL_SH at 5e6c79eb), byte for byte, so the phone reads beads exactly as
-/// the Work panel does; BeadsModel parses their output. Both are read-only.
+/// The desktop factory mod's scripts, byte for byte, so the phone reads beads
+/// exactly as the Work panel does; BeadsModel parses their output. STORES_SH
+/// is home-manager-conf users/wolf/programs/herdr-core/app/factory/src/feed.ts
+/// at 5e6c79eb; DETAIL_SH (its fast read of the store's export, with the
+/// revision and "fresh"/"maybe") and COMMENTS_SH are the beads mod's feed.ts at
+/// 6046ee51. They never write a store (DETAIL_SH keeps its own answers and
+/// freshness marks under ~/.cache/herdr-beads).
 const STORES_SH: &str = include_str!("beads/stores.sh");
+const COMMENTS_SH: &str = include_str!("beads/comments.sh");
+/// The phone's own: DETAIL_SH then COMMENTS_SH in one exec (beads/read.sh), so a
+/// bead's plan and comments arrive together, and none is read for a bead with none.
+const READ_SH: &str = include_str!("beads/read.sh");
+/// The status doc read (that mod's doc.ts DOC_SH at 6046ee51): `~/deacon/work/<name>.md`
+/// with its mtime and checksum from that machine's own clock, or "same" when the
+/// phone's `key` still matches. Read-only; at most 200 kB of text.
+const DOC_SH: &str = include_str!("docs/doc.sh");
 /// Runs a vendored script ($1) with bd on that machine's login PATH when the
 /// core's own PATH lacks it (a service environment without the Nix profile),
 /// as USAGE_LOOK does for aswap; the scripts themselves stay byte for byte.
@@ -66,9 +77,19 @@ pub(crate) enum PhoneOp {
     /// Every beads store's list (STORES_SH); `known` are `project=fingerprint`
     /// pairs from the last read, whose unchanged stores are not listed again.
     BeadsStores { known: Vec<String> },
-    /// One bead's `bd show` and `bd comments` (DETAIL_SH), from the store of
-    /// `project` (a store name, or `repo:<name>`'s project).
-    BeadsDetail { project: String, id: String },
+    /// One bead (DETAIL_SH), from the store of `project` (a store name, or
+    /// `repo:<name>`'s project): from the store's export when it can, else
+    /// `bd show`; `confirm` asks bd itself (the export said "maybe").
+    BeadsDetail { project: String, id: String, confirm: bool },
+    /// One bead's comments (COMMENTS_SH), read when it is opened in Tasks.
+    BeadsComments { project: String, id: String },
+    /// One bead's plan and comments together (READ_SH), for the Tasks tab:
+    /// one exec instead of two in a row; `confirm` as for BeadsDetail.
+    BeadsRead { project: String, id: String, confirm: bool },
+    /// A status doc (DOC_SH): `name` is `_deacon`, `<project>` or
+    /// `<project>/<agent>` under ~/deacon/work; `key` the `mtime:cksum` the
+    /// phone already shows, so an unchanged doc comes back "same", without text.
+    DocRead { name: String, key: Option<String> },
 }
 
 impl PhoneOp {
@@ -99,10 +120,42 @@ impl PhoneOp {
                 Some(Self::BeadsStores { known })
             }
             "beads.detail" => {
+                only(&["project", "id", "confirm"]).then_some(())?;
+                let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
+                let id = value["id"].as_str().filter(|i| bead_id(i))?.to_owned();
+                let confirm = match &value["confirm"] {
+                    Value::Null => false,
+                    Value::Bool(b) => *b,
+                    _ => return None,
+                };
+                Some(Self::BeadsDetail { project, id, confirm })
+            }
+            "beads.read" => {
+                only(&["project", "id", "confirm"]).then_some(())?;
+                let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
+                let id = value["id"].as_str().filter(|i| bead_id(i))?.to_owned();
+                let confirm = match &value["confirm"] {
+                    Value::Null => false,
+                    Value::Bool(b) => *b,
+                    _ => return None,
+                };
+                Some(Self::BeadsRead { project, id, confirm })
+            }
+            "beads.comments" => {
                 only(&["project", "id"]).then_some(())?;
                 let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
                 let id = value["id"].as_str().filter(|i| bead_id(i))?.to_owned();
-                Some(Self::BeadsDetail { project, id })
+                Some(Self::BeadsComments { project, id })
+            }
+            "doc.read" => {
+                only(&["name", "key"]).then_some(())?;
+                let name = value["name"].as_str().filter(|n| doc_name(n))?.to_owned();
+                let key = match &value["key"] {
+                    Value::Null => None,
+                    Value::String(k) if doc_key(k) => Some(k.clone()),
+                    _ => return None,
+                };
+                Some(Self::DocRead { name, key })
             }
             "tab.detach" => {
                 only(&["space", "tab", "park", "kill"]).then_some(())?;
@@ -147,8 +200,30 @@ impl PhoneOp {
                 let result = call("machine.exec", json!({"argv":argv,"timeout":20}))?;
                 Ok(script_reply(&result)?.to_string())
             }
-            Self::BeadsDetail { project, id } => {
-                let argv = json!(["sh", "-c", WITH_LOGIN_PATH, "sh", DETAIL_SH, STORE_ROOT, REPOS_FILE, project, id]);
+            Self::BeadsDetail { project, id, confirm } => {
+                let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(DETAIL_SH), json!(STORE_ROOT), json!(REPOS_FILE), json!(project), json!(id)];
+                if *confirm {
+                    argv.push(json!("confirm"));
+                }
+                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                Ok(script_reply(&result)?.to_string())
+            }
+            Self::BeadsRead { project, id, confirm } => {
+                let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(READ_SH), json!(DETAIL_SH), json!(COMMENTS_SH)];
+                argv.extend([json!(STORE_ROOT), json!(REPOS_FILE), json!(project), json!(id)]);
+                if *confirm {
+                    argv.push(json!("confirm"));
+                }
+                let result = call("machine.exec", json!({"argv":argv,"timeout":15}))?;
+                Ok(script_reply(&result)?.to_string())
+            }
+            Self::BeadsComments { project, id } => {
+                let argv = json!(["sh", "-c", WITH_LOGIN_PATH, "sh", COMMENTS_SH, STORE_ROOT, REPOS_FILE, project, id]);
+                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                Ok(script_reply(&result)?.to_string())
+            }
+            Self::DocRead { name, key } => {
+                let argv = json!(["sh", "-c", DOC_SH, "sh", name, key.as_deref().unwrap_or("")]);
                 let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
                 Ok(script_reply(&result)?.to_string())
             }
@@ -164,6 +239,29 @@ fn store_name(name: &str) -> bool {
         && bare != "."
         && bare != ".."
         && bare.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// A status doc's name under ~/deacon/work: `_deacon`, `<project>` or `<project>/<agent>`,
+/// each part a plain file name (never `.`, `..`, hidden or an option).
+fn doc_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    name.len() <= 160
+        && (1..=2).contains(&parts.len())
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 64
+                && !p.starts_with('.')
+                && !p.starts_with('-')
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
+}
+
+/// DOC_SH's `mtime:cksum`, both decimal.
+fn doc_key(key: &str) -> bool {
+    key.len() <= 40
+        && key.split_once(':').is_some_and(|(m, c)| {
+            !m.is_empty() && !c.is_empty() && m.chars().all(|x| x.is_ascii_digit()) && c.chars().all(|x| x.is_ascii_digit())
+        })
 }
 
 /// A bead id: `factory-setup.21`, `bd-a1b2`.
@@ -544,8 +642,18 @@ mod tests {
     fn beads_ops_take_only_plain_names_ids_and_fingerprints() {
         assert_eq!(
             PhoneOp::parse(r#"{"op":"beads.detail","project":"repo:herdr","id":"factory-setup.21"}"#),
-            Some(PhoneOp::BeadsDetail { project: "repo:herdr".into(), id: "factory-setup.21".into() })
+            Some(PhoneOp::BeadsDetail { project: "repo:herdr".into(), id: "factory-setup.21".into(), confirm: false })
         );
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.detail","project":"x","id":"x-1","confirm":true}"#),
+            Some(PhoneOp::BeadsDetail { project: "x".into(), id: "x-1".into(), confirm: true })
+        );
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.detail","project":"x","id":"x-1","confirm":"yes"}"#), None);
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.comments","project":"x","id":"x-1"}"#),
+            Some(PhoneOp::BeadsComments { project: "x".into(), id: "x-1".into() })
+        );
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.comments","project":"x","id":"x-1","confirm":true}"#), None);
         for bad in [r#""project":"../x","id":"a-1""#, r#""project":"a/b","id":"a-1""#, r#""project":"x","id":"--all""#,
             r#""project":"x","id":"a 1""#, r#""project":"","id":"a-1""#] {
             assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.detail",{bad}}}"#)), None, "{bad}");
@@ -563,7 +671,7 @@ mod tests {
     #[test]
     fn beads_reads_pass_the_scripts_args_as_argv_and_their_text_back() {
         let mut seen = Vec::new();
-        let reply = PhoneOp::BeadsDetail { project: "factory".into(), id: "factory-setup.21".into() }
+        let reply = PhoneOp::BeadsDetail { project: "factory".into(), id: "factory-setup.21".into(), confirm: false }
             .run(|method, params| {
                 seen.push((method.to_owned(), params));
                 Ok(exec(0, "\u{1e}{\"id\":\"factory-setup.21\"}\n\u{1d}[]\n\u{1f}ok\n"))
@@ -577,6 +685,35 @@ mod tests {
         assert_eq!(argv[2], WITH_LOGIN_PATH);
         assert_eq!(argv[4], DETAIL_SH);
         assert_eq!(argv.as_array().map(|a| a[5..].to_vec()), Some(vec![json!(STORE_ROOT), json!(REPOS_FILE), json!("factory"), json!("factory-setup.21")]));
+        // A confirm asks bd itself: the script's own fifth argument.
+        let mut asked = Vec::new();
+        let _ = PhoneOp::BeadsDetail { project: "factory".into(), id: "a-1".into(), confirm: true }.run(|_, params| {
+            asked.push(params["argv"].as_array().and_then(|a| a.last().cloned()));
+            Ok(exec(0, ""))
+        });
+        assert_eq!(asked, vec![Some(json!("confirm"))]);
+        let mut both = Vec::new();
+        let _ = PhoneOp::BeadsRead { project: "factory".into(), id: "a-1".into(), confirm: true }.run(|_, params| {
+            both.push(params["argv"].clone());
+            Ok(exec(0, ""))
+        });
+        // One exec: the wrapper, then both vendored scripts as they are, then the store args and confirm.
+        assert_eq!(both.len(), 1);
+        assert_eq!((both[0][4].clone(), both[0][5].clone(), both[0][6].clone()), (json!(READ_SH), json!(DETAIL_SH), json!(COMMENTS_SH)));
+        assert_eq!(both[0].as_array().map(|a| a[7..].to_vec()), Some(vec![json!(STORE_ROOT), json!(REPOS_FILE), json!("factory"), json!("a-1"), json!("confirm")]));
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.read","project":"x","id":"x-1"}"#),
+            Some(PhoneOp::BeadsRead { project: "x".into(), id: "x-1".into(), confirm: false })
+        );
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.read","project":"../x","id":"x-1"}"#), None);
+        assert!(READ_SH.contains(r#"exec sh -c "$c" sh "$1" "$2" "$3" "$4""#) && !READ_SH.contains("rm "));
+        let mut comments = Vec::new();
+        let _ = PhoneOp::BeadsComments { project: "factory".into(), id: "a-1".into() }.run(|_, params| {
+            comments.push(params["argv"].clone());
+            Ok(exec(0, ""))
+        });
+        assert_eq!(comments[0][4], json!(COMMENTS_SH));
+        assert_eq!(comments[0].as_array().map(|a| a[5..].to_vec()), Some(vec![json!(STORE_ROOT), json!(REPOS_FILE), json!("factory"), json!("a-1")]));
         let stores = PhoneOp::BeadsStores { known: vec!["a=1".into()] }
             .run(|_, params| {
                 assert_eq!(params["argv"].as_array().and_then(|a| a.last().cloned()), Some(json!("a=1")));
@@ -589,13 +726,45 @@ mod tests {
     }
 
     #[test]
+    fn a_status_doc_is_read_by_a_plain_name_under_deacon_work_only() {
+        assert_eq!(PhoneOp::parse(r#"{"op":"doc.read","name":"_deacon"}"#), Some(PhoneOp::DocRead { name: "_deacon".into(), key: None }));
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"doc.read","name":"factory/phone-rail","key":"1795350000:123456"}"#),
+            Some(PhoneOp::DocRead { name: "factory/phone-rail".into(), key: Some("1795350000:123456".into()) })
+        );
+        for bad in ["../x", "a/../b", ".hidden", "a/b/c", "-x", "a b", "", "a/", "/etc/passwd", "a/.x"] {
+            assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"doc.read","name":"{bad}"}}"#)), None, "{bad}");
+        }
+        assert_eq!(PhoneOp::parse(r#"{"op":"doc.read","name":"x","key":"$(rm)"}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"doc.read","name":"x","path":"/etc"}"#), None);
+        let mut seen = Vec::new();
+        let reply = PhoneOp::DocRead { name: "factory".into(), key: Some("1:2".into()) }
+            .run(|_, params| {
+                seen.push(params["argv"].clone());
+                Ok(exec(0, "same\n1795350000\n"))
+            })
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .unwrap_or_default();
+        assert_eq!(reply["text"], "same\n1795350000\n");
+        // No login shell: the doc needs no bd; the name and key are the script's own args.
+        assert_eq!(seen[0], json!(["sh", "-c", DOC_SH, "sh", "factory", "1:2"]));
+        assert!(DOC_SH.contains("$HOME/deacon/work/$1.md") && DOC_SH.contains("head -c 200000"));
+        assert!(!DOC_SH.contains("rm ") && !DOC_SH.contains(" > ") && !DOC_SH.contains(">>"));
+    }
+
+    #[test]
     fn the_beads_scripts_only_read() {
-        for script in [STORES_SH, DETAIL_SH] {
+        for script in [STORES_SH, DETAIL_SH, COMMENTS_SH] {
             assert!(script.contains("--json"));
-            for write in ["bd update", "bd close", "bd create", "bd comment ", "bd delete", "bd sync", "rm "] {
+            for write in ["bd update", "bd close", "bd create", "bd comment ", "bd delete", "bd sync", "rm -r", "rm -f \"$1", "rm -f \"$2"] {
                 assert!(!script.contains(write), "{write}");
             }
         }
+        // DETAIL_SH writes only its own answers and marks, under ~/.cache/herdr-beads, and prunes only there.
+        assert!(DETAIL_SH.contains(r#"cache="${XDG_CACHE_HOME:-$HOME/.cache}/herdr-beads""#));
+        assert_eq!(DETAIL_SH.matches("-delete").count(), 1);
+        assert!(DETAIL_SH.contains(r#"find "$cache" -type f -mmin +1440 -delete"#));
         // The desktop's framing, which BeadsModel parses.
         assert!(STORES_SH.contains("\\036%s\\n\\034%s\\n") && DETAIL_SH.contains("\\037missing"));
     }
@@ -608,6 +777,9 @@ mod tests {
             r#"{"op":"usage.look"}"#,
             r#"{"op":"beads.stores","known":[]}"#,
             r#"{"op":"beads.detail","project":"demo","id":"demo-1.2"}"#,
+            r#"{"op":"beads.comments","project":"demo","id":"demo-1.2"}"#,
+            r#"{"op":"beads.read","project":"demo","id":"demo-1.2"}"#,
+            r#"{"op":"doc.read","name":"factory/phone-rail"}"#,
             r#"{"op":"tab.detach","space":"s1","tab":"a","park":["t5"]}"#,
         ] {
             let refused = crate::remote::session_action(u64::MAX, op);

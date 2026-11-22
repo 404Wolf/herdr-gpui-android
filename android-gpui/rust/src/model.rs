@@ -43,6 +43,38 @@ pub struct Palette {
     pub border: u32,
     pub muted: u32,
     pub accent: u32,
+    /// Chrome roles a provisioned palette sets exactly (`set_default_palette_json`'s
+    /// `roles`); the built-in palettes derive them all.
+    pub roles: RoleOverrides,
+}
+
+/// Exact chrome colours that replace the derived ones (an OLED design's own surfaces).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoleOverrides {
+    /// Panels and sheets beside the bars (the bars, header and rail keep `Palette::chrome`).
+    pub panel: Option<u32>,
+    /// Raised fills: code blocks, bar tracks, sheet handles.
+    pub raised: Option<u32>,
+    /// A pressed or hovered row.
+    pub hover: Option<u32>,
+    pub selected: Option<u32>,
+    pub danger: Option<u32>,
+    pub working: Option<u32>,
+    pub success: Option<u32>,
+    pub info: Option<u32>,
+}
+
+impl RoleOverrides {
+    pub const NONE: Self = Self {
+        panel: None,
+        raised: None,
+        hover: None,
+        selected: None,
+        danger: None,
+        working: None,
+        success: None,
+        info: None,
+    };
 }
 
 pub const PALETTES: [Palette; 4] = [
@@ -58,6 +90,7 @@ pub const PALETTES: [Palette; 4] = [
         border: 0x2b3747,
         muted: 0x9fb0c6,
         accent: 0x76d3b2,
+        roles: RoleOverrides::NONE,
     },
     Palette {
         name: "Nord",
@@ -71,6 +104,7 @@ pub const PALETTES: [Palette; 4] = [
         border: 0x4c566a,
         muted: 0xaebacd,
         accent: 0x8fbcbb,
+        roles: RoleOverrides::NONE,
     },
     Palette {
         name: "Mocha",
@@ -84,6 +118,7 @@ pub const PALETTES: [Palette; 4] = [
         border: 0x313244,
         muted: 0xa6adc8,
         accent: 0xa6e3a1,
+        roles: RoleOverrides::NONE,
     },
     Palette {
         name: "Latte",
@@ -97,6 +132,7 @@ pub const PALETTES: [Palette; 4] = [
         border: 0xccd0da,
         muted: 0x6c6f85,
         accent: 0x1e66f5,
+        roles: RoleOverrides::NONE,
     },
 ];
 
@@ -124,8 +160,10 @@ pub fn palette() -> Palette {
 }
 
 /// Replaces the Default palette from `{"background", "foreground", "chrome",
-/// "border", "muted", "accent": "rrggbb", "ansi": [16 × "rrggbb"]}`. A missing
-/// field keeps Default's own. Returns false, changing nothing, on bad input.
+/// "border", "muted", "accent": "rrggbb", "ansi": [16 × "rrggbb"], "roles":
+/// {"panel", "raised", "hover", "selected", "danger", "working", "success",
+/// "info": "rrggbb"}}`. A missing field keeps Default's own (a missing role is
+/// derived). Returns false, changing nothing, on bad input or an unknown role.
 pub fn set_default_palette_json(raw: &str) -> bool {
     fn color(value: &serde_json::Value) -> Option<u32> {
         let text = value.as_str()?.trim_start_matches('#');
@@ -165,6 +203,28 @@ pub fn set_default_palette_json(raw: &str) -> bool {
                 return false;
             };
             *slot = rgb;
+        }
+    }
+    if let Some(roles) = value.get("roles") {
+        let Some(map) = roles.as_object() else {
+            return false;
+        };
+        for (key, found) in map {
+            let Some(rgb) = color(found) else {
+                return false;
+            };
+            let slot = match key.as_str() {
+                "panel" => &mut palette.roles.panel,
+                "raised" => &mut palette.roles.raised,
+                "hover" => &mut palette.roles.hover,
+                "selected" => &mut palette.roles.selected,
+                "danger" => &mut palette.roles.danger,
+                "working" => &mut palette.roles.working,
+                "success" => &mut palette.roles.success,
+                "info" => &mut palette.roles.info,
+                _ => return false,
+            };
+            *slot = Some(rgb);
         }
     }
     palette.name = "Provisioned";
@@ -311,6 +371,12 @@ pub(crate) struct ChromeRoles {
     pub control: u32,
     /// Container for the selected rail row or toggled control.
     pub selected: u32,
+    /// Panels and sheets (the Work panel, action sheets): the surface unless a design sets its own.
+    pub panel: u32,
+    /// Raised fill on the surface (code blocks, bar tracks, sheet handles).
+    pub raised: u32,
+    /// A pressed or hovered row on the surface.
+    pub hover: u32,
     pub danger: u32,
     pub warning: u32,
     /// Status dots: paired with a word, so they carry no text contrast duty.
@@ -324,6 +390,7 @@ pub(crate) struct ChromeRoles {
 #[cfg(any(feature = "android-ui", test))]
 impl ChromeRoles {
     pub(crate) fn of(palette: &Palette) -> Self {
+        let set = palette.roles;
         let surface = palette.chrome;
         let text = palette.foreground;
         // Above this luminance black contrasts more than white does.
@@ -347,12 +414,15 @@ impl ChromeRoles {
             outline: palette.border,
             primary: readable(palette.accent, surface, on_surface, TEXT_CONTRAST),
             control: container(text, 0.12),
-            selected: container(palette.accent, 0.22),
-            danger: readable(palette.ansi[1], surface, on_surface, TEXT_CONTRAST),
+            selected: set.selected.unwrap_or_else(|| container(palette.accent, 0.22)),
+            panel: set.panel.unwrap_or(surface),
+            raised: set.raised.unwrap_or_else(|| container(text, 0.08)),
+            hover: set.hover.unwrap_or_else(|| container(text, 0.05)),
+            danger: readable(set.danger.unwrap_or(palette.ansi[1]), surface, on_surface, TEXT_CONTRAST),
             warning: readable(palette.ansi[3], surface, on_surface, TEXT_CONTRAST),
-            success: palette.ansi[2],
-            info: palette.ansi[4],
-            working: palette.ansi[3],
+            success: set.success.unwrap_or(palette.ansi[2]),
+            info: set.info.unwrap_or(palette.ansi[4]),
+            working: set.working.unwrap_or(palette.ansi[3]),
             light,
         }
     }
@@ -360,7 +430,7 @@ impl ChromeRoles {
     /// ARGB ints in the order `GpuiChrome` reads them; the final slot is 1 for
     /// a light surface.
     #[cfg(any(target_os = "android", test))]
-    pub(crate) fn to_argb(self) -> [i32; 14] {
+    pub(crate) fn to_argb(self) -> [i32; 17] {
         let argb = |color: u32| (0xff00_0000 | color) as i32;
         [
             argb(self.background),
@@ -376,6 +446,9 @@ impl ChromeRoles {
             argb(self.success),
             argb(self.info),
             argb(self.working),
+            argb(self.panel),
+            argb(self.raised),
+            argb(self.hover),
             i32::from(self.light),
         ]
     }
@@ -1752,6 +1825,25 @@ mod tests {
             "missing fields keep Default's"
         );
         assert_eq!(palette_at(3), Some(PALETTES[3]));
+        // Wolf's OLED design (factory-9zz.7): exact panel, raised, hover, selected and status
+        // colours; anything not named stays derived. An unknown role refuses the whole palette.
+        let oled = r##"{"background":"000000","chrome":"000000","foreground":"e6e6e6","border":"222222",
+            "muted":"a3a3a3","accent":"7c9cff","roles":{"panel":"0b0b0b","raised":"161616","hover":"121212",
+            "selected":"17202e","working":"f2c14e","danger":"ff5f5f","success":"6fbf73"}}"##;
+        assert!(!set_default_palette_json(r#"{"roles":{"glow":"ffffff"}}"#));
+        assert!(!set_default_palette_json(r#"{"roles":["0b0b0b"]}"#));
+        assert!(set_default_palette_json(oled));
+        let roles = ChromeRoles::of(&palette_at(0).unwrap_or(PALETTES[0]));
+        assert_eq!(
+            (roles.surface, roles.panel, roles.raised, roles.hover, roles.selected),
+            (0x000000, 0x0b0b0b, 0x161616, 0x121212, 0x17202e)
+        );
+        assert_eq!((roles.working, roles.success, roles.info), (0xf2c14e, 0x6fbf73, PALETTES[0].ansi[4]));
+        assert_eq!(roles.danger, 0xff5f5f, "it already reads on black");
+        assert!(contrast(roles.on_surface, roles.selected) >= TEXT_CONTRAST);
+        assert!(contrast(roles.on_surface_variant, roles.surface) >= TEXT_CONTRAST);
+        let exported = roles.to_argb();
+        assert_eq!((exported[13], exported[14], exported[15]), (0xff0b_0b0bu32 as i32, 0xff16_1616u32 as i32, 0xff12_1212u32 as i32));
         *DEFAULT_OVERRIDE
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -2358,7 +2450,9 @@ mod tests {
             assert_ne!(roles.selected, roles.surface, "{}", palette.name);
             let exported = roles.to_argb();
             assert_eq!(exported[1], (0xff00_0000 | palette.chrome) as i32);
-            assert_eq!(exported[13], i32::from(roles.light));
+            assert_eq!(exported[16], i32::from(roles.light));
+            assert_ne!(roles.raised, roles.surface, "{}", palette.name);
+            assert_ne!(roles.hover, roles.surface, "{}", palette.name);
         }
         // A color that already passes keeps its hue; only failures are blended.
         let default = PALETTES[0];

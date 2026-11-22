@@ -20,6 +20,16 @@ public final class GpuiChromeTest {
     }
 
     @Test
+    public void readsPanelRaisedAndHoverAfterTheStatusColoursAndLightLast() {
+        GpuiChrome chrome = GpuiChrome.of(roles());
+        assertEquals(0xff000000 | 13, chrome.working);
+        assertEquals(0xff000000 | 14, chrome.panel);
+        assertEquals(0xff000000 | 15, chrome.raised);
+        assertEquals(0xff000000 | 16, chrome.hover);
+        assertEquals(false, chrome.light);
+    }
+
+    @Test
     public void agentStatesMapToTheirRolesAndUnknownStatesStayNeutral() {
         GpuiChrome chrome = GpuiChrome.of(roles());
         assertEquals(chrome.working, chrome.status("working"));

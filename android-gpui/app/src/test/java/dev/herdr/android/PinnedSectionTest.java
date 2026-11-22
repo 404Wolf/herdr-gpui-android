@@ -113,7 +113,8 @@ public final class PinnedSectionTest {
         assertEquals("it runs on another machine",
                 PinsRail.cant(true, DESK, new JSONObject().put("id", "laptop/t1").put("created_ms", 5L)));
         assertEquals(Pins.Key.of(DESK, "t3qx", 1000L), PinsRail.keyOf(DESK, pane));
-        assertTrue(PinButton.TARGET_DP >= 48 && PinnedSection.ROW_DP >= 48);
+        assertTrue(PinButton.TARGET_DP >= 48);
+        assertEquals(FleetTree.LEAD_ROW_DP, PinnedSection.ROW_DP);
     }
 
     @Test public void thePinNamesTheAgentFromTheListBeforeTheRailWasEverDrawn() throws Exception {

@@ -33,6 +33,14 @@ final class AgentNames {
         return SHORT_ID.matcher(t).matches();
     }
 
+    /** A harness's own name ("claude", "codex", "gemini", "agy", Antigravity's): which program, not which agent. */
+    static boolean harness(String text) {
+        return text != null && HARNESSES.contains(text.trim().toLowerCase(java.util.Locale.ROOT));
+    }
+
+    private static final java.util.Set<String> HARNESSES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "claude", "claude code", "codex", "gemini", "gemini cli", "agy", "antigravity", "antigravity cli"));
+
     /** "factory-setup.21": a bead id, which names a task's bead, not the agent. */
     static boolean beadId(String text) {
         return text != null && BEAD_ID.matcher(text.trim()).matches();
@@ -49,7 +57,7 @@ final class AgentNames {
         for (String candidate : new String[] {m.name, task, m.title}) {
             if (candidate == null) continue;
             String c = candidate.trim();
-            if (!c.isEmpty() && !alias(c) && !beadId(c)) return c;
+            if (!c.isEmpty() && !alias(c) && !beadId(c) && !harness(c)) return c;
         }
         return UNNAMED;
     }

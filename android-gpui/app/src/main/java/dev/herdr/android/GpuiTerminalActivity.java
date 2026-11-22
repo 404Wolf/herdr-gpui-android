@@ -499,6 +499,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         usageFeed.watch(UsageFeed.Watch.RAIL, sidebarOpen && !railMinimized);
         // Each look holds the core session's one worker, so typing would wait behind the rail's prefetch.
         usageFeed.typing(() -> imeShown || (composer != null && composer.busy() != null));
+                // The cover's way to the work panel (Overview | Tasks); docked from 640 dp, where it always shows.
+        workButton = ActionSheet.label(this, "Work", 13, chrome.onSurface);
+        workButton.setGravity(android.view.Gravity.CENTER);
+        workButton.setBackground(ActionSheet.ripple(chrome));
+        workButton.setContentDescription("Show the work panel: overview and tasks");
+        workButton.setVisibility(View.GONE);
+        workButton.setOnClickListener(v -> toggleWorkPanel(!workPanelOpen));
+        tabRow.addView(workButton, new LinearLayout.LayoutParams(dp(56), -1));
         tabRow.addView(pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
@@ -586,6 +594,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railColumns.addView(sidebar, new LinearLayout.LayoutParams(0, -1));
         railColumns.addView(column, new LinearLayout.LayoutParams(0, -1, 1));
         root.addView(railColumns, new FrameLayout.LayoutParams(-1, -1));
+        // The right panel (Overview | Tasks; WorkPanel): docked at the right from 640 dp, over everything on the cover.
+        workPanel = new WorkPanel(this, chrome, workPanelHost());
+        root.addView(workPanel.view(), new FrameLayout.LayoutParams(0, -1, android.view.Gravity.END));
+        workPanel.attach();
+        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
         railScrim = new View(this);
@@ -644,14 +657,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean railOverlay;
 
     private boolean railAsDrawer() {
-        return railShown().drawer(compactWindow());
+        return railShown().drawer(railCompact());
+    }
+
+    /** No room to dock the rail: the cover, or the unfolded screen while the work panel takes its half. */
+    private boolean railCompact() {
+        return compactWindow() || WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode());
     }
 
     /** Opens the rail as a drawer over the terminal, never narrowing it. */
     private void showRailOverlay() {
         if (sidebarOpen) return;
         // Transient: nothing docked (the stored choice, the strip) changes.
-        setRailShown(railShown().floated(compactWindow()));
+        setRailShown(railShown().floated(railCompact()));
         applySidebarWidth();
         updateHostSampling();
         revealedPane = "";
@@ -738,9 +756,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (wanted) {
             edgeBack = EdgeBack.register(this, () -> {
                 if (composer != null && composer.hideKeyboard()) return;
+                if (workPanelBack()) return;
                 if (shellMode()) leaveByBack(); else showRailOverlay();
             }, () -> {
                 if (composer != null && composer.hideKeyboard()) return;
+                if (workPanelBack()) return;
                 if (filePager == null || !filePager.hide()) leaveByBack();
             });
         } else {
@@ -795,6 +815,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             hideSidebar();
             return;
         }
+        if (workPanelBack()) return;
         if (filePager != null && filePager.hide()) return;
         super.onBackPressed();
     }
@@ -1284,6 +1305,108 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** The usage feed of the machine on screen (UsageFeed): kept answers, one look at a time. */
     private UsageFeed usageFeed;
+
+    /** The right panel (WorkPanel), the chrome revision it last saw, and whether the cover's is open. */
+    private WorkPanel workPanel;
+    private TextView workButton;
+    private long workPanelRevision = -1;
+    private boolean workPanelOpen;
+
+    /** Docked at the right from 640 dp (the unfolded split, or beside the rail when wider); over all on the cover. */
+    private void applyWorkPanel() {
+        if (workPanel == null || terminalRoot == null) return;
+        int widthDp = getResources().getConfiguration().screenWidthDp;
+        WorkPanelLayout layout = WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen);
+        int rootWidth = root().getWidth();
+        int width = layout.overlay ? -1 : Math.max(dp(WorkPanelLayout.MIN_DP), Math.round(rootWidth * layout.share));
+        FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) workPanel.view().getLayoutParams();
+        if (at.width != (layout.shown ? width : 0)) {
+            at.width = layout.shown ? width : 0;
+            workPanel.view().setLayoutParams(at);
+        }
+        int right = layout.shown && !layout.overlay ? width : 0;
+        if (railColumns.getPaddingRight() != right) railColumns.setPadding(0, 0, right, 0);
+        workPanel.show(layout.shown, layout.overlay);
+        if (workButton != null) {
+            workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
+            workButton.setSelected(layout.shown);
+        }
+    }
+
+    private View root() {
+        return (View) railColumns.getParent();
+    }
+
+    /** The cover's Work button and the panel's ×. */
+    private void toggleWorkPanel(boolean open) {
+        workPanelOpen = open;
+        applyWorkPanel();
+    }
+
+    /** Back: a selection in the panel first, then the cover's open panel. */
+    private boolean workPanelBack() {
+        if (workPanel == null || !workPanel.shown()) return false;
+        if (workPanel.back()) return true;
+        if (workPanelOpen && compactWindow()) {
+            toggleWorkPanel(false);
+            return true;
+        }
+        return false;
+    }
+
+    private WorkPanel.Host workPanelHost() {
+        return new WorkPanel.Host() {
+            @Override public String op(String json) {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                if (now == null || now.isClosed() || now.remoteHandle <= 0) throw new HostSwitched();
+                return RemoteNative.sessionAction(now.remoteHandle, json);
+            }
+            @Override public void note(String text) { GpuiTerminalActivity.this.note(text); }
+            @Override public void quote(String header, String text) { quoteToDraft(header, text); }
+            @Override public void openPath(String path) {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                if (now == null || filePager == null) return;
+                if (compactWindow()) toggleWorkPanel(false);
+                filePager.open(now.paneId, path, 0);
+            }
+            @Override public void openLink(String url) {
+                String lower = url == null ? "" : url.toLowerCase(java.util.Locale.ROOT);
+                if (url == null || url.length() > 2048 || !(lower.startsWith("http://") || lower.startsWith("https://"))) return;
+                try {
+                    startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+                } catch (RuntimeException e) {
+                    note("No app here opens that link");
+                }
+            }
+            @Override public boolean typing() { return imeShown || (composer != null && composer.busy() != null); }
+            @Override public void closed() { toggleWorkPanel(false); }
+            @Override public void focus(String id) {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                if (now == null || now.isClosed()) return;
+                // The bead stays open in Tasks; on the cover the terminal comes to the front.
+                if (compactWindow()) toggleWorkPanel(false);
+                focusRemotePane(now, id);
+            }
+        };
+    }
+
+    /**
+     * A quote from the panel into the draft of the agent on screen: its
+     * header, then each line as "> ", then a blank line; never sent.
+     * t3jk's quoteToDraft (factory-9zz.4) replaces this with the composer's
+     * own insertion at the cursor; until then it joins the draft like a taken-back message.
+     */
+    private void quoteToDraft(String header, String text) {
+        if (composer == null) return;
+        StringBuilder quoted = new StringBuilder(header).append('\n');
+        for (String line : text.split("\n", -1)) quoted.append("> ").append(line).append('\n');
+        composer.takeBack(quoted.append('\n').toString());
+        if (compactWindow()) toggleWorkPanel(false);
+        note("Quoted into the draft · not sent");
+    }
 
     /** The connected machine's aswap accounts (UsageView), drawn from the feed of that same machine. */
     private void showUsage() {
@@ -2323,7 +2446,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int widthDp = getResources().getConfiguration().screenWidthDp;
         // A drawer open across the fold ends here: it never decides the docked choice.
         railPanel = storedRailPanel();
-        RailPanel.Shown next = RailPanel.Shown.configured(railPanel, widthDp >= 600, shellMode());
+        RailPanel.Shown next = RailPanel.Shown.configured(railPanel, widthDp >= 600 && !railCompact(), shellMode());
         boolean opening = next.open && !sidebarOpen;
         setRailShown(next);
         applySidebarWidth();
@@ -2402,7 +2525,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // cover's, or one opened by a gesture) is transient: it shuts to what
         // was docked, the strip included.
         if (!railAsDrawer()) storeRailPanel(railPanel.with(open ? RailPanel.Mode.OPEN : RailPanel.Mode.CLOSED));
-        setRailShown(railShown().toggled(open, compactWindow()));
+        setRailShown(railShown().toggled(open, railCompact()));
         applySidebarWidth();
         updateHostSampling();
         if (sidebarOpen) {
@@ -2545,11 +2668,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void applySidebarWidth() {
         if (sidebar == null) return;
+        applyWorkPanel();
         placeRail();
         int available = terminalRoot == null ? 0
                 : terminalRoot.getWidth() - terminalRoot.getPaddingLeft() - terminalRoot.getPaddingRight();
         int width;
-        boolean strip = railShown().strip(compactWindow());
+        boolean strip = railShown().strip(railCompact());
         if (!sidebarOpen) {
             width = strip ? dp(RailPanel.STRIP_DP) : 0;
         } else if (railAsDrawer()) {
@@ -2679,6 +2803,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
+        if (workPanel != null && current != null && current.chromeRevision != workPanelRevision) {
+            workPanelRevision = current.chromeRevision;
+            java.util.List<BeadsModel.Term> terms = current.panes == null ? java.util.Collections.emptyList()
+                    : BeadsModel.terms(current.workspaces, current.tabs, current.panes);
+            workPanel.select(PanelModel.agentOf(terms, current.paneId), current.hostId, current.hostName, terms);
+        }
         if (usageFeed != null) {
             String usageHost = current == null ? null : current.hostId;
             usageFeed.select(usageHost, current != null && current.ready && !current.isClosed(), () -> usageLook(usageHost));
@@ -2958,15 +3088,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         chip.setText(text);
         chip.setTextSize(12);
         chip.setSingleLine(true);
-        chip.setTextColor(active ? chrome.background : idle ? chrome.onSurfaceVariant : chrome.onSurface);
+        chip.setTextColor(idle && !active ? chrome.onSurfaceVariant : chrome.onSurface);
         chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
         chip.setPadding(dp(7), 0, dp(7), 0);
         android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
         shape.setCornerRadius(dp(3));
-        shape.setColor(active ? chrome.primary : chrome.background);
-        shape.setStroke(dp(1), active ? chrome.primary : chrome.outline);
+        // The window on screen: the palette's quiet selected container (OLED: #17202e), not a bright accent fill.
+        shape.setColor(active ? chrome.selected : chrome.background);
+        shape.setStroke(dp(1), active ? chrome.selected : chrome.outline);
         chip.setBackground(new android.graphics.drawable.RippleDrawable(
-                android.content.res.ColorStateList.valueOf(chrome.selected), shape,
+                android.content.res.ColorStateList.valueOf(chrome.hover), shape,
                 new android.graphics.drawable.ColorDrawable(0xffffffff)));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
         params.setMarginEnd(dp(3));
@@ -6666,6 +6797,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
         if (usageFeed != null) usageFeed.detach(this);
+        if (workPanel != null) workPanel.detach();
         Dictation.pending(this).setListener(null);
         stopHostSampling();
         stopConnection();

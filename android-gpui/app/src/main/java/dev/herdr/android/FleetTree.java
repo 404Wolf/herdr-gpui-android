@@ -825,10 +825,12 @@ final class FleetTree {
     /** The Deacon's and a PM's fold column ({@link RailDisclosure}): a 48dp touch target. */
     static final int PM_CHEVRON_DP = 48;
     /**
-     * Row heights: a Deacon or PM row meets the 48dp touch minimum (its fold
-     * button is the row's height); agents under it are denser, 36dp (Wolf).
+     * Row heights, tighter as Wolf's OLED preview has them: a Deacon or PM row
+     * is 40dp and an agent's 32dp. Each whole row (full height and width) is
+     * its own tap target, so no row needs a TouchDelegate reaching into its
+     * neighbours; the lead's fold button is the row's height and 48dp wide.
      */
-    static final int LEAD_ROW_DP = 48, AGENT_ROW_DP = 36;
+    static final int LEAD_ROW_DP = 40, AGENT_ROW_DP = 32;
 
     /**
      * What a screen reader hears for a lead row's fold control, or null when
@@ -1331,7 +1333,8 @@ final class FleetTree {
     }
 
     private static final Set<String> GENERIC_NAMES = new HashSet<>(Arrays.asList(
-            "general", "pm", "deacon", "worker", "main", "shell", "zsh", "bash", "claude", "claude code", "codex"));
+            "general", "pm", "deacon", "worker", "main", "shell", "zsh", "bash", "claude", "claude code", "codex",
+            "gemini", "agy", "antigravity"));
 
     /** A tab or title that names no task: a role, a shell, a harness, a number, a terminal id. */
     static boolean genericName(String name) {
