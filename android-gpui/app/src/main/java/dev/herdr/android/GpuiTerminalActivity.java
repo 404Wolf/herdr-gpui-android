@@ -100,8 +100,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 thread.setDaemon(true);
                 return thread;
             });
+    /** Pumps every connection's frames at a fixed delay; nothing that waits on a network runs here. */
     private final ScheduledThreadPoolExecutor worker = new ScheduledThreadPoolExecutor(1, task -> {
-        Thread thread = new Thread(task, "herdr-gpui-https");
+        Thread thread = new Thread(task, "herdr-gpui-pump");
+        thread.setDaemon(true);
+        return thread;
+    });
+    /**
+     * Opens connections (a machine switch, a reconnect) and reads the saved hosts and caches
+     * (audit A1): a switch's waits of tens of seconds never hold up the pump of the terminal
+     * on screen, so it keeps painting and echoing while another computer connects.
+     */
+    private final java.util.concurrent.ExecutorService connector = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "herdr-gpui-connect");
         thread.setDaemon(true);
         return thread;
     });
@@ -330,7 +341,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             nativeSetTheme(appliedPalette);
             chrome = GpuiChrome.load(appliedPalette);
             // Host switching needs the saved hosts before the first rail paint.
-            worker.execute(() -> {
+            connector.execute(() -> {
                 try {
                     java.util.List<SavedRemoteHost> hosts = new RemoteHostStore(this).read();
                     runOnUiThread(() -> { savedHosts = hosts; updateHostSampling(); refreshSidebar(true); });
@@ -934,7 +945,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         final int epoch = hostEpoch.now();
         clearLinkProblem();
         publishCurrent("Reconnecting…");
-        worker.execute(() -> {
+        connector.execute(() -> {
             SavedRemoteHost host = null;
             try {
                 // The rail's cached list is often empty here; the store is truth.
@@ -2054,7 +2065,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     nativeShowAgentFooter(showAgentFooter);
                     applyTheme();
             // Host switching needs the saved hosts before the first rail paint.
-            worker.execute(() -> {
+            connector.execute(() -> {
                 try {
                     java.util.List<SavedRemoteHost> hosts = new RemoteHostStore(this).read();
                     runOnUiThread(() -> { savedHosts = hosts; refreshSidebar(true); });
@@ -2272,7 +2283,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (previous != null) {
             synchronized (stateLock) { publish(previous, "Switching to " + host.name + "…"); }
         }
-        worker.execute(() -> {
+        connector.execute(() -> {
             long handle = 0;
             try {
                 char[] key = new RemoteIdentityStore(this).read();
@@ -2324,6 +2335,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * computer's live Deacon (FleetTree.switchLanding) unless a live terminal
      * there was named; with no Deacon, the usual choice below applies.
      */
+    /** After its list, the most a switch waits for its pane (and a Deacon instead) to land. */
+    static final long AWAIT_LANDING_MS = 30_000;
+
     /** How long a machine switch waits for the new host's list, as before reconnects were bounded. */
     private static final long MACHINE_SWITCH_READY_MS = 45_000;
 
@@ -2336,6 +2350,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private String awaitHostPane(long handle, String hostId, String forcedPane, boolean machineSwitch,
             long readyWithinMs) throws Exception {
         long until = SystemClock.uptimeMillis() + readyWithinMs;
+        // Everything this waits for, together: the list, the spaces and every landing (audit A1).
+        final long overall = until + AWAIT_LANDING_MS;
         JSONObject state = null;
         boolean listed = false;
         while (SystemClock.uptimeMillis() < until) {
@@ -2392,7 +2408,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // A pane picked offline while this connected (item 77) is where it lands.
         for (int pick = 0; pick < 3; pick++) {
             RemoteNative.focus(handle, pane);
-            until = SystemClock.uptimeMillis() + 20_000;
+            until = Math.min(SystemClock.uptimeMillis() + 20_000, overall);
             boolean landed = false;
             while (!landed && SystemClock.uptimeMillis() < until) {
                 state = new JSONObject(RemoteNative.poll(handle, 0, false));
@@ -2407,7 +2423,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                     pane = deacon;
                     RemoteNative.focus(handle, pane);
-                    until = SystemClock.uptimeMillis() + 20_000;
+                    until = Math.min(SystemClock.uptimeMillis() + 20_000, overall);
                     continue;
                 }
                 if (!landed) Thread.sleep(150);
@@ -6871,6 +6887,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         stopHostSampling();
         stopConnection();
         worker.shutdownNow();
+        connector.shutdownNow();
         GpuiLaunch.release(launch);
         launch = null;
         shortcutJson = null;
@@ -8154,7 +8171,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** Reads Home's cached Fleet view off the UI thread; the rail and strip redraw with it. */
     private void loadFleetCache() {
         final java.io.File file = new java.io.File(getNoBackupFilesDir(), HomeCache.FILE_NAME);
-        worker.execute(() -> {
+        connector.execute(() -> {
             java.util.Map<String, HomeCache.Entry> read = HomeCache.read(file);
             main.post(() -> {
                 if (destroyed) return;
