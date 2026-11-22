@@ -59,6 +59,7 @@ public final class HeldScrollEntryTest {
                 + "    boolean scrollLocalOnly(Connection target, int lines) { went.add(\"local \" + lines); return true; }\n"
                 + "    boolean doubt;\n"
                 + "    boolean linkInDoubt(Connection target) { return target != null && doubt; }\n"
+                + "    void sayRoute(Connection target) { }\n"
                 + "    public void target(boolean present, boolean closed, long handle, boolean ready, boolean shellMode) {\n"
                 + "        shell = shellMode;\n"
                 + "        if (!present) { connection = null; return; }\n"

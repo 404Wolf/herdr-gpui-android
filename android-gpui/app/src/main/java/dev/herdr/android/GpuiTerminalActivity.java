@@ -1376,6 +1376,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean requestScroll(int lines) {
         final Connection target;
         synchronized (stateLock) { target = connection; }
+        sayRoute(target);
         return HeldScroll.scroll(shellMode(), target != null, target != null && target.isClosed(),
                 target == null ? 0 : target.remoteHandle, target != null && target.ready, linkInDoubt(target), lines,
                 new HeldScroll.Sink() {
@@ -1394,8 +1395,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return target != null && monitor != null && monitor.suspect(target.quietMs);
     }
 
+    /** Once per gesture, where its steps go: what the device check reads (factory-9zz.1). Main thread. */
+    private void sayRoute(Connection target) {
+        if (routeSaid) return;
+        routeSaid = true;
+        android.util.Log.i("herdr-scroll", "drag: " + (target == null ? "no pane"
+                : "closed=" + target.isClosed() + " ready=" + target.ready + " handle=" + target.remoteHandle
+                + " doubt=" + linkInDoubt(target)));
+    }
+
     /** The edge rule has answered the gesture now running: once per drag or fling. Main thread. */
     private boolean edgeSaid;
+    /** The gesture now running has logged where its steps go. Main thread. */
+    private boolean routeSaid;
 
     /**
      * After a step on the phone's own rows: a drag back that moved nothing is answered,
@@ -1534,7 +1546,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         showLatest(step.optLong("local_offset", 0) > 0);
                         if (!latest) answerEdge(lines, step, false);
                     });
-                } catch (Exception | LinkageError ignored) {
+                } catch (Exception | LinkageError failed) {
+                    android.util.Log.w("herdr-scroll", "held step failed: " + failed);
                 }
             });
         } catch (java.util.concurrent.RejectedExecutionException busy) {
@@ -6128,6 +6141,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (masked == MotionEvent.ACTION_DOWN) {
             stopFling();
             edgeSaid = false;
+            routeSaid = false;
             touchDownX = edgeStartX = event.getX();
             edgeClaimed = false;
             touchDownY = lastTouchY = event.getY();
