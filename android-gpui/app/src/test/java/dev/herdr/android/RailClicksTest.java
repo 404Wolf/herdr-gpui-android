@@ -145,15 +145,27 @@ public final class RailClicksTest {
         assertTrue(overview.contains("row.setOnClickListener(v -> pickMachine(machine))"));
         String tree = section(home, "private LinearLayout treeLine(", "private TextView chevronSlot(");
         assertTrue(tree.contains("toggle.setBackground(ripple())"));
-        String chip = section(home, "private TextView chip(", "private static boolean hasRole(");
+        String chip = section(home, "private TextView chip(", "private View agentLine(");
         assertTrue(chip.contains("RippleDrawable("));
-        for (String[] constructor : new String[][] {
-                {"private RailWorkspaceRow createRailWorkspaceRow(", "private void updateRailWorkspaceRow("},
-                {"private RailPaneRow createRailPaneRow(", "private void updateRailPaneRow("}}) {
-            String row = section(rail, constructor[0], constructor[1]);
-            assertTrue(constructor[0], row.contains("holder.mark.setBackground(railBackground(false))"));
-            assertTrue(constructor[0], row.contains("holder.mark.setOnClickListener("));
-        }
+        String space = section(rail, "private RailWorkspaceRow createRailWorkspaceRow(", "private void updateRailWorkspaceRow(");
+        // Header rows fold with the same control as PM rows, full height.
+        assertTrue(space.contains("holder.mark = new RailDisclosure(this, chrome)"));
+        assertTrue(space.contains("holder.mark.setOnClickListener("));
+        assertTrue(space.contains("holder.mark.offerOn(holder.row)"));
+        assertTrue(space.contains("new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1)"));
+        // A Deacon or PM row folds with its own disclosure button, the row's full height and 48dp wide.
+        String pane = section(rail, "private RailPaneRow createRailPaneRow(", "private void updateRailPaneRow(");
+        assertTrue(pane.contains("holder.mark = new RailDisclosure(this, chrome)"));
+        assertTrue(pane.contains("holder.mark.setOnClickListener("));
+        assertTrue(pane.contains("holder.mark.offerOn(holder.row)"));
+        assertTrue(pane.contains("new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1)"));
+        String agent = section(rail, "private RailPaneRow railAgent(", "private RailWorkspaceRow railHeader(");
+        assertTrue(agent.contains("row.mark.bind(foldSays != null, folded, foldSays)"));
+        assertTrue(agent.contains("FleetTree.LEAD_ROW_DP"));
+        // The fold control folds only; with nothing to fold, its empty column taps the row.
+        String fold = pane.substring(pane.indexOf("holder.mark.setOnClickListener("), pane.indexOf("holder.mark.offerOn("));
+        assertTrue(fold.indexOf("toggleRepo(holder.foldKey)") < fold.indexOf("else holder.row.performClick()"));
+        assertFalse(fold.contains("focusRemotePane"));
         // The project bar's window chips (item 70; tabPill before them) press with a ripple too.
         String pill = section(rail, "private TextView windowChip(", "private void showTabActions(");
         assertTrue(pill.contains("RippleDrawable("));

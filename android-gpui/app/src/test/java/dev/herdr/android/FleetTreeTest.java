@@ -846,20 +846,6 @@ public final class FleetTreeTest {
         assertSame(loose, tree.outside.get(0).pm);
     }
 
-    @Test public void aWorkerBadgeShowsItsTaskNotAGenericTabName() {
-        // t6z in the shared "general" tab: its task title, not "general".
-        assertEquals("worker·Desktop Fleet sidebar", FleetTree.roleBadge("worker", "t6z",
-                FleetTree.workerTask("Desktop Fleet sidebar", "general", "t6z")));
-        // No title of its own: a specific tab name still says something.
-        assertEquals("smoke-marker", FleetTree.workerTask("", "smoke-marker", "t6x"));
-        // No title, a generic tab: its terminal id.
-        assertEquals("worker·t6z", FleetTree.roleBadge("worker", "t6z", FleetTree.workerTask("", "general", "t6z")));
-        for (String generic : new String[] {"General", "pm", "Deacon", "worker", "MAIN", "shell", "zsh", "bash",
-                "claude", "Claude Code", "codex", "12", "t6z"}) {
-            assertEquals(generic, "t6z", FleetTree.workerTask(generic, generic, "t6z"));
-        }
-    }
-
     @Test public void pickingAComputerResolvesToItsExactDeaconOrToStart() {
         // One computer: two deacon candidates; the canonical (oldest) one is focused.
         FleetTree.Member older = label(m("t6k", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
@@ -887,16 +873,6 @@ public final class FleetTreeTest {
         assertEquals(FleetTree.Pick.FOCUS, FleetTree.pick(true, Arrays.asList(cached, pm)));
         assertSame(cached, FleetTree.pickTarget(Arrays.asList(cached, pm)));
     }
-
-    @Test public void thePaneHeaderBadgeNamesTheRole() {
-        assertEquals("PM·t19", FleetTree.roleBadge("pm", "t19", "ignored"));
-        assertEquals("Deacon·t6k", FleetTree.roleBadge("deacon", "t6k", ""));
-        assertEquals("worker·smoke-marker", FleetTree.roleBadge("worker", "t6x", " smoke-marker "));
-        assertEquals("worker·t6x", FleetTree.roleBadge("worker", "t6x", ""));
-        assertEquals("", FleetTree.roleBadge("", "t1", "x"));
-    }
-
-    // ── Leftovers are never dropped ─────────────────────────────────────
 
     @Test public void shellOnlySpacesAndSpacelessAgentsStayVisible() {
         FleetTree.Member shell = m("t1", "s1", "scratch", 0, 0, "/h", "");

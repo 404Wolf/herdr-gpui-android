@@ -938,6 +938,7 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
         action,
         "tab.new" | "agent.claude" | "agent.codex" | "pane.close"
     ) && crate::core_session::TabEdit::parse(action).is_none()
+        && crate::phone_ops::PhoneOp::parse(action).is_none()
     {
         return Err(Error::Config);
     }

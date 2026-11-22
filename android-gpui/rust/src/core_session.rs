@@ -605,7 +605,17 @@ impl Connection<'_> {
                     .to_string());
                 }
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
-                None => return Err(Error::StaleTarget),
+                None => match crate::phone_ops::PhoneOp::parse(action) {
+                    Some(op) => {
+                        let reply = op.run(|method, params| self.call(method, params))?;
+                        // Done is done: a failed re-read leaves the view for the next poll, never an error.
+                        if op.edits() && self.refresh().is_err() {
+                            self.dirty = true;
+                        }
+                        return Ok(reply);
+                    }
+                    None => return Err(Error::StaleTarget),
+                },
             },
         }
         Ok(json!({"queued":true}).to_string())
@@ -2245,10 +2255,13 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
         if terminal["state"] != "live" {
             continue;
         }
+        // Empty labels are a parked terminal (the desktop's Park, the phone's
+        // tab.detach): in no tab, so loose, its own window, under its lead.
         let space = terminal["labels"]["herdr.space"]
             .as_str()
+            .filter(|s| !s.is_empty())
             .unwrap_or("loose");
-        let tab = terminal["labels"]["herdr.tab"].as_str().unwrap_or(id);
+        let tab = terminal["labels"]["herdr.tab"].as_str().filter(|t| !t.is_empty()).unwrap_or(id);
         if !spaces.iter().any(|s| s["id"] == space) {
             // A space missing from the app document is named as the desktop
             // shows it: the `where` label's space part, else the folder.
@@ -2304,6 +2317,12 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             // The repo a project sits under, when a label says so (item 61).
             "repo": label("repo").unwrap_or(""),
             "kind": kind.unwrap_or(""),
+            // Its hc name ("phone-rail"): what the phone's rows call it, never its id (factory-jmc).
+            "name": terminal["name"].as_str().filter(|n| !n.is_empty() && n.len() <= 128).unwrap_or(""),
+            // The factory's join labels: the bead a worker is on, a helper's role (BeadsModel).
+            "issue": label("issue").unwrap_or(""),
+            "task": label("task").unwrap_or(""),
+            "helper": label("helper").unwrap_or(""),
             // What the deacon view shows under each agent: the program's own
             // status message, why it is blocked, and since when (core clock, ms).
             "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),
@@ -2711,6 +2730,24 @@ b"}"#), None);
         rename_tab(&mut doc, "s1", "mobile-1-9", "review").unwrap();
         project(&mut view, &terminals, &doc).unwrap();
         assert_eq!((view["tabs"][0]["label"].clone(), view["tabs"][0]["named"].clone()), (json!("review"), json!(true)));
+    }
+
+    #[test]
+    fn a_parked_agent_survives_a_refresh_loose_and_still_under_its_pm() {
+        let doc = json!({"spaces":[{"id":"s1","name":"work","tabs":[{"id":"x"}]}]});
+        let terminals = json!([
+            {"address":"t5","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"app"},"title":"pm","status":{}},
+            {"address":"t44","state":"live","labels":{"herdr.space":"","herdr.tab":"","parent":"t5","agent.kind":"claude"},"title":"Fix tests","status":{"state":"working"}}]);
+        let mut view = json!({"pane_id":"t5"});
+        for _ in 0..2 {
+            project(&mut view, &terminals, &doc).unwrap();
+            let parked = view["panes"].as_array().unwrap().iter().find(|p| p["id"] == "t44").unwrap().clone();
+            assert_eq!(parked["workspace_id"], "loose");
+            assert_eq!(parked["tab_id"], "t44");
+            assert_eq!(parked["parent"], "t5");
+            assert_eq!(parked["status"], "working");
+            assert!(!view["workspaces"].as_array().unwrap().iter().any(|s| s["id"] == ""), "no blank-named space");
+        }
     }
 
     #[test]
