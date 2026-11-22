@@ -97,7 +97,13 @@ final class ActionBar {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
         row.setPadding(dp(PAD_DP), 0, dp(PAD_DP), 0);
-        row.setBackgroundColor(chrome.background);
+        // A 1 dp hairline on top (t42y review), the app's background below it.
+        android.graphics.drawable.LayerDrawable back = new android.graphics.drawable.LayerDrawable(
+                new android.graphics.drawable.Drawable[] {
+                        new android.graphics.drawable.ColorDrawable(chrome.outline),
+                        new android.graphics.drawable.ColorDrawable(chrome.background)});
+        back.setLayerInset(1, 0, Math.max(1, dp(1)), 0, 0);
+        row.setBackground(back);
         row.setVisibility(View.GONE);
         row.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             if (r - l != or - ol) v.post(this::redraw);
