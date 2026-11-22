@@ -2153,8 +2153,14 @@ fn serve(
                 Ok(Operation::Discover(reply)) => {
                     let _ = reply.send(connection.discover());
                 }
-                Ok(Operation::Action(action, reply)) => {
-                    let _ = reply.send(connection.action(&action, cols, rows));
+                Ok(Operation::Action(action, reply, until)) => {
+                    // Its caller gave up (and was told Busy): never run it late, so a retry
+                    // cannot start a second shell or Deacon.
+                    if until.is_some_and(|until| Instant::now() >= until) {
+                        let _ = reply.send(Err(Error::Busy));
+                    } else {
+                        let _ = reply.send(connection.action(&action, cols, rows));
+                    }
                 }
                 Ok(Operation::Put(file, reply)) => {
                     let _ = reply.send(connection.put(&file));
@@ -3478,7 +3484,28 @@ mod connection_tests {
         action: &str,
         answer: impl Fn(&str, &Value, usize) -> std::result::Result<Value, &'static str> + Send + 'static,
     ) -> (Result<String>, Vec<(String, Value)>) {
-        operation_against(|tx| Operation::Action(action.into(), tx), answer)
+        operation_against(|tx| Operation::Action(action.into(), tx, None), answer)
+    }
+
+    /// Audit A4: an action whose caller already gave up (and was told Busy) never runs, so a
+    /// retry cannot launch a second shell; one still in time runs as before.
+    #[test]
+    fn an_action_its_caller_gave_up_on_never_runs_late() {
+        let answer = |method: &str, _: &Value, _: usize| -> std::result::Result<Value, &'static str> {
+            Ok(match method {
+                "terminal.run" => json!({"address":"t9"}),
+                "terminal.attach" => json!({"channel":2}),
+                other => base_answer(other),
+            })
+        };
+        let past = Instant::now() - Duration::from_millis(1);
+        let (result, seen) = operation_against(|tx| Operation::Action("tab.new".into(), tx, Some(past)), answer);
+        assert!(matches!(result, Err(Error::Busy)), "{result:?}");
+        assert!(seen.iter().all(|(method, _)| method != "terminal.run"), "{seen:?}");
+        let soon = Instant::now() + Duration::from_secs(30);
+        let (result, seen) = operation_against(|tx| Operation::Action("tab.new".into(), tx, Some(soon)), answer);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(seen.iter().any(|(method, _)| method == "terminal.run"), "{seen:?}");
     }
 
     /// As `action_against`, for any operation the worker takes.
@@ -5325,7 +5352,7 @@ mod claim_tests {
         core.push.send((3, 2, Vec::new())).unwrap();
         reviewer_wait(|| lock(&core.owner.state).terminal.is_none());
         let (tx, rx) = mpsc::sync_channel(1);
-        core.owner.commands.send(Operation::Action("pane.close".into(), tx)).unwrap();
+        core.owner.commands.send(Operation::Action("pane.close".into(), tx, None)).unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
         // Current code still attempts the pending attach, but the owner's
         // finished/missing rejection must leave the pane ended. No run/start

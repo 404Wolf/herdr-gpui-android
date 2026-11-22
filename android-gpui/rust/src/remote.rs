@@ -28,6 +28,9 @@ pub enum Error {
     Closed,
     #[error("Remote session capacity or queue limit reached")]
     Capacity,
+    /// The session is up but still working on earlier requests: this one did not run.
+    #[error("The computer is still busy with an earlier request; try again")]
+    Busy,
     #[error("Select a current terminal before sending input")]
     StaleTarget,
     #[error("A file to put on the host is empty or over 8 MB")]
@@ -383,7 +386,9 @@ impl Heard {
 }
 pub(crate) enum Operation {
     Discover(mpsc::SyncSender<Result<String>>),
-    Action(String, mpsc::SyncSender<Result<String>>),
+    /// A phone action, its reply, and when its caller stops waiting: an action still queued
+    /// then is never run (the caller was told the computer is busy, and may ask again).
+    Action(String, mpsc::SyncSender<Result<String>>, Option<Instant>),
     /// A file for a terminal's machine (`terminal.put`): bytes, so not an Action's bounded JSON.
     Put(PutFile, mpsc::SyncSender<Result<String>>),
     Frame(u32, u8, Vec<u8>),
@@ -970,12 +975,22 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
     }
     let owner = session(id)?;
     let (tx, rx) = mpsc::sync_channel(1);
+    let wait = Duration::from_secs(20);
     owner
         .commands
-        .try_send(Operation::Action(action.into(), tx))
+        .try_send(Operation::Action(action.into(), tx, Some(Instant::now() + wait)))
         .map_err(|_| Error::Capacity)?;
-    rx.recv_timeout(Duration::from_secs(20))
-        .map_err(|_| Error::Closed)?
+    action_reply(rx.recv_timeout(wait))
+}
+
+/// An action's answer: the session's own, or Busy when it was still queued or running at the
+/// wait's end (audit A4: a busy session is not a closed one), or Closed when the session ended.
+fn action_reply(reply: std::result::Result<Result<String>, mpsc::RecvTimeoutError>) -> Result<String> {
+    match reply {
+        Ok(answer) => answer,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::Busy),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Closed),
+    }
 }
 /// Types a held message into the attach `attach` (the phone's AttachId, the
 /// one on screen when Wolf tapped Send): its paste, then Enter, both on that
@@ -1182,6 +1197,13 @@ pub fn discover(id: u64) -> Result<String> {
 #[allow(clippy::unwrap_used)]
 mod last_use_tests {
     use super::*;
+
+    #[test]
+    fn a_busy_session_is_busy_and_only_an_ended_one_is_closed() {
+        assert_eq!(action_reply(Ok(Ok("x".into()))).unwrap(), "x");
+        assert!(matches!(action_reply(Err(mpsc::RecvTimeoutError::Timeout)), Err(Error::Busy)));
+        assert!(matches!(action_reply(Err(mpsc::RecvTimeoutError::Disconnected)), Err(Error::Closed)));
+    }
 
     /// t217's probe on fc3d430: a one-day cap made a phone last used two days
     /// ago look newer than a desktop idle for a day and a half.
