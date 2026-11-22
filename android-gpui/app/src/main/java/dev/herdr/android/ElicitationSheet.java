@@ -42,7 +42,21 @@ final class ElicitationSheet {
         String step(String goal, String progress);
         /** One input command into this pane's ordered input; false if refused. */
         boolean send(String commandJson);
+        /**
+         * Where the asking pane is on the screen (its window coordinates), so the
+         * sheet sits in it and dims only it; null: the whole window.
+         */
+        default android.graphics.Rect area() { return null; }
     }
+
+    /** The sheet's card: at most this wide, this far in from the pane's edges (review P1-3). */
+    static final int MAX_DP = 420, MARGIN_DP = 16;
+    /** Option rows, radios and buttons (review P1-3). */
+    static final int ROW_DP = 56, RADIO_DP = 20, RADIO_GAP_DP = 16, BUTTON_DP = 48;
+    /** The asking pane's scrim: half black, over that pane only. */
+    static final int SCRIM = 0x80000000;
+    /** At most this many lines of the quoted context. */
+    static final int CONTEXT_LINES = 3;
 
     /** Re-read the dialog while the sheet is open, to follow the agent's redraws. */
     static final long REFRESH_MILLIS = 250;
@@ -102,6 +116,11 @@ final class ElicitationSheet {
         window.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout card = ActionSheet.card(activity, chrome);
         card.setPadding(dp(16), dp(12), dp(16), dp(10));
+        // The window is the asking pane: its scrim dims that pane only, and the card sits at its bottom centre.
+        android.widget.FrameLayout over = new android.widget.FrameLayout(activity);
+        over.setBackgroundColor(SCRIM);
+        over.setOnClickListener(v -> dismiss());
+        card.setClickable(true);
         // Status first: a long dialog scrolls, and what happened must stay in view.
         status = ActionSheet.label(activity, "", 13, chrome.onSurfaceVariant);
         status.setVisibility(View.GONE);
@@ -111,11 +130,32 @@ final class ElicitationSheet {
         scroll = new ScrollView(activity);
         scroll.addView(body);
         card.addView(scroll, new LinearLayout.LayoutParams(-1, -2));
-        window.setContentView(card);
-        ActionSheet.size(window);
+        android.graphics.Rect area = pane.area();
+        int areaWidth = area != null ? area.width() : activity.getResources().getDisplayMetrics().widthPixels;
+        android.widget.FrameLayout.LayoutParams cardAt = new android.widget.FrameLayout.LayoutParams(
+                cardWidth(areaWidth, activity.getResources().getDisplayMetrics().density), -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        cardAt.bottomMargin = dp(MARGIN_DP);
+        over.addView(card, cardAt);
+        window.setContentView(over);
         Window w = window.getWindow();
         if (w != null) {
-            w.setGravity(Gravity.BOTTOM);
+            w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0));
+            // No whole-window dim: the scrim is this window's own, over the asking pane only.
+            w.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            // Touches outside it (the work panel) still reach the app.
+            w.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN);
+            WindowManager.LayoutParams at = w.getAttributes();
+            at.gravity = Gravity.TOP | Gravity.START;
+            if (area != null) {
+                at.x = area.left;
+                at.y = area.top;
+                at.width = area.width();
+                at.height = area.height();
+            } else {
+                at.width = WindowManager.LayoutParams.MATCH_PARENT;
+                at.height = WindowManager.LayoutParams.MATCH_PARENT;
+            }
+            w.setAttributes(at);
             w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
             if (!capturable) w.addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         }
@@ -129,6 +169,11 @@ final class ElicitationSheet {
         render(dialog);
         window.show();
         main.postDelayed(refresh, REFRESH_MILLIS);
+    }
+
+    /** The card's width in a pane {@code areaPx} wide: at most {@link #MAX_DP}, {@link #MARGIN_DP} in from each side. */
+    static int cardWidth(int areaPx, float density) {
+        return Math.max(0, Math.min(Math.round(MAX_DP * density), areaPx - 2 * Math.round(MARGIN_DP * density)));
     }
 
     void dismiss() {
@@ -208,7 +253,7 @@ final class ElicitationSheet {
         question.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         question.setPadding(0, dp(8), 0, dp(6));
         body.addView(question);
-        for (String line : dialog.detail) body.addView(detail(line));
+        if (!dialog.detail.isEmpty()) body.addView(detail(String.join("\n", dialog.detail)));
         if (dialog.kind != Elicitation.Kind.REVIEW) options(dialog);
         body.addView(buttons(dialog));
         // A redraw of the same question keeps the user's place in a long list.
@@ -221,8 +266,7 @@ final class ElicitationSheet {
         for (java.util.Map.Entry<Integer, TextView> entry : marks.entrySet()) {
             boolean picked = entry.getKey() == 0 ? answer.useCustom : answer.chosen.contains(entry.getKey());
             TextView mark = entry.getValue();
-            mark.setText(mark(dialog.multi, picked));
-            mark.setTextColor(picked ? chrome.primary : chrome.onSurfaceVariant);
+            styleRadio(mark, dialog.multi, picked);
             View row = (View) mark.getParent();
             if (entry.getKey() != 0) row.setContentDescription((picked ? "Selected: " : "") + labelOf(dialog, entry.getKey()));
         }
@@ -255,10 +299,24 @@ final class ElicitationSheet {
         String who = dialog.harness == Elicitation.Harness.CLAUDE ? "Claude"
                 : dialog.harness == Elicitation.Harness.CODEX ? "Codex" : "Gemini";
         switch (dialog.kind) {
-            case CONFIRM: return who + " asks for permission";
+            // A tool's permission prompt; another menu (the usage limit's) only asks.
+            case CONFIRM: return permission(dialog) ? who + " asks for permission" : who + " asks";
             case REVIEW: return who + " · review your answers";
             default: return dialog.multi ? who + " asks · pick any" : who + " asks";
         }
+    }
+
+    /**
+     * A permission prompt: Claude's "Do you want to …?" with a Yes. Its other
+     * CONFIRM menus (the usage limit's "What do you want to do?") are not.
+     */
+    static boolean permission(Elicitation.Dialog dialog) {
+        String q = dialog.question == null ? "" : dialog.question.trim().toLowerCase(java.util.Locale.ROOT);
+        if (q.startsWith("do you want to") || q.startsWith("allow ")) return true;
+        for (Elicitation.Choice c : dialog.choices) {
+            if (c.role == Elicitation.Role.ANSWER && c.label.trim().toLowerCase(java.util.Locale.ROOT).startsWith("yes")) return true;
+        }
+        return false;
     }
 
     private View tabs(Elicitation.Dialog dialog) {
@@ -303,6 +361,8 @@ final class ElicitationSheet {
     private View detail(String line) {
         TextView view = ActionSheet.label(activity, line, 13, chrome.onSurfaceVariant);
         view.setTypeface(Typeface.MONOSPACE);
+        view.setMaxLines(CONTEXT_LINES);
+        view.setEllipsize(android.text.TextUtils.TruncateAt.END);
         view.setPadding(dp(8), dp(2), dp(8), dp(2));
         view.setBackgroundColor(chrome.control);
         return view;
@@ -328,13 +388,12 @@ final class ElicitationSheet {
         boolean picked = answer.chosen.contains(choice.number);
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setMinimumHeight(dp(48));
+        row.setMinimumHeight(dp(ROW_DP));
         row.setPadding(dp(4), dp(6), dp(4), dp(6));
         row.setBackground(ActionSheet.ripple(chrome));
         row.setGravity(Gravity.CENTER_VERTICAL);
-        TextView mark = ActionSheet.label(activity, mark(dialog.multi, picked), 18, picked ? chrome.primary : chrome.onSurfaceVariant);
-        mark.setPadding(0, 0, dp(10), 0);
-        row.addView(mark);
+        TextView mark = radio(dialog.multi, picked);
+        row.addView(mark, radioAt());
         LinearLayout words = new LinearLayout(activity);
         words.setOrientation(LinearLayout.VERTICAL);
         words.addView(ActionSheet.label(activity, choice.label, 15, chrome.onSurface));
@@ -353,10 +412,9 @@ final class ElicitationSheet {
         LinearLayout row = new LinearLayout(activity);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(4), dp(4), dp(4), dp(4));
-        TextView mark = ActionSheet.label(activity, mark(dialog.multi, answer.useCustom), 18,
-                answer.useCustom ? chrome.primary : chrome.onSurfaceVariant);
-        mark.setPadding(0, 0, dp(10), 0);
-        row.addView(mark);
+        row.setMinimumHeight(dp(ROW_DP));
+        TextView mark = radio(dialog.multi, answer.useCustom);
+        row.addView(mark, radioAt());
         EditText field = field("Type your own answer", answer.text);
         marks.put(0, mark);
         // Starting to type picks the custom answer (and, single-select, drops the option picked).
@@ -370,6 +428,7 @@ final class ElicitationSheet {
             answers.custom(dialog, text, !text.trim().isEmpty() || answer.useCustom);
             refreshMarks(dialog);
         }));
+        mark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         mark.setContentDescription("Use your own answer");
         mark.setOnClickListener(v -> {
             answers.custom(dialog, field.getText().toString(), !answer.useCustom);
@@ -399,16 +458,50 @@ final class ElicitationSheet {
         return field;
     }
 
-    private static String mark(boolean multi, boolean picked) {
-        if (multi) return picked ? "☑" : "☐";
-        return picked ? "◉" : "○";
+    /** A drawn 20dp radio (a ring, filled when picked) or check box (a ✓ when picked), not a glyph. */
+    private TextView radio(boolean multi, boolean picked) {
+        TextView mark = new TextView(activity);
+        mark.setGravity(Gravity.CENTER);
+        mark.setTextSize(13);
+        mark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        styleRadio(mark, multi, picked);
+        return mark;
+    }
+
+    private void styleRadio(TextView mark, boolean multi, boolean picked) {
+        GradientDrawable ring = new GradientDrawable();
+        ring.setShape(multi ? GradientDrawable.RECTANGLE : GradientDrawable.OVAL);
+        if (multi) ring.setCornerRadius(dp(4));
+        ring.setStroke(dp(2), picked ? chrome.primary : chrome.onSurfaceVariant);
+        ring.setColor(multi && picked ? chrome.primary : 0);
+        if (!multi && picked) {
+            GradientDrawable dot = new GradientDrawable();
+            dot.setShape(GradientDrawable.OVAL);
+            dot.setColor(chrome.primary);
+            android.graphics.drawable.LayerDrawable both = new android.graphics.drawable.LayerDrawable(
+                    new android.graphics.drawable.Drawable[] {ring, dot});
+            both.setLayerInset(1, dp(5), dp(5), dp(5), dp(5));
+            mark.setBackground(both);
+        } else {
+            mark.setBackground(ring);
+        }
+        mark.setText(multi && picked ? "✓" : "");
+        mark.setTextColor(chrome.background);
+    }
+
+    private LinearLayout.LayoutParams radioAt() {
+        LinearLayout.LayoutParams at = new LinearLayout.LayoutParams(dp(RADIO_DP), dp(RADIO_DP));
+        at.setMarginEnd(dp(RADIO_GAP_DP));
+        return at;
     }
 
     private View buttons(Elicitation.Dialog dialog) {
         LinearLayout row = new LinearLayout(activity);
         row.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         row.setPadding(0, dp(10), 0, 0);
-        TextView cancel = ActionSheet.button(activity, chrome, "Cancel", chrome.danger);
+        // Cancel only closes the agent's dialog: grey, not the red of a destructive action (review P1-3).
+        TextView cancel = ActionSheet.button(activity, chrome, "Cancel", chrome.onSurfaceVariant);
+        cancel.setMinHeight(dp(BUTTON_DP));
         // Esc dismisses the agent's dialog: a second tap, like every destructive row.
         ConfirmInPlace.bind(cancel, "Cancel", ConfirmInPlace.again("Cancel"), () -> start(Elicitation.Finish.CANCEL));
         row.addView(cancel);
@@ -418,6 +511,7 @@ final class ElicitationSheet {
             row.addView(chat);
         }
         submit = ActionSheet.button(activity, chrome, submitLabel(dialog), chrome.primary);
+        submit.setMinHeight(dp(BUTTON_DP));
         submit.setContentDescription(dialog.kind == Elicitation.Kind.CONFIRM ? "Send the choice to the agent" : "Submit the answers to the agent");
         submit.setOnClickListener(v -> start(Elicitation.Finish.SUBMIT));
         updateSubmit(dialog);
