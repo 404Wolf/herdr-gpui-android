@@ -443,6 +443,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         surface.setSaveEnabled(false);
         surface.getHolder().addCallback(this);
         surface.setOnTouchListener((view, event) -> forwardTouch(event));
+        // The left edge opens the sidebar (Wolf 11-22): the system's Back gesture yields there,
+        // in one strip within Android's 200 dp per edge (the right edge's is the panel's).
+        surface.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (Build.VERSION.SDK_INT < 29) return;
+            int[] edge = EdgeStrip.left(r - l, b - t, dp(EdgeStrip.WIDTH_DP), dp(EdgeStrip.TALL_DP));
+            v.setSystemGestureExclusionRects(java.util.Collections.singletonList(
+                    new android.graphics.Rect(edge[0], edge[1], edge[2], edge[3])));
+        });
         // Android's Back gesture owns the screen edges and ignores exclusion
         // requests, so a left-edge Back swipe opens the rail (setEdgeBack) and
         // a right swipe inside the left half does too (forwardTouch).
@@ -507,15 +515,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         usageFeed.watch(UsageFeed.Watch.RAIL, sidebarOpen && !railMinimized);
         // Each look holds the core session's one worker, so typing would wait behind the rail's prefetch.
         usageFeed.typing(() -> imeShown || (composer != null && composer.busy() != null));
-                // The cover's way to the work panel (Overview | Tasks); docked from 640 dp, where it always shows.
-        workButton = ActionSheet.label(this, "Work", 13, chrome.onSurface);
-        workButton.setGravity(android.view.Gravity.CENTER);
-        workButton.setBackground(ActionSheet.ripple(chrome));
-        workButton.setContentDescription("Show the work panel: overview and tasks");
-        workButton.setVisibility(View.GONE);
-        workButton.setOnClickListener(v -> toggleWorkPanel(!workPanelOpen));
-        tabRow.addView(workButton, new LinearLayout.LayoutParams(dp(56), -1));
-        tabRow.addView(rail.pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
+                tabRow.addView(rail.pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(WorkPanelLayout.TOP_BAR_DP)));
         // Where this window is: machine › repo › worktree › window, and why
@@ -1319,9 +1319,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (attachTarget() != null) menu.getMenu().add(0, 7, MoreMenu.ATTACH, "Attach image");
         if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, "Usage").setIcon(R.drawable.ic_bar_usage).setIconTintList(tint);
+        // The Work panel opens from the right edge (Wolf 11-22: no Work button); the menu offers
+        // it too, for TalkBack and anyone the gesture doesn't suit.
+        if (!shellMode() && compactWindow()) {
+            menu.getMenu().add(0, 9, MoreMenu.USAGE, workPanelOpen ? "Hide overview and tasks" : "Overview and tasks");
+        }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 8) showUsage();
+            if (item.getItemId() == 9) toggleWorkPanel(!workPanelOpen);
+            else if (item.getItemId() == 8) showUsage();
             else if (item.getItemId() == 7) showAttachSources();
             else if (item.getItemId() == 1) showDisplayOptions();
             else if (item.getItemId() == 2) showSessionActions();
@@ -1341,7 +1347,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** The right panel (WorkPanel), the chrome revision it last saw, and whether the cover's is open. */
     private WorkPanel workPanel;
-    private TextView workButton;
     private long workPanelRevision = -1;
     private boolean workPanelOpen;
 
@@ -1370,10 +1375,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             root().getLocationOnScreen(origin);
             panelDivider.place(!compactWindow(), layout, choice, rootWidth - (layout.shown ? width : 0), rootWidth, origin[0]);
         }
-        if (workButton != null) {
-            workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
-            workButton.setSelected(layout.shown);
-        }
+
     }
 
     private View root() {
@@ -5246,7 +5248,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // The system owns the screen edges for Back, so the open gesture starts
             // inside the left third rather than at the very edge.
             int width = terminalSurface == null ? 0 : terminalSurface.getWidth();
-            if (!edgeClaimed && !sidebarOpen && width > 0 && touchDownX < width / 2f) {
+            // Never over a gesture that already has an owner: a scroll in progress (a text
+            // selection and the file viewer take their touches before this).
+            if (!edgeClaimed && !sidebarOpen && !scrolling && !panning && width > 0 && touchDownX < width / 2f) {
                 float dx = event.getX() - edgeStartX;
                 float dy = Math.abs(event.getY() - touchDownY);
                 // From the edge strip (where Back does not take it: buttons
