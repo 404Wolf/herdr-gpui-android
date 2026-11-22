@@ -47,6 +47,31 @@ public final class WorkPanelLayoutTest {
         assertEquals(1 - 320f / FOLD, WorkPanelLayout.dragged(10, FOLD), 1e-6f);
     }
 
+    @Test public void aReleaseNearTheHingeLandsOnIt() {
+        assertEquals(FOLD / 2f, WorkPanelLayout.snapped(FOLD / 2f + 12, FOLD), 0f);
+        assertEquals(FOLD / 2f + 30, WorkPanelLayout.snapped(FOLD / 2f + 30, FOLD), 0f);
+        assertEquals(0.5f, WorkPanelLayout.released(WorkPanelLayout.snapped(FOLD / 2f - 9, FOLD), FOLD, 0.4f).share, 1e-6f);
+    }
+
+    @Test public void theGripIsAVisiblePillAndTheHiddenPanelLeavesAHandle() throws IOException {
+        String divider = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/PanelDivider.java")), StandardCharsets.UTF_8);
+        assertEquals(4, PanelDivider.GRIP_W_DP);
+        assertEquals(36, PanelDivider.GRIP_H_DP);
+        assertEquals(48, PanelDivider.EDGE_GRIP_H_DP);
+        assertTrue(divider.contains("edge.addView(pill(gripColor)"));
+        assertTrue(divider.contains("dragged(true);") && divider.contains("dragged(false);"));
+    }
+
+    @Test public void thePanelsTypeIsReadable() throws IOException {
+        assertEquals(14f, WorkPanel.BODY_SP, 0f);
+        assertEquals(20, WorkPanel.LINE_DP);
+        assertEquals(16, WorkPanel.SIDE_DP);
+        String panel = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/WorkPanel.java")), StandardCharsets.UTF_8);
+        // The age moved into the tab row; bullets hang at their text.
+        assertTrue(panel.contains("showAge(f.text"));
+        assertTrue(panel.contains("first + Math.round(bodyPaint().measureText(marker))"));
+    }
+
     @Test public void theChoiceIsKeptAsTextAndAnythingElseIsTheDefault() {
         WorkPanelLayout.Choice c = WorkPanelLayout.Choice.parse(new WorkPanelLayout.Choice(0.42f, true).stored());
         assertTrue(c.hidden);
