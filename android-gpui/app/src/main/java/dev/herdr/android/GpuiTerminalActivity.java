@@ -2310,11 +2310,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private static boolean hasPane(JSONArray panes, String paneId) {
-        for (int i = 0; i < panes.length(); i++) {
-            JSONObject pane = panes.optJSONObject(i);
-            if (pane != null && paneId.equals(pane.optString("id", ""))) return true;
-        }
-        return false;
+        return HostLanding.hasPane(panes, paneId);
     }
 
     /**
@@ -2393,9 +2389,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     switchingHost = false;
                     switchingTo = null;
                     if (destroyed || !hostResumed || hostEpoch.stale(epoch)) { runWaitingPick(); return; }
-                    if (failure instanceof Refused) {
+                    if (failure instanceof HostLanding.Refused) {
                         // It answered and said no: not offline, so no cached view; stay here.
-                        note(host.name + " refused that terminal: " + ((Refused) failure).reason);
+                        note(host.name + " refused that terminal: " + ((HostLanding.Refused) failure).reason);
                         runWaitingPick();
                         return;
                     }
@@ -2407,15 +2403,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
     }
 
-    /**
-     * Waits for the new session, focuses its first pane and returns that id.
-     * {@code machineSwitch}: another computer was picked, so it lands on that
-     * computer's live Deacon (FleetTree.switchLanding) unless a live terminal
-     * there was named; with no Deacon, the usual choice below applies.
-     */
-    /** After its list, the most a switch waits for its pane (and a Deacon instead) to land. */
-    static final long AWAIT_LANDING_MS = 30_000;
-
     /** How long a machine switch waits for the new host's list, as before reconnects were bounded. */
     private static final long MACHINE_SWITCH_READY_MS = 45_000;
 
@@ -2425,112 +2412,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return arrived <= 0 ? "" : " (network back " + (SystemClock.uptimeMillis() - arrived) + " ms ago)";
     }
 
+    /** Where a new session lands (HostLanding), on this phone's native session and saved panes. */
     private String awaitHostPane(long handle, String hostId, String forcedPane, boolean machineSwitch,
             long readyWithinMs) throws Exception {
-        long until = SystemClock.uptimeMillis() + readyWithinMs;
-        // Everything this waits for, together: the list, the spaces and every landing (audit A1).
-        final long overall = until + AWAIT_LANDING_MS;
-        JSONObject state = null;
-        boolean listed = false;
-        while (SystemClock.uptimeMillis() < until) {
-            state = new JSONObject(RemoteNative.poll(handle, 0, false));
-            String phase = state.optString("state");
-            // Why it closed (a timeout, a refusal, a host key), not only that it did.
-            if ("closed".equals(phase)) throw new IllegalStateException("closed: " + state.optString("status"));
-            // The pane list arrives with the first snapshot; an empty array is
-            // not readiness.
-            JSONArray panes = state.optJSONArray("panes");
-            listed = "ready".equals(phase) || panes != null && panes.length() > 0;
-            if (listed) break;
-            Thread.sleep(150);
-        }
-        // Past its time a dead path holds up nothing: the caller closes the handle.
-        if (!listed) throw new IllegalStateException("no answer within " + readyWithinMs / 1000 + " s");
-        // A Deacon may be known only by its space's name: give the spaces a moment.
-        for (long spaces = SystemClock.uptimeMillis() + 1_500; machineSwitch && !FleetPanes.hasSpaces(state)
-                && SystemClock.uptimeMillis() < spaces; ) {
-            Thread.sleep(150);
-            state = new JSONObject(RemoteNative.poll(handle, 0, false));
-        }
-        JSONArray panes = state == null ? null : state.optJSONArray("panes");
-        if (panes == null || panes.length() == 0) throw new IllegalStateException("no panes");
-        // An explicit pick wins; then (switching computers) its live Deacon;
-        // then the pane this phone last used on that host; the daemon's own
-        // focus is often an idle shell.
-        String landing = machineSwitch ? FleetPanes.switchLanding(state, forcedPane) : "";
-        String pane = !landing.isEmpty() ? landing
-                : forcedPane != null && !forcedPane.isEmpty() ? forcedPane : rememberedHostPane(hostId);
-        // Then a pane that is actually doing something: an idle shell reads as
-        // a blank terminal even though it is rendering.
-        if (pane.isEmpty() || !hasPane(panes, pane)) {
-            for (int i = 0; i < panes.length() && pane.isEmpty(); i++) {
-                String status = panes.getJSONObject(i).optString("status", "");
-                if (!"unknown".equals(status) && !"idle".equals(status)) {
-                    pane = panes.getJSONObject(i).optString("id", "");
-                }
-            }
-        }
-        if (pane.isEmpty() || !hasPane(panes, pane)) {
-            for (int i = 0; i < panes.length() && pane.isEmpty(); i++) {
-                if (!"unknown".equals(panes.getJSONObject(i).optString("status", ""))) {
-                    pane = panes.getJSONObject(i).optString("id", "");
-                }
-            }
-        }
-        if (pane.isEmpty() || !hasPane(panes, pane)) {
-            pane = state.optString("focused_pane", "");
-        }
-        if (pane.isEmpty() || !hasPane(panes, pane)) pane = panes.getJSONObject(0).optString("id", "");
-        rememberHostPane(hostId, pane);
-        if (pane.isEmpty()) throw new IllegalStateException("no pane id");
-        // A pane picked offline while this connected (item 77) is where it lands.
-        for (int pick = 0; pick < 3; pick++) {
-            RemoteNative.focus(handle, pane);
-            until = Math.min(SystemClock.uptimeMillis() + 20_000, overall);
-            boolean landed = false;
-            while (!landed && SystemClock.uptimeMillis() < until) {
-                state = new JSONObject(RemoteNative.poll(handle, 0, false));
-                landed = pane.equals(state.optString("pane_id")) && "ready".equals(state.optString("state"));
-                // herdr-core refused it (audit A3): say why now, never wait out the 20 s.
-                String refused = refusedReason(state, pane);
-                if (refused != null) {
-                    // Switching computers: its Deacon instead, once; else the reason.
-                    String deacon = machineSwitch ? FleetPanes.switchLanding(state, null) : "";
-                    if (deacon.isEmpty() || deacon.equals(pane) || refusedReason(state, deacon) != null) {
-                        throw new Refused(pane, refused);
-                    }
-                    pane = deacon;
-                    RemoteNative.focus(handle, pane);
-                    until = Math.min(SystemClock.uptimeMillis() + 20_000, overall);
-                    continue;
-                }
-                if (!landed) Thread.sleep(150);
-            }
-            if (!landed) break;
-            String picked = rememberedHostPane(hostId);
-            if (machineSwitch || picked.isEmpty() || picked.equals(pane) || !hasPane(panes, picked)) return pane;
-            pane = picked;
-        }
-        return pane;
-    }
-
-    /** herdr-core refused to attach the pane a switch was for, and there was nothing to land on instead. */
-    static final class Refused extends Exception {
-        final String pane, reason;
-
-        Refused(String pane, String reason) {
-            super("refused " + pane + ": " + reason);
-            this.pane = pane;
-            this.reason = reason;
-        }
-    }
-
-    /** Why herdr-core refused to attach {@code pane} on this session, or null (core_session `refused`). */
-    static String refusedReason(JSONObject state, String pane) {
-        JSONObject refused = state == null ? null : state.optJSONObject("refused");
-        if (refused == null || pane == null || !pane.equals(refused.optString("terminal", ""))) return null;
-        String reason = refused.optString("reason", "").trim();
-        return reason.isEmpty() ? "it gave no reason" : reason;
+        HostLanding.Link link = new HostLanding.Link() {
+            @Override public JSONObject poll() throws Exception { return new JSONObject(RemoteNative.poll(handle, 0, false)); }
+            @Override public void focus(String pane) { RemoteNative.focus(handle, pane); }
+        };
+        HostLanding.Memory memory = new HostLanding.Memory() {
+            @Override public String remembered(String host) { return rememberedHostPane(host); }
+            @Override public void remember(String host, String pane) { rememberHostPane(host, pane); }
+        };
+        return new HostLanding(link, memory, SystemClock::uptimeMillis, Thread::sleep)
+                .await(hostId, forcedPane, machineSwitch, readyWithinMs);
     }
 
     private void adoptHost(SavedRemoteHost host, long handle, String pane) {

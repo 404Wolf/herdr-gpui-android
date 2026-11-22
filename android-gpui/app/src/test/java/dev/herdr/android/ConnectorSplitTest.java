@@ -35,9 +35,7 @@ public final class ConnectorSplitTest {
 
     @Test public void aSwitchsWaitsAreBoundedTogether() throws Exception {
         String wait = between(activity(), "private String awaitHostPane(", "private void adoptHost(");
-        assertTrue(wait.contains("final long overall = until + AWAIT_LANDING_MS;"));
-        assertFalse("every landing wait is capped by the overall bound",
-                wait.contains("until = SystemClock.uptimeMillis() + 20_000;"));
-        assertTrue(GpuiTerminalActivity.AWAIT_LANDING_MS <= 30_000);
+        assertTrue("the activity only adapts HostLanding", wait.contains(".await(hostId, forcedPane, machineSwitch, readyWithinMs);"));
+        assertTrue(HostLanding.LANDING_MS <= 30_000);
     }
 }
