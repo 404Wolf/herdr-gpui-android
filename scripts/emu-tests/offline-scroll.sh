@@ -338,10 +338,13 @@ else
     exit 1
 fi
 
-# (E-S2) A full-screen agent, airplane mode on, a drag at once (before any silence could say the
-# link is dead): never unanswered. Then the held frame: the note says only the screen was saved.
+# (E-S2) A full-screen agent, airplane mode on, a drag within a second (before any silence could
+# say the link is dead): never unanswered. Then the held frame: the note says only the screen was
+# saved.
 mark_log
+off_at=$(date +%s.%N)
 airplane enable
+sleep 1
 drag_back
 if note_shown 'only the last screen was saved|the agent scrolls when the link is back' 4; then
     record fullscreen-drag-at-once PASS "$($ui text "$EMU_OUT/ui.xml" 'only the last screen|scrolls when the link' 2> /dev/null)"
@@ -351,10 +354,22 @@ else
 fi
 quiet 6
 app_log > "$EMU_OUT/app-offline-1.log"
-if grep -q 'herdr-net.*no network' "$EMU_OUT/app-offline-1.log" && grep -q 'link lost: No network' "$EMU_OUT/app-offline-1.log"; then
-    record no-network-fails-fast PASS "the link was given up on the no-network callback (app-offline-1.log)"
+# The emulator resets the socket itself ("Remote session is closed"); a phone over Tailscale keeps
+# it, and the no-network callback gives it up ("No network"). Either way: within 2 s.
+lost=$(python3 - "$EMU_OUT/app-offline-1.log" "$off_at" << 'PY'
+import re, sys
+for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"\s*(\d+\.\d+)", line)
+    if m and "link lost:" in line:
+        print("%.1f" % (float(m.group(1)) - float(sys.argv[2])))
+        break
+PY
+)
+if grep -q 'herdr-net.*no network' "$EMU_OUT/app-offline-1.log" && [[ -n "$lost" ]] \
+    && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) <= 2 else 1)" "$lost"; then
+    record link-given-up PASS "the link was given up ${lost} s after airplane mode (app-offline-1.log)"
 else
-    record no-network-fails-fast FAIL "no 'no network' / 'link lost: No network' lines (app-offline-1.log)"
+    record link-given-up FAIL "no 'no network' line, or the link was not given up within 2 s ('${lost}', app-offline-1.log)"
 fi
 drag_back
 if note_shown 'only the last screen was saved' 4; then
@@ -399,8 +414,10 @@ else
     record reconnect-time FAIL "not live within 30 s of airplane mode off (app-back-1.log, not-back.png)"
 fi
 
-# (E-S1) A main-screen pane with history: held offline, a drag moves it.
-if switch_to shell-a; then
+# (E-S1) A main-screen pane with history: held offline, a drag moves it. Opened from Home, as
+# agent-f was: the two may sit in different tabs.
+launch
+if open_agent shell-a; then
     quiet 5
     mark_log
     airplane enable
@@ -422,13 +439,16 @@ if switch_to shell-a; then
     airplane disable
     wait_live 30 || record shell-back FAIL "not live within 30 s after the shell check"
 else
-    record shell-held-scroll SKIP "no shell-a tab"
+    shot shell-open-fail
+    record shell-held-scroll FAIL "could not open shell-a (shell-open-fail.png)"
 fi
 
 # (E-R2) The network is up but the host is down: the attempts are bounded, then the indicator
-# offers Reconnect, which works once the host is back.
+# offers Reconnect, which works once the host is back. Stopping the core ends the live link
+# (stopping sshd alone leaves an open session up); with sshd down every attempt is refused.
 mark_log
 stop_sshd
+hc server stop > /dev/null 2>&1
 if wait_ui 'offline · tap to reconnect' 150 > /dev/null; then
     shot stopped
     app_log > "$EMU_OUT/app-stopped.log"
@@ -447,6 +467,9 @@ if wait_ui 'offline · tap to reconnect' 150 > /dev/null; then
         record stays-stopped FAIL "$((after - tries)) attempts after stopping"
     fi
     start_sshd || record setup FAIL "sshd did not restart"
+    # The core starts again with a terminal to land on (a stopped core keeps none of these).
+    hc run --bg --label agent.kind=claude --name shell-b -- sh -c 'printf "back\n$ "; exec cat' \
+        > "$EMU_OUT/hc-b.log" 2>&1 || record setup FAIL "hc run shell-b after the restart (hc-b.log)"
     mark_log
     if tap_ui 'offline · tap to reconnect' 10 && tap_ui '^Reconnect$' 10 && wait_live 40; then
         record reconnect-by-hand PASS "Reconnect brought the pane back"
