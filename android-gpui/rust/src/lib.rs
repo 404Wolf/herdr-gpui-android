@@ -24,6 +24,7 @@ pub mod elicitation;
 #[cfg(all(feature = "remote", target_os = "android"))]
 mod elicitation_jni;
 #[cfg(all(feature = "remote", unix))]
+mod agent_history;
 mod phone_ops;
 /// Wolf's ask: scrolling keeps working offline, on held and cached panes.
 #[cfg(all(test, feature = "remote", unix))]
