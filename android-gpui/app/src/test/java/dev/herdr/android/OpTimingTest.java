@@ -39,6 +39,9 @@ public final class OpTimingTest {
                 OpTiming.reason("beads.detail", new IllegalStateException("herdr-core protocol: \"denied\": exec refused")));
         assertEquals("can't reach the machine", OpTiming.reason("beads.detail", new IllegalArgumentException("x")));
         assertEquals("can't reach the machine", OpTiming.reason("beads.detail", new IllegalStateException("  ")));
-        assertEquals(160, OpTiming.reason("usage.look", new IllegalStateException("x".repeat(300))).length());
+        assertEquals(OpTiming.REASON_MAX, OpTiming.reason("usage.look", new IllegalStateException("x".repeat(300))).length());
+        // Untrusted daemon text: one line, no control characters, no paths.
+        assertEquals("exec failed: … not found", OpTiming.clean("exec failed:\n/home/wolf/.config/x\u001b[31m not found"));
+        assertEquals("cannot read …", OpTiming.clean("cannot read ~/beads/demo/.beads"));
     }
 }
