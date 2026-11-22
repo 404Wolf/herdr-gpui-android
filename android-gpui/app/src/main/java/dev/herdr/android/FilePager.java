@@ -24,13 +24,13 @@ import java.util.function.BiFunction;
 import org.json.JSONObject;
 
 /**
- * Two pages over the terminal's area: the live terminal, and a read-only,
- * highlighted file to its right. A file opens from a tapped path in the
- * terminal or an agent's {@code open_file} event; then a swipe left (from the
- * right half, clear of the rail's gesture) shows it and a swipe right, Back or
- * the header's arrow goes back. The terminal keeps running underneath and the
- * file page lies over it, so neither page changes the other's layout. A thin
- * handle on the right edge says a file is there.
+ * A read-only, highlighted file over the terminal's area. A file opens from a tapped path in the
+ * terminal or the panel, or an agent's {@code open_file} event; it comes DOWN FROM THE TOP over
+ * the terminal (Wolf 11-22) and goes back up with an upward swipe that starts on its header, or
+ * one past the end of the file, or Back or the header's arrow. Scrolling and selecting the text
+ * keep their own gestures. The terminal keeps running underneath and the file page lies over it,
+ * so neither page changes the other's layout, and closing returns to exactly what was there. A
+ * small tab at the top says a file is there; a tap or a downward pull on it brings it back.
  */
 final class FilePager extends FrameLayout {
     /** Reads {@code (terminal, path)} with a blocking session action; returns its JSON reply. */
@@ -95,9 +95,8 @@ final class FilePager extends FrameLayout {
         handle.setVisibility(GONE);
         handle.setContentDescription("Show the file");
         handle.setOnClickListener(v -> show());
-        // A wide touch target around a thin mark.
-        handle.setPadding(dp(10), 0, 0, 0);
-        addView(handle, new LayoutParams(dp(14), dp(56), Gravity.END | Gravity.CENTER_VERTICAL));
+        // A wide touch target around a thin mark, at the top: the file comes down from there.
+        addView(handle, new LayoutParams(dp(56), dp(14), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
         applyChrome(chrome);
     }
 
@@ -112,8 +111,8 @@ final class FilePager extends FrameLayout {
         GradientDrawable mark = new GradientDrawable();
         mark.setColor(GpuiChrome.withAlpha(chrome.outline, 200));
         mark.setCornerRadius(dp(2));
-        // Inset: the mark is 3dp at the edge, the rest is touch target.
-        handle.setBackground(new android.graphics.drawable.InsetDrawable(mark, dp(11), dp(8), 0, dp(8)));
+        // Inset: the mark is 3dp at the top edge, the rest is touch target.
+        handle.setBackground(new android.graphics.drawable.InsetDrawable(mark, dp(8), 0, dp(8), dp(11)));
         adapter.notifyDataSetChanged();
     }
 
@@ -124,6 +123,11 @@ final class FilePager extends FrameLayout {
 
     /** Opens {@code path} (from {@code terminal}'s folder) at {@code line}, reading it off the UI thread. */
     void open(String terminal, String path, int line) {
+        open(terminal, path, line, reader);
+    }
+
+    /** As {@link #open(String, String, int)}, read through {@code through} (another machine's session). */
+    void open(String terminal, String path, int line, BiFunction<String, String, String> through) {
         if (terminal == null || terminal.isEmpty() || path == null || path.isEmpty()) return;
         final int ticket = ++request;
         title.setText(path);
@@ -134,7 +138,7 @@ final class FilePager extends FrameLayout {
         worker.execute(() -> {
             FileDocument read;
             try {
-                read = FileDocument.parse(path, line, reader.apply(terminal, path));
+                read = FileDocument.parse(path, line, through.apply(terminal, path));
             } catch (RuntimeException | LinkageError failure) {
                 read = FileDocument.failed(path, line, "Reopen and check the session");
             }
@@ -207,7 +211,7 @@ final class FilePager extends FrameLayout {
         shown = open;
         if (changed && onShownChanged != null) onShownChanged.run();
         page.setVisibility(VISIBLE);
-        page.animate().translationX(open ? 0 : getWidth()).setDuration(160).withEndAction(() -> {
+        page.animate().translationY(open ? 0 : -getHeight()).setDuration(180).withEndAction(() -> {
             if (!shown) page.setVisibility(INVISIBLE);
         }).start();
         handle.setVisibility(!open && hasFile() ? VISIBLE : GONE);
@@ -215,13 +219,15 @@ final class FilePager extends FrameLayout {
 
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
-        page.setTranslationX(shown ? 0 : w);
+        page.setTranslationX(0);
+        page.setTranslationY(shown ? 0 : -h);
     }
 
     /**
-     * Claims a mostly horizontal drag: leftward from the terminal's right
-     * half when a file is there, rightward on the file page. A claimed drag
-     * reaches the terminal as a cancel, so it never becomes a tap or scroll.
+     * Claims a mostly vertical drag that moves the page (Dismiss.claims): upward on the file page
+     * when it starts on the header or the list is at its end, downward from the top tab while a
+     * file is there. A claimed drag reaches the views under it as a cancel, so it never becomes
+     * a tap, a scroll or a selection.
      */
     @Override public boolean onInterceptTouchEvent(MotionEvent event) {
         switch (event.getActionMasked()) {
@@ -232,12 +238,11 @@ final class FilePager extends FrameLayout {
                 return false;
             case MotionEvent.ACTION_MOVE:
                 if (event.getPointerCount() > 1) return false;
-                float dx = event.getX() - downX;
-                float dy = Math.abs(event.getY() - downY);
-                boolean horizontal = Math.abs(dx) > slop && Math.abs(dx) > dy * 2;
-                boolean leftOnTerminal = !shown && dx < 0 && hasFile() && downX > getWidth() / 2f;
-                boolean rightOnFile = shown && dx > 0;
-                dragging = horizontal && (leftOnTerminal || rightOnFile);
+                float dx = Math.abs(event.getX() - downX);
+                float dy = event.getY() - downY;
+                boolean onHeader = downY < page.getTranslationY() + dp(28);
+                boolean onTab = !shown && hasFile() && downY < dp(28) && Math.abs(downX - getWidth() / 2f) < dp(48);
+                dragging = Dismiss.claims(shown, dy, dx, slop, onHeader, !list.canScrollVertically(1), onTab);
                 if (dragging) page.setVisibility(VISIBLE);
                 return dragging;
             default:
@@ -247,17 +252,17 @@ final class FilePager extends FrameLayout {
 
     @Override public boolean onTouchEvent(MotionEvent event) {
         if (!dragging) return super.onTouchEvent(event);
-        float dx = event.getX() - downX;
-        int width = getWidth();
+        float dy = event.getY() - downY;
+        int height = getHeight();
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_MOVE:
-                float base = shown ? 0 : width;
-                page.setTranslationX(Math.max(0, Math.min(width, base + dx)));
+                float base = shown ? 0 : -height;
+                page.setTranslationY(Math.max(-height, Math.min(0, base + dy)));
                 return true;
             case MotionEvent.ACTION_UP:
                 dragging = false;
                 // A third of the way commits; less springs back.
-                settle(shown ? dx < width / 3f : -dx > width / 3f);
+                settle(shown ? -dy < height / 3f : dy > height / 3f);
                 return true;
             case MotionEvent.ACTION_CANCEL:
                 dragging = false;
@@ -265,6 +270,24 @@ final class FilePager extends FrameLayout {
                 return true;
             default:
                 return true;
+        }
+    }
+
+    /** Which vertical drags move the page: pure, for tests. */
+    static final class Dismiss {
+        private Dismiss() { }
+
+        /**
+         * {@code dy} down positive. Shown: an upward drag past the slop, mostly vertical, that
+         * starts on the header or comes when the list is already at its end. Hidden: a downward
+         * drag from the top tab.
+         */
+        static boolean claims(boolean shown, float dy, float dx, float slop, boolean onHeader, boolean atEnd,
+                boolean onTab) {
+            boolean vertical = Math.abs(dy) > slop && Math.abs(dy) > dx * 2;
+            if (!vertical) return false;
+            if (shown) return dy < 0 && (onHeader || atEnd);
+            return dy > 0 && onTab;
         }
     }
 

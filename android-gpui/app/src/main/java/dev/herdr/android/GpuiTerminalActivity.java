@@ -558,6 +558,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
         column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
         filePager.setOnShownChanged(() -> {
+            if (!filePager.showingFile() && reopenPanelAfterFile) {
+                reopenPanelAfterFile = false;
+                toggleWorkPanel(true);
+            }
             composer.setCovered(filePager.showingFile());
             refreshOffer();
         });
@@ -1484,14 +1488,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             @Override public void openFile(String hostId, String path) {
                 Connection now;
                 synchronized (stateLock) { now = connection; }
-                if (now == null || filePager == null) return;
-                // The viewer reads through the connection on screen: another machine's file waits for t3jk's wiring.
-                if (hostId == null || !hostId.equals(now.hostId)) {
-                    note("That file is on " + hostName(hostId) + "; switch to it to open the file");
+                if (now == null || filePager == null || hostId == null) return;
+                // On the cover the panel covers the terminal: it steps aside and comes back when
+                // the file closes, as it was (WorkPanel keeps its tab and scroll).
+                if (compactWindow() && workPanelOpen) {
+                    toggleWorkPanel(false);
+                    reopenPanelAfterFile = true;
+                }
+                if (hostId.equals(now.hostId)) {
+                    filePager.open(now.paneId, path, 0);
                     return;
                 }
-                if (compactWindow()) toggleWorkPanel(false);
-                filePager.open(now.paneId, path, 0);
+                // The doc's own machine (Wolf 11-22): read through that machine's mirror session,
+                // never the one on screen; nothing to read through says so.
+                HostSample mirror = hostSamples.get(hostId);
+                JSONArray panes = mirror == null ? null : mirror.panes;
+                String terminal = panes == null || panes.length() == 0 ? "" : panes.optJSONObject(0) == null ? ""
+                        : panes.optJSONObject(0).optString("id", "");
+                if (mirror == null || !mirror.connected || mirror.handle <= 0 || terminal.isEmpty()) {
+                    note("Can't reach " + hostName(hostId) + " to open that file now");
+                    return;
+                }
+                final long handle = mirror.handle;
+                filePager.open(terminal, path, 0, (t, p) -> readThrough(handle, t, p));
             }
             @Override public void openLink(String url) {
                 String lower = url == null ? "" : url.toLowerCase(java.util.Locale.ROOT);
@@ -5903,6 +5922,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { target = connection; }
         return readFile(target, terminal, path, 0);
     }
+
+    /** One {@code file.read} through another machine's mirror session {@code handle}, as {@link #readFile}. */
+    private static String readThrough(long handle, String terminal, String path) {
+        try {
+            JSONObject read = new JSONObject().put("op", "file.read").put("terminal", terminal).put("path", path);
+            return RemoteNative.sessionAction(handle, read.toString());
+        } catch (JSONException impossible) {
+            return "{\"queued\":false}";
+        } catch (RuntimeException failed) {
+            String kind = RemoteError.kindOf(failed);
+            return "{\"queued\":false,\"error\":\"" + (kind.isEmpty() ? "failed" : kind) + "\"}";
+        }
+    }
+
+    /** The cover's panel stepped aside for a file opened from it: it comes back when the file closes. */
+    private boolean reopenPanelAfterFile;
 
     /** One {@code file.read} through {@code target}'s session; {@code limit} lines, 0 for the tap's whole read. */
     private String readFile(Connection target, String terminal, String path, int limit) {
