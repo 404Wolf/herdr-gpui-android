@@ -196,7 +196,7 @@ public final class OfflineNeverDimsTest {
         for (String branch : new String[] {"if (", "if(", "switch", "while", "throw", "? false", "?false"}) {
             assertTrue("requestScroll may not branch before HeldScroll: " + branch, !entry.contains(branch));
         }
-        assertEquals(3, count(scroll, "return "));
+        assertEquals(4, count(scroll, "return "));
         // The drag and the fling reach it with every step.
         assertTrue(terminal.contains("boolean atEdge = step != 0 && !requestScroll(step);"));
     }

@@ -36,4 +36,17 @@ public class ReconnectPolicyTest {
         assertFalse(ReconnectPolicy.dead(ReconnectPolicy.SUSPECT_QUIET_MS, false));
         assertTrue(ReconnectPolicy.dead(ReconnectPolicy.DEAD_QUIET_MS, false));
     }
+
+    @Test
+    public void offlineRedesign_aLinkIsInDoubtOnlyWhenQuietPastARefreshJustAfterAChange() {
+        // Quiet past one missed refresh, just after a network change: nothing is sent over it.
+        assertTrue(ReconnectPolicy.suspect(ReconnectPolicy.DOUBT_QUIET_MS, true));
+        assertFalse(ReconnectPolicy.suspect(ReconnectPolicy.DOUBT_QUIET_MS - 1, true));
+        // Without a change, a quiet link is trusted until it is dead.
+        assertFalse(ReconnectPolicy.suspect(ReconnectPolicy.DEAD_QUIET_MS - 1, false));
+        // In doubt before it is given up: drags stay on the phone in between.
+        assertTrue(ReconnectPolicy.DOUBT_QUIET_MS < ReconnectPolicy.SUSPECT_QUIET_MS);
+        // Longer than one two-second refresh, so a healthy link is not doubted.
+        assertTrue(ReconnectPolicy.DOUBT_QUIET_MS > 2_000);
+    }
 }

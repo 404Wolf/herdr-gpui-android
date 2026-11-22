@@ -68,12 +68,18 @@ final class Transcripts {
         final TranscriptKey key;
         final String text;
         final boolean truncated;
+        /**
+         * The program's screen only, not its history: what the core's bounded read gives for a
+         * full-screen program (Claude Code, Codex). It shows nothing the held frame does not.
+         */
+        final boolean screen;
         final long asOfMs;
 
-        Transcript(TranscriptKey key, String text, boolean truncated, long asOfMs) {
+        Transcript(TranscriptKey key, String text, boolean truncated, boolean screen, long asOfMs) {
             this.key = key;
             this.text = text;
             this.truncated = truncated;
+            this.screen = screen;
             this.asOfMs = asOfMs;
         }
     }
@@ -99,6 +105,15 @@ final class Transcripts {
     /** "transcript as of 14:02 · may be outdated". */
     static String label(String when) {
         return "transcript as of " + when + " · may be outdated";
+    }
+
+    /**
+     * The transcript view's title: its pane, when it was read, and what it is not. A screen-only
+     * read says "screen only"; one the core cut says "older lines not kept".
+     */
+    static String title(String pane, String when, Transcript t) {
+        return pane + " · " + label(when) + (t.screen ? " · screen only" : "")
+                + (t.truncated ? " · older lines not kept" : "");
     }
 
     /** The file a transcript is kept in. */
@@ -127,6 +142,11 @@ final class Transcripts {
      * stays whole).
      */
     synchronized boolean save(TranscriptKey key, String text, boolean truncated, long asOfMs) {
+        return save(key, text, truncated, false, asOfMs);
+    }
+
+    /** As {@link #save(TranscriptKey, String, boolean, long)}; {@code screen}: the screen only, no history. */
+    synchronized boolean save(TranscriptKey key, String text, boolean truncated, boolean screen, long asOfMs) {
         if (!started) start();
         if (key == null || text == null) return false;
         byte[] body = text.getBytes(StandardCharsets.UTF_8);
@@ -138,7 +158,7 @@ final class Transcripts {
         try {
             header = new JSONObject().put("v", 1).put("core", key.machine.core).put("hostkey", key.machine.hostKey)
                     .put("address", key.address).put("created_ms", key.createdMs).put("incarnation", key.incarnation)
-                    .put("as_of_ms", asOfMs).put("truncated", truncated).toString();
+                    .put("as_of_ms", asOfMs).put("truncated", truncated).put("screen", screen).toString();
         } catch (JSONException impossible) {
             return false;
         }
@@ -165,7 +185,7 @@ final class Transcripts {
         if (header == null || !header.names(key)) return null;
         String body = text.substring(end + 1);
         if (body.getBytes(StandardCharsets.UTF_8).length > MAX_TEXT_BYTES) return null;
-        return new Transcript(key, body, header.truncated, header.asOfMs);
+        return new Transcript(key, body, header.truncated, header.screen, header.asOfMs);
     }
 
     /**
@@ -288,7 +308,7 @@ final class Transcripts {
     private static final class Header {
         final String core, hostKey, address, incarnation;
         final long createdMs, asOfMs;
-        final boolean truncated;
+        final boolean truncated, screen;
 
         private Header(JSONObject h) {
             core = h.optString("core", "");
@@ -298,6 +318,9 @@ final class Transcripts {
             createdMs = h.optLong("created_ms", 0);
             asOfMs = h.optLong("as_of_ms", 0);
             truncated = h.optBoolean("truncated", false);
+            // Files written before the flag were all read without stitching, so an agent's was its
+            // screen only: unknown counts as the screen, and offers no history.
+            screen = h.optBoolean("screen", true);
         }
 
         static Header parse(String line) {

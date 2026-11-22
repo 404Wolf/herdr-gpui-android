@@ -27,14 +27,25 @@ import java.util.Set;
 final class ConnectionMonitor {
     /** After a network change, how long a short silence is treated as a dead link. */
     private static final long CHANGE_WINDOW_MS = 8_000;
+    /**
+     * How long the phone must have no network before the live link is given up: a handover
+     * that loses Wi-Fi a moment before cellular is up is not an outage.
+     */
+    static final long GONE_GRACE_MS = 500;
 
     private final ConnectivityManager connectivity;
     private final Handler main;
     private final Runnable attempt;
     private final Runnable changed;
+    private final Runnable gone;
     private final ReconnectPolicy policy = new ReconnectPolicy();
     private final Set<Network> physical = new HashSet<>();
     private final Runnable fire = this::fire;
+    private final Runnable goneCheck = this::goneCheck;
+    /** A physical network was seen since start: an empty set means they were lost, not unknown yet. */
+    private boolean seenPhysical;
+    /** Every physical network was lost and none came back: the link cannot be up. Any thread. */
+    private volatile boolean noNetwork;
     private boolean started;
     private boolean wanted;
     private volatile long changedAt;
@@ -43,21 +54,36 @@ final class ConnectionMonitor {
      * @param attempt runs one reconnect; it must report back with
      *     {@link #succeeded()} or {@link #failed()}
      * @param changed runs on any network change, to re-check a live link
+     * @param gone runs when the phone has had no network for {@link #GONE_GRACE_MS}: a live
+     *     link is dead now, without waiting for its silence to say so
      */
-    ConnectionMonitor(Context context, Handler main, Runnable attempt, Runnable changed) {
+    ConnectionMonitor(Context context, Handler main, Runnable attempt, Runnable changed, Runnable gone) {
         this.connectivity = context.getSystemService(ConnectivityManager.class);
         this.main = main;
         this.attempt = attempt;
         this.changed = changed;
+        this.gone = gone;
     }
 
     private final ConnectivityManager.NetworkCallback physicalCallback = new ConnectivityManager.NetworkCallback() {
         @Override public void onAvailable(Network network) {
-            main.post(() -> { if (physical.add(network)) networkChanged(); });
+            main.post(() -> {
+                seenPhysical = true;
+                noNetwork = false;
+                main.removeCallbacks(goneCheck);
+                if (physical.add(network)) networkChanged();
+            });
         }
 
         @Override public void onLost(Network network) {
-            main.post(() -> { if (physical.remove(network)) networkChanged(); });
+            main.post(() -> {
+                if (!physical.remove(network)) return;
+                if (physical.isEmpty() && seenPhysical) {
+                    main.removeCallbacks(goneCheck);
+                    main.postDelayed(goneCheck, GONE_GRACE_MS);
+                }
+                networkChanged();
+            });
         }
     };
 
@@ -100,7 +126,10 @@ final class ConnectionMonitor {
         if (!started) return;
         started = false;
         main.removeCallbacks(fire);
+        main.removeCallbacks(goneCheck);
         physical.clear();
+        seenPhysical = false;
+        noNetwork = false;
         try {
             connectivity.unregisterNetworkCallback(physicalCallback);
         } catch (RuntimeException ignored) {
@@ -156,6 +185,17 @@ final class ConnectionMonitor {
                 && connectivity.getActiveNetwork() == null;
     }
 
+    /**
+     * Whether a live link is in doubt, so that nothing may be sent over it (a drag scrolls the
+     * phone's own rows instead of giving a full-screen agent wheel input): every network is
+     * gone, or the network just changed and the link has been quiet for {@code quietMs}. Any thread.
+     */
+    boolean suspect(long quietMs) {
+        if (noNetwork) return true;
+        long since = SystemClock.uptimeMillis() - changedAt;
+        return ReconnectPolicy.suspect(quietMs, changedAt != 0 && since < CHANGE_WINDOW_MS);
+    }
+
     /** Whether a live session quiet this long should be replaced now. Any thread. */
     boolean dead(long quietMs) {
         long since = SystemClock.uptimeMillis() - changedAt;
@@ -171,6 +211,14 @@ final class ConnectionMonitor {
             schedule(policy.next());
         }
         changed.run();
+    }
+
+    /** Still no network after the grace: the live link is gone. Main thread. */
+    private void goneCheck() {
+        if (!started || !physical.isEmpty()) return;
+        noNetwork = true;
+        android.util.Log.i("herdr-net", "no network");
+        gone.run();
     }
 
     private void schedule(long delayMs) {

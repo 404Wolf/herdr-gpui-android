@@ -25,8 +25,7 @@ final class TranscriptScreen {
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout card = ActionSheet.card(activity, chrome);
         int pad = dp(activity, 12);
-        TextView title = ActionSheet.label(activity, pane + " · " + Transcripts.label(when)
-                + (t.truncated ? " · older lines not kept" : ""), 12, chrome.warning);
+        TextView title = ActionSheet.label(activity, Transcripts.title(pane, when, t), 12, chrome.warning);
         title.setPadding(pad, pad, pad, dp(activity, 6));
         card.addView(title);
         TextView text = new TextView(activity);

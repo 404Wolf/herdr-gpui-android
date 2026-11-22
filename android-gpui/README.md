@@ -340,6 +340,19 @@ direct link shows the same program still running there; the transcript opens
 at its newest line, scrolls back, and says it may be outdated. A core without
 those features is never read and nothing is offered: the app behaves as before.
 
+Scrolling offline never goes unanswered. When the phone loses every network,
+the link is given up half a second later, without waiting for it to go quiet,
+and the frame on screen scrolls on the phone. Just after a network change,
+while the link has missed a refresh, a drag also scrolls only the phone's own
+rows and sends the program nothing, not even a wheel report. Claude Code and
+Codex are full-screen programs: they keep their history to themselves, so a
+held or saved screen of theirs has no rows above it. A drag back there opens a
+saved transcript that holds more than the screen, if there is one. Otherwise it
+says "offline · only the last screen was saved", or, while the link is only in
+doubt, that the agent scrolls when the link is back. A transcript read without
+stitching is a full-screen program's screen only, and its title says "screen
+only".
+
 See [../android/VALIDATION.md](../android/VALIDATION.md) for the previous native
 preview's checks. GPUI-specific build and runtime evidence belongs in
 `VALIDATION.md` in this directory; the earlier Java APK's validation is not proof

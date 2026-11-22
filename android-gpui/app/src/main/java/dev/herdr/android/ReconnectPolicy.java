@@ -20,6 +20,12 @@ final class ReconnectPolicy {
     static final long DEAD_QUIET_MS = 12_000;
     /** Just after a network change, a link that missed one refresh is not trusted. */
     static final long SUSPECT_QUIET_MS = 3_500;
+    /**
+     * Just after a network change, a link this quiet is in doubt: it has missed a refresh (the
+     * core sends one every two seconds), so nothing is sent over it until it talks again or is
+     * replaced. Losing every network says so sooner (ConnectionMonitor's no-network grace).
+     */
+    static final long DOUBT_QUIET_MS = 2_500;
 
     private int attempt;
 
@@ -46,5 +52,10 @@ final class ReconnectPolicy {
      */
     static boolean dead(long quietMs, boolean networkJustChanged) {
         return quietMs >= (networkJustChanged ? SUSPECT_QUIET_MS : DEAD_QUIET_MS);
+    }
+
+    /** Whether a live link quiet for {@code quietMs} is in doubt: only just after a network change. */
+    static boolean suspect(long quietMs, boolean networkJustChanged) {
+        return networkJustChanged && quietMs >= DOUBT_QUIET_MS;
     }
 }

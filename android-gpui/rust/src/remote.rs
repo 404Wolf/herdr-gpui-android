@@ -799,22 +799,44 @@ pub fn hold_note(pane: &str, title: &str, note: &str, cols: u16, rows: u16) -> R
     hold(terminal);
     Ok(id)
 }
+/// One step of the phone's own scrolling of `grid`, sending nothing:
+/// `{"local_offset": rows back from the newest, "history": rows kept above the
+/// screen, "moved": whether the view changed}`. A full-screen program's grid
+/// keeps no history, so a step back there never moves: the caller says so
+/// rather than leave a drag unanswered.
+pub(crate) fn scroll_grid<U: rio_vt::event::EventListener>(
+    grid: &mut rio_vt::crosswords::Crosswords<U>,
+    scroll: rio_vt::crosswords::grid::Scroll,
+) -> Value {
+    let before = grid.display_offset();
+    grid.scroll_display(scroll);
+    let offset = grid.display_offset();
+    json!({"local_offset": offset, "history": grid.history_size(), "moved": offset != before})
+}
+/// The answer of a scroll with no grid to move.
+fn scrolled_nothing() -> Value {
+    json!({"local_offset": 0, "history": 0, "moved": false})
+}
+/// A step of `delta` rows back (positive) or forward, at most 1000 either way.
+fn delta_scroll(delta: i64) -> rio_vt::crosswords::grid::Scroll {
+    rio_vt::crosswords::grid::Scroll::Delta(delta.clamp(-1000, 1000) as i32)
+}
 /// Scrolls the held frame's own history, with no link: `delta` rows back
 /// (positive) or forward, or back to the newest line when `latest`. Never sends
 /// anything, so even a program that takes wheel input is scrolled locally.
-/// `{"local_offset": rows back from the newest}`; 0 when nothing is held.
+/// See [`scroll_grid`] for the answer; all zero when nothing is held.
 pub fn scroll_held(delta: i64, latest: bool) -> String {
-    let offset = lock(held()).as_ref().map_or(0, |held| {
-        let mut grid = held.terminal.grid().lock();
-        let scroll = if latest {
-            rio_vt::crosswords::grid::Scroll::Bottom
-        } else {
-            rio_vt::crosswords::grid::Scroll::Delta(delta.clamp(-1000, 1000) as i32)
-        };
-        grid.scroll_display(scroll);
-        grid.display_offset()
-    });
-    json!({"local_offset": offset}).to_string()
+    let scroll = if latest {
+        rio_vt::crosswords::grid::Scroll::Bottom
+    } else {
+        delta_scroll(delta)
+    };
+    lock(held())
+        .as_ref()
+        .map_or_else(scrolled_nothing, |held| {
+            scroll_grid(&mut held.terminal.grid().lock(), scroll)
+        })
+        .to_string()
 }
 pub fn poll(id: u64, _since: u64, _mirror: bool) -> Result<String> {
     let owner = session(id)?;
@@ -1067,6 +1089,17 @@ pub fn scroll_local(id: u64, delta: i64, paint: UiPaint<'_>) -> Result<String> {
     }
     let _ = (paint.generation, paint.title, paint.status, paint.shortcuts);
     Ok(json!({"queued":true}).to_string())
+}
+/// Scrolls session `id`'s live grid on the phone only, while its link is in
+/// doubt: never wheel input, which a full-screen agent would wait on over a
+/// dead link. Answers as [`scroll_grid`] does.
+pub fn scroll_local_only(id: u64, delta: i64) -> Result<String> {
+    let owner = session(id)?;
+    let state = lock(&owner.state);
+    let answer = state.terminal.as_ref().map_or_else(scrolled_nothing, |terminal| {
+        scroll_grid(&mut terminal.grid().lock(), delta_scroll(delta))
+    });
+    Ok(answer.to_string())
 }
 pub fn scroll_to(id: u64, offset: i64) -> Result<String> {
     let owner = session(id)?;

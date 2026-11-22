@@ -1326,11 +1326,68 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         final Connection target;
         synchronized (stateLock) { target = connection; }
         return HeldScroll.scroll(shellMode(), target != null, target != null && target.isClosed(),
-                target == null ? 0 : target.remoteHandle, target != null && target.ready, lines,
+                target == null ? 0 : target.remoteHandle, target != null && target.ready, linkInDoubt(target), lines,
                 new HeldScroll.Sink() {
                     @Override public boolean held(int step) { return scrollHeld(step, false); }
                     @Override public boolean live(int step) { return scrollLive(target, step); }
+                    @Override public boolean local(int step) { return scrollLocalOnly(target, step); }
                 });
+    }
+
+    /**
+     * Whether a live pane's link is in doubt (no network, or quiet just after a change): then a
+     * drag scrolls the phone's own rows and sends nothing (factory-9zz.1: a full-screen agent
+     * otherwise gets wheel input over a dead link, and nothing moves). Any thread.
+     */
+    private boolean linkInDoubt(Connection target) {
+        return target != null && monitor != null && monitor.suspect(target.quietMs);
+    }
+
+    /** The edge rule has answered the gesture now running: once per drag or fling. Main thread. */
+    private boolean edgeSaid;
+
+    /**
+     * After a step on the phone's own rows: a drag back that moved nothing is answered,
+     * once per gesture, by the saved history or a note saying why there is nothing older.
+     * {@code doubt}: the live pane's link is in doubt (it is not offline). Main thread.
+     */
+    private void answerEdge(int lines, JSONObject step, boolean doubt) {
+        HeldScroll.Edge edge = HeldScroll.edge(lines, step.optBoolean("moved", true),
+                step.optLong("history", 0), transcriptOpen != null && transcriptHistory, edgeSaid);
+        if (edge == HeldScroll.Edge.NONE) return;
+        edgeSaid = true;
+        stopFling();
+        if (edge == HeldScroll.Edge.OPEN_HISTORY) {
+            transcriptOpen.run();
+        } else if (doubt && edge == HeldScroll.Edge.SCREEN_ONLY) {
+            note(HeldScroll.DOUBT_NOTE);
+        } else {
+            note(edge == HeldScroll.Edge.SCREEN_ONLY ? HeldScroll.SCREEN_ONLY_NOTE : HeldScroll.NO_OLDER_NOTE);
+        }
+    }
+
+    /**
+     * A live pane whose link is in doubt scrolls its own rows on the phone: nothing is sent,
+     * not even a wheel report. Its "Latest" pill follows the offset.
+     */
+    private boolean scrollLocalOnly(Connection target, int lines) {
+        final int epoch = scrollEpoch.get();
+        try {
+            scrollWorker.execute(() -> {
+                if (epoch != scrollEpoch.get()) return;
+                try {
+                    JSONObject step = new JSONObject(RemoteNative.scrollLocalOnly(target.remoteHandle, lines));
+                    main.post(() -> {
+                        showLatest(step.optLong("local_offset", 0) > 0);
+                        answerEdge(lines, step, true);
+                    });
+                } catch (Exception | LinkageError ignored) {
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException busy) {
+            return false;
+        }
+        return true;
     }
 
     /** A live Herdr pane scrolls its own buffered rows; the daemon backfills gaps. */
@@ -1409,8 +1466,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         try {
             scrollWorker.execute(() -> {
                 try {
-                    long offset = new JSONObject(RemoteNative.scrollHeld(lines, latest)).optLong("local_offset", 0);
-                    main.post(() -> showLatest(offset > 0));
+                    JSONObject step = new JSONObject(RemoteNative.scrollHeld(lines, latest));
+                    main.post(() -> {
+                        showLatest(step.optLong("local_offset", 0) > 0);
+                        if (!latest) answerEdge(lines, step, false);
+                    });
                 } catch (Exception | LinkageError ignored) {
                 }
             });
@@ -2430,6 +2490,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private TranscriptKeeper transcripts;
     /** The offline transcript's button, and what it was last looked up for. Main thread. */
     private TextView transcriptButton;
+    /** Opens the transcript the button offers, checked again then; null while none is offered. */
+    private Runnable transcriptOpen;
+    /** The offered transcript holds more than the screen: a drag past the top opens it. */
+    private boolean transcriptHistory;
     private String transcriptQuery = "";
     /** Counts lookups: an answer, or a tap, for an older one is stale. Main thread. */
     private long transcriptSeq;
@@ -5733,6 +5797,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void hideTranscriptButton() {
+        transcriptOpen = null;
+        transcriptHistory = false;
         if (transcriptButton == null) return;
         transcriptButton.setVisibility(View.GONE);
         transcriptButton.setOnClickListener(null);
@@ -5773,7 +5839,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 android.text.format.DateFormat.is24HourFormat(this), java.util.Locale.getDefault());
         transcriptButton.setText("≡ transcript · as of " + when);
         transcriptButton.setContentDescription("Read " + pane + "'s " + Transcripts.label(when));
-        transcriptButton.setOnClickListener(v -> {
+        transcriptOpen = () -> {
             // Checked again on the tap: the selection may have moved since it was shown.
             refreshTranscript(here());
             if (!transcriptCurrent(seq, machine, address, t)) {
@@ -5781,7 +5847,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 return;
             }
             TranscriptScreen.show(this, chrome, pane, when, t);
-        });
+        };
+        transcriptHistory = !t.screen;
+        transcriptButton.setOnClickListener(v -> { if (transcriptOpen != null) transcriptOpen.run(); });
         transcriptButton.setVisibility(View.VISIBLE);
     }
 
@@ -5970,6 +6038,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (masked == MotionEvent.ACTION_DOWN) {
             stopFling();
+            edgeSaid = false;
             touchDownX = edgeStartX = event.getX();
             edgeClaimed = false;
             touchDownY = lastTouchY = event.getY();
@@ -6133,7 +6202,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Herdr in front is Wolf looking at it (item 71): the attach that follows says so.
         markUsed();
         if (monitor == null && !launch.shell) {
-            monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown);
+            monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown, this::networkGone);
         }
         if (monitor != null) monitor.start();
         loadFleetCache();
@@ -7068,9 +7137,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         current.generation, LinkFrame.part(current.hostId), shortcutJson);
                 if (rawState == null || rawState.length() > 1024 * 1024) throw new IOException("Oversized remote state");
                 JSONObject state = new JSONObject(rawState);
+                current.quietMs = state.optLong("quiet_ms", 0);
                 // herdr-core answers a refresh every two seconds; silence well
                 // past that is a dead path (TCP would take far longer to say so).
-                if (current.ready && monitor != null && monitor.dead(state.optLong("quiet_ms", 0))) {
+                if (current.ready && monitor != null && monitor.dead(current.quietMs)) {
                     fail(current, "The host stopped answering");
                     return;
                 }
@@ -7167,7 +7237,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         if (item != null && pane.equals(item.optString("id"))
                                 && "blocked".equals(item.optString("status"))) {
                             final long generation = current.generation;
-                            main.post(() -> nativeShowKeyboard(generation));
+                            // Never for a link lost since (factory-9zz.1): no keyboard offline.
+                            main.post(() -> {
+                                if (current(current) && current.ready && !current.isClosed()) nativeShowKeyboard(generation);
+                            });
                             break;
                         }
                     }
@@ -7277,6 +7350,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     ? "SSH input stopped; it may have reached the host. Reconnect and inspect before retrying"
                     : "Remote session stopped. Reconnect from Remote hosts");
         }
+    }
+
+    /**
+     * The phone has no network at all (ConnectionMonitor's grace has passed): the live link is
+     * dead now, so the frame is held and scrolls on the phone at once, instead of after the
+     * link's silence proves it (factory-9zz.1: 3.7 s of drags sent over a dead link). Main thread.
+     */
+    private void networkGone() {
+        final Connection current;
+        synchronized (stateLock) { current = connection; }
+        if (current == null || current.shell || current.isClosed() || !current.ready) return;
+        fail(current, "No network");
     }
 
     private void fail(Connection failed, String message) {
@@ -7952,6 +8037,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         volatile String remotePhase = "";
         volatile String status = "Connecting…";
         volatile long fastUntil;
+        /** Milliseconds since the link last said anything, as the last poll saw it. */
+        volatile long quietMs;
         volatile long renderedScroll;
         /** Last offset {@link #fetchRows} asked for and when, guarded by the connection. */
         long fetchedOffset = -1, fetchedAt;

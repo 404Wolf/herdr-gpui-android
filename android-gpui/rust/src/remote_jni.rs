@@ -486,6 +486,16 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollLocal(
 }
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollLocalOnly(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    delta: jlong,
+) -> jstring {
+    result_string(&mut env, remote::scroll_local_only(handle as u64, delta))
+}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_herdr_android_RemoteNative_scrollTo(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
