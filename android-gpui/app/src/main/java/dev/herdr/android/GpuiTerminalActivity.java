@@ -1376,10 +1376,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void fitAroundCluster(View cluster) {
         boolean shows = cluster.getVisibility() == View.VISIBLE;
-        int height = shows ? cluster.getHeight() + dp(ActionBar.MARGIN_DP) : 0;
         boolean overPanel = workPanel != null && workPanel.view().getVisibility() == View.VISIBLE
                 && cluster.getLeft() >= workPanel.view().getLeft();
-        if (workPanel != null) workPanel.clearBottom(overPanel ? height : 0);
+        if (workPanel != null) workPanel.clearCluster(overPanel && shows ? cluster : null);
         int cells = 0;
         if (shows && !overPanel && terminalSurface != null && terminalSurface.getWidth() > 0 && composer != null) {
             int cols = composer.columns();
