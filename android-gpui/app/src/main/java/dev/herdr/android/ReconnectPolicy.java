@@ -26,11 +26,7 @@ final class ReconnectPolicy {
     static final long ATTEMPT_MS = 10_000;
     /** {@link #next(long)}'s answer when the epoch is spent. */
     static final long EXHAUSTED = -1;
-    /**
-     * A network that arrives this soon after the epoch began is tried at once but starts no new
-     * epoch: a network that flaps (validated, lost, validated) must not lift the bound.
-     */
-    static final long RENEW_AFTER_MS = 15_000;
+
 
     /**
      * herdr-core is refreshed every two seconds, so this much silence on a
@@ -67,12 +63,13 @@ final class ReconnectPolicy {
     }
 
     /**
-     * A network arrived at {@code nowMs}: the next attempt is immediate. A new epoch starts only
-     * when this one began {@link #RENEW_AFTER_MS} ago or more (or never began); within that, the
-     * attempt counts against the epoch. {@link #EXHAUSTED} when it is spent.
+     * A network arrived or validated at {@code nowMs}: the next attempt is immediate. Only a
+     * network the epoch did not have ({@code newNetwork}) starts a new epoch; the same network
+     * validating again (it flaps, or a check runs again) is tried at once but counts against the
+     * epoch, so it can never lift the bound. {@link #EXHAUSTED} when it is spent.
      */
-    long arrived(long nowMs) {
-        if (startedAt < 0 || nowMs - startedAt >= RENEW_AFTER_MS) reset();
+    long arrived(long nowMs, boolean newNetwork) {
+        if (newNetwork) reset();
         if (next(nowMs) == EXHAUSTED) return EXHAUSTED;
         return 0;
     }

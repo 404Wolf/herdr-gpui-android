@@ -87,21 +87,17 @@ public class ReconnectPolicyTest {
     }
 
     @Test
-    public void offlineRedesign_aFlappingNetworkIsTriedAtOnceButDoesNotLiftTheBound() {
-        ReconnectPolicy policy = new ReconnectPolicy();
-        long now = 0;
-        assertEquals(0, policy.next(now));
-        // The network validates again and again within the epoch's first seconds: each is an
-        // immediate attempt, counted, never a new epoch.
-        for (int i = 1; i < ReconnectPolicy.MAX_ATTEMPTS; i++) {
-            now += 500;
-            assertEquals(0, policy.arrived(now));
-        }
-        assertEquals(ReconnectPolicy.EXHAUSTED, policy.arrived(now + 500));
-        assertTrue(policy.exhausted());
-        // A network arriving once the epoch is old enough starts a new one.
-        assertEquals(0, policy.arrived(ReconnectPolicy.RENEW_AFTER_MS));
-        assertFalse(policy.exhausted());
-        assertEquals(1, policy.attempts());
+    public void offlineRedesign_theSameNetworkValidatingAgainNeverLiftsTheBound() {
+        // The same network validates again and again, however far apart (Slurm 11177: every
+        // ~50 s on the emulator): each is an immediate attempt, counted, never a new epoch.
+        ReconnectPolicy bounded = new ReconnectPolicy();
+        assertEquals(0, bounded.next(0));
+        for (int i = 1; i < ReconnectPolicy.MAX_ATTEMPTS; i++) assertEquals(0, bounded.arrived(i * 7_000L, false));
+        assertEquals(ReconnectPolicy.EXHAUSTED, bounded.arrived(85_000, false));
+        assertTrue(bounded.exhausted());
+        // A network the epoch did not have starts a new one.
+        assertEquals(0, bounded.arrived(86_000, true));
+        assertFalse(bounded.exhausted());
+        assertEquals(1, bounded.attempts());
     }
 }
