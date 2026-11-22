@@ -165,7 +165,7 @@ public final class PinnedSectionTest {
         assertTrue(rail.contains("Pins.shared(this).relabel(current.machine, names);\n                            rail.checkPinArrival(current);"));
         // Opening refuses an ended pin and a reused address: verified against the list now.
         int open = rail.indexOf("    void openPin(Pins.Pin pin)");
-        String body = rail.substring(open, rail.indexOf("closeRailDrawer();", open));
+        String body = rail.substring(open, rail.indexOf("Pins.shared(a).opened(pin.key);", open));
         assertTrue(body.indexOf("Pins.verify(pin.key, now.remoteBoot, now.fingerprint, now.panes)") < body.indexOf("focusRemotePane("));
         assertTrue(body.contains("pin.ended() ? Pins.Verify.ENDED"));
     }

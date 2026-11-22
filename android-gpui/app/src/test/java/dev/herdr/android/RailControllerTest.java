@@ -26,4 +26,22 @@ public final class RailControllerTest {
         assertTrue(rail.contains("private final DeaconFlow deaconFlow = DeaconFlow.shared();"));
         assertFalse(gta.contains("DeaconFlow"));
     }
+
+    @Test public void aTapSelectsAndRevealsButTheRailStaysOpen() throws IOException {
+        // Wolf (11-22, 12:25): the tapped item opens and its branch unfolds; he closes the rail himself.
+        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
+                StandardCharsets.UTF_8);
+        String rail = TerminalSource.rail();
+        assertFalse(gta.contains("closeRailDrawer"));
+        assertFalse(rail.contains("closeRailDrawer"));
+        assertFalse(rail.contains("hideSidebar"));
+        // A row's tap is a picked focus (or a switch to it), which asks for the reveal of its branch.
+        String open = rail.substring(rail.indexOf("private void openRailPane("), rail.indexOf("private void openRailPane(") + 300);
+        assertTrue(open.contains("a.focusRemotePane(current, paneId);"));
+        assertTrue(open.contains("else switchToRailPane(host, paneId);"));
+        assertTrue(gta.contains("    void focusRemotePane(Connection target, String paneId) {\n        focusRemotePane(target, paneId, true);"));
+        assertTrue(gta.contains("if (picked) rail.requestRailReveal(target.hostId, paneId);"));
+        // Back still closes the drawer; only a selection no longer does.
+        assertTrue(gta.contains("if (sidebarOpen && railAsDrawer()) {\n            hideSidebar();"));
+    }
 }
