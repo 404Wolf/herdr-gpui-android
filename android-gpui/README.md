@@ -186,7 +186,9 @@ pick a fixed size in **View** to override it. A lost link to a Herdr host is
 resumed on its own while the terminal is on screen: at once, then after 0.5,
 1, 2, 4 and 8 s, at most 12 attempts or 90 s for one network. With no network
 nothing is tried. When a network appears or validates, an attempt still hanging
-on the old path is closed and a new one starts immediately. Each attempt gets
+on the old path is closed and a new one starts immediately. That network starts
+a new epoch only if the current one began at least 15 s earlier, so a network
+that keeps flapping cannot lift the bound. Each attempt gets
 10 s to reach the host's list of panes. Once a network's attempts are spent the
 indicator says "offline · tap to reconnect", and nothing runs until a network
 arrives or the user taps **Reconnect**. The last frame
