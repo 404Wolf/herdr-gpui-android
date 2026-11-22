@@ -1356,6 +1356,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 step.optLong("history", 0), transcriptOpen != null && transcriptHistory, edgeSaid);
         if (edge == HeldScroll.Edge.NONE) return;
         edgeSaid = true;
+        // Once per gesture: what the device check reads (factory-9zz.1).
+        android.util.Log.i("herdr-scroll", (doubt ? "in doubt" : "held") + ": " + edge + " history="
+                + step.optLong("history", 0));
         stopFling();
         if (edge == HeldScroll.Edge.OPEN_HISTORY) {
             transcriptOpen.run();
@@ -1375,14 +1378,23 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         try {
             scrollWorker.execute(() -> {
                 if (epoch != scrollEpoch.get()) return;
+                JSONObject step;
                 try {
-                    JSONObject step = new JSONObject(RemoteNative.scrollLocalOnly(target.remoteHandle, lines));
-                    main.post(() -> {
-                        showLatest(step.optLong("local_offset", 0) > 0);
-                        answerEdge(lines, step, true);
-                    });
-                } catch (Exception | LinkageError ignored) {
+                    step = new JSONObject(RemoteNative.scrollLocalOnly(target.remoteHandle, lines));
+                } catch (Exception | LinkageError gone) {
+                    // The session ended under the step (the link is going): still answered, never silent.
+                    step = new JSONObject();
+                    try {
+                        step.put("moved", false).put("history", 0).put("local_offset", 0);
+                    } catch (JSONException impossible) {
+                        return;
+                    }
                 }
+                final JSONObject answer = step;
+                main.post(() -> {
+                    showLatest(answer.optLong("local_offset", 0) > 0);
+                    answerEdge(lines, answer, true);
+                });
             });
         } catch (java.util.concurrent.RejectedExecutionException busy) {
             return false;
