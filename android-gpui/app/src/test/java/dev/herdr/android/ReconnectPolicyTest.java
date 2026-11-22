@@ -85,4 +85,23 @@ public class ReconnectPolicyTest {
         // Longer than one two-second refresh, so a healthy link is not doubted.
         assertTrue(ReconnectPolicy.DOUBT_QUIET_MS > 2_000);
     }
+
+    @Test
+    public void offlineRedesign_aFlappingNetworkIsTriedAtOnceButDoesNotLiftTheBound() {
+        ReconnectPolicy policy = new ReconnectPolicy();
+        long now = 0;
+        assertEquals(0, policy.next(now));
+        // The network validates again and again within the epoch's first seconds: each is an
+        // immediate attempt, counted, never a new epoch.
+        for (int i = 1; i < ReconnectPolicy.MAX_ATTEMPTS; i++) {
+            now += 500;
+            assertEquals(0, policy.arrived(now));
+        }
+        assertEquals(ReconnectPolicy.EXHAUSTED, policy.arrived(now + 500));
+        assertTrue(policy.exhausted());
+        // A network arriving once the epoch is old enough starts a new one.
+        assertEquals(0, policy.arrived(ReconnectPolicy.RENEW_AFTER_MS));
+        assertFalse(policy.exhausted());
+        assertEquals(1, policy.attempts());
+    }
 }

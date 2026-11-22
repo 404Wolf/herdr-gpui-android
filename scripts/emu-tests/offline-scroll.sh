@@ -389,11 +389,28 @@ fi
 # No attempt while there is no network at all.
 quiet 10
 app_log > "$EMU_OUT/app-offline-2.log"
-tries=$(count 'attempt [0-9]* failed' "$EMU_OUT/app-offline-2.log")
-if (( tries == 0 )); then
-    record no-attempts-offline PASS "no reconnect attempt during 16 s with no network"
+# Attempts that began once the phone knew it had no network (an attempt started by the link's own
+# loss, before the callback, is the emulator resetting the socket first).
+tries=$(python3 - "$EMU_OUT/app-offline-2.log" << 'PY'
+import re, sys
+lost, n = None, 0
+for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"\s*(\d+\.\d+)", line)
+    if not m:
+        continue
+    t = float(m.group(1))
+    if "lost the last network" in line and lost is None:
+        lost = t
+    f = re.search(r"attempt \d+ failed after (\d+) ms", line)
+    if f and lost is not None and t - int(f.group(1)) / 1000 > lost:
+        n += 1
+print(n if lost is not None else "no-callback")
+PY
+)
+if [[ "$tries" == 0 ]]; then
+    record no-attempts-offline PASS "no reconnect attempt began after the phone lost its network"
 else
-    record no-attempts-offline FAIL "$tries attempts failed with no network (app-offline-2.log)"
+    record no-attempts-offline FAIL "'$tries' attempts began with no network (app-offline-2.log)"
 fi
 
 # (E-R1) The network comes back: live again within 4 s of it (8 s at most).
@@ -455,7 +472,8 @@ if wait_ui 'offline · tap to reconnect' 150 > /dev/null; then
     shot stopped
     app_log > "$EMU_OUT/app-stopped.log"
     tries=$(count 'attempt [0-9]* failed' "$EMU_OUT/app-stopped.log")
-    if (( tries >= 1 && tries <= 12 )); then
+    # The epoch's bound, plus the one attempt the link's own loss may start before it.
+    if (( tries >= 1 && tries <= 13 )); then
         record bounded-retries PASS "$tries attempts, then 'offline · tap to reconnect' (stopped.png)"
     else
         record bounded-retries FAIL "$tries attempts before stopping (app-stopped.log)"

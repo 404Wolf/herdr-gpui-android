@@ -87,6 +87,7 @@ final class ConnectionMonitor {
             main.post(() -> {
                 if (!physical.remove(network)) return;
                 if (physical.isEmpty() && seenPhysical) {
+                    android.util.Log.i("herdr-net", "lost the last network");
                     // In doubt at once (a drag sends nothing from now on); the live link is
                     // given up only after the grace, so a handover gap costs no reconnect.
                     noNetwork = true;
@@ -244,8 +245,13 @@ final class ConnectionMonitor {
             arrivedAt = now;
             android.util.Log.i("herdr-net", "network arrived or validated");
             if (wanted) {
-                policy.reset();
-                next();
+                long delay = policy.arrived(now);
+                if (delay == ReconnectPolicy.EXHAUSTED) {
+                    main.removeCallbacks(fire);
+                    listener.exhausted();
+                } else {
+                    schedule(delay);
+                }
             }
         }
         listener.changed();
