@@ -1321,6 +1321,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             @Override public boolean typing() { return imeShown || (composer != null && composer.drafting()); }
             @Override public void closed() { toggleWorkPanel(false); }
+            @Override public void focus(String id) {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                if (now == null || now.isClosed()) return;
+                // The bead stays open in Tasks; on the cover the terminal comes to the front.
+                if (compactWindow()) toggleWorkPanel(false);
+                focusRemotePane(now, id);
+            }
         };
     }
 
@@ -2616,8 +2624,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { current = connection; }
         if (workPanel != null && current != null && current.chromeRevision != workPanelRevision) {
             workPanelRevision = current.chromeRevision;
-            workPanel.select(current.panes == null ? null : PanelModel.agentOf(
-                    BeadsModel.terms(current.workspaces, current.tabs, current.panes), current.paneId), current.hostId, current.hostName);
+            java.util.List<BeadsModel.Term> terms = current.panes == null ? java.util.Collections.emptyList()
+                    : BeadsModel.terms(current.workspaces, current.tabs, current.panes);
+            workPanel.select(PanelModel.agentOf(terms, current.paneId), current.hostId, current.hostName, terms);
         }
         if (usageFeed != null) {
             String usageHost = current == null ? null : current.hostId;

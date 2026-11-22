@@ -173,4 +173,23 @@ final class PanelModel {
         if (at.length() >= 16) at = at.substring(5, 16);
         return (c.author == null ? "someone" : c.author) + (at.isEmpty() ? "" : " · " + at);
     }
+
+    /**
+     * Who is clearly working on bead {@code id}: the live agents on this
+     * machine whose issue label is that bead and whose project (its own label,
+     * or its parent's) is {@code project}. Never a guess from titles or names.
+     */
+    static List<FleetTree.Member> assignees(List<? extends FleetTree.Member> members, String id, String project) {
+        Map<String, FleetTree.Member> byId = new HashMap<>();
+        for (FleetTree.Member m : members) byId.put(m.id, m);
+        List<FleetTree.Member> out = new ArrayList<>();
+        for (FleetTree.Member m : members) {
+            if (!(m instanceof BeadsModel.Term) || !id.equals(((BeadsModel.Term) m).issue)) continue;
+            if (!m.isAgent() || !FleetTree.running(m)) continue;
+            FleetTree.Member parent = byId.get(m.parent);
+            String own = !m.project.isEmpty() ? m.project : parent == null ? "" : parent.project;
+            if (own.equals(project)) out.add(m);
+        }
+        return out;
+    }
 }
