@@ -1331,7 +1331,8 @@ final class FleetTree {
     }
 
     private static final Set<String> GENERIC_NAMES = new HashSet<>(Arrays.asList(
-            "general", "pm", "deacon", "worker", "main", "shell", "zsh", "bash", "claude", "claude code", "codex"));
+            "general", "pm", "deacon", "worker", "main", "shell", "zsh", "bash", "claude", "claude code", "codex",
+            "gemini", "agy", "antigravity"));
 
     /** A tab or title that names no task: a role, a shell, a harness, a number, a terminal id. */
     static boolean genericName(String name) {

@@ -48,6 +48,16 @@ public final class AgentNamesTest {
         assertEquals("audit", AgentNames.of(agent("t4a", "", "factory-setup.2", "audit", "Phone-rail lane B")));
     }
 
+    @Test public void aHarnessNameIsTheProgramNotTheAgent() {
+        // Antigravity (agy) as a recognized harness: its default names never name a row.
+        assertEquals(AgentNames.UNNAMED, AgentNames.of(agent("t9", "agy", "", "", "Antigravity")));
+        assertEquals(AgentNames.UNNAMED, AgentNames.of(agent("t9", "gemini", "", "", "Gemini CLI")));
+        assertEquals(AgentNames.UNNAMED, AgentNames.of(agent("t9", "", "", "", "Claude Code")));
+        assertEquals("phone-rail", AgentNames.of(agent("t9", "phone-rail", "", "", "Antigravity")));
+        assertEquals("fix the agy launcher", AgentNames.of(agent("t9", "agy", "fix the agy launcher", "", "")));
+        assertTrue(FleetTree.genericName("antigravity") && FleetTree.genericName("agy"));
+    }
+
     @Test public void aliasesAndBeadIdsAreRecognised() {
         for (String alias : new String[] {"t3xz", "T1B6", "server/t1z", "ab12", "x", ""}) assertTrue(alias, AgentNames.alias(alias));
         for (String name : new String[] {"phone-rail", "factory-pm", "Phone-rail lane B", "deacon"}) assertFalse(name, AgentNames.alias(name));
