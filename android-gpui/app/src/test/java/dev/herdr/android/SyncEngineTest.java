@@ -276,4 +276,20 @@ public final class SyncEngineTest {
         r.settle();
         assertEquals(List.of("DOC:x"), r.asked);
     }
+
+    /** Preview-15's log: a key asked again while its read was out ran a second read at once. */
+    @Test public void askingWhileAReadIsOutDoesNotReadTwice() {
+        Rig r = new Rig();
+        r.engine.connected(A);
+        r.answers.put("", "tree");
+        r.engine.want(beads(A), SyncEngine.Priority.PREFETCH);
+        // The read is out (disk done, net queued); the next draws ask again.
+        while (!r.disk.isEmpty()) r.disk.poll().run();
+        while (!r.main.isEmpty()) r.main.poll().run();
+        assertTrue(r.engine.reading(beads(A)));
+        r.engine.want(beads(A), SyncEngine.Priority.VISIBLE);
+        r.engine.want(beads(A), SyncEngine.Priority.PREFETCH);
+        r.settle();
+        assertEquals(List.of("BEADS:"), r.asked);
+    }
 }
