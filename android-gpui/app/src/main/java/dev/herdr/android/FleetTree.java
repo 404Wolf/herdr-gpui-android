@@ -27,6 +27,13 @@ final class FleetTree {
     static class Member {
         String id = "", title = "", status = "", space = "", spaceName = "", tab = "";
         String role = "", project = "", parent = "", kind = "", cwd = "", msg = "", waitKind = "";
+        /**
+         * Its hc name ("phone-rail") and the factory's task= and helper= labels:
+         * what the row calls it (AgentNames), never its id.
+         */
+        String name = "", task = "", helper = "";
+        /** Tells it from another agent here with the same name: its folder, or "2" (AgentNames.disambiguate). */
+        String nameNote = "";
         /** The foreground program's name, when the core says ("" when unknown). */
         String program = "";
         long statusMs, createdMs;

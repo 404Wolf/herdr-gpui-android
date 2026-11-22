@@ -73,8 +73,12 @@ final class FleetPanes {
             m.msg = pane.optString("msg", "").replace('\n', ' ').trim();
             m.waitKind = pane.optString("wait_kind", "");
             m.statusMs = pane.optLong("status_ms", 0);
+            m.name = label(pane, "name");
+            m.task = label(pane, "task");
+            m.helper = label(pane, "helper");
             out.add(m);
         }
+        AgentNames.disambiguate(out);
         return out;
     }
 
@@ -93,9 +97,23 @@ final class FleetPanes {
         return state != null && state.optJSONArray("workspaces") != null;
     }
 
-    /** A title worth showing: the agent's own, else its harness or "shell" and folder. */
+    /** A pane's string field, flat (the core view's) or under its labels; JSON null is no value. */
+    private static String label(JSONObject pane, String key) {
+        Object v = pane.opt(key);
+        if (!(v instanceof String) || ((String) v).trim().isEmpty()) {
+            JSONObject labels = pane.optJSONObject("labels");
+            v = labels == null ? null : labels.opt(key);
+        }
+        return v instanceof String ? ((String) v).trim() : "";
+    }
+
+    /**
+     * What an agent's row says: its name (AgentNames), never its terminal id.
+     * A plain shell with nothing to name it reads as "shell · folder".
+     */
     static String displayTitle(FleetTree.Member m) {
-        if (!m.title.isEmpty() && !RailTree.isTerminalId(m.title)) return m.title;
+        if (!AgentNames.unnamed(m)) return AgentNames.of(m) + (m.nameNote.isEmpty() ? "" : " · " + m.nameNote);
+        if (m.isAgent()) return AgentNames.UNNAMED;
         String folder = FleetTree.lastSegment(m.cwd);
         String who = m.kind.isEmpty() ? "shell" : m.kind;
         return folder.isEmpty() ? who : who + " · " + folder;
