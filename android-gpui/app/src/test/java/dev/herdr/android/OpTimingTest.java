@@ -33,4 +33,12 @@ public final class OpTimingTest {
     private static String read(String name) throws IOException {
         return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")), StandardCharsets.UTF_8);
     }
+
+    @Test public void aFailedLookSaysTheCoresOwnWordsElseThatTheMachineCouldNotBeAsked() {
+        assertEquals("herdr-core protocol: \"denied\": exec refused",
+                OpTiming.reason("beads.detail", new IllegalStateException("herdr-core protocol: \"denied\": exec refused")));
+        assertEquals("can't reach the machine", OpTiming.reason("beads.detail", new IllegalArgumentException("x")));
+        assertEquals("can't reach the machine", OpTiming.reason("beads.detail", new IllegalStateException("  ")));
+        assertEquals(160, OpTiming.reason("usage.look", new IllegalStateException("x".repeat(300))).length());
+    }
 }

@@ -41,4 +41,22 @@ final class OpTiming {
         if (line.endsWith(")")) android.util.Log.w("herdr-ops", line);
         else android.util.Log.i("herdr-ops", line);
     }
+
+    /**
+     * Why a look failed, in words for the view: the core session's own error
+     * (the native layer throws it as an IllegalStateException with its
+     * display text, written for people), bounded; anything else is that the
+     * machine could not be asked. Logged under "herdr-ops" for diagnosis.
+     */
+    static String reason(String op, RuntimeException failure) {
+        String said = failure instanceof IllegalStateException ? failure.getMessage() : null;
+        String reason = said == null || said.trim().isEmpty() ? "can't reach the machine"
+                : said.trim().length() > 160 ? said.trim().substring(0, 159) + "…" : said.trim();
+        try {
+            android.util.Log.w("herdr-ops", op + " failed: " + reason);
+        } catch (RuntimeException notOnAndroid) {
+            // JVM unit tests have no logcat.
+        }
+        return reason;
+    }
 }

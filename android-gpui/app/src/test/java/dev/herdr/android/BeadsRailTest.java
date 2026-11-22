@@ -101,6 +101,71 @@ public final class BeadsRailTest {
         assertNull(BeadsRail.work("no-such-host", "p", java.util.Collections.emptyList()));
     }
 
+    private static BeadsModel.Term term(String id, String role, String parent, String project, String issue) {
+        BeadsModel.Term t = new BeadsModel.Term();
+        t.id = id;
+        t.role = role;
+        t.parent = parent;
+        t.project = project;
+        t.issue = issue;
+        t.kind = "claude";
+        return t;
+    }
+
+    @Test public void aTappedAgentShowsItsOwnBeadAHelperItsWorkersAndNoneIsNeverGuessed() {
+        java.util.List<BeadsModel.Term> m = java.util.Arrays.asList(
+                term("t1", "pm", "", "factory", "factory-setup"),
+                term("t2", "worker", "t1", "factory", "factory-setup.22"),
+                term("t3", "", "t2", "", ""),                       // a helper of t2, no issue of its own
+                term("t4", "", "t2", "", "factory-setup.40"),       // a helper with its own
+                term("t5", "worker", "t1", "factory", ""),          // a legacy worker: no bead linked
+                term("t6", "", "t5", "", ""));
+        assertEquals("factory-setup.22", BeadsRail.beadOf("t2", m));
+        assertEquals("factory-setup.22", BeadsRail.beadOf("t3", m));
+        assertEquals("factory-setup.40", BeadsRail.beadOf("t4", m));
+        // Not the PM's own bead: the chain stops at the lead.
+        assertNull(BeadsRail.beadOf("t5", m));
+        assertNull(BeadsRail.beadOf("t6", m));
+        assertNull(BeadsRail.beadOf("nobody", m));
+        assertEquals("factory", BeadsRail.projectOf("t3", m));
+    }
+
+    @Test public void theTapFocusesFirstThenShowsTheBeadFullyOpenAndSelectable() throws IOException {
+        String rail = source("GpuiTerminalActivity");
+        String tap = section(rail, "holder.row.setOnClickListener(view -> {\n            if (holder.live) {", "holder.row.setOnLongClickListener(view -> { showPaneActions(holder)");
+        assertTrue(tap.indexOf("focusRemotePane(holder.connection, holder.paneId)") < tap.indexOf("beadsRail.tapped("));
+        // The cover's drawer stays open on the bead (its terminal focused behind it); a drawer that closes
+        // over it closes the bead, so reopened it shows the agents; Back from it is one step to the terminal.
+        assertTrue(tap.contains("if (!bead) closeRailDrawer();"));
+        String hide = section(rail, "private void hideSidebar() {", "setSidebarOpen(false);");
+        assertTrue(hide.contains("beadsRail.showingAgentsBead()) beadsRail.close();"));
+        String systemBack = section(rail, "public void onBackPressed()", "super.onBackPressed();");
+        assertTrue(systemBack.indexOf("beadsRail.showingAgentsBead()") < systemBack.indexOf("beadsRail.back()"));
+        String beads = source("BeadsRail");
+        String tapped = section(beads, "void tapped(", "/** detailId for an agent");
+        assertTrue(tapped.contains("!agent.isAgent()") && tapped.contains("\"pm\".equals(agent.role)"));
+        String open = section(beads, "void openFor(", "void tapped(");
+        assertTrue(open.contains("if (bead != null) showAll.add(bead);"));
+        assertTrue(open.contains("if (bead != null) readDetail(bead);"));
+        // Who works on it needs the stores: an agent's bead asks for them too, and says so while it waits.
+        assertTrue(open.contains("want(hostId, look);"));
+        String detail = section(beads, "private void renderDetail()", "/** Lines a text takes");
+        assertTrue(detail.contains("No task linked."));
+        assertTrue(detail.contains("Reading who works on it…"));
+        // No comments anywhere (Wolf, via t2kg): the detail draws none.
+        assertTrue(!detail.contains("COMMENTS") && !detail.contains("detail.comments"));
+        assertTrue(detail.contains("if (fromAgent || (!all && !hidden)) return;"));
+        assertTrue(detail.contains("title.setTextIsSelectable(true)"));
+        assertTrue(beads.contains("view.setTextIsSelectable(true);"));
+        // An unreadable store or a host switch mid-load: the error is said, a switch is dropped.
+        String read = section(beads, "private void readDetail(", "/** Redraws when");
+        assertTrue(read.contains("catch (HostSwitched gone)") && read.contains("Can't read ") == false);
+        assertTrue(detail.contains("\"Can't read \" + detailId"));
+        // Back from an agent's bead goes back to the agents.
+        String back = section(beads, "boolean back()", "/** Leaves the beads view");
+        assertTrue(back.contains("if (detailId != null && !fromAgent)"));
+    }
+
     @Test public void itOnlyReads() throws IOException {
         String beads = source("BeadsRail");
         assertTrue(beads.contains("\"beads.stores\"") && beads.contains("\"beads.detail\""));

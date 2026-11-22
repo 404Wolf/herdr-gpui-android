@@ -45,8 +45,8 @@ final class BeadsRail {
      * the core session, and typing, until it answers (see {@link OpTiming}).
      */
     static final long ROW_POLL_MS = 60_000;
-    /** The compact detail: the description's first lines and the latest comments, until Show all. */
-    static final int DESCRIPTION_LINES = 6, COMMENTS = 2;
+    /** The compact detail: the description's first lines, until Show all. */
+    static final int DESCRIPTION_LINES = 6;
 
     /** Each machine's stores, as last read, and when (by saved host id). */
     private static final Map<String, Map<String, BeadsModel.Store>> STORES = new HashMap<>();
@@ -78,6 +78,12 @@ final class BeadsRail {
     private String detailId;
     private BeadsModel.Detail detail;
     private String detailError;
+    /**
+     * Opened from an agent's row (its bead, or that it has none): Back returns
+     * to the agents, not to the project's list. The agent's name, for "No task linked".
+     */
+    private boolean fromAgent;
+    private String agentName;
     private boolean detailBusy;
     private boolean paused;
     /** What the body shows was drawn from these inputs; the same inputs draw nothing new. */
@@ -223,7 +229,9 @@ final class BeadsRail {
                 }
             } catch (HostSwitched gone) {
                 error = null;
-            } catch (JSONException | RuntimeException | LinkageError e) {
+            } catch (RuntimeException e) {
+                error = OpTiming.reason("beads.stores", e);
+            } catch (JSONException | LinkageError e) {
                 error = "can't reach the machine";
             }
             BeadsModel.Stores answer = read;
@@ -249,12 +257,100 @@ final class BeadsRail {
         });
     }
 
+    /**
+     * The bead an agent works on, by its hidden labels: its own issue=, else
+     * (a helper, or a sub-agent) the nearest one up its parent chain below the
+     * lead; null when none links one. Never guessed from titles.
+     */
+    static String beadOf(String agentId, List<? extends FleetTree.Member> members) {
+        Map<String, FleetTree.Member> byId = new HashMap<>();
+        for (FleetTree.Member m : members) byId.put(m.id, m);
+        FleetTree.Member at = byId.get(agentId);
+        for (int hops = 0; at != null && hops < 8; hops++) {
+            // A lead's bead is not its workers': the chain stops at the PM or the Deacon.
+            if (hops > 0 && ("pm".equals(at.role) || "deacon".equals(at.role))) return null;
+            String issue = at instanceof BeadsModel.Term ? ((BeadsModel.Term) at).issue.trim() : "";
+            if (!issue.isEmpty()) return issue;
+            at = at.parent.isEmpty() ? null : byId.get(at.parent);
+        }
+        return null;
+    }
+
+    /** The project whose store holds an agent's bead: its own label, else up its chain. */
+    static String projectOf(String agentId, List<? extends FleetTree.Member> members) {
+        Map<String, FleetTree.Member> byId = new HashMap<>();
+        for (FleetTree.Member m : members) byId.put(m.id, m);
+        FleetTree.Member at = byId.get(agentId);
+        for (int hops = 0; at != null && hops < 8; hops++) {
+            if (!at.project.trim().isEmpty()) return at.project.trim();
+            at = byId.get(at.parent);
+        }
+        return "";
+    }
+
+    /**
+     * An agent's row was tapped: its terminal is focused (the caller), and this
+     * shows the bead it works on, every section and comment open; or, when no
+     * label links one, an honest "No task linked". Nothing is assigned or made.
+     */
+    void openFor(String hostId, String agentId, List<? extends FleetTree.Member> members, Function<String, String> look) {
+        String bead = beadOf(agentId, members);
+        String project = projectOf(agentId, members);
+        FleetTree.Member agent = null;
+        for (FleetTree.Member m : members) if (m.id.equals(agentId)) agent = m;
+        this.hostId = hostId;
+        this.members = members;
+        this.look = look;
+        // The store is found by project; DETAIL_SH also tries the repo stores. Without one, the bead's prefix.
+        this.project = !project.isEmpty() ? project : bead == null ? "" : bead.replaceFirst("[-.].*$", "");
+        agentName = agent == null ? "this agent" : FleetPanes.displayTitle(agent);
+        fromAgent = true;
+        detailId = bead == null ? NO_TASK : bead;
+        detail = null;
+        detailError = null;
+        if (bead != null) showAll.add(bead);
+        root.setVisibility(View.VISIBLE);
+        changed.run();
+        drawn = "";
+        render();
+        scroll.scrollTo(0, 0);
+        if (bead != null) readDetail(bead);
+        // Who works on it comes from the stores: read them too (paced as the row's reads).
+        want(hostId, look);
+        main.removeCallbacks(poll);
+        main.postDelayed(poll, POLL_MS);
+    }
+
+    /**
+     * An agent's row in the rail was tapped (its terminal is focused by the
+     * caller): a worker or helper also shows its own bead (openFor). A PM or
+     * the Deacon only focuses: a PM's beads stay on its Beads row, as now.
+     * True when it opened one (the cover's drawer then stays open on it).
+     */
+    boolean tapped(String hostId, String agentId, List<? extends FleetTree.Member> members, Function<String, String> look) {
+        FleetTree.Member agent = null;
+        for (FleetTree.Member m : members) if (m.id.equals(agentId)) agent = m;
+        // A plain shell is no one's task: it only focuses.
+        if (agent == null || !agent.isAgent() || "deacon".equals(agent.role) || "pm".equals(agent.role)) return false;
+        openFor(hostId, agentId, members, look);
+        return true;
+    }
+
+    /** Showing an agent's bead (or its "No task linked"), opened by a tap on its row. */
+    boolean showingAgentsBead() {
+        return isOpen() && fromAgent && detailId != null;
+    }
+
+    /** detailId for an agent no label links to a bead. */
+    static final String NO_TASK = "";
+
     /** Drills in: the project's beads, read again now and while it shows. */
     void open(String hostId, String project, List<? extends FleetTree.Member> members, Function<String, String> look) {
         this.hostId = hostId;
         this.project = project;
         this.members = members;
         this.look = look;
+        fromAgent = false;
         detailId = null;
         detail = null;
         root.setVisibility(View.VISIBLE);
@@ -276,7 +372,8 @@ final class BeadsRail {
     /** Pops one level; false when there was nothing to pop. */
     boolean back() {
         if (!isOpen()) return false;
-        if (detailId != null) {
+        // From an agent's row, Back goes back to the agents.
+        if (detailId != null && !fromAgent) {
             detailId = null;
             detail = null;
             detailError = null;
@@ -304,7 +401,7 @@ final class BeadsRail {
         // Hidden (the drawer closed over a terminal, a docked rail minimized): no reads, keep the timer.
         if (root.isShown()) {
             want(hostId, look);
-            if (detailId != null) readDetail(detailId);
+            if (detailId != null && !NO_TASK.equals(detailId)) readDetail(detailId);
         }
         main.postDelayed(poll, POLL_MS);
     }
@@ -342,7 +439,9 @@ final class BeadsRail {
                 }
             } catch (HostSwitched gone) {
                 error = null;
-            } catch (JSONException | RuntimeException | LinkageError e) {
+            } catch (RuntimeException e) {
+                error = OpTiming.reason("beads.detail", e);
+            } catch (JSONException | LinkageError e) {
                 error = "can't reach the machine";
             }
             BeadsModel.Detail answer = read;
@@ -372,8 +471,8 @@ final class BeadsRail {
         Object focusKey = focused == null ? null : focused.getTag();
         body.removeAllViews();
         if (detailId != null) {
-            back.setText("‹ " + project + "  ›  " + detailId);
-            back.setContentDescription("Back to " + project + "'s beads");
+            back.setText(fromAgent ? "‹ " + agentName : "‹ " + project + "  ›  " + detailId);
+            back.setContentDescription(fromAgent ? "Back to the agents" : "Back to " + project + "'s beads");
             renderDetail();
         } else {
             back.setText("‹ " + project);
@@ -390,7 +489,7 @@ final class BeadsRail {
     private String inputs() {
         return hostId + "\n" + project + "\n" + detailId + "\n" + storesStamp + "\n" + MISSING.get(hostId) + "\n"
                 + READ_ERROR.get(hostId) + "\n" + STORES.containsKey(hostId) + "\n" + membersKey(members) + "\n"
-                + unfolded + "\n" + showAll + "\n" + System.identityHashCode(detail) + "\n" + detailError;
+                + unfolded + "\n" + showAll + "\n" + System.identityHashCode(detail) + "\n" + detailError + "\n" + fromAgent + "\n" + agentName;
     }
 
     private void renderList() {
@@ -526,6 +625,11 @@ final class BeadsRail {
     }
 
     private void renderDetail() {
+        if (NO_TASK.equals(detailId)) {
+            body.addView(note("No task linked. " + agentName + " carries no bead label, so there is nothing to show; "
+                    + "a bead is never guessed or made from here.", chrome.onSurfaceVariant));
+            return;
+        }
         if (detail == null) {
             body.addView(note(detailError != null ? "Can't read " + detailId + ": " + detailError : "Reading " + detailId + "…",
                     detailError != null ? chrome.danger : chrome.onSurfaceVariant));
@@ -534,6 +638,8 @@ final class BeadsRail {
         if (detailError != null) body.addView(note("Showing the last read; the newest failed: " + detailError, chrome.warning));
         TextView title = mono(detail.title, 15, chrome.onSurface, true);
         title.setPadding(dp(6), dp(6), dp(6), dp(2));
+        // Selectable for quoting, like the sections (long-press select and copy).
+        title.setTextIsSelectable(true);
         body.addView(title);
         List<String> meta = new ArrayList<>();
         if (detail.status != null && !detail.status.isEmpty()) meta.add(detail.status);
@@ -548,7 +654,9 @@ final class BeadsRail {
         BeadsModel.Work work = work(hostId, project, members);
         List<FleetTree.Member> agents = work == null ? Collections.emptyList() : BeadsModel.agentsOf(work, detail.id);
         body.addView(heading("AGENTS"));
-        if (agents.isEmpty()) body.addView(note("No agent is working on it.", chrome.onSurfaceVariant));
+        // Until the stores are read, who works on it is not known: say so, not "no one".
+        if (work == null) body.addView(note("Reading who works on it…", chrome.onSurfaceVariant));
+        else if (agents.isEmpty()) body.addView(note("No agent is working on it.", chrome.onSurfaceVariant));
         for (FleetTree.Member agent : agents) body.addView(agentRow(agent, 0));
         boolean all = showAll.contains(detail.id);
         boolean hidden = false;
@@ -558,22 +666,9 @@ final class BeadsRail {
             if (!all && lineCount(s[1]) > DESCRIPTION_LINES) hidden = true;
             body.addView(section(s[0], s[1], !all));
         }
-        List<BeadsModel.Comment> comments = detail.comments;
-        if (!comments.isEmpty()) {
-            body.addView(heading("COMMENTS (" + comments.size() + ")"));
-            int from = all ? 0 : Math.max(0, comments.size() - COMMENTS);
-            if (from > 0) hidden = true;
-            for (int i = from; i < comments.size(); i++) {
-                BeadsModel.Comment c = comments.get(i);
-                TextView by = mono((c.author == null ? "" : c.author) + (c.at == null ? "" : "  " + c.at), 11, chrome.onSurfaceVariant, false);
-                by.setPadding(dp(6), 0, dp(6), 0);
-                body.addView(by);
-                TextView text = prose(c.text);
-                text.setPadding(dp(6), 0, dp(6), dp(8));
-                body.addView(text);
-            }
-        }
-        if (!all && !hidden) return;
+        // No comments (Wolf, via t2kg and t2mk: "No comments at all"): the bead's own plan only.
+        // An agent's bead is open in full: there is nothing to show more or less of.
+        if (fromAgent || (!all && !hidden)) return;
         TextView more = mono(all ? "Show less" : "Show all", 13, chrome.primary, true);
         more.setTag("more:" + detail.id);
         more.setMinHeight(dp(44));
