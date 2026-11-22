@@ -275,9 +275,18 @@ final class MdText {
     private static final Pattern WEB_LINK = Pattern.compile("^\\[([^\\]\\n]+)\\]\\((https?://[^\\s)]+)\\)");
     private static final Pattern LOCAL_LINK = Pattern.compile("^\\[([^\\]\\n]+)\\]\\(((?:/|~/)[^\\s)]*)\\)");
     private static final Pattern ESCAPED = Pattern.compile("[\\\\`*_\\[\\]()#|>-]");
-    /** A bare url, or a bead-id shape: factory-setup.21, demo-1.2, bd-a1b. */
+    /** A path's shape, alone or in running text. */
+    private static final String PATH_SHAPE = "((?<![^\\s(\\[\"'])(?:~/|/)[\\w.+@-]+(?:/[\\w.+@-]*)*[\\w/])";
+    private static final Pattern PATH_ONLY = Pattern.compile(PATH_SHAPE);
+    /**
+     * A bare url; a bead-id shape (factory-setup.21, demo-1.2, bd-a1b); or a
+     * file path, absolute or under ~ (/home/wolf/notes/, ~/deacon/work/x.md),
+     * starting a word (after a space, a bracket or a quote: never inside a url,
+     * a tag or a word like "and/or" or "1/2"), without trailing punctuation.
+     */
     private static final Pattern PLAIN = Pattern.compile(
-            "(https?://[^\\s<>()]+[^\\s<>().,;:!?'\"])|((?<![\\w./-])[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:\\.\\d+)+|(?<![\\w./-])[a-z]+-[a-z0-9]{3}(?![\\w-]))");
+            "(https?://[^\\s<>()]+[^\\s<>().,;:!?'\"])|((?<![\\w./-])[a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:\\.\\d+)+|(?<![\\w./-])[a-z]+-[a-z0-9]{3}(?![\\w-]))"
+                    + "|" + PATH_SHAPE);
 
     private void inline(String src, boolean noLinks) {
         StringBuilder plain = new StringBuilder();
@@ -301,6 +310,8 @@ final class MdText {
                     int s = text.length();
                     text.append(code);
                     styles.add(new Style(Style.Kind.CODE, s, text.length(), null));
+                    // A code span that is just a path (`~/deacon/work/x.md`) opens it too.
+                    if (!noLinks && PATH_ONLY.matcher(code).matches()) styles.add(new Style(Style.Kind.LOCAL, s, text.length(), code));
                     i = end + n;
                     continue;
                 }
@@ -367,6 +378,7 @@ final class MdText {
             text.append(m.group());
             if (m.group(1) != null && !noLinks) styles.add(new Style(Style.Kind.LINK, s, text.length(), m.group(1)));
             else if (m.group(2) != null && ref.test(m.group(2))) styles.add(new Style(Style.Kind.BEAD, s, text.length(), m.group(2)));
+            else if (m.group(3) != null && !noLinks) styles.add(new Style(Style.Kind.LOCAL, s, text.length(), m.group(3)));
             last = m.end();
         }
         text.append(t, last, t.length());
