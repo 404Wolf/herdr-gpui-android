@@ -63,8 +63,11 @@ final class WorkPanel {
         void note(String text);
         /** Puts {@code text}, quoted, in the draft of the agent on screen (never sends). */
         void quote(String header, String text);
-        /** Opens a local path the doc links, on the doc's own machine. */
-        void openPath(String path);
+        /**
+         * Opens {@code path} in the native file viewer of saved host
+         * {@code hostId}: the doc's own machine, which need not be the one on screen.
+         */
+        void openFile(String hostId, String path);
         /** Opens a web link (http/https), as the terminal's links open. */
         void openLink(String url);
         /** The keyboard is up or a draft is in the composer. */
@@ -727,7 +730,7 @@ final class WorkPanel {
         MdText md = MdText.of(src, ids::contains);
         SelectableText view = new SelectableText(activity, host::note);
         view.setQuote((start, end) -> host.quote(header, DocModel.quoteBody(md.sourceOf(start, end))));
-        view.setText(spans(md), TextView.BufferType.SPANNABLE);
+        view.setText(spans(md, hostId), TextView.BufferType.SPANNABLE);
         view.setTextColor(chrome.onSurface);
         view.setTextSize(BODY_SP);
         if (android.os.Build.VERSION.SDK_INT >= 28) view.setLineHeight(dp(LINE_DP));
@@ -736,7 +739,8 @@ final class WorkPanel {
         return view;
     }
 
-    private CharSequence spans(MdText md) {
+    /** {@code source}: the saved host the text came from, kept on its links (a switch never retargets them). */
+    private CharSequence spans(MdText md, String source) {
         SpannableStringBuilder s = new SpannableStringBuilder(md.text());
         int dim = chrome.raised;
         for (MdText.Style st : md.styles) {
@@ -769,7 +773,7 @@ final class WorkPanel {
                     break;
                 }
                 case RULE: s.setSpan(new ForegroundColorSpan(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x88)), a, b, flags); break;
-                default: s.setSpan(link(st), a, b, flags); break;
+                default: s.setSpan(link(st, source), a, b, flags); break;
             }
         }
         // The blank line between blocks is a gap, not a full line.
@@ -783,12 +787,13 @@ final class WorkPanel {
         return s;
     }
 
-    private ClickableSpan link(MdText.Style st) {
+    private ClickableSpan link(MdText.Style st, String source) {
         return new ClickableSpan() {
             @Override public void onClick(View widget) {
                 switch (st.kind) {
                     case BEAD: openBead(st.value); break;
-                    case LOCAL: host.openPath(st.value); break;
+                    // The doc's (or bead's) own machine, as it was asked for, never the one on screen now.
+                    case LOCAL: host.openFile(source, st.value); break;
                     default: host.openLink(st.value); break;
                 }
             }
