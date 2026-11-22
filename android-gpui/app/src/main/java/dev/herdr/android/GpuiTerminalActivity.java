@@ -3404,6 +3404,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (selected) revealRepos.add(railKey(host, "repo/" + repo.key));
         }
+        for (FleetTree.RepoRow group : tree.groups) {
+            for (FleetTree.PmRow pm : group.projects) {
+                if (pm.project == focusedProject) revealRepos.add(railKey(host, "group/" + group.key));
+            }
+        }
         for (FleetTree.PmRow pm : tree.outside) {
             if (pm.project == focusedProject) reveal.add(railFold(railKey(host, "outside"), FleetTree.Fold.OUTSIDE));
         }
@@ -3458,6 +3463,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             railNote(host, "deacon-state", why, chrome.onSurfaceVariant, 0,
                     live && !railDeaconBusy.contains(host.id) ? () -> railStartDeacon(host, current) : null,
                     order, keep);
+        }
+        // PMs labelled herdr.group=<name>, in their named groups above the repositories (factory-r8f.6).
+        for (FleetTree.RepoRow group : tree.groups) {
+            String key = railFold(railKey(host, "group/" + group.key), FleetTree.Fold.GROUP);
+            boolean folded = railFolded(key);
+            railHeader(host, live, current, "named:" + group.key, group.name, group.label(folded), key, folded, 0, "", order, keep);
+            if (folded) continue;
+            for (FleetTree.PmRow pm : group.projects) railPm(host, live, current, pm, 1, selectedPane, order, keep);
         }
         for (FleetTree.RepoRow repo : tree.repos) {
             String key = railFold(railKey(host, "repo/" + repo.key), FleetTree.Fold.REPO);

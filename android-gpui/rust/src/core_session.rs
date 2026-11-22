@@ -2214,6 +2214,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "issue": label("issue").unwrap_or(""),
             "task": label("task").unwrap_or(""),
             "helper": label("helper").unwrap_or(""),
+            // A PM's sidebar group (herdr.group, factory-r8f.6): presentation only.
+            "group": label("herdr.group").unwrap_or(""),
             // What the deacon view shows under each agent: the program's own
             // status message, why it is blocked, and since when (core clock, ms).
             "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),
@@ -2616,6 +2618,21 @@ b"}"#), None);
         rename_tab(&mut doc, "s1", "mobile-1-9", "review").unwrap();
         project(&mut view, &terminals, &doc).unwrap();
         assert_eq!((view["tabs"][0]["label"].clone(), view["tabs"][0]["named"].clone()), (json!("review"), json!(true)));
+    }
+
+    #[test]
+    fn a_pms_herdr_group_label_reaches_the_phone_and_nothing_else_makes_one() {
+        let doc = json!({"spaces":[{"id":"s1","name":"work","tabs":[{"id":"x"}]}]});
+        let terminals = json!([
+            {"address":"t5","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"app","herdr.group":"herdr"},"title":"pm","status":{}},
+            {"address":"t6","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"web","group":"not-ours"},"title":"pm","status":{}},
+            {"address":"t7","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","herdr.group":"x".repeat(129)},"title":"pm","status":{}}]);
+        let mut view = json!({"pane_id":"t5"});
+        project(&mut view, &terminals, &doc).unwrap();
+        let group = |id: &str| view["panes"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["group"].clone();
+        assert_eq!(group("t5"), "herdr");
+        assert_eq!(group("t6"), "", "only herdr.group names a group");
+        assert_eq!(group("t7"), "", "an overlong label is no group");
     }
 
     #[test]

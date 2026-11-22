@@ -32,6 +32,8 @@ final class FleetTree {
          * what the row calls it (AgentNames), never its id.
          */
         String name = "", task = "", helper = "";
+        /** A PM's sidebar group, from its herdr.group label (factory-r8f.6); "" when it has none. */
+        String group = "";
         /** Tells it from another agent here with the same name: its folder, or "2" (AgentNames.disambiguate). */
         String nameNote = "";
         /** The foreground program's name, when the core says ("" when unknown). */
@@ -186,6 +188,20 @@ final class FleetTree {
     };
 
     /** deacon, pm or worker; any other label value is treated as no role. */
+    /** At most this many characters of a group's name. */
+    static final int GROUP_CHARS = 40;
+
+    /** A herdr.group label as a group's name: trimmed, plain and bounded, else "" (no group). */
+    static String groupName(String value) {
+        String v = value == null ? "" : value.trim();
+        if (v.isEmpty() || "none".equals(v) || v.codePointCount(0, v.length()) > GROUP_CHARS) return "";
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (Character.isISOControl(c) || Character.getType(c) == Character.FORMAT) return "";
+        }
+        return v;
+    }
+
     static String role(String value) {
         String v = value == null ? "" : value.trim();
         return v.equals("deacon") || v.equals("pm") || v.equals("worker") ? v : "";
@@ -790,6 +806,8 @@ final class FleetTree {
         OUTSIDE,
         /** Agents that have no project/checkout placement. */
         OTHERS,
+        /** A named group of PMs (their herdr.group label): open at rest, like a repository. */
+        GROUP,
         /** An agent's own sub-agents. */
         AGENT
     }
@@ -800,7 +818,7 @@ final class FleetTree {
      * chevron; once a PM is opened, its workers show their own sub-agents.
      */
     static boolean foldedByDefault(Fold fold) {
-        return fold != Fold.AGENT && fold != Fold.REPO;
+        return fold != Fold.AGENT && fold != Fold.REPO && fold != Fold.GROUP;
     }
 
     static final int RAIL_DEPTH_DP = 18;
@@ -995,9 +1013,22 @@ final class FleetTree {
             String name = repoGroup(node);
             if (!name.isEmpty()) known.add(name);
         }
+        Map<String, RepoRow> named = new java.util.TreeMap<>((a, b) -> {
+            int c = a.compareToIgnoreCase(b);
+            return c != 0 ? c : a.compareTo(b);
+        });
         for (PmRow row : tree.allProjects) {
-            if (row.labelledPm()) repoGroup(groups, repoGroup(row), !row.project.repo.isEmpty()).add(row);
+            if (!row.labelledPm()) continue;
+            if (!row.pm.group.isEmpty()) named.computeIfAbsent(row.pm.group, k -> new RepoRow(k, k)).add(row);
+            else repoGroup(groups, repoGroup(row), !row.project.repo.isEmpty()).add(row);
         }
+        for (RepoRow group : named.values()) {
+            group.projects.sort((a, b) -> {
+                int c = a.name().compareToIgnoreCase(b.name());
+                return c != 0 ? c : a.name().compareTo(b.name());
+            });
+        }
+        tree.groups.addAll(named.values());
         for (PmRow row : tree.allProjects) {
             if (row.labelledPm()) continue;
             String name = repoGroup(row);
@@ -1103,6 +1134,11 @@ final class FleetTree {
         final List<PmRow> pms = new ArrayList<>();
         /** All project rows, including inferred/no-PM and idle projects, in first space order. */
         final List<PmRow> allProjects = new ArrayList<>();
+        /**
+         * Named groups of PMs (herdr.group), by name, above the repositories:
+         * presentation only; a PM without the label stays in its repository.
+         */
+        final List<RepoRow> groups = new ArrayList<>();
         /** Git repositories first, then other groups; project order within each category. */
         final List<RepoRow> repos = new ArrayList<>();
         /** Unplaced/extra agents, nested by parent; shells stay reachable as checkouts. */
