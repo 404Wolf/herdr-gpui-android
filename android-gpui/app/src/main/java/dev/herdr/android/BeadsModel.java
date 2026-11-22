@@ -1138,4 +1138,38 @@ final class BeadsModel {
     private static boolean present(JSONObject o, String k) {
         return o.has(k) && !o.isNull(k);
     }
+
+    // ---- which bead an agent works on (its hidden labels) ----------------------
+
+    /**
+     * The bead an agent works on, by its hidden labels: its own issue=, else
+     * (a helper, or a sub-agent) the nearest one up its parent chain below the
+     * lead; null when none links one. Never guessed from titles.
+     */
+    static String beadOf(String agentId, List<? extends FleetTree.Member> members) {
+        Map<String, FleetTree.Member> byId = new HashMap<>();
+        for (FleetTree.Member m : members) byId.put(m.id, m);
+        FleetTree.Member at = byId.get(agentId);
+        for (int hops = 0; at != null && hops < 8; hops++) {
+            // A lead's bead is not its workers': the chain stops at the PM or the Deacon.
+            if (hops > 0 && ("pm".equals(at.role) || "deacon".equals(at.role))) return null;
+            String issue = at instanceof Term ? ((Term) at).issue.trim() : "";
+            if (!issue.isEmpty()) return issue;
+            at = at.parent.isEmpty() ? null : byId.get(at.parent);
+        }
+        return null;
+    }
+
+    /** The project whose store holds an agent's bead: its own label, else up its chain. */
+    static String projectOf(String agentId, List<? extends FleetTree.Member> members) {
+        Map<String, FleetTree.Member> byId = new HashMap<>();
+        for (FleetTree.Member m : members) byId.put(m.id, m);
+        FleetTree.Member at = byId.get(agentId);
+        for (int hops = 0; at != null && hops < 8; hops++) {
+            if (!at.project.trim().isEmpty()) return at.project.trim();
+            at = byId.get(at.parent);
+        }
+        return "";
+    }
+
 }

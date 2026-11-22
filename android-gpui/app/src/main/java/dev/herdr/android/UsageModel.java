@@ -361,6 +361,12 @@ final class UsageModel {
             fresh = false;
         }
 
+        /** The machine was busy (its core refused the look for now): what shows stays, the note says so. */
+        void busy() {
+            fresh = true;
+            failure = "busy, retrying";
+        }
+
         /** A look's answer, or {@code unreachable} when the machine could not be asked. */
         void answered(Look answer, boolean unreachable, long now) {
             fresh = true;
@@ -397,6 +403,9 @@ final class UsageModel {
 
         /** The note under the title, or "": why it is old, a whole-sheet state, or that aswap is stale. */
         String note(long nowSeconds, ZoneId zone) {
+            if ("busy, retrying".equals(failure)) {
+                return machine + " is busy, retrying" + (listed() ? " · showing " + clock(shownAt, zone) : "");
+            }
             if (failure != null && listed()) {
                 return failure + " · showing " + clock(shownAt, zone);
             }

@@ -53,6 +53,8 @@ final class UsageView {
     private final UsageModel.Sheet state;
     private final PauseWatch pauses;
     private boolean asking, closed, paused;
+    /** Retries in a row of a busy machine, for the backoff. */
+    private int busyTries;
 
     private final Runnable poll = this::ask;
     private final Runnable tick = new Runnable() {
@@ -176,23 +178,38 @@ final class UsageView {
         asking = true;
         worker.execute(() -> {
             UsageModel.Look answer = null;
-            boolean unreachable = false, switched = false;
+            boolean unreachable = false, switched = false, busy = false;
             try {
                 answer = UsageModel.parse(OpTiming.timed("usage.look", look));
             } catch (HostSwitched gone) {
                 switched = true;
-            } catch (RuntimeException | LinkageError e) {
-                // The cause is never shown: only that the machine could not be asked.
+            } catch (RuntimeException e) {
+                // A busy core is retried, not called unreachable (its exec slots can all be taken).
+                if (OpTiming.busy(OpTiming.reason("usage.look", e))) busy = true;
+                else unreachable = true;
+            } catch (LinkageError e) {
                 unreachable = true;
             }
             UsageModel.Look result = answer;
-            boolean lost = unreachable, left = switched;
+            boolean lost = unreachable, left = switched, wait = busy;
             main.post(() -> {
                 // The phone is on another machine now: this sheet's machine is no longer the selected one.
                 if (left) { asking = false; dialog.dismiss(); return; }
+                if (wait) { waited(); return; }
+                busyTries = 0;
                 answered(result, lost);
             });
         });
+    }
+
+    /** The machine was busy: keep what shows, say so, and ask again after a growing wait. */
+    private void waited() {
+        asking = false;
+        if (closed) return;
+        state.busy();
+        render();
+        main.removeCallbacks(poll);
+        if (!paused) main.postDelayed(poll, OpTiming.busyBackoff(busyTries++));
     }
 
     private void answered(UsageModel.Look answer, boolean unreachable) {

@@ -44,4 +44,18 @@ public final class OpTimingTest {
         assertEquals("exec failed: … not found", OpTiming.clean("exec failed:\n/home/wolf/.config/x\u001b[31m not found"));
         assertEquals("cannot read …", OpTiming.clean("cannot read ~/beads/demo/.beads"));
     }
+
+    @Test public void aBusyCoreIsRetriedWithBackoffNotCalledUnreachable() {
+        // What the phone logged when every beads read failed (FINDINGS, 2026-11-22).
+        String said = OpTiming.reason("beads.stores",
+                new IllegalStateException("herdr-core protocol: \"unavailable\": 16 execs are running already"));
+        assertTrue(OpTiming.busy(said));
+        assertTrue(!OpTiming.busy("herdr-core protocol: \"denied\": exec refused"));
+        assertTrue(!OpTiming.busy("can't reach the machine"));
+        assertTrue(!OpTiming.busy(null));
+        assertEquals(5_000, OpTiming.busyBackoff(0));
+        assertEquals(10_000, OpTiming.busyBackoff(1));
+        assertEquals(40_000, OpTiming.busyBackoff(3));
+        assertEquals(60_000, OpTiming.busyBackoff(9));
+    }
 }
