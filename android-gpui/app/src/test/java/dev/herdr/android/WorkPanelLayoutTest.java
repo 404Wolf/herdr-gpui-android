@@ -17,8 +17,8 @@ public final class WorkPanelLayoutTest {
     @Test public void theSplitIsWolfsChoiceWithEachSideAtLeastItsMinimum() {
         assertEquals(0.5f, WorkPanelLayout.of(FOLD, false, false).share, 0f);
         assertEquals(0.4f, WorkPanelLayout.of(FOLD, false, false, new WorkPanelLayout.Choice(0.4f, false)).share, 1e-6f);
-        // Too narrow a panel or too narrow a terminal is clamped.
-        assertEquals(280f / FOLD, WorkPanelLayout.of(FOLD, false, false, new WorkPanelLayout.Choice(0.1f, false)).share, 1e-6f);
+        // Any width is kept; only too narrow a terminal is clamped.
+        assertEquals(0.1f, WorkPanelLayout.of(FOLD, false, false, new WorkPanelLayout.Choice(0.1f, false)).share, 1e-6f);
         assertEquals(1 - 320f / FOLD, WorkPanelLayout.of(FOLD, false, false, new WorkPanelLayout.Choice(0.9f, false)).share, 1e-6f);
         // The cover is untouched by the divider.
         assertFalse(WorkPanelLayout.of(412, false, false, new WorkPanelLayout.Choice(0.4f, true)).divider);
@@ -28,7 +28,10 @@ public final class WorkPanelLayoutTest {
         WorkPanelLayout.Choice kept = WorkPanelLayout.released(FOLD - 400, FOLD, 0.5f);
         assertFalse(kept.hidden);
         assertEquals(400f / FOLD, kept.share, 1e-6f);
-        WorkPanelLayout.Choice hidden = WorkPanelLayout.released(FOLD - 150, FOLD, 0.42f);
+        // Only at zero (within about 12 px) is it hidden: 150 dp or 10 dp are kept as they are.
+        assertEquals(150f / FOLD, WorkPanelLayout.released(FOLD - 150, FOLD, 0.42f).share, 1e-6f);
+        assertFalse(WorkPanelLayout.released(FOLD - 10, FOLD, 0.42f).hidden);
+        WorkPanelLayout.Choice hidden = WorkPanelLayout.released(FOLD - 4, FOLD, 0.42f);
         assertTrue(hidden.hidden);
         // It comes back at the share it had.
         assertEquals(0.42f, hidden.share, 0f);
@@ -38,9 +41,17 @@ public final class WorkPanelLayoutTest {
         // Hidden, the rail can dock again; shown, the panel takes its room.
         assertFalse(WorkPanelLayout.splitsWithRail(FOLD, false, true));
         assertTrue(WorkPanelLayout.splitsWithRail(FOLD, false, false));
-        assertTrue(WorkPanelLayout.restores(-60, 10));
-        assertFalse(WorkPanelLayout.restores(-30, 0));
+        assertTrue(WorkPanelLayout.restores(-12, 2));
+        assertFalse(WorkPanelLayout.restores(-4, 0));
         assertFalse(WorkPanelLayout.restores(-60, 80));
+        // A reveal keeps exactly the width it was let go at, from zero up; none at all stays hidden.
+        assertEquals(37f / FOLD, WorkPanelLayout.revealed(FOLD - 37, FOLD, 0.42f).share, 1e-6f);
+        assertFalse(WorkPanelLayout.revealed(FOLD - 37, FOLD, 0.42f).hidden);
+        assertTrue(WorkPanelLayout.revealed(FOLD - 2, FOLD, 0.42f).hidden);
+        // While the finger is down the panel is exactly there, zero included.
+        assertEquals(0f, WorkPanelLayout.live(FOLD, 0).share, 0f);
+        assertTrue(WorkPanelLayout.live(FOLD, 0).shown);
+        assertEquals(1 - 320f / FOLD, WorkPanelLayout.live(FOLD, 0.95f).share, 1e-6f);
         assertFalse(WorkPanelLayout.shownAgain(hidden).hidden);
         assertEquals(0.42f, WorkPanelLayout.shownAgain(hidden).share, 0f);
         // The drag never squeezes the terminal under its minimum.
@@ -70,6 +81,15 @@ public final class WorkPanelLayoutTest {
         // The age moved into the tab row; bullets hang at their text.
         assertTrue(panel.contains("showAge(f.text"));
         assertTrue(panel.contains("first + Math.round(bodyPaint().measureText(marker))"));
+        // The end of the text scrolls clear of the floating composer icons (review A6).
+        assertEquals(64, WorkPanel.BOTTOM_DP);
+        assertTrue(panel.contains("scroll.setPadding(0, 0, 0, dp(BOTTOM_DP));") && panel.contains("scroll.setClipToPadding(false);"));
+    }
+
+    @Test public void withNoChoiceTheUnfoldedSplitIsOnTheHinge() {
+        // The review's Fold is 949 dp wide: the default leaves the divider at 474.5 dp (A3).
+        WorkPanelLayout l = WorkPanelLayout.of(949, false, false, WorkPanelLayout.Choice.parse(""));
+        assertEquals(474.5f, 949 * (1 - l.share), 1e-3f);
     }
 
     @Test public void theChoiceIsKeptAsTextAndAnythingElseIsTheDefault() {
@@ -81,16 +101,22 @@ public final class WorkPanelLayoutTest {
         assertEquals(0f, WorkPanelLayout.Choice.parse(null).share, 0f);
     }
 
-    @Test public void theTerminalResizesOnceOnTheReleaseNeverWhileDragging() throws IOException {
+    @Test public void thePanelFollowsTheFingerAndOnlyTheReleaseIsKept() throws IOException {
         String divider = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/PanelDivider.java")), StandardCharsets.UTF_8);
         int move = divider.indexOf("case MotionEvent.ACTION_MOVE:"), up = divider.indexOf("case MotionEvent.ACTION_UP:");
-        // A move only moves the preview line; the choice (and the resize) waits for the lift.
-        assertFalse(divider.substring(move, up).contains("chose.accept"));
-        assertTrue(divider.substring(up, divider.indexOf("case MotionEvent.ACTION_CANCEL:")).contains("chose.accept(WorkPanelLayout.released("));
+        // A move hands the live share on (once a frame); the choice waits for the lift.
+        assertTrue(divider.substring(move, up).contains("liveShare(WorkPanelLayout.dragged("));
+        assertFalse(divider.substring(move, up).contains("finish("));
+        assertTrue(divider.substring(up, divider.indexOf("case MotionEvent.ACTION_CANCEL:")).contains("finish(WorkPanelLayout.released("));
+        assertTrue(divider.contains("finish(WorkPanelLayout.revealed("));
+        assertTrue(divider.contains("divider.postOnAnimation("));
+        assertFalse(divider.contains("preview"));
         // The right edge's strip is excluded from Android's Back gesture.
         assertTrue(divider.contains("setSystemGestureExclusionRects"));
         String gta = TerminalSource.text();
         assertTrue(gta.contains("\"work_panel_\" + (getResources().getConfiguration().orientation"));
         assertTrue(gta.contains("root().announceForAccessibility(next.hidden ? \"Work panel hidden\" : \"Work panel restored\");"));
+        assertTrue(gta.contains("new PanelDivider(this, chrome, this::choosePanel, this::dragPanel)"));
+        assertTrue(gta.contains(": WorkPanelLayout.live(widthDp, panelLive);"));
     }
 }

@@ -52,8 +52,14 @@ final class DocModel {
         }
     }
 
-    /** How a doc's age reads, and how loud: "updated 4m ago", "not updated for 2d". */
+    /**
+     * How a doc's age reads, and how loud: "updated 4m ago", "not updated for 2d".
+     * Amber is the "needs you" colour, so an age is quiet until it is really
+     * stale: from {@link #WARN_S} (review A5; a working day's doc is fine).
+     */
     enum Level { OK, WARN, OLD }
+
+    static final long WARN_S = 12 * 3600;
 
     static final class Freshness {
         final long age;
@@ -73,7 +79,7 @@ final class DocModel {
         String ago = age < 90 ? "just now" : age < 3600 ? Math.round(age / 60.0) + "m ago"
                 : age < 86400 ? Math.round(age / 3600.0) + "h ago" : Math.round(age / 86400.0) + "d ago";
         if (age >= 86400) return new Freshness(age, "not updated for " + ago.replace(" ago", ""), Level.OLD);
-        return new Freshness(age, "updated " + ago, age >= 7200 ? Level.WARN : Level.OK);
+        return new Freshness(age, "updated " + ago, age >= WARN_S ? Level.WARN : Level.OK);
     }
 
     /**
