@@ -44,8 +44,7 @@ public final class BeadsLinkTest {
     }
 
     @Test public void theRailShowsNoBeads() throws IOException {
-        String rail = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
+        String rail = TerminalSource.text();
         for (String beads : new String[] {"BeadsRail", "beads.stores", "beads.detail", "☰ Beads", "☰!"}) {
             assertFalse(beads, rail.contains(beads));
         }

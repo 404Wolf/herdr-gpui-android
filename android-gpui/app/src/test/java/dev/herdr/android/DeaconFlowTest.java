@@ -74,7 +74,7 @@ public final class DeaconFlowTest {
 
     @Test public void homeAndTheRailDriveTheSameSharedFlow() throws IOException {
         String home = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/HomeActivity.java")), StandardCharsets.UTF_8);
-        String rail = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String rail = TerminalSource.text();
         assertTrue(home.contains("private final DeaconFlow deaconFlow = DeaconFlow.shared();"));
         assertTrue(rail.contains("private final DeaconFlow deaconFlow = DeaconFlow.shared();"));
         for (String gone : new String[] {"railDeaconPending", "railDeaconBusy", "railProjectBusy"}) assertFalse(rail.contains(gone));

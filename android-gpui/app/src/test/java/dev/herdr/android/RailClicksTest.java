@@ -135,7 +135,7 @@ public final class RailClicksTest {
         assertTrue(rail.indexOf("FleetTree.memberAt(") < rail.indexOf("railWorktreeOpening.add(key)"));
         assertTrue(rail.contains("railWorktreeOpening.remove(key)"));
         assertTrue(rail.contains("!current.ready"));
-        assertTrue(rail.contains("if (connection != current) return;"));
+        assertTrue(rail.contains("if (a.connection != current) return;"));
     }
 
     @Test public void fleetMachineRowsAndIndependentPressTargetsHaveFeedbackAndActions() throws IOException {
@@ -149,13 +149,13 @@ public final class RailClicksTest {
         assertTrue(chip.contains("RippleDrawable("));
         String space = section(rail, "private RailWorkspaceRow createRailWorkspaceRow(", "private void updateRailWorkspaceRow(");
         // Header rows fold with the same control as PM rows, full height.
-        assertTrue(space.contains("holder.mark = new RailDisclosure(this, chrome)"));
+        assertTrue(space.contains("holder.mark = new RailDisclosure(a, a.chrome)"));
         assertTrue(space.contains("holder.mark.setOnClickListener("));
         assertTrue(space.contains("holder.mark.offerOn(holder.row)"));
         assertTrue(space.contains("new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1)"));
         // A Deacon or PM row folds with its own disclosure button, the row's full height and 48dp wide.
         String pane = section(rail, "private RailPaneRow createRailPaneRow(", "private void updateRailPaneRow(");
-        assertTrue(pane.contains("holder.mark = new RailDisclosure(this, chrome)"));
+        assertTrue(pane.contains("holder.mark = new RailDisclosure(a, a.chrome)"));
         assertTrue(pane.contains("holder.mark.setOnClickListener("));
         assertTrue(pane.contains("holder.mark.offerOn(holder.row)"));
         assertTrue(pane.contains("new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1)"));
@@ -175,6 +175,7 @@ public final class RailClicksTest {
     }
 
     private static String source(String name) throws IOException {
+        if (name.equals("GpuiTerminalActivity")) return TerminalSource.text();
         return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")),
                 StandardCharsets.UTF_8);
     }

@@ -38,7 +38,7 @@ public final class ErrorWordsTest {
     }
 
     @Test public void theRailAndHomeSayItByKind() throws IOException {
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         String home = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/HomeActivity.java")), StandardCharsets.UTF_8);
         assertTrue(gta.contains("failure = ErrorWords.of(error, target.hostName);"));
         assertTrue(home.contains("failure = ErrorWords.of(error, host.name);"));
