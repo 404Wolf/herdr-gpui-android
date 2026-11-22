@@ -61,7 +61,14 @@ final class RailDrag {
     private View armed, dragged, marked;
     private Drawable markedWas;
     private Runnable sheet;
-    private float downX, downY, lastY = -1;
+    private float downX, downY;
+    /**
+     * The finger in the rail's viewport (px from its top; -1: not over the
+     * rail) and what it drags: kept in viewport terms, so a hold at an edge
+     * keeps scrolling as the content moves under it (audit t483).
+     */
+    private float viewY = -1;
+    private Ref dragging;
     private boolean scrolling;
 
     RailDrag(ViewGroup rows, ScrollView scroll, GpuiChrome chrome, Planner planner) {
@@ -154,12 +161,13 @@ final class RailDrag {
             case DragEvent.ACTION_DRAG_STARTED:
                 return true;
             case DragEvent.ACTION_DRAG_LOCATION:
-                lastY = e.getY();
-                show(item, lastY);
+                viewY = e.getY() - scroll.getScrollY();
+                dragging = item;
+                show(item, e.getY());
                 autoScroll();
                 return true;
             case DragEvent.ACTION_DRAG_EXITED:
-                lastY = -1;
+                viewY = -1;
                 unmark();
                 return true;
             case DragEvent.ACTION_DROP: {
@@ -172,7 +180,8 @@ final class RailDrag {
             }
             case DragEvent.ACTION_DRAG_ENDED:
                 // Dropped or not, the row is back where the list draws it; nothing was written unless dropped.
-                lastY = -1;
+                viewY = -1;
+                dragging = null;
                 unmark();
                 if (dragged != null) dragged.setAlpha(1f);
                 dragged = null;
@@ -247,8 +256,13 @@ final class RailDrag {
         scroll.postOnAnimation(new Runnable() {
             @Override public void run() {
                 float step = step();
-                if (lastY < 0 || dragged == null || step == 0) { scrolling = false; return; }
+                if (viewY < 0 || dragged == null || dragging == null || step == 0) { scrolling = false; return; }
+                int before = scroll.getScrollY();
                 scroll.scrollBy(0, Math.round(step));
+                // At the end of the list nothing moves: stop rather than spin.
+                if (scroll.getScrollY() == before) { scrolling = false; return; }
+                // The finger hasn't moved, the rows have: where it lands is under it now.
+                show(dragging, viewY + scroll.getScrollY());
                 scroll.postOnAnimation(this);
             }
         });
@@ -256,8 +270,7 @@ final class RailDrag {
 
     /** px to scroll this frame: toward the edge the pointer is within {@link #EDGE_DP} of. */
     private float step() {
-        float inView = lastY - scroll.getScrollY();
-        return scrollStep(inView, scroll.getHeight(), dp(EDGE_DP), dp(MAX_SCROLL_DP));
+        return scrollStep(viewY, scroll.getHeight(), dp(EDGE_DP), dp(MAX_SCROLL_DP));
     }
 
     /** Pure: the scroll for a pointer {@code y} px into a {@code height} px viewport (negative: up). */

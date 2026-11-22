@@ -1116,7 +1116,8 @@ impl Connection<'_> {
                 // never writes back another window's stale order.
                 for _ in 0..5 {
                     let doc = self.call("doc.get", json!({"name":"projects.order"}))?;
-                    let Some(value) = order_move(&doc["value"], &scope, &id, &target, after, &shown) else {
+                    // Nothing moves: done. A list at its cap is refused out loud (Capacity), never as a no-op.
+                    let Some(value) = order_move(&doc["value"], &scope, &id, &target, after, &shown)? else {
                         return Ok(());
                     };
                     match self.call(
@@ -1692,6 +1693,8 @@ impl OrderScope {
         }
     }
 }
+/// herdr-projects-order's bound on one list.
+const ORDER_MAX_IDS: usize = 1000;
 /// The keys herdr-projects-order reads; any other key is a newer writer's, kept as it is.
 const ORDER_KNOWN: [&str; 5] = ["repos", "projects", "windows", "groups", "grouped"];
 /// herdr-projects-order's reading of the projects.order doc: lists of names
@@ -1732,9 +1735,10 @@ fn order_clean(value: &Value) -> Value {
 /// One drag in projects.order, as herdr-projects-order makes it: `scope`'s
 /// stored list (a project's windows less those no longer shown: they ended),
 /// then the names `shown` adds, with `id` just before or after `target`.
-/// Only that list changes. None: nothing moves (either is missing, or it is
-/// already there).
-fn order_move(value: &Value, scope: &OrderScope, id: &str, target: &str, after: bool, shown: &[String]) -> Option<Value> {
+/// Only that list changes. Ok(None): nothing moves (either is missing, or it
+/// is already there); Err(Capacity): the list would pass herdr-projects-order's
+/// 1000 names, which it refuses too.
+fn order_move(value: &Value, scope: &OrderScope, id: &str, target: &str, after: bool, shown: &[String]) -> Result<Option<Value>> {
     let mut v = order_clean(value);
     let (top, key) = scope.place();
     let list = match key {
@@ -1751,13 +1755,18 @@ fn order_move(value: &Value, scope: &OrderScope, id: &str, target: &str, after: 
     let mut ids = stored.clone();
     ids.extend(shown.iter().filter(|x| !stored.contains(x)).cloned());
     if id == target || !ids.iter().any(|x| x == id) || !ids.iter().any(|x| x == target) {
-        return None;
+        return Ok(None);
     }
     let mut rest: Vec<String> = ids.iter().filter(|x| *x != id).cloned().collect();
-    let at = rest.iter().position(|x| x == target)? + usize::from(after);
+    let Some(at) = rest.iter().position(|x| x == target).map(|i| i + usize::from(after)) else {
+        return Ok(None);
+    };
     rest.insert(at, id.to_owned());
-    if rest == ids || rest.len() > 1000 {
-        return None;
+    if rest == ids {
+        return Ok(None);
+    }
+    if rest.len() > ORDER_MAX_IDS {
+        return Err(Error::Capacity);
     }
     match key {
         None => v[top] = json!(rest),
@@ -1768,7 +1777,7 @@ fn order_move(value: &Value, scope: &OrderScope, id: &str, target: &str, after: 
             v[top][key] = json!(rest);
         }
     }
-    Some(v)
+    Ok(Some(v))
 }
 /// Appends one space to herdr-app's document, keeping every space and tab
 /// already there (edit_doc hands it the freshest version on each try).
@@ -3051,17 +3060,17 @@ b"}"#), None);
         let w = |p: &str| OrderScope::Windows(p.to_owned());
         // As herdr-projects-order's test_item_79: its own list beside the others.
         let got = order_move(&json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]}}), &w("research-ui"), "t1s7", "t1s6", false,
-            &ids(&["t1s6", "t1s7", "tab:s3/4"])).unwrap();
+            &ids(&["t1s6", "t1s7", "tab:s3/4"])).unwrap().unwrap();
         assert_eq!(got, json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]},"windows":{"research-ui":["t1s7","t1s6","tab:s3/4"]}}));
         // Windows that ended leave the list at the next move; a new one joins.
-        let again = order_move(&got, &w("research-ui"), "t1new", "t1s6", false, &ids(&["t1s6", "t1new"])).unwrap();
+        let again = order_move(&got, &w("research-ui"), "t1new", "t1s6", false, &ids(&["t1s6", "t1new"])).unwrap().unwrap();
         assert_eq!(again["windows"]["research-ui"], json!(["t1new", "t1s6"]));
         // Nothing moves: the same place, a name not shown (the lead), or onto itself.
-        assert!(order_move(&again, &w("research-ui"), "t1new", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
-        assert!(order_move(&again, &w("research-ui"), "t9r", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
-        assert!(order_move(&again, &w("research-ui"), "t1s6", "t1s6", true, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, &w("research-ui"), "t1new", "t1s6", false, &ids(&["t1new", "t1s6"])).unwrap().is_none());
+        assert!(order_move(&again, &w("research-ui"), "t9r", "t1s6", false, &ids(&["t1new", "t1s6"])).unwrap().is_none());
+        assert!(order_move(&again, &w("research-ui"), "t1s6", "t1s6", true, &ids(&["t1new", "t1s6"])).unwrap().is_none());
         // After, and a doc that was never written.
-        let fresh = order_move(&Value::Null, &w("x#t1"), "a", "c", true, &ids(&["a", "b", "c"])).unwrap();
+        let fresh = order_move(&Value::Null, &w("x#t1"), "a", "c", true, &ids(&["a", "b", "c"])).unwrap().unwrap();
         assert_eq!(fresh, json!({"repos":[],"projects":{},"windows":{"x#t1":["b","c","a"]}}));
         // A doc with no windows yet reads without the key, as the tool keeps it.
         assert_eq!(order_clean(&json!({"repos":["a"],"projects":{},"windows":{}})), json!({"repos":["a"],"projects":{}}));
@@ -3073,20 +3082,20 @@ b"}"#), None);
         // factory-r8f.8: a window's move used to drop the groups' order and any newer key.
         let doc = json!({"repos":["mono"],"projects":{"mono":["qos"]},"groups":["herdr","agents"],
             "grouped":{"herdr":["factory","aswap"]},"pinned":{"x":1},"future":["kept"]});
-        let got = order_move(&doc, &OrderScope::Windows("factory".into()), "t2", "t1", false, &ids(&["t1", "t2"])).unwrap();
+        let got = order_move(&doc, &OrderScope::Windows("factory".into()), "t2", "t1", false, &ids(&["t1", "t2"])).unwrap().unwrap();
         for key in ["repos", "projects", "groups", "grouped", "pinned", "future"] {
             assert_eq!(got[key], doc[key], "{key}");
         }
         assert_eq!(got["windows"]["factory"], json!(["t2", "t1"]));
         // The groups, and one group's projects, by the same rule; only that list changes.
-        let groups = order_move(&doc, &OrderScope::Groups, "agents", "herdr", false, &ids(&["herdr", "agents"])).unwrap();
+        let groups = order_move(&doc, &OrderScope::Groups, "agents", "herdr", false, &ids(&["herdr", "agents"])).unwrap().unwrap();
         assert_eq!(groups["groups"], json!(["agents", "herdr"]));
         assert_eq!(groups["grouped"], doc["grouped"]);
-        let inside = order_move(&doc, &OrderScope::Group("herdr".into()), "factory", "aswap", true, &ids(&["factory", "aswap", "newpm"])).unwrap();
+        let inside = order_move(&doc, &OrderScope::Group("herdr".into()), "factory", "aswap", true, &ids(&["factory", "aswap", "newpm"])).unwrap().unwrap();
         assert_eq!(inside["grouped"]["herdr"], json!(["aswap", "factory", "newpm"]));
         assert_eq!(inside["groups"], doc["groups"]);
         // A new group's list starts from what is shown; a group's list is not a repo's.
-        let fresh = order_move(&doc, &OrderScope::Group("agents".into()), "b", "a", false, &ids(&["a", "b"])).unwrap();
+        let fresh = order_move(&doc, &OrderScope::Group("agents".into()), "b", "a", false, &ids(&["a", "b"])).unwrap().unwrap();
         assert_eq!(fresh["grouped"], json!({"herdr":["factory","aswap"],"agents":["b","a"]}));
         assert_eq!(fresh["projects"], doc["projects"]);
         // Groups and grouped read only once something is stored, as the tool writes them.
@@ -3103,7 +3112,7 @@ b"}"#), None);
             let scope = OrderScope::parse(m["scope"].as_str().unwrap()).unwrap();
             let peers: Vec<String> = m["peers"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_owned()).collect();
             let (id, target, after) = (m["id"].as_str().unwrap(), m["target"].as_str().unwrap(), m["after"].as_bool().unwrap());
-            let got = order_move(&case["order"], &scope, id, target, after, &peers).unwrap_or_else(|| panic!("{}", case["name"]));
+            let got = order_move(&case["order"], &scope, id, target, after, &peers).unwrap().unwrap_or_else(|| panic!("{}", case["name"]));
             let (top, key) = scope.place();
             let list = match key { None => &got[top], Some(k) => &got[top][k] };
             let mut want: Vec<String> = peers.iter().filter(|x| *x != id).cloned().collect();
@@ -3113,6 +3122,20 @@ b"}"#), None);
             moves += 1;
         }
         assert!(moves >= 6, "the fixture's move cases: {moves}");
+    }
+
+    #[test]
+    fn a_list_at_its_cap_is_refused_out_loud_not_taken_for_a_no_op() {
+        // Audit t483: a refusal at 1000 names was a silent success.
+        let names: Vec<String> = (0..1000).map(|i| format!("p{i}")).collect();
+        let doc = json!({"repos":[],"projects":{},"grouped":{"herdr":names}});
+        let more: Vec<String> = names.iter().cloned().chain(["new".to_owned()]).collect();
+        assert!(matches!(
+            order_move(&doc, &OrderScope::Group("herdr".into()), "new", "p0", false, &more),
+            Err(Error::Capacity)
+        ));
+        // At the cap itself, a move within it still works.
+        assert!(order_move(&doc, &OrderScope::Group("herdr".into()), "p9", "p0", false, &names).unwrap().is_some());
     }
 
     #[test]
