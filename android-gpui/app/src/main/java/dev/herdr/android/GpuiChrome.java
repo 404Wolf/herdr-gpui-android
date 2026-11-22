@@ -7,13 +7,17 @@ package dev.herdr.android;
  * every text role keeps WCAG AA contrast on its surface.
  */
 final class GpuiChrome {
-    /** Thirteen ARGB colors, then 1 when the surface is light. */
-    static final int ROLE_COUNT = 14;
+    /** Sixteen ARGB colors, then 1 when the surface is light. */
+    static final int ROLE_COUNT = 17;
 
     final int background, surface, onSurface, onSurfaceVariant, outline, primary;
     /** Tonal container for keycaps and the selected rail row. */
     final int control, selected;
     final int danger, warning, success, info, working;
+    /** Panels and sheets (the Work panel, action sheets); the surface unless the palette sets its own. */
+    final int panel;
+    /** Raised fills on the surface (code blocks, bar tracks, sheet handles) and a pressed row. */
+    final int raised, hover;
     final boolean light;
 
     private GpuiChrome(int[] roles) {
@@ -30,7 +34,10 @@ final class GpuiChrome {
         success = roles[10];
         info = roles[11];
         working = roles[12];
-        light = roles[13] != 0;
+        panel = roles[13];
+        raised = roles[14];
+        hover = roles[15];
+        light = roles[16] != 0;
     }
 
     static GpuiChrome of(int[] roles) {
