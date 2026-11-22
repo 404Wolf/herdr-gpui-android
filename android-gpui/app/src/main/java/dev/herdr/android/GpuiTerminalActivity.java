@@ -6546,6 +6546,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 return current(current) && current.ready && pane.equals(current.paneId) && attach == current.attach
                         && nativeSendCommand(current.generation, json);
             }
+            // The sheet sits in (and dims) the terminal that asked, not the work panel beside it.
+            @Override public android.graphics.Rect area() {
+                if (terminalColumn == null || !terminalColumn.isLaidOut()) return null;
+                int[] at = new int[2];
+                terminalColumn.getLocationOnScreen(at);
+                return new android.graphics.Rect(at[0], at[1], at[0] + terminalColumn.getWidth(), at[1] + terminalColumn.getHeight());
+            }
         });
     }
 
