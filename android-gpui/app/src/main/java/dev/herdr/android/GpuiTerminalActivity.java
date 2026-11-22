@@ -4302,7 +4302,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 result = new JSONObject(RemoteNative.sessionAction(target.remoteHandle, json));
                 if (!result.optBoolean("queued", false)) failure = result.optString("error", "it did not answer");
             } catch (Exception | LinkageError error) {
-                failure = "the computer did not answer";
+                // By the failure's kind (ErrorWords), never its text.
+                failure = ErrorWords.of(error, target.hostName);
             }
             final JSONObject reply = result;
             final String reason = failure;
