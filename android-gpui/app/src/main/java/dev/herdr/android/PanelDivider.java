@@ -24,12 +24,14 @@ import java.util.function.Consumer;
  * an inward swipe to bring it back. TalkBack gets Hide and Show actions.
  */
 final class PanelDivider {
-    static final int TOUCH_DP = 24, GRIP_W_DP = 3, GRIP_H_DP = 28;
+    static final int TOUCH_DP = 24, GRIP_W_DP = 4, GRIP_H_DP = 36, EDGE_GRIP_H_DP = 48;
 
     private final Activity activity;
     private final FrameLayout divider, edge;
     private final View preview;
     private final Consumer<WorkPanelLayout.Choice> chose;
+    private final View line, grip;
+    private final int gripColor, lineColor, dragColor;
     private WorkPanelLayout.Choice choice = WorkPanelLayout.Choice.DEFAULT;
     private float share;
     private int widthPx, originPx;
@@ -39,14 +41,14 @@ final class PanelDivider {
         this.activity = activity;
         this.chose = chose;
         divider = new FrameLayout(activity);
-        View line = new View(activity);
+        line = new View(activity);
         line.setBackgroundColor(chrome.outline);
         divider.addView(line, new FrameLayout.LayoutParams(dp(1), -1, Gravity.CENTER_HORIZONTAL));
-        View grip = new View(activity);
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(chrome.raised);
-        g.setCornerRadius(dp(2));
-        grip.setBackground(g);
+        // A 4x36dp pill on the line, mid-grey (review P0-3); the accent while dragged.
+        gripColor = GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x8C);
+        lineColor = chrome.outline;
+        dragColor = chrome.primary;
+        grip = pill(gripColor);
         divider.addView(grip, new FrameLayout.LayoutParams(dp(GRIP_W_DP), dp(GRIP_H_DP), Gravity.CENTER));
         divider.setContentDescription("Work panel divider: drag to resize, or all the way right to hide");
         divider.setVisibility(View.GONE);
@@ -54,12 +56,28 @@ final class PanelDivider {
         preview.setBackgroundColor(chrome.primary);
         preview.setVisibility(View.GONE);
         edge = new FrameLayout(activity);
+        // Hidden, a visible handle at the right edge says the swipe is there (review P0-3).
+        edge.addView(pill(gripColor), new FrameLayout.LayoutParams(dp(GRIP_W_DP), dp(EDGE_GRIP_H_DP), Gravity.END | Gravity.CENTER_VERTICAL));
         edge.setContentDescription("Show the work panel");
         edge.setVisibility(View.GONE);
         edge.setOnClickListener(v -> chose.accept(WorkPanelLayout.shownAgain(choice)));
         dragging();
         restoring();
         actions();
+    }
+
+    private View pill(int color) {
+        View pill = new View(activity);
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(dp(GRIP_W_DP) / 2f);
+        pill.setBackground(g);
+        return pill;
+    }
+
+    private void dragged(boolean on) {
+        line.setBackgroundColor(on ? dragColor : lineColor);
+        ((GradientDrawable) grip.getBackground()).setColor(on ? dragColor : gripColor);
     }
 
     View divider() { return divider; }
@@ -102,6 +120,7 @@ final class PanelDivider {
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                     movePreview(xPx);
                     preview.setVisibility(View.VISIBLE);
+                    dragged(true);
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     float shareNow = WorkPanelLayout.dragged(xDp, windowDp);
@@ -109,12 +128,14 @@ final class PanelDivider {
                     return true;
                 case MotionEvent.ACTION_UP:
                     preview.setVisibility(View.GONE);
+                    dragged(false);
                     // A tap is no drag: nothing changes.
                     if (Math.abs(e.getRawX() - down[0]) < dp(4)) return true;
-                    chose.accept(WorkPanelLayout.released(xDp, windowDp, share));
+                    chose.accept(WorkPanelLayout.released(WorkPanelLayout.snapped(xDp, windowDp), windowDp, share));
                     return true;
                 case MotionEvent.ACTION_CANCEL:
                     preview.setVisibility(View.GONE);
+                    dragged(false);
                     return true;
                 default:
                     return true;
