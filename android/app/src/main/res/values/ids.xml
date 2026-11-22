@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- A pinned agent's row offers Unpin to TalkBack as an action of its own (PinnedSection). -->
+    <item name="pin_unpin_action" type="id" />
+</resources>

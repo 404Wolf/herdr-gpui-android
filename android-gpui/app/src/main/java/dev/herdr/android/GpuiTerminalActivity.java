@@ -465,6 +465,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         LinearLayout.LayoutParams badgeAt = new LinearLayout.LayoutParams(-2, -1);
         badgeAt.gravity = LinkBadge.GRAVITY;
         tabRow.addView(linkBox, badgeAt);
+        // The pin of the agent on screen, top right (factory-9zz.2): PinsRail keeps it and the rail's Pinned section.
+        pinsRail = new PinsRail(this, chrome, Pins.shared(this), this::openPin, () -> refreshSidebar(true), this::note);
+        tabRow.addView(pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
         // Where this window is: machine › repo › worktree › window, and why
@@ -478,6 +481,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
+        pinsRail.button().extendTouch(crumb);
         filePager = new FilePager(this, surface, chrome, this::readFile, actionWorker);
         content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
@@ -2484,6 +2488,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
+        if (pinsRail != null) {
+            JSONObject shown = current == null ? null : PinsRail.paneOf(current.panes, current.paneId);
+            boolean agent = shown != null && !shellMode()
+                    && (!shown.optString("kind", "").isEmpty() || !shown.optString("role", "").isEmpty());
+            pinsRail.bindScreen(current == null ? null : current.machine, current != null && current.ready && !current.isClosed(),
+                    current != null && !current.ready && !current.isClosed(), current == null ? null : current.hostId,
+                    current == null ? null : current.hostName, current == null ? null : current.session,
+                    current == null ? null : current.panes, current == null ? "" : current.paneId, agent, railMembers);
+        }
         // A touch from now on carries this pane's stamp with its down.
         terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
         if (composer != null) {
@@ -3251,6 +3264,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (current != null) signature.append(current.paneId);
         signature.append(currentHostId);
+        java.util.List<String> savedIds = new java.util.ArrayList<>();
+        for (SavedRemoteHost host : savedHosts) savedIds.add(host.id);
+        if (pinsRail != null) signature.append(pinsRail.signature(savedIds));
         if (!force && signature.toString().equals(sidebarSignature)) return;
         sidebarSignature = signature.toString();
         if (savedHosts.isEmpty()) {
@@ -3263,6 +3279,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // seconds and replacing a view under a finger cancels its tap.
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
+        // Pinned agents first, on any machine: the one-tap way to another machine's agent (factory-9zz.2).
+        if (pinsRail != null) order.add(pinsRail.section(savedIds));
         // The machine this terminal is on leads the rail; the others follow in
         // saved order, so the top of the rail always names where you are.
         java.util.List<SavedRemoteHost> hosts = new java.util.ArrayList<>(savedHosts);
@@ -3748,6 +3766,34 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private final java.util.Set<String> railWorktreeOpening = new java.util.HashSet<>();
     /** Each terminal's space, for the rail's header long-press menus. */
     private final java.util.Map<String, String> railSpaceOf = new java.util.HashMap<>();
+    /** The pin button and the rail's Pinned section (PinsRail). */
+    private PinsRail pinsRail;
+
+    /**
+     * A pinned agent's row was tapped. P2 (t3jk) replaces this with the switch
+     * path for any machine; until then a pin on the machine on screen focuses
+     * its terminal, and another machine's pin says it opens there.
+     */
+    private void openPin(Pins.Pin pin) {
+        Connection now;
+        synchronized (stateLock) { now = connection; }
+        if (now != null && pin.key.machine.equals(now.machine)) {
+            // Only the very terminal that was pinned: listed now with its creation time, never a reused address.
+            Pins.Verify verdict = pin.ended() ? Pins.Verify.ENDED
+                    : Pins.verify(pin.key, now.remoteBoot, now.fingerprint, now.panes);
+            if (verdict != Pins.Verify.GO) {
+                note(PinsRail.refusal(verdict, pin));
+                return;
+            }
+            focusRemotePane(now, pin.key.address);
+            Pins.shared(this).opened(pin.key);
+            closeRailDrawer();
+            return;
+        }
+        note(pin.label.isEmpty() ? "That pin is on " + pin.machineName + ": open it there for now"
+                : pin.label + " is on " + pin.machineName + ": open it there for now");
+    }
+
     /** The live machine's members as the rail last read them, with their names and labels (AgentNames). */
     private java.util.List<? extends FleetTree.Member> railMembers = java.util.Collections.emptyList();
     private final java.util.Map<String, String> railDeaconPending = new java.util.concurrent.ConcurrentHashMap<>();
@@ -7185,6 +7231,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
+                        if (selected && pinsRail != null && current.machine != null) Pins.shared(this).observe(current.machine, current.panes);
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
