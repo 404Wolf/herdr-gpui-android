@@ -145,6 +145,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean keysOnDeck;
     /** Colors for every surface outside the painted grid, from the current palette. */
     private GpuiChrome chrome;
+    /** The keyboard up now is the one autoKeyboardPane raised, untouched since: it waits for the answer. */
+    private volatile boolean keyboardRaisedByApp;
+    /** factory-setup.33: the agent's question dialog on the pane, answered from a native sheet. */
+    private final ElicitationOffer elicitation = new ElicitationOffer(this, () -> chrome,
+            () -> ElicitationPolicy.busy(imeShown, keyboardRaisedByApp, composer == null ? null : composer.busy()),
+            () -> ProvisionedSettings.capturable(this), this::hideRaisedKeyboard);
+    /** What the offer last saw (connection, pane, attach, readiness, status, kind); posted on change only. */
+    private String elicitationSignature = "";
     /** The terminal and, swiped to, a file an agent or a tapped path opened. */
     private FilePager filePager;
     private volatile boolean sidebarOpen;
@@ -384,6 +392,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
                 view.setPadding(bounds.left, bounds.top, bounds.right, bounds.bottom);
                 boolean ime = insets.isVisible(WindowInsets.Type.ime());
+                if (!ime && imeShown) keyboardRaisedByApp = false;   // put away: the next one is the user's
                 if (ime && !imeShown) markUsed();
                 imeShown = ime;
                 if (composer != null) composer.imeVisible(ime);
@@ -1534,6 +1543,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * dismissal cannot leave the button out of step.
      */
     private void toggleKeyboard() {
+        keyboardRaisedByApp = false;   // the user's own keyboard from here on
         boolean shown = false;
         View root = getWindow().getDecorView();
         if (Build.VERSION.SDK_INT >= 30 && root.getRootWindowInsets() != null) {
@@ -5939,9 +5949,42 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // A hello the outbox was not yet read for is bound on a later poll.
         if (current.machine == null && current.ready && current.remoteBoot != null) bindMachine(current, current.remoteBoot);
         publishTranscriptProof(current, current.ready);
+        boolean live = current.ready && pane.equals(current.paneId);
+        String where = current.generation + "/" + pane + "/" + attach + "/" + live;
+        String status = live ? paneStatus(current) : null, kind = agentKind(current);
+        if (!(where + "/" + status + "/" + kind).equals(elicitationSignature)) {
+            elicitationSignature = where + "/" + status + "/" + kind;
+            main.post(() -> offerElicitation(current, where, pane, attach, status, kind));
+        }
         if (signature.equals(offerSignature)) return;
         offerSignature = signature;
         main.post(this::refreshOffer);
+    }
+
+    /** The sheet opens: a keyboard the app raised for the question goes away (the user's own stays). */
+    private void hideRaisedKeyboard() {
+        if (!ElicitationPolicy.hidesKeyboard(imeShown, keyboardRaisedByApp)) return;
+        keyboardRaisedByApp = false;
+        allowNextKeyboardShow = false;
+        super.gpuiHideKeyboard(imeSession);
+        if (Build.VERSION.SDK_INT >= 30 && getWindow().getInsetsController() != null) {
+            getWindow().getInsetsController().hide(WindowInsets.Type.ime());
+        }
+    }
+
+    /** Hands the offer this pane; its keys go only to this pane at this attach, through its input queue. Main thread. */
+    private void offerElicitation(Connection current, String where, String pane, long attach, String status, String kind) {
+        if (destroyed) return;
+        String nativeKind = ElicitationPolicy.kind(kind);
+        elicitation.observe(where, current(current) ? status : null, kind, new ElicitationSheet.Pane() {
+            @Override public String parse() { return ElicitationNative.parse(attach, nativeKind); }
+            @Override public boolean attached() { return ElicitationNative.attached(attach); }
+            @Override public String step(String goal, String progress) { return ElicitationNative.step(attach, nativeKind, goal, progress); }
+            @Override public boolean send(String json) {
+                return current(current) && current.ready && pane.equals(current.paneId) && attach == current.attach
+                        && nativeSendCommand(current.generation, json);
+            }
+        });
     }
 
     /** The outbox changed (any thread): the strip and the status line follow. */
@@ -6395,6 +6438,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     @Override protected void onDestroy() {
         destroyed = true;
         open = false;
+        elicitation.destroy();
         attachWorker.shutdownNow();
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
@@ -7187,6 +7231,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     return;
                 }
                 mutation = true;
+                keyboardRaisedByApp = false;   // typed: the keyboard is in use
                 raw = doubleEnter(current, command, raw);
                 String result = RemoteNative.input(current.remoteHandle, current.paneId, raw);
                 if (!new JSONObject(result).optBoolean("queued", false)) throw new IOException("Input was not queued");
@@ -7313,9 +7358,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         if (item != null && pane.equals(item.optString("id"))
                                 && "blocked".equals(item.optString("status"))) {
                             final long generation = current.generation;
-                            // Never for a link lost since (factory-9zz.1): no keyboard offline.
+                            // Never for a link lost since (factory-9zz.1): no keyboard offline. A keyboard
+                            // the app raises is not Wolf's own (the question sheet may put it away).
                             main.post(() -> {
-                                if (current(current) && current.ready && !current.isClosed()) nativeShowKeyboard(generation);
+                                if (!(current(current) && current.ready && !current.isClosed())) return;
+                                keyboardRaisedByApp = true;
+                                nativeShowKeyboard(generation);
                             });
                             break;
                         }
@@ -7443,6 +7491,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void fail(Connection failed, String message) {
         synchronized (stateLock) {
             if (!current(failed)) return;
+            // The agent's dialog belongs to this connection: its sheet closes with it.
+            main.post(elicitation::close);
             failed.cancel();
             if (failed.poll != null) failed.poll.cancel(false);
             if (resumable(failed)) {
