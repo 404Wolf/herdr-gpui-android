@@ -33,9 +33,11 @@ final class RailDisclosure extends View {
      * 20dp square around it. The touch target stays the whole 48dp column,
      * the row's full height.
      */
-    static final float SQUARE_DP = 20f, CORNER_DP = 5f, ARM_DP = 2f, STROKE_DP = 1.25f;
+    static final float SQUARE_DP = 20f, CORNER_DP = 5f, ARM_DP = 3f, STROKE_DP = 1.5f;
     /** The chevron's centre, this far in from the column's end: close to its label, the whole column still the target. */
-    static final float ARROW_AT_DP = 11f;
+    static final float ARROW_AT_DP = 8f;
+    /** How far the touch target reaches past the drawn column into its label. */
+    static final int REACH_DP = 10;
 
     private final float density;
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -53,7 +55,7 @@ final class RailDisclosure extends View {
         stroke.setStrokeWidth(STROKE_DP * density);
         stroke.setStrokeCap(Paint.Cap.ROUND);
         stroke.setStrokeJoin(Paint.Join.ROUND);
-        stroke.setColor(chrome.onSurface);
+        stroke.setColor(chrome.onSurfaceVariant);
         pressColor = GpuiChrome.withAlpha(chrome.primary, 0x40);
         setSaveFromParentEnabled(false);
         bind(false, true, null);
@@ -90,6 +92,25 @@ final class RailDisclosure extends View {
             degrees = target;
             invalidate();
         }
+    }
+
+    /**
+     * The drawn column is narrow (28dp, the chevron near its label); its touch
+     * target reaches the row's start (the screen's edge) and {@link #REACH_DP}
+     * into the label, the row's full height, so it is still a 48dp-wide target
+     * and never reaches another row.
+     */
+    void extendTouch(View row) {
+        row.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (!shown) { row.setTouchDelegate(null); return; }
+            android.graphics.Rect hit = new android.graphics.Rect();
+            getHitRect(hit);
+            hit.left = 0;
+            hit.right += Math.round(REACH_DP * density);
+            hit.top = 0;
+            hit.bottom = b - t;
+            row.setTouchDelegate(new android.view.TouchDelegate(hit, this));
+        });
     }
 
     boolean shown() {

@@ -152,8 +152,10 @@ final class PinnedSection {
         root.removeAllViews();
         root.setVisibility(rows.isEmpty() ? View.GONE : View.VISIBLE);
         if (rows.isEmpty()) return;
-        TextView header = text("Pinned", 11, chrome.onSurfaceVariant, true);
-        header.setPadding(dp(10), dp(6), dp(10), dp(2));
+        // A quiet caps label, 12dp above and 4dp below (review D3).
+        TextView header = text("PINNED", 11, chrome.onSurfaceVariant, true);
+        header.setContentDescription("Pinned");
+        header.setPadding(dp(10), dp(12), dp(10), dp(4));
         if (Build.VERSION.SDK_INT >= 28) header.setAccessibilityHeading(true);
         root.addView(header);
         for (Row r : rows) root.addView(row(r));
