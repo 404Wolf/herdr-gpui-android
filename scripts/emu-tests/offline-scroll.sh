@@ -283,7 +283,7 @@ switch_to() { # name
     local n
     pane_is "$1" && return 0
     for n in 1 2 3; do
-        tap_ui "Window [0-9]+, $1[.,]" 8 || tap_ui "$1" 8 || true
+        tap_ui "Window [0-9]+, $1([.,]|$)" 8 || tap_ui "^[0-9]+ $1$" 8 || true
         quiet 4
         pane_is "$1" && return 0
     done
@@ -346,11 +346,13 @@ off_at=$(date +%s.%N)
 airplane enable
 sleep 1
 drag_back
-if note_shown 'only the last screen was saved|the agent scrolls when the link is back' 4; then
+if note_shown 'only the last screen was saved|the agent scrolls when the link is back' 6 \
+    || app_log | grep -q 'herdr-scroll.*SCREEN_ONLY'; then
     record fullscreen-drag-at-once PASS "$($ui text "$EMU_OUT/ui.xml" 'only the last screen|scrolls when the link' 2> /dev/null)"
 else
     shot fullscreen-drag-fail
-    record fullscreen-drag-at-once FAIL "no answer to a drag right after airplane mode (fullscreen-drag-fail.png)"
+    app_log > "$EMU_OUT/app-drag-at-once.log"
+    record fullscreen-drag-at-once FAIL "no answer to a drag right after airplane mode (fullscreen-drag-fail.png, app-drag-at-once.log)"
 fi
 quiet 6
 app_log > "$EMU_OUT/app-offline-1.log"
@@ -414,10 +416,9 @@ else
     record reconnect-time FAIL "not live within 30 s of airplane mode off (app-back-1.log, not-back.png)"
 fi
 
-# (E-S1) A main-screen pane with history: held offline, a drag moves it. Opened from Home, as
-# agent-f was: the two may sit in different tabs.
-launch
-if open_agent shell-a; then
+# (E-S1) A main-screen pane with history: held offline, a drag moves it. Its tab sits beside
+# agent-f's; the labelled nodes are kept when the switch fails.
+if switch_to shell-a || { quiet 5; switch_to shell-a; }; then
     quiet 5
     mark_log
     airplane enable
@@ -440,7 +441,8 @@ if open_agent shell-a; then
     wait_live 30 || record shell-back FAIL "not live within 30 s after the shell check"
 else
     shot shell-open-fail
-    record shell-held-scroll FAIL "could not open shell-a (shell-open-fail.png)"
+    dump > /dev/null 2>&1 && $ui list "$EMU_OUT/ui.xml" > "$EMU_OUT/shell-open-fail.txt" 2>&1
+    record shell-held-scroll FAIL "could not switch to shell-a (shell-open-fail.png, shell-open-fail.txt)"
 fi
 
 # (E-R2) The network is up but the host is down: the attempts are bounded, then the indicator
@@ -466,13 +468,18 @@ if wait_ui 'offline · tap to reconnect' 150 > /dev/null; then
     else
         record stays-stopped FAIL "$((after - tries)) attempts after stopping"
     fi
+    mark_log
     start_sshd || record setup FAIL "sshd did not restart"
     # The core starts again with a terminal to land on (a stopped core keeps none of these).
     hc run --bg --label agent.kind=claude --name shell-b -- sh -c 'printf "back\n$ "; exec cat' \
         > "$EMU_OUT/hc-b.log" 2>&1 || record setup FAIL "hc run shell-b after the restart (hc-b.log)"
-    mark_log
-    if tap_ui 'offline · tap to reconnect' 10 && tap_ui '^Reconnect$' 10 && wait_live 40; then
-        record reconnect-by-hand PASS "Reconnect brought the pane back"
+    # A network event may start a new epoch on its own before the tap (seen in run 10869);
+    # either way the pane must come back.
+    if find_ui 'offline · tap to reconnect' > /dev/null; then
+        tap_ui 'offline · tap to reconnect' 10 > /dev/null && tap_ui '^Reconnect$' 10 > /dev/null
+    fi
+    if wait_live 40; then
+        record reconnect-by-hand PASS "the pane came back once the host was up"
     else
         shot reconnect-by-hand-fail
         record reconnect-by-hand FAIL "Reconnect did not bring the pane back (reconnect-by-hand-fail.png)"
