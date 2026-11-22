@@ -1548,12 +1548,27 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 JSONArray panes = mirror == null ? null : mirror.panes;
                 String terminal = panes == null || panes.length() == 0 ? "" : panes.optJSONObject(0) == null ? ""
                         : panes.optJSONObject(0).optString("id", "");
+                // Each read is kept with its source machine (factory-9zz.12), so it opens offline too.
+                SavedRemoteHost source = savedHost(hostId);
+                MachineKey docMachine = source == null || bindings == null ? null
+                        : bindings.machine(source.id, source.connectionRevision);
                 if (mirror == null || !mirror.connected || mirror.handle <= 0 || terminal.isEmpty()) {
-                    note("Can't reach " + hostName(hostId) + " to open that file now");
+                    RefFiles.Copy copy = docMachine == null || refFiles == null ? null
+                            : refFiles.open(docMachine, DOC_FILES, path, System.currentTimeMillis());
+                    if (copy == null) {
+                        note("Can't reach " + hostName(hostId) + " to open that file now");
+                        return;
+                    }
+                    String saved = copy.reply();
+                    filePager.open(DOC_FILES, path, 0, (t, p) -> saved);
                     return;
                 }
                 final long handle = mirror.handle;
-                filePager.open(terminal, path, 0, (t, p) -> readThrough(handle, t, p));
+                filePager.open(terminal, path, 0, (t, p) -> {
+                    String reply = readThrough(handle, t, p);
+                    if (docMachine != null && refFiles != null) refFiles.save(docMachine, DOC_FILES, p, reply, System.currentTimeMillis());
+                    return reply;
+                });
             }
             @Override public void openLink(String url) {
                 String lower = url == null ? "" : url.toLowerCase(java.util.Locale.ROOT);
@@ -5988,6 +6003,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return "{\"queued\":false,\"error\":\"" + (kind.isEmpty() ? "failed" : kind) + "\"}";
         }
     }
+
+    /** The name the panel's file reads are kept under in RefFiles (only relative names need it). */
+    static final String DOC_FILES = "panel";
 
     /** The cover's panel stepped aside for a file opened from it: it comes back when the file closes. */
     private boolean reopenPanelAfterFile;

@@ -31,7 +31,15 @@ public final class FilePagerDismissTest {
         assertFalse("no slide from the right any more", pager.contains("translationX(open ? 0 : getWidth())"));
         String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
-        assertTrue(gta.contains("filePager.open(terminal, path, 0, (t, p) -> readThrough(handle, t, p));"));
+        assertTrue(gta.contains("String reply = readThrough(handle, t, p);"));
         assertTrue("the cover's panel comes back as it was", gta.contains("toggleWorkPanel(true);") && gta.contains("reopenPanelAfterFile = true;"));
+    }
+
+    @Test public void anotherMachinesDocIsKeptWithItsMachineAndOpensFromThatCopyOffline() throws Exception {
+        String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(gta.contains("refFiles.save(docMachine, DOC_FILES, p, reply, System.currentTimeMillis());"));
+        assertTrue(gta.contains("refFiles.open(docMachine, DOC_FILES, path, System.currentTimeMillis())"));
+        assertTrue("the machine is the doc's own, by its binding", gta.contains("bindings.machine(source.id, source.connectionRevision)"));
     }
 }
