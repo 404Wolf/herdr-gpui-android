@@ -89,10 +89,37 @@ final class PinButton {
      * button. A TouchDelegate on the view the finger lands on is the one Android
      * consults first, so the crumb's own tap keeps the rest of its width.
      */
-    void extendTouch(View below) {
+    void extendTouch(View below, View... beside) {
         home = (View) button.getParent();
+        this.beside = beside;
         below.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extend(below));
         button.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extend(below));
+        for (View other : beside) other.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extend(below));
+    }
+
+    /** Buttons beside the pin in the same strip whose targets reach down as well (the ⋮). */
+    private View[] beside = new View[0];
+
+    /** Several delegates on one view: the one whose rect the finger went down in takes the gesture. */
+    static final class Delegates extends TouchDelegate {
+        private final java.util.List<TouchDelegate> all;
+        private TouchDelegate taking;
+
+        Delegates(java.util.List<TouchDelegate> all, View any) {
+            super(new Rect(), any);
+            this.all = all;
+        }
+
+        @Override public boolean onTouchEvent(android.view.MotionEvent event) {
+            if (event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+                taking = null;
+                for (TouchDelegate d : all) {
+                    if (d.onTouchEvent(event)) { taking = d; return true; }
+                }
+                return false;
+            }
+            return taking != null && taking.onTouchEvent(event);
+        }
     }
 
     private void extend(View below) {
@@ -104,7 +131,16 @@ final class PinButton {
         }
         float density = activity.getResources().getDisplayMetrics().density;
         int reach = Math.max(0, Math.round(TARGET_DP * density) - strip.getHeight());
-        Rect hit = new Rect(strip.getLeft() + button.getLeft(), 0, strip.getLeft() + button.getRight(), reach);
-        below.setTouchDelegate(reach == 0 ? null : new TouchDelegate(hit, button));
+        if (reach == 0) {
+            below.setTouchDelegate(null);
+            return;
+        }
+        java.util.List<TouchDelegate> all = new java.util.ArrayList<>();
+        all.add(new TouchDelegate(new Rect(strip.getLeft() + button.getLeft(), 0, strip.getLeft() + button.getRight(), reach), button));
+        for (View other : beside) {
+            if (other.getParent() != strip || other.getVisibility() != View.VISIBLE) continue;
+            all.add(new TouchDelegate(new Rect(strip.getLeft() + other.getLeft(), 0, strip.getLeft() + other.getRight(), reach), other));
+        }
+        below.setTouchDelegate(all.size() == 1 ? all.get(0) : new Delegates(all, button));
     }
 }

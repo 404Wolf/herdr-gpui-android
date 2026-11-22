@@ -145,6 +145,9 @@ final class WorkPanel {
     };
 
     private final LinearLayout trailing;
+    /** The text, with the header laid over its top (its 48 dp targets reach into the text's first rows). */
+    private final FrameLayout stack;
+    static final int TARGET_DP = 48;
 
     WorkPanel(Activity activity, GpuiChrome chrome, Host host) {
         this.activity = activity;
@@ -184,12 +187,20 @@ final class WorkPanel {
         trailing.setGravity(Gravity.CENTER_VERTICAL);
         tabs.addView(trailing, new LinearLayout.LayoutParams(-2, -1));
         // Exactly the terminal's tab row (WorkPanelLayout.TOP_BAR_DP): both bars end on one line.
-        root.addView(tabs, new LinearLayout.LayoutParams(-1, dp(WorkPanelLayout.TOP_BAR_DP)));
-        // The bar's buttons keep 48 dp targets by reaching below it, not by making it taller.
-        tabs.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> extendTargets());
-        View rule = new View(activity);
-        rule.setBackgroundColor(chrome.outline);
-        root.addView(rule, new LinearLayout.LayoutParams(-1, 1));
+        // The row itself is a 48 dp target strip laid over the text, drawn only in its top
+        // TOP_BAR_DP (and the rule under it): its buttons take a finger in the strip below the
+        // bar too, while a touch there off any button falls through to the text (t42y C3).
+        int bar = dp(WorkPanelLayout.TOP_BAR_DP), reach = Math.max(bar, dp(TARGET_DP));
+        android.graphics.drawable.LayerDrawable band = new android.graphics.drawable.LayerDrawable(
+                new android.graphics.drawable.Drawable[] {
+                        new android.graphics.drawable.ColorDrawable(chrome.panel),
+                        new android.graphics.drawable.ColorDrawable(chrome.outline)});
+        band.setLayerInset(0, 0, 0, 0, reach - bar);
+        band.setLayerInset(1, 0, bar, 0, reach - bar - 1);
+        tabs.setBackground(band);
+        for (View v : new View[] {overviewTab, tasksTab, close}) v.setPadding(v.getPaddingLeft(), 0, v.getPaddingRight(), reach - bar);
+        stack = new FrameLayout(activity);
+        root.addView(stack, new LinearLayout.LayoutParams(-1, 0, 1));
         scroll = new ScrollView(activity);
         body = new LinearLayout(activity);
         body.setOrientation(LinearLayout.VERTICAL);
@@ -199,70 +210,14 @@ final class WorkPanel {
         scroll.setPadding(0, 0, 0, dp(BOTTOM_DP));
         scroll.setClipToPadding(false);
         scroll.addView(body, new FrameLayout.LayoutParams(-1, -2));
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        FrameLayout.LayoutParams textAt = new FrameLayout.LayoutParams(-1, -1);
+        textAt.topMargin = bar + 1;
+        stack.addView(scroll, textAt);
+        stack.addView(tabs, new FrameLayout.LayoutParams(-1, reach, Gravity.TOP));
     }
 
     View view() {
         return root;
-    }
-
-    /**
-     * Gives the header's buttons (the tabs, the cover's ×, the docked pin and ⋮) 48 dp tall
-     * targets that reach below the 30 dp bar into the panel's first rows: one delegate on the
-     * panel finds the button whose extended rect the finger is in.
-     */
-    private void extendTargets() {
-        java.util.List<View> buttons = new java.util.ArrayList<>();
-        for (View v : new View[] {overviewTab, tasksTab, close}) if (v != null) buttons.add(v);
-        for (int i = 0; i < trailing.getChildCount(); i++) buttons.add(trailing.getChildAt(i));
-        int reach = Math.max(0, dp(48) - tabs.getHeight());
-        root.setTouchDelegate(new TallTargets(buttons, tabs, reach));
-    }
-
-    /** One TouchDelegate for several buttons of a bar, each reaching {@code reach} px below it. */
-    static final class TallTargets extends android.view.TouchDelegate {
-        private final java.util.List<View> buttons;
-        private final View bar;
-        private final int reach;
-        private View target;
-
-        TallTargets(java.util.List<View> buttons, View bar, int reach) {
-            super(new android.graphics.Rect(), bar);
-            this.buttons = buttons;
-            this.bar = bar;
-            this.reach = reach;
-        }
-
-        @Override public boolean onTouchEvent(android.view.MotionEvent event) {
-            int x = (int) event.getX(), y = (int) event.getY();
-            if (event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
-                target = null;
-                // Only the strip just below the bar: inside it, the buttons take their own touches.
-                if (y < bar.getBottom() || y >= bar.getBottom() + reach) return false;
-                for (View b : buttons) {
-                    if (b.getVisibility() != View.VISIBLE || !b.isEnabled()) continue;
-                    int[] at = offset(b);
-                    if (x >= at[0] && x < at[0] + b.getWidth()) { target = b; break; }
-                }
-            }
-            if (target == null) return false;
-            View t = target;
-            if (event.getActionMasked() == android.view.MotionEvent.ACTION_UP
-                    || event.getActionMasked() == android.view.MotionEvent.ACTION_CANCEL) target = null;
-            int[] at = offset(t);
-            event.setLocation(t.getWidth() / 2f, Math.min(t.getHeight() - 1, Math.max(0, y - at[1])));
-            return t.dispatchTouchEvent(event);
-        }
-
-        /** {@code b}'s left and top within the bar's parent. */
-        private int[] offset(View b) {
-            int left = 0, top = 0;
-            for (View v = b; v != null && v != bar.getParent(); v = v.getParent() instanceof View ? (View) v.getParent() : null) {
-                left += v.getLeft();
-                top += v.getTop();
-            }
-            return new int[] {left, top};
-        }
     }
 
     /** Room at the bottom of the panel's text for the composer's icon cluster floating over it. */
@@ -606,6 +561,8 @@ final class WorkPanel {
                 new android.graphics.drawable.Drawable[] {line});
         under.setLayerGravity(0, Gravity.BOTTOM | Gravity.FILL_HORIZONTAL);
         under.setLayerHeight(0, dp(2));
+        // Under the label, at the bar's bottom, not the 48 dp target's.
+        under.setLayerInsetBottom(0, Math.max(0, dp(TARGET_DP) - dp(WorkPanelLayout.TOP_BAR_DP)));
         view.setBackground(selected ? under : null);
         view.setSelected(selected);
         view.setContentDescription(view.getText() + (selected ? ", selected tab" : ", tab"));

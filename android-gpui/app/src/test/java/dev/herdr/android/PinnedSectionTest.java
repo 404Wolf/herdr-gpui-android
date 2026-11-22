@@ -152,7 +152,7 @@ public final class PinnedSectionTest {
     @Test public void theActivityWiresTheButtonTheSectionTheObserveAndTheOpen() throws IOException {
         String rail = TerminalSource.text();
         assertTrue(rail.contains("tabRow.addView(rail.pinsRail.button().view()"));
-        assertTrue(rail.contains("rail.pinsRail.button().extendTouch(crumb);"));
+        assertTrue(rail.contains("rail.pinsRail.button().extendTouch(crumb, tabMenu);"));
         // Right under the machine chooser, the first host's row (Wolf, 9zz.10).
         assertTrue(rail.contains("RailHostRow first = hosts.isEmpty() ? null : railHostRows.get(\"host:\" + hosts.get(0).id);"));
         assertTrue(rail.contains("order.add(at + 1, pinsRail.section(savedIds));"));

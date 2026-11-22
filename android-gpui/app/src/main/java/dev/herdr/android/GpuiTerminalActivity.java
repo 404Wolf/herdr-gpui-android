@@ -529,7 +529,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
-        rail.pinsRail.button().extendTouch(crumb);
+        rail.pinsRail.button().extendTouch(crumb, tabMenu);
         filePager = new FilePager(this, surface, chrome, this::readFileOrCopy, actionWorker);
         content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
@@ -1385,9 +1385,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /**
-     * Room for the icon cluster where it covers something, and nowhere else (Wolf: no strip):
-     * docked, the panel's text scrolls clear of it; on the cover or with the panel hidden it sits
-     * over the terminal, so the draft keeps clear of its width on the prompt row.
+     * Room for the icon cluster where it covers something, and nowhere else (Wolf: no strip
+     * across the app): docked, the panel's text scrolls clear of it and the terminal is
+     * untouched; over the terminal (the cover, or the panel hidden) the terminal's grid ends
+     * above the cluster's top (t2kg 11-22: the prompt row and footer must stay visible), and
+     * the black room left of the cluster holds its status words.
      */
     private void fitAroundCluster(View cluster) {
         boolean shows = cluster.getVisibility() == View.VISIBLE;
@@ -1395,15 +1397,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean overPanel = workPanel != null && workPanel.view().getVisibility() == View.VISIBLE
                 && cluster.getLeft() >= workPanel.view().getLeft();
         if (workPanel != null) workPanel.clearBottom(overPanel ? height : 0);
-        int cells = 0;
-        if (shows && !overPanel && terminalSurface != null && terminalSurface.getWidth() > 0 && composer != null) {
-            int cols = composer.columns();
-            if (cols > 0) {
-                float cell = terminalSurface.getWidth() / (float) cols;
-                cells = (int) Math.ceil((cluster.getWidth() + dp(ActionBar.MARGIN_DP)) / cell);
-            }
-        }
-        if (composer != null) composer.reserveCells(cells);
+        int below = shows && !overPanel ? height : 0;
+        View content = terminalColumn == null || terminalColumn.getChildCount() == 0 ? null : terminalColumn.getChildAt(0);
+        if (content == null) return;
+        FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) content.getLayoutParams();
+        if (at.bottomMargin == below) return;
+        at.bottomMargin = below;
+        content.setLayoutParams(at);
     }
 
     /**
@@ -1423,6 +1423,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // WorkPanel.extendTargets), never by making the bar taller.
         to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         to.addView(tabMenu, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
+        // Docked, the panel's header row is a 48 dp target strip drawn 30 dp tall: the glyphs
+        // sit in its top part (WorkPanel); in the tab row they are centred and reach below it.
+        int below = docked ? Math.max(0, dp(WorkPanel.TARGET_DP) - dp(WorkPanelLayout.TOP_BAR_DP)) : 0;
+        for (View v : new View[] {pin, tabMenu}) v.setPadding(v.getPaddingLeft(), 0, v.getPaddingRight(), below);
     }
 
     /** The terminal | panel divider (PanelDivider), and Wolf's split per orientation (factory-9zz.9). */
@@ -3073,8 +3077,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabActive = activeId;
         tabStrip.removeAllViews();
         final Connection target = current;
-        tabStrip.addView(projectChip(project));
-        if (repo != null) {
+        // On the cover the breadcrumb below already names the project and repo (t42y C4/C5).
+        if (!compactWindow()) tabStrip.addView(projectChip(project));
+        if (repo != null && !compactWindow()) {
             TextView crumbText = new TextView(this);
             crumbText.setText(ProjectBar.crumbText(repo));
             crumbText.setTextSize(11);
