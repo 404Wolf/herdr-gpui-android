@@ -4065,6 +4065,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
             }
 
+            @Override public boolean flushHeld() {
+                return GpuiTerminalActivity.this.flushHeld();
+            }
+
             @Override public void toLive() {
                 takeViewportForTyping();
             }
@@ -4844,6 +4848,57 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
             main.post(this::refreshOffer);
         });
+    }
+
+    /**
+     * Send with an empty draft (Wolf 11-22): this pane's held messages are typed now, the lane's
+     * head first and the next only once the one before was written, so the order holds and none
+     * goes twice; then, on Claude Code, its send-now key (Enter on the empty prompt, "Press up
+     * to edit queued messages, Enter to send them immediately") so a busy turn takes them at
+     * once. Codex steers each typed message by itself. False when nothing is held here.
+     */
+    private boolean flushHeld() {
+        Here here = here();
+        if (outbox == null || !here.live || covered()) return false;
+        Outbox.Message head = outbox.outbox().offer(here.lane());
+        if (head == null) return false;
+        flushNext(here.tap(), 0);
+        return true;
+    }
+
+    private void flushNext(OfferGate.Tap tap, int sent) {
+        Here here = here();
+        Outbox.Message m = outbox == null ? null : outbox.outbox().offer(here.lane());
+        if (m == null || sent >= HeldFlush.MAX || !here.mayType(tap, covered())) {
+            if (sent > 0 && HeldFlush.sendNowKey(paneKind(here))) {
+                // The pane is still the one tapped: Claude's own send-now for what it queued.
+                if (here.mayType(tap, covered())) queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
+            }
+            refreshOffer();
+            return;
+        }
+        String wire = HeldWords.wire(m.text, m.composed.wallMs, java.util.TimeZone.getDefault(),
+                !here.status.isEmpty(), false);
+        outbox.send(m.id, here.lane(), tap.handle, tap.attach, wire, false, outcome -> main.post(() -> {
+            if (outcome == Outbox.Outcome.WRITTEN) {
+                flushNext(tap, sent + 1);
+                return;
+            }
+            if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it still waits");
+            else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
+            refreshOffer();
+        }));
+    }
+
+    /** The harness of the pane on screen ("claude", "codex", ...), "" when not an agent's. */
+    private String paneKind(Here here) {
+        Connection c = here.connection;
+        JSONArray panes = c == null ? null : c.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject p = panes.optJSONObject(i);
+            if (p != null && here.pane.equals(p.optString("id"))) return p.optString("kind", "");
+        }
+        return "";
     }
 
     /** The one queue, every computer and pane. Main thread. */
