@@ -350,7 +350,7 @@ if find_ui '. (offline|connecting) · ' > /dev/null; then
 else
     record offline-indicator FAIL "no offline indicator (offline-indicator.png)"
 fi
-if tap_ui 'transcript · as of' 10 && wait_ui 'transcript as of .* may be outdated' 15 > /dev/null; then
+if tap_ui 'transcript · as of' 10 && wait_ui '· transcript as of .* may be outdated' 15 > /dev/null; then
     quiet 2
     shot transcript-newest
     if find_ui 'transcript line 299' > /dev/null; then
@@ -393,8 +393,10 @@ if [[ -n "$abtn" && -n "$btab" ]]; then
     else
         record pending-switch PASS "no agent-a transcript after a tap during the switch to agent-b"
     fi
-    # Close whatever opened, without opening the rail when nothing did.
-    find_ui 'transcript as of .* may be outdated' > /dev/null && a shell input keyevent KEYCODE_BACK
+    # Close whatever opened, without opening the rail when nothing did. The dialog's title is
+    # '<pane> · transcript as of …'; the button's own description ('Read <pane>'s transcript as of
+    # …') must not count, or Back with no dialog open opens the rail.
+    find_ui '· transcript as of .* may be outdated' > /dev/null && a shell input keyevent KEYCODE_BACK
     quiet 2
 else
     record pending-switch SKIP "no A button or B tab on screen to tap (offline-button.png)"
