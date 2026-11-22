@@ -1327,6 +1327,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int right = layout.shown && !layout.overlay ? width : 0;
         if (railColumns.getPaddingRight() != right) railColumns.setPadding(0, 0, right, 0);
         workPanel.show(layout.shown, layout.overlay);
+        placeTopRight(layout.shown && !layout.overlay);
         if (workButton != null) {
             workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
             workButton.setSelected(layout.shown);
@@ -1335,6 +1336,24 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private View root() {
         return (View) railColumns.getParent();
+    }
+
+    /**
+     * The pin and ⋮ belong at the far right of the whole screen (Wolf): in the
+     * docked panel's header beside the terminal, else at the end of the tab row.
+     * Moving the same views keeps their state, listeners and accessibility.
+     */
+    private void placeTopRight(boolean docked) {
+        View pin = pinsRail.button().view();
+        android.view.ViewGroup to = docked ? workPanel.trailing() : tabRow;
+        if (pin.getParent() == to) return;
+        for (View v : new View[] {pin, tabMenu}) {
+            android.view.ViewGroup from = (android.view.ViewGroup) v.getParent();
+            if (from != null) from.removeView(v);
+        }
+        int height = docked ? dp(40) : -1;
+        to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), height));
+        to.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), height));
     }
 
     /** The cover's Work button and the panel's ×. */
