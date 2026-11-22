@@ -1036,6 +1036,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             railButton.addView(sidebarBadge, new FrameLayout.LayoutParams(-2, -2,
                     android.view.Gravity.TOP | android.view.Gravity.END));
             pinned.addView(railButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
+            pinned.addView(iconButton(R.drawable.ic_bar_panes, "Panes",
+                    "Workspaces, tabs and panes for this host", view -> showPanes()));
         }
         ImageButton keyboard = iconButton(R.drawable.ic_bar_keyboard, "Keyboard",
                 "Show or hide the on-screen keyboard", view -> toggleKeyboard());
@@ -1043,12 +1045,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronousTouch(keyboard);
         pinned.addView(keyboard);
         if (!shellMode()) pinned.addView(quickShellButton());
-        // One bar at every width (factory-setup.29): rail, keyboard and >_. Spaces and panes,
-        // view, session, usage and back to hosts are in the top bar's ⋮, the only one; a raw
-        // shell has no top bar, so its ⋮ is here.
-        if (shellMode()) {
-            pinned.addView(iconButton(R.drawable.ic_bar_more, "More", "View, session and back to hosts",
-                    view -> showMoreActions(view, false)));
+        if (compact) {
+            // A compact bar keeps frequent controls and the keys in view; the
+            // rest live in one overflow menu, as platform toolbars do.
+            pinned.addView(iconButton(R.drawable.ic_bar_more, "More",
+                    "More terminal actions", view -> showMoreActions(view, false)));
+        } else {
+            pinned.addView(iconButton(R.drawable.ic_bar_view, "View",
+                    "Terminal display and keyboard options", view -> showDisplayOptions()));
+            pinned.addView(iconButton(R.drawable.ic_bar_session, "Session",
+                    shellMode() ? (debuggable() ? "Copy the screen, save a screenshot or return to the hosts"
+                            : "Copy the screen or return to the hosts")
+                            : "New tab, split, zoom or close this session's pane", view -> showSessionActions()));
+            pinned.addView(iconButton(R.drawable.ic_bar_close, "Back to hosts",
+                    "Return to the host list; terminals keep running", view -> finish()));
         }
         LinearLayout keys = new LinearLayout(this);
         keys.setOrientation(LinearLayout.HORIZONTAL);
@@ -1192,11 +1202,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         menu.getMenu().add(0, 2, MoreMenu.SESSION, "Session actions").setIcon(R.drawable.ic_bar_session)
                 .setIconTintList(tint);
         menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Back to hosts").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
-        // Panes is ⋮'s at every width now that the bar has no Panes button.
-        if (!shellMode()) {
-            menu.getMenu().add(0, 4, MoreMenu.PANES, "Spaces & panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
-        }
         if (navigation && !shellMode()) {
+            menu.getMenu().add(0, 4, MoreMenu.PANES, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
             menu.getMenu().add(0, 5, MoreMenu.HOSTS, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts)
                     .setIconTintList(tint);
             menu.getMenu().add(0, 6, MoreMenu.GESTURES, "Gestures");
