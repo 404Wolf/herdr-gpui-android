@@ -620,6 +620,70 @@ public final class FleetTreeTest {
                 Arrays.asList(row.workers.get(0).where, row.workers.get(1).where));
     }
 
+    @Test public void aPmsHerdrGroupPutsItInANamedGroupAboveTheRepositories() {
+        FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
+        FleetTree.Member factory = label(m("t2", "f", "factory", 1, 0, "/c/f", "working"), "pm", "factory");
+        FleetTree.Member aswap = label(m("t6", "a", "aswap", 2, 0, "/c/a", "idle"), "pm", "aswap");
+        FleetTree.Member agents = label(m("t7", "g", "agents", 3, 0, "/c/g", "idle"), "pm", "agents");
+        FleetTree.Member plain = label(m("t8", "p", "plain", 4, 0, "/c/p", "idle"), "pm", "plain");
+        FleetTree.Member worker = label(m("t9", "f", "factory", 1, 1, "/c/f", "working"), "worker", "factory");
+        worker.parent = "t2";
+        factory.group = FleetTree.groupName("herdr");
+        aswap.group = FleetTree.groupName(" herdr ");
+        agents.group = FleetTree.groupName("Agents");
+        FleetTree.PmTree tree = FleetTree.pmTree(FleetTree.build(Arrays.asList(deacon, factory, aswap, agents, plain, worker), null));
+        // By name, case aside; each lists its PMs as a repository would; the Deacon stays outside.
+        assertEquals(2, tree.groups.size());
+        assertEquals("Agents", tree.groups.get(0).name);
+        assertEquals("herdr", tree.groups.get(1).name);
+        assertEquals(Arrays.asList("aswap", "factory"),
+                Arrays.asList(tree.groups.get(1).projects.get(0).name(), tree.groups.get(1).projects.get(1).name()));
+        assertEquals("2 projects", tree.groups.get(1).countLabel());
+        assertSame(deacon, tree.deacon);
+        // Workers stay under their own PM.
+        assertEquals("t9", tree.groups.get(1).projects.get(1).workers.get(0).member.id);
+        // An unlabelled PM keeps its place in the repositories: the plain fallback.
+        int placed = 0;
+        for (FleetTree.RepoRow repo : tree.repos) {
+            for (FleetTree.PmRow row : repo.projects) {
+                assertEquals("plain", row.name());
+                placed++;
+            }
+        }
+        assertEquals(1, placed);
+        // Groups open at rest, like repositories.
+        assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.GROUP));
+    }
+
+    @Test public void aGroupNameIsPlainAndBounded() {
+        assertEquals("herdr", FleetTree.groupName("  herdr "));
+        assertEquals("", FleetTree.groupName(null));
+        assertEquals("", FleetTree.groupName("none"));
+        assertEquals("", FleetTree.groupName("a\u0007b"));
+        assertEquals("", FleetTree.groupName("a\u202eb"));
+        assertEquals("", FleetTree.groupName(new String(new char[FleetTree.GROUP_CHARS + 1]).replace('\0', 'x')));
+        assertEquals("web · 2", FleetTree.groupName("web · 2"));
+    }
+
+    @Test public void theRailDrawsNamedGroupsAfterTheDeaconAndBeforeTheRepositories() throws Exception {
+        String rail = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        int deacon = rail.indexOf("FleetTree.Member deacon = fleet.deacon;");
+        int groups = rail.indexOf("for (FleetTree.RepoRow group : tree.groups) {\n            String key = railFold(railKey(host, \"group/\" + group.key), FleetTree.Fold.GROUP);");
+        int repos = rail.indexOf("String key = railFold(railKey(host, \"repo/\" + repo.key), FleetTree.Fold.REPO);");
+        assertTrue(deacon > 0 && groups > deacon && repos > groups);
+        // The focused agent's group opens, as its repository would.
+        assertTrue(rail.contains("if (pm.project == focusedProject) revealRepos.add(railKey(host, \"group/\" + group.key));"));
+    }
+
+    @Test public void thePhoneReadsTheGroupFromTheCoresViewOrTheRawLabel() throws Exception {
+        org.json.JSONArray panes = new org.json.JSONArray("[{\"id\":\"t2\",\"role\":\"pm\",\"group\":\"herdr\"},"
+                + "{\"id\":\"t3\",\"labels\":{\"role\":\"pm\",\"herdr.group\":\"agents\"}},{\"id\":\"t4\",\"role\":\"pm\"}]");
+        List<FleetTree.Member> members = FleetPanes.members(null, null, panes, FleetTree.Member::new);
+        assertEquals(Arrays.asList("herdr", "agents", ""),
+                Arrays.asList(members.get(0).group, members.get(1).group, members.get(2).group));
+    }
+
     @Test public void theSidebarGroupsPmsByRepoWithTheirCheckoutBelow() {
         FleetTree.Member deacon = label(m("t3", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
         FleetTree.Member hm = label(m("t67", "hm", "home-manager", 1, 0, "/c/hm", "working"), "pm", "home-manager");
@@ -846,20 +910,6 @@ public final class FleetTreeTest {
         assertSame(loose, tree.outside.get(0).pm);
     }
 
-    @Test public void aWorkerBadgeShowsItsTaskNotAGenericTabName() {
-        // t6z in the shared "general" tab: its task title, not "general".
-        assertEquals("worker·Desktop Fleet sidebar", FleetTree.roleBadge("worker", "t6z",
-                FleetTree.workerTask("Desktop Fleet sidebar", "general", "t6z")));
-        // No title of its own: a specific tab name still says something.
-        assertEquals("smoke-marker", FleetTree.workerTask("", "smoke-marker", "t6x"));
-        // No title, a generic tab: its terminal id.
-        assertEquals("worker·t6z", FleetTree.roleBadge("worker", "t6z", FleetTree.workerTask("", "general", "t6z")));
-        for (String generic : new String[] {"General", "pm", "Deacon", "worker", "MAIN", "shell", "zsh", "bash",
-                "claude", "Claude Code", "codex", "12", "t6z"}) {
-            assertEquals(generic, "t6z", FleetTree.workerTask(generic, generic, "t6z"));
-        }
-    }
-
     @Test public void pickingAComputerResolvesToItsExactDeaconOrToStart() {
         // One computer: two deacon candidates; the canonical (oldest) one is focused.
         FleetTree.Member older = label(m("t6k", "d", "deacon", 0, 0, "/h", "idle"), "deacon", "");
@@ -887,16 +937,6 @@ public final class FleetTreeTest {
         assertEquals(FleetTree.Pick.FOCUS, FleetTree.pick(true, Arrays.asList(cached, pm)));
         assertSame(cached, FleetTree.pickTarget(Arrays.asList(cached, pm)));
     }
-
-    @Test public void thePaneHeaderBadgeNamesTheRole() {
-        assertEquals("PM·t19", FleetTree.roleBadge("pm", "t19", "ignored"));
-        assertEquals("Deacon·t6k", FleetTree.roleBadge("deacon", "t6k", ""));
-        assertEquals("worker·smoke-marker", FleetTree.roleBadge("worker", "t6x", " smoke-marker "));
-        assertEquals("worker·t6x", FleetTree.roleBadge("worker", "t6x", ""));
-        assertEquals("", FleetTree.roleBadge("", "t1", "x"));
-    }
-
-    // ── Leftovers are never dropped ─────────────────────────────────────
 
     @Test public void shellOnlySpacesAndSpacelessAgentsStayVisible() {
         FleetTree.Member shell = m("t1", "s1", "scratch", 0, 0, "/h", "");

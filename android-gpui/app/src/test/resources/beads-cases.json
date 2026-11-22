@@ -1,0 +1,2373 @@
+{
+ "source": "Desktop factory mod: home-manager-conf branch factory/pm-beads at 5e6c79eb, users/wolf/programs/herdr-core/app/factory/src/feed.ts (parseBeads, errorLine, parseStores, knownArgs, parseDetail, splitBeads/projectBeads, buildWork), model.ts (parentOf, compareIds, beadTree, progress, crewOf, workScope, joinProject, needsYou, agentsByBead, agentsOnBead, beadPlace, epicProject, repoProjects), factory-sidebar.ts readBeads (merge) and factory-work.ts project() (epics, folding, tree). Every expect is the desktop's own answer, computed by running those files on each input; cases taken from test/feed.test.mjs and test/model.test.mjs name their desktop_test. Read by BeadsModelTest (phone). A change to either side is diffed against this file.",
+ "format": "Strings are raw script stdout (STORES_SH, DETAIL_SH) or bd's JSON. terms: one machine's live terminals as the phone knows them (id, title, status, role, project, parent, issue, task, helper). error_prefix: the message starts so (the rest is the JSON engine's). A tree node: {id, mark, agents, closed, children} as the Work panel shows it (closed: its closed leaves folded as 'N closed').",
+ "phone_differences": "One model is one core, so one machine: projectKey's 'machine:' and qualified addresses are dropped, and every term is live (the phone lists live terminals only). Ev is not read, so no asks. A PM's Work is its lead's tab: work(project) takes the project's first role=pm member as the tab's root. Detail's published copies are sorted by dest (org.json keeps no key order).",
+ "stores": [
+  {
+   "name": "framed stores",
+   "desktop_test": "feed.test.mjs 'stores: each project framed on its own; a failing one doesn't hide the rest'",
+   "out": "\u001efp\n\u001c17.5\n[{\"id\":\"fp-1\",\"title\":\"x\",\"status\":\"open\"}]\n\u001f0\n\u001ebroken\n\u001c\nError: database locked\nHint: run bd doctor\n\u001f1\n\u001eidle\n\u001c9.25\n\u001fsame\n\u001ecut\n[{\"id\"",
+   "expect": {
+    "missing": false,
+    "stores": {
+     "fp": {
+      "ids": [
+       "fp-1"
+      ],
+      "error": null,
+      "fp": "17.5",
+      "same": false
+     },
+     "broken": {
+      "ids": null,
+      "error": "bd list exited 1: Error: database locked",
+      "fp": "",
+      "same": false
+     },
+     "idle": {
+      "ids": null,
+      "error": null,
+      "fp": "9.25",
+      "same": true
+     },
+     "cut": {
+      "ids": null,
+      "error": "the listing was cut short",
+      "fp": "",
+      "same": false
+     }
+    },
+    "order": [
+     "fp",
+     "broken",
+     "idle",
+     "cut"
+    ]
+   }
+  },
+  {
+   "name": "no bd",
+   "desktop_test": "feed.test.mjs 'stores: each project framed…'",
+   "out": "\u001dnobd\n",
+   "expect": {
+    "missing": true,
+    "stores": {},
+    "order": []
+   }
+  },
+  {
+   "name": "no stores",
+   "desktop_test": "feed.test.mjs 'stores: each project framed…'",
+   "out": "",
+   "expect": {
+    "missing": false,
+    "stores": {},
+    "order": []
+   }
+  },
+  {
+   "name": "a store that printed bad JSON keeps its fingerprint, one with only warnings says its last line",
+   "desktop_test": null,
+   "out": "\u001ebad\n\u001c3.5\nwarning: x\n[{]\n\u001f0\n\u001equiet\n\u001c4\nwarning: one\nwarning: two\n\u001f0\n\u001ewarned\n\u001c5\nwarning: old schema\n[{\"id\":\"w-1\",\"title\":\"W\",\"status\":\"open\"}]\n\u001f0\n",
+   "expect": {
+    "missing": false,
+    "stores": {
+     "bad": {
+      "ids": null,
+      "error_prefix": "bd list: bad JSON (",
+      "fp": "3.5",
+      "same": false
+     },
+     "quiet": {
+      "ids": null,
+      "error": "warning: two",
+      "fp": "4",
+      "same": false
+     },
+     "warned": {
+      "ids": [
+       "w-1"
+      ],
+      "error": null,
+      "fp": "5",
+      "same": false
+     }
+    },
+    "order": [
+     "bad",
+     "quiet",
+     "warned"
+    ]
+   }
+  },
+  {
+   "name": "an exit code with spaces after it, and a store without a fingerprint line",
+   "desktop_test": null,
+   "out": "\u001ea\n\u001c1\n[]\n\u001f0  \n\n\u001eb\n[]\n\u001f0\n",
+   "expect": {
+    "missing": false,
+    "stores": {
+     "a": {
+      "ids": [],
+      "error": null,
+      "fp": "1",
+      "same": false
+     },
+     "b": {
+      "ids": [],
+      "error": null,
+      "fp": "",
+      "same": false
+     }
+    },
+    "order": [
+     "a",
+     "b"
+    ]
+   }
+  }
+ ],
+ "beads": [
+  {
+   "name": "after warnings, odd rows dropped",
+   "desktop_test": "feed.test.mjs 'bd's list, after warnings, with odd rows dropped'",
+   "text": "warning: something\n[{\"id\":\"a\",\"title\":\"A\",\"status\":\"open\",\"labels\":[\"x\",3]},{\"nope\":1}]\n",
+   "expect": {
+    "beads": [
+     {
+      "id": "a",
+      "title": "A",
+      "status": "open",
+      "type": null,
+      "priority": null,
+      "labels": [
+       "x"
+      ],
+      "parent": null,
+      "assignee": null
+     }
+    ],
+    "error": null
+   }
+  },
+  {
+   "name": "no list: its last line",
+   "desktop_test": "feed.test.mjs 'bd's list…'",
+   "text": "Error: no database\n",
+   "expect": {
+    "beads": null,
+    "error": "Error: no database"
+   }
+  },
+  {
+   "name": "cut short",
+   "desktop_test": "feed.test.mjs 'bd's list…'",
+   "text": "[{",
+   "expect": {
+    "beads": null,
+    "error": "bd list: the JSON was cut short"
+   }
+  },
+  {
+   "name": "bad JSON",
+   "desktop_test": "feed.test.mjs 'bd's list…'",
+   "text": "[{]",
+   "expect": {
+    "beads": null,
+    "error_prefix": "bd list: bad JSON ("
+   }
+  },
+  {
+   "name": "nothing",
+   "desktop_test": null,
+   "text": "  \n ",
+   "expect": {
+    "beads": null,
+    "error": "no output"
+   }
+  },
+  {
+   "name": "defaults: title is the id, status open; non-string fields dropped",
+   "desktop_test": null,
+   "text": "[{\"id\":\"z-1\"},{\"id\":\"z-2\",\"title\":7,\"status\":null,\"issue_type\":\"epic\",\"priority\":1,\"labels\":\"x\",\"parent\":5,\"assignee\":\"t2\"},{\"id\":3},\"s\",null]",
+   "expect": {
+    "beads": [
+     {
+      "id": "z-1",
+      "title": "z-1",
+      "status": "open",
+      "type": null,
+      "priority": null,
+      "labels": [],
+      "parent": null,
+      "assignee": null
+     },
+     {
+      "id": "z-2",
+      "title": "z-2",
+      "status": "open",
+      "type": "epic",
+      "priority": 1,
+      "labels": [],
+      "parent": null,
+      "assignee": "t2"
+     }
+    ],
+    "error": null
+   }
+  }
+ ],
+ "error_lines": [
+  {
+   "text": "warning: a\nError: locked\nHint: b\n",
+   "expect": "Error: locked"
+  },
+  {
+   "text": "  first \n  last one  \n\n",
+   "expect": "last one"
+  },
+  {
+   "text": "",
+   "expect": ""
+  },
+  {
+   "text": "errors: 3\nerror: real",
+   "expect": "error: real"
+  },
+  {
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "expect": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+ ],
+ "merges": [
+  {
+   "name": "a same store keeps the last read, a failed one its beads with the error; gone stores go; known args only for stores with beads and a fingerprint",
+   "desktop_test": "factory-sidebar.ts readBeads; feed.test.mjs knownArgs",
+   "reads": [
+    "\u001efp\n\u001c10\n[{\"id\":\"fp-1\",\"title\":\"t\",\"status\":\"open\"}]\n\u001f0\n\u001elocked\n\u001c11\n[{\"id\":\"l-1\",\"title\":\"t\",\"status\":\"open\"}]\n\u001f0\n\u001egone\n\u001c12\n[]\n\u001f0\n\u001eempty\n\u001c\n[]\n\u001f0\n",
+    "\u001efp\n\u001c10\n\u001fsame\n\u001elocked\n\u001c13\nError: database locked\n\u001f1\n\u001eempty\n\u001c\n[]\n\u001f0\n\u001enew\n\u001c14\n\u001fsame\n"
+   ],
+   "expect": [
+    {
+     "kept": {
+      "fp": {
+       "ids": [
+        "fp-1"
+       ],
+       "error": null,
+       "fp": "10"
+      },
+      "locked": {
+       "ids": [
+        "l-1"
+       ],
+       "error": null,
+       "fp": "11"
+      },
+      "gone": {
+       "ids": [],
+       "error": null,
+       "fp": "12"
+      },
+      "empty": {
+       "ids": [],
+       "error": null,
+       "fp": ""
+      }
+     },
+     "order": [
+      "fp",
+      "locked",
+      "gone",
+      "empty"
+     ],
+     "known": [
+      "fp=10",
+      "locked=11",
+      "gone=12"
+     ]
+    },
+    {
+     "kept": {
+      "fp": {
+       "ids": [
+        "fp-1"
+       ],
+       "error": null,
+       "fp": "10"
+      },
+      "locked": {
+       "ids": [
+        "l-1"
+       ],
+       "error": "bd list exited 1: Error: database locked",
+       "fp": ""
+      },
+      "empty": {
+       "ids": [],
+       "error": null,
+       "fp": ""
+      },
+      "new": {
+       "ids": null,
+       "error": null,
+       "fp": ""
+      }
+     },
+     "order": [
+      "fp",
+      "locked",
+      "empty",
+      "new"
+     ],
+     "known": [
+      "fp=10"
+     ]
+    }
+   ]
+  }
+ ],
+ "splits": [
+  {
+   "name": "a repo store's epics become their projects' beads, beside the projects' own stores",
+   "desktop_test": "feed.test.mjs 'projectBeads: a repo store's epics become their projects' beads, beside the projects' own stores'",
+   "out": "\u001ecrate-reorg\n\u001c2\n[{\"id\":\"cr-1\",\"title\":\"own store\",\"status\":\"open\"}]\n\u001f0\n\u001erepo:macro\n\u001c1\n[{\"id\":\"mac-crate-reorg\",\"title\":\"crate-reorg\",\"status\":\"open\",\"issue_type\":\"epic\"},{\"id\":\"mac-crate-reorg.1\",\"title\":\"split hex\",\"status\":\"open\",\"issue_type\":\"task\",\"parent\":\"mac-crate-reorg\"},{\"id\":\"mac-ci\",\"title\":\"ci\",\"status\":\"open\",\"issue_type\":\"epic\"}]\n\u001f0\n\u001erepo:other\n\u001c\nError: locked\n\u001f1\n\u001elonely\n\u001c3\n[]\n\u001f0\n",
+   "expect": {
+    "projects": {
+     "crate-reorg": {
+      "ids": [
+       "cr-1",
+       "mac-crate-reorg",
+       "mac-crate-reorg.1"
+      ],
+      "error": null
+     },
+     "ci": {
+      "ids": [
+       "mac-ci"
+      ],
+      "error": null
+     },
+     "lonely": {
+      "ids": [],
+      "error": null
+     }
+    },
+    "order": [
+     "crate-reorg",
+     "ci",
+     "lonely"
+    ]
+   },
+   "store_of": [
+    {
+     "project": "crate-reorg",
+     "id": "cr-1",
+     "expect": "crate-reorg"
+    },
+    {
+     "project": "crate-reorg",
+     "id": "mac-crate-reorg.1",
+     "expect": "repo:macro"
+    },
+    {
+     "project": "ci",
+     "id": "mac-ci",
+     "expect": "repo:macro"
+    },
+    {
+     "project": "crate-reorg",
+     "id": "mac-ci",
+     "expect": null
+    },
+    {
+     "project": "nope",
+     "id": "cr-1",
+     "expect": null
+    }
+   ]
+  },
+  {
+   "name": "the project's own store's error wins; a failed repo store keeps its last beads, its error named by the store",
+   "desktop_test": null,
+   "out": "\u001efp\n\u001c\nError: database locked\n\u001f1\n\u001erepo:macro\n\u001c1\n[{\"id\":\"mac-fp\",\"title\":\"fp\",\"status\":\"open\",\"issue_type\":\"epic\"},{\"id\":\"mac-fp.1\",\"title\":\"x\",\"status\":\"open\"}]\n\u001f0\n\u001erepo:broken\n\u001c\nError: gone\n\u001f2\n",
+   "previous": {
+    "repo:broken": [
+     {
+      "id": "mac-fp.9",
+      "title": "kept from before",
+      "status": "open",
+      "labels": [
+       "project:fp"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "projects": {
+     "fp": {
+      "ids": [
+       "mac-fp",
+       "mac-fp.1",
+       "mac-fp.9"
+      ],
+      "error": "bd list exited 1: Error: database locked"
+     }
+    },
+    "order": [
+     "fp"
+    ]
+   }
+  }
+ ],
+ "parents": [
+  {
+   "name": "bd's parent",
+   "desktop_test": "model.test.mjs 'a bead's parent: bd's field, the parent-child dependency, then the id's prefix'",
+   "ids": [
+    "fp-1",
+    "fp-1.1",
+    "fp-2"
+   ],
+   "bead": {
+    "id": "x",
+    "title": "X",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [],
+    "parent": "fp-2"
+   },
+   "expect": "fp-2"
+  },
+  {
+   "name": "the parent-child dependency",
+   "desktop_test": "model.test.mjs 'a bead's parent: bd's field, the parent-child dependency, then the id's prefix'",
+   "ids": [
+    "fp-1",
+    "fp-1.1",
+    "fp-2"
+   ],
+   "bead": {
+    "id": "x",
+    "title": "X",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [],
+    "dependencies": [
+     {
+      "issue_id": "x",
+      "depends_on_id": "fp-1",
+      "type": "parent-child"
+     }
+    ]
+   },
+   "expect": "fp-1"
+  },
+  {
+   "name": "a blocks dependency is no parent",
+   "desktop_test": "model.test.mjs 'a bead's parent: bd's field, the parent-child dependency, then the id's prefix'",
+   "ids": [
+    "fp-1",
+    "fp-1.1",
+    "fp-2"
+   ],
+   "bead": {
+    "id": "x",
+    "title": "X",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [],
+    "dependencies": [
+     {
+      "issue_id": "x",
+      "depends_on_id": "fp-1",
+      "type": "blocks"
+     }
+    ]
+   },
+   "expect": null
+  },
+  {
+   "name": "the id's prefix",
+   "desktop_test": "model.test.mjs 'a bead's parent: bd's field, the parent-child dependency, then the id's prefix'",
+   "ids": [
+    "fp-1",
+    "fp-1.1",
+    "fp-2"
+   ],
+   "bead": {
+    "id": "fp-1.1.3",
+    "title": "FP-1.1.3",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": []
+   },
+   "expect": "fp-1.1"
+  },
+  {
+   "name": "a parent that isn't listed is no parent",
+   "desktop_test": "model.test.mjs 'a bead's parent: bd's field, the parent-child dependency, then the id's prefix'",
+   "ids": [
+    "fp-1",
+    "fp-1.1",
+    "fp-2"
+   ],
+   "bead": {
+    "id": "fp-9.1",
+    "title": "FP-9.1",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": []
+   },
+   "expect": null
+  },
+  {
+   "name": "an unlisted parent falls through to the id",
+   "desktop_test": "model.test.mjs 'a bead's parent: bd's field, the parent-child dependency, then the id's prefix'",
+   "ids": [
+    "fp-1",
+    "fp-1.1",
+    "fp-2"
+   ],
+   "bead": {
+    "id": "fp-1.1",
+    "title": "FP-1.1",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [],
+    "parent": "nope"
+   },
+   "expect": "fp-1"
+  }
+ ],
+ "compare_ids": [
+  {
+   "a": "fp-5az.2",
+   "b": "fp-5az.10",
+   "expect": -1
+  },
+  {
+   "a": "fp-5az.10",
+   "b": "fp-5az.2",
+   "expect": 1
+  },
+  {
+   "a": "fp-7",
+   "b": "fp-q",
+   "expect": -1
+  },
+  {
+   "a": "fp-1",
+   "b": "fp-1.1",
+   "expect": -1
+  },
+  {
+   "a": "fp-a",
+   "b": "fp-B",
+   "expect": -1
+  },
+  {
+   "a": "fp-a",
+   "b": "fp-A",
+   "expect": -1
+  },
+  {
+   "a": "fp-01",
+   "b": "fp-1",
+   "expect": 0
+  },
+  {
+   "a": "fp-1",
+   "b": "fp-1",
+   "expect": 0
+  },
+  {
+   "a": "a-b",
+   "b": "a.b",
+   "expect": -1
+  },
+  {
+   "a": "a_b",
+   "b": "a-b",
+   "expect": -1
+  },
+  {
+   "a": "x9",
+   "b": "xa",
+   "expect": -1
+  },
+  {
+   "a": "fp-2",
+   "b": "fp-10.1",
+   "expect": -1
+  }
+ ],
+ "trees": [
+  {
+   "name": "epics first, needs-you then in progress, ids in natural order",
+   "desktop_test": "model.test.mjs 'the tree: epics first, needs-you then in progress, ids in natural order'",
+   "beads": [
+    {
+     "id": "fp-zzz",
+     "title": "FP-ZZZ",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "fp-5az.10",
+     "title": "FP-5AZ.10",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "fp-5az"
+    },
+    {
+     "id": "fp-5az.1",
+     "title": "FP-5AZ.1",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "fp-5az",
+     "dependencies": [
+      {
+       "issue_id": "fp-5az.1",
+       "depends_on_id": "fp-5az",
+       "type": "parent-child"
+      }
+     ]
+    },
+    {
+     "id": "fp-5az.2",
+     "title": "FP-5AZ.2",
+     "status": "in_progress",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [
+      "needs-wolf"
+     ],
+     "parent": "fp-5az"
+    },
+    {
+     "id": "fp-5az",
+     "title": "FP-5AZ",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 1,
+     "labels": []
+    }
+   ],
+   "expect": {
+    "tree": [
+     {
+      "id": "fp-5az",
+      "children": [
+       {
+        "id": "fp-5az.2",
+        "children": []
+       },
+       {
+        "id": "fp-5az.1",
+        "children": []
+       },
+       {
+        "id": "fp-5az.10",
+        "children": []
+       }
+      ]
+     },
+     {
+      "id": "fp-zzz",
+      "children": []
+     }
+    ],
+    "epics": [
+     [
+      "fp-5az",
+      0,
+      3
+     ]
+    ]
+   }
+  },
+  {
+   "name": "a parent cycle doesn't loop or lose beads",
+   "desktop_test": "model.test.mjs 'a parent cycle doesn't loop or lose beads'",
+   "beads": [
+    {
+     "id": "x",
+     "title": "X",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "y"
+    },
+    {
+     "id": "y",
+     "title": "Y",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "x"
+    }
+   ],
+   "expect": {
+    "tree": [
+     {
+      "id": "x",
+      "children": []
+     },
+     {
+      "id": "y",
+      "children": []
+     }
+    ],
+    "epics": []
+   }
+  },
+  {
+   "name": "epic progress counts leaf work, nested too",
+   "desktop_test": "model.test.mjs 'epic progress counts leaf work, nested too'",
+   "beads": [
+    {
+     "id": "e",
+     "title": "E",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "e.1",
+     "title": "E.1",
+     "status": "open",
+     "issue_type": "feature",
+     "priority": 2,
+     "labels": [],
+     "parent": "e"
+    },
+    {
+     "id": "e.1.1",
+     "title": "E.1.1",
+     "status": "closed",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "e.1"
+    },
+    {
+     "id": "e.1.2",
+     "title": "E.1.2",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "e.1"
+    },
+    {
+     "id": "e.2",
+     "title": "E.2",
+     "status": "closed",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "e"
+    }
+   ],
+   "expect": {
+    "tree": [
+     {
+      "id": "e",
+      "children": [
+       {
+        "id": "e.1",
+        "children": [
+         {
+          "id": "e.1.2",
+          "children": []
+         },
+         {
+          "id": "e.1.1",
+          "children": []
+         }
+        ]
+       },
+       {
+        "id": "e.2",
+        "children": []
+       }
+      ]
+     }
+    ],
+    "epics": [
+     [
+      "e",
+      2,
+      3
+     ]
+    ]
+   }
+  },
+  {
+   "name": "status, then priority, then id; a closed needs-wolf label doesn't count",
+   "desktop_test": null,
+   "beads": [
+    {
+     "id": "s-6",
+     "title": "S-6",
+     "status": "closed",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [
+      "needs-wolf"
+     ]
+    },
+    {
+     "id": "s-5",
+     "title": "S-5",
+     "status": "deferred",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "s-4",
+     "title": "S-4",
+     "status": "weird",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "s-3",
+     "title": "S-3",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 0,
+     "labels": []
+    },
+    {
+     "id": "s-2",
+     "title": "S-2",
+     "status": "blocked",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "s-1",
+     "title": "S-1",
+     "status": "tombstone",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "s-0",
+     "title": "S-0",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 3,
+     "labels": []
+    },
+    {
+     "id": "s-7",
+     "title": "S-7",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "s-8",
+     "title": "S-8",
+     "status": "in_progress",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    }
+   ],
+   "expect": {
+    "tree": [
+     {
+      "id": "s-8",
+      "children": []
+     },
+     {
+      "id": "s-2",
+      "children": []
+     },
+     {
+      "id": "s-3",
+      "children": []
+     },
+     {
+      "id": "s-7",
+      "children": []
+     },
+     {
+      "id": "s-0",
+      "children": []
+     },
+     {
+      "id": "s-1",
+      "children": []
+     },
+     {
+      "id": "s-4",
+      "children": []
+     },
+     {
+      "id": "s-5",
+      "children": []
+     },
+     {
+      "id": "s-6",
+      "children": []
+     }
+    ],
+    "epics": []
+   }
+  }
+ ],
+ "repo_projects": [
+  {
+   "name": "a repo store splits into projects by epic",
+   "desktop_test": "model.test.mjs 'a repo store splits into projects by epic: mac-<project>, a project: label, children by parent or id'",
+   "beads": [
+    {
+     "id": "mac-crate-reorg",
+     "title": "MAC-CRATE-REORG",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "mac-crate-reorg.1",
+     "title": "MAC-CRATE-REORG.1",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "mac-crate-reorg"
+    },
+    {
+     "id": "mac-crate-reorg-stale-agent-docs",
+     "title": "MAC-CRATE-REORG-STALE-AGENT-DOCS",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "mac-x9z",
+     "title": "MAC-X9Z",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "mac-crate-reorg.1"
+    },
+    {
+     "id": "mac-prs",
+     "title": "MAC-PRS",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "mac-prs.4",
+     "title": "MAC-PRS.4",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "mac-wasm",
+     "title": "MAC-WASM",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 2,
+     "labels": [
+      "project:wasm-rust"
+     ]
+    },
+    {
+     "id": "mac-ixh",
+     "title": "MAC-IXH",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "mac-loose",
+     "title": "MAC-LOOSE",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [
+      "project:wasm-rust"
+     ]
+    }
+   ],
+   "expect": {
+    "crate-reorg": [
+     "mac-crate-reorg",
+     "mac-crate-reorg.1",
+     "mac-crate-reorg-stale-agent-docs",
+     "mac-x9z"
+    ],
+    "prs": [
+     "mac-prs",
+     "mac-prs.4"
+    ],
+    "wasm-rust": [
+     "mac-wasm",
+     "mac-loose"
+    ]
+   }
+  }
+ ],
+ "epic_projects": [
+  {
+   "bead": {
+    "id": "mac-a.1",
+    "title": "MAC-A.1",
+    "status": "open",
+    "issue_type": "epic",
+    "priority": 2,
+    "labels": []
+   },
+   "expect": null
+  },
+  {
+   "bead": {
+    "id": "mac-crate-reorg",
+    "title": "MAC-CRATE-REORG",
+    "status": "open",
+    "issue_type": "epic",
+    "priority": 2,
+    "labels": []
+   },
+   "expect": "crate-reorg"
+  },
+  {
+   "bead": {
+    "id": "x",
+    "title": "X",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [
+     "project:"
+    ]
+   },
+   "expect": null
+  },
+  {
+   "bead": {
+    "id": "mac-x",
+    "title": "MAC-X",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [
+     "project:",
+     "project:y"
+    ]
+   },
+   "expect": "x"
+  },
+  {
+   "bead": {
+    "id": "mac-x",
+    "title": "MAC-X",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": [
+     "other",
+     "project:y"
+    ]
+   },
+   "expect": "y"
+  },
+  {
+   "bead": {
+    "id": "macx",
+    "title": "MACX",
+    "status": "open",
+    "issue_type": "task",
+    "priority": 2,
+    "labels": []
+   },
+   "expect": null
+  }
+ ],
+ "places": [
+  {
+   "desktop_test": "model.test.mjs 'a bead in detail: its epic and parents, its children, and every agent on it on its machine'",
+   "beads": [
+    {
+     "id": "fp",
+     "title": "Epic",
+     "status": "open",
+     "issue_type": "epic",
+     "labels": []
+    },
+    {
+     "id": "fp.1",
+     "title": "Task",
+     "status": "in_progress",
+     "parent": "fp",
+     "labels": []
+    },
+    {
+     "id": "fp.1.1",
+     "title": "Sub B",
+     "status": "open",
+     "parent": "fp.1",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "fp.1.2",
+     "title": "Sub A",
+     "status": "open",
+     "parent": "fp.1",
+     "priority": 1,
+     "labels": []
+    },
+    {
+     "id": "fp.2",
+     "title": "Other",
+     "status": "open",
+     "parent": "fp",
+     "labels": []
+    }
+   ],
+   "id": "fp.1",
+   "expect": {
+    "bead": "fp.1",
+    "trail": [
+     "fp"
+    ],
+    "children": [
+     "fp.1.2",
+     "fp.1.1"
+    ]
+   }
+  },
+  {
+   "desktop_test": "model.test.mjs 'a bead in detail: its epic and parents, its children, and every agent on it on its machine'",
+   "beads": [
+    {
+     "id": "fp",
+     "title": "Epic",
+     "status": "open",
+     "issue_type": "epic",
+     "labels": []
+    },
+    {
+     "id": "fp.1",
+     "title": "Task",
+     "status": "in_progress",
+     "parent": "fp",
+     "labels": []
+    },
+    {
+     "id": "fp.1.1",
+     "title": "Sub B",
+     "status": "open",
+     "parent": "fp.1",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "fp.1.2",
+     "title": "Sub A",
+     "status": "open",
+     "parent": "fp.1",
+     "priority": 1,
+     "labels": []
+    },
+    {
+     "id": "fp.2",
+     "title": "Other",
+     "status": "open",
+     "parent": "fp",
+     "labels": []
+    }
+   ],
+   "id": "nope",
+   "expect": {
+    "bead": null,
+    "trail": [],
+    "children": []
+   }
+  },
+  {
+   "desktop_test": "model.test.mjs 'a bead in detail: its epic and parents, its children, and every agent on it on its machine'",
+   "beads": [
+    {
+     "id": "fp",
+     "title": "Epic",
+     "status": "open",
+     "issue_type": "epic",
+     "labels": []
+    },
+    {
+     "id": "fp.1",
+     "title": "Task",
+     "status": "in_progress",
+     "parent": "fp",
+     "labels": []
+    },
+    {
+     "id": "fp.1.1",
+     "title": "Sub B",
+     "status": "open",
+     "parent": "fp.1",
+     "priority": 2,
+     "labels": []
+    },
+    {
+     "id": "fp.1.2",
+     "title": "Sub A",
+     "status": "open",
+     "parent": "fp.1",
+     "priority": 1,
+     "labels": []
+    },
+    {
+     "id": "fp.2",
+     "title": "Other",
+     "status": "open",
+     "parent": "fp",
+     "labels": []
+    }
+   ],
+   "id": "fp",
+   "expect": {
+    "bead": "fp",
+    "trail": [],
+    "children": [
+     "fp.1",
+     "fp.2"
+    ]
+   }
+  }
+ ],
+ "joins": [
+  {
+   "name": "rows, states and counts",
+   "desktop_test": "model.test.mjs 'the join: rows, states and counts'",
+   "project": "fp",
+   "terms": [
+    {
+     "id": "t1",
+     "role": "deacon"
+    },
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "fp",
+     "status": "idle"
+    },
+    {
+     "id": "t3",
+     "role": "worker",
+     "project": "fp",
+     "parent": "t2",
+     "issue": "fp-5az.1",
+     "task": "panel",
+     "status": "working"
+    },
+    {
+     "id": "t4",
+     "helper": "audit",
+     "project": "fp",
+     "parent": "t3",
+     "status": "blocked"
+    },
+    {
+     "id": "t5",
+     "helper": "review",
+     "project": "fp",
+     "parent": "t3",
+     "status": "idle"
+    },
+    {
+     "id": "t6",
+     "parent": "t4",
+     "status": "working"
+    },
+    {
+     "id": "t7",
+     "parent": "t3",
+     "status": "done"
+    },
+    {
+     "id": "t8",
+     "role": "worker",
+     "project": "fp",
+     "task": "loose",
+     "status": "done"
+    }
+   ],
+   "beads": [
+    {
+     "id": "fp-5az",
+     "title": "FP-5AZ",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 1,
+     "labels": []
+    },
+    {
+     "id": "fp-5az.1",
+     "title": "FP-5AZ.1",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "fp-5az",
+     "dependencies": [
+      {
+       "issue_id": "fp-5az.1",
+       "depends_on_id": "fp-5az",
+       "type": "parent-child"
+      }
+     ]
+    },
+    {
+     "id": "fp-5az.2",
+     "title": "FP-5AZ.2",
+     "status": "in_progress",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [
+      "needs-wolf"
+     ],
+     "parent": "fp-5az"
+    },
+    {
+     "id": "fp-5az.3",
+     "title": "FP-5AZ.3",
+     "status": "closed",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "fp-5az"
+    },
+    {
+     "id": "fp-q",
+     "title": "FP-Q",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": []
+    }
+   ],
+   "expect": {
+    "lead": "t2",
+    "workers": [
+     "t3",
+     "t8"
+    ],
+    "helpers": {
+     "t3": [
+      "t4",
+      "t6",
+      "t5"
+     ],
+     "t8": []
+    },
+    "subagents": {
+     "t3": [
+      "t7"
+     ],
+     "t8": []
+    },
+    "tasks": [
+     [
+      "fp-5az.1",
+      "needs-you",
+      "FP-5AZ.1"
+     ],
+     [
+      "fp-5az.2",
+      "needs-you",
+      "FP-5AZ.2"
+     ],
+     [
+      "t8",
+      "done",
+      "loose"
+     ]
+    ],
+    "queued": 1,
+    "counts": {
+     "needsYou": 2,
+     "working": 0,
+     "done": 1
+    },
+    "epics": [
+     [
+      "fp-5az",
+      1,
+      3
+     ]
+    ],
+    "needs": [
+     [
+      "fp-5az.1",
+      "t4",
+      "blocked",
+      "FP-5AZ.1"
+     ],
+     [
+      "fp-5az.2",
+      null,
+      "decision",
+      "FP-5AZ.2"
+     ]
+    ],
+    "agents_by_bead": {
+     "fp-5az.1": [
+      "t3",
+      "t4",
+      "t6",
+      "t5",
+      "t7"
+     ]
+    }
+   }
+  },
+  {
+   "name": "without beads (bd missing): workers by their task label",
+   "desktop_test": "model.test.mjs 'the join without beads (bd missing): workers by their task label'",
+   "project": "fp",
+   "terms": [
+    {
+     "id": "t1",
+     "role": "deacon"
+    },
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "fp",
+     "status": "idle"
+    },
+    {
+     "id": "t3",
+     "role": "worker",
+     "project": "fp",
+     "parent": "t2",
+     "issue": "fp-5az.1",
+     "task": "panel",
+     "status": "working"
+    },
+    {
+     "id": "t4",
+     "helper": "audit",
+     "project": "fp",
+     "parent": "t3",
+     "status": "blocked"
+    },
+    {
+     "id": "t5",
+     "helper": "review",
+     "project": "fp",
+     "parent": "t3",
+     "status": "idle"
+    },
+    {
+     "id": "t6",
+     "parent": "t4",
+     "status": "working"
+    },
+    {
+     "id": "t7",
+     "parent": "t3",
+     "status": "done"
+    },
+    {
+     "id": "t8",
+     "role": "worker",
+     "project": "fp",
+     "task": "loose",
+     "status": "done"
+    }
+   ],
+   "beads": [],
+   "expect": {
+    "lead": "t2",
+    "workers": [
+     "t3",
+     "t8"
+    ],
+    "helpers": {
+     "t3": [
+      "t4",
+      "t6",
+      "t5"
+     ],
+     "t8": []
+    },
+    "subagents": {
+     "t3": [
+      "t7"
+     ],
+     "t8": []
+    },
+    "tasks": [
+     [
+      "t3",
+      "needs-you",
+      "panel"
+     ],
+     [
+      "t8",
+      "done",
+      "loose"
+     ]
+    ],
+    "queued": 0,
+    "counts": {
+     "needsYou": 1,
+     "working": 0,
+     "done": 0
+    },
+    "epics": [],
+    "needs": [
+     [
+      null,
+      "t4",
+      "blocked",
+      "panel"
+     ]
+    ],
+    "agents_by_bead": {}
+   }
+  },
+  {
+   "name": "needs you: decisions and blocked agents, the blocked one to open",
+   "desktop_test": "model.test.mjs 'needs you: decisions and blocked agents, the blocked one to open' and 'agents nest under their bead'",
+   "project": "fp",
+   "terms": [
+    {
+     "id": "t1",
+     "role": "deacon"
+    },
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "fp",
+     "status": "idle"
+    },
+    {
+     "id": "t3",
+     "role": "worker",
+     "project": "fp",
+     "parent": "t2",
+     "issue": "fp-5az.1",
+     "task": "panel",
+     "status": "working"
+    },
+    {
+     "id": "t4",
+     "helper": "audit",
+     "project": "fp",
+     "parent": "t3",
+     "status": "blocked"
+    },
+    {
+     "id": "t5",
+     "helper": "review",
+     "project": "fp",
+     "parent": "t3",
+     "status": "idle"
+    },
+    {
+     "id": "t6",
+     "parent": "t4",
+     "status": "working"
+    },
+    {
+     "id": "t7",
+     "parent": "t3",
+     "status": "done"
+    },
+    {
+     "id": "t8",
+     "role": "worker",
+     "project": "fp",
+     "task": "loose",
+     "status": "done"
+    }
+   ],
+   "beads": [
+    {
+     "id": "fp-5az",
+     "title": "FP-5AZ",
+     "status": "open",
+     "issue_type": "epic",
+     "priority": 1,
+     "labels": []
+    },
+    {
+     "id": "fp-5az.1",
+     "title": "FP-5AZ.1",
+     "status": "open",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [],
+     "parent": "fp-5az",
+     "dependencies": [
+      {
+       "issue_id": "fp-5az.1",
+       "depends_on_id": "fp-5az",
+       "type": "parent-child"
+      }
+     ]
+    },
+    {
+     "id": "fp-5az.2",
+     "title": "FP-5AZ.2",
+     "status": "in_progress",
+     "issue_type": "task",
+     "priority": 2,
+     "labels": [
+      "needs-wolf"
+     ],
+     "parent": "fp-5az"
+    }
+   ],
+   "expect": {
+    "lead": "t2",
+    "workers": [
+     "t3",
+     "t8"
+    ],
+    "helpers": {
+     "t3": [
+      "t4",
+      "t6",
+      "t5"
+     ],
+     "t8": []
+    },
+    "subagents": {
+     "t3": [
+      "t7"
+     ],
+     "t8": []
+    },
+    "tasks": [
+     [
+      "fp-5az.1",
+      "needs-you",
+      "FP-5AZ.1"
+     ],
+     [
+      "fp-5az.2",
+      "needs-you",
+      "FP-5AZ.2"
+     ],
+     [
+      "t8",
+      "done",
+      "loose"
+     ]
+    ],
+    "queued": 0,
+    "counts": {
+     "needsYou": 2,
+     "working": 0,
+     "done": 0
+    },
+    "epics": [
+     [
+      "fp-5az",
+      0,
+      2
+     ]
+    ],
+    "needs": [
+     [
+      "fp-5az.1",
+      "t4",
+      "blocked",
+      "FP-5AZ.1"
+     ],
+     [
+      "fp-5az.2",
+      null,
+      "decision",
+      "FP-5AZ.2"
+     ]
+    ],
+    "agents_by_bead": {
+     "fp-5az.1": [
+      "t3",
+      "t4",
+      "t6",
+      "t5",
+      "t7"
+     ]
+    }
+   }
+  }
+ ],
+ "works": [
+  {
+   "name": "a PM's epics, tree and needs-you: finished epics fold, closed leaves fold, agents under their bead",
+   "desktop_test": null,
+   "project": "fp",
+   "terms": [
+    {
+     "id": "t1",
+     "role": "deacon"
+    },
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "fp",
+     "status": "idle"
+    },
+    {
+     "id": "t3",
+     "role": "worker",
+     "project": "fp",
+     "parent": "t2",
+     "issue": "fp-5az.1",
+     "task": "panel",
+     "status": "working"
+    },
+    {
+     "id": "t4",
+     "helper": "audit",
+     "project": "fp",
+     "parent": "t3",
+     "status": "blocked"
+    },
+    {
+     "id": "t5",
+     "helper": "review",
+     "project": "fp",
+     "parent": "t3",
+     "status": "idle"
+    },
+    {
+     "id": "t6",
+     "parent": "t4",
+     "status": "working"
+    },
+    {
+     "id": "t7",
+     "parent": "t3",
+     "status": "done"
+    },
+    {
+     "id": "t8",
+     "role": "worker",
+     "project": "fp",
+     "task": "loose",
+     "status": "done"
+    },
+    {
+     "id": "t10",
+     "role": "worker",
+     "project": "fp",
+     "parent": "t2",
+     "task": "fp-7",
+     "status": "idle"
+    },
+    {
+     "id": "t11",
+     "parent": "t2",
+     "status": "working",
+     "title": "scratch"
+    },
+    {
+     "id": "t12",
+     "role": "pm",
+     "project": "other",
+     "parent": "t2",
+     "status": "blocked"
+    }
+   ],
+   "out": "\u001efp\n\u001c17.5\n[{\"id\":\"fp-5az\",\"title\":\"FP-5AZ\",\"status\":\"open\",\"issue_type\":\"epic\",\"priority\":1,\"labels\":[]},{\"id\":\"fp-5az.1\",\"title\":\"FP-5AZ.1\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[],\"parent\":\"fp-5az\",\"dependencies\":[{\"issue_id\":\"fp-5az.1\",\"depends_on_id\":\"fp-5az\",\"type\":\"parent-child\"}]},{\"id\":\"fp-5az.2\",\"title\":\"FP-5AZ.2\",\"status\":\"in_progress\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[\"needs-wolf\"],\"parent\":\"fp-5az\"},{\"id\":\"fp-5az.3\",\"title\":\"FP-5AZ.3\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[],\"parent\":\"fp-5az\"},{\"id\":\"fp-5az.4\",\"title\":\"FP-5AZ.4\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[],\"parent\":\"fp-5az\"},{\"id\":\"fp-old\",\"title\":\"FP-OLD\",\"status\":\"closed\",\"issue_type\":\"epic\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-old.1\",\"title\":\"FP-OLD.1\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-7\",\"title\":\"FP-7\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-8\",\"title\":\"FP-8\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-q\",\"title\":\"FP-Q\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-9\",\"title\":\"FP-9\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-9.1\",\"title\":\"FP-9.1\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]},{\"id\":\"fp-9.2\",\"title\":\"FP-9.2\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[]}]\n\u001f0\n\u001eother\n\u001c1\n[{\"id\":\"o-1\",\"title\":\"O-1\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[\"needs-wolf\"]}]\n\u001f0\n",
+   "expect": {
+    "error": null,
+    "scope": [
+     "t2",
+     "t3",
+     "t4",
+     "t6",
+     "t5",
+     "t7",
+     "t10",
+     "t11"
+    ],
+    "tasks": [
+     [
+      "fp-5az.1",
+      "needs-you"
+     ],
+     [
+      "fp-5az.2",
+      "needs-you"
+     ],
+     [
+      "fp-7",
+      "idle"
+     ]
+    ],
+    "epics": [
+     [
+      "fp-5az",
+      2,
+      4
+     ]
+    ],
+    "done_epics": 1,
+    "open": 1,
+    "total": 2,
+    "needs": [
+     [
+      "fp-5az.1",
+      "t4",
+      "blocked"
+     ]
+    ],
+    "blocked": [],
+    "needs_you": 1,
+    "tree": [
+     {
+      "id": "fp-5az",
+      "mark": null,
+      "agents": [],
+      "closed": 2,
+      "children": [
+       {
+        "id": "fp-5az.2",
+        "mark": "working",
+        "agents": [],
+        "closed": 0,
+        "children": []
+       },
+       {
+        "id": "fp-5az.1",
+        "mark": null,
+        "agents": [
+         "t3",
+         "t4",
+         "t6",
+         "t5",
+         "t7"
+        ],
+        "closed": 0,
+        "children": []
+       }
+      ]
+     },
+     {
+      "id": "fp-7",
+      "mark": null,
+      "agents": [
+       "t10"
+      ],
+      "closed": 0,
+      "children": []
+     },
+     {
+      "id": "fp-q",
+      "mark": null,
+      "agents": [],
+      "closed": 0,
+      "children": []
+     },
+     {
+      "id": "fp-9",
+      "mark": "done",
+      "agents": [],
+      "closed": 1,
+      "children": [
+       {
+        "id": "fp-9.2",
+        "mark": null,
+        "agents": [],
+        "closed": 0,
+        "children": []
+       }
+      ]
+     }
+    ],
+    "closed_folded": 3,
+    "loose": [
+     "t11"
+    ],
+    "agents_on_bead": {
+     "fp-5az.1": [
+      "t3",
+      "t4",
+      "t6",
+      "t5",
+      "t7"
+     ],
+     "fp-7": [
+      "t10"
+     ]
+    },
+    "row_roles": {
+     "t3": "worker",
+     "t4": "audit",
+     "t6": "t6",
+     "t5": "review",
+     "t7": "t7",
+     "t10": "worker"
+    }
+   }
+  },
+  {
+   "name": "Work only shows needs-you rows owned by its tab",
+   "desktop_test": "feed.test.mjs 'Work only shows needs-you rows and asks owned by its tab' (under a PM, one machine, no asks)",
+   "project": "fp",
+   "terms": [
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "fp"
+    },
+    {
+     "id": "t3",
+     "role": "worker",
+     "project": "fp",
+     "issue": "fp-1",
+     "parent": "t2"
+    },
+    {
+     "id": "t4",
+     "parent": "t3",
+     "status": "blocked"
+    },
+    {
+     "id": "t5",
+     "role": "worker",
+     "project": "fp",
+     "issue": "fp-2",
+     "status": "blocked"
+    },
+    {
+     "id": "t6",
+     "parent": "t3"
+    }
+   ],
+   "out": "\u001efp\n\u001c1\n[{\"id\":\"fp-1\",\"title\":\"This tab\",\"status\":\"open\",\"labels\":[\"needs-wolf\"]},{\"id\":\"fp-2\",\"title\":\"Sibling tab\",\"status\":\"open\",\"labels\":[\"needs-wolf\"]},{\"id\":\"fp-3\",\"title\":\"No agent\",\"status\":\"open\",\"labels\":[\"needs-wolf\"]}]\n\u001f0\n",
+   "expect": {
+    "error": null,
+    "scope": [
+     "t2",
+     "t3",
+     "t4",
+     "t6"
+    ],
+    "tasks": [
+     [
+      "fp-1",
+      "needs-you"
+     ],
+     [
+      "fp-2",
+      "needs-you"
+     ],
+     [
+      "fp-3",
+      "needs-you"
+     ]
+    ],
+    "epics": [],
+    "done_epics": 0,
+    "open": 0,
+    "total": 0,
+    "needs": [
+     [
+      "fp-1",
+      "t3",
+      "decision"
+     ]
+    ],
+    "blocked": [
+     "t4"
+    ],
+    "needs_you": 2,
+    "tree": [
+     {
+      "id": "fp-1",
+      "mark": "needs-you",
+      "agents": [
+       "t3",
+       "t4",
+       "t6"
+      ],
+      "closed": 0,
+      "children": []
+     },
+     {
+      "id": "fp-2",
+      "mark": null,
+      "agents": [],
+      "closed": 0,
+      "children": []
+     },
+     {
+      "id": "fp-3",
+      "mark": null,
+      "agents": [],
+      "closed": 0,
+      "children": []
+     }
+    ],
+    "closed_folded": 0,
+    "loose": [],
+    "agents_on_bead": {
+     "fp-1": [
+      "t3",
+      "t4",
+      "t6"
+     ],
+     "fp-2": [
+      "t5"
+     ]
+    },
+    "row_roles": {
+     "t3": "worker",
+     "t4": "t4",
+     "t6": "t6"
+    }
+   }
+  },
+  {
+   "name": "a blocked lead needs you; a repo store's epic is the project's; the own store's error shows",
+   "desktop_test": null,
+   "project": "crate-reorg",
+   "terms": [
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "crate-reorg",
+     "status": "blocked",
+     "title": "reorg pm"
+    },
+    {
+     "id": "t3",
+     "role": "worker",
+     "project": "crate-reorg",
+     "parent": "t2",
+     "issue": "mac-crate-reorg",
+     "status": "working"
+    },
+    {
+     "id": "t4",
+     "parent": "t3",
+     "status": "idle"
+    }
+   ],
+   "out": "\u001ecrate-reorg\n\u001c\nError: database locked\n\u001f1\n\u001erepo:macro\n\u001c1\n[{\"id\":\"mac-crate-reorg\",\"title\":\"MAC-CRATE-REORG\",\"status\":\"open\",\"issue_type\":\"epic\",\"priority\":2,\"labels\":[]},{\"id\":\"mac-crate-reorg.1\",\"title\":\"MAC-CRATE-REORG.1\",\"status\":\"closed\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[],\"parent\":\"mac-crate-reorg\"},{\"id\":\"mac-crate-reorg.2\",\"title\":\"MAC-CRATE-REORG.2\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"labels\":[\"needs-wolf\"],\"parent\":\"mac-crate-reorg\"},{\"id\":\"mac-ci\",\"title\":\"MAC-CI\",\"status\":\"open\",\"issue_type\":\"epic\",\"priority\":2,\"labels\":[]}]\n\u001f0\n",
+   "expect": {
+    "error": "bd list exited 1: Error: database locked",
+    "scope": [
+     "t2",
+     "t3",
+     "t4"
+    ],
+    "tasks": [
+     [
+      "mac-crate-reorg.2",
+      "needs-you"
+     ],
+     [
+      "mac-crate-reorg",
+      "working"
+     ]
+    ],
+    "epics": [
+     [
+      "mac-crate-reorg",
+      1,
+      2
+     ]
+    ],
+    "done_epics": 0,
+    "open": 1,
+    "total": 1,
+    "needs": [
+     [
+      null,
+      "t2",
+      "blocked"
+     ]
+    ],
+    "blocked": [],
+    "needs_you": 1,
+    "tree": [
+     {
+      "id": "mac-crate-reorg",
+      "mark": null,
+      "agents": [
+       "t3",
+       "t4"
+      ],
+      "closed": 1,
+      "children": [
+       {
+        "id": "mac-crate-reorg.2",
+        "mark": null,
+        "agents": [],
+        "closed": 0,
+        "children": []
+       }
+      ]
+     }
+    ],
+    "closed_folded": 1,
+    "loose": [],
+    "agents_on_bead": {
+     "mac-crate-reorg": [
+      "t3",
+      "t4"
+     ]
+    },
+    "row_roles": {
+     "t3": "worker",
+     "t4": "t4"
+    }
+   }
+  },
+  {
+   "name": "no beads for the project",
+   "desktop_test": null,
+   "project": "empty",
+   "terms": [
+    {
+     "id": "t2",
+     "role": "pm",
+     "project": "empty",
+     "status": "idle"
+    }
+   ],
+   "out": "\u001efp\n\u001c1\n[]\n\u001f0\n",
+   "expect": {
+    "error": null,
+    "scope": [
+     "t2"
+    ],
+    "tasks": [],
+    "epics": [],
+    "done_epics": 0,
+    "open": 0,
+    "total": 0,
+    "needs": [],
+    "blocked": [],
+    "needs_you": 0,
+    "tree": [],
+    "closed_folded": 0,
+    "loose": [],
+    "agents_on_bead": {},
+    "row_roles": {}
+   }
+  }
+ ],
+ "details": [
+  {
+   "name": "the bead, not its sync metadata",
+   "desktop_test": "feed.test.mjs 'DETAIL_SH finds a bead in its project's store, else a repo store; parseDetail shows the bead, not its sync metadata'",
+   "out": "\u001e[{\"id\":\"fp-1\",\"title\":\"Ship it\",\"status\":\"in_progress\",\"issue_type\":\"task\",\"priority\":1,\"assignee\":\"t2mk\",\"description\":\"Line one\\nLine two\",\"notes\":\"\",\"metadata\":{\"macro.sync\":\"{}\"},\"external_ref\":\"macro:x\"}]\n\u001d[{\"author\":\"t2kg\",\"text\":\"go\",\"created_at\":\"2026-11-21T10:00:00Z\"}]\n\u001fok\n",
+   "expect": {
+    "id": "fp-1",
+    "title": "Ship it",
+    "status": "in_progress",
+    "type": "task",
+    "priority": 1,
+    "assignee": "t2mk",
+    "owner": null,
+    "created_at": null,
+    "updated_at": null,
+    "close_reason": null,
+    "spec_id": null,
+    "sections": [
+     [
+      "Description",
+      "Line one\nLine two"
+     ]
+    ],
+    "comments": [
+     [
+      "t2kg",
+      "go",
+      "2026-11-21T10:00:00Z"
+     ]
+    ],
+    "published": []
+   }
+  },
+  {
+   "name": "a repo store's bead, no comments",
+   "desktop_test": "feed.test.mjs 'DETAIL_SH finds…'",
+   "out": "\u001e[{\"id\":\"mac-2\",\"title\":\"In the repo\",\"status\":\"open\"}]\n\u001d[]\n\u001fok\n",
+   "expect": {
+    "id": "mac-2",
+    "title": "In the repo",
+    "status": "open",
+    "type": null,
+    "priority": null,
+    "assignee": null,
+    "owner": null,
+    "created_at": null,
+    "updated_at": null,
+    "close_reason": null,
+    "spec_id": null,
+    "sections": [],
+    "comments": [],
+    "published": []
+   }
+  },
+  {
+   "name": "missing",
+   "desktop_test": "feed.test.mjs 'DETAIL_SH finds…'",
+   "out": "\u001fmissing\n",
+   "expect": {
+    "error": "This bead isn't in its project's store any more."
+   }
+  },
+  {
+   "name": "no bd",
+   "desktop_test": "feed.test.mjs 'DETAIL_SH finds…'",
+   "out": "\u001dnobd\n",
+   "expect": {
+    "error": "bd isn't installed on that machine."
+   }
+  },
+  {
+   "name": "unreadable show",
+   "desktop_test": null,
+   "out": "\u001e{nope\n\u001d[]\n\u001fok\n",
+   "expect": {
+    "error": "bd show returned something unreadable."
+   }
+  },
+  {
+   "name": "no bead in the list",
+   "desktop_test": null,
+   "out": "\u001e[]\n\u001d[]\n\u001fok\n",
+   "expect": {
+    "error": "bd show returned no bead."
+   }
+  },
+  {
+   "name": "not an object",
+   "desktop_test": null,
+   "out": "\u001e[{\"title\":\"no id\"}]\n\u001d[]\n\u001fok\n",
+   "expect": {
+    "error": "bd show returned no bead."
+   }
+  },
+  {
+   "name": "every section, the spec, published copies (http only), comments by text or body",
+   "desktop_test": null,
+   "out": "\u001e{\"id\":\"fp-2\",\"title\":\"All\",\"status\":\"closed\",\"issue_type\":\"epic\",\"priority\":0,\"assignee\":\" \",\"owner\":\"wolf\",\"created_at\":\"2026-11-20T00:00:00Z\",\"updated_at\":\"2026-11-21T00:00:00Z\",\"close_reason\":\"done\",\"spec_id\":\"https://example.com/spec\",\"description\":\"D\",\"design\":\"  \",\"acceptance_criteria\":\"A\",\"notes\":\"N\",\"metadata\":{\"published.macro\":\"https://macro.example/x\",\"published.linear\":\"not a url\",\"published.\":\"https://x.example\",\"published.gitea\":\" https://g.example/y \",\"other\":\"z\"}}\n\u001d[{\"author\":\"\",\"body\":\"by body\"},{\"author\":\"a\",\"text\":\"\"},{\"author\":\"b\",\"text\":5},\"junk\",{\"text\":\"late\",\"created_at\":\"\"}]\n\u001fok\n",
+   "expect": {
+    "id": "fp-2",
+    "title": "All",
+    "status": "closed",
+    "type": "epic",
+    "priority": 0,
+    "assignee": null,
+    "owner": "wolf",
+    "created_at": "2026-11-20T00:00:00Z",
+    "updated_at": "2026-11-21T00:00:00Z",
+    "close_reason": "done",
+    "spec_id": "https://example.com/spec",
+    "sections": [
+     [
+      "Description",
+      "D"
+     ],
+     [
+      "Acceptance",
+      "A"
+     ],
+     [
+      "Notes",
+      "N"
+     ]
+    ],
+    "comments": [
+     [
+      null,
+      "by body",
+      null
+     ],
+     [
+      "b",
+      "5",
+      null
+     ],
+     [
+      null,
+      "late",
+      null
+     ]
+    ],
+    "published": [
+     [
+      "gitea",
+      "https://g.example/y"
+     ],
+     [
+      "macro",
+      "https://macro.example/x"
+     ]
+    ]
+   }
+  },
+  {
+   "name": "a bead without a title or status; comments that aren't JSON",
+   "desktop_test": null,
+   "out": "\u001e{\"id\":\"fp-3\"}\n\u001dError: no comments\n\u001fok\n",
+   "expect": {
+    "id": "fp-3",
+    "title": "fp-3",
+    "status": "",
+    "type": null,
+    "priority": null,
+    "assignee": null,
+    "owner": null,
+    "created_at": null,
+    "updated_at": null,
+    "close_reason": null,
+    "spec_id": null,
+    "sections": [],
+    "comments": [],
+    "published": []
+   }
+  }
+ ]
+}
