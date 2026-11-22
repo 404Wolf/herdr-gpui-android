@@ -18,38 +18,47 @@ public final class ActionBarTest {
         return in;
     }
 
-    @Test public void theWidestLineIsImgClearQueueTypeTalkSendWithSendLast() {
-        List<ActionBar.Item> items = ActionBar.items(ControlLine.ladder(idle()).get(0));
+    private static String ids(List<ActionBar.Item> items) {
         StringBuilder ids = new StringBuilder();
         for (ActionBar.Item i : items) ids.append(i.id).append(' ');
-        assertEquals("attach clear queue type talk send ", ids.toString());
-        assertEquals("img", items.get(0).label);
-        assertEquals("clear", items.get(1).label);
-        assertEquals("send", items.get(items.size() - 1).id);
-        for (ActionBar.Item i : items) assertTrue(i.id, i.button);
+        return ids.toString().trim();
     }
 
-    @Test public void typeSaysHideWhileTheKeyboardIsUp() {
+    @Test public void theQueueThenFiveFixedSlotsWithSendLast() {
+        List<ActionBar.Item> items = ActionBar.items(ControlLine.ladder(idle()).get(0));
+        assertEquals("queue clear attach type talk send", ids(items));
+        assertEquals(R.drawable.ic_act_mic, ActionBar.icon(items.get(4)));
+        assertEquals(R.drawable.ic_act_send, ActionBar.icon(items.get(5)));
+        assertEquals(R.drawable.ic_act_image, ActionBar.icon(items.get(2)));
+    }
+
+    @Test public void typeShowsTheHideKeyboardIconWhileTheKeyboardIsUp() {
         ControlLine.State in = idle();
         in.typing = true;
         List<ActionBar.Item> items = ActionBar.items(ControlLine.ladder(in).get(0));
-        boolean hide = false;
-        for (ActionBar.Item i : items) if ("type".equals(i.id)) hide = "hide".equals(i.label);
-        assertTrue(hide);
+        for (ActionBar.Item i : items) if ("type".equals(i.id)) assertEquals(R.drawable.ic_act_keyboard_hide, ActionBar.icon(i));
     }
 
-    @Test public void statusWordsAreALabelAndGapsAreDropped() {
-        List<GhostText.Control> line = java.util.Arrays.asList(
-                new GhostText.Control(ControlLine.STATUS, "rec 0:05", "danger"),
-                new GhostText.Control(ControlLine.GAP_TYPE, "────", "dim"),
-                new GhostText.Control("talk", " stop ", "danger"),
-                new GhostText.Control("clear", "✕", "dim"));
-        List<ActionBar.Item> items = ActionBar.items(line);
-        assertEquals(3, items.size());
-        assertFalse("status is not a button", items.get(0).button);
-        assertEquals("stop", items.get(1).label);
-        assertEquals("danger", items.get(1).style);
-        assertEquals("the cross says clear", "clear", items.get(2).label);
+    @Test public void recordingChangesIconsInPlaceAndNothingMoves() {
+        ControlLine.State in = idle();
+        in.queued = 0;
+        in.recording = true;
+        in.dictating = true;
+        in.talks = java.util.Arrays.asList(new GhostText.Control("talk", "rec 0:05", "danger"),
+                new GhostText.Control("talk", "stop", "danger"));
+        List<ActionBar.Item> items = ActionBar.items(ControlLine.ladder(in).get(0));
+        assertEquals("status cancel attach type talk send", ids(items));
+        assertEquals("rec 0:05", items.get(0).label);
+        assertEquals("one discard button while recording", R.drawable.ic_act_close, ActionBar.icon(items.get(1)));
+        assertEquals(R.drawable.ic_act_stop, ActionBar.icon(items.get(4)));
+        // The five slots are the same ids, in the same order, idle or recording.
+        ControlLine.State idle = idle();
+        idle.queued = 0;
+        List<ActionBar.Item> calm = ActionBar.items(ControlLine.ladder(idle).get(0));
+        assertEquals(calm.size(), 5);
+        for (int n = 0; n < 5; n++) {
+            assertTrue(ActionBar.isSlot(calm.get(n).id) && ActionBar.isSlot(items.get(n + 1).id));
+        }
     }
 
     @Test public void theRowTakesTheWidestLineThatFits() {
@@ -64,10 +73,27 @@ public final class ActionBarTest {
         assertEquals("nothing fits: the barest line", ladder.size() - 1, narrow);
     }
 
+    @Test public void targetsAre48dpAndTheClusterTakesNoStrip() throws Exception {
+        assertTrue(ActionBar.TARGET_DP >= 48 && ActionBar.BUTTON_DP == 40);
+        String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(gta.contains("new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.BOTTOM | android.view.Gravity.END);"));
+        assertFalse("no bar reserving height", gta.contains("fitAboveActionBar"));
+    }
+
+    @Test public void clearKeepsItsSlotDisabledWhenThereIsNothingToClear() {
+        ControlLine.State in = idle();
+        in.clearable = false;
+        in.queued = 0;
+        List<ActionBar.Item> items = ActionBar.items(ControlLine.ladder(in).get(0));
+        assertEquals("clear attach type talk send", ids(items));
+        assertEquals(ActionBar.DISABLED, items.get(0).style);
+    }
+
     @Test public void thePromptGetsNoControlWords() throws Exception {
         String composer = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/ComposerBar.java")), java.nio.charset.StandardCharsets.UTF_8);
-        assertTrue(composer.contains("shownRows, queueOpen, selectedRow, cols, Collections.emptyList(), GhostText.Colors.of(chrome));"));
+        assertTrue(composer.contains("shownRows, queueOpen, selectedRow, cols, reserved(), GhostText.Colors.of(chrome));"));
         assertFalse(composer.contains("GhostText.withRungs(json, ladder)"));
     }
 }
