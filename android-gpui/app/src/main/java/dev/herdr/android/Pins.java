@@ -52,7 +52,7 @@ final class Pins {
 
         /** The key, or null when the machine is unproven, the address relayed or the creation time unknown. */
         static Key of(MachineKey machine, String address, Long createdMs) {
-            if (machine == null || createdMs == null || createdMs <= 0 || !TranscriptKey.plainAddress(address)) {
+            if (machine == null || createdMs == null || createdMs <= 0 || !plainAddress(address)) {
                 return null;
             }
             return new Key(machine, address, createdMs);
@@ -388,7 +388,22 @@ final class Pins {
     }
 
     private static String plainIncarnation(String value) {
-        return TranscriptKey.plainIncarnation(value) ? value : null;
+        if (value == null || value.isEmpty() || value.length() > 64) return null;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z')) return null;
+        }
+        return value;
+    }
+
+    /** A terminal of the core itself: letters, digits, '-' and '_' (a relayed machine/t7 is not). */
+    static boolean plainAddress(String address) {
+        if (address == null || address.isEmpty() || address.length() > 64) return false;
+        for (int i = 0; i < address.length(); i++) {
+            char c = address.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '-' && c != '_') return false;
+        }
+        return true;
     }
 
     private static String bounded(String value) {
