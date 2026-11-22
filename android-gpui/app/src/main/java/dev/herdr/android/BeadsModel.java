@@ -1047,6 +1047,12 @@ final class BeadsModel {
         final List<Comment> comments = new ArrayList<>();
         /** Published copies (metadata published.&lt;dest&gt; = an http(s) url), as {dest, url}, by dest. */
         final List<String[]> published = new ArrayList<>();
+        /** The store's revision it was read at (its export's Dolt commit), when known. */
+        String rev;
+        /** bd's comment count, when known: zero means no comments are read. */
+        Integer commentCount;
+        /** Read from the store's export while the database may be newer: confirm with bd show. */
+        boolean maybeStale;
     }
 
     private static Detail failed(String why) {
@@ -1079,7 +1085,11 @@ final class BeadsModel {
         if (out.startsWith("\u001dnobd")) return failed("bd isn't installed on that machine.");
         if (MISSING.matcher(out).find() || !out.startsWith("\u001e")) return failed("This bead isn't in its project's store any more.");
         String[] parts = out.substring(1).split("\u001d", -1);
-        String showPart = parts[0], rest = parts.length > 1 ? parts[1] : "";
+        String showPart = parts[0], after = parts.length > 1 ? parts[1] : "";
+        // "\x1c<revision> fresh|maybe" after the (now empty) comments: the export's read.
+        int mark = after.indexOf('\u001c');
+        String rest = mark < 0 ? after : after.substring(0, mark);
+        String revPart = mark < 0 ? "" : trim(STATUS_WORD.matcher(after.substring(mark + 1)).replaceFirst(""));
         Object v;
         try {
             v = json(showPart);
@@ -1122,6 +1132,10 @@ final class BeadsModel {
         d.updatedAt = filled(b, "updated_at");
         d.closeReason = filled(b, "close_reason");
         d.specId = filled(b, "spec_id");
+        d.commentCount = b.opt("comment_count") instanceof Number ? ((Number) b.opt("comment_count")).intValue() : null;
+        String[] rev = revPart.isEmpty() ? new String[0] : revPart.split("[" + WS + "]+");
+        d.rev = rev.length > 0 && !rev[0].isEmpty() ? rev[0] : null;
+        d.maybeStale = rev.length > 1 && "maybe".equals(rev[1]);
         JSONObject meta = b.optJSONObject("metadata");
         Map<String, String> published = new TreeMap<>();
         if (meta != null) for (Iterator<String> it = meta.keys(); it.hasNext(); ) {
@@ -1132,6 +1146,34 @@ final class BeadsModel {
         }
         for (Map.Entry<String, String> e : published.entrySet()) d.published.add(new String[] { e.getKey(), e.getValue() });
         return d;
+    }
+
+    /** COMMENTS_SH's output: the comments, oldest first, or why there are none (error set). */
+    static Comments parseComments(String out) {
+        Comments c = new Comments();
+        if (out.startsWith("\u001dnobd")) { c.error = "bd isn't installed on that machine."; return c; }
+        if (!out.startsWith("\u001d")) { c.error = "This bead isn't in its project's store any more."; return c; }
+        try {
+            String list = trim(STATUS_WORD.matcher(out.substring(1)).replaceFirst(""));
+            Object v = json(list.isEmpty() ? "[]" : list);
+            if (v instanceof JSONArray) {
+                JSONArray a = (JSONArray) v;
+                for (int i = 0; i < a.length(); i++) {
+                    JSONObject x = a.optJSONObject(i);
+                    Object t = x == null ? null : present(x, "text") ? x.opt("text") : present(x, "body") ? x.opt("body") : "";
+                    String said = t == null ? "" : text(t);
+                    if (!said.isEmpty()) c.list.add(new Comment(filled(x, "author"), said, filled(x, "created_at")));
+                }
+            }
+        } catch (JSONException e) {
+            c.error = "bd comments returned something unreadable.";
+        }
+        return c;
+    }
+
+    static final class Comments {
+        String error;
+        final List<Comment> list = new ArrayList<>();
     }
 
     /** JS `x ?? y` sees null and undefined alike: a key holding JSON null is absent. */
