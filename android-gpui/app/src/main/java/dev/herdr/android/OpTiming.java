@@ -72,4 +72,23 @@ final class OpTiming {
         }
         return reason;
     }
+
+    /** Retries of a busy machine: the first wait, doubling up to the last. */
+    static final long BUSY_FIRST_MS = 5_000, BUSY_MAX_MS = 60_000;
+
+    /**
+     * The core refused the look because it is busy, not broken: its "unavailable"
+     * kind (as when its exec slots are all taken, "16 execs are running
+     * already"). Worth a retry with backoff; the last answer stays shown.
+     */
+    static boolean busy(String reason) {
+        return reason != null && (reason.contains("\"unavailable\"") || reason.contains("execs are running already"));
+    }
+
+    /** The wait before retry {@code attempt} (0 first) of a busy machine: 5 s, 10 s, 20 s… at most 60 s. */
+    static long busyBackoff(int attempt) {
+        long wait = BUSY_FIRST_MS;
+        for (int i = 0; i < attempt && wait < BUSY_MAX_MS; i++) wait *= 2;
+        return Math.min(wait, BUSY_MAX_MS);
+    }
 }

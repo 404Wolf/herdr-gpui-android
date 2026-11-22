@@ -145,6 +145,19 @@ public final class UsageModelTest {
         assertFalse(sheet.old());
     }
 
+    @Test public void aBusyMachineKeepsWhatShowsAndSaysItIsRetrying() {
+        UsageModel.Sheet sheet = new UsageModel.Sheet("demo");
+        sheet.answered(UsageModel.parse(reply(WORK)), false, NOW * 1000);
+        sheet.busy();
+        assertEquals("demo is busy, retrying · showing 10:42", sheet.note(NOW, UTC));
+        assertTrue(sheet.old());
+        sheet.answered(UsageModel.parse(reply(WORK)), false, NOW * 1000 + 30_000);
+        assertEquals("", sheet.note(NOW, UTC));
+        UsageModel.Sheet empty = new UsageModel.Sheet("demo");
+        empty.busy();
+        assertEquals("demo is busy, retrying", empty.note(NOW, UTC));
+    }
+
     @Test public void withNothingShownTheSheetSaysTheWholeState() {
         UsageModel.Sheet sheet = new UsageModel.Sheet("demo");
         sheet.answered(null, true, NOW * 1000);
