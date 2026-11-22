@@ -195,6 +195,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         volatile boolean connected;
         volatile long revision = -1;
         volatile long nextAttemptAt;
+        /** The next read (HostSampling: slower while the rail doesn't show this machine). */
+        volatile long nextPollAt;
     }
     private final java.util.Map<String, HostSample> hostSamples = new java.util.concurrent.ConcurrentHashMap<>();
     private java.util.concurrent.ScheduledExecutorService sampler;
@@ -2124,6 +2126,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         hostSamples.clear();
     }
 
+    /** Whether the rail shows {@code hostId}'s rows now (HostSampling). */
+    private boolean railShows(String hostId) {
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        // The same rule as the rail's picker (refreshSidebar): a connection on screen and more than one machine.
+        return HostSampling.shown(hostId, currentHostId, current != null, savedHosts.size());
+    }
+
     private boolean sampleCurrent(String hostId, HostSample sample) {
         return hostResumed && sidebarOpen && !destroyed
                 && !hostId.equals(currentHostId) && !hostId.equals(switchingTo)
@@ -2142,6 +2152,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (host == null || host.expectedFingerprint.isEmpty()) return;
         long now = SystemClock.uptimeMillis();
+        // A machine the rail doesn't show (the picker names it) is read slower: its counts, not its rows.
+        boolean shown = railShows(hostId);
+        if (now < sample.nextPollAt) return;
+        sample.nextPollAt = now + HostSampling.every(shown) - 500;
         if (sample.handle == 0) {
             if (now < sample.nextAttemptAt) return;
             try {
@@ -2177,7 +2191,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         try {
             JSONObject state = new JSONObject(RemoteNative.poll(sample.handle, sample.revision, true));
             if (state.optBoolean("unchanged", false)) {
-                if (sample.connected) sample.connected = true;
+                sample.connected = true;
                 return;
             }
             if ("closed".equals(state.optString("state"))) throw new IllegalStateException("closed");
@@ -2188,8 +2202,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 sample.tabs = state.optJSONArray("tabs");
                 sample.revision = state.optLong("token", state.optLong("revision", 0));
                 sample.connected = true;
-                sidebarSignature = "";
-                if (!destroyed) runOnUiThread(() -> refreshSidebar(false));
+                // Only a machine the rail shows rebuilds it; a hidden one's new list waits for its picker.
+                if (shown) {
+                    sidebarSignature = "";
+                    if (!destroyed) runOnUiThread(() -> refreshSidebar(false));
+                }
             }
         } catch (Exception | LinkageError failure) {
             closeSample(sample);
@@ -3602,6 +3619,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { current = connection; }
         StringBuilder signature = new StringBuilder();
         for (SavedRemoteHost host : savedHosts) {
+            // Hidden machines (the picker names them) don't redraw the rail.
+            if (!railShows(host.id)) continue;
             HostSample sample = hostSamples.get(host.id);
             signature.append(host.id).append(':');
             if (host.id.equals(currentHostId)) {
