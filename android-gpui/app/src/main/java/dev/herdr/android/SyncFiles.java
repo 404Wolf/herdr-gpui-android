@@ -52,6 +52,7 @@ final class SyncFiles implements SyncEngine.Store {
     }
 
     @Override public SyncEngine.Entry load(SyncEngine.Key key) {
+        if (PanelSync.isLiveOnly(key.machine)) return null;
         File file = fileOf(key);
         if (!file.isFile() || file.length() > (long) key.kind.maxChars * 4 + 4096) return null;
         try {
@@ -67,7 +68,8 @@ final class SyncFiles implements SyncEngine.Store {
     }
 
     @Override public void save(SyncEngine.Key key, SyncEngine.Entry entry) {
-        if (!entry.hasData() || entry.text.length() > key.kind.maxChars) return;
+        // A profile refused its machine works live only: nothing of it is kept.
+        if (PanelSync.isLiveOnly(key.machine) || !entry.hasData() || entry.text.length() > key.kind.maxChars) return;
         if (freeBytes.getAsLong() < freeFloorBytes) return;
         byte[] bytes;
         try {

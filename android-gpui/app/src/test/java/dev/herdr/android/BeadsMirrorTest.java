@@ -196,4 +196,19 @@ public final class BeadsMirrorTest {
         full.save(d, new SyncEngine.Entry("doc", "", 7, "", SyncEngine.Entry.State.FRESH, null, 5));
         assertNull(full.load(d));
     }
+
+    /** Unproven: nothing reads; a profile refused its machine reads live and keeps nothing on disk. */
+    @Test public void aRefusedProfileReadsLiveAndKeepsNothing() throws Exception {
+        assertNull(PanelSync.keyFor(null, false, "h1"));
+        assertEquals(SyncEngineTest.A, PanelSync.keyFor(SyncEngineTest.A, true, "h1"));
+        MachineKey live = PanelSync.keyFor(null, true, "h1");
+        assertTrue(PanelSync.isLiveOnly(live));
+        assertFalse(PanelSync.isLiveOnly(SyncEngineTest.A));
+        File dir = Files.createTempDirectory("sync").toFile();
+        SyncFiles files = new SyncFiles(dir, 1 << 20, 0, System::currentTimeMillis, () -> Long.MAX_VALUE);
+        SyncEngine.Key key = new SyncEngine.Key(live, SyncEngine.Kind.DOC, "x");
+        files.save(key, new SyncEngine.Entry("doc", "", 5, "", SyncEngine.Entry.State.FRESH, null, 1));
+        assertNull(files.load(key));
+        assertFalse(files.fileOf(key).exists());
+    }
 }

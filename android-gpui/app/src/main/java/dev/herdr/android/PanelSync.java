@@ -35,6 +35,7 @@ final class PanelSync {
     private final Runnable fire = () -> { for (Runnable r : new ArrayList<>(changed)) r.run(); };
     private final List<SyncEngine.Key> heard = new ArrayList<>();
     private final String[] machineName;
+    private final java.util.Map<SyncEngine.Key, Object[]> docs = new java.util.HashMap<>();
     private MachineKey machine;
 
     PanelSync(SyncEngine engine, String[] machineName) {
@@ -71,6 +72,27 @@ final class PanelSync {
             return t;
         });
         return one::execute;
+    }
+
+    /** What a key made by {@link #liveOnly} starts with: never written to disk. */
+    static final String LIVE_ONLY = "live-only ";
+
+    /**
+     * The key the panel's reads go under: the proven machine; for a profile refused its machine
+     * (it works live only, MachineBindings), one of its own that is never kept on disk; null
+     * while the connection has not proven its machine yet (nothing is read until it has).
+     */
+    static MachineKey keyFor(MachineKey proven, boolean refused, String hostId) {
+        if (proven != null) return proven;
+        return refused ? liveOnly(hostId) : null;
+    }
+
+    static MachineKey liveOnly(String hostId) {
+        return MachineKey.of(LIVE_ONLY + (hostId == null || hostId.isEmpty() ? "-" : hostId), "unproven");
+    }
+
+    static boolean isLiveOnly(MachineKey key) {
+        return key != null && key.core.startsWith(LIVE_ONLY);
     }
 
     /** The machine on screen, as proven (null: not yet), and what it calls itself. */
@@ -207,7 +229,14 @@ final class PanelSync {
         if (machine == null || name == null) return new Doc(null, null, false);
         SyncEngine.Key key = key(SyncEngine.Kind.DOC, name);
         SyncEngine.Entry e = engine.want(key, priority);
-        return new Doc(e == null || !e.hasData() ? null : DocModel.parse(e.text), e == null ? null : e.error, engine.reading(key));
+        DocModel.Read read = null;
+        if (e != null && e.hasData()) {
+            // Parsed once per version, not on every tick.
+            Object[] memo = docs.get(key);
+            if (memo == null || (long) memo[0] != e.version) docs.put(key, memo = new Object[] {e.version, DocModel.parse(e.text)});
+            read = (DocModel.Read) memo[1];
+        }
+        return new Doc(read, e == null ? null : e.error, engine.reading(key));
     }
 
     private SyncEngine.Key key(SyncEngine.Kind kind, String name) {
