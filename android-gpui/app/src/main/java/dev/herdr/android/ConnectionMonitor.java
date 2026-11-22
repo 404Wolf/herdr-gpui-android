@@ -55,6 +55,8 @@ final class ConnectionMonitor {
     private final Listener listener;
     private final ReconnectPolicy policy = new ReconnectPolicy();
     private final Set<Network> physical = new HashSet<>();
+    /** The physical networks when the epoch began: one not among them is a new network. */
+    private final Set<Network> epochNetworks = new HashSet<>();
     private final Runnable fire = this::fire;
     private final Runnable goneCheck = this::goneCheck;
     /** A physical network was seen since start: an empty set means they were lost, not unknown yet. */
@@ -121,6 +123,7 @@ final class ConnectionMonitor {
         if (started || connectivity == null) return;
         started = true;
         policy.reset();
+        epochNetworks.clear();
         try {
             connectivity.registerNetworkCallback(new NetworkRequest.Builder()
                     .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -165,6 +168,7 @@ final class ConnectionMonitor {
         if (!wanted) {
             wanted = true;
             policy.reset();
+            newEpoch();
         }
         next();
     }
@@ -179,6 +183,7 @@ final class ConnectionMonitor {
     void retry() {
         wanted = true;
         policy.reset();
+        newEpoch();
         next();
     }
 
@@ -245,7 +250,9 @@ final class ConnectionMonitor {
             arrivedAt = now;
             android.util.Log.i("herdr-net", "network arrived or validated");
             if (wanted) {
-                long delay = policy.arrived(now);
+                boolean fresh = !epochNetworks.containsAll(physical);
+                if (fresh) newEpoch();
+                long delay = policy.arrived(now, fresh);
                 if (delay == ReconnectPolicy.EXHAUSTED) {
                     main.removeCallbacks(fire);
                     listener.exhausted();
@@ -255,6 +262,12 @@ final class ConnectionMonitor {
             }
         }
         listener.changed();
+    }
+
+    /** An epoch begins with the networks the phone has now. Main thread. */
+    private void newEpoch() {
+        epochNetworks.clear();
+        epochNetworks.addAll(physical);
     }
 
     /** Schedules the epoch's next attempt, or says it is spent. Main thread. */
