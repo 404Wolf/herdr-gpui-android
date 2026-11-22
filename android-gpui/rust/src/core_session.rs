@@ -1599,7 +1599,8 @@ fn send_refusal(error: &Error) -> Value {
 /// rows asked for, so this is generous.
 pub(crate) const READ_WAIT: Duration = Duration::from_secs(10);
 /// A bounded read's answer as the phone keeps it: the text (within the bound
-/// asked for, else a protocol error), whether the core cut it, and the
+/// asked for, else a protocol error), whether the core cut it, whether it is
+/// the screen only, and the
 /// incarnation it read, or null when the core could not say (then the phone
 /// keeps nothing of it).
 fn transcript_reply(result: &Value, max_bytes: usize) -> Result<Value> {
@@ -1617,6 +1618,9 @@ fn transcript_reply(result: &Value, max_bytes: usize) -> Result<Value> {
         "supported": true,
         "text": text,
         "truncated": result["truncated"].as_bool().unwrap_or(false),
+        // The screen alone (a full-screen program read without stitching), not
+        // its history: offline, the phone says so instead of offering more.
+        "screen": result["how"] == "screen",
         "incarnation": incarnation,
     }))
 }
@@ -3479,7 +3483,13 @@ mod connection_tests {
             m => Ok(base_answer(m)),
         });
         let reply: Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(reply, json!({"supported":true,"text":"a\nb","truncated":true,"incarnation":"0a1b2c3d4e5f6a7b"}));
+        assert_eq!(reply, json!({"supported":true,"text":"a\nb","truncated":true,"screen":false,"incarnation":"0a1b2c3d4e5f6a7b"}));
+        // A full-screen program read without stitching is its screen only, and says so.
+        let (result, _) = operation_against_with(both, |tx| Operation::Read(request(), tx), |method, _, _| match method {
+            "terminal.read" => Ok(json!({"text":"top","complete":false,"how":"screen","truncated":false,"incarnation":"ab"})),
+            m => Ok(base_answer(m)),
+        });
+        assert_eq!(serde_json::from_str::<Value>(&result.unwrap()).unwrap()["screen"], true);
         let read = seen.iter().find(|(m, _)| m == "terminal.read").unwrap();
         assert_eq!(read.1, json!({"terminal":"t7","lines":2000,"max_bytes":65536,"stitch":false}));
         assert!(seen.iter().all(|(m, _)| m != "terminal.send" && m != "terminal.keys"));

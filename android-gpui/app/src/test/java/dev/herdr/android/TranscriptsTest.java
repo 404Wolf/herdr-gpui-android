@@ -7,6 +7,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
@@ -161,6 +162,47 @@ public final class TranscriptsTest {
 
     @Test public void itSaysWhenItWasReadAndThatItMayBeOutdated() {
         assertEquals("transcript as of 14:02 · may be outdated", Transcripts.label("14:02"));
+    }
+
+    @Test public void offlineRedesign_aScreenOnlyReadIsKeptAsScreenAndSaysSo() {
+        // factory-9zz.1 gap 2: Claude Code and Codex are full-screen, and a read without
+        // stitching gives their screen only. It is kept as that, never offered as history.
+        Transcripts store = store();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        assertTrue(store.save(key, "the screen", false, true, 1_000));
+        store.observe(A, seen("t5", 7L, INC), 1_500);
+        Transcripts.Transcript screen = store.proven(A, "t5");
+        assertTrue(screen.screen);
+        assertEquals("t5 · transcript as of 14:02 · may be outdated · screen only",
+                Transcripts.title("t5", "14:02", screen));
+        // A shell's history is not.
+        TranscriptKey shell = TranscriptKey.of(A, "t6", 8L, INC);
+        assertTrue(store.save(shell, "a\nb", true, false, 1_000));
+        store.observe(A, seen("t6", 8L, INC), 1_600);
+        Transcripts.Transcript history = store.proven(A, "t6");
+        assertFalse(history.screen);
+        assertEquals("t6 · transcript as of 14:02 · may be outdated · older lines not kept",
+                Transcripts.title("t6", "14:02", history));
+    }
+
+    @Test public void offlineRedesign_aFileFromBeforeTheScreenFlagCountsAsTheScreen() throws IOException {
+        Transcripts store = store();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        assertTrue(store.save(key, "old", false, false, 1_000));
+        File file = store.file(key);
+        String text = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        org.json.JSONObject header;
+        try {
+            header = new org.json.JSONObject(text.substring(0, text.indexOf('\n')));
+        } catch (org.json.JSONException broken) {
+            throw new AssertionError(broken);
+        }
+        assertFalse(header.optBoolean("screen", true));
+        header.remove("screen");
+        Files.write(file.toPath(), (header.toString() + text.substring(text.indexOf('\n')))
+                .getBytes(StandardCharsets.UTF_8));
+        store.observe(A, seen("t5", 7L, INC), 1_500);
+        assertTrue("unknown is not claimed as history", store.proven(A, "t5").screen);
     }
 
     // ---- what to read, when ----

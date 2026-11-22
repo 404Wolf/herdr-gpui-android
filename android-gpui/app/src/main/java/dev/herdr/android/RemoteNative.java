@@ -67,7 +67,8 @@ final class RemoteNative {
     static native String scrollTo(long handle, long offsetFromBottom);
     /**
      * Scrolls the frame held on screen while the link is down (the last
-     * closed session's grid), locally; {"local_offset": rows back}.
+     * closed session's grid), locally: {"local_offset": rows back, "history": rows kept above
+     * the screen, "moved"}. A full-screen agent's grid keeps no history, so it never moves.
      */
     static native String scrollHeld(long deltaRows, boolean latest);
     /**
@@ -85,6 +86,11 @@ final class RemoteNative {
     static native long openSaved(String path);
     static native String scrollLocal(long handle, long deltaRows, long generation,
             String title, String status, String shortcuts);
+    /**
+     * Scrolls session {@code handle}'s live grid on the phone only, sending nothing (no wheel
+     * report), while its link is in doubt: {"local_offset", "history", "moved"}.
+     */
+    static native String scrollLocalOnly(long handle, long deltaRows);
     static native void close(long handle);
 
     /** A raw login shell on a remote PTY, drawn by the Rio terminal. Blocks for SSH: worker only. */

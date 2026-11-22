@@ -56,6 +56,9 @@ public final class HeldScrollEntryTest {
                 + "    boolean shellMode() { return shell; }\n"
                 + "    boolean scrollHeld(int lines, boolean latest) { went.add(\"held \" + lines); return true; }\n"
                 + "    boolean scrollLive(Connection target, int lines) { went.add(\"live \" + lines); return true; }\n"
+                + "    boolean scrollLocalOnly(Connection target, int lines) { went.add(\"local \" + lines); return true; }\n"
+                + "    boolean doubt;\n"
+                + "    boolean linkInDoubt(Connection target) { return target != null && doubt; }\n"
                 + "    public void target(boolean present, boolean closed, long handle, boolean ready, boolean shellMode) {\n"
                 + "        shell = shellMode;\n"
                 + "        if (!present) { connection = null; return; }\n"
@@ -63,6 +66,7 @@ public final class HeldScrollEntryTest {
                 + "        connection.closed = closed; connection.remoteHandle = handle; connection.ready = ready;\n"
                 + "    }\n"
                 + "    public boolean scroll(int lines) { return requestScroll(lines); }\n"
+                + "    public void doubt(boolean inDoubt) { doubt = inDoubt; }\n"
                 + "    // From GpuiTerminalActivity.java, verbatim:\n"
                 + "    private boolean requestScroll(int lines) " + OfflineNeverDimsTest.body(activity, "requestScroll") + "\n"
                 + "    private boolean heldFrame(Connection target) " + OfflineNeverDimsTest.body(activity, "heldFrame") + "\n"
@@ -90,10 +94,16 @@ public final class HeldScrollEntryTest {
     }
 
     /** Scrolls {@code steps} through the activity's entry against one target; what reached each sink. */
-    @SuppressWarnings("unchecked")
     private static List<String> scroll(boolean present, boolean closed, long handle, boolean ready, boolean shell,
             int... steps) throws Exception {
+        return scroll(false, present, closed, handle, ready, shell, steps);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> scroll(boolean doubt, boolean present, boolean closed, long handle, boolean ready,
+            boolean shell, int... steps) throws Exception {
         Object entry = probe.getConstructor().newInstance();
+        probe.getMethod("doubt", boolean.class).invoke(entry, doubt);
         probe.getMethod("target", boolean.class, boolean.class, long.class, boolean.class, boolean.class)
                 .invoke(entry, present, closed, handle, ready, shell);
         Method scroll = probe.getMethod("scroll", int.class);
@@ -132,5 +142,12 @@ public final class HeldScrollEntryTest {
 
     @Test public void wolfAskOfflineScrolling_theActivitysEntryScrollsALivePaneThroughItsSession() throws Exception {
         assertEquals(Arrays.asList("live 7", "live -7"), scroll(true, false, 7, true, false, DRAG));
+    }
+
+    @Test public void offlineRedesign_theActivitysEntryScrollsALivePaneInDoubtOnThePhoneOnly() throws Exception {
+        // factory-9zz.1: no wheel input over a link in doubt; the phone's own rows move.
+        assertEquals(Arrays.asList("local 7", "local -7"), scroll(true, true, false, 7, true, false, DRAG));
+        // A held frame stays held whatever the link's doubt.
+        assertEquals(held(DRAG), scroll(true, true, true, 7, false, false, DRAG));
     }
 }

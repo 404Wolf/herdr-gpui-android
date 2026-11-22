@@ -186,8 +186,10 @@ final class TranscriptKeeper {
         if (key == null) return;
         String text = answer.optString("text", "");
         boolean truncated = answer.optBoolean("truncated", false);
+        // An answer that does not say is not claimed as history.
+        boolean screen = answer.optBoolean("screen", true);
         long asOf = wall.getAsLong();
-        disk.execute(() -> store.save(key, text, truncated, asOf));
+        disk.execute(() -> store.save(key, text, truncated, screen, asOf));
     }
 
     /** The proven transcript of {@code address} on {@code machine}, given to {@code then} (on the disk thread). */
