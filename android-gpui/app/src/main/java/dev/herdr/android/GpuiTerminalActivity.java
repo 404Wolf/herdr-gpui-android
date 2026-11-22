@@ -2388,6 +2388,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (previous != null) {
             synchronized (stateLock) { publish(previous, "Switching to " + host.name + "…"); }
         }
+        switchAskedAt = SystemClock.uptimeMillis();
+        // Cached first (Wolf 11-22): the pane this switch lands on is shown at once from its saved
+        // copy ("connecting · HH:MM"), never seconds of blank; the live session replaces it on
+        // its first paint (adoptHost holds the saved frame until then). Its stand-in is that
+        // host's own, so nothing typed or read crosses to the machine switched away from.
+        String cached = cachedLanding(host.id, pane);
+        if (!cached.isEmpty()) {
+            stopConnection();
+            currentHostId = host.id;
+            savedShownHost = null;
+            savedShownAt = 0;
+            installOffline(host.id, host.name, cached);
+            showSaved(host.id, cached);
+            sidebarSignature = "";
+            rail.refreshSidebar(true);
+        }
         connector.execute(() -> {
             long handle = 0;
             try {
@@ -2435,6 +2451,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 });
             }
         });
+    }
+
+    /**
+     * The pane a switch to {@code hostId} shows from cache while it connects: the pick, else
+     * that computer's Deacon from its last list, else the pane last used there; "" when none
+     * is known (then the switch waits for the live list as before).
+     */
+    private String cachedLanding(String hostId, String pane) {
+        if (pane != null && !pane.isEmpty()) return pane;
+        JSONArray[] last = lastLists(hostId);
+        if (last != null) {
+            try {
+                String deacon = FleetPanes.switchLanding(new JSONObject().put("workspaces", last[0])
+                        .put("tabs", last[1]).put("panes", last[2]), "");
+                if (!deacon.isEmpty()) return deacon;
+            } catch (JSONException unexpected) {
+                // Fall back to the remembered pane below.
+            }
+        }
+        return rememberedHostPane(hostId);
     }
 
     /** How long a machine switch waits for the new host's list, as before reconnects were bounded. */
@@ -6687,6 +6723,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             nativeAttachShell(generation, renderId, host, pane);
             savedShownHost = host;
             savedShownAt = savedAt;
+        }
+        if (switchAskedAt > 0) {
+            android.util.Log.w("herdr-switch", "cached " + pane + " shown " + (SystemClock.uptimeMillis() - switchAskedAt)
+                    + " ms after the tap (" + (savedAt > 0 ? "saved copy" : "not cached") + ")");
         }
         // A copy just drawn starts at its newest line.
         showLatest(false);
