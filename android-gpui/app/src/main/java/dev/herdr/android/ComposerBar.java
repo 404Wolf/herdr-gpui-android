@@ -171,6 +171,7 @@ final class ComposerBar {
     private int linkDown;
     /** Taps on controls that just moved are ignored ({@link TapGuard}). */
     private final TapGuard tapGuard = new TapGuard();
+    private final ActionBar actions;
     /** The clear (✕) and its undo (item 76). */
     private final ClearUndo clearing = new ClearUndo(new ClearUndo.Effects() {
         @Override public boolean cancelDictation() { return cancelDictationForClear(); }
@@ -395,6 +396,15 @@ final class ComposerBar {
         clearing.resume(preferences.getString(CLEAR_RECORD, ""), wall());
         field = createField();
         field.setVisibility(View.GONE);
+        actions = new ActionBar(context, chrome, new ActionBar.Act() {
+            @Override public void tap(String id) { targetTapped(id); }
+            @Override public boolean hold(String id) {
+                if ("send".equals(id)) { setKeysOpen(!keysOpen); return true; }
+                if ("clear".equals(id)) { tapClear(true); return true; }
+                return false;
+            }
+            @Override public String describe(String id) { return ComposerBar.describe(id); }
+        });
         targets = new TargetStrip(context);
         targets.setVisibility(View.GONE);
         keysOverlay = new KeysOverlay(context);
@@ -1467,16 +1477,24 @@ final class ComposerBar {
             long now = android.os.SystemClock.uptimeMillis();
             shownRows = queue.rows(drafts.pane(), queuedMessages, loose, parkedHere(), linkDown, cols, queueOpen,
                     selectedRow, now);
+            // The controls are app buttons now (ActionBar, Wolf 11-22): the prompt keeps only the
+            // draft and the queue's rows, never the old words.
+            controls(loose);
             json = GhostText.json(GhostText.kind(kind), draft, marks, drafts.cuts(), clipLengths, parkedIds(),
-                    shownRows, queueOpen, selectedRow, cols, controls(loose), GhostText.Colors.of(chrome));
-            json = GhostText.withRungs(json, ladder);
+                    shownRows, queueOpen, selectedRow, cols, Collections.emptyList(), GhostText.Colors.of(chrome));
             QueueView.Row selected = queueOpen && selectedRow != null ? row(selectedRow) : null;
             // Its actions on the row itself: selecting one never changes the controls' line.
             if (selected != null) json = GhostText.withRowActions(json, selected.id, ControlLine.rowRungs(selected));
         }
+        actions.bind(agent ? ladder : Collections.<List<GhostText.Control>>emptyList());
         if (json.equals(lastGhost)) return;
         lastGhost = json;
         host.setGhost(json);
+    }
+
+    /** The app's bottom-right buttons (ActionBar): the host puts it under both panes. */
+    View actionBar() {
+        return actions.view();
     }
 
     /**

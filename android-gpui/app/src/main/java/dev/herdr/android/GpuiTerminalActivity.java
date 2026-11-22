@@ -617,6 +617,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         root.addView(panelDivider.preview(), new FrameLayout.LayoutParams(dp(2), -1, android.view.Gravity.START));
         root.addView(panelDivider.edge(), new FrameLayout.LayoutParams(dp(WorkPanelLayout.EDGE_DP), dp(WorkPanelLayout.EDGE_TALL_DP),
                 android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL));
+        // The composer's buttons (ActionBar): one row at the very bottom right of the whole app,
+        // under the terminal and the panel; the root's padding already keeps it above the
+        // navigation bar and the keyboard. Both panes end above it while it shows.
+        View actionBar = composer.actionBar();
+        root.addView(actionBar, new FrameLayout.LayoutParams(-1, dp(ActionBar.HEIGHT_DP), android.view.Gravity.BOTTOM));
+        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> fitAboveActionBar(actionBar));
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
@@ -1364,6 +1370,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private View root() {
         return (View) railColumns.getParent();
+    }
+
+    /** The terminal (with the rail) and the panel end above the action bar while it shows. */
+    private void fitAboveActionBar(View bar) {
+        int below = bar.getVisibility() == View.VISIBLE ? dp(ActionBar.HEIGHT_DP) : 0;
+        for (View pane : new View[] {railColumns, workPanel == null ? null : workPanel.view(),
+                panelDivider == null ? null : panelDivider.divider(), panelDivider == null ? null : panelDivider.preview()}) {
+            if (pane == null) continue;
+            FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) pane.getLayoutParams();
+            if (at.bottomMargin == below) continue;
+            at.bottomMargin = below;
+            pane.setLayoutParams(at);
+        }
     }
 
     /**
