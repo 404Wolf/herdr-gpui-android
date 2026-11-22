@@ -114,6 +114,21 @@ final class PanelModel {
         for (BeadsModel.Node k : n.children) add(out, k, depth + 1, folded, open);
     }
 
+    /**
+     * A tap on a bead's title (no disclosure triangles): open, it closes, with
+     * its beads folded away; closed, it opens its plan and unfolds its beads.
+     * True when it is now open.
+     */
+    static boolean toggle(String id, boolean kids, Set<String> open, Set<String> folded) {
+        if (open.remove(id)) {
+            if (kids) folded.add(id);
+            return false;
+        }
+        open.add(id);
+        folded.remove(id);
+        return true;
+    }
+
     /** The ids above {@code id} in the tree, nearest first: unfolded so the agent's own bead shows. */
     static List<String> parentsOf(List<BeadsModel.Node> roots, String id) {
         Map<String, String> up = new HashMap<>();
