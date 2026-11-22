@@ -62,11 +62,11 @@ final class OpTiming {
      * machine could not be asked. Logged under "herdr-ops" for diagnosis.
      */
     static String reason(String op, RuntimeException failure) {
-        String said = failure instanceof IllegalStateException ? failure.getMessage() : null;
-        String reason = said == null ? "" : clean(said);
-        if (reason.isEmpty()) reason = "can't reach the machine";
+        // By the failure's kind (ErrorWords), never its text (audit E).
+        String reason = ErrorWords.of(failure, "");
         try {
-            android.util.Log.w("herdr-ops", op + " failed: " + reason);
+            android.util.Log.w("herdr-ops", op + " failed: " + RemoteError.kindOf(failure)
+                    + (failure instanceof RemoteError && !((RemoteError) failure).coreKind.isEmpty() ? "/" + ((RemoteError) failure).coreKind : ""));
         } catch (RuntimeException notOnAndroid) {
             // JVM unit tests have no logcat.
         }
