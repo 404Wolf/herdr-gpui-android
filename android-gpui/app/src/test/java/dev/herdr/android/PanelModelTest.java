@@ -103,7 +103,7 @@ public final class PanelModelTest {
         assertTrue(gta.contains("return railShown().drawer(railCompact());"));
         assertTrue(gta.contains("WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode())"));
         assertTrue(gta.contains("if (workPanelBack()) return;"));
-        assertTrue(gta.contains("@Override public boolean typing() { return imeShown || (composer != null && composer.drafting()); }"));
+        assertTrue(gta.contains("@Override public boolean typing() { return imeShown || (composer != null && composer.busy() != null); }"));
         assertTrue(gta.contains("private void quoteToDraft(String header, String text)"));
         String panel = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/WorkPanel.java")), StandardCharsets.UTF_8);
         // Reads wait while Wolf types, one at a time, and never redraw under a selection.
