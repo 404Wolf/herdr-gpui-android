@@ -87,20 +87,25 @@ impl PhoneOp {
             (all.len() <= MAX_TAB_TERMINALS).then_some(())?;
             all.iter().map(id).collect()
         };
+        // Strict: an op with a field it does not take is refused, not half-read.
+        let only = |keys: &[&str]| value.as_object().is_some_and(|o| o.keys().all(|k| k == "op" || keys.contains(&k.as_str())));
         match value["op"].as_str()? {
-            "usage.look" => Some(Self::UsageLook),
+            "usage.look" => only(&[]).then_some(Self::UsageLook),
             "beads.stores" => {
+                only(&["known"]).then_some(())?;
                 let all = value["known"].as_array().map_or(&[][..], Vec::as_slice);
                 (all.len() <= MAX_KNOWN).then_some(())?;
                 let known = all.iter().map(|v| v.as_str().filter(|k| known_pair(k)).map(str::to_owned)).collect::<Option<_>>()?;
                 Some(Self::BeadsStores { known })
             }
             "beads.detail" => {
+                only(&["project", "id"]).then_some(())?;
                 let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
                 let id = value["id"].as_str().filter(|i| bead_id(i))?.to_owned();
                 Some(Self::BeadsDetail { project, id })
             }
             "tab.detach" => {
+                only(&["space", "tab", "park", "kill"]).then_some(())?;
                 let park = ids("park")?;
                 (!park.is_empty()).then_some(())?;
                 Some(Self::TabDetach { space: id(&value["space"])?, tab: id(&value["tab"])?, park, kill: ids("kill")? })
@@ -608,7 +613,12 @@ mod tests {
         assert_eq!(PhoneOp::parse(r#"{"op":"usage.look"}"#), Some(PhoneOp::UsageLook));
         assert_eq!(PhoneOp::parse(r#"{"op":"tab.rename"}"#), None);
         assert_eq!(PhoneOp::parse("usage.look"), None);
-        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"usage.look","pad":"{}"}}"#, "x".repeat(40_000))), None);
+        // Strict: a field the op does not take refuses the whole op.
+        assert_eq!(PhoneOp::parse(r#"{"op":"usage.look","on":"laptop"}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.detail","project":"demo","id":"demo-1","argv":["rm"]}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"tab.detach","space":"s1","tab":"a","park":["t5"],"force":true}"#), None);
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.stores","known":[],"root":"/"}"#), None);
+        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.stores","known":["{}"]}}"#, "x".repeat(40_000))), None);
     }
 
     #[test]

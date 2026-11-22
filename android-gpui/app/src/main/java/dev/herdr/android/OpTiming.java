@@ -41,4 +41,35 @@ final class OpTiming {
         if (line.endsWith(")")) android.util.Log.w("herdr-ops", line);
         else android.util.Log.i("herdr-ops", line);
     }
+
+    /** Words for the view at most this long. */
+    static final int REASON_MAX = 120;
+
+    /**
+     * The daemon's words made safe to show: untrusted text, so one line with
+     * no control characters, paths hidden ("…"), at most {@link #REASON_MAX}.
+     */
+    static String clean(String text) {
+        String line = text.replaceAll("\u001b\\[[0-9;?]*[A-Za-z]", "").replaceAll("\\p{Cntrl}+", " ").replaceAll("(~|\\.{0,2})?/[^\\s\"']*", "…")
+                .replaceAll("\\s+", " ").trim();
+        return line.length() > REASON_MAX ? line.substring(0, REASON_MAX - 1) + "…" : line;
+    }
+
+    /**
+     * Why a look failed, in words for the view: the core session's own error
+     * (the native layer throws it as an IllegalStateException with its
+     * display text, written for people), bounded; anything else is that the
+     * machine could not be asked. Logged under "herdr-ops" for diagnosis.
+     */
+    static String reason(String op, RuntimeException failure) {
+        String said = failure instanceof IllegalStateException ? failure.getMessage() : null;
+        String reason = said == null ? "" : clean(said);
+        if (reason.isEmpty()) reason = "can't reach the machine";
+        try {
+            android.util.Log.w("herdr-ops", op + " failed: " + reason);
+        } catch (RuntimeException notOnAndroid) {
+            // JVM unit tests have no logcat.
+        }
+        return reason;
+    }
 }

@@ -710,6 +710,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (shellMode()) leaveByBack(); else showRailOverlay();
             }, () -> {
                 if (composer != null && composer.hideKeyboard()) return;
+                if (sidebarOpen && railAsDrawer() && beadsRail != null && beadsRail.showingAgentsBead()) {
+                    hideSidebar();
+                    return;
+                }
                 if (sidebarOpen && beadsRail != null && beadsRail.back()) return;
                 if (filePager == null || !filePager.hide()) leaveByBack();
             });
@@ -761,6 +765,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Back puts the composer's keyboard away first (and any other keyboard that is up).
         if (composer != null && composer.hideKeyboard()) return;
         if (KeyboardHide.hideIfShown(this)) return;
+        if (sidebarOpen && railAsDrawer() && beadsRail != null && beadsRail.showingAgentsBead()) {
+            // On the cover, Back from an agent's bead is its terminal, already focused: one step, not two.
+            hideSidebar();
+            return;
+        }
         if (sidebarOpen && beadsRail != null && beadsRail.back()) return;
         if (sidebarOpen && railAsDrawer()) {
             hideSidebar();
@@ -2209,6 +2218,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void hideSidebar() {
+        // A drawer closed over an agent's bead closes the bead too: reopened, it shows the agents.
+        if (railAsDrawer() && beadsRail != null && beadsRail.showingAgentsBead()) beadsRail.close();
         if (!sidebarOpen) return;
         setSidebarOpen(false);
     }
@@ -4510,12 +4521,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         stateParams.leftMargin = dp(6);
         holder.row.addView(holder.state, stateParams);
         holder.row.setOnClickListener(view -> {
+            boolean bead = false;
             if (holder.live) {
                 focusRemotePane(holder.connection, holder.paneId);
+                // And what it works on: a worker's or helper's bead (BeadsRail.tapped).
+                bead = beadsRail != null && beadsRail.tapped(holder.host.id, holder.paneId, railMembers, beadsLook(holder.host.id));
             } else {
                 switchHost(holder.host, holder.paneId);
             }
-            closeRailDrawer();
+            // The cover's drawer stays open on the bead, its terminal focused behind it; one Back shows it.
+            if (!bead) closeRailDrawer();
         });
         holder.row.setOnLongClickListener(view -> { showPaneActions(holder); return true; });
         return holder;
