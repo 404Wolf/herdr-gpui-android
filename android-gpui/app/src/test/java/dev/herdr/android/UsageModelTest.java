@@ -208,6 +208,7 @@ public final class UsageModelTest {
         assertTrue(rail.contains("usageFeed.select(usageHost, current != null && current.ready && !current.isClosed(), () -> usageLook(usageHost));"));
         assertTrue(rail.contains("usageFeed.watch(UsageFeed.Watch.RAIL, next.open && !next.minimized);"));
         assertTrue(rail.contains("if (usageFeed != null) usageFeed.detach(this);"));
+        assertTrue(rail.contains("usageFeed.typing(() -> imeShown || (composer != null && composer.drafting()));"));
         assertTrue(rail.contains("if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, \"Usage\").setIcon(R.drawable.ic_bar_usage)"));
     }
 }

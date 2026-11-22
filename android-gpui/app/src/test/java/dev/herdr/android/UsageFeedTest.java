@@ -57,6 +57,31 @@ public final class UsageFeedTest {
         assertEquals(7_000, pace.delay(23_000));
     }
 
+    @Test public void theRailAloneAsksEveryTwentyFiveSecondsAtMostAndNeverWhileWolfTypes() {
+        UsageFeed.Pace pace = new UsageFeed.Pace();
+        pace.online = true;
+        pace.watch(UsageFeed.Watch.RAIL, true);
+        assertEquals(0, pace.delay(0));
+        pace.started();
+        pace.ended(UsageFeed.Outcome.DATA, 0);
+        assertEquals(UsageFeed.Pace.RAIL_CADENCE_MS, pace.delay(0));
+        assertEquals(0, pace.delay(25_000));
+        // The keyboard up or a draft: no look, only a later check, however overdue.
+        pace.typing = true;
+        assertEquals(UsageFeed.Pace.RAIL_CADENCE_MS, pace.delay(60_000));
+        // Opening the sheet is asking: it asks at once, typing or not, then every ten seconds.
+        pace.watch(UsageFeed.Watch.SHEET, true);
+        assertEquals(0, pace.delay(60_000));
+        pace.started();
+        pace.ended(UsageFeed.Outcome.DATA, 60_000);
+        assertEquals(UsageFeed.Pace.CADENCE_MS, pace.delay(60_000));
+        // A busy machine's longer wait still applies to the rail.
+        pace.watch(UsageFeed.Watch.SHEET, false);
+        pace.typing = false;
+        for (int i = 0; i < 4; i++) { pace.started(); pace.ended(UsageFeed.Outcome.BUSY, 0); }
+        assertEquals(60_000, pace.delay(0));
+    }
+
     @Test public void aBusyOrUnreachableMachineIsAskedLessAndLessOften() {
         UsageFeed.Pace pace = watched();
         pace.started();

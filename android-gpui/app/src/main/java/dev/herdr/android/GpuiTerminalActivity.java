@@ -469,6 +469,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         pinsRail = new PinsRail(this, chrome, Pins.shared(this), this::openPin, () -> refreshSidebar(true), this::note);
         usageFeed = UsageFeed.shared(this).attach(this);
         usageFeed.watch(UsageFeed.Watch.RAIL, sidebarOpen && !railMinimized);
+        // Each look holds the core session's one worker, so typing would wait behind the rail's prefetch.
+        usageFeed.typing(() -> imeShown || (composer != null && composer.drafting()));
         tabRow.addView(pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));

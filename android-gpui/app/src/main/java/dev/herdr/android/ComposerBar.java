@@ -773,6 +773,11 @@ final class ComposerBar {
     }
 
     /** The keyboard showed or hid; hiding it ends typing, the text stays as ghost text. */
+    /** A draft is in the composer for the pane on screen (the usage feed holds its prefetch then). */
+    boolean drafting() {
+        return !drafts.draft().text.isEmpty();
+    }
+
     void imeVisible(boolean visible) {
         if (visible) {
             if (typing) imeShown = true;

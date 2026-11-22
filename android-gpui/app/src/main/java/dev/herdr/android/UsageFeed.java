@@ -37,12 +37,16 @@ import java.util.function.Supplier;
  * wait for both before it drew anything, behind any other action queued on the
  * terminal's worker. So: the last answer for each machine is kept, on disk
  * too, and drawn at once; one look at a time asks the <em>selected</em>
- * machine only, on a thread of its own; while the Usage sheet or the rail is
- * visible it asks every {@link Pace#CADENCE_MS} (a 50–300 ms exec every 10 s
- * holds one of the core's 16 exec slots about 1–3% of the time); nothing asks
- * while the app is paused or the machine is offline; and a core whose exec
- * slots are full ("execs are running already") is asked again after a
- * growing wait. Never a refresh: aswap's upstream quota calls are its own.
+ * machine only, on a thread of its own; while the Usage sheet is open it asks
+ * every {@link Pace#CADENCE_MS} (a 50–300 ms exec every 10 s holds one of the
+ * core's 16 exec slots about 1–3% of the time), and while only the rail
+ * shows, every {@link Pace#RAIL_CADENCE_MS} at most and never while Wolf types
+ * (the keyboard is up or a draft is in the composer): each look is a
+ * machine.exec on the core session's one worker, so typing waits behind it
+ * (factory-setup.38). Nothing asks while the app is paused or the machine is
+ * offline, and a core whose exec slots are full ("execs are running
+ * already") is asked again after a growing wait. Never a refresh: aswap's
+ * upstream quota calls are its own.
  */
 final class UsageFeed {
     /** Who wants fresh usage on screen. */
@@ -84,9 +88,16 @@ final class UsageFeed {
      */
     static final class Pace {
         static final long CADENCE_MS = 10_000;
+        /**
+         * Only the rail watching: a prefetch, so the sheet opens on fresh
+         * numbers. This is a floor between looks, never sooner.
+         */
+        static final long RAIL_CADENCE_MS = 25_000;
 
         private final Set<Watch> watching = EnumSet.noneOf(Watch.class);
         boolean paused, online, inFlight;
+        /** The keyboard is up or a draft is in the composer: the rail's prefetch waits (the sheet still asks). */
+        boolean typing;
         /** When the last look ended (elapsed clock), or -1 before any. */
         long lastEndMs = -1;
         private int busyTries;
@@ -111,8 +122,12 @@ final class UsageFeed {
         /** How long until the next look, or -1 when nothing should ask (not watched, or one is out). */
         long delay(long nowMs) {
             if (!watched() || inFlight) return -1;
+            boolean sheet = watching.contains(Watch.SHEET);
+            // Typing: the rail's prefetch looks again later, and never asks while it lasts.
+            if (!sheet && typing) return RAIL_CADENCE_MS;
             if (lastEndMs < 0) return 0;
-            return Math.max(0, lastEndMs + waitMs - nowMs);
+            long wait = sheet ? waitMs : Math.max(waitMs, RAIL_CADENCE_MS);
+            return Math.max(0, lastEndMs + wait - nowMs);
         }
 
         void started() {
@@ -162,6 +177,7 @@ final class UsageFeed {
     private String hostId;
     private Supplier<String> look;
     private PauseWatch pauses;
+    private java.util.function.BooleanSupplier typing = () -> false;
     private final Runnable ask = this::ask;
 
     private UsageFeed(File file) {
@@ -179,6 +195,7 @@ final class UsageFeed {
     void detach(Activity activity) {
         if (pauses != null) pauses.stop(activity);
         pauses = null;
+        typing = () -> false;
         pace.paused = true;
         schedule();
     }
@@ -212,6 +229,11 @@ final class UsageFeed {
         schedule();
     }
 
+    /** Whether Wolf is typing (the keyboard up, a draft in the composer), read before each look. */
+    void typing(java.util.function.BooleanSupplier typing) {
+        this.typing = typing;
+    }
+
     /** {@code listener} hears every answer for the selected machine, on the main thread, until removed. */
     void listen(Consumer<Answer> listener) {
         listeners.add(listener);
@@ -238,6 +260,7 @@ final class UsageFeed {
 
     private void schedule() {
         main.removeCallbacks(ask);
+        pace.typing = typing.getAsBoolean();
         long delay = pace.delay(SystemClock.elapsedRealtime());
         // Due now: asked now, not after the main thread draws the sheet that wants it (~0.7 s on the emulator).
         if (delay == 0) ask();
@@ -245,6 +268,7 @@ final class UsageFeed {
     }
 
     private void ask() {
+        pace.typing = typing.getAsBoolean();
         long delay = pace.delay(SystemClock.elapsedRealtime());
         if (delay != 0 || look == null) {
             if (delay > 0) main.postDelayed(ask, delay);
