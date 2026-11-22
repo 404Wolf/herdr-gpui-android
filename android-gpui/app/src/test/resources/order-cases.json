@@ -1,0 +1,181 @@
+{
+  "source": "Desktop model: users/wolf/programs/herdr-core/app/mods/projects/model.js (repoGroups, dropPlan, homeSection), factory-r8f.8. Read by test_reorder.mjs; the phone's ProjectModelTest reads a copy (android-gpui/app/src/test/resources/order-cases.json). A change to either model is a change to this file.",
+  "format": {
+    "sections": "projects: [{name, lead, born, group?, old_group?, repo?}] on one computer (group: the lead's herdr.group label; old_group: its older group= label; repo: its repo= label, else no repo). order: that computer's projects.order. expect: the sections in drawn order, each [key, [project names]].",
+    "drops": "Same projects and order; item: {section: key} or {project: name}; over: {section: key} or {project: name}; after: the lower half. expect: null (nothing changes), {op: move, move: {scope, id, target, after, peers}}, {op: regroup, label: {leads, group (null: cleared)}, move}, or {op: refuse} (why is free text)."
+  },
+  "sections": [
+    {
+      "name": "fallback: groups by name, a group's projects by birth, then repos by birth, no repo last",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "aswap", "lead": "tb", "born": 2, "group": "herdr"},
+        {"name": "teammate", "lead": "tc", "born": 3, "group": "agents"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"},
+        {"name": "loose", "lead": "tf", "born": 0}
+      ],
+      "order": null,
+      "expect": [["group:agents", ["teammate"]], ["group:herdr", ["factory", "aswap"]], ["repo:mono", ["qos"]], ["none", ["loose"]]]
+    },
+    {
+      "name": "Wolf's order: groups and a group's projects as stored; a new group and a new project after the listed ones; a gone name skipped",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "aswap", "lead": "tb", "born": 2, "group": "herdr"},
+        {"name": "newpm", "lead": "tn", "born": 9, "group": "herdr"},
+        {"name": "teammate", "lead": "tc", "born": 3, "group": "agents"},
+        {"name": "zed", "lead": "tz", "born": 5, "group": "zeta"},
+        {"name": "abc", "lead": "ty", "born": 6, "group": "alpha"}
+      ],
+      "order": {"repos": [], "projects": {}, "groups": ["herdr", "gone", "agents"], "grouped": {"herdr": ["aswap", "gone", "factory"]}},
+      "expect": [["group:herdr", ["aswap", "factory", "newpm"]], ["group:agents", ["teammate"]], ["group:alpha", ["abc"]], ["group:zeta", ["zed"]]]
+    },
+    {
+      "name": "a group's list and a repo's list with one name are two lists; the older group= label groups too",
+      "projects": [
+        {"name": "x", "lead": "tx", "born": 1, "group": "herdr"},
+        {"name": "y", "lead": "ty", "born": 2, "old_group": "herdr"},
+        {"name": "p", "lead": "tp", "born": 3, "repo": "herdr"},
+        {"name": "q", "lead": "tq", "born": 4, "repo": "herdr"}
+      ],
+      "order": {"repos": [], "projects": {"herdr": ["q", "p"]}, "grouped": {"herdr": ["y", "x"]}},
+      "expect": [["group:herdr", ["y", "x"]], ["repo:herdr", ["q", "p"]]]
+    }
+  ],
+  "drops": [
+    {
+      "name": "a group among groups",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "teammate", "lead": "tc", "born": 3, "group": "agents"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"}
+      ],
+      "order": null,
+      "item": {"section": "group:herdr"}, "over": {"section": "group:agents"}, "after": false,
+      "expect": {"op": "move", "move": {"scope": "groups", "id": "herdr", "target": "agents", "after": false, "peers": ["agents", "herdr"]}}
+    },
+    {
+      "name": "a group over a project of another group: before or after that group",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "teammate", "lead": "tc", "born": 3, "group": "agents"}
+      ],
+      "order": null,
+      "item": {"section": "group:agents"}, "over": {"project": "factory"}, "after": true,
+      "expect": {"op": "move", "move": {"scope": "groups", "id": "agents", "target": "herdr", "after": true, "peers": ["agents", "herdr"]}}
+    },
+    {
+      "name": "a group onto a repo: refused (groups stay above the repos)",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"}
+      ],
+      "order": null,
+      "item": {"section": "group:herdr"}, "over": {"section": "repo:mono"}, "after": true,
+      "expect": {"op": "refuse"}
+    },
+    {
+      "name": "a repo among repos; no repo is not dragged",
+      "projects": [
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"},
+        {"name": "z", "lead": "tz", "born": 5, "repo": "zulip"},
+        {"name": "loose", "lead": "tf", "born": 0}
+      ],
+      "order": null,
+      "item": {"section": "repo:zulip"}, "over": {"section": "repo:mono"}, "after": false,
+      "expect": {"op": "move", "move": {"scope": "repos", "id": "zulip", "target": "mono", "after": false, "peers": ["mono", "zulip"]}}
+    },
+    {
+      "name": "no repo dragged: nothing",
+      "projects": [
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"},
+        {"name": "loose", "lead": "tf", "born": 0}
+      ],
+      "order": null,
+      "item": {"section": "none"}, "over": {"section": "repo:mono"}, "after": false,
+      "expect": null
+    },
+    {
+      "name": "a project within its group",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "aswap", "lead": "tb", "born": 2, "group": "herdr"}
+      ],
+      "order": null,
+      "item": {"project": "aswap"}, "over": {"project": "factory"}, "after": false,
+      "expect": {"op": "move", "move": {"scope": "group:herdr", "id": "aswap", "target": "factory", "after": false, "peers": ["factory", "aswap"]}}
+    },
+    {
+      "name": "a project dropped where it is: nothing",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "aswap", "lead": "tb", "born": 2, "group": "herdr"}
+      ],
+      "order": null,
+      "item": {"project": "aswap"}, "over": {"project": "factory"}, "after": true,
+      "expect": null
+    },
+    {
+      "name": "a project within no repo",
+      "projects": [
+        {"name": "a", "lead": "t1", "born": 1},
+        {"name": "b", "lead": "t2", "born": 2}
+      ],
+      "order": null,
+      "item": {"project": "a"}, "over": {"project": "b"}, "after": true,
+      "expect": {"op": "move", "move": {"scope": "repo:", "id": "a", "target": "b", "after": true, "peers": ["a", "b"]}}
+    },
+    {
+      "name": "a project into another group: its herdr.group, then its place there",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr"},
+        {"name": "teammate", "lead": "tc", "born": 3, "group": "agents"},
+        {"name": "helper", "lead": "td", "born": 4, "group": "agents"}
+      ],
+      "order": null,
+      "item": {"project": "factory"}, "over": {"project": "helper"}, "after": false,
+      "expect": {"op": "regroup", "label": {"leads": ["ta"], "group": "agents"}, "move": {"scope": "group:agents", "id": "factory", "target": "helper", "after": false, "peers": ["factory", "teammate", "helper"]}}
+    },
+    {
+      "name": "a repo's project onto a group's header: grouped, first in it",
+      "projects": [
+        {"name": "teammate", "lead": "tc", "born": 3, "group": "agents"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"}
+      ],
+      "order": null,
+      "item": {"project": "qos"}, "over": {"section": "group:agents"}, "after": true,
+      "expect": {"op": "regroup", "label": {"leads": ["te"], "group": "agents"}, "move": {"scope": "group:agents", "id": "qos", "target": "teammate", "after": false, "peers": ["teammate", "qos"]}}
+    },
+    {
+      "name": "a grouped project onto its own repo: ungrouped (herdr.group cleared)",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr", "repo": "mono"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"}
+      ],
+      "order": null,
+      "item": {"project": "factory"}, "over": {"project": "qos"}, "after": true,
+      "expect": {"op": "regroup", "label": {"leads": ["ta"], "group": null}, "move": {"scope": "repo:mono", "id": "factory", "target": "qos", "after": true, "peers": ["factory", "qos"]}}
+    },
+    {
+      "name": "ungrouping refused while the older group= label would keep it grouped",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr", "old_group": "herdr", "repo": "mono"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"}
+      ],
+      "order": null,
+      "item": {"project": "factory"}, "over": {"section": "repo:mono"}, "after": false,
+      "expect": {"op": "refuse"}
+    },
+    {
+      "name": "a project into another repo: refused (its repo comes from git)",
+      "projects": [
+        {"name": "factory", "lead": "ta", "born": 1, "group": "herdr", "repo": "mono"},
+        {"name": "z", "lead": "tz", "born": 5, "repo": "zulip"},
+        {"name": "qos", "lead": "te", "born": 4, "repo": "mono"}
+      ],
+      "order": null,
+      "item": {"project": "qos"}, "over": {"project": "z"}, "after": false,
+      "expect": {"op": "refuse"}
+    }
+  ]
+}

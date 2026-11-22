@@ -1105,8 +1105,8 @@ impl Connection<'_> {
                 // layout, rather than offer a menu that cannot work.
                 placed.map_err(|error| Error::WindowNotPlaced(Box::new(error)))
             }
-            TabEdit::WindowsMove {
-                project,
+            TabEdit::OrderMove {
+                scope,
                 id,
                 target,
                 after,
@@ -1116,7 +1116,7 @@ impl Connection<'_> {
                 // never writes back another window's stale order.
                 for _ in 0..5 {
                     let doc = self.call("doc.get", json!({"name":"projects.order"}))?;
-                    let Some(value) = order_move(&doc["value"], &project, &id, &target, after, &shown) else {
+                    let Some(value) = order_move(&doc["value"], &scope, &id, &target, after, &shown) else {
                         return Ok(());
                     };
                     match self.call(
@@ -1404,11 +1404,12 @@ pub(crate) enum TabEdit {
     /// in `folder` (else the lead's), its terminal labelled parent=<lead>
     /// so it is that project's window wherever its tab goes.
     WindowNew { space: String, lead: String, folder: Option<String>, kind: &'static str },
-    /// Wolf's drag of a project's window (item 79): `id` just before or after
-    /// `target` in the core doc projects.order's `windows[<project>]`, the
-    /// list the desktop's status line keeps; `shown`: the project's windows
-    /// after its lead as drawn (the lead never moves).
-    WindowsMove { project: String, id: String, target: String, after: bool, shown: Vec<String> },
+    /// One drag in the core doc projects.order, as herdr-projects-order moves it:
+    /// `id` just before or after `target` in `scope`'s list (an [`OrderScope`]);
+    /// `shown`: that list as drawn. A project's window (item 79, `windows.move`)
+    /// is the scope `windows:<project>`; the groups and a group's projects
+    /// (factory-r8f.8, `order.move`) are `groups` and `group:<name>`.
+    OrderMove { scope: OrderScope, id: String, target: String, after: bool, shown: Vec<String> },
     Interrupt { terminal: String },
     Kill { terminal: String },
     DeaconStart { machine: String },
@@ -1487,10 +1488,32 @@ impl TabEdit {
                 if shown.len() > 1000 {
                     return None;
                 }
-                Self::WindowsMove {
-                    project: name(&value["project"])?,
+                Self::OrderMove {
+                    scope: OrderScope::Windows(name(&value["project"])?),
                     id: name(&value["id"])?,
                     target: name(&value["target"])?,
+                    after: value["after"].as_bool()?,
+                    shown: shown.iter().map(name).collect::<Option<Vec<_>>>()?,
+                }
+            }
+            "order.move" => {
+                let name = |v: &Value| {
+                    v.as_str()
+                        .filter(|x| !x.is_empty() && x.len() <= 200 && !x.chars().any(char::is_control))
+                        .map(str::to_owned)
+                };
+                let shown = value["shown"].as_array()?;
+                if shown.len() > 1000 {
+                    return None;
+                }
+                let (id, target) = (name(&value["id"])?, name(&value["target"])?);
+                if id == target {
+                    return None;
+                }
+                Self::OrderMove {
+                    scope: OrderScope::parse(value["scope"].as_str()?)?,
+                    id,
+                    target,
                     after: value["after"].as_bool()?,
                     shown: shown.iter().map(name).collect::<Option<Vec<_>>>()?,
                 }
@@ -1603,8 +1626,53 @@ fn rename_tab(doc: &mut Value, space: &str, tab: &str, name: &str) -> Result<()>
     item["named"] = json!(true);
     Ok(())
 }
+/// Which list of projects.order a drop moves, as herdr-projects-order names
+/// them: `repos`, `repo:<name>` (`repo:` for no repo), `groups`,
+/// `group:<name>` (factory-r8f.8), or `windows:<project>` (item 79).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrderScope {
+    Repos,
+    Repo(String),
+    Groups,
+    Group(String),
+    Windows(String),
+}
+impl OrderScope {
+    fn parse(scope: &str) -> Option<Self> {
+        if scope.len() > 210 || scope.chars().any(char::is_control) {
+            return None;
+        }
+        match scope {
+            "repos" => return Some(Self::Repos),
+            "groups" => return Some(Self::Groups),
+            _ => {}
+        }
+        if let Some(repo) = scope.strip_prefix("repo:") {
+            return Some(Self::Repo(repo.to_owned()));
+        }
+        if let Some(group) = scope.strip_prefix("group:") {
+            return (!group.is_empty()).then(|| Self::Group(group.to_owned()));
+        }
+        let project = scope.strip_prefix("windows:")?;
+        (!project.is_empty()).then(|| Self::Windows(project.to_owned()))
+    }
+    /// Its list in the doc: the top key, and the key in that object (None: a top list).
+    fn place(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::Repos => ("repos", None),
+            Self::Groups => ("groups", None),
+            Self::Repo(repo) => ("projects", Some(repo)),
+            Self::Group(group) => ("grouped", Some(group)),
+            Self::Windows(project) => ("windows", Some(project)),
+        }
+    }
+}
+/// The keys herdr-projects-order reads; any other key is a newer writer's, kept as it is.
+const ORDER_KNOWN: [&str; 5] = ["repos", "projects", "windows", "groups", "grouped"];
 /// herdr-projects-order's reading of the projects.order doc: lists of names
-/// only, `windows` only once something is stored there.
+/// only; `windows`, `groups` and `grouped` only once something is stored
+/// there, so older readers see the doc as before; and every key it doesn't
+/// know kept as it is, so a move here never erases another surface's order.
 fn order_clean(value: &Value) -> Value {
     let names = |v: &Value| -> Vec<Value> {
         v.as_array()
@@ -1621,19 +1689,40 @@ fn order_clean(value: &Value) -> Value {
     if !windows.is_empty() {
         out["windows"] = Value::from(windows);
     }
+    let groups = names(&value["groups"]);
+    if !groups.is_empty() {
+        out["groups"] = Value::from(groups);
+    }
+    let grouped = lists(&value["grouped"]);
+    if !grouped.is_empty() {
+        out["grouped"] = Value::from(grouped);
+    }
+    if let Some(all) = value.as_object() {
+        for (key, kept) in all.iter().filter(|(key, _)| !ORDER_KNOWN.contains(&key.as_str())) {
+            out[key] = kept.clone();
+        }
+    }
     out
 }
-/// One window move in projects.order (item 79), as herdr-projects-order makes
-/// it: the stored list for `project` less the windows no longer shown (they
-/// ended), then those `shown` adds, with `id` just before or after `target`.
-/// None: nothing moves (either is missing, or it is already there).
-fn order_move(value: &Value, project: &str, id: &str, target: &str, after: bool, shown: &[String]) -> Option<Value> {
+/// One drag in projects.order, as herdr-projects-order makes it: `scope`'s
+/// stored list (a project's windows less those no longer shown: they ended),
+/// then the names `shown` adds, with `id` just before or after `target`.
+/// Only that list changes. None: nothing moves (either is missing, or it is
+/// already there).
+fn order_move(value: &Value, scope: &OrderScope, id: &str, target: &str, after: bool, shown: &[String]) -> Option<Value> {
     let mut v = order_clean(value);
-    let stored: Vec<String> = v["windows"][project]
+    let (top, key) = scope.place();
+    let list = match key {
+        None => &v[top],
+        Some(key) => &v[top][key],
+    };
+    let stored: Vec<String> = list
         .as_array()
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
-    let stored: Vec<String> = if shown.is_empty() { stored } else { stored.into_iter().filter(|x| shown.contains(x)).collect() };
+    let windows = matches!(scope, OrderScope::Windows(_));
+    let stored: Vec<String> =
+        if windows && !shown.is_empty() { stored.into_iter().filter(|x| shown.contains(x)).collect() } else { stored };
     let mut ids = stored.clone();
     ids.extend(shown.iter().filter(|x| !stored.contains(x)).cloned());
     if id == target || !ids.iter().any(|x| x == id) || !ids.iter().any(|x| x == target) {
@@ -1645,10 +1734,15 @@ fn order_move(value: &Value, project: &str, id: &str, target: &str, after: bool,
     if rest == ids || rest.len() > 1000 {
         return None;
     }
-    if !v["windows"].is_object() {
-        v["windows"] = json!({});
+    match key {
+        None => v[top] = json!(rest),
+        Some(key) => {
+            if !v[top].is_object() {
+                v[top] = json!({});
+            }
+            v[top][key] = json!(rest);
+        }
     }
-    v["windows"][project] = json!(rest);
     Some(v)
 }
 /// Appends one space to herdr-app's document, keeping every space and tab
@@ -2917,22 +3011,88 @@ b"}"#), None);
     #[test]
     fn window_moves_keep_their_own_list_in_projects_order() {
         let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let w = |p: &str| OrderScope::Windows(p.to_owned());
         // As herdr-projects-order's test_item_79: its own list beside the others.
-        let got = order_move(&json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]}}), "research-ui", "t1s7", "t1s6", false,
+        let got = order_move(&json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]}}), &w("research-ui"), "t1s7", "t1s6", false,
             &ids(&["t1s6", "t1s7", "tab:s3/4"])).unwrap();
         assert_eq!(got, json!({"repos":[],"projects":{"monopoly":["cleanup","qos"]},"windows":{"research-ui":["t1s7","t1s6","tab:s3/4"]}}));
         // Windows that ended leave the list at the next move; a new one joins.
-        let again = order_move(&got, "research-ui", "t1new", "t1s6", false, &ids(&["t1s6", "t1new"])).unwrap();
+        let again = order_move(&got, &w("research-ui"), "t1new", "t1s6", false, &ids(&["t1s6", "t1new"])).unwrap();
         assert_eq!(again["windows"]["research-ui"], json!(["t1new", "t1s6"]));
         // Nothing moves: the same place, a name not shown (the lead), or onto itself.
-        assert!(order_move(&again, "research-ui", "t1new", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
-        assert!(order_move(&again, "research-ui", "t9r", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
-        assert!(order_move(&again, "research-ui", "t1s6", "t1s6", true, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, &w("research-ui"), "t1new", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, &w("research-ui"), "t9r", "t1s6", false, &ids(&["t1new", "t1s6"])).is_none());
+        assert!(order_move(&again, &w("research-ui"), "t1s6", "t1s6", true, &ids(&["t1new", "t1s6"])).is_none());
         // After, and a doc that was never written.
-        let fresh = order_move(&Value::Null, "x#t1", "a", "c", true, &ids(&["a", "b", "c"])).unwrap();
+        let fresh = order_move(&Value::Null, &w("x#t1"), "a", "c", true, &ids(&["a", "b", "c"])).unwrap();
         assert_eq!(fresh, json!({"repos":[],"projects":{},"windows":{"x#t1":["b","c","a"]}}));
         // A doc with no windows yet reads without the key, as the tool keeps it.
         assert_eq!(order_clean(&json!({"repos":["a"],"projects":{},"windows":{}})), json!({"repos":["a"],"projects":{}}));
+    }
+
+    #[test]
+    fn a_move_keeps_every_key_it_does_not_own_and_moves_groups() {
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // factory-r8f.8: a window's move used to drop the groups' order and any newer key.
+        let doc = json!({"repos":["mono"],"projects":{"mono":["qos"]},"groups":["herdr","agents"],
+            "grouped":{"herdr":["factory","aswap"]},"pinned":{"x":1},"future":["kept"]});
+        let got = order_move(&doc, &OrderScope::Windows("factory".into()), "t2", "t1", false, &ids(&["t1", "t2"])).unwrap();
+        for key in ["repos", "projects", "groups", "grouped", "pinned", "future"] {
+            assert_eq!(got[key], doc[key], "{key}");
+        }
+        assert_eq!(got["windows"]["factory"], json!(["t2", "t1"]));
+        // The groups, and one group's projects, by the same rule; only that list changes.
+        let groups = order_move(&doc, &OrderScope::Groups, "agents", "herdr", false, &ids(&["herdr", "agents"])).unwrap();
+        assert_eq!(groups["groups"], json!(["agents", "herdr"]));
+        assert_eq!(groups["grouped"], doc["grouped"]);
+        let inside = order_move(&doc, &OrderScope::Group("herdr".into()), "factory", "aswap", true, &ids(&["factory", "aswap", "newpm"])).unwrap();
+        assert_eq!(inside["grouped"]["herdr"], json!(["aswap", "factory", "newpm"]));
+        assert_eq!(inside["groups"], doc["groups"]);
+        // A new group's list starts from what is shown; a group's list is not a repo's.
+        let fresh = order_move(&doc, &OrderScope::Group("agents".into()), "b", "a", false, &ids(&["a", "b"])).unwrap();
+        assert_eq!(fresh["grouped"], json!({"herdr":["factory","aswap"],"agents":["b","a"]}));
+        assert_eq!(fresh["projects"], doc["projects"]);
+        // Groups and grouped read only once something is stored, as the tool writes them.
+        assert_eq!(order_clean(&json!({"repos":[],"projects":{},"groups":[],"grouped":{}})), json!({"repos":[],"projects":{}}));
+    }
+
+    #[test]
+    fn the_shared_drop_cases_move_the_list_they_name() {
+        // t47c's fixture (home-manager-conf 8cfb8310, test-fixtures/order-cases.json), the phone's copy.
+        let cases: Value = serde_json::from_str(include_str!("../../app/src/test/resources/order-cases.json")).unwrap();
+        let mut moves = 0;
+        for case in cases["drops"].as_array().unwrap() {
+            let Some(m) = case["expect"].get("move") else { continue };
+            let scope = OrderScope::parse(m["scope"].as_str().unwrap()).unwrap();
+            let peers: Vec<String> = m["peers"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_owned()).collect();
+            let (id, target, after) = (m["id"].as_str().unwrap(), m["target"].as_str().unwrap(), m["after"].as_bool().unwrap());
+            let got = order_move(&case["order"], &scope, id, target, after, &peers).unwrap_or_else(|| panic!("{}", case["name"]));
+            let (top, key) = scope.place();
+            let list = match key { None => &got[top], Some(k) => &got[top][k] };
+            let mut want: Vec<String> = peers.iter().filter(|x| *x != id).cloned().collect();
+            let at = want.iter().position(|x| x == target).unwrap() + usize::from(after);
+            want.insert(at, id.to_owned());
+            assert_eq!(list, &json!(want), "{}", case["name"]);
+            moves += 1;
+        }
+        assert!(moves >= 6, "the fixture's move cases: {moves}");
+    }
+
+    #[test]
+    fn order_moves_parse_their_scope() {
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"order.move","scope":"group:herdr","id":"aswap","target":"factory","after":false,"shown":["factory","aswap"]}"#),
+            Some(TabEdit::OrderMove { scope: OrderScope::Group("herdr".into()), id: "aswap".into(), target: "factory".into(), after: false, shown: vec!["factory".into(), "aswap".into()] })
+        );
+        assert!(matches!(TabEdit::parse(r#"{"op":"order.move","scope":"groups","id":"a","target":"b","after":true,"shown":[]}"#),
+            Some(TabEdit::OrderMove { scope: OrderScope::Groups, .. })));
+        assert!(matches!(TabEdit::parse(r#"{"op":"order.move","scope":"repo:","id":"a","target":"b","after":true,"shown":[]}"#),
+            Some(TabEdit::OrderMove { scope: OrderScope::Repo(r), .. }) if r.is_empty()));
+        for bad in ["group:", "windows:", "teams", "", "group:a\nb"] {
+            let json = format!(r#"{{"op":"order.move","scope":"{bad}","id":"a","target":"b","after":true,"shown":[]}}"#);
+            assert_eq!(TabEdit::parse(&json), None, "{bad}");
+        }
+        assert_eq!(TabEdit::parse(r#"{"op":"order.move","scope":"groups","id":"a","target":"a","after":true,"shown":[]}"#), None);
     }
 
     #[test]
@@ -2992,7 +3152,7 @@ b"}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"window.new","space":"s1","lead":"laptop/t5","kind":"shell"}"#), None);
         assert_eq!(
             TabEdit::parse(r#"{"op":"windows.move","project":"same#t31","id":"t1c","target":"tab:s1/4","after":true,"shown":["t1c","tab:s1/4"]}"#),
-            Some(TabEdit::WindowsMove { project: "same#t31".into(), id: "t1c".into(), target: "tab:s1/4".into(), after: true, shown: vec!["t1c".into(), "tab:s1/4".into()] })
+            Some(TabEdit::OrderMove { scope: OrderScope::Windows("same#t31".into()), id: "t1c".into(), target: "tab:s1/4".into(), after: true, shown: vec!["t1c".into(), "tab:s1/4".into()] })
         );
         assert_eq!(TabEdit::parse(r#"{"op":"windows.move","project":"p","id":"a","target":"b","shown":[]}"#), None);
         assert_eq!(TabEdit::parse(r#"{"op":"windows.move","project":"p","id":"a\nb","target":"b","after":false,"shown":[]}"#), None);
