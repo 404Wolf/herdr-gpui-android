@@ -83,8 +83,8 @@ public final class HeldScrollTest {
         Recorder held = new Recorder();
         assertTrue(HeldScroll.scroll(false, true, true, 7, false, true, 2, held));
         assertFalse(HeldScroll.scroll(false, true, false, 0, false, true, 2, held));
-        assertFalse(HeldScroll.scroll(true, true, false, 7, true, true, 2, held));
-        assertEquals("held 2;", held.went.toString());
+        assertTrue(HeldScroll.scroll(true, true, false, 7, true, true, 2, held));
+        assertEquals("held 2;live 2;", held.went.toString());
     }
 
     @Test public void offlineRedesign_aDragBackThatMovesNothingIsAlwaysAnswered() {

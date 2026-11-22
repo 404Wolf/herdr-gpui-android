@@ -45,7 +45,8 @@ final class HeldScroll {
             boolean suspect, int lines, Sink sink) {
         if (held(shell, present, closed, remoteHandle, ready)) return sink.held(lines);
         if (remoteHandle <= 0) return false;
-        return suspect ? sink.local(lines) : sink.live(lines);
+        // A raw shell has no Herdr link to doubt: its own terminal scrolls it.
+        return suspect && !shell ? sink.local(lines) : sink.live(lines);
     }
 
     /** What a step on the phone's own rows should add, once per gesture, when it did not move. */
