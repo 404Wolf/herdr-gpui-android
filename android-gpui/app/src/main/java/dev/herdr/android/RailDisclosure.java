@@ -28,6 +28,12 @@ final class RailDisclosure extends View {
     /** Rotation of the chevron while folded (pointing right) and open (pointing down). */
     static final float FOLDED_DEGREES = 0f, OPEN_DEGREES = 90f;
     static final long SPIN_MS = 150;
+    /**
+     * What it draws, small (Wolf: the arrows were much too large): a 20dp
+     * tonal square with a 5dp chevron in it. The touch target stays the
+     * whole 48dp column, the row's full height.
+     */
+    static final float SQUARE_DP = 20f, CORNER_DP = 5f, ARM_DP = 2.5f, STROKE_DP = 1.5f;
 
     private final float density;
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -45,7 +51,7 @@ final class RailDisclosure extends View {
         super(context);
         density = context.getResources().getDisplayMetrics().density;
         stroke.setStyle(Paint.Style.STROKE);
-        stroke.setStrokeWidth(2 * density);
+        stroke.setStrokeWidth(STROKE_DP * density);
         stroke.setStrokeCap(Paint.Cap.ROUND);
         stroke.setStrokeJoin(Paint.Join.ROUND);
         stroke.setColor(chrome.onSurface);
@@ -123,8 +129,8 @@ final class RailDisclosure extends View {
     private RippleDrawable ripple(int w, int h) {
         GradientDrawable square = new GradientDrawable();
         square.setColor(0xffffffff);
-        square.setCornerRadius(8 * density);
-        int half = Math.round(16 * density);
+        square.setCornerRadius(CORNER_DP * density);
+        int half = Math.round(SQUARE_DP / 2 * density);
         int dx = Math.max(0, (w - Math.round(density)) / 2 - half), dy = Math.max(0, h / 2 - half);
         InsetDrawable mask = new InsetDrawable(square, dx, dy, Math.max(0, w - dx - 2 * half), dy);
         return new RippleDrawable(ColorStateList.valueOf(pressColor), null, mask);
@@ -146,11 +152,11 @@ final class RailDisclosure extends View {
         float w = getWidth(), h = getHeight();
         canvas.drawRect(w - density, h * 0.2f, w, h * 0.8f, hairline);
         float cx = (w - density) / 2f, cy = h / 2f;
-        float half = 16 * density;
+        float half = SQUARE_DP / 2 * density;
         square.set(cx - half, cy - half, cx + half, cy + half);
-        canvas.drawRoundRect(square, 8 * density, 8 * density, tone);
-        // An 18dp chevron "›": arms 4dp across, 8dp tall, centred on the square.
-        float arm = 4 * density;
+        canvas.drawRoundRect(square, CORNER_DP * density, CORNER_DP * density, tone);
+        // A small chevron "›" (ARM_DP across, twice that tall), centred on the square.
+        float arm = ARM_DP * density;
         chevron.rewind();
         chevron.moveTo(cx - arm / 2f, cy - arm);
         chevron.lineTo(cx + arm / 2f, cy);

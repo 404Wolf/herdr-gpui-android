@@ -806,8 +806,11 @@ final class FleetTree {
     static final int RAIL_DEPTH_DP = 18;
     /** The Deacon's and a PM's fold column ({@link RailDisclosure}): a 48dp touch target. */
     static final int PM_CHEVRON_DP = 48;
-    /** Row heights: a Deacon or PM row meets the 48dp touch minimum; agents under it 40dp. */
-    static final int LEAD_ROW_DP = 48, AGENT_ROW_DP = 40;
+    /**
+     * Row heights: a Deacon or PM row meets the 48dp touch minimum (its fold
+     * button is the row's height); agents under it are denser, 36dp (Wolf).
+     */
+    static final int LEAD_ROW_DP = 48, AGENT_ROW_DP = 36;
 
     /**
      * What a screen reader hears for a lead row's fold control, or null when
