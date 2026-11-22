@@ -50,12 +50,16 @@ public final class OpTimingTest {
 
     @Test public void aBusyCoreIsRetriedWithBackoffNotCalledUnreachable() {
         // What the phone logged when every beads read failed (FINDINGS, 2026-11-22).
-        String said = OpTiming.reason("beads.stores",
-                new IllegalStateException("herdr-core protocol: \"unavailable\": 16 execs are running already"));
-        assertTrue(OpTiming.busy(said));
-        assertTrue(!OpTiming.busy("herdr-core protocol: \"denied\": exec refused"));
-        assertTrue(!OpTiming.busy("can't reach the machine"));
-        assertTrue(!OpTiming.busy(null));
+        // Decided by kind, never by the words (audit E).
+        assertTrue(RemoteError.busy(new RemoteError("refused", "unavailable", "16 execs are running already")));
+        assertTrue(RemoteError.busy(new RemoteError("busy", "", "The computer is still busy")));
+        assertTrue(!RemoteError.busy(new RemoteError("refused", "denied", "exec refused")));
+        assertTrue(!RemoteError.busy(new RemoteError("closed", "", "Remote session is closed")));
+        assertTrue("the words alone never count", !RemoteError.busy(
+                new IllegalStateException("herdr-core protocol: \"unavailable\": 16 execs are running already")));
+        assertTrue(!RemoteError.busy(null));
+        assertEquals("timeout", RemoteError.kindOf(new RemoteError("timeout", "", "x")));
+        assertEquals("", RemoteError.kindOf(new RuntimeException("x")));
         assertEquals(5_000, OpTiming.busyBackoff(0));
         assertEquals(10_000, OpTiming.busyBackoff(1));
         assertEquals(40_000, OpTiming.busyBackoff(3));

@@ -46,10 +46,37 @@ fn result_string(env: &mut JNIEnv<'_>, result: remote::Result<String>) -> jstrin
             }
         },
         Err(error) => {
-            fail(env, &error.to_string());
+            fail_with(env, &error);
             std::ptr::null_mut()
         }
     }
+}
+/// Throws `RemoteError(kind, coreKind, message)`: Java decides by the kind, never the text
+/// (audit E). Falls back to an IllegalStateException if the class cannot be made.
+fn fail_with(env: &mut JNIEnv<'_>, error: &remote::Error) {
+    if env.exception_check().unwrap_or(true) {
+        return;
+    }
+    let message = error.to_string();
+    if throw_remote_error(env, error.kind().as_str(), error.core_kind().unwrap_or(""), &message).is_err() {
+        let _ = env.exception_clear();
+        fail(env, &message);
+    }
+}
+fn throw_remote_error(env: &mut JNIEnv<'_>, kind: &str, core_kind: &str, message: &str) -> jni::errors::Result<()> {
+    let kind = env.new_string(kind)?;
+    let core_kind = env.new_string(core_kind)?;
+    let message = env.new_string(message)?;
+    let error = env.new_object(
+        "dev/herdr/android/RemoteError",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        &[
+            jni::objects::JValue::Object(&kind),
+            jni::objects::JValue::Object(&core_kind),
+            jni::objects::JValue::Object(&message),
+        ],
+    )?;
+    env.throw(jni::objects::JThrowable::from(error))
 }
 fn read(env: &mut JNIEnv<'_>, value: &JString<'_>, limit: usize) -> Option<Zeroizing<String>> {
     match bounded_string(env, value, limit) {
