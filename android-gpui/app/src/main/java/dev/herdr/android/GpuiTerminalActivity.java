@@ -1481,10 +1481,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             @Override public void note(String text) { GpuiTerminalActivity.this.note(text); }
             @Override public void quote(String header, String text) { quoteToDraft(header, text); }
-            @Override public void openPath(String path) {
+            @Override public void openFile(String hostId, String path) {
                 Connection now;
                 synchronized (stateLock) { now = connection; }
                 if (now == null || filePager == null) return;
+                // The viewer reads through the connection on screen: another machine's file waits for t3jk's wiring.
+                if (hostId == null || !hostId.equals(now.hostId)) {
+                    note("That file is on " + hostName(hostId) + "; switch to it to open the file");
+                    return;
+                }
                 if (compactWindow()) toggleWorkPanel(false);
                 filePager.open(now.paneId, path, 0);
             }
