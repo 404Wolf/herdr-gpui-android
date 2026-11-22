@@ -27,7 +27,10 @@ public final class OpTimingTest {
     }
 
     @Test public void theUsageLookIsTimed() throws IOException {
-        assertTrue(read("UsageView").contains("OpTiming.timed(\"usage.look\""));
+        // Split into where its time went (UsageTiming), never with the reply itself.
+        String usage = read("UsageView") + (Files.exists(Paths.get("src/main/java/dev/herdr/android/UsageFeed.java")) ? read("UsageFeed") : "");
+        assertTrue(usage.contains("UsageTiming.of("));
+        assertTrue(!usage.contains("log(reply") && !usage.contains("+ reply"));
     }
 
     private static String read(String name) throws IOException {

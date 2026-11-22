@@ -53,6 +53,9 @@ final class UsageView {
     private final UsageModel.Sheet state;
     private final PauseWatch pauses;
     private boolean asking, closed, paused;
+    /** When the sheet opened (elapsed clock), and whether its first fresh rows were logged. */
+    private long openedAt;
+    private boolean drewFresh;
     /** Retries in a row of a busy machine, for the backoff. */
     private int busyTries;
 
@@ -165,8 +168,10 @@ final class UsageView {
             int height = Math.round(activity.getResources().getDisplayMetrics().heightPixels * 0.88f);
             window.setLayout(WindowManager.LayoutParams.MATCH_PARENT, height);
         }
+        openedAt = android.os.SystemClock.elapsedRealtime();
         Object[] cached = LAST_GOOD.get(hostId);
         if (cached != null) state.opened((UsageModel.Look) cached[0], (Long) cached[1]);
+        UsageTiming.log(UsageTiming.drawn(cached != null ? "kept" : "no", 0));
         render();
         dialog.show();
         ask();
@@ -176,11 +181,15 @@ final class UsageView {
     private void ask() {
         if (closed || asking || paused) return;
         asking = true;
+        long queued = android.os.SystemClock.elapsedRealtime();
         worker.execute(() -> {
             UsageModel.Look answer = null;
             boolean unreachable = false, switched = false, busy = false;
+            long started = android.os.SystemClock.elapsedRealtime();
+            String reply = null;
             try {
-                answer = UsageModel.parse(OpTiming.timed("usage.look", look));
+                reply = look.get();
+                answer = UsageModel.parse(reply);
             } catch (HostSwitched gone) {
                 switched = true;
             } catch (RuntimeException e) {
@@ -190,6 +199,7 @@ final class UsageView {
             } catch (LinkageError e) {
                 unreachable = true;
             }
+            UsageTiming.log(UsageTiming.of(started - queued, android.os.SystemClock.elapsedRealtime() - started, reply).line());
             UsageModel.Look result = answer;
             boolean lost = unreachable, left = switched, wait = busy;
             main.post(() -> {
@@ -219,6 +229,10 @@ final class UsageView {
         state.answered(answer, unreachable, now);
         if (answer != null && answer.kind == UsageModel.Kind.ACCOUNTS) LAST_GOOD.put(hostId, new Object[] {answer, now});
         render();
+        if (!drewFresh) {
+            drewFresh = true;
+            UsageTiming.log(UsageTiming.drawn("fresh", android.os.SystemClock.elapsedRealtime() - openedAt));
+        }
         main.removeCallbacks(poll);
         if (!paused) main.postDelayed(poll, POLL_MS);
     }
