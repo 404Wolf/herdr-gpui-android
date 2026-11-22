@@ -2703,7 +2703,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         new ActionSheet(this, chrome, w.name + " · shares its tab with another project")
-                .danger("Close this window (" + w.terminal + " only)", () ->
+                .danger("Close this window only", () ->
                         runEdit(target, "Close " + w.name, "op", "pane.kill", "terminal", w.terminal))
                 .show();
     }
@@ -2825,7 +2825,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void updateCrumb(Connection current, String space) {
         if (crumb == null || crumbNote != null) return;
-        String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "", ownTitle = "";
+        String title = "", status = "", cwd = "", spaceLabel = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
@@ -2834,22 +2834,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     chromeTitle(pane.optString("title", ""), current.paneId), current.paneId), pane);
             status = pane.optString("status", "");
             cwd = pane.optString("cwd", "");
-            role = FleetTree.role(pane.optString("role", ""));
-            tabId = pane.optString("tab_id", "");
-            ownTitle = HomeActivity.cleanTitle(chromeTitle(pane.optString("title", ""), current.paneId), current.paneId);
         }
-        // The pane's role badge, as the desktop's pane header: PM·t19, worker·<task>, Deacon·t6k.
-        // A worker's task is its own title, else a tab name that is not generic
-        // (several workers can share a tab like "general"), else its id.
-        String tabName = "";
-        JSONArray tabs = current.tabs;
-        for (int i = 0; tabs != null && i < tabs.length(); i++) {
-            JSONObject tab = tabs.optJSONObject(i);
-            if (tab != null && tabId.equals(tab.optString("id")) && space.equals(tab.optString("workspace_id"))) {
-                tabName = tab.optString("label", "");
-            }
+        // The agent's name (AgentNames), as its rail row says it: no role badge, no id (factory-jmc).
+        for (FleetTree.Member m : railMembers) {
+            if (m.id.equals(current.paneId) && !AgentNames.unnamed(m)) title = FleetPanes.displayTitle(m);
         }
-        String badge = FleetTree.roleBadge(role, current.paneId, FleetTree.workerTask(ownTitle, tabName, current.paneId));
         String named = RailTree.labels(current.workspaces, current.tabs, panes).get(space);
         if (named != null) spaceLabel = chromeTitle(named, space);
         String repo = RailTree.repoOfPath(cwd);
@@ -2859,11 +2848,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!spaceLabel.isEmpty()) parts.add(spaceLabel);
         if (!title.isEmpty()) parts.add(RailTree.withoutSpace(title, spaceLabel));
         android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
-        if (!badge.isEmpty()) {
-            text.append(badge, new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0);
-            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.primary), 0, text.length(), 0);
-            text.append("   ");
-        }
         text.append(android.text.TextUtils.join("  ›  ", parts));
         String why = "blocked".equals(status) ? "needs you: waiting for your answer"
                 : "error".equals(status) ? "stopped with an error" : "";
@@ -3424,7 +3408,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String hKey = railFold(railKey(host, "helpers"), FleetTree.Fold.DEACON);
             boolean hFolded = railFolded(hKey) && !containsMember(tree.helpers, selectedPane);
             String said = FleetPanes.displayTitle(deacon);
-            String sub = deacon.id + (FleetTree.genericName(said) || said.equals(deacon.id) ? "" : " · " + said);
+            // Its own name under "Deacon", never its terminal id (factory-jmc).
+            String sub = FleetTree.genericName(said) || AgentNames.UNNAMED.equals(said) ? "" : said;
             railAgent(host, live, current, deacon, "Deacon", sub, FleetTree.railAgentPadding(0, false),
                     tree.helpers.isEmpty() ? null : hKey, hFolded, 0, hFolded && tree.deaconBlocked(), selectedPane, order, keep);
             String pending = railDeaconPending.getOrDefault(host.id, "");
@@ -3535,7 +3520,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             selectRailHeader(header, pm.contains(selectedPane));
             if (live && !pm.catalogs.isEmpty()) header.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
         } else {
-            String sub = pm.pm.id + (pm.where.isEmpty() ? "" : " · " + pm.where);
+            String sub = pm.where;
             RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, FleetTree.railAgentPadding(depth, false),
                     foldKey, folded, pm.workerRows, folded && pm.blocked(), selectedPane, order, keep);
             if (row != null) {
@@ -3699,7 +3684,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             row = createRailPaneRow();
             railPanes.put(paneKey, row);
         }
-        String title = lead != null ? lead : chromeTitle(FleetPanes.displayTitle(m), m.id);
+        // Its name (AgentNames), never its terminal id; "no task label" is drawn dim.
+        String title = lead != null ? lead : FleetPanes.displayTitle(m);
         String changes = lead == null ? FleetTree.changes(FleetPanes.LOOKS.get(host.id), m.cwd) : "";
         String shownSub = sub + (changes.isEmpty() ? "" : (sub.isEmpty() ? "" : " · ") + changes);
         row.foldKey = foldKey;
@@ -3878,7 +3864,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             });
             String cwd = holder.live ? paneCwd(holder.connection, pane) : "";
             if (!cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", cwd));
-            sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", pane));
         }
         Runnable worktrees = holder.worktrees;
         if (worktrees != null) sheet.add("Worktrees…", worktrees);
@@ -4445,8 +4430,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             sheet.add("Space “" + spaceLabel + "”…", () -> showSpaceSheet(target, space, spaceLabel, pane));
         }
         if (!cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", cwd));
-        sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", pane))
-                .danger("Close terminal", () -> runEdit(target, "Close " + title, "op", "pane.kill", "terminal", pane))
+        // No terminal id here (Wolf, factory-jmc): "i never need to see t3xz or the code since i do not use that".
+        sheet.danger("Close terminal", () -> runEdit(target, "Close " + title, "op", "pane.kill", "terminal", pane))
                 .show();
     }
 
@@ -4555,17 +4540,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             holder.row.setSelected(selected);
         }
         if (!title.contentEquals(holder.title.getText())) holder.title.setText(title);
-        String word = status == null || status.isEmpty() || "unknown".equals(status) ? "" : status;
-        // Blocked is a red "!" on the agent's own row, and on its PM's or the
-        // Deacon's row while the blocked work is folded under it.
-        boolean alarm = "blocked".equals(status) || "error".equals(status) || "question".equals(status) || bubbled;
-        String state = alarm ? (word.isEmpty() ? "!" : "! " + word) : word;
+        holder.title.setTextColor(AgentNames.UNNAMED.equals(title) ? chrome.onSurfaceVariant : chrome.onSurface);
+        // The dot is the state (Wolf: "the dot is enough"); no state word. A red "!" stays only on a
+        // PM's or the Deacon's row while blocked work is folded under it, where no dot shows it.
+        String state = bubbled ? "!" : "";
         if (!state.contentEquals(holder.state.getText())) holder.state.setText(state);
-        holder.state.setTextColor(alarm ? chrome.danger : selected ? chrome.onSurface : chrome.onSurfaceVariant);
+        holder.state.setTextColor(chrome.danger);
         CharSequence sub = holder.sub.getVisibility() == View.VISIBLE ? holder.sub.getText() : "";
         // A row description overrides its children, so the state has to be said here.
         String described = "Focus pane " + title + (sub.length() == 0 ? "" : ", " + sub)
-                + (word.isEmpty() ? "" : ", " + word)
+                + ", " + AgentNames.stateWords(status, "question".equals(status) ? "question" : "")
                 + (bubbled ? ", something under it needs you" : "")
                 + (holder.foldKey == null ? "" : ", long press for more");
         if (!described.contentEquals(holder.row.getContentDescription() == null
