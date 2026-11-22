@@ -8,16 +8,23 @@ package dev.herdr.android;
  * the rail still docked at the left. A raw shell has no panel.
  *
  * <p>Docked, Wolf moves the divider (factory-9zz.9): the panel's share of the
- * width is his {@link Choice}, kept per orientation, with each side at least
- * its minimum; dragged all the way right the panel is hidden, and an inward
- * swipe from the right edge brings it back. Pure: sizes in dp in, a layout out.
+ * width is his {@link Choice}, kept per orientation. The panel follows the
+ * finger the whole way ({@link #live}), down to zero; released under
+ * {@link #HIDE_BELOW_DP} it is hidden, else it stays exactly where it was
+ * let go. Hidden, a drag in from the right edge grows it from zero with the
+ * finger and keeps the width it is let go at. Pure: sizes in dp in, a layout out.
  */
 final class WorkPanelLayout {
     static final int COVER_DP = 640, SPLIT_DP = 1100, MIN_DP = 340;
-    /** The least a docked panel and the terminal beside it may be, while dragging. */
-    static final int PANEL_MIN_DP = 280, TERMINAL_MIN_DP = 320;
-    /** A release with the panel narrower than this hides it; an inward edge swipe this long brings it back. */
-    static final int HIDE_BELOW_DP = 200, RESTORE_DP = 48;
+    /**
+     * Hidden only at zero: a release this close to the edge (about 12 px on
+     * the Fold, for an imprecise finger) hides it, and a reveal let go there
+     * stays hidden; any wider width is kept exactly (Wolf: no threshold, no
+     * preset, no minimum). The terminal beside it keeps {@link #TERMINAL_MIN_DP}.
+     */
+    static final int HIDE_BELOW_DP = 6, PANEL_MIN_DP = HIDE_BELOW_DP, TERMINAL_MIN_DP = 320;
+    /** A tap on the hidden panel's handle, or this long an inward swipe, is a reveal, not a stray touch. */
+    static final int RESTORE_DP = 8;
     /** The right-edge zone that takes the restoring swipe: narrow, and short enough to exclude from Back. */
     static final int EDGE_DP = 20, EDGE_TALL_DP = 200;
 
@@ -78,6 +85,16 @@ final class WorkPanelLayout {
         return new WorkPanelLayout(!c.hidden, false, false, share, true, c.hidden);
     }
 
+    /**
+     * The panel while a finger moves the divider or reveals it: exactly at
+     * {@code share} (zero included), only the terminal's minimum holding.
+     * Nothing is kept until the release.
+     */
+    static WorkPanelLayout live(int widthDp, float share) {
+        float most = widthDp <= 0 ? 1 : Math.max(0, 1 - (float) TERMINAL_MIN_DP / widthDp);
+        return new WorkPanelLayout(true, false, false, Math.max(0, Math.min(most, share)), true, false);
+    }
+
     static WorkPanelLayout of(int widthDp, boolean shell, boolean open) {
         return of(widthDp, shell, open, Choice.DEFAULT);
     }
@@ -110,6 +127,15 @@ final class WorkPanelLayout {
     static Choice released(float dividerXDp, int widthDp, float before) {
         if (widthDp - dividerXDp < HIDE_BELOW_DP) return new Choice(before, true);
         return new Choice(clamp(dragged(dividerXDp, widthDp), widthDp), false);
+    }
+
+    /**
+     * A reveal from the right edge let go with the divider at {@code dividerXDp}:
+     * shown at that width, or still hidden (at {@code before}) when it is
+     * narrower than {@link #HIDE_BELOW_DP}. Never a preset width.
+     */
+    static Choice revealed(float dividerXDp, int widthDp, float before) {
+        return released(dividerXDp, widthDp, before);
     }
 
     /** The choice with the panel shown again, at the share it had. */

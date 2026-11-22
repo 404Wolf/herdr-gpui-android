@@ -30,13 +30,19 @@ public final class DocModelTest {
         assertEquals("the doc couldn't be read", DocModel.parse(null).error);
     }
 
-    @Test public void freshnessWarnsAfterTwoHoursAndSaysWhenItWentStale() {
+    @Test public void freshnessWarnsAfterTwelveHoursAndSaysWhenItWentStale() {
         DocModel.Read r = new DocModel.Read();
         r.now = 100_000;
         r.mtime = r.now - 30;
         assertEquals("updated just now", DocModel.freshness(r).text);
         r.mtime = r.now - 3 * 3600;
         assertEquals("updated 3h ago", DocModel.freshness(r).text);
+        assertEquals(DocModel.Level.OK, DocModel.freshness(r).level);
+        // The review's shot: 9h is quiet grey, not the amber of "needs you" (A5).
+        r.mtime = r.now - 9 * 3600;
+        assertEquals(DocModel.Level.OK, DocModel.freshness(r).level);
+        r.mtime = r.now - 13 * 3600;
+        assertEquals("updated 13h ago", DocModel.freshness(r).text);
         assertEquals(DocModel.Level.WARN, DocModel.freshness(r).level);
         r.mtime = r.now - 2 * 86400;
         assertEquals("not updated for 2d", DocModel.freshness(r).text);
