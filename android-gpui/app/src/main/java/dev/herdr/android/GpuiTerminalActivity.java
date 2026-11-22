@@ -2247,7 +2247,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void switchHost(SavedRemoteHost host, String pane) { switchHost(host, pane, true); }
 
     private void switchHost(SavedRemoteHost host, String pane, boolean picked) {
-        if (host == null || switchingHost || host.id.equals(currentHostId)) return;
+        if (host == null) return;
+        if (switchingHost) {
+            // Not dropped (factory audit, PR 6): the latest pick runs once this switch settles.
+            hostPicks.keep(new HostPick(host.id, pane, picked, null));
+            note(HostPick.note(hostName(switchingTo), host.name));
+            return;
+        }
+        if (host.id.equals(currentHostId)) return;
         pendingShell.clear();
         if (host.expectedFingerprint.isEmpty()) {
             note("Trust " + host.name + " from Remote hosts first");
@@ -2294,6 +2301,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         RemoteNative.close(readyHandle);
                         switchingHost = false;
                         switchingTo = null;
+                        runWaitingPick();
                         return;
                     }
                     if (picked && readyPane.equals(forcedPane)) requestRailReveal(host.id, readyPane);
@@ -2305,9 +2313,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 runOnUiThread(() -> {
                     switchingHost = false;
                     switchingTo = null;
-                    if (destroyed || !hostResumed || hostEpoch.stale(epoch)) return;
+                    if (destroyed || !hostResumed || hostEpoch.stale(epoch)) { runWaitingPick(); return; }
                     // Unreachable: show it from the cache; the monitor keeps trying it.
                     switchHostOffline(host, forcedPane, picked);
+                    runWaitingPick();
                 });
             }
         });
@@ -2449,6 +2458,40 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         switchingTo = null;
         sidebarSignature = "";
         refreshSidebar(true);
+        runWaitingPick();
+    }
+
+    /** The pick kept while a switch ran (HostPick.Queue): the latest one. */
+    private final HostPick.Queue hostPicks = new HostPick.Queue();
+
+    /** Runs the pick kept during a switch, after it (posted: the switch's own state settles first). */
+    private void runWaitingPick() {
+        if (!hostPicks.waiting()) return;
+        main.post(() -> {
+            HostPick pick = hostPicks.take();
+            if (pick == null || destroyed) return;
+            if (pick.pin != null) { openPin(pick.pin); return; }
+            SavedRemoteHost host = savedHost(pick.hostId);
+            if (host == null) return;
+            if (host.id.equals(currentHostId)) {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                if (now != null && pick.pane != null && !pick.pane.isEmpty()) focusRemotePane(now, pick.pane);
+                return;
+            }
+            switchHost(host, pick.pane, pick.picked);
+        });
+    }
+
+    private SavedRemoteHost savedHost(String id) {
+        if (id == null) return null;
+        for (SavedRemoteHost h : savedHosts) if (h.id.equals(id)) return h;
+        return null;
+    }
+
+    private String hostName(String id) {
+        SavedRemoteHost h = savedHost(id);
+        return h == null ? "" : h.name;
     }
 
     /**
@@ -3670,12 +3713,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (live) {
             // With the factory's issue/task/helper labels, so agents join their beads.
             railMembers = BeadsModel.terms(workspaces, tabs, panes);
-            MachineKey machine = current == null ? null : current.machine;
-            if (machine != null && current.ownList) {
-                java.util.Map<String, String> names = new java.util.HashMap<>();
-                for (FleetTree.Member m : railMembers) if (!AgentNames.unnamed(m)) names.put(m.id, AgentNames.of(m));
-                Pins.shared(this).relabel(machine, names);
-            }
         }
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
@@ -4125,6 +4162,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Another machine's pin (Wolf: macro's deacon pin "never loads"; it only said "open it there").
         // Its profile is a hint; the machine that profile is bound to decides, and the terminal is
         // checked again on arrival (pinArriving), never another one in its place.
+        if (switchingHost) {
+            // Kept, not dropped: it opens (and is verified) once the switch settles.
+            hostPicks.keep(new HostPick(pin.profile, pin.key.address, true, pin));
+            note(HostPick.note(hostName(switchingTo), pin.machineName));
+            closeRailDrawer();
+            return;
+        }
+        if (now != null && now.machine == null && pin.profile.equals(currentHostId) && !now.isClosed()) {
+            // This profile's machine hasn't said who it is yet: the pin opens when it does (bindMachine).
+            pinAwaitingHello = pin;
+            note("Waiting for " + pin.machineName + " to answer…");
+            closeRailDrawer();
+            return;
+        }
         SavedRemoteHost host = pinHost(pin);
         if (host == null) {
             note((pin.label.isEmpty() ? "That pin" : pin.label) + " is on " + pin.machineName
@@ -4136,6 +4187,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         pinArriving = switchingHost && host.id.equals(switchingTo) ? pin : null;
         closeRailDrawer();
     }
+
+    /** A pin opened while this profile's machine had not said who it is; opened when it does. */
+    private volatile Pins.Pin pinAwaitingHello;
 
     /** A pin opened on another machine, to verify against that machine's first own list. */
     private volatile Pins.Pin pinArriving;
@@ -6192,6 +6246,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (binding == null) return;
         if (binding.bound()) {
             current.machine = key;
+            Pins.Pin waiting = pinAwaitingHello;
+            if (waiting != null) {
+                pinAwaitingHello = null;
+                main.post(() -> { if (!destroyed) openPin(waiting); });
+            }
             // No transcript proof here: the panes may still be a resumed connection's. The poll
             // publishes this connection's own list once it has one (TranscriptKeeper.mayPublish).
         } else {
@@ -7851,6 +7910,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         if (selected && current.ownList && pinsRail != null && current.machine != null) {
                             Pins.shared(this).observe(current.machine, current.panes);
                             checkPinArrival(current);
+                            // Pins follow their agents' names here, with the list they come from, not in the rail's render.
+                            java.util.Map<String, String> names = new java.util.HashMap<>();
+                            for (FleetTree.Member m : BeadsModel.terms(current.workspaces, current.tabs, current.panes)) {
+                                if (!AgentNames.unnamed(m)) names.put(m.id, AgentNames.of(m));
+                            }
+                            Pins.shared(this).relabel(current.machine, names);
                         }
                     }
                 }
