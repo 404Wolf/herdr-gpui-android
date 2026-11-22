@@ -1691,6 +1691,19 @@ mod tests {
         );
     }
 
+    /// Antigravity (agy 1.5.13): a full-width rule, `>` at column 0 with nothing after it when
+    /// empty, another rule, then its footer. The host draws it as Claude's prompt (GhostText.kind).
+    #[test]
+    fn antigravitys_prompt_box_is_found_as_claudes() {
+        let rule = "─".repeat(40);
+        let rows = screen(&["⡿  Working...", &rule, ">", &rule, "esc to cancel     auto · model · high"], 40);
+        let anchor = locate(&rows, Some((2, 2)), PromptKind::Claude).expect("agy's prompt");
+        assert_eq!((anchor.prompt_row, anchor.indent), (2, 2));
+        let layout = place_all(&controls(ghost(vec![text("hi")])), Some(anchor), &rows, None);
+        assert!(layout.controls.iter().all(|c| c.row == 3), "into the rule under the prompt");
+        assert!(layout.placed.iter().all(|p| p.row != 4), "nothing over the footer");
+    }
+
     fn styled(t: &str, style: GhostStyle) -> GhostSpan {
         GhostSpan {
             text: t.into(),
