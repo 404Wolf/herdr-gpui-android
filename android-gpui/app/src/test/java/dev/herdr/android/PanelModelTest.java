@@ -42,8 +42,9 @@ public final class PanelModelTest {
         assertNull(PanelModel.agentOf(members, "t9"));
         PanelModel.Agent deacon = new PanelModel.Agent("t1", "deacon", "", "deacon", null, "Deacon");
         assertEquals("_deacon", deacon.doc());
-        assertFalse(deacon.hasTasks());
-        assertEquals(PanelModel.Tab.OVERVIEW, PanelModel.tab(PanelModel.Tab.TASKS, deacon));
+        // The deacon's Tasks: every task on every machine (factory-9zz.14).
+        assertTrue(deacon.hasTasks());
+        assertEquals(PanelModel.Tab.TASKS, PanelModel.tab(PanelModel.Tab.TASKS, deacon));
         assertEquals(PanelModel.Tab.TASKS, PanelModel.tab(PanelModel.Tab.TASKS, pm));
     }
 
@@ -99,15 +100,16 @@ public final class PanelModelTest {
     }
 
     @Test public void theActivityPlacesThePanelAndRoutesBackTypingAndQuotes() throws IOException {
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         assertTrue(gta.contains("return railShown().drawer(railCompact());"));
         assertTrue(gta.contains("WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode(),"));
         assertTrue(gta.contains("if (workPanelBack()) return;"));
         assertTrue(gta.contains("@Override public boolean typing() { return imeShown || (composer != null && composer.busy() != null); }"));
         assertTrue(gta.contains("private void quoteToDraft(String header, String text)"));
         String panel = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/WorkPanel.java")), StandardCharsets.UTF_8);
-        // Reads wait while Wolf types, one at a time, and never redraw under a selection.
-        assertTrue(panel.contains("if (inFlight || paused || agent == null || host.typing()) return;"));
+        // The engine's reads first (it gates them itself), then a bead read alone, one at a time and
+        // never while Wolf types; never a redraw under a selection.
+        assertTrue(panel.indexOf("syncReads();") < panel.indexOf("if (inFlight || paused || host.typing()) return;"));
         assertTrue(panel.contains("if (!force && SelectableText.anySelected(body)) { pending = true; return; }"));
         assertTrue(panel.contains("new Thread(task, \"herdr-panel\")"));
     }

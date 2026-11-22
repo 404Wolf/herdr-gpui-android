@@ -181,8 +181,7 @@ public final class FleetReposTest {
 
     @Test public void homeAndRailUseTheSameRepoProjectionAndCounts() throws IOException {
         for (String activity : Arrays.asList("HomeActivity", "GpuiTerminalActivity")) {
-            String source = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + activity + ".java")),
-                    StandardCharsets.UTF_8);
+            String source = activity.equals("GpuiTerminalActivity") ? TerminalSource.text() : new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + activity + ".java")), StandardCharsets.UTF_8);
             assertTrue(activity, source.contains("FleetTree.RepoRow repo : tree.repos"));
             assertTrue(activity, source.contains("FleetTree.PmRow pm : repo.projects"));
             assertTrue(activity, source.contains("repo.label("));

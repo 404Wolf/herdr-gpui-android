@@ -102,8 +102,7 @@ public final class TabMenuTest {
     }
 
     @Test public void theSheetAndToolbarUseIt() throws IOException {
-        String rail = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
+        String rail = TerminalSource.text();
         int start = rail.indexOf("private void showTabActions(");
         String sheet = rail.substring(start, rail.indexOf("private boolean stillOwned(", start));
         assertTrue(sheet.contains("TabMenu.closeLabel(inTab)"));

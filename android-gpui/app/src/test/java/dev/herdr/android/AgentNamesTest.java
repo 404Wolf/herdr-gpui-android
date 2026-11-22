@@ -132,6 +132,7 @@ public final class AgentNamesTest {
     }
 
     private static String source(String name) throws IOException {
+        if (name.equals("GpuiTerminalActivity")) return TerminalSource.text();
         return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")), StandardCharsets.UTF_8);
     }
 

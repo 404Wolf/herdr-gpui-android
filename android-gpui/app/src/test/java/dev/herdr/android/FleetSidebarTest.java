@@ -81,15 +81,14 @@ public final class FleetSidebarTest {
     }
 
     @Test public void theActiveAgentsPathUnfoldsWhenTheRailOpensAndItsRowShows() throws java.io.IOException {
-        String ui = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
-                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        String ui = TerminalSource.text();
         // Every way the rail opens asks for the reveal a switch gets (its group or repo and its PM unfold).
         int opens = 0;
         for (int at = ui.indexOf("revealedPane = \"\";"); at >= 0; at = ui.indexOf("revealedPane = \"\";", at + 1)) {
-            if (ui.startsWith("revealActiveOnOpen();", ui.indexOf('\n', at) + 1 + countSpaces(ui, ui.indexOf('\n', at) + 1))) opens++;
+            if (ui.startsWith("rail.revealActiveOnOpen();", ui.indexOf('\n', at) + 1 + countSpaces(ui, ui.indexOf('\n', at) + 1))) opens++;
         }
         assertEquals(3, opens);
-        assertTrue(ui.contains("if (current != null) requestRailReveal(currentHostId, current.paneId);"));
+        assertTrue(ui.contains("if (current != null) requestRailReveal(a.currentHostId, current.paneId);"));
         // No disclosure square any more: only the chevron is drawn.
         String disclosure = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/RailDisclosure.java")), java.nio.charset.StandardCharsets.UTF_8);
@@ -390,8 +389,7 @@ public final class FleetSidebarTest {
 
     @Test public void bothViewsConsumeTheSharedPlacementAndCountsWithoutAPmOverflow() throws IOException {
         for (String name : Arrays.asList("HomeActivity", "GpuiTerminalActivity")) {
-            String source = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")),
-                    StandardCharsets.UTF_8);
+            String source = name.equals("GpuiTerminalActivity") ? TerminalSource.text() : new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")), StandardCharsets.UTF_8);
             assertTrue(name, source.contains("pm.countsLabel()"));
             assertTrue(name, source.contains("repo.label("));
             assertTrue(name, source.contains("repo.idle"));

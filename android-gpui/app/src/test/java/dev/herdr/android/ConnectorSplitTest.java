@@ -11,8 +11,7 @@ import org.junit.Test;
 /** Audit A1: opening a connection never runs on the thread that pumps the terminal on screen. */
 public final class ConnectorSplitTest {
     private static String activity() throws Exception {
-        return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
+        return TerminalSource.text();
     }
 
     private static String between(String text, String from, String to) {
@@ -24,7 +23,7 @@ public final class ConnectorSplitTest {
 
     @Test public void switchesAndReconnectsRunOnTheConnectorAndPumpsOnTheWorker() throws Exception {
         String gta = activity();
-        String switching = between(gta, "private void switchHost(SavedRemoteHost host, String pane, boolean picked) {",
+        String switching = between(gta, "    void switchHost(SavedRemoteHost host, String pane, boolean picked) {",
                 "private String awaitHostPane(");
         assertTrue(switching.contains("connector.execute(() -> {"));
         assertFalse("a switch never waits on the pump's thread", switching.contains("worker.execute("));
@@ -36,9 +35,7 @@ public final class ConnectorSplitTest {
 
     @Test public void aSwitchsWaitsAreBoundedTogether() throws Exception {
         String wait = between(activity(), "private String awaitHostPane(", "private void adoptHost(");
-        assertTrue(wait.contains("final long overall = until + AWAIT_LANDING_MS;"));
-        assertFalse("every landing wait is capped by the overall bound",
-                wait.contains("until = SystemClock.uptimeMillis() + 20_000;"));
-        assertTrue(GpuiTerminalActivity.AWAIT_LANDING_MS <= 30_000);
+        assertTrue("the activity only adapts HostLanding", wait.contains(".await(hostId, forcedPane, machineSwitch, readyWithinMs);"));
+        assertTrue(HostLanding.LANDING_MS <= 30_000);
     }
 }

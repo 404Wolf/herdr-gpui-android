@@ -15,6 +15,8 @@ package dev.herdr.android;
  * finger and keeps the width it is let go at. Pure: sizes in dp in, a layout out.
  */
 final class WorkPanelLayout {
+    /** The app's top bar: the terminal's tab row and the panel's header are this tall, on one line (Wolf 11-22). */
+    static final int TOP_BAR_DP = 30;
     static final int COVER_DP = 640, SPLIT_DP = 1100, MIN_DP = 340;
     /**
      * Hidden only at zero: a release this close to the edge (about 12 px on
