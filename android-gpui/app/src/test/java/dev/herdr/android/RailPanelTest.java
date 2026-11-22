@@ -143,7 +143,7 @@ public final class RailPanelTest {
         String badge = section(ui, "private void updateRailBadge(", "private void applySidebarWidth(");
         assertTrue(badge.contains("railStripBadge") && badge.contains("sidebarBadge"));
         assertTrue("the toolbar keeps the badge while the rail is not open", badge.contains("!sidebarOpen"));
-        String bar = section(ui, "private void refreshTabStrip(", "private boolean tabCompact;");
+        String bar = section(ui, "    void refreshTabStrip(", "private boolean tabCompact;");
         assertTrue("the badge is the bar's own count", bar.contains("barNeedYou = needYou;"));
         // Closing hides the rail's rows; it never drops them, and opening rebuilds them at once.
         String set = section(ui, "private void setRailPanel(", "private void railKey(");
@@ -189,6 +189,7 @@ public final class RailPanelTest {
     }
 
     private static String source(String name) throws IOException {
+        if (name.equals("GpuiTerminalActivity")) return TerminalSource.text();
         return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")),
                 StandardCharsets.UTF_8);
     }

@@ -44,7 +44,7 @@ public final class ElicitationSheetTest {
         // The scrim is the sheet's own window over the asking pane, not a whole-window dim.
         assertTrue(sheet.contains("w.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);"));
         assertTrue(sheet.contains("over.setBackgroundColor(SCRIM);"));
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         assertTrue(gta.contains("terminalColumn.getLocationOnScreen(at);"));
     }
 }

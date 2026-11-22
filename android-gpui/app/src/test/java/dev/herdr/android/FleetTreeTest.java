@@ -666,8 +666,7 @@ public final class FleetTreeTest {
     }
 
     @Test public void theRailDrawsNamedGroupsAfterTheDeaconAndBeforeTheRepositories() throws Exception {
-        String rail = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
-                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        String rail = TerminalSource.text();
         int deacon = rail.indexOf("FleetTree.Member deacon = fleet.deacon;");
         int groups = rail.indexOf("for (FleetTree.RepoRow group : tree.groups) {\n            String key = railFold(railKey(host, \"group/\" + group.key), FleetTree.Fold.GROUP);");
         int repos = rail.indexOf("String key = railFold(railKey(host, \"repo/\" + repo.key), FleetTree.Fold.REPO);");

@@ -70,7 +70,7 @@ public final class PendingShellTest {
 
     @Test public void theStripShowsItAndItsTimerLeavesOtherHostsAlone() throws IOException {
         String rail = source();
-        int start = rail.indexOf("private void refreshTabStrip(");
+        int start = rail.indexOf("    void refreshTabStrip(");
         String strip = rail.substring(start, rail.indexOf("private boolean tabCompact;", start));
         assertTrue(strip.contains("+ \"|\" + pending"));
         assertTrue(strip.indexOf("pendingShell.pill()") < strip.indexOf("windowChip(\"+\""));
@@ -84,7 +84,6 @@ public final class PendingShellTest {
     }
 
     static String source() throws IOException {
-        return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
+        return TerminalSource.text();
     }
 }

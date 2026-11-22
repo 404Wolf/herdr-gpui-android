@@ -28,17 +28,17 @@ public final class HostPickTest {
     }
 
     @Test public void everySwitchsEndRunsTheWaitingPickAndPinsOpenFromAnyState() throws IOException {
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
-        int start = gta.indexOf("private void switchHost(SavedRemoteHost host, String pane, boolean picked) {");
+        String gta = TerminalSource.text();
+        int start = gta.indexOf("    void switchHost(SavedRemoteHost host, String pane, boolean picked) {");
         String head = gta.substring(start, gta.indexOf("pendingShell.clear();", start));
         // A switch in flight keeps the pick instead of returning with nothing done.
         assertTrue(head.contains("hostPicks.keep(new HostPick(host.id, pane, picked, null));"));
         // Four ends of a switch, and the refused one (audit A3).
         assertEquals(5, count(gta, "runWaitingPick();"));
-        String pin = gta.substring(gta.indexOf("private void openPin(Pins.Pin pin)"), gta.indexOf("private volatile Pins.Pin pinAwaitingHello;"));
+        String pin = gta.substring(gta.indexOf("    void openPin(Pins.Pin pin)"), gta.indexOf("    volatile Pins.Pin pinAwaitingHello;"));
         assertTrue(pin.contains("hostPicks.keep(new HostPick(pin.profile, pin.key.address, true, pin));"));
         assertTrue(pin.contains("pinAwaitingHello = pin;"));
-        assertTrue(gta.contains("Pins.Pin waiting = pinAwaitingHello;"));
+        assertTrue(gta.contains("Pins.Pin waiting = rail.pinAwaitingHello;"));
         // Pins follow names in the poll, beside observe, not in the rail's render.
         String render = gta.substring(gta.indexOf("private void addHostRows("), gta.indexOf("private void addHostRows(") + 4000);
         assertFalse(render.contains(".relabel("));

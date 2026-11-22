@@ -113,7 +113,7 @@ public final class WorkPanelLayoutTest {
         assertFalse(divider.contains("preview"));
         // The right edge's strip is excluded from Android's Back gesture.
         assertTrue(divider.contains("setSystemGestureExclusionRects"));
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         assertTrue(gta.contains("\"work_panel_\" + (getResources().getConfiguration().orientation"));
         assertTrue(gta.contains("root().announceForAccessibility(next.hidden ? \"Work panel hidden\" : \"Work panel restored\");"));
         assertTrue(gta.contains("new PanelDivider(this, chrome, this::choosePanel, this::dragPanel)"));

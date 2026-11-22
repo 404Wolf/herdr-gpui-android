@@ -80,4 +80,46 @@ public final class BeadCacheTest {
         assertEquals(Arrays.asList("t3"), Arrays.asList(on.stream().map(m -> m.id).toArray()));
         assertTrue(PanelModel.assignees(terms, "demo-9", "demo").isEmpty());
     }
+    /**
+     * factory-9zz.14, the first Tasks entry that "loads forever": a real machine's listing (server:
+     * 10 stores, 173 KB; macro: 674 KB, measured 11-22) is over the old 128 KiB entry cap, so put()
+     * dropped it and every first entry after a start waited on a cold, full read behind whatever held
+     * the core session. The listing must be kept and come back after a restart.
+     */
+    @Test public void aRealSizedListingIsKeptAndDrawsAfterARestart() throws Exception {
+        StringBuilder listing = new StringBuilder();
+        for (int s = 0; s < 10; s++) {
+            listing.append("\u001estore").append(s).append("\n\u001c1795368238.").append(s).append("\n[");
+            for (int b = 0; b < 160; b++) {
+                if (b > 0) listing.append(',');
+                listing.append("{\"id\":\"store").append(s).append('-').append(b)
+                        .append("\",\"title\":\"A bead title long enough to look like a real one, number ").append(b)
+                        .append("\",\"status\":\"open\",\"issue_type\":\"task\"}");
+            }
+            listing.append("]\n\u001f0\n");
+        }
+        assertTrue("as big as server's listing", listing.length() > 170_000);
+        File dir = Files.createTempDirectory("beads").toFile();
+        File file = new File(dir, BeadCache.FILE_NAME);
+        String key = BeadCache.storesKey("host");
+        new BeadCache(file).put(key, new BeadCache.Entry(listing.toString(), 5_000, ""), Runnable::run);
+        BeadCache again = new BeadCache(file);
+        again.load();
+        assertTrue("the listing was kept", again.get(key) != null);
+        BeadsModel.Stores read = BeadsModel.parseStores(again.get(key).text);
+        assertEquals(10, read.byProject.size());
+        assertEquals(160, read.byProject.get("store9").beads.size());
+    }
+
+    /** A bead read over the cap is kept (its plan first) rather than dropped and read again every second. */
+    @Test public void aBigBeadReadIsKeptNotReadAgainForever() {
+        BeadCache cache = new BeadCache(new File("/nonexistent/never-written"));
+        StringBuilder big = new StringBuilder(READ);
+        while (big.length() < 300_000) big.append("x");
+        String key = BeadCache.key("host", "factory", "x-1");
+        cache.put(key, new BeadCache.Entry(big.toString(), 5_000, ""), Runnable::run);
+        assertTrue("kept", cache.get(key) != null);
+        assertEquals("x-1", BeadCache.detail(cache.get(key).text).id);
+        assertEquals("its comments weren't read", BeadCache.comments(cache.get(key).text).error);
+    }
 }

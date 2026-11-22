@@ -3,13 +3,15 @@ package dev.herdr.android;
 /**
  * How much of the phone the offline cache may use (the offline redesign's §7.2, Wolf's steer: be
  * generous, keep a lot for new and recent sessions, let very old ones phase out). One budget for
- * the three stores, on disk only: transcripts, pane copies and referenced files.
+ * the stores, on disk only: transcripts, pane copies, referenced files and the sync engine's
+ * mirrors (beads, docs; {@link SyncEngine}).
  *
  * <ul>
  *   <li>In all: {@link #TOTAL_BYTES} (4 GiB), or {@link #FREE_SHARE} of the free space measured
  *       when the budget is made, whichever is smaller.
  *   <li>Split 5 : 1 : 2 between transcripts, pane copies and referenced files (2.5, 0.5 and 1 GiB
- *       of a full budget).
+ *       of a full budget); the sync engine's {@link #syncBytes} (64 MiB of a full budget, agreed
+ *       with the offline owner, factory-9zz.14) comes out of the referenced files' share.
  *   <li>Nothing is written while the phone has under {@link #FREE_FLOOR_BYTES} free; reads go on.
  * </ul>
  *
@@ -56,13 +58,16 @@ final class OfflineBudget {
     final long transcriptBytes;
     final long paneBytes;
     final long refBytes;
+    /** The sync engine's mirrors: a 64th of the budget (64 MiB of 4 GiB), taken from {@link #refBytes}. */
+    final long syncBytes;
     final long freeFloorBytes;
 
     private OfflineBudget(long totalBytes, long freeFloorBytes) {
         this.totalBytes = totalBytes;
         this.transcriptBytes = totalBytes / 8 * 5;
         this.paneBytes = totalBytes / 8;
-        this.refBytes = totalBytes / 8 * 2;
+        this.syncBytes = totalBytes / 64;
+        this.refBytes = totalBytes / 8 * 2 - syncBytes;
         this.freeFloorBytes = freeFloorBytes;
     }
 

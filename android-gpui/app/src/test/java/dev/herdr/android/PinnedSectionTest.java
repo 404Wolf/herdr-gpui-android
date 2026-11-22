@@ -120,8 +120,7 @@ public final class PinnedSectionTest {
     @Test public void thePinIsWhiteAndSitsAtTheWholeScreensRightWhenThePanelIsDocked() throws Exception {
         // Wolf: white, not grey, pinned or not; the outline/filled glyph tells them apart.
         assertEquals(0xFFFFFFFF, PinButton.tint(0xFFFFFFFF));
-        String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
-                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         assertTrue(gta.contains("placeTopRight(layout.shown && !layout.overlay);"));
         assertTrue(gta.contains("android.view.ViewGroup to = docked ? workPanel.trailing() : tabRow;"));
         for (String glyph : new String[] {"ic_pin_outline", "ic_pin_filled"}) {
@@ -151,22 +150,21 @@ public final class PinnedSectionTest {
     }
 
     @Test public void theActivityWiresTheButtonTheSectionTheObserveAndTheOpen() throws IOException {
-        String rail = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
-        assertTrue(rail.contains("tabRow.addView(pinsRail.button().view()"));
-        assertTrue(rail.contains("pinsRail.button().extendTouch(crumb);"));
+        String rail = TerminalSource.text();
+        assertTrue(rail.contains("tabRow.addView(rail.pinsRail.button().view()"));
+        assertTrue(rail.contains("rail.pinsRail.button().extendTouch(crumb);"));
         // Right under the machine chooser, the first host's row (Wolf, 9zz.10).
         assertTrue(rail.contains("RailHostRow first = hosts.isEmpty() ? null : railHostRows.get(\"host:\" + hosts.get(0).id);"));
         assertTrue(rail.contains("order.add(at + 1, pinsRail.section(savedIds));"));
         // Observed only from the proven list of the connection on screen, where seenLists is kept.
         int seen = rail.indexOf("seenLists.put(current.hostId");
         assertTrue(seen > 0 && rail.indexOf("Pins.shared(this).observe(current.machine, current.panes)", seen) - seen < 300);
-        assertTrue(rail.contains("private void openPin(Pins.Pin pin)"));
+        assertTrue(rail.contains("    void openPin(Pins.Pin pin)"));
         // Only a proven list (the poll's selected: ready, pane and boot known) updates pins.
-        assertTrue(rail.contains("if (selected && current.ownList && pinsRail != null && current.machine != null) {"));
-        assertTrue(rail.contains("Pins.shared(this).relabel(current.machine, names);\n                            checkPinArrival(current);"));
+        assertTrue(rail.contains("if (selected && current.ownList && rail.pinsRail != null && current.machine != null) {"));
+        assertTrue(rail.contains("Pins.shared(this).relabel(current.machine, names);\n                            rail.checkPinArrival(current);"));
         // Opening refuses an ended pin and a reused address: verified against the list now.
-        int open = rail.indexOf("private void openPin(Pins.Pin pin)");
+        int open = rail.indexOf("    void openPin(Pins.Pin pin)");
         String body = rail.substring(open, rail.indexOf("closeRailDrawer();", open));
         assertTrue(body.indexOf("Pins.verify(pin.key, now.remoteBoot, now.fingerprint, now.panes)") < body.indexOf("focusRemotePane("));
         assertTrue(body.contains("pin.ended() ? Pins.Verify.ENDED"));
