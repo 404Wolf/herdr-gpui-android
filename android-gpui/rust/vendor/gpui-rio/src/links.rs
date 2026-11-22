@@ -1052,10 +1052,13 @@ mod tests {
 
     #[test]
     fn the_files_on_rows_are_what_taps_open_once_each_and_never_urls() {
+        // Padded to the grid's width, as real rows are: a row whose text runs to its edge
+        // continues on the next (a program's own wrap), which these are not.
+        let row = |text: &str| Row::new(&format!("{text:<80}"), false);
         let rows = [
-            Row::new("Wrote docs/PLAN.md and see ~/notes/x.md:4 for more", false),
-            Row::new("Read [spec](SPEC.md), https://example.com/a.md and docs/PLAN.md", false),
-            Row::new("nothing here but words.", false),
+            row("Wrote docs/PLAN.md and see ~/notes/x.md:4 for more"),
+            row("Read [spec](SPEC.md), https://example.com/a.md and docs/PLAN.md"),
+            row("nothing here but words."),
         ];
         let files = files_in(&rows, &["file:///etc/hosts.txt".into(), "https://x.dev/b.md".into()], 16);
         assert_eq!(files, ["/etc/hosts.txt", "docs/PLAN.md", "~/notes/x.md", "SPEC.md"]);
