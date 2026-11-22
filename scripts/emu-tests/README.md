@@ -98,3 +98,24 @@ line), `transcript-scroll` (swiping changes what is on screen; the kept text sta
 Not covered here: an old core (it is never read; the JVM and Rust tests cover the gate), a program
 replaced on the same address (the JVM tests cover the incarnation proof), and a cold start with the
 core down (Home then has no agents to open).
+
+## offline-scroll.sh: offline drags and the way back (factory-9zz.1)
+
+```sh
+lease-run --kind android --outputs <dir> -- scripts/emu-test.sh scripts/emu-tests/offline-scroll.sh
+```
+
+The same scratch host as `offline-s2.sh`, with a full-screen fake agent (`agent-f`: the alternate
+screen with mouse reporting, as Claude Code and Codex draw) and a main-screen shell (`shell-a`, 200
+lines). Airplane mode is the emulator's own (`cmd connectivity airplane-mode`). The checks:
+
+- a drag right after airplane mode is answered by a note, never by nothing;
+- the link is given up on the no-network callback;
+- a drag on the held full-screen frame says only its screen was saved;
+- no reconnect attempt is made with no network;
+- the pane is live again within 4 s of the network's return (WARN up to 8 s), timed from the app's
+  own `herdr-net` and `herdr-reconnect` lines;
+- a held shell frame scrolls;
+- with the host down, the attempts stop at 12 or fewer with "offline · tap to reconnect", and
+  Reconnect brings the pane back once the host is up.
+

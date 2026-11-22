@@ -133,4 +133,17 @@ public final class LinkBadgeTest {
         assertTrue(live.description.contains("open the queue"));
         assertFalse(LinkBadge.look(true, true, null, false, null, 3).queuedOnly);
     }
+
+    @Test public void offlineRedesign_spentAttemptsSayTapToReconnect() {
+        LinkBadge.Look look = LinkBadge.look(true, false, true, null, true, "14:32", 2);
+        assertEquals(LinkBadge.STOPPED, look.text);
+        assertTrue(look.text.length() <= LinkBadge.MAX_CHARS);
+        assertEquals(LinkBadge.Tone.WARN, look.tone);
+        assertEquals(LinkBadge.RECONNECT, look.primary);
+        assertTrue(look.description.contains("14:32"));
+        // Not spent: as before.
+        assertEquals("offline · 14:32 · 2 queued", LinkBadge.look(true, true, false, null, true, "14:32", 2).text);
+        // Spent but back up (no reconnect wanted): hidden as before.
+        assertFalse(LinkBadge.look(false, false, true, null, false, null, 0).shown);
+    }
 }
