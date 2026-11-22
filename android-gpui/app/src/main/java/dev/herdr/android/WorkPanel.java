@@ -99,7 +99,7 @@ final class WorkPanel {
      * Tasks' own tokens (Wolf): small equal sides, dense rows, a round marker,
      * each level indented by one step; the plan and "N closed" start at the title.
      */
-    static final int TASKS_SIDE_DP = 12, TASK_ROW_DP = 36, TASK_PAD_DP = 4, MARK_DP = 8, MARK_GAP_DP = 10, INDENT_DP = 14,
+    static final int TASKS_SIDE_DP = 12, TASK_ROW_DP = 24, TASK_PAD_DP = 2, MARK_DP = 8, MARK_GAP_DP = 10, INDENT_DP = 14,
             TITLE_AT_DP = MARK_DP + MARK_GAP_DP;
     /** Loading, drawn as what comes: a Tasks row (title and progress), a doc's lines, a plan's lines. */
     static final Skeleton.Shape TASK_SHAPE = new Skeleton.Shape(TASK_ROW_DP + 2 * TASK_PAD_DP, TITLE_AT_DP, true),
@@ -510,7 +510,8 @@ final class WorkPanel {
         if (key != null) s.append('|').append(docErrors.get(key));
         if (now == PanelModel.Tab.TASKS) {
             for (Map.Entry<String, BeadsModel.Store> e : stores.entrySet()) s.append('|').append(e.getKey()).append(e.getValue().fp);
-            s.append('|').append(storesError).append(folded).append(open).append(storesKeptAt);
+            // storesAt too: a read that answers with no stores and no error still ends the skeleton (t46v).
+            s.append('|').append(storesError).append(folded).append(open).append(storesKeptAt).append('|').append(storesAt);
             long nowMs = System.currentTimeMillis();
             for (String id : open) {
                 String bead = beadKey(id);
@@ -564,9 +565,10 @@ final class WorkPanel {
     }
 
     private void tasks() {
+        // The kept listing first, so its beads (not "No epics or beads") draw on the first frame (t46v).
+        useKeptStores();
         Map<String, BeadsModel.ProjectBeads> byProject = BeadsModel.projectBeads(stores);
         BeadsModel.ProjectBeads mine = byProject.get(agent.project);
-        useKeptStores();
         if (stores.isEmpty() && storesAt < 0 && storesError == null) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
         // Kept beads show at once, with how old they are (no dots while a newer read is out).
         if (storesKeptAt > 0) body.addView(dim("beads from " + BeadCache.age(storesKeptAt, System.currentTimeMillis())));
