@@ -64,8 +64,40 @@ fn write_frame(socket: &mut impl Write, channel: u32, kind: u8, bytes: &[u8]) ->
     socket.write_all(bytes)?;
     Ok(())
 }
+/// How long the phone waits for an RPC: 15 s, or longer than the core itself was asked to
+/// take (`machine.exec`'s `timeout`, in seconds) plus a margin, so the phone never gives up on a
+/// command the computer is still allowed to run.
+fn rpc_wait(params: &Value) -> Duration {
+    const BASE: Duration = Duration::from_secs(15);
+    const MARGIN: Duration = Duration::from_secs(5);
+    const MOST: Duration = Duration::from_secs(120);
+    params["timeout"]
+        .as_u64()
+        .map(|seconds| (Duration::from_secs(seconds) + MARGIN).clamp(BASE, MOST))
+        .unwrap_or(BASE)
+}
+
+/// A reply's id against the call awaited: this call's, an earlier call's that timed out (ids
+/// only grow), or one this session never sent.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyOrder {
+    This,
+    Late,
+    Unknown,
+}
+
+fn reply_order(reply: &Value, awaited: u64) -> ReplyOrder {
+    match reply.as_u64() {
+        Some(id) if id == awaited => ReplyOrder::This,
+        Some(id) if id < awaited => ReplyOrder::Late,
+        _ => ReplyOrder::Unknown,
+    }
+}
+
 struct Connection<'a> {
     socket: UnixStream,
+    /// Replies to calls this session had given up on, dropped (see `reply_order`).
+    late_replies: u64,
     decoder: Decoder,
     owner: &'a Arc<Session>,
     serial: u64,
@@ -356,7 +388,8 @@ impl Connection<'_> {
         }
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.call_within(method, params, Duration::from_secs(15))
+        let wait = rpc_wait(&params);
+        self.call_within(method, params, wait)
     }
     fn call_within(&mut self, method: &str, params: Value, wait: Duration) -> Result<Value> {
         self.call_pumping(method, params, wait, None)
@@ -386,8 +419,16 @@ impl Connection<'_> {
             let Some(frame) = self.read()? else { continue };
             if frame.channel == 0 && frame.kind == 0 {
                 let reply: Value = serde_json::from_slice(&frame.bytes)?;
-                if reply["id"] != id {
-                    return Err(Error::Protocol("uncorrelated RPC reply".into()));
+                match reply_order(&reply["id"], id) {
+                    // A call this session gave up on answered late: it is over, drop it.
+                    ReplyOrder::Late => {
+                        self.late_replies += 1;
+                        #[cfg(feature = "android-ui")]
+                        log::debug!("dropped a late RPC reply ({} so far)", self.late_replies);
+                        continue;
+                    }
+                    ReplyOrder::Unknown => return Err(Error::Protocol("uncorrelated RPC reply".into())),
+                    ReplyOrder::This => {}
                 }
                 if let Some(error) = reply.get("error") {
                     return Err(Error::Rpc {
@@ -402,7 +443,7 @@ impl Connection<'_> {
             }
             self.deliver(frame)?;
         }
-        Err(Error::Protocol(format!("{method} timed out")))
+        Err(Error::Timeout { method: method.to_owned() })
     }
     /// While a slow RPC (a transcript read) waits for its reply: keystrokes,
     /// output credit and other frames for the attached pane, held messages and
@@ -2018,6 +2059,7 @@ pub(crate) fn run(
     }
     let mut connection = Connection {
         socket,
+        late_replies: 0,
         decoder: Decoder::default(),
         owner,
         serial: 0,
@@ -2154,7 +2196,7 @@ fn serve(
                 // herdr-core refused (the window closed, an agent restarted
                 // under a new id): stay on the window that was showing and
                 // refresh, instead of ending the session.
-                Err(reason @ (Error::Protocol(_) | Error::Rpc { .. })) => {
+                Err(reason @ (Error::Protocol(_) | Error::Timeout { .. } | Error::Rpc { .. })) => {
                     #[cfg(feature = "android-ui")]
                     log::warn!("switch {terminal} refused: {reason}");
                     #[cfg(not(feature = "android-ui"))]
@@ -2162,7 +2204,7 @@ fn serve(
                     connection.refresh()?;
                     if !previous.is_empty()
                         && previous != terminal
-                        && let Err(Error::Protocol(_) | Error::Rpc { .. }) =
+                        && let Err(Error::Protocol(_) | Error::Timeout { .. } | Error::Rpc { .. }) =
                             connection.attach(&previous, cols, rows)
                     {
                         connection.refresh()?;
@@ -2192,7 +2234,7 @@ fn serve(
                 match connection.attach(&pane, cols, rows) {
                     Ok(()) => {}
                     // Refused (the program ended, the pane is gone): it stays ended.
-                    Err(Error::Protocol(_) | Error::Rpc { .. }) => {
+                    Err(Error::Protocol(_) | Error::Timeout { .. } | Error::Rpc { .. }) => {
                         let mut state = lock(&owner.state);
                         state.view["state"] = json!("connecting");
                         state.view["status"] = json!("Terminal stream ended; select a terminal to attach again");
@@ -5459,6 +5501,7 @@ mod focus_review_tests {
         peer.set_nonblocking(true).unwrap();
         let connection = Connection {
             socket,
+            late_replies: 0,
             decoder: Decoder::default(),
             owner,
             serial: 1,
@@ -5491,6 +5534,44 @@ mod focus_review_tests {
             painted: false,
         };
         (connection, peer)
+    }
+
+    #[test]
+    fn the_phone_waits_longer_than_the_core_was_asked_to_take() {
+        assert_eq!(rpc_wait(&json!({})), Duration::from_secs(15));
+        assert_eq!(rpc_wait(&json!({"timeout":5})), Duration::from_secs(15));
+        assert_eq!(rpc_wait(&json!({"timeout":20})), Duration::from_secs(25));
+        assert_eq!(rpc_wait(&json!({"timeout":100000})), Duration::from_secs(120));
+        assert_eq!(rpc_wait(&json!({"timeout":"20"})), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_reply_to_a_call_given_up_on_is_dropped_and_the_next_call_still_gets_its_own() {
+        assert_eq!(reply_order(&json!(4), 4), ReplyOrder::This);
+        assert_eq!(reply_order(&json!(3), 4), ReplyOrder::Late);
+        assert_eq!(reply_order(&json!(5), 4), ReplyOrder::Unknown);
+        assert_eq!(reply_order(&json!("4"), 4), ReplyOrder::Unknown);
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        connection.socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        // The first call times out: a typed Timeout, never "uncorrelated" or Closed.
+        let first = connection.call_within("machine.exec", json!({}), Duration::from_millis(60));
+        assert!(matches!(&first, Err(Error::Timeout { method }) if method == "machine.exec"), "{first:?}");
+        let asked: Vec<Value> = frames(&mut peer).into_iter().map(|(_, _, b)| serde_json::from_slice(&b).unwrap()).collect();
+        let late = asked[0]["id"].as_u64().unwrap();
+        // Its reply arrives during the next call, before that call's own reply.
+        let reply = |id: u64, result: Value| {
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap()
+        };
+        write_frame(&mut peer, 0, 0, &reply(late, json!({"stdout":"late"}))).unwrap();
+        write_frame(&mut peer, 0, 0, &reply(late + 1, json!({"stdout":"mine"}))).unwrap();
+        let second = connection.call("terminal.list", json!({})).unwrap();
+        assert_eq!(second["stdout"], "mine");
+        assert_eq!(connection.late_replies, 1);
+        // A reply this session never asked for still ends it as a protocol error.
+        write_frame(&mut peer, 0, 0, &reply(late + 9, json!({}))).unwrap();
+        let third = connection.call_within("doc.get", json!({}), Duration::from_secs(2));
+        assert!(matches!(third, Err(Error::Protocol(_))), "{third:?}");
     }
 
     fn frames(peer: &mut UnixStream) -> Vec<(u32, u8, Vec<u8>)> {

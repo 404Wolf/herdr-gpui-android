@@ -36,6 +36,10 @@ pub enum Error {
     PutName,
     #[error("herdr-core protocol: {0}")]
     Protocol(String),
+    /// The core did not answer `method` within the phone's wait. The call may still finish on
+    /// the computer; its late reply is dropped, never mistaken for another call's.
+    #[error("herdr-core did not answer {method} in time")]
+    Timeout { method: String },
     /// The core answered an RPC with an error: a definite reply, so whatever
     /// the call would have done was refused, never half-sent.
     #[error("herdr-core protocol: \"{kind}\": {message}")]
