@@ -108,6 +108,8 @@ struct Connection<'a> {
     socket: UnixStream,
     /// Replies to calls this session had given up on, dropped (see `reply_order`).
     late_replies: u64,
+    /// The session's queue, for slow RPCs to keep pumping what Wolf types (`call_slow`).
+    commands: Option<&'a mpsc::Receiver<Operation>>,
     decoder: Decoder,
     owner: &'a Arc<Session>,
     serial: u64,
@@ -401,6 +403,13 @@ impl Connection<'_> {
         let wait = rpc_wait(&params);
         self.call_within(method, params, wait)
     }
+    /// A call that may take seconds (a command on the machine, a file put, a refresh): what
+    /// Wolf types keeps going out while it waits (audit A5), as a transcript read's does.
+    fn call_slow(&mut self, method: &str, params: Value) -> Result<Value> {
+        let wait = rpc_wait(&params);
+        let commands = self.commands;
+        self.call_pumping(method, params, wait, commands)
+    }
     fn call_within(&mut self, method: &str, params: Value, wait: Duration) -> Result<Value> {
         self.call_pumping(method, params, wait, None)
     }
@@ -658,7 +667,7 @@ impl Connection<'_> {
                 Some(edit) => self.edit_tab(edit, cols, rows)?,
                 None => match crate::phone_ops::PhoneOp::parse(action) {
                     Some(op) => {
-                        let reply = op.run(|method, params| self.call(method, params))?;
+                        let reply = op.run(|method, params| self.call_slow(method, params))?;
                         // Done is done: a failed re-read leaves the view for the next poll, never an error.
                         if op.edits() && self.refresh().is_err() {
                             self.dirty = true;
@@ -731,7 +740,9 @@ impl Connection<'_> {
             "name": file.name,
             "data": base64::engine::general_purpose::STANDARD.encode(&file.bytes),
         });
-        match self.call_within("terminal.put", params, PUT_WAIT) {
+        let commands = self.commands;
+        let put = self.call_pumping("terminal.put", params, PUT_WAIT, commands);
+        match put {
             Ok(result) => {
                 let path = result["path"]
                     .as_str()
@@ -789,7 +800,7 @@ impl Connection<'_> {
     /// absolute path (one exec, as the desktop does; the same path as git.look).
     fn deacon_folder(&mut self) -> Result<String> {
         use base64::Engine;
-        let result = self.call("machine.exec", json!({"argv":["sh","-c",DEACON_DIR],"timeout":10}))?;
+        let result = self.call_slow("machine.exec", json!({"argv":["sh","-c",DEACON_DIR],"timeout":10}))?;
         if result["code"] != 0 {
             return Err(Error::Protocol("the Deacon's folder could not be made".into()));
         }
@@ -870,7 +881,7 @@ impl Connection<'_> {
     fn git_look(&mut self, paths: &[String]) -> Result<String> {
         let mut argv = vec![json!("sh"), json!("-c"), json!(GIT_LOOK), json!("sh")];
         argv.extend(paths.iter().map(|p| json!(p)));
-        let result = self.call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+        let result = self.call_slow("machine.exec", json!({"argv":argv,"timeout":10}))?;
         let text = exec_stdout(&result)?;
         Ok(json!({"queued":true,"text":text,"truncated":result["truncated"]}).to_string())
     }
@@ -891,7 +902,7 @@ impl Connection<'_> {
                 if let Some(machine) = machine {
                     exec["on"] = json!(machine);
                 }
-                let result = self.call("machine.exec", exec)?;
+                let result = self.call_slow("machine.exec", exec)?;
                 let home = exec_stdout(&result)?;
                 (rest.to_owned(), Some(home).filter(|h| h.starts_with('/')))
             }
@@ -1156,7 +1167,7 @@ impl Connection<'_> {
     }
     fn discover(&mut self) -> Result<String> {
         use base64::Engine;
-        let result = self.call(
+        let result = self.call_slow(
             "machine.exec",
             json!({"argv":["tailscale","status","--json"],"timeout":5}),
         )?;
@@ -1191,7 +1202,7 @@ impl Connection<'_> {
             let host = peer["host"].as_str().unwrap_or("");
             // Peer names enter argv, never a shell string. Reuse only the
             // bootstrap machine's existing trust; never accept new host keys.
-            let probe = self.call("machine.exec", json!({"argv":["ssh","-oBatchMode=yes","-oStrictHostKeyChecking=yes","-oConnectTimeout=2","--",host,"command -v herdr-core >/dev/null && herdr-core server status >/dev/null"],"timeout":3}))?;
+            let probe = self.call_slow("machine.exec", json!({"argv":["ssh","-oBatchMode=yes","-oStrictHostKeyChecking=yes","-oConnectTimeout=2","--",host,"command -v herdr-core >/dev/null && herdr-core server status >/dev/null"],"timeout":3}))?;
             peer["core"] = json!(if probe["code"] == 0 {
                 "available"
             } else {
@@ -1204,7 +1215,7 @@ impl Connection<'_> {
         // Subscribe precedes reading the app document; doc events/missed force
         // another read. Polling also handles older cores and unlabelled workers.
         self.dirty = false;
-        let list = self.call("terminal.list", json!({}))?;
+        let list = self.call_slow("terminal.list", json!({}))?;
         #[cfg(feature = "android-ui")]
         {
             let mut state = lock(&self.owner.state);
@@ -1214,13 +1225,13 @@ impl Connection<'_> {
             });
             state.observe_footer_foreground(terminal, Instant::now());
         }
-        let doc = self.call("doc.get", json!({"name":"herdr-app"}))?;
+        let doc = self.call_slow("doc.get", json!({"name":"herdr-app"}))?;
         // Wolf's order of the projects (item 62), kept in this core's doc
         // projects.order by the desktop's sidebar; the phone's project
         // switcher reads it. A core without it (older, or never dragged) has
         // no order: birth order then.
         let order = self
-            .call("doc.get", json!({"name":"projects.order"}))
+            .call_slow("doc.get", json!({"name":"projects.order"}))
             .map(|o| o["value"].clone())
             .unwrap_or(Value::Null);
         let mut state = lock(&self.owner.state);
@@ -2074,6 +2085,7 @@ pub(crate) fn run(
     let mut connection = Connection {
         socket,
         late_replies: 0,
+        commands: Some(&commands),
         decoder: Decoder::default(),
         owner,
         serial: 0,
@@ -5552,6 +5564,7 @@ mod focus_review_tests {
         let connection = Connection {
             socket,
             late_replies: 0,
+            commands: None,
             decoder: Decoder::default(),
             owner,
             serial: 1,
@@ -5595,6 +5608,29 @@ mod focus_review_tests {
         assert_eq!(view["refused"]["terminal"], "t1b6");
         assert_eq!(view["refused"]["reason"].as_str().unwrap().chars().count(), 240);
         assert_ne!(view["revision"], 3, "the view changed, so the phone reads it");
+    }
+
+    /// Audit A5: keys typed while a command runs on the machine go out before its reply.
+    #[test]
+    fn typing_flows_while_a_slow_call_waits() {
+        let owner = owner();
+        let (mut connection, mut peer) = awaiting_measurement(&owner);
+        connection.socket.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        connection.commands = Some(&rx);
+        tx.send(Operation::Frame(2, 0, b"typed".to_vec())).unwrap();
+        // No reply comes: the call times out, but the keys left while it waited.
+        let commands = connection.commands;
+        let short = Duration::from_millis(80);
+        let result = connection.call_pumping("machine.exec", json!({"argv":["true"]}), short, commands);
+        assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+        let sent = frames(&mut peer);
+        assert!(sent.iter().any(|(channel, kind, bytes)| (*channel, *kind) == (2, 0) && bytes == b"typed"), "{sent:?}");
+        // An operation that needs the RPC slot waits for the reply instead of going out.
+        let (reply, _) = mpsc::sync_channel(1);
+        tx.send(Operation::Action("tab.new".into(), reply, None)).unwrap();
+        let _ = connection.call_pumping("machine.exec", json!({"argv":["true"]}), short, commands);
+        assert!(matches!(connection.held, Some(Operation::Action(..))));
     }
 
     #[test]
