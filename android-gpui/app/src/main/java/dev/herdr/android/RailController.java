@@ -73,6 +73,90 @@ final class RailController {
         return a.dp(value);
     }
 
+    /** Reordering by drag (factory-r8f.8): made with the rail's rows, once they exist. */
+    private RailDrag drag;
+
+    private RailDrag drag() {
+        if (drag == null) drag = new RailDrag(a.sidebarRows, a.sidebarScroll, a.chrome, new RailDrag.Planner() {
+            @Override public RailOrder.Plan plan(RailDrag.Ref item, RailDrag.Ref over, boolean after) {
+                FleetTree.PmTree tree = railTrees.get(item.hostId);
+                if (tree == null) return null;
+                return RailOrder.dropPlan(FleetTree.orderSections(tree), item.at, over.at, after, orderOf(item.hostId));
+            }
+
+            @Override public void drop(RailDrag.Ref item, RailOrder.Plan plan) {
+                applyDrop(item.hostId, plan);
+            }
+        });
+        return drag;
+    }
+
+    /** A drop just made, drawn at once until the core's own doc comes back (ms, uptime). */
+    private final java.util.Map<String, org.json.JSONObject> droppedOrders = new java.util.HashMap<>();
+    private final java.util.Map<String, Long> droppedUntil = new java.util.HashMap<>();
+    static final long DROP_SHOWN_MS = 6_000;
+
+    /** This machine's projects.order as the rail draws it: a drop's, briefly, else the core's last. */
+    private org.json.JSONObject orderOf(String hostId) {
+        Long until = droppedUntil.get(hostId);
+        if (until != null && android.os.SystemClock.uptimeMillis() < until) return droppedOrders.get(hostId);
+        droppedOrders.remove(hostId);
+        droppedUntil.remove(hostId);
+        return railOrders.get(hostId);
+    }
+
+    /**
+     * A drop's plan done on its machine: a refusal is said; a move is drawn at
+     * once and written with order.move; a regroup sets each lead's herdr.group
+     * (group.set, display only), then the move. A failure is said and the
+     * stored order comes back on the next read.
+     */
+    private void applyDrop(String hostId, RailOrder.Plan plan) {
+        Connection current;
+        synchronized (a.stateLock) { current = a.connection; }
+        if (plan.op == RailOrder.Op.REFUSE) { a.note("Can't move it there: " + plan.why); return; }
+        if (current == null || !current.ready || !hostId.equals(a.currentHostId)) {
+            a.note("Order not saved: " + a.hostName(hostId) + " is unreachable");
+            return;
+        }
+        if (plan.move != null) {
+            droppedOrders.put(hostId, RailOrder.applied(orderOf(hostId), plan.move));
+            droppedUntil.put(hostId, android.os.SystemClock.uptimeMillis() + DROP_SHOWN_MS);
+            refreshSidebar(true);
+        }
+        Runnable move = () -> {
+            if (plan.move == null) return;
+            String json;
+            try {
+                json = new JSONObject().put("op", "order.move").put("scope", plan.move.scope).put("id", plan.move.id)
+                        .put("target", plan.move.target).put("after", plan.move.after)
+                        .put("shown", new org.json.JSONArray(plan.move.peers)).toString();
+            } catch (org.json.JSONException impossible) { return; }
+            railAction(current, json, "save the order", reply -> refreshSidebar(true), () -> {
+                droppedUntil.remove(hostId);
+                refreshSidebar(true);
+            });
+        };
+        if (plan.op == RailOrder.Op.MOVE) { move.run(); return; }
+        regroup(current, plan.leads, 0, plan.group, move);
+    }
+
+    /** Each lead's herdr.group, one after another, then {@code then}. */
+    private void regroup(Connection current, java.util.List<String> leads, int i, String group, Runnable then) {
+        if (i >= leads.size()) { then.run(); return; }
+        String json;
+        try {
+            json = new JSONObject().put("op", "group.set").put("terminal", leads.get(i))
+                    .put("group", group == null ? org.json.JSONObject.NULL : group).toString();
+        } catch (org.json.JSONException impossible) { return; }
+        railAction(current, json, group == null ? "take it out of its group" : "move it to " + group,
+                reply -> regroup(current, leads, i + 1, group, then), () -> refreshSidebar(true));
+    }
+
+    /** Each machine's projects.order as last read, and its tree as last drawn (a drop plans on it). */
+    private final java.util.Map<String, org.json.JSONObject> railOrders = new java.util.HashMap<>();
+    final java.util.Map<String, FleetTree.PmTree> railTrees = new java.util.HashMap<>();
+
     /** Reused rail rows, so a sampler refresh never replaces the view under a finger. */
     private final java.util.Map<String, RailHostRow> railHostRows = new java.util.HashMap<>();
     final java.util.Map<String, RailWorkspaceRow> railWorkspaces = new java.util.HashMap<>();
@@ -93,7 +177,9 @@ final class RailController {
             signature.append(host.id).append(':');
             if (host.id.equals(a.currentHostId)) {
                 signature.append("live:").append(current == null ? 0 : current.chromeRevision)
-                        .append(current != null && current.ready && !current.isClosed() ? "+" : "-");
+                        .append(current != null && current.ready && !current.isClosed() ? "+" : "-")
+                        // Wolf's order (projects.order) redraws the rail when it changes, here or elsewhere.
+                        .append(current == null || current.projectsOrder == null ? 0 : current.projectsOrder.toString().hashCode());
             } else if (sample == null) {
                 signature.append("none");
             } else if (!sample.connected) {
@@ -120,6 +206,7 @@ final class RailController {
         }
         // Rows are reused, never rebuilt: the sampler refreshes every three
         // seconds and replacing a view under a finger cancels its tap.
+        drag().clear();
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
         // The machine a terminal is on leads the rail; the others follow in
@@ -208,7 +295,11 @@ final class RailController {
         }
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
+        // Wolf's order of this machine's groups, repos and PMs: its live doc, else the last one read.
+        if (live && current != null && current.projectsOrder != null) railOrders.put(host.id, current.projectsOrder);
+        fleet.order = orderOf(host.id);
         FleetTree.PmTree tree = FleetTree.pmTree(fleet);
+        railTrees.put(host.id, tree);
         String selectedPane = live && current != null ? current.paneId : "";
         // Reveal an explicit pick even on cold launch. Merely restoring the
         // last pane leaves its PM at the saved fold state.
@@ -308,23 +399,28 @@ final class RailController {
         for (FleetTree.RepoRow group : tree.groups) {
             String key = railFold(railKey(host, "group/" + group.key), FleetTree.Fold.GROUP);
             boolean folded = railFolded(key);
-            railHeader(host, live, current, "named:" + group.key, group.name, group.label(folded), key, folded, 0, "", order, keep);
+            RailWorkspaceRow groupRow = railHeader(host, live, current, "named:" + group.key, group.name, group.label(folded), key,
+                    folded, 0, "", order, keep);
+            // Groups and their PMs drag on a machine that is reachable (factory-r8f.8).
+            if (live) drag().mark(groupRow.row, new RailDrag.Ref(host.id, RailOrder.At.section("group:" + group.name)));
             if (folded) continue;
-            for (FleetTree.PmRow pm : group.projects) railPm(host, live, current, pm, 1, selectedPane, order, keep);
+            for (FleetTree.PmRow pm : group.projects) railPm(host, live, current, pm, 1, selectedPane, order, keep, "group:" + group.name);
         }
         for (FleetTree.RepoRow repo : tree.repos) {
             String key = railFold(railKey(host, "repo/" + repo.key), FleetTree.Fold.REPO);
             boolean folded = railFolded(key);
-            railHeader(host, live, current, "repo:" + repo.key, repo.name, repo.label(folded), key, folded, 0, "", order, keep);
+            RailWorkspaceRow repoRow = railHeader(host, live, current, "repo:" + repo.key, repo.name, repo.label(folded), key,
+                    folded, 0, "", order, keep);
+            if (live) drag().mark(repoRow.row, new RailDrag.Ref(host.id, RailOrder.At.section("repo:" + repo.name)));
             if (folded) continue;
-            for (FleetTree.PmRow pm : repo.projects) railPm(host, live, current, pm, 1, selectedPane, order, keep);
+            for (FleetTree.PmRow pm : repo.projects) railPm(host, live, current, pm, 1, selectedPane, order, keep, "repo:" + repo.name);
             if (!repo.idle.isEmpty()) {
                 String idleKey = railFold(railKey(host, "idle/" + repo.key), FleetTree.Fold.IDLE);
                 boolean idleFolded = railFolded(idleKey);
                 railHeader(host, live, current, "idle:" + repo.key, repo.idle.size() + " idle", "", idleKey,
                         idleFolded, 1, "", order, keep);
                 if (!idleFolded) {
-                    for (FleetTree.PmRow pm : repo.idle) railPm(host, live, current, pm, 2, selectedPane, order, keep);
+                    for (FleetTree.PmRow pm : repo.idle) railPm(host, live, current, pm, 2, selectedPane, order, keep, null);
                 }
             }
             for (FleetTree.SpaceNode node : repo.loose) railCheckout(host, live, current, node, 1, selectedPane, order, keep);
@@ -336,7 +432,7 @@ final class RailController {
             railHeader(host, live, current, "group:outside", "Outside git", "" + tree.outsideCount(), key,
                     folded, 0, "", order, keep);
             if (!folded) {
-                for (FleetTree.PmRow pm : tree.outside) railPm(host, live, current, pm, 1, selectedPane, order, keep);
+                for (FleetTree.PmRow pm : tree.outside) railPm(host, live, current, pm, 1, selectedPane, order, keep, null);
                 for (FleetTree.SpaceNode node : tree.outsideLoose) railCheckout(host, live, current, node, 1, selectedPane, order, keep);
             }
         }
@@ -378,8 +474,10 @@ final class RailController {
     }
 
     /** One PM row (its project's name, the PM's checkout below), then its workers when unfolded. */
+    /** {@code section}: the drag section it is listed in (group:<name> or repo:<name>), or null: it doesn't drag. */
     private void railPm(SavedRemoteHost host, boolean live, Connection current,
-            FleetTree.PmRow pm, int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
+            FleetTree.PmRow pm, int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep,
+            String section) {
         String key = pm.foldKey(host.id);
         // A PM with no workers has nothing to fold, so it is never folded: its Beads row shows.
         boolean folded = pm.workerRows > 0 && railFolds().folded(key);
@@ -398,6 +496,9 @@ final class RailController {
             String sub = pm.where;
             RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, FleetTree.railAgentPadding(depth, false),
                     foldKey, folded, pm.workerRows, folded && pm.blocked(), selectedPane, order, keep);
+            if (row != null && live && section != null) {
+                drag().mark(row.row, new RailDrag.Ref(host.id, RailOrder.At.project(pm.orderId, section)));
+            }
             if (row != null) {
                 row.state.setText(pm.countsLabel());
                 row.state.setTextColor(pm.blocked() ? a.chrome.danger : a.chrome.onSurfaceVariant);
@@ -1157,11 +1258,16 @@ final class RailController {
         holder.row.addView(holder.meta, metaParams);
         // No trailing "›": the fold chevron is the row's one arrow (review D5).
         holder.row.setBackground(railBackground(false));
+        drag().watch(holder.row);
         holder.row.setOnLongClickListener(view -> {
             // A Fleet header (project, checkout slice, group) is not a physical
             // space: its menu never renames, moves or adds to the shared space.
-            if (holder.physicalSpace == null) showFleetHeaderActions(holder);
-            else showSpaceActions(holder);
+            Runnable menu = () -> {
+                if (holder.physicalSpace == null) showFleetHeaderActions(holder);
+                else showSpaceActions(holder);
+            };
+            // A group or repo header drags; let go in place, its menu (factory-r8f.8).
+            if (!drag().arm(view, menu)) menu.run();
             return true;
         });
         holder.row.setOnClickListener(view -> {
@@ -1465,7 +1571,12 @@ final class RailController {
                 switchToRailPane(holder.host, holder.paneId);
             }
         });
-        holder.row.setOnLongClickListener(view -> { showPaneActions(holder); return true; });
+        drag().watch(holder.row);
+        holder.row.setOnLongClickListener(view -> {
+            // A PM row drags; let go in place, its menu (factory-r8f.8).
+            if (!drag().arm(view, () -> showPaneActions(holder))) showPaneActions(holder);
+            return true;
+        });
         return holder;
     }
 

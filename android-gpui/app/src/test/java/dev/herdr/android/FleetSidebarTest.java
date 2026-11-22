@@ -67,7 +67,7 @@ public final class FleetSidebarTest {
         assertEquals(34, FleetTree.LEAD_ROW_DP);
         assertEquals(0, FleetTree.GROUP_GAP_DP);
         assertEquals(36, FleetTree.AGENT_ROW_DP);
-        assertEquals(16, FleetTree.RAIL_DEPTH_DP);
+        assertEquals(20, FleetTree.RAIL_DEPTH_DP);
         assertTrue(RailDisclosure.SQUARE_DP <= 24);
         assertEquals("Show 3 rows under factory", FleetTree.foldSays("factory", false, 3, true, "k"));
         assertEquals("Hide 1 row under factory", FleetTree.foldSays("factory", false, 1, false, "k"));

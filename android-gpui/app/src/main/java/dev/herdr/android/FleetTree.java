@@ -32,8 +32,13 @@ final class FleetTree {
          * what the row calls it (AgentNames), never its id.
          */
         String name = "", task = "", helper = "";
-        /** A PM's sidebar group, from its herdr.group label (factory-r8f.6); "" when it has none. */
+        /**
+         * A PM's sidebar group: its herdr.group label, else its older group=
+         * label (factory-r8f.6, -r8f.8: herdr.group ?? group); "" when it has none.
+         */
         String group = "";
+        /** Its older group= label, which a drop never clears ("" none). */
+        String oldGroup = "";
         /** Tells it from another agent here with the same name: its folder, or "2" (AgentNames.disambiguate). */
         String nameNote = "";
         /** The foreground program's name, when the core says ("" when unknown). */
@@ -157,6 +162,8 @@ final class FleetTree {
         final List<Member> others = new ArrayList<>();
         /** Every terminal of this computer, in space/tab order. */
         final List<Member> all = new ArrayList<>();
+        /** Wolf's order of this computer's groups, repos and PMs (its core doc projects.order), or null. */
+        org.json.JSONObject order;
     }
 
     /** Unopened worktrees shown before "+N more"; a tap shows a page more. */
@@ -821,7 +828,8 @@ final class FleetTree {
         return fold != Fold.AGENT && fold != Fold.REPO && fold != Fold.GROUP;
     }
 
-    static final int RAIL_DEPTH_DP = 16;
+    // A step deeper than the 16dp it was: rows inside a group or a repo read as inside it (Wolf, factory-r8f.8).
+    static final int RAIL_DEPTH_DP = 20;
     /** The Deacon's and a PM's fold column ({@link RailDisclosure}): a 48dp touch target. */
     static final int PM_CHEVRON_DP = 28;
     /**
@@ -876,6 +884,12 @@ final class FleetTree {
         }
 
         String name() { return project.name; }
+
+        /** Its id in projects.order: its name, or name#<PM's address> when two PMs here share it. */
+        String orderId = "";
+
+        /** The repo it sits in without a group (its section there: repo:<name>). */
+        String home = "";
 
         /** The PM or any of its workers is blocked: the row says so even while folded. */
         boolean blocked() { return project.tally[0] > 0; }
@@ -1021,18 +1035,29 @@ final class FleetTree {
             int c = a.compareToIgnoreCase(b);
             return c != 0 ? c : a.compareTo(b);
         });
+        // A PM's id in projects.order: its name, told apart by its address when two share it.
+        Map<String, Integer> sameName = new HashMap<>();
+        for (PmRow row : tree.allProjects) if (row.labelledPm()) sameName.merge(row.name(), 1, Integer::sum);
         for (PmRow row : tree.allProjects) {
             if (!row.labelledPm()) continue;
+            row.orderId = ProjectModel.orderId(row.name(), sameName.get(row.name()) > 1 ? row.pm.id : null);
+            row.home = repoGroup(row);
             if (!row.pm.group.isEmpty()) named.computeIfAbsent(row.pm.group, k -> new RepoRow(k, k)).add(row);
-            else repoGroup(groups, repoGroup(row), !row.project.repo.isEmpty()).add(row);
+            else repoGroup(groups, row.home, !row.project.repo.isEmpty()).add(row);
         }
+        org.json.JSONObject order = fleet.order;
         for (RepoRow group : named.values()) {
+            // By birth, then name (the desktop's fallback, factory-r8f.8), then Wolf's order of them.
             group.projects.sort((a, b) -> {
-                int c = a.name().compareToIgnoreCase(b.name());
+                int c = Long.compare(created(a.pm), created(b.pm));
                 return c != 0 ? c : a.name().compareTo(b.name());
             });
+            List<PmRow> placed = ProjectModel.orderBy(new ArrayList<>(group.projects), orderList(order, "grouped", group.name),
+                    r -> r.orderId, PmRow::name);
+            group.projects.clear();
+            group.projects.addAll(placed);
         }
-        tree.groups.addAll(named.values());
+        tree.groups.addAll(ProjectModel.orderBy(new ArrayList<>(named.values()), orderList(order, "groups", null), g -> g.name, null));
         for (PmRow row : tree.allProjects) {
             if (row.labelledPm()) continue;
             String name = repoGroup(row);
@@ -1071,8 +1096,52 @@ final class FleetTree {
             closedWorktrees(owner, fleet.git, open);
             if (!owner.closed.isEmpty()) repoGroup(groups, owner.name, true).catalogs.add(owner);
         }
-        for (RepoRow group : groups.values()) if (group.git) tree.repos.add(group);
-        for (RepoRow group : groups.values()) if (!group.git) tree.repos.add(group);
+        List<RepoRow> drawn = new ArrayList<>();
+        for (RepoRow group : groups.values()) if (group.git) drawn.add(group);
+        for (RepoRow group : groups.values()) if (!group.git) drawn.add(group);
+        // Wolf's order of the repos, and of each repo's PMs, over the rail's own (factory-r8f.8).
+        for (RepoRow repo : drawn) {
+            List<PmRow> placed = ProjectModel.orderBy(new ArrayList<>(repo.projects), orderList(order, "projects", repo.name),
+                    r -> r.orderId, PmRow::name);
+            repo.projects.clear();
+            repo.projects.addAll(placed);
+        }
+        tree.repos.addAll(ProjectModel.orderBy(drawn, orderList(order, "repos", null), g -> g.name, null));
+    }
+
+    /** One list of projects.order: a top list ({@code in} null) or {@code key[in]}; null when it has none. */
+    static List<String> orderList(org.json.JSONObject order, String key, String in) {
+        if (order == null) return null;
+        org.json.JSONArray a = in == null ? order.optJSONArray(key)
+                : order.optJSONObject(key) == null ? null : order.optJSONObject(key).optJSONArray(in);
+        if (a == null) return null;
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < a.length(); i++) if (a.opt(i) instanceof String) out.add(a.optString(i));
+        return out;
+    }
+
+    /**
+     * The rail's sections as drawn, for a drop's plan (RailOrder.dropPlan):
+     * the named groups, then the repos, each with its PMs (labelled PMs only:
+     * the rows that drag).
+     */
+    static List<RailOrder.Section> orderSections(PmTree tree) {
+        List<RailOrder.Section> out = new ArrayList<>();
+        for (RepoRow g : tree.groups) out.add(section(g, true));
+        for (RepoRow r : tree.repos) out.add(section(r, false));
+        return out;
+    }
+
+    private static RailOrder.Section section(RepoRow row, boolean group) {
+        RailOrder.Section s = new RailOrder.Section((group ? "group:" : "repo:") + row.name, row.name, group);
+        for (PmRow p : row.projects) {
+            if (!p.labelledPm()) continue;
+            RailOrder.Item item = new RailOrder.Item(p.name(), p.pm.id, p.pm.createdMs, p.pm.group.equals(p.pm.oldGroup) ? "" : p.pm.group,
+                    p.pm.oldGroup, p.home);
+            item.orderId = p.orderId;
+            s.projects.add(item);
+        }
+        return s;
     }
 
     /** A checkout row opens an agent when present, otherwise its first shell. */

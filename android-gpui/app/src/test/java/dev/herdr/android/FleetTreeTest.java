@@ -655,6 +655,53 @@ public final class FleetTreeTest {
         assertFalse(FleetTree.foldedByDefault(FleetTree.Fold.GROUP));
     }
 
+    @Test public void wolfsOrderPlacesTheGroupsTheirPmsAndTheReposPmsByBirthOtherwise() throws Exception {
+        FleetTree.Member factory = label(m("t2", "f", "factory", 1, 0, "/c/f", "idle"), "pm", "factory");
+        FleetTree.Member aswap = label(m("t6", "a", "aswap", 2, 0, "/c/a", "idle"), "pm", "aswap");
+        FleetTree.Member newpm = label(m("t5", "n", "newpm", 3, 0, "/c/n", "idle"), "pm", "newpm");
+        FleetTree.Member agents = label(m("t7", "g", "teammate", 4, 0, "/c/g", "idle"), "pm", "teammate");
+        factory.group = aswap.group = newpm.group = "herdr";
+        agents.group = "agents";
+        factory.createdMs = 30;
+        aswap.createdMs = 10;
+        newpm.createdMs = 20;
+        FleetTree.Fleet fleet = FleetTree.build(Arrays.asList(factory, aswap, newpm, agents), null);
+        // No order: groups by name, a group's PMs by birth (the desktop's fallback).
+        FleetTree.PmTree plain = FleetTree.pmTree(fleet);
+        assertEquals("agents", plain.groups.get(0).name);
+        assertEquals(Arrays.asList("aswap", "newpm", "factory"), names(plain.groups.get(1)));
+        // Wolf's order: his groups and his PMs in a group first; a new one after them.
+        fleet.order = new org.json.JSONObject("{\"repos\":[],\"projects\":{},\"groups\":[\"herdr\"],"
+                + "\"grouped\":{\"herdr\":[\"factory\",\"gone\",\"aswap\"]}}");
+        FleetTree.PmTree ordered = FleetTree.pmTree(fleet);
+        assertEquals("herdr", ordered.groups.get(0).name);
+        assertEquals(Arrays.asList("factory", "aswap", "newpm"), names(ordered.groups.get(0)));
+        // What a drop plans on: the sections as drawn, with each PM's order id and lead.
+        List<RailOrder.Section> sections = FleetTree.orderSections(ordered);
+        assertEquals("group:herdr", sections.get(0).key);
+        assertEquals("t2", sections.get(0).projects.get(0).lead);
+        assertEquals("factory", sections.get(0).projects.get(0).orderId);
+    }
+
+    private static List<String> names(FleetTree.RepoRow row) {
+        List<String> out = new ArrayList<>();
+        for (FleetTree.PmRow r : row.projects) out.add(r.name());
+        return out;
+    }
+
+    @Test public void theOlderGroupLabelGroupsTooAfterHerdrGroup() throws Exception {
+        org.json.JSONArray panes = new org.json.JSONArray("[{\"id\":\"t1\",\"role\":\"pm\",\"group\":\"new\",\"old_group\":\"old\"},"
+                + "{\"id\":\"t2\",\"labels\":{\"role\":\"pm\",\"group\":\"old\"}},"
+                + "{\"id\":\"t3\",\"labels\":{\"role\":\"pm\",\"herdr.group\":\"new\",\"group\":\"old\"}}]");
+        List<FleetTree.Member> got = FleetPanes.members(new org.json.JSONArray(), new org.json.JSONArray(), panes, FleetTree.Member::new);
+        assertEquals("new", got.get(0).group);
+        assertEquals("old", got.get(0).oldGroup);
+        assertEquals("old", got.get(1).group);
+        assertEquals("old", got.get(1).oldGroup);
+        assertEquals("new", got.get(2).group);
+        assertEquals("old", got.get(2).oldGroup);
+    }
+
     @Test public void aGroupNameIsPlainAndBounded() {
         assertEquals("herdr", FleetTree.groupName("  herdr "));
         assertEquals("", FleetTree.groupName(null));

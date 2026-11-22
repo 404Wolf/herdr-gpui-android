@@ -1138,6 +1138,15 @@ impl Connection<'_> {
                 self.call("terminal.kill", json!({"terminal":terminal}))?;
                 self.refresh()
             }
+            TabEdit::GroupSet { terminal, group } => {
+                // A PM dropped into another group, or back onto its repo (factory-r8f.8): its
+                // herdr.group label only, presentation; "" removes it.
+                self.call(
+                    "terminal.label",
+                    json!({"terminal":terminal,"labels":{"herdr.group":group.unwrap_or_default()}}),
+                )?;
+                self.refresh()
+            }
             TabEdit::DeaconStart { machine } => self.start_deacon(&machine, cols, rows).map(drop),
             TabEdit::GitLook { .. }
             | TabEdit::FileRead { .. }
@@ -1412,6 +1421,9 @@ pub(crate) enum TabEdit {
     OrderMove { scope: OrderScope, id: String, target: String, after: bool, shown: Vec<String> },
     Interrupt { terminal: String },
     Kill { terminal: String },
+    /// A PM's sidebar group (factory-r8f.8): `terminal`'s herdr.group label set to
+    /// `group`, or removed (None). Display only: no other label is written.
+    GroupSet { terminal: String, group: Option<String> },
     DeaconStart { machine: String },
     GitLook { paths: Vec<String> },
     /// `limit`: lines to read, at most FILE_LINES (the phone's offline copies ask for fewer).
@@ -1520,6 +1532,19 @@ impl TabEdit {
             }
             "pane.interrupt" => Self::Interrupt { terminal: id("terminal")? },
             "pane.kill" => Self::Kill { terminal: id("terminal")? },
+            "group.set" => Self::GroupSet {
+                // A lead on this core only, as window.new's.
+                terminal: id("terminal").filter(|t| !t.contains('/'))?,
+                group: match &value["group"] {
+                    Value::Null => None,
+                    v => Some(
+                        v.as_str()
+                            .map(str::trim)
+                            .filter(|g| !g.is_empty() && *g != "none" && g.chars().count() <= 40 && !g.chars().any(char::is_control))?
+                            .to_owned(),
+                    ),
+                },
+            },
             "deacon.start" => Self::DeaconStart { machine: name().unwrap_or_default() },
             "git.look" => Self::GitLook {
                 paths: {
@@ -2511,8 +2536,11 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             "issue": label("issue").unwrap_or(""),
             "task": label("task").unwrap_or(""),
             "helper": label("helper").unwrap_or(""),
-            // A PM's sidebar group (herdr.group, factory-r8f.6): presentation only.
-            "group": label("herdr.group").unwrap_or(""),
+            // A PM's sidebar group (factory-r8f.6): presentation only. herdr.group,
+            // else the older group= label, as every reader takes it (factory-r8f.8);
+            // the older label on its own too, which a drop never clears.
+            "group": label("herdr.group").or_else(|| label("group")).unwrap_or(""),
+            "old_group": label("group").unwrap_or(""),
             // What the deacon view shows under each agent: the program's own
             // status message, why it is blocked, and since when (core clock, ms).
             "msg": terminal["status"]["msg"].as_str().map(|m| m.chars().take(240).collect::<String>()).unwrap_or_default(),
@@ -2931,17 +2959,26 @@ b"}"#), None);
     }
 
     #[test]
-    fn a_pms_herdr_group_label_reaches_the_phone_and_nothing_else_makes_one() {
+    fn a_pms_group_reaches_the_phone_herdr_group_first() {
         let doc = json!({"spaces":[{"id":"s1","name":"work","tabs":[{"id":"x"}]}]});
         let terminals = json!([
             {"address":"t5","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"app","herdr.group":"herdr"},"title":"pm","status":{}},
             {"address":"t6","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"web","group":"not-ours"},"title":"pm","status":{}},
-            {"address":"t7","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","herdr.group":"x".repeat(129)},"title":"pm","status":{}}]);
+            {"address":"t7","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","herdr.group":"x".repeat(129)},"title":"pm","status":{}},
+            {"address":"t8","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"api","herdr.group":"new","group":"old"},"title":"pm","status":{}},
+            {"address":"t9","state":"live","labels":{"herdr.space":"s1","herdr.tab":"x","role":"pm","project":"cli"},"title":"pm","status":{}}]);
         let mut view = json!({"pane_id":"t5"});
         project(&mut view, &terminals, &doc).unwrap();
         let group = |id: &str| view["panes"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["group"].clone();
+        let old = |id: &str| view["panes"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["old_group"].clone();
         assert_eq!(group("t5"), "herdr");
-        assert_eq!(group("t6"), "", "only herdr.group names a group");
+        // herdr.group ?? group (factory-r8f.8): the older label groups too, and is said on its own.
+        assert_eq!(group("t6"), "not-ours");
+        assert_eq!(old("t6"), "not-ours");
+        assert_eq!(group("t8"), "new", "herdr.group comes first");
+        assert_eq!(old("t8"), "old");
+        assert_eq!(group("t9"), "");
+        assert_eq!(old("t9"), "");
         assert_eq!(group("t7"), "", "an overlong label is no group");
     }
 
@@ -3076,6 +3113,27 @@ b"}"#), None);
             moves += 1;
         }
         assert!(moves >= 6, "the fixture's move cases: {moves}");
+    }
+
+    #[test]
+    fn a_group_drop_sets_or_clears_herdr_group_only() {
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"group.set","terminal":"t5","group":" herdr "}"#),
+            Some(TabEdit::GroupSet { terminal: "t5".into(), group: Some("herdr".into()) })
+        );
+        assert_eq!(
+            TabEdit::parse(r#"{"op":"group.set","terminal":"t5","group":null}"#),
+            Some(TabEdit::GroupSet { terminal: "t5".into(), group: None })
+        );
+        for bad in [r#""group":"""#, r#""group":"none""#, r#""group":"a
+b""#, r#""group":7"#] {
+            let json = format!(r#"{{"op":"group.set","terminal":"t5",{bad}}}"#);
+            assert_eq!(TabEdit::parse(&json), None, "{bad}");
+        }
+        let long = format!(r#"{{"op":"group.set","terminal":"t5","group":"{}"}}"#, "x".repeat(41));
+        assert_eq!(TabEdit::parse(&long), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"group.set","terminal":"laptop/t5","group":"herdr"}"#), None);
+        assert_eq!(TabEdit::parse(r#"{"op":"group.set","group":"herdr"}"#), None);
     }
 
     #[test]
