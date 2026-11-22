@@ -57,10 +57,16 @@ public final class FleetSidebarTest {
     }
 
     @Test public void theLeadFoldIsATouchSizedButtonThatNamesWhatItHides() {
-        assertTrue(FleetTree.PM_CHEVRON_DP >= 48);
-        // Tighter rows (Wolf's OLED preview): each whole row is its tap target; the fold button is 48dp wide.
-        assertEquals(40, FleetTree.LEAD_ROW_DP);
-        assertEquals(32, FleetTree.AGENT_ROW_DP);
+        // The drawn column is 28dp, the chevron 8dp before its label (review D1); its touch reaches the
+        // screen's edge and 10dp into the label, so the target stays at least 48dp wide.
+        assertEquals(28, FleetTree.PM_CHEVRON_DP);
+        assertTrue(FleetTree.PM_CHEVRON_DP + RailDisclosure.REACH_DP + 7 >= 44);
+        assertEquals(8f, RailDisclosure.ARROW_AT_DP, 0f);
+        assertEquals(3f, RailDisclosure.ARM_DP, 0f);
+        // Rows: 36dp for leads and agents alike (30dp agent rows were easy to mis-tap).
+        assertEquals(36, FleetTree.LEAD_ROW_DP);
+        assertEquals(36, FleetTree.AGENT_ROW_DP);
+        assertEquals(16, FleetTree.RAIL_DEPTH_DP);
         assertTrue(RailDisclosure.SQUARE_DP <= 24);
         assertEquals("Show 3 rows under factory", FleetTree.foldSays("factory", false, 3, true, "k"));
         assertEquals("Hide 1 row under factory", FleetTree.foldSays("factory", false, 1, false, "k"));
@@ -71,6 +77,28 @@ public final class FleetSidebarTest {
         assertNull(FleetTree.foldSays(null, false, 2, true, "k"));
         assertEquals("collapsed", FleetTree.foldState(true));
         assertEquals("expanded", FleetTree.foldState(false));
+    }
+
+    @Test public void theActiveAgentsPathUnfoldsWhenTheRailOpensAndItsRowShows() throws java.io.IOException {
+        String ui = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        // Every way the rail opens asks for the reveal a switch gets (its group or repo and its PM unfold).
+        int opens = 0;
+        for (int at = ui.indexOf("revealedPane = \"\";"); at >= 0; at = ui.indexOf("revealedPane = \"\";", at + 1)) {
+            if (ui.startsWith("revealActiveOnOpen();", ui.indexOf('\n', at) + 1 + countSpaces(ui, ui.indexOf('\n', at) + 1))) opens++;
+        }
+        assertEquals(3, opens);
+        assertTrue(ui.contains("if (current != null) requestRailReveal(currentHostId, current.paneId);"));
+        // No disclosure square any more: only the chevron is drawn.
+        String disclosure = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/RailDisclosure.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertFalse(disclosure.contains("drawRoundRect"));
+    }
+
+    private static int countSpaces(String s, int from) {
+        int n = 0;
+        while (from + n < s.length() && s.charAt(from + n) == ' ') n++;
+        return n;
     }
 
     @Test public void deaconHelpersStepPastTheDeaconsFoldColumnLikeWorkers() {

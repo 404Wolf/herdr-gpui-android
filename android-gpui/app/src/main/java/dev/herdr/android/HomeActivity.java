@@ -515,6 +515,19 @@ public final class HomeActivity extends Activity {
     }
 
     /** Waiting for Wolf first, then failures, work, and the quiet ones. */
+    /**
+     * An agent row's second line: what it says (a question it asks) and its
+     * folder's changes, never a state word, the dot is the state (factory-jmc).
+     * A blocked or failed agent's own message ("blocked until …") is left out
+     * too: its red dot says it (Wolf); TalkBack still hears the message.
+     */
+    static String rowWords(String status, String msg, String changes) {
+        String said = "blocked".equals(status) || "error".equals(status) || msg == null ? "" : msg.trim();
+        String more = changes == null ? "" : changes;
+        if (more.isEmpty()) return said;
+        return said.isEmpty() ? more : said + " · " + more;
+    }
+
     private static int statusPriority(String status) {
         switch (status) {
             case "blocked": return 0;
@@ -1562,14 +1575,9 @@ public final class HomeActivity extends Activity {
         row.addView(dot(statusColor(agent.status)));
         LinearLayout lines = column();
         lines.addView(single(text(breadcrumb(agent), 12, chrome.onSurface)));
-        // What it says (a question it asks), not a state word: the dot is the state (factory-jmc).
-        String said = agent.msg;
         String changes = FleetTree.changes(agent.machine.git, agent.cwd);
-        if (!changes.isEmpty()) said = said.isEmpty() ? changes : said + " · " + changes;
-        if (!said.isEmpty()) {
-            lines.addView(single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
-                    : chrome.onSurfaceVariant)));
-        }
+        String said = rowWords(agent.status, agent.msg, changes);
+        if (!said.isEmpty()) lines.addView(single(text(said, 11, chrome.onSurfaceVariant)));
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
         row.setContentDescription(FleetPanes.displayTitle(agent) + ", " + statusWord(agent.status, agent.waitKind)
                 + (changes.isEmpty() ? "" : ", " + changes) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));

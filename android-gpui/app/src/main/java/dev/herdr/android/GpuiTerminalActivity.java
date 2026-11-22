@@ -581,7 +581,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         sidebarScroll.setVerticalScrollBarEnabled(false);
         sidebarRows = new LinearLayout(this);
         sidebarRows.setOrientation(LinearLayout.VERTICAL);
-        sidebarRows.setPadding(dp(6), dp(4), dp(6), dp(12));
+        // A little less from the screen's edge to the fold arrows (Wolf, 9zz.10).
+        sidebarRows.setPadding(dp(3), dp(4), dp(6), dp(12));
         sidebarScroll.addView(sidebarRows, new android.widget.FrameLayout.LayoutParams(-1, -2));
         // Hosts and workspaces exceed one screen; the fade says the list keeps going.
         android.widget.FrameLayout railFrame = new android.widget.FrameLayout(this);
@@ -611,6 +612,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         workPanel = new WorkPanel(this, chrome, workPanelHost());
         root.addView(workPanel.view(), new FrameLayout.LayoutParams(0, -1, android.view.Gravity.END));
         workPanel.attach();
+        panelDivider = new PanelDivider(this, chrome, this::choosePanel);
+        root.addView(panelDivider.divider(), new FrameLayout.LayoutParams(dp(PanelDivider.TOUCH_DP), -1, android.view.Gravity.START));
+        root.addView(panelDivider.preview(), new FrameLayout.LayoutParams(dp(2), -1, android.view.Gravity.START));
+        root.addView(panelDivider.edge(), new FrameLayout.LayoutParams(dp(WorkPanelLayout.EDGE_DP), dp(WorkPanelLayout.EDGE_TALL_DP),
+                android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL));
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
@@ -675,7 +681,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** No room to dock the rail: the cover, or the unfolded screen while the work panel takes its half. */
     private boolean railCompact() {
-        return compactWindow() || WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode());
+        return compactWindow() || WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode(),
+                panelChoice().hidden);
     }
 
     /** Opens the rail as a drawer over the terminal, never narrowing it. */
@@ -686,6 +693,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         applySidebarWidth();
         updateHostSampling();
         revealedPane = "";
+        revealActiveOnOpen();
         refreshSidebar(true);
     }
 
@@ -1329,9 +1337,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void applyWorkPanel() {
         if (workPanel == null || terminalRoot == null) return;
         int widthDp = getResources().getConfiguration().screenWidthDp;
-        WorkPanelLayout layout = WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen);
+        WorkPanelLayout.Choice choice = panelChoice();
+        WorkPanelLayout layout = WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen, choice);
         int rootWidth = root().getWidth();
-        int width = layout.overlay ? -1 : Math.max(dp(WorkPanelLayout.MIN_DP), Math.round(rootWidth * layout.share));
+        // Docked, Wolf's divider sets the share (each side keeps its minimum: WorkPanelLayout.clamp).
+        int width = layout.overlay ? -1 : Math.round(rootWidth * layout.share);
         FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) workPanel.view().getLayoutParams();
         if (at.width != (layout.shown ? width : 0)) {
             at.width = layout.shown ? width : 0;
@@ -1341,6 +1351,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (railColumns.getPaddingRight() != right) railColumns.setPadding(0, 0, right, 0);
         workPanel.show(layout.shown, layout.overlay);
         placeTopRight(layout.shown && !layout.overlay);
+        if (panelDivider != null) {
+            int[] origin = new int[2];
+            root().getLocationOnScreen(origin);
+            panelDivider.place(!compactWindow(), layout, choice, rootWidth - (layout.shown ? width : 0), rootWidth, origin[0]);
+        }
         if (workButton != null) {
             workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
             workButton.setSelected(layout.shown);
@@ -1367,6 +1382,29 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int height = docked ? dp(40) : -1;
         to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), height));
         to.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), height));
+    }
+
+    /** The terminal | panel divider (PanelDivider), and Wolf's split per orientation (factory-9zz.9). */
+    private PanelDivider panelDivider;
+
+    private String panelChoiceKey() {
+        return "work_panel_" + (getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                ? "land" : "port");
+    }
+
+    private WorkPanelLayout.Choice panelChoice() {
+        return WorkPanelLayout.Choice.parse(getSharedPreferences("terminal-display", MODE_PRIVATE).getString(panelChoiceKey(), ""));
+    }
+
+    /** A drag's release, the restoring edge swipe or TalkBack: kept, then one relayout (one terminal resize). */
+    private void choosePanel(WorkPanelLayout.Choice next) {
+        boolean was = panelChoice().hidden;
+        getSharedPreferences("terminal-display", MODE_PRIVATE).edit().putString(panelChoiceKey(), next.stored()).apply();
+        // TalkBack hears the change itself, once, on the release (not while dragging).
+        if (was != next.hidden) root().announceForAccessibility(next.hidden ? "Work panel hidden" : "Work panel restored");
+        applySidebarWidth();
+        refreshSidebar(true);
+        if (next.hidden) note("Work panel hidden · swipe in from the right edge to bring it back");
     }
 
     /** The cover's Work button and the panel's ×. */
@@ -2663,6 +2701,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         updateHostSampling();
         if (sidebarOpen) {
             revealedPane = "";
+            revealActiveOnOpen();
             refreshSidebar(true);
         }
     }
@@ -2703,6 +2742,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         updateHostSampling();
         if (opening) {
             revealedPane = "";
+            revealActiveOnOpen();
             refreshSidebar(true);
         }
     }
@@ -3708,8 +3748,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // seconds and replacing a view under a finger cancels its tap.
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
-        // Pinned agents first, on any machine: the one-tap way to another machine's agent (factory-9zz.2).
-        if (pinsRail != null) order.add(pinsRail.section(savedIds));
         // The machine this terminal is on leads the rail; the others follow in
         // saved order, so the top of the rail always names where you are.
         java.util.List<SavedRemoteHost> hosts = new java.util.ArrayList<>(savedHosts);
@@ -3740,6 +3778,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
+        }
+        // Pinned agents, on any machine, right under the machine chooser at the top (Wolf, 9zz.10):
+        // the one-tap way to another machine's agent (factory-9zz.2).
+        if (pinsRail != null) {
+            RailHostRow first = hosts.isEmpty() ? null : railHostRows.get("host:" + hosts.get(0).id);
+            int at = first == null ? -1 : order.indexOf(first.row);
+            order.add(at + 1, pinsRail.section(savedIds));
         }
         pruneRailRows(keep);
         commitRailOrder(order);
@@ -4046,6 +4091,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void requestRailReveal(String hostId, String paneId) {
         railPickedFocus = hostId == null || paneId == null || paneId.isEmpty() ? "" : hostId + "/" + paneId;
+    }
+
+    /**
+     * The rail opening: the agent on screen's path (its group or repository,
+     * its PM) unfolds and its row scrolls into view, as on a switch
+     * (factory-9zz.10); every other fold keeps Wolf's state.
+     */
+    private void revealActiveOnOpen() {
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        if (current != null) requestRailReveal(currentHostId, current.paneId);
     }
 
     /**
@@ -4731,8 +4787,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
         holder.mark.offerOn(holder.row);
         LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
-        markParams.setMarginEnd(dp(6));
         holder.row.addView(holder.mark, markParams);
+        // The drawn column is narrow (the chevron near its label); its touch reaches the edge and into the label.
+        holder.mark.extendTouch(holder.row);
         holder.label = railText("", 12, chrome.primary);
         holder.label.setTypeface(railMono(false));
         holder.row.addView(holder.label, new LinearLayout.LayoutParams(0, -2, 1));
@@ -4742,11 +4799,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         LinearLayout.LayoutParams metaParams = new LinearLayout.LayoutParams(-2, -2);
         metaParams.leftMargin = dp(6);
         holder.row.addView(holder.meta, metaParams);
-        TextView chevron = railText("›", 15, chrome.onSurfaceVariant);
-        chevron.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        LinearLayout.LayoutParams chevronParams = new LinearLayout.LayoutParams(-2, -2);
-        chevronParams.leftMargin = dp(4);
-        holder.row.addView(chevron, chevronParams);
+        // No trailing "›": the fold chevron is the row's one arrow (review D5).
         holder.row.setBackground(railBackground(false));
         holder.row.setOnLongClickListener(view -> {
             // A Fleet header (project, checkout slice, group) is not a physical
@@ -5019,8 +5072,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         });
         holder.mark.offerOn(holder.row);
         LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
-        markParams.setMarginEnd(dp(6));
         holder.row.addView(holder.mark, markParams);
+        // The drawn column is narrow (the chevron near its label); its touch reaches the edge and into the label.
+        holder.mark.extendTouch(holder.row);
         // Status as a small square mark (no ovals in the boxy rail).
         holder.dot = new View(this);
         holder.dot.setBackgroundColor(chrome.onSurfaceVariant);

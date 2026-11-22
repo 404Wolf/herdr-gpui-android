@@ -87,6 +87,11 @@ final class WorkPanel {
     private final LinearLayout root, tabs, body;
     private final ScrollView scroll;
     private final TextView overviewTab, tasksTab, close;
+    /** The overview's age, at the right of the tab row. */
+    private TextView age;
+    /** The panel's type (review P1-4): 14sp body on 20dp lines, 16dp sides, 14sp tabs. */
+    static final float BODY_SP = 14f, TAB_SP = 14f;
+    static final int LINE_DP = 20, SIDE_DP = 16;
     private PauseWatch pauses;
 
     // What is on screen.
@@ -149,6 +154,10 @@ final class WorkPanel {
         second.setMarginStart(dp(16));
         tabs.addView(tasksTab, second);
         tabs.addView(new View(activity), new LinearLayout.LayoutParams(0, 1, 1));
+        age = ActionSheet.label(activity, "", 12, chrome.onSurfaceVariant);
+        age.setSingleLine(true);
+        age.setVisibility(View.GONE);
+        tabs.addView(age, new LinearLayout.LayoutParams(-2, -2));
         close = ActionSheet.label(activity, "×", 20, chrome.onSurfaceVariant);
         close.setGravity(Gravity.CENTER);
         close.setBackground(ActionSheet.ripple(chrome));
@@ -166,7 +175,7 @@ final class WorkPanel {
         scroll = new ScrollView(activity);
         body = new LinearLayout(activity);
         body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(dp(12), dp(8), dp(12), dp(16));
+        body.setPadding(dp(SIDE_DP), dp(8), dp(SIDE_DP), dp(16));
         scroll.addView(body, new FrameLayout.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
     }
@@ -440,7 +449,7 @@ final class WorkPanel {
     // ---- drawing ----
 
     private TextView tab(String label, PanelModel.Tab which) {
-        TextView view = ActionSheet.label(activity, label, 13, chrome.onSurfaceVariant);
+        TextView view = ActionSheet.label(activity, label, TAB_SP, chrome.onSurfaceVariant);
         view.setGravity(Gravity.CENTER);
         view.setOnClickListener(v -> {
             if (tab == which) return;
@@ -468,6 +477,7 @@ final class WorkPanel {
         styleTab(tasksTab, now == PanelModel.Tab.TASKS);
         int y = force ? scrollOf[now.ordinal()] : scroll.getScrollY();
         body.removeAllViews();
+        showAge("", true);
         if (agent == null) body.addView(dim("Open an agent to see its overview and tasks."));
         else if (now == PanelModel.Tab.OVERVIEW) overview();
         else tasks();
@@ -496,7 +506,15 @@ final class WorkPanel {
 
     private void styleTab(TextView view, boolean selected) {
         view.setTextColor(selected ? chrome.onSurface : chrome.onSurfaceVariant);
-        view.setTypeface(Typeface.create("sans-serif-medium", selected ? Typeface.BOLD : Typeface.NORMAL));
+        view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        // The tab on screen: a 2dp accent underline under its label (review P1-4).
+        android.graphics.drawable.GradientDrawable line = new android.graphics.drawable.GradientDrawable();
+        line.setColor(chrome.primary);
+        android.graphics.drawable.LayerDrawable under = new android.graphics.drawable.LayerDrawable(
+                new android.graphics.drawable.Drawable[] {line});
+        under.setLayerGravity(0, Gravity.BOTTOM | Gravity.FILL_HORIZONTAL);
+        under.setLayerHeight(0, dp(2));
+        view.setBackground(selected ? under : null);
         view.setSelected(selected);
         view.setContentDescription(view.getText() + (selected ? ", selected tab" : ", tab"));
     }
@@ -521,10 +539,8 @@ final class WorkPanel {
             return;
         }
         DocModel.Freshness f = DocModel.freshness(d);
-        TextView age = dim(f.text + (error != null ? " · can't read it now: " + error : ""));
-        age.setGravity(Gravity.END);
-        age.setTextColor(f.level == DocModel.Level.OK && error == null ? chrome.onSurfaceVariant : chrome.warning);
-        body.addView(age);
+        // Its age sits in the tab row, not a row of its own (review P1-4).
+        showAge(f.text + (error != null ? " · can't read it now" : ""), f.level == DocModel.Level.OK && error == null);
         String header = DocModel.header(agent.label + "'s overview", name, machine, d.rev, d.rev, d.mtime);
         body.addView(markdown(d.text, header));
     }
@@ -705,8 +721,9 @@ final class WorkPanel {
         view.setQuote((start, end) -> host.quote(header, DocModel.quoteBody(md.sourceOf(start, end))));
         view.setText(spans(md), TextView.BufferType.SPANNABLE);
         view.setTextColor(chrome.onSurface);
-        view.setTextSize(13);
-        view.setLineSpacing(0, 1.2f);
+        view.setTextSize(BODY_SP);
+        if (android.os.Build.VERSION.SDK_INT >= 28) view.setLineHeight(dp(LINE_DP));
+        else view.setLineSpacing(0, 1.4f);
         view.setPadding(0, dp(2), 0, dp(4));
         return view;
     }
@@ -720,7 +737,8 @@ final class WorkPanel {
             switch (st.kind) {
                 case HEADING: {
                     int level = Integer.parseInt(st.value);
-                    s.setSpan(new RelativeSizeSpan(level == 1 ? 1.3f : level == 2 ? 1.18f : 1.08f), a, b, flags);
+                    // 18sp and 16sp over the 14sp body; deeper headings at the body's size, bold.
+                    s.setSpan(new RelativeSizeSpan(level == 1 ? 18f / BODY_SP : level == 2 ? 16f / BODY_SP : 1f), a, b, flags);
                     s.setSpan(new StyleSpan(Typeface.BOLD), a, b, flags);
                     break;
                 }
@@ -735,14 +753,25 @@ final class WorkPanel {
                     s.setSpan(new RelativeSizeSpan(0.9f), a, b, flags);
                     break;
                 case QUOTE: s.setSpan(new QuoteSpan(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x88)), a, b, flags); break;
-                case BULLET: s.setSpan(new LeadingMarginSpan.Standard(dp(14 * Integer.parseInt(st.value)), dp(14 * Integer.parseInt(st.value) + 12)), a, b, flags); break;
+                case BULLET: {
+                    // Wrapped lines hang at the item's text, just past its "• " or "1. ".
+                    int first = dp(14 * Integer.parseInt(st.value));
+                    String marker = md.text().substring(a, Math.min(b, md.text().indexOf(' ', a) + 1));
+                    s.setSpan(new LeadingMarginSpan.Standard(first, first + Math.round(bodyPaint().measureText(marker))), a, b, flags);
+                    break;
+                }
                 case RULE: s.setSpan(new ForegroundColorSpan(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x88)), a, b, flags); break;
                 default: s.setSpan(link(st), a, b, flags); break;
             }
         }
         // The blank line between blocks is a gap, not a full line.
         String t = md.text();
-        for (int i = t.indexOf("\n\n"); i >= 0; i = t.indexOf("\n\n", i + 2)) s.setSpan(new AbsoluteSizeSpan(dp(8)), i + 1, i + 2, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        // 20dp above a heading, 8dp between other blocks (the gap line is sized; review P1-4).
+        Set<Integer> headings = new HashSet<>();
+        for (MdText.Block b : md.blocks) if ("heading".equals(b.kind)) headings.add(b.start);
+        for (int i = t.indexOf("\n\n"); i >= 0; i = t.indexOf("\n\n", i + 2)) {
+            s.setSpan(new AbsoluteSizeSpan(dp(headings.contains(i + 2) ? 18 : 8)), i + 1, i + 2, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
         return s;
     }
 
@@ -774,6 +803,18 @@ final class WorkPanel {
         if (open.add(id)) openedAt.put(id, SystemClock.elapsedRealtime());
         redraw(true);
         main.post(tick);
+    }
+
+    private void showAge(String text, boolean ok) {
+        age.setText(text);
+        age.setTextColor(ok ? chrome.onSurfaceVariant : chrome.warning);
+        age.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    private TextPaint bodyPaint() {
+        TextPaint paint = new TextPaint();
+        paint.setTextSize(BODY_SP * activity.getResources().getDisplayMetrics().scaledDensity);
+        return paint;
     }
 
     private TextView heading(String text) {

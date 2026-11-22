@@ -13,6 +13,16 @@ public final class HomeAgentTextTest {
         assertEquals("no status", HomeActivity.statusWord("", ""));
     }
 
+    @Test public void aBlockedRowShowsNoBlockedUntilTextItsRedDotSaysIt() {
+        assertEquals("", HomeActivity.rowWords("blocked", "blocked until Wolf picks a design", ""));
+        assertEquals("", HomeActivity.rowWords("error", "crashed: exit 1", ""));
+        assertEquals("2 changed", HomeActivity.rowWords("blocked", "blocked until …", "2 changed"));
+        // Others still say what they ask, and their folder's changes.
+        assertEquals("Which branch? · 2 changed", HomeActivity.rowWords("idle", "Which branch?", "2 changed"));
+        assertEquals("Which branch?", HomeActivity.rowWords("working", " Which branch? ", ""));
+        assertEquals("", HomeActivity.rowWords("idle", null, null));
+    }
+
     @Test public void ageRoundsDownAndHidesWhenUnknown() {
         long now = 10L * 24 * 60 * 60_000;
         assertEquals("", HomeActivity.age(0, now));
