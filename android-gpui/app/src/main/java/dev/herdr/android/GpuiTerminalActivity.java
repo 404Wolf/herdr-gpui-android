@@ -1389,11 +1389,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void fitAroundCluster(View cluster) {
         boolean shows = cluster.getVisibility() == View.VISIBLE;
-        int height = shows ? cluster.getHeight() + dp(ActionBar.MARGIN_DP) : 0;
         boolean overPanel = workPanel != null && workPanel.view().getVisibility() == View.VISIBLE
                 && cluster.getLeft() >= workPanel.view().getLeft();
-        if (workPanel != null) workPanel.clearBottom(overPanel ? height : 0);
-        int below = shows && !overPanel ? height : 0;
+        if (workPanel != null) workPanel.clearCluster(overPanel && shows ? cluster : null);
+        int below = shows && !overPanel ? cluster.getHeight() + dp(ActionBar.MARGIN_DP) : 0;
         View content = terminalColumn == null || terminalColumn.getChildCount() == 0 ? null : terminalColumn.getChildAt(0);
         if (content == null) return;
         FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) content.getLayoutParams();
@@ -1416,7 +1415,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (from != null) from.removeView(v);
         }
         // Both bars are TOP_BAR_DP tall; 48 dp targets reach below them (PinButton.extendTouch,
-        // WorkPanel.extendTargets), never by making the bar taller.
+        // WorkPanel's target strip), never by making the bar taller.
         to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         to.addView(tabMenu, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         // Docked, the panel's header row is a 48 dp target strip drawn 30 dp tall: the glyphs

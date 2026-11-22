@@ -220,13 +220,32 @@ final class WorkPanel {
         return root;
     }
 
-    /** Room at the bottom of the panel's text for the composer's icon cluster floating over it. */
-    void clearBottom(int px) {
-        // The scroll's own padding (review A6): the cluster's measured height while it covers the
-        // panel, else the fixed default; never added to the body's (no double padding).
-        int bottom = px > 0 ? px : dp(BOTTOM_DP);
+    /**
+     * Room at the bottom of the panel's text for the composer's icon cluster
+     * floating over it ({@code null}: it doesn't cover the panel). Measured on
+     * screen, from the cluster's top to the scroll's own bottom, so the
+     * gesture inset and the cluster's margin below it count too (review C1:
+     * the cluster's height alone left the last lines under it). The scroll's
+     * own padding, never added to the body's.
+     */
+    void clearCluster(View cluster) {
+        int bottom = dp(BOTTOM_DP);
+        if (cluster != null && cluster.getVisibility() == View.VISIBLE && scroll.getHeight() > 0) {
+            int[] at = new int[2], over = new int[2];
+            scroll.getLocationOnScreen(at);
+            cluster.getLocationOnScreen(over);
+            bottom = clearance(at[1] + scroll.getHeight(), over[1], dp(CLEAR_GAP_DP), bottom);
+        }
         if (scroll.getPaddingBottom() == bottom) return;
         scroll.setPadding(0, 0, 0, bottom);
+    }
+
+    /** The space above the cluster's top the text clears by. */
+    static final int CLEAR_GAP_DP = 8;
+
+    /** The padding that lets the text's end scroll above a cluster whose top is at {@code clusterTop} (px, on screen). */
+    static int clearance(int scrollBottom, int clusterTop, int gapPx, int leastPx) {
+        return Math.max(leastPx, scrollBottom - clusterTop + gapPx);
     }
 
     /** Where the activity docks its top-right controls while the panel sits beside the terminal. */
