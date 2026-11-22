@@ -125,6 +125,8 @@ public final class GhostTextTest {
     @Test public void kindsTheRendererDoesNotKnowAreOther() {
         assertEquals("claude", GhostText.kind("claude"));
         assertEquals("codex", GhostText.kind("codex"));
+        assertEquals("Antigravity's prompt box is Claude's shape", "claude", GhostText.kind("agy"));
+        assertEquals("claude", GhostText.kind("antigravity"));
         assertEquals("other", GhostText.kind("aider"));
         assertEquals("other", GhostText.kind(null));
     }
