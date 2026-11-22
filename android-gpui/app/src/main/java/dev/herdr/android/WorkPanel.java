@@ -56,7 +56,7 @@ import java.util.concurrent.Executors;
  * is never pulled out from under a finger.
  */
 final class WorkPanel {
-    static final long DOC_MS = 10_000, STORES_MS = 30_000, TICK_MS = 1_000;
+    static final long TICK_MS = 1_000;
 
     /** What the activity gives the panel. */
     interface Host {
@@ -712,9 +712,13 @@ final class WorkPanel {
         final List<? extends FleetTree.Member> members;
         final java.util.function.Function<String, BeadCache.Entry> kept;
         final java.util.function.Function<String, String> key;
+        /** A bead the mirror lacks is read alone here (step()); elsewhere it waits for the mirror's next read. */
+        final boolean readsAlone;
 
         Where(String project, Set<String> open, Set<String> folded, List<? extends FleetTree.Member> members,
-                java.util.function.Function<String, BeadCache.Entry> kept, java.util.function.Function<String, String> key) {
+                java.util.function.Function<String, BeadCache.Entry> kept, java.util.function.Function<String, String> key,
+                boolean readsAlone) {
+            this.readsAlone = readsAlone;
             this.project = project;
             this.open = open;
             this.folded = folded;
@@ -725,7 +729,7 @@ final class WorkPanel {
     }
 
     private Where here() {
-        return new Where(agent.project, open, folded, members, this::kept, this::beadKey);
+        return new Where(agent.project, open, folded, members, this::kept, this::beadKey, true);
     }
 
     private View row(PanelModel.Row r, Where at) {
@@ -793,7 +797,9 @@ final class WorkPanel {
         BeadCache.Entry kept = at.kept.apply(id);
         if (kept == null) {
             String error = beadErrors.get(key);
-            box.addView(error != null ? warn("Can't read it: " + error) : new Skeleton(activity, chrome, 3, TEXT_SHAPE));
+            // Nothing reads a bead alone on another machine: say so rather than a skeleton that never ends.
+            box.addView(error != null ? warn("Can't read it: " + error)
+                    : at.readsAlone ? new Skeleton(activity, chrome, 3, TEXT_SHAPE) : dim("Its plan comes with that machine's next read."));
             return box;
         }
         BeadsModel.Detail d = BeadCache.detail(kept.text);
@@ -858,7 +864,7 @@ final class WorkPanel {
                 Where at = new Where(project, deaconOpen.computeIfAbsent(scope, k -> new HashSet<>()),
                         deaconFolded.computeIfAbsent(scope, k -> new HashSet<>()), who,
                         id -> b.bead(storeIn(project, id, machineStores), id),
-                        id -> scope + "\n" + id);
+                        id -> scope + "\n" + id, false);
                 for (PanelModel.Row r : PanelModel.rows(BeadsModel.beadTree(beads), at.folded, at.open)) {
                     PanelModel.Row deeper = new PanelModel.Row(r.node, r.depth + 1, r.epic, r.folded, r.open, r.progress, r.closedAfter);
                     body.addView(row(deeper, at));

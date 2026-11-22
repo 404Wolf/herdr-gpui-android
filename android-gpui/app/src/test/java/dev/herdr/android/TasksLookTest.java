@@ -61,6 +61,14 @@ public final class TasksLookTest {
         assertTrue(sig.contains(".append(storesKeptAt).append('|').append(storesAt);"));
     }
 
+    @Test public void theDeaconsOtherMachinesNeverWaitOnAReadThatNeverComes() throws IOException {
+        String panel = source("WorkPanel");
+        assertTrue(panel.contains("this::kept, this::beadKey, true);"));
+        assertTrue(panel.contains("id -> scope + \"\\n\" + id, false);"));
+        assertTrue(panel.contains(": at.readsAlone ? new Skeleton(activity, chrome, 3, TEXT_SHAPE) : dim("));
+        assertFalse(panel.contains("DOC_MS") || panel.contains("STORES_MS"));
+    }
+
     @Test public void loadingIsOneSkeletonNeverDots() throws IOException {
         for (String name : new String[] {"WorkPanel", "UsageView", "UsageModel"}) {
             String s = source(name);
