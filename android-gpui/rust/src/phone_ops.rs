@@ -38,6 +38,9 @@ exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 /// 6046ee51. They never write a store (DETAIL_SH keeps its own answers and
 /// freshness marks under ~/.cache/herdr-beads).
 const STORES_SH: &str = include_str!("beads/stores.sh");
+/// The phone's whole-store mirror (factory-9zz.14): each changed store's `bd export`, read-only,
+/// fingerprinted by its Dolt manifest's bytes so an unchanged store costs no bd at all.
+const DUMP_SH: &str = include_str!("beads/dump.sh");
 const COMMENTS_SH: &str = include_str!("beads/comments.sh");
 /// The phone's own: DETAIL_SH then COMMENTS_SH in one exec (beads/read.sh), so a
 /// bead's plan and comments arrive together, and none is read for a bead with none.
@@ -58,6 +61,8 @@ const STORE_ROOT: &str = "~/beads";
 const REPOS_FILE: &str = "~/.config/beads/repos.json";
 /// At most this many known `project=fingerprint` args (stores skipped when unchanged).
 const MAX_KNOWN: usize = 256;
+/// At most this many machines in a `machines.list` answer.
+const MAX_MACHINES: usize = 64;
 
 /// At most this many terminals in one detached tab.
 const MAX_TAB_TERMINALS: usize = 32;
@@ -77,6 +82,12 @@ pub(crate) enum PhoneOp {
     /// Every beads store's list (STORES_SH); `known` are `project=fingerprint`
     /// pairs from the last read, whose unchanged stores are not listed again.
     BeadsStores { known: Vec<String> },
+    /// Every beads store's whole export (DUMP_SH), for the phone's mirror; `known` as for
+    /// BeadsStores. `on` names another machine of this core (`machine.list`): the deacon's
+    /// Tasks read every machine through the one it is on.
+    BeadsDump { known: Vec<String>, on: Option<String> },
+    /// The machines this core knows (`machine.list`): their names and whether they are connected.
+    MachinesList,
     /// One bead (DETAIL_SH), from the store of `project` (a store name, or
     /// `repo:<name>`'s project): from the store's export when it can, else
     /// `bd show`; `confirm` asks bd itself (the export said "maybe").
@@ -119,6 +130,19 @@ impl PhoneOp {
                 let known = all.iter().map(|v| v.as_str().filter(|k| known_pair(k)).map(str::to_owned)).collect::<Option<_>>()?;
                 Some(Self::BeadsStores { known })
             }
+            "beads.dump" => {
+                only(&["known", "on"]).then_some(())?;
+                let all = value["known"].as_array().map_or(&[][..], Vec::as_slice);
+                (all.len() <= MAX_KNOWN).then_some(())?;
+                let known = all.iter().map(|v| v.as_str().filter(|k| known_pair(k)).map(str::to_owned)).collect::<Option<_>>()?;
+                let on = match &value["on"] {
+                    Value::Null => None,
+                    Value::String(m) if machine_name(m) => Some(m.clone()),
+                    _ => return None,
+                };
+                Some(Self::BeadsDump { known, on })
+            }
+            "machines.list" => only(&[]).then_some(Self::MachinesList),
             "beads.detail" => {
                 only(&["project", "id", "confirm"]).then_some(())?;
                 let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
@@ -200,6 +224,30 @@ impl PhoneOp {
                 let result = call("machine.exec", json!({"argv":argv,"timeout":20}))?;
                 Ok(script_reply(&result)?.to_string())
             }
+            Self::BeadsDump { known, on } => {
+                let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(DUMP_SH), json!(STORE_ROOT), json!(REPOS_FILE)];
+                argv.extend(known.iter().map(|k| json!(k)));
+                let mut params = json!({"argv":argv,"timeout":60});
+                if let Some(on) = on {
+                    params["on"] = json!(on);
+                }
+                let result = call("machine.exec", params)?;
+                Ok(script_reply(&result)?.to_string())
+            }
+            Self::MachinesList => {
+                let result = call("machine.list", json!({}))?;
+                let machines: Vec<Value> = result["machines"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .filter_map(|m| {
+                        let name = m["name"].as_str().filter(|n| machine_name(n))?;
+                        Some(json!({"name":name,"state":m["state"].as_str().unwrap_or(""),"temporary":m["temporary"] == true}))
+                    })
+                    .take(MAX_MACHINES)
+                    .collect();
+                Ok(json!({"queued":true,"machines":machines}).to_string())
+            }
             Self::BeadsDetail { project, id, confirm } => {
                 let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(DETAIL_SH), json!(STORE_ROOT), json!(REPOS_FILE), json!(project), json!(id)];
                 if *confirm {
@@ -229,6 +277,14 @@ impl PhoneOp {
             }
         }
     }
+}
+
+/// A machine's name as herdr-core gives it (`rohan` in `rohan/t7`): plain, short, no path.
+fn machine_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['-', '.'])
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// A store's name as STORES_SH prints it: a folder under the root, or `repo:<name>`.
@@ -725,6 +781,139 @@ mod tests {
         assert_eq!(stores["error"], "the beads read exited with 124");
     }
 
+    /// factory-9zz.14: the whole-store mirror, here or (the deacon's Tasks) on a named machine.
+    #[test]
+    fn the_beads_dump_takes_fingerprints_and_a_plain_machine_name() {
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.dump","known":["factory=2091239757.147"]}"#),
+            Some(PhoneOp::BeadsDump { known: vec!["factory=2091239757.147".into()], on: None })
+        );
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.dump","known":[],"on":"small-pickle"}"#),
+            Some(PhoneOp::BeadsDump { known: vec![], on: Some("small-pickle".into()) })
+        );
+        for bad in [r#""on":"../x""#, r#""on":"a b""#, r#""on":"-x""#, r#""on":"""#, r#""on":7"#, r#""known":["x=$(rm)"]"#, r#""root":"/""#] {
+            assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.dump",{bad}}}"#)), None, "{bad}");
+        }
+        assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.dump","on":"{}"}}"#, "m".repeat(65))), None);
+        let mut seen = Vec::new();
+        let reply = PhoneOp::BeadsDump { known: vec!["a=1.2".into()], on: Some("server".into()) }
+            .run(|method, params| {
+                seen.push((method.to_owned(), params));
+                Ok(exec(0, "\u{1e}a\n\u{1c}1.2\n\u{1f}same\n"))
+            })
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .unwrap_or_default();
+        assert_eq!(reply["text"], "\u{1e}a\n\u{1c}1.2\n\u{1f}same\n");
+        let (method, params) = &seen[0];
+        assert_eq!(method, "machine.exec");
+        assert_eq!(params["on"], "server");
+        assert_eq!(params["argv"][4], json!(DUMP_SH));
+        assert_eq!(params["argv"].as_array().and_then(|a| a.last().cloned()), Some(json!("a=1.2")));
+        // Here: no `on` at all, so the core runs it on its own machine.
+        let mut here = Vec::new();
+        let _ = PhoneOp::BeadsDump { known: vec![], on: None }.run(|_, params| {
+            here.push(params);
+            Ok(exec(0, ""))
+        });
+        assert!(here[0].get("on").is_none());
+    }
+
+    #[test]
+    fn the_machine_list_keeps_plain_names_only() {
+        assert_eq!(PhoneOp::parse(r#"{"op":"machines.list"}"#), Some(PhoneOp::MachinesList));
+        assert_eq!(PhoneOp::parse(r#"{"op":"machines.list","on":"x"}"#), None);
+        let reply = PhoneOp::MachinesList
+            .run(|method, _| {
+                assert_eq!(method, "machine.list");
+                Ok(json!({"machines":[
+                    {"name":"laptop","state":"connected","temporary":false,"target":"laptop"},
+                    {"name":"bad name","state":"connected"},
+                    {"name":"sandbox-1","state":"unreachable","temporary":true}]}))
+            })
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            reply["machines"],
+            json!([{"name":"laptop","state":"connected","temporary":false},{"name":"sandbox-1","state":"unreachable","temporary":true}])
+        );
+    }
+
+    /// DUMP_SH run for real against a fake bd: frames, gzip, "same" by the manifest's bytes
+    /// (not its mtime, which every read touches), and bd's failure said per store.
+    #[cfg(unix)]
+    #[test]
+    fn the_dump_script_frames_each_store_and_skips_unchanged_ones() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("herdr-dump-{}", std::process::id()));
+        let root = dir.join("beads");
+        let bin = dir.join("bin");
+        for store in ["alpha", "broken"] {
+            std::fs::create_dir_all(root.join(store).join(".beads/embeddeddolt/db/.dolt/noms"))?;
+            std::fs::write(root.join(store).join(".beads/embeddeddolt/db/.dolt/noms/manifest"), format!("5:{store}:root"))?;
+        }
+        std::fs::create_dir_all(&bin)?;
+        let bd = bin.join("bd");
+        std::fs::write(
+            &bd,
+            "#!/bin/sh\ncase \"$BEADS_DIR\" in *broken*) echo 'Error: locked' >&2; exit 3;; esac\n\
+             touch \"$BEADS_DIR\"/embeddeddolt/db/.dolt/noms/manifest\nprintf '{\"id\":\"a-1\",\"title\":\"One\"}\\n'\n",
+        )?;
+        std::process::Command::new("chmod").arg("+x").arg(&bd).status()?;
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let run = |known: &[&str]| -> std::io::Result<String> {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(DUMP_SH)
+                .arg("sh")
+                .arg(&root)
+                .arg(dir.join("none.json"))
+                .args(known)
+                .env("PATH", &path)
+                .output()?;
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let first = run(&[])?;
+        let chunks: Vec<&str> = first.split('\u{1e}').skip(1).collect();
+        assert_eq!(chunks.len(), 2, "{first}");
+        let alpha = chunks[0];
+        assert!(alpha.starts_with("alpha\n\u{1c}"), "{alpha}");
+        let mut lines = alpha.lines().skip(1);
+        let fp = lines.next().ok_or("no fingerprint")?.trim_start_matches('\u{1c}').to_owned();
+        assert!(known_pair(&format!("alpha={fp}")), "{fp}");
+        let encoding = lines.next().ok_or("no encoding")?.trim_start_matches('\u{1d}').to_owned();
+        let payload = base64::engine::general_purpose::STANDARD.decode(lines.next().ok_or("no payload")?)?;
+        let text = if encoding == "gzip" {
+            let mut gunzip = std::process::Command::new("gzip")
+                .arg("-dc")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            gunzip.stdin.take().ok_or("no stdin")?.write_all(&payload)?;
+            String::from_utf8(gunzip.wait_with_output()?.stdout)?
+        } else {
+            String::from_utf8(payload)?
+        };
+        assert_eq!(text, "{\"id\":\"a-1\",\"title\":\"One\"}\n");
+        assert_eq!(lines.next(), Some("\u{1f}0"));
+        assert!(
+            chunks[1].starts_with("broken\n") && chunks[1].contains("\u{1d}-\nError: locked") && chunks[1].ends_with("\u{1f}3\n"),
+            "{}",
+            chunks[1]
+        );
+        // The read touched the manifest's mtime, not its bytes: the store is still "same".
+        let again = run(&[&format!("alpha={fp}")])?;
+        assert!(again.contains(&format!("\u{1e}alpha\n\u{1c}{fp}\n\u{1f}same\n")), "{again}");
+        // A write (new bytes): exported again.
+        std::fs::write(root.join("alpha/.beads/embeddeddolt/db/.dolt/noms/manifest"), "5:alpha:next")?;
+        assert!(!run(&[&format!("alpha={fp}")])?.contains("\u{1f}same"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn a_status_doc_is_read_by_a_plain_name_under_deacon_work_only() {
         assert_eq!(PhoneOp::parse(r#"{"op":"doc.read","name":"_deacon"}"#), Some(PhoneOp::DocRead { name: "_deacon".into(), key: None }));
@@ -755,12 +944,15 @@ mod tests {
 
     #[test]
     fn the_beads_scripts_only_read() {
-        for script in [STORES_SH, DETAIL_SH, COMMENTS_SH] {
-            assert!(script.contains("--json"));
+        for script in [STORES_SH, DETAIL_SH, COMMENTS_SH, DUMP_SH] {
+            assert!(script.contains("--json") || script.contains("bd export >"));
             for write in ["bd update", "bd close", "bd create", "bd comment ", "bd delete", "bd sync", "rm -r", "rm -f \"$1", "rm -f \"$2"] {
                 assert!(!script.contains(write), "{write}");
             }
         }
+        // DUMP_SH removes only its own two mktemp files.
+        assert_eq!(DUMP_SH.matches("rm ").count(), 1);
+        assert!(DUMP_SH.contains(r#"trap 'rm -f "$out" "$err"' EXIT"#) && DUMP_SH.contains("out=$(mktemp"));
         // DETAIL_SH writes only its own answers and marks, under ~/.cache/herdr-beads, and prunes only there.
         assert!(DETAIL_SH.contains(r#"cache="${XDG_CACHE_HOME:-$HOME/.cache}/herdr-beads""#));
         assert_eq!(DETAIL_SH.matches("-delete").count(), 1);
@@ -776,6 +968,8 @@ mod tests {
         for op in [
             r#"{"op":"usage.look"}"#,
             r#"{"op":"beads.stores","known":[]}"#,
+            r#"{"op":"beads.dump","known":[]}"#,
+            r#"{"op":"machines.list"}"#,
             r#"{"op":"beads.detail","project":"demo","id":"demo-1.2"}"#,
             r#"{"op":"beads.comments","project":"demo","id":"demo-1.2"}"#,
             r#"{"op":"beads.read","project":"demo","id":"demo-1.2"}"#,
