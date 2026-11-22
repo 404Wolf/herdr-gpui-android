@@ -135,7 +135,7 @@ final class WorkPanel {
         thread.execute(cache::load);
         root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(chrome.surface);
+        root.setBackgroundColor(chrome.panel);
         root.setVisibility(View.GONE);
         tabs = new LinearLayout(activity);
         tabs.setGravity(Gravity.CENTER_VERTICAL);
@@ -155,7 +155,7 @@ final class WorkPanel {
         tabs.addView(close, new LinearLayout.LayoutParams(dp(48), dp(48)));
         root.addView(tabs, new LinearLayout.LayoutParams(-1, -2));
         View rule = new View(activity);
-        rule.setBackgroundColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x33));
+        rule.setBackgroundColor(chrome.outline);
         root.addView(rule, new LinearLayout.LayoutParams(-1, 1));
         scroll = new ScrollView(activity);
         body = new LinearLayout(activity);
@@ -702,7 +702,7 @@ final class WorkPanel {
 
     private CharSequence spans(MdText md) {
         SpannableStringBuilder s = new SpannableStringBuilder(md.text());
-        int dim = GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x33);
+        int dim = chrome.raised;
         for (MdText.Style st : md.styles) {
             if (st.end <= st.start && st.kind != MdText.Style.Kind.RULE) continue;
             int a = st.start, b = st.end, flags = Spanned.SPAN_EXCLUSIVE_EXCLUSIVE;

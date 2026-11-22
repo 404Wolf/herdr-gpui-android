@@ -2907,15 +2907,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         chip.setText(text);
         chip.setTextSize(12);
         chip.setSingleLine(true);
-        chip.setTextColor(active ? chrome.background : idle ? chrome.onSurfaceVariant : chrome.onSurface);
+        chip.setTextColor(idle && !active ? chrome.onSurfaceVariant : chrome.onSurface);
         chip.setGravity(android.view.Gravity.CENTER_VERTICAL);
         chip.setPadding(dp(7), 0, dp(7), 0);
         android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
         shape.setCornerRadius(dp(3));
-        shape.setColor(active ? chrome.primary : chrome.background);
-        shape.setStroke(dp(1), active ? chrome.primary : chrome.outline);
+        // The window on screen: the palette's quiet selected container (OLED: #17202e), not a bright accent fill.
+        shape.setColor(active ? chrome.selected : chrome.background);
+        shape.setStroke(dp(1), active ? chrome.selected : chrome.outline);
         chip.setBackground(new android.graphics.drawable.RippleDrawable(
-                android.content.res.ColorStateList.valueOf(chrome.selected), shape,
+                android.content.res.ColorStateList.valueOf(chrome.hover), shape,
                 new android.graphics.drawable.ColorDrawable(0xffffffff)));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(24));
         params.setMarginEnd(dp(3));
