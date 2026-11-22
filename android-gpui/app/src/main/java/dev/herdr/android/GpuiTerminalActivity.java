@@ -612,9 +612,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         workPanel = new WorkPanel(this, chrome, workPanelHost());
         root.addView(workPanel.view(), new FrameLayout.LayoutParams(0, -1, android.view.Gravity.END));
         workPanel.attach();
-        panelDivider = new PanelDivider(this, chrome, this::choosePanel);
+        panelDivider = new PanelDivider(this, chrome, this::choosePanel, this::dragPanel);
         root.addView(panelDivider.divider(), new FrameLayout.LayoutParams(dp(PanelDivider.TOUCH_DP), -1, android.view.Gravity.START));
-        root.addView(panelDivider.preview(), new FrameLayout.LayoutParams(dp(2), -1, android.view.Gravity.START));
         root.addView(panelDivider.edge(), new FrameLayout.LayoutParams(dp(WorkPanelLayout.EDGE_DP), dp(WorkPanelLayout.EDGE_TALL_DP),
                 android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL));
         // The composer's buttons (ActionBar): one row at the very bottom right of the whole app,
@@ -1344,7 +1343,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (workPanel == null || terminalRoot == null) return;
         int widthDp = getResources().getConfiguration().screenWidthDp;
         WorkPanelLayout.Choice choice = panelChoice();
-        WorkPanelLayout layout = WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen, choice);
+        // A finger on the divider or the edge: the panel is exactly where it is, nothing kept yet.
+        WorkPanelLayout layout = Float.isNaN(panelLive) || shellMode() || widthDp < WorkPanelLayout.COVER_DP
+                ? WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen, choice) : WorkPanelLayout.live(widthDp, panelLive);
         int rootWidth = root().getWidth();
         // Docked, Wolf's divider sets the share (each side keeps its minimum: WorkPanelLayout.clamp).
         int width = layout.overlay ? -1 : Math.round(rootWidth * layout.share);
@@ -1376,7 +1377,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void fitAboveActionBar(View bar) {
         int below = bar.getVisibility() == View.VISIBLE ? dp(ActionBar.HEIGHT_DP) : 0;
         for (View pane : new View[] {railColumns, workPanel == null ? null : workPanel.view(),
-                panelDivider == null ? null : panelDivider.divider(), panelDivider == null ? null : panelDivider.preview()}) {
+                panelDivider == null ? null : panelDivider.divider()}) {
             if (pane == null) continue;
             FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) pane.getLayoutParams();
             if (at.bottomMargin == below) continue;
@@ -1415,8 +1416,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return WorkPanelLayout.Choice.parse(getSharedPreferences("terminal-display", MODE_PRIVATE).getString(panelChoiceKey(), ""));
     }
 
-    /** A drag's release, the restoring edge swipe or TalkBack: kept, then one relayout (one terminal resize). */
+    /** The panel's share while a finger drags it (PanelDivider, at most once a frame); NaN otherwise. */
+    private float panelLive = Float.NaN;
+
+    /** Follows the finger: the panel and the terminal take the live width; NaN puts the kept choice back. */
+    private void dragPanel(float share) {
+        panelLive = share;
+        applyWorkPanel();
+    }
+
+    /** A drag's release, the reveal from the edge or TalkBack: kept, then laid out at it. */
     private void choosePanel(WorkPanelLayout.Choice next) {
+        panelLive = Float.NaN;
         boolean was = panelChoice().hidden;
         getSharedPreferences("terminal-display", MODE_PRIVATE).edit().putString(panelChoiceKey(), next.stored()).apply();
         // TalkBack hears the change itself, once, on the release (not while dragging).

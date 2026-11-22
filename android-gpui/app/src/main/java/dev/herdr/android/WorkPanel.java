@@ -91,7 +91,7 @@ final class WorkPanel {
     private TextView age;
     /** The panel's type (review P1-4): 14sp body on 20dp lines, 16dp sides, 14sp tabs. */
     static final float BODY_SP = 14f, TAB_SP = 14f;
-    static final int LINE_DP = 20, SIDE_DP = 16, BOTTOM_DP = 16;
+    static final int LINE_DP = 20, SIDE_DP = 16, BOTTOM_DP = 64;
     private PauseWatch pauses;
 
     // What is on screen.
@@ -176,9 +176,10 @@ final class WorkPanel {
         body = new LinearLayout(activity);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setPadding(dp(SIDE_DP), dp(8), dp(SIDE_DP), dp(8));
-        // Text stops 16 dp above the bar below, scrolled or at its end (review A6).
+        // The composer's icons float over the panel's bottom right (no bar): the
+        // text scrolls under them, and its end scrolls clear of them (review A6).
         scroll.setPadding(0, 0, 0, dp(BOTTOM_DP));
-        scroll.setClipToPadding(true);
+        scroll.setClipToPadding(false);
         scroll.addView(body, new FrameLayout.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
     }
