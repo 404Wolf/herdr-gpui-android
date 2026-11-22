@@ -38,7 +38,8 @@ final class RailScrollView extends ScrollView {
         } else if (action == MotionEvent.ACTION_MOVE) {
             float dx = event.getX() - downX;
             float dy = event.getY() - downY;
-            if (!claimed && dx < -claim && Math.abs(dx) > Math.abs(dy) * RATIO) {
+            // A drag that extends a text selection is the selection's, never a swipe that closes.
+            if (!claimed && dx < -claim && Math.abs(dx) > Math.abs(dy) * RATIO && !SelectableText.anySelected(this)) {
                 claimed = true;
                 return true;
             }
