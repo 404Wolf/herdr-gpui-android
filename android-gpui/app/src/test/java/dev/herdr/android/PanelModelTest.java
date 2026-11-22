@@ -99,7 +99,7 @@ public final class PanelModelTest {
     }
 
     @Test public void theActivityPlacesThePanelAndRoutesBackTypingAndQuotes() throws IOException {
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         assertTrue(gta.contains("return railShown().drawer(railCompact());"));
         assertTrue(gta.contains("WorkPanelLayout.splitsWithRail(getResources().getConfiguration().screenWidthDp, shellMode(),"));
         assertTrue(gta.contains("if (workPanelBack()) return;"));

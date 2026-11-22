@@ -11,8 +11,7 @@ import org.junit.Test;
 /** Audit A1: opening a connection never runs on the thread that pumps the terminal on screen. */
 public final class ConnectorSplitTest {
     private static String activity() throws Exception {
-        return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")),
-                StandardCharsets.UTF_8);
+        return TerminalSource.text();
     }
 
     private static String between(String text, String from, String to) {
@@ -24,7 +23,7 @@ public final class ConnectorSplitTest {
 
     @Test public void switchesAndReconnectsRunOnTheConnectorAndPumpsOnTheWorker() throws Exception {
         String gta = activity();
-        String switching = between(gta, "private void switchHost(SavedRemoteHost host, String pane, boolean picked) {",
+        String switching = between(gta, "    void switchHost(SavedRemoteHost host, String pane, boolean picked) {",
                 "private String awaitHostPane(");
         assertTrue(switching.contains("connector.execute(() -> {"));
         assertFalse("a switch never waits on the pump's thread", switching.contains("worker.execute("));

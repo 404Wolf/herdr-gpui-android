@@ -29,12 +29,12 @@ public final class RailArrivalTest {
     }
 
     @Test public void cachedRowsNeverForceTheirIdOnASwitch() throws IOException {
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         String to = gta.substring(gta.indexOf("private void switchToRailPane("), gta.indexOf("private volatile RailArrival railArriving;"));
         // Mirrored (live) rows open directly; cached ones switch without the id and are checked on arrival.
-        assertTrue(to.contains("if (mirrored || paneId == null || paneId.isEmpty()) { switchHost(host, paneId); return; }"));
-        assertTrue(to.contains("switchHost(host, null);"));
-        assertTrue(gta.contains("checkRailArrival(current);"));
+        assertTrue(to.contains("if (mirrored || paneId == null || paneId.isEmpty()) { a.switchHost(host, paneId); return; }"));
+        assertTrue(to.contains("a.switchHost(host, null);"));
+        assertTrue(gta.contains("rail.checkRailArrival(current);"));
         // The rail's own "open on another machine" paths all go through it.
         String rail = gta.substring(gta.indexOf("private void openRailPane("), gta.indexOf("private void openRailPane(") + 400);
         assertTrue(rail.contains("else switchToRailPane(host, paneId);"));

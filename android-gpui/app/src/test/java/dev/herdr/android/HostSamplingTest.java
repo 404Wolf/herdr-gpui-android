@@ -26,12 +26,12 @@ public final class HostSamplingTest {
     }
 
     @Test public void aHiddenMachinesChangeNeverRebuildsTheRail() throws IOException {
-        String gta = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), StandardCharsets.UTF_8);
+        String gta = TerminalSource.text();
         String sample = gta.substring(gta.indexOf("private void sampleHost(String hostId, HostSample sample) {"), gta.indexOf("private void sampleHost(String hostId, HostSample sample) {") + 4000);
         assertTrue(sample.contains("sample.nextPollAt = now + HostSampling.every(shown) - 500;"));
         assertTrue(sample.contains("if (shown) {\n                    sidebarSignature = \"\";"));
         assertFalse(sample.contains("if (sample.connected) sample.connected = true;"));
         // The rail's signature skips machines it doesn't show.
-        assertTrue(gta.contains("if (!railShows(host.id)) continue;"));
+        assertTrue(gta.contains("if (!a.railShows(host.id)) continue;"));
     }
 }

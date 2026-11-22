@@ -197,8 +197,7 @@ public final class UsageModelTest {
     }
 
     @Test public void theMenuOffersUsageOnlyWithHerdrAndAsksTheSameMachine() throws java.io.IOException {
-        String rail = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
-                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        String rail = TerminalSource.text();
         int start = rail.indexOf("private void showUsage(");
         String usage = rail.substring(start, rail.indexOf("private ImageButton iconButton(", start));
         assertTrue(usage.contains("!hostId.equals(now.hostId)"));
