@@ -127,7 +127,11 @@ final class RefFiles {
     /** The process's one store; its disk work runs on the caller's worker thread. */
     static synchronized RefFiles shared(android.content.Context context) {
         if (shared == null) {
-            shared = new RefFiles(new File(context.getApplicationContext().getNoBackupFilesDir(), "refs-v1"));
+            File dir = new File(context.getApplicationContext().getNoBackupFilesDir(), "refs-v1");
+            // The referenced files' share of the offline budget (1 GiB of a full one).
+            OfflineBudget budget = OfflineBudget.forFree(dir.getParentFile().getUsableSpace());
+            shared = new RefFiles(dir, new Budget(Math.min(MAX_TOTAL_BYTES, budget.refBytes), MAX_FILES, MAX_IDLE_MS,
+                    budget.freeFloorBytes, MAX_FILE_BYTES), dir.getParentFile()::getUsableSpace);
         }
         return shared;
     }

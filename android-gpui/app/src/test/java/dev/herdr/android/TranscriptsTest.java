@@ -104,12 +104,16 @@ public final class TranscriptsTest {
         Transcripts.Transcript open = store.open(key);
         assertEquals("kept", open.text);
         assertTrue(open.truncated);
-        // A file whose header names something else is a miss, whatever its name.
-        File file = store.file(key);
-        String body = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
-        Files.write(file.toPath(), body.replace("\"t5\"", "\"t9\"").getBytes(StandardCharsets.UTF_8));
+        // A header naming something else is a miss, whatever its name.
+        File head = store.head(key);
+        String header = new String(Files.readAllBytes(head.toPath()), StandardCharsets.UTF_8);
+        Files.write(head.toPath(), header.replace("\"t5\"", "\"t9\"").getBytes(StandardCharsets.UTF_8));
         assertNull(store.open(key));
-        Files.write(file.toPath(), "not a header\nkept".getBytes(StandardCharsets.UTF_8));
+        Files.write(head.toPath(), "not a header".getBytes(StandardCharsets.UTF_8));
+        assertNull(store.open(key));
+        // And so is a file kept before depth accrued (one header line, then the text).
+        File legacy = store.file(key);
+        Files.write(legacy.toPath(), "not a header\nkept".getBytes(StandardCharsets.UTF_8));
         assertNull(store.open(key));
     }
 
@@ -132,19 +136,19 @@ public final class TranscriptsTest {
         assertNull(store.open(TranscriptKey.of(A, "t1", 1L, INC)));
     }
 
-    @Test public void theOldestGoFirstWhenTheCountOrTheBytesWouldPassTheirBound() {
-        Transcripts store = store();
-        for (int i = 0; i < Transcripts.MAX_FILES + 5; i++) {
-            assertTrue(store.save(TranscriptKey.of(A, "t" + i, 1L, INC), "text " + i, false, 1_000 + i));
+    @Test public void theColdestGoFirstWhenTheCountWouldPassItsBound() {
+        Transcripts store = new Transcripts(dir.getRoot(), OfflineBudget.of(1L << 40, 0), () -> Long.MAX_VALUE, 8);
+        store.start();
+        for (int i = 0; i < 13; i++) {
+            assertTrue(store.save(TranscriptKey.of(A, "t" + i, 1L, INC), "text " + i, false, false, 1_000 + i));
         }
-        assertEquals(Transcripts.MAX_FILES, store.count());
-        assertNull("the oldest went", store.open(TranscriptKey.of(A, "t0", 1L, INC)));
-        assertNotNull(store.open(TranscriptKey.of(A, "t" + (Transcripts.MAX_FILES + 4), 1L, INC)));
-        assertTrue(store.bytes() <= Transcripts.MAX_TOTAL_BYTES);
-        // The newer of two copies of one terminal wins; an older save never replaces it.
+        assertEquals(8, store.count());
+        assertNull("the one that grew longest ago went", store.open(TranscriptKey.of(A, "t0", 1L, INC)));
+        assertNotNull(store.open(TranscriptKey.of(A, "t12", 1L, INC)));
+        // The newer of two reads of one terminal wins; an older read never replaces it.
         TranscriptKey key = TranscriptKey.of(A, "t50", 1L, INC);
-        assertTrue(store.save(key, "newer", false, 9_000));
-        assertFalse(store.save(key, "older", false, 8_000));
+        assertTrue(store.save(key, "newer", false, true, 9_000));
+        assertFalse(store.save(key, "older", false, true, 8_000));
         assertEquals("newer", store.open(key).text);
     }
 
@@ -188,21 +192,20 @@ public final class TranscriptsTest {
     @Test public void offlineRedesign_aFileFromBeforeTheScreenFlagCountsAsTheScreen() throws IOException {
         Transcripts store = store();
         TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
-        assertTrue(store.save(key, "old", false, false, 1_000));
-        File file = store.file(key);
-        String text = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
-        org.json.JSONObject header;
-        try {
-            header = new org.json.JSONObject(text.substring(0, text.indexOf('\n')));
-        } catch (org.json.JSONException broken) {
-            throw new AssertionError(broken);
-        }
-        assertFalse(header.optBoolean("screen", true));
-        header.remove("screen");
-        Files.write(file.toPath(), (header.toString() + text.substring(text.indexOf('\n')))
-                .getBytes(StandardCharsets.UTF_8));
+        // A stage-2 file: one header line with no "screen", then the text.
+        String header = "{\"v\":1,\"core\":\"core-a\",\"hostkey\":\"SHA256:host-a\",\"address\":\"t5\","
+                + "\"created_ms\":7,\"incarnation\":\"" + INC + "\",\"as_of_ms\":1000,\"truncated\":false}";
+        File legacy = store.file(key);
+        assertTrue(legacy.getParentFile().isDirectory() || legacy.getParentFile().mkdirs());
+        Files.write(legacy.toPath(), (header + "\nold").getBytes(StandardCharsets.UTF_8));
         store.observe(A, seen("t5", 7L, INC), 1_500);
-        assertTrue("unknown is not claimed as history", store.proven(A, "t5").screen);
+        Transcripts.Transcript old = store.proven(A, "t5");
+        assertEquals("old", old.text);
+        assertTrue("unknown is not claimed as history", old.screen);
+        // The next read replaces it with a kept transcript and the old file goes.
+        assertTrue(store.save(key, "new", false, false, 2_000));
+        assertFalse(legacy.exists());
+        assertEquals("new", store.proven(A, "t5").text);
     }
 
     // ---- what to read, when ----
@@ -289,5 +292,134 @@ public final class TranscriptsTest {
         store.observe(A, seen("t5", 7L, INC), 12);
         assertNull(store.proven(A, "t5"));
         assertEquals(0, store.count());
+    }
+
+    // ---- depth accrues, tapers with age, within the budget (offline redesign §7.2) ----
+
+    private static String rows(int from, int to) {
+        StringBuilder out = new StringBuilder();
+        for (int i = from; i < to; i++) out.append("row ").append(i).append('\n');
+        return out.toString();
+    }
+
+    @Test public void offlineRedesign_historyReadsJoinOnTheirOverlapAndGrowPastOneRead() {
+        Transcripts store = store();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        assertTrue(store.save(key, rows(0, 100) + "$ ", false, false, 1_000));
+        // The next read overlaps the last 60 rows and has moved on; the prompt line was being typed.
+        assertTrue(store.save(key, rows(40, 160) + "$ ls", false, false, 2_000));
+        String text = store.open(key).text;
+        assertTrue(text.startsWith("row 0\nrow 1\n"));
+        assertTrue(text.endsWith("row 159\n$ ls"));
+        assertEquals("each row once", 1, text.split("row 99\n", -1).length - 1);
+        assertFalse("the old prompt line was replaced", text.contains("$ \nrow 100"));
+        // A read with nothing new changes nothing.
+        long before = store.body(key).length();
+        assertTrue(store.save(key, rows(60, 160) + "$ ls", false, false, 3_000));
+        assertEquals(before, store.body(key).length());
+    }
+
+    @Test public void offlineRedesign_readsThatDoNotOverlapAreKeptApartByAGapRow() {
+        Transcripts store = store();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        assertTrue(store.save(key, rows(0, 100), false, false, 1_000));
+        assertTrue(store.save(key, rows(500, 600), false, false, 2_000));
+        String text = store.open(key).text;
+        assertTrue(text.contains("row 99\n" + Transcripts.GAP + "\nrow 500"));
+    }
+
+    @Test public void offlineRedesign_aScreenOnlyReadReplacesWhatWasKept() {
+        Transcripts store = store();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        assertTrue(store.save(key, rows(0, 10), false, true, 1_000));
+        assertTrue(store.save(key, rows(3, 13), false, true, 2_000));
+        assertEquals(rows(3, 13).trim(), store.open(key).text);
+        assertTrue(store.open(key).screen);
+    }
+
+    @Test public void offlineRedesign_openingReadsOnlyTheNewestWindow() {
+        Transcripts store = store();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        // Grow one transcript past the window by joined reads of 2,000 rows.
+        for (int start = 0; start < 10_000; start += 1_500) {
+            assertTrue(store.save(key, rows(start, start + 2_000), false, false, 1_000 + start));
+        }
+        Transcripts.Transcript t = store.open(key);
+        String[] lines = t.text.split("\n");
+        assertEquals(Transcripts.WINDOW_LINES, lines.length);
+        assertEquals("row 10999", lines[lines.length - 1]);
+        assertTrue("older lines are on disk, not shown", t.truncated);
+        assertTrue(store.body(key).length() > t.text.length());
+    }
+
+    @Test public void offlineRedesign_depthTapersWithAgeAndVeryOldTranscriptsGo() {
+        long day = OfflineBudget.DAY_MS;
+        Transcripts store = store();
+        TranscriptKey old = TranscriptKey.of(A, "t1", 1L, INC);
+        TranscriptKey stale = TranscriptKey.of(A, "t2", 1L, INC);
+        // 3 MiB of history each, grown at day 0.
+        StringBuilder big = new StringBuilder();
+        for (int start = 0; big.length() < 3 * 1024 * 1024; start += 2_000) big.append(rows(start, start + 2_000));
+        String text = big.toString();
+        for (TranscriptKey key : new TranscriptKey[] {old, stale}) {
+            for (int at = 0; at < text.length(); ) {
+                int end = Math.min(text.length(), text.lastIndexOf('\n', Math.min(text.length() - 1, at + 200_000)) + 1);
+                assertTrue(store.save(key, text.substring(at, end), false, false, 1 + at));
+                at = end;
+            }
+        }
+        assertTrue(store.body(old).length() > 2 * 1024 * 1024);
+        // Twelve days later (cool: 2 MiB) a write elsewhere tapers both to their newest 2 MiB.
+        TranscriptKey hot = TranscriptKey.of(A, "t3", 1L, INC);
+        assertTrue(store.save(hot, rows(0, 10), false, false, 12 * day));
+        assertTrue(store.body(old).length() <= 2 * 1024 * 1024);
+        assertTrue(store.open(old).text.endsWith(text.substring(text.lastIndexOf("row ", text.length() - 2)).trim()));
+        assertTrue(store.open(old).truncated);
+        // Past 90 days with no growth: gone. The hot one, read since, stays.
+        assertTrue(store.save(hot, rows(5, 20), false, false, 100 * day));
+        assertNull(store.open(old));
+        assertNull(store.open(stale));
+        assertNotNull(store.open(hot));
+    }
+
+    @Test public void offlineRedesign_theStoreKeepsItsShareOfTheBudgetColdestFirst() {
+        // A budget whose transcript share is 5/8 of 64 KiB = 40 KiB.
+        Transcripts store = new Transcripts(dir.getRoot(), OfflineBudget.of(64 * 1024, 0), () -> Long.MAX_VALUE);
+        store.start();
+        for (int i = 0; i < 20; i++) {
+            assertTrue(store.save(TranscriptKey.of(A, "t" + i, 1L, INC), rows(0, 400), false, false, 1_000 + i));
+            assertTrue("within the share after write " + i + ": " + store.bytes(), store.bytes() <= 40 * 1024);
+        }
+        assertNotNull("the newest stays", store.open(TranscriptKey.of(A, "t19", 1L, INC)));
+        assertNull("the coldest went", store.open(TranscriptKey.of(A, "t0", 1L, INC)));
+    }
+
+    @Test public void offlineRedesign_underTheFreeSpaceFloorNothingIsWrittenButReadsWork() {
+        long[] free = {Long.MAX_VALUE};
+        Transcripts store = new Transcripts(dir.getRoot(), OfflineBudget.of(1L << 30, 1_000), () -> free[0]);
+        store.start();
+        TranscriptKey key = TranscriptKey.of(A, "t5", 7L, INC);
+        assertTrue(store.save(key, "kept", false, false, 1_000));
+        free[0] = 999;
+        assertFalse(store.save(key, "kept\nmore", false, false, 2_000));
+        assertEquals("kept", store.open(key).text);
+    }
+
+    @Test public void offlineRedesign_theBudgetIsGenerousButASmallPhoneGetsLess() {
+        OfflineBudget phone = OfflineBudget.forFree(432L * 1000 * 1000 * 1000);
+        assertEquals(4 * OfflineBudget.GIB, phone.totalBytes);
+        assertEquals(2560 * OfflineBudget.MIB, phone.transcriptBytes);
+        assertEquals(512 * OfflineBudget.MIB, phone.paneBytes);
+        assertEquals(1024 * OfflineBudget.MIB, phone.refBytes);
+        assertEquals(8 * OfflineBudget.GIB, phone.freeFloorBytes);
+        // 20 GB free: 2 % of it.
+        assertEquals((long) (20e9 * 0.02), OfflineBudget.forFree(20_000_000_000L).totalBytes);
+        // The taper.
+        assertEquals(32 * OfflineBudget.MIB, OfflineBudget.depth(0));
+        assertEquals(8 * OfflineBudget.MIB, OfflineBudget.depth(2 * OfflineBudget.DAY_MS));
+        assertEquals(2 * OfflineBudget.MIB, OfflineBudget.depth(8 * OfflineBudget.DAY_MS));
+        assertEquals(512 * 1024, OfflineBudget.depth(31 * OfflineBudget.DAY_MS));
+        assertEquals(0, OfflineBudget.depth(90 * OfflineBudget.DAY_MS));
+        assertEquals(OfflineBudget.TOTAL_BYTES / 8, PaneSnapshots.MAX_TOTAL_BYTES);
     }
 }

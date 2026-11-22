@@ -328,7 +328,7 @@ The conversation stays readable with no link. While a reconnect runs, the last
 frame stays on screen, dimmed, and still scrolls through its own history on
 the phone. Whenever a session closes, the pane's terminal grid (history,
 screen and cursor, up to 4 MB) is saved in the app's no-backup storage, at
-most 16 panes and 32 MB in all. Opening a pane from Home while its computer is
+most 256 panes and 512 MB in all. Opening a pane from Home while its computer is
 unreachable, or returning to the terminal before it reconnects, draws that
 saved grid exactly as the program drew it, labelled "last saved screen ·
 HH:MM · may be outdated", until the live pane attaches. A dispatched action may
@@ -341,8 +341,17 @@ offers the bounded read (`read-bounded`) and program incarnations
 `terminal.read` at a time (never stitched, so a full-screen program is never
 scrolled), the agent on screen at most once a minute while it prints, and the
 other agents only on an unmetered network, each at most every five minutes.
-Each transcript is kept per computer, terminal and incarnation, up to 256 KB
-each, 48 transcripts and 16 MB in all, oldest first out. Offline, a pane offers
+Each transcript is kept per computer, terminal and incarnation. A read of
+history (a shell's scrollback, and later a stitched or conversation read) is
+joined to what is kept, on the lines the two share. Where reads do not overlap,
+a gap row says lines may be missing. A full-screen program's screen-only read
+replaces the copy. The cache is generous, on disk only. Its budget is 4 GB, or
+2% of the free space at start if that is less, and nothing is written under
+8 GB free. Transcripts get 2.5 GB of it, saved panes 0.5 GB, and files agents
+mention 1 GB. A transcript keeps its newest 32 MB while it grew in the last day,
+8 MB up to a week, 2 MB up to a month and 512 KB up to 90 days. After that it
+goes, and the coldest go first when the store is full. Opening one reads only
+its newest 4,000 lines (4 MB at most). Offline, a pane offers
 "transcript · as of HH:MM" only when the last list its computer gave over a
 direct link shows the same program still running there; the transcript opens
 at its newest line, scrolls back, and says it may be outdated. A core without
