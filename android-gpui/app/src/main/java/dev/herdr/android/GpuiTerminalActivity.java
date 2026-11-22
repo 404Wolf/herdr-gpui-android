@@ -540,7 +540,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         sidebarScroll.setVerticalScrollBarEnabled(false);
         sidebarRows = new LinearLayout(this);
         sidebarRows.setOrientation(LinearLayout.VERTICAL);
-        sidebarRows.setPadding(dp(6), dp(4), dp(6), dp(12));
+        // A little less from the screen's edge to the fold arrows (Wolf, 9zz.10).
+        sidebarRows.setPadding(dp(3), dp(4), dp(6), dp(12));
         sidebarScroll.addView(sidebarRows, new android.widget.FrameLayout.LayoutParams(-1, -2));
         // Hosts and workspaces exceed one screen; the fade says the list keeps going.
         android.widget.FrameLayout railFrame = new android.widget.FrameLayout(this);
@@ -645,6 +646,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         applySidebarWidth();
         updateHostSampling();
         revealedPane = "";
+        revealActiveOnOpen();
         refreshSidebar(true);
     }
 
@@ -2368,6 +2370,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         updateHostSampling();
         if (sidebarOpen) {
             revealedPane = "";
+            revealActiveOnOpen();
             refreshSidebar(true);
         }
     }
@@ -2408,6 +2411,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         updateHostSampling();
         if (opening) {
             revealedPane = "";
+            revealActiveOnOpen();
             refreshSidebar(true);
         }
     }
@@ -3424,8 +3428,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // seconds and replacing a view under a finger cancels its tap.
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
-        // Pinned agents first, on any machine: the one-tap way to another machine's agent (factory-9zz.2).
-        if (pinsRail != null) order.add(pinsRail.section(savedIds));
         // The machine this terminal is on leads the rail; the others follow in
         // saved order, so the top of the rail always names where you are.
         java.util.List<SavedRemoteHost> hosts = new java.util.ArrayList<>(savedHosts);
@@ -3456,6 +3458,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
+        }
+        // Pinned agents, on any machine, right under the machine chooser at the top (Wolf, 9zz.10):
+        // the one-tap way to another machine's agent (factory-9zz.2).
+        if (pinsRail != null) {
+            RailHostRow first = hosts.isEmpty() ? null : railHostRows.get("host:" + hosts.get(0).id);
+            int at = first == null ? -1 : order.indexOf(first.row);
+            order.add(at + 1, pinsRail.section(savedIds));
         }
         pruneRailRows(keep);
         commitRailOrder(order);
@@ -3762,6 +3771,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void requestRailReveal(String hostId, String paneId) {
         railPickedFocus = hostId == null || paneId == null || paneId.isEmpty() ? "" : hostId + "/" + paneId;
+    }
+
+    /**
+     * The rail opening: the agent on screen's path (its group or repository,
+     * its PM) unfolds and its row scrolls into view, as on a switch
+     * (factory-9zz.10); every other fold keeps Wolf's state.
+     */
+    private void revealActiveOnOpen() {
+        Connection current;
+        synchronized (stateLock) { current = connection; }
+        if (current != null) requestRailReveal(currentHostId, current.paneId);
     }
 
     /**

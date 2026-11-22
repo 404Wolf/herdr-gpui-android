@@ -6,7 +6,6 @@ import android.content.res.ColorStateList;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
-import android.graphics.RectF;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -16,32 +15,32 @@ import android.view.accessibility.AccessibilityNodeInfo;
 
 /**
  * The fold control in front of a Deacon or PM row of the rail: a 48dp column
- * the full height of the row, with a real chevron on an always-visible tonal
- * square, so it reads as a button and not as a count. Tapping it folds only;
+ * the full height of the row, with a small bare chevron near its label (no
+ * grey square: Wolf). Tapping it folds only;
  * the rest of the row keeps focusing the agent. A lead row with nothing to
  * fold keeps the empty column so titles line up and a first worker never
  * shifts the row; that column is part of the row (no press, no hairline, a
- * tap there is the row's). When it folds, a hairline on its trailing edge says
- * these are two targets, and its press ripples the square it draws.
+ * tap there is the row's). Its press ripples a small square around the
+ * chevron.
  */
 final class RailDisclosure extends View {
     /** Rotation of the chevron while folded (pointing right) and open (pointing down). */
     static final float FOLDED_DEGREES = 0f, OPEN_DEGREES = 90f;
     static final long SPIN_MS = 150;
     /**
-     * What it draws, small (Wolf: the arrows were much too large): a 20dp
-     * tonal square with a 5dp chevron in it. The touch target stays the
-     * whole 48dp column, the row's full height.
+     * What it draws, small (Wolf: the arrows were much too large, then
+     * smaller again): a bare 4dp chevron, no square behind it, near its label; a press ripples a
+     * 20dp square around it. The touch target stays the whole 48dp column,
+     * the row's full height.
      */
-    static final float SQUARE_DP = 20f, CORNER_DP = 5f, ARM_DP = 2.5f, STROKE_DP = 1.5f;
+    static final float SQUARE_DP = 20f, CORNER_DP = 5f, ARM_DP = 2f, STROKE_DP = 1.25f;
+    /** The chevron's centre, this far in from the column's end: close to its label, the whole column still the target. */
+    static final float ARROW_AT_DP = 11f;
 
     private final float density;
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint tone = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint hairline = new Paint();
     private final Path chevron = new Path();
     private final int pressColor;
-    private final RectF square = new RectF();
     private boolean shown;
     private boolean folded = true;
     private float degrees = FOLDED_DEGREES;
@@ -55,8 +54,6 @@ final class RailDisclosure extends View {
         stroke.setStrokeCap(Paint.Cap.ROUND);
         stroke.setStrokeJoin(Paint.Join.ROUND);
         stroke.setColor(chrome.onSurface);
-        tone.setColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x1F));
-        hairline.setColor(GpuiChrome.withAlpha(chrome.outline, 0x66));
         pressColor = GpuiChrome.withAlpha(chrome.primary, 0x40);
         setSaveFromParentEnabled(false);
         bind(false, true, null);
@@ -131,7 +128,8 @@ final class RailDisclosure extends View {
         square.setColor(0xffffffff);
         square.setCornerRadius(CORNER_DP * density);
         int half = Math.round(SQUARE_DP / 2 * density);
-        int dx = Math.max(0, (w - Math.round(density)) / 2 - half), dy = Math.max(0, h / 2 - half);
+        int cx = w - Math.round(ARROW_AT_DP * density);
+        int dx = Math.max(0, cx - half), dy = Math.max(0, h / 2 - half);
         InsetDrawable mask = new InsetDrawable(square, dx, dy, Math.max(0, w - dx - 2 * half), dy);
         return new RippleDrawable(ColorStateList.valueOf(pressColor), null, mask);
     }
@@ -150,11 +148,8 @@ final class RailDisclosure extends View {
         super.onDraw(canvas);
         if (!shown) return;
         float w = getWidth(), h = getHeight();
-        canvas.drawRect(w - density, h * 0.2f, w, h * 0.8f, hairline);
-        float cx = (w - density) / 2f, cy = h / 2f;
-        float half = SQUARE_DP / 2 * density;
-        square.set(cx - half, cy - half, cx + half, cy + half);
-        canvas.drawRoundRect(square, CORNER_DP * density, CORNER_DP * density, tone);
+        // A bare chevron (Wolf: no grey square), towards the label: centred on the column's last ARROW_AT_DP.
+        float cx = w - ARROW_AT_DP * density, cy = h / 2f;
         // A small chevron "›" (ARM_DP across, twice that tall), centred on the square.
         float arm = ARM_DP * density;
         chevron.rewind();
