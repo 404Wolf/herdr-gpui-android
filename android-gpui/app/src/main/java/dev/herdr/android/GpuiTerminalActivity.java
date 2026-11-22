@@ -823,10 +823,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /** Choosing a destination in the drawer closes it, as Android's drawers do. */
-    void closeRailDrawer() {
-        if (railAsDrawer()) hideSidebar();
-    }
-
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
         // Back puts the composer's keyboard away first (and any other keyboard that is up).
