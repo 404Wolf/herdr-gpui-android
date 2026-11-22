@@ -44,7 +44,7 @@ final class ConnectionMonitor {
     private final Runnable goneCheck = this::goneCheck;
     /** A physical network was seen since start: an empty set means they were lost, not unknown yet. */
     private boolean seenPhysical;
-    /** Every physical network was lost and none came back: the link cannot be up. Any thread. */
+    /** Every physical network was lost and none came back yet: the link cannot be up. Any thread. */
     private volatile boolean noNetwork;
     private boolean started;
     private boolean wanted;
@@ -79,6 +79,9 @@ final class ConnectionMonitor {
             main.post(() -> {
                 if (!physical.remove(network)) return;
                 if (physical.isEmpty() && seenPhysical) {
+                    // In doubt at once (a drag sends nothing from now on); the live link is
+                    // given up only after the grace, so a handover gap costs no reconnect.
+                    noNetwork = true;
                     main.removeCallbacks(goneCheck);
                     main.postDelayed(goneCheck, GONE_GRACE_MS);
                 }
@@ -216,7 +219,6 @@ final class ConnectionMonitor {
     /** Still no network after the grace: the live link is gone. Main thread. */
     private void goneCheck() {
         if (!started || !physical.isEmpty()) return;
-        noNetwork = true;
         android.util.Log.i("herdr-net", "no network");
         gone.run();
     }
