@@ -2409,6 +2409,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             // The repo a project sits under, when a label says so (item 61).
             "repo": label("repo").unwrap_or(""),
             "kind": kind.unwrap_or(""),
+            // The agent's session id (factory-9zz.12): the phone asks for its history by it.
+            "session": label("agent.session").filter(|s| crate::agent_history::plain_session(s)).unwrap_or(""),
             // Its hc name ("phone-rail"): what the phone's rows call it, never its id (factory-jmc).
             "name": terminal["name"].as_str().filter(|n| !n.is_empty() && n.len() <= 128).unwrap_or(""),
             // The factory's join labels: the bead a worker is on, a helper's role (BeadsModel).

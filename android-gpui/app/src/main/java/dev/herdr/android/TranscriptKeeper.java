@@ -21,6 +21,11 @@ final class TranscriptKeeper {
     /** The bounded read; {@code RemoteNative::readTranscript} in the app. */
     interface Wire {
         String read(long handle, String terminal, int lines, int maxBytes);
+
+        /** A phone op on the same session (RemoteNative::sessionAction): the agent's history. */
+        default String op(long handle, String json) {
+            return null;
+        }
     }
 
     /** The most rows of history one read asks for. */
@@ -31,8 +36,16 @@ final class TranscriptKeeper {
     /** The process's one keeper: a read thread and a disk thread of its own, low priority. */
     static synchronized TranscriptKeeper shared(android.content.Context context) {
         if (shared == null) {
+            Wire wire = new Wire() {
+                @Override public String read(long handle, String terminal, int lines, int maxBytes) {
+                    return RemoteNative.readTranscript(handle, terminal, lines, maxBytes);
+                }
+                @Override public String op(long handle, String json) {
+                    return RemoteNative.sessionAction(handle, json);
+                }
+            };
             shared = new TranscriptKeeper(Transcripts.shared(context), thread("herdr-transcripts-disk"),
-                    thread("herdr-transcripts-read"), RemoteNative::readTranscript,
+                    thread("herdr-transcripts-read"), wire,
                     android.os.SystemClock::elapsedRealtime, System::currentTimeMillis);
         }
         return shared;
@@ -147,9 +160,10 @@ final class TranscriptKeeper {
         TranscriptPlanner.Pane pane = null;
         for (TranscriptPlanner.Pane p : panes) if (p.address.equals(address)) pane = p;
         Long created = pane == null ? null : pane.createdMs;
+        String[] agent = agentOf(link.panes, address);
         reader.execute(() -> {
             try {
-                read(link, address, created);
+                read(link, address, created, agent);
             } finally {
                 synchronized (this) {
                     planner.finished(address, elapsed.getAsLong());
@@ -158,7 +172,71 @@ final class TranscriptKeeper {
         });
     }
 
-    private void read(Link link, String address, Long created) {
+    /** {kind, session} of {@code address} in a poll's list (the terminal's own labels), or null. */
+    static String[] agentOf(JSONArray list, String address) {
+        for (int i = 0; list != null && i < list.length(); i++) {
+            JSONObject p = list.optJSONObject(i);
+            if (p == null || !address.equals(p.optString("id", ""))) continue;
+            String kind = p.optString("kind", ""), session = p.optString("session", "");
+            if (!("claude".equals(kind) || "codex".equals(kind)) || !plainSession(session)) return null;
+            return new String[] {kind, session};
+        }
+        return null;
+    }
+
+    static boolean plainSession(String id) {
+        if (id == null || id.isEmpty() || id.length() > 128) return false;
+        for (int i = 0; i < id.length(); i++) {
+            char c = id.charAt(i);
+            if (!(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-')) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Where each kept agent's session file was found and its size:mtime when last read, per
+     * transcript identity (machine, terminal, creation, incarnation): the file is searched for
+     * once, then only checked, and read again only when it changed (factory-9zz.12).
+     */
+    private final Map<TranscriptKey, String[]> historyAt = new HashMap<>();
+
+    /**
+     * The agent's history from its own session file, for a full-screen agent whose read gave
+     * only its screen: saved as its transcript (not "screen only"). True when the kept history
+     * stands (new, or unchanged since it was saved), so the screen read is not saved over it.
+     */
+    boolean readHistory(Link link, TranscriptKey key, String[] agent) {
+        if (agent == null) return false;
+        String[] at;
+        synchronized (this) { at = historyAt.get(key); }
+        String reply;
+        try {
+            JSONObject ask = new JSONObject().put("op", "agent.history").put("kind", agent[0]).put("session", agent[1]);
+            if (at != null) ask.put("path", at[0]).put("key", at[1]);
+            reply = wire.op(link.handle, ask.toString());
+        } catch (JSONException | RuntimeException failed) {
+            return false;
+        }
+        if (reply == null) return false;
+        JSONObject answer;
+        try {
+            answer = new JSONObject(reply);
+        } catch (JSONException unreadable) {
+            return false;
+        }
+        if (answer.has("unavailable") || answer.has("error")) return false;
+        String path = answer.optString("path", ""), fileKey = answer.optString("key", "");
+        if (answer.optBoolean("same", false)) return at != null;
+        if (!answer.has("text") || path.isEmpty()) return false;
+        synchronized (this) { historyAt.put(key, new String[] {path, fileKey}); }
+        String text = answer.optString("text", "");
+        boolean truncated = answer.optBoolean("truncated", false);
+        long asOf = wall.getAsLong();
+        disk.execute(() -> store.save(key, text, truncated, false, asOf));
+        return true;
+    }
+
+    private void read(Link link, String address, Long created, String[] agent) {
         String reply;
         try {
             reply = wire.read(link.handle, address, LINES, Transcripts.MAX_TEXT_BYTES);
@@ -188,6 +266,8 @@ final class TranscriptKeeper {
         boolean truncated = answer.optBoolean("truncated", false);
         // An answer that does not say is not claimed as history.
         boolean screen = answer.optBoolean("screen", true);
+        // A full-screen agent's screen is not its history: its own session file is (9zz.12).
+        if (screen && readHistory(link, key, agent)) return;
         long asOf = wall.getAsLong();
         disk.execute(() -> store.save(key, text, truncated, screen, asOf));
     }
