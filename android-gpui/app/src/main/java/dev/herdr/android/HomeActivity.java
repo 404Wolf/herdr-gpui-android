@@ -83,12 +83,7 @@ public final class HomeActivity extends Activity {
         long gitAt;
         boolean gitBusy;
         Set<String> gitAsked = new HashSet<>();
-        /** Start Deacon / New project / opening a worktree: in flight, and the last error. */
-        boolean deaconBusy, projectBusy;
-        /** A Deacon just launched, not yet confirmed running: its terminal and when. */
-        String deaconPending = "";
-        long deaconPendingAt;
-        String deaconError = "", projectError = "";
+        // Start Deacon and New project live in DeaconFlow, shared with the rail (audit PR 10).
         /** The navigation intent and session that requested this Deacon, including its polling stage. */
         long deaconNavigation, deaconHandle;
         final Set<String> opening = new HashSet<>();
@@ -1017,11 +1012,10 @@ public final class HomeActivity extends Activity {
         // A cached view is drawn as it was, in full colour (the machine row says
         // offline); it is live only once this session lists terminals.
         boolean ready = live(machine);
-        if (fleet.deacon != null && deaconGuard(machine) > 0 && machine.deaconPending.isEmpty()) clearDeaconGuard(machine);
+        DeaconFlow.State flowed = deaconFlow.of(machine.host.id);
+        if (fleet.deacon != null && deaconGuard(machine) > 0 && flowed.pending.isEmpty()) clearDeaconGuard(machine);
         // Claude runs there again (Wolf started it): the failure no longer applies.
-        if (fleet.deacon != null && machine.deaconPending.isEmpty() && !fleet.deacon.status.isEmpty()) {
-            machine.deaconError = "";
-        }
+        if (fleet.deacon != null && !fleet.deacon.status.isEmpty()) deaconFlow.running(machine.host.id);
         maybeLookGit(machine, all, ready, false);
 
         // The computer picker: name, agents, how many need you, ▾ for the others.
@@ -1038,9 +1032,9 @@ public final class HomeActivity extends Activity {
         meta.setSingleLine(true);
         meta.setEllipsize(TextUtils.TruncateAt.END);
         row.addView(meta, new LinearLayout.LayoutParams(0, -2, 1));
-        switch (FleetTree.deaconAction(ready, fleet.deacon, machine.deaconBusy || deaconGuard(machine) > 0)) {
+        switch (FleetTree.deaconAction(ready, fleet.deacon, flowed.busy() || deaconGuard(machine) > 0)) {
             case OPEN:
-                if (!machine.deaconPending.isEmpty()) row.addView(chip("Starting…", false, null));
+                if (!flowed.pending.isEmpty()) row.addView(chip("Starting…", false, null));
                 else row.addView(chip("Deacon", true, () -> openAgent((Agent) fleet.deacon)));
                 break;
             case START: row.addView(chip("Start Deacon", true, () -> startDeacon(machine))); break;
@@ -1049,7 +1043,7 @@ public final class HomeActivity extends Activity {
             default: row.addView(chip(fleet.deacon != null ? "Deacon" : "Start Deacon", false, null)); break;
         }
         {
-            TextView plus = chip("+", ready && !machine.projectBusy && !machine.deaconBusy, () -> {
+            TextView plus = chip("+", ready && !flowed.asking && !flowed.starting, () -> {
                 if (fleet.deacon != null) newProject(machine, (Agent) fleet.deacon);
                 else startDeacon(machine);
             });
@@ -1105,13 +1099,14 @@ public final class HomeActivity extends Activity {
      * New project itself is the computer row's +.
      */
     private void deaconRows(Machine machine, FleetTree.PmTree tree, boolean ready) {
+        DeaconFlow.State flowed = deaconFlow.of(machine.host.id);
         if (tree.deacon == null) {
-            boolean busy = machine.deaconBusy || deaconGuard(machine) > 0;
-            String said = !ready ? "No Deacon. Connect this computer to start one."
-                    : busy ? "Starting the Deacon…"
-                    : machine.deaconError.isEmpty() ? "No Deacon on this computer. Tap to start one."
-                    : "Could not start the Deacon: " + machine.deaconError + ". Tap to try again.";
-            deaconCard.addView(actionLine("", null, "◆", said, machine.deaconError.isEmpty()
+            boolean busy = flowed.busy() || deaconGuard(machine) > 0;
+            String said = !ready ? DeaconFlow.none(false, "this computer")
+                    : busy ? DeaconFlow.starting(machine.host.name)
+                    : flowed.error.isEmpty() ? DeaconFlow.none(true, machine.host.name)
+                    : DeaconFlow.couldNotStart(flowed.error);
+            deaconCard.addView(actionLine("", null, "◆", said, flowed.error.isEmpty()
                     ? chrome.onSurfaceVariant : chrome.danger, ready && !busy ? () -> startDeacon(machine) : null));
             return;
         }
@@ -1128,19 +1123,19 @@ public final class HomeActivity extends Activity {
             top.kids.add(new Row((guide, self) -> agentLine(guide, agent, "", null, null, "")));
         }
         emit(deaconCard, top, "", true, 0);
-        if (deacon.id.equals(machine.deaconPending)) {
-            deaconCard.addView(actionLine("   ", null, "◆", "Starting the Deacon on " + machine.host.name + "…",
+        if (deacon.id.equals(flowed.pending)) {
+            deaconCard.addView(actionLine("   ", null, "◆", DeaconFlow.starting(machine.host.name),
                     chrome.onSurfaceVariant, null));
-        } else if (!machine.deaconError.isEmpty() || !FleetTree.running(deacon)) {
-            String said = machine.deaconError.isEmpty() ? notRunning(machine) : machine.deaconError;
+        } else if (!flowed.error.isEmpty() || !FleetTree.running(deacon)) {
+            String said = flowed.error.isEmpty() ? DeaconFlow.notRunning(machine.host.name) : flowed.error;
             deaconCard.addView(actionLine("   ", null, "!", said + ". Tap to open it.", chrome.danger,
                     () -> openAgent(deacon)));
         }
-        if (machine.projectBusy) {
-            deaconCard.addView(actionLine("   ", null, "+", "Asking the Deacon…", chrome.onSurfaceVariant, null));
-        } else if (!machine.projectError.isEmpty()) {
-            deaconCard.addView(actionLine("   ", null, "+", "Could not reach the Deacon: " + machine.projectError
-                    + ". Tap to try again.", chrome.danger, ready ? () -> newProject(machine, deacon) : null));
+        if (flowed.asking) {
+            deaconCard.addView(actionLine("   ", null, "+", DeaconFlow.asking(), chrome.onSurfaceVariant, null));
+        } else if (!flowed.askError.isEmpty()) {
+            deaconCard.addView(actionLine("   ", null, "+", DeaconFlow.couldNotAsk(flowed.askError),
+                    chrome.danger, ready ? () -> newProject(machine, deacon) : null));
         }
     }
 
@@ -1599,6 +1594,9 @@ public final class HomeActivity extends Activity {
         }
     }
 
+    /** Start Deacon and New project, shared with the rail (DeaconFlow). */
+    private final DeaconFlow deaconFlow = DeaconFlow.shared();
+
     private void clearDeaconGuard(Machine machine) {
         try {
             getSharedPreferences("home", MODE_PRIVATE).edit().remove("deacon_start:" + machine.host.id).apply();
@@ -1614,18 +1612,17 @@ public final class HomeActivity extends Activity {
      */
     private void startDeacon(Machine machine) {
         long handle = machine.handle;
-        if (machine.deaconBusy || deaconGuard(machine) > 0) return;
+        if (deaconFlow.of(machine.host.id).busy() || deaconGuard(machine) > 0) return;
         long intent = beginNavigation();
         if (handle <= 0 || !"ready".equals(machine.state)) {
-            machine.deaconError = machine.host.name + " is offline";
+            deaconFlow.failed(machine.host.id, machine.host.name + " is offline");
             machine.ui++;
             render(true);
             return;
         }
-        machine.deaconBusy = true;
+        if (!deaconFlow.begin(machine.host.id)) return;
         machine.deaconNavigation = intent;
         machine.deaconHandle = handle;
-        machine.deaconError = "";
         machine.ui++;
         try {
             getSharedPreferences("home", MODE_PRIVATE).edit()
@@ -1652,37 +1649,30 @@ public final class HomeActivity extends Activity {
                     failure = "the Deacon started, but " + result.optString("layout_error");
                 }
             } catch (Exception | LinkageError error) {
-                failure = "the computer did not answer";
+                failure = ErrorWords.of(error, machine.host.name);
             }
             final String reason = failure, address = terminal;
             final boolean fresh = started;
             main.post(() -> {
                 if (destroyed) return;
-                if (address.isEmpty()) {
-                    machine.deaconBusy = false;
+                DeaconFlow.Started outcome = deaconFlow.started(machine.host.id, address, fresh, reason, System.currentTimeMillis());
+                if (outcome == DeaconFlow.Started.FAILED) {
                     clearDeaconGuard(machine);
-                    machine.deaconError = reason == null ? "it did not answer" : reason;
                     machine.ui++;
                     render(true);
                     return;
                 }
-                if (reason != null) machine.deaconError = reason;
-                if (fresh) {
+                if (outcome == DeaconFlow.Started.PENDING) {
                     // Launched: "Starting…" until claude is seen running there (checkDeaconStart).
-                    machine.deaconPending = address;
-                    machine.deaconPendingAt = System.currentTimeMillis();
                     machine.ui++;
                     render(true);
                     return;
                 }
                 // An existing Deacon: open it; a kept shell gets a recovery message, not "found".
-                machine.deaconBusy = false;
                 FleetTree.Member found = null;
                 for (Agent agent : members(machine)) if (agent.id.equals(address)) found = agent;
                 if (found != null && !FleetTree.running(found)) {
-                    machine.deaconError = notRunning(machine);
-                } else if (reason == null) {
-                    machine.deaconError = "";
+                    deaconFlow.failed(machine.host.id, DeaconFlow.notRunning(machine.host.name));
                 }
                 machine.ui++;
                 render(true);
@@ -1691,47 +1681,23 @@ public final class HomeActivity extends Activity {
         });
     }
 
-    /** How long a new Deacon has to show claude running before it counts as failed. */
-    private static final long DEACON_START_MS = 45_000;
-
-    private static String notRunning(Machine machine) {
-        return "The Deacon's terminal on " + machine.host.name + " is open, but claude isn't running in it."
-                + " Start claude there, or check that it is installed";
-    }
-
     /**
-     * A launched Deacon is confirmed by what the core reports: a status or a
-     * non-shell program in it. Gone, or still a plain shell after
-     * DEACON_START_MS, it failed; its terminal keeps the role, so a retry
-     * finds it instead of launching a second.
+     * A launched Deacon is confirmed by what the core reports (DeaconFlow.check,
+     * shared with the rail): running, or failed when gone or still a shell
+     * after its start time; its terminal keeps the role, so a retry finds it.
      */
     private void checkDeaconStart(Machine machine) {
-        if (machine.deaconPending.isEmpty() || !"ready".equals(machine.state)) return;
-        FleetTree.Member launched = null;
-        for (Agent agent : members(machine)) if (agent.id.equals(machine.deaconPending)) launched = agent;
-        // Not in the list yet right after launch is not "gone": give the view a few polls.
-        long elapsed = System.currentTimeMillis() - machine.deaconPendingAt;
-        if (launched == null && elapsed < 5_000) return;
-        FleetTree.StartHealth health = FleetTree.startHealth(launched, elapsed, DEACON_START_MS);
-        if (health == FleetTree.StartHealth.WAITING) return;
-        String address = machine.deaconPending;
-        machine.deaconPending = "";
-        machine.deaconBusy = false;
-        if (health == FleetTree.StartHealth.RUNNING) {
-            machine.deaconError = "";
-            note = "Started the Deacon on " + machine.host.name;
-            clearDeaconGuard(machine);
-        } else {
-            machine.deaconError = launched == null
-                    ? "The Deacon on " + machine.host.name + " stopped right away. Check that claude is installed"
-                            + " and signed in there"
-                    : "The Deacon's terminal opened on " + machine.host.name + ", but claude didn't start in it."
-                            + " Check that claude is installed there";
-            clearDeaconGuard(machine);
-        }
+        if (!"ready".equals(machine.state)) return;
+        String address = deaconFlow.pending(machine.host.id);
+        DeaconFlow.Check check = deaconFlow.check(machine.host.id, machine.host.name, members(machine), System.currentTimeMillis());
+        if (check == DeaconFlow.Check.NONE || check == DeaconFlow.Check.WAITING) return;
+        if (check == DeaconFlow.Check.RUNNING) note = DeaconFlow.started(machine.host.name);
+        clearDeaconGuard(machine);
         machine.ui++;
         render(true);
-        if (launched != null) openTerminal(machine, address, "Deacon", machine.deaconHandle, machine.deaconNavigation);
+        boolean listed = false;
+        for (Agent agent : members(machine)) if (agent.id.equals(address)) listed = true;
+        if (listed) openTerminal(machine, address, "Deacon", machine.deaconHandle, machine.deaconNavigation);
     }
 
     /**
@@ -1741,10 +1707,10 @@ public final class HomeActivity extends Activity {
      */
     private void newProject(Machine machine, Agent deacon) {
         long handle = machine.handle;
-        if (machine.projectBusy) return;
+        if (deaconFlow.of(machine.host.id).asking) return;
         beginNavigation();
         if (handle <= 0 || !"ready".equals(machine.state)) {
-            machine.projectError = machine.host.name + " is offline";
+            deaconFlow.asked(machine.host.id, machine.host.name + " is offline");
             machine.ui++;
             render(true);
             return;
@@ -1770,7 +1736,7 @@ public final class HomeActivity extends Activity {
     }
 
     private void sendToDeacon(Machine machine, Agent deacon, String text) {
-        if (machine.projectBusy) return; // one send per tap
+        if (deaconFlow.of(machine.host.id).asking) return; // one send per tap
         long intent = beginNavigation();
         long handle = machine.handle;
         String action;
@@ -1779,8 +1745,7 @@ public final class HomeActivity extends Activity {
         } catch (org.json.JSONException impossible) {
             return;
         }
-        machine.projectBusy = true;
-        machine.projectError = "";
+        if (!deaconFlow.ask(machine.host.id)) return;
         machine.ui++;
         render(true);
         worker.execute(() -> {
@@ -1789,13 +1754,12 @@ public final class HomeActivity extends Activity {
                 JSONObject result = new JSONObject(RemoteNative.sessionAction(handle, action));
                 if (!result.optBoolean("queued", false)) failure = result.optString("error", "it did not answer");
             } catch (Exception | LinkageError error) {
-                failure = "the computer did not answer";
+                failure = ErrorWords.of(error, machine.host.name);
             }
             final String reason = failure;
             main.post(() -> {
                 if (destroyed) return;
-                machine.projectBusy = false;
-                machine.projectError = reason == null ? "" : reason;
+                deaconFlow.asked(machine.host.id, reason);
                 machine.ui++;
                 render(true);
                 if (reason == null) completeNavigation(machine, handle, intent, () -> openAgent(deacon, intent));

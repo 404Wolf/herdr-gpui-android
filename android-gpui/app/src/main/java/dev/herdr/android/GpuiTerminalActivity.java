@@ -3918,11 +3918,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String sub = FleetTree.genericName(said) || AgentNames.UNNAMED.equals(said) ? "" : said;
             railAgent(host, live, current, deacon, "Deacon", sub, FleetTree.railAgentPadding(0, false),
                     tree.helpers.isEmpty() ? null : hKey, hFolded, 0, hFolded && tree.deaconBlocked(), selectedPane, order, keep);
-            String pending = railDeaconPending.getOrDefault(host.id, "");
-            if (deacon.id.equals(pending)) {
-                railNote(host, "deacon-state", "Starting the Deacon…", chrome.onSurfaceVariant, 1, null, order, keep);
-            } else if (!FleetTree.running(deacon)) {
-                railNote(host, "deacon-state", "Claude isn't running in the Deacon's terminal. Tap to open it.",
+            DeaconFlow.State flowed = deaconFlow.of(host.id);
+            if (deacon.id.equals(flowed.pending)) {
+                railNote(host, "deacon-state", DeaconFlow.starting(host.name), chrome.onSurfaceVariant, 1, null, order, keep);
+            } else if (!flowed.error.isEmpty() || !FleetTree.running(deacon)) {
+                String why = flowed.error.isEmpty() ? DeaconFlow.notRunning(host.name) : flowed.error;
+                railNote(host, "deacon-state", why + ". Tap to open it.",
                         chrome.danger, 1, () -> openRailPane(host, live, current, deacon.id), order, keep);
             }
             if (!hFolded) {
@@ -3932,15 +3933,20 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
             }
             // New project is the computer row's +; while it is asking, say so here.
-            if (railProjectBusy.contains(host.id)) {
-                railNote(host, "new-project", "Asking the Deacon…", chrome.onSurfaceVariant, 1, null, order, keep);
+            if (deaconFlow.of(host.id).asking) {
+                railNote(host, "new-project", DeaconFlow.asking(), chrome.onSurfaceVariant, 1, null, order, keep);
+            } else if (!deaconFlow.of(host.id).askError.isEmpty()) {
+                railNote(host, "new-project", DeaconFlow.couldNotAsk(deaconFlow.of(host.id).askError), chrome.danger, 1,
+                        live && current != null ? () -> railNewProject(host, live, current, deacon) : null, order, keep);
             }
         } else {
+            DeaconFlow.State flowed = deaconFlow.of(host.id);
             String why = !live ? "No Deacon. Switch to " + host.name + " to start one."
-                    : railDeaconBusy.contains(host.id) ? "Starting the Deacon…"
-                    : "◆ No Deacon on this computer. Tap to start one.";
-            railNote(host, "deacon-state", why, chrome.onSurfaceVariant, 0,
-                    live && !railDeaconBusy.contains(host.id) ? () -> railStartDeacon(host, current) : null,
+                    : flowed.busy() ? DeaconFlow.starting(host.name)
+                    : flowed.error.isEmpty() ? "◆ " + DeaconFlow.none(true, host.name)
+                    : DeaconFlow.couldNotStart(flowed.error);
+            railNote(host, "deacon-state", why, flowed.error.isEmpty() ? chrome.onSurfaceVariant : chrome.danger, 0,
+                    live && !flowed.busy() ? () -> railStartDeacon(host, current) : null,
                     order, keep);
         }
         // PMs labelled herdr.group=<name>, in their named groups above the repositories (factory-r8f.6).
@@ -4278,7 +4284,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     // ── Rail Fleet actions (explicit taps only) ─────────────────────────
 
     /** Machines with a New project (or other Deacon message) in flight: one send per tap. */
-    private final java.util.Set<String> railProjectBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** A worktree open already queued by a tap, scoped to its computer. */
     private final java.util.Set<String> railWorktreeOpening = new java.util.HashSet<>();
     /** Each terminal's space, for the rail's header long-press menus. */
@@ -4369,9 +4374,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** The live machine's members as the rail last read them, with their names and labels (AgentNames). */
     private java.util.List<? extends FleetTree.Member> railMembers = java.util.Collections.emptyList();
-    private final java.util.Map<String, String> railDeaconPending = new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.Map<String, Long> railDeaconPendingAt = new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.Set<String> railDeaconBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Start Deacon and New project, shared with Home (DeaconFlow, audit PR 10). */
+    private final DeaconFlow deaconFlow = DeaconFlow.shared();
     private final java.util.Set<String> railGitBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final java.util.Map<String, java.util.Set<String>> railGitAsked = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -4440,7 +4444,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!word.contentEquals(header.state.getText())) header.state.setText(word);
         header.state.setTextColor(blocked > 0 ? chrome.danger : header.live ? chrome.onSurface : chrome.onSurfaceVariant);
         FleetTree.Member deacon = fleet.deacon;
-        boolean busy = railDeaconBusy.contains(host.id) || railDeaconPending.containsKey(host.id);
+        boolean busy = deaconFlow.of(host.id).busy();
         FleetTree.DeaconAction action = FleetTree.deaconAction(live, deacon, busy);
         String deaconText = action == FleetTree.DeaconAction.OPEN ? "◆" : action == FleetTree.DeaconAction.START
                 ? "Start Deacon" : action == FleetTree.DeaconAction.STARTING ? "Starting…" : "";
@@ -4453,14 +4457,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             else if (live && !busy) railStartDeacon(host, current);
         });
         header.plus.setVisibility(live || deacon != null ? View.VISIBLE : View.GONE);
-        boolean asking = railProjectBusy.contains(host.id);
+        boolean asking = deaconFlow.of(host.id).asking;
         boolean canAsk = !asking && (deacon != null || live && !busy);
         header.plus.setEnabled(canAsk);
         header.plus.setAlpha(canAsk ? 1f : 0.4f);
         header.plus.setContentDescription(deacon != null ? "New project on " + host.name + ": ask its Deacon"
                 : "New project on " + host.name + ": start its Deacon first");
         header.plus.setOnClickListener(v -> {
-            if (railProjectBusy.contains(host.id)) return;
+            if (deaconFlow.of(host.id).asking) return;
             if (deacon != null) railNewProject(host, live, current, deacon);
             else if (live && !busy) railStartDeacon(host, current);
         });
@@ -4511,46 +4515,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     private void railStartDeacon(SavedRemoteHost host, Connection current) {
-        if (current == null || !railDeaconBusy.add(host.id)) return;
+        if (current == null || !deaconFlow.begin(host.id)) return;
         refreshSidebar(true);
         String json;
         try {
             json = new JSONObject().put("op", "deacon.start").put("name", host.name).toString();
-        } catch (JSONException impossible) { return; }
+        } catch (JSONException impossible) { deaconFlow.failed(host.id, ""); return; }
         railAction(current, json, "start the Deacon", reply -> {
-            railDeaconBusy.remove(host.id);
             String terminal = reply.optString("terminal", "");
-            if (!reply.optString("layout_error", "").isEmpty()) {
-                note("The Deacon started, but " + reply.optString("layout_error"));
-            }
-            if (reply.optBoolean("started", false) && !terminal.isEmpty()) {
-                // Starting… until claude is seen running there (checkRailDeacon).
-                railDeaconPending.put(host.id, terminal);
-                railDeaconPendingAt.put(host.id, System.currentTimeMillis());
-            } else if (!terminal.isEmpty()) {
-                focusRemotePane(current, terminal);
-            }
+            String layout = reply.optString("layout_error", "");
+            DeaconFlow.Started outcome = deaconFlow.started(host.id, terminal, reply.optBoolean("started", false),
+                    layout.isEmpty() ? null : "the Deacon started, but " + layout, System.currentTimeMillis());
+            // Starting… until claude is seen running there (checkRailDeacon); an existing one opens.
+            if (outcome == DeaconFlow.Started.EXISTING) focusRemotePane(current, terminal);
             refreshSidebar(true);
-        }, () -> { railDeaconBusy.remove(host.id); refreshSidebar(true); });
+        }, () -> { deaconFlow.failed(host.id, "it did not answer"); refreshSidebar(true); });
     }
 
-    /** Confirms a launched Deacon from the live view, as Home does; never relaunches. */
+    /** Confirms a launched Deacon from the live view (DeaconFlow, as Home does); never relaunches. */
     private void checkRailDeacon(SavedRemoteHost host, Connection current, java.util.List<FleetTree.Member> members) {
-        String pending = railDeaconPending.get(host.id);
-        if (pending == null) return;
-        FleetTree.Member launched = null;
-        for (FleetTree.Member m : members) if (m.id.equals(pending)) launched = m;
-        long elapsed = System.currentTimeMillis() - railDeaconPendingAt.getOrDefault(host.id, 0L);
-        if (launched == null && elapsed < 5_000) return;
-        FleetTree.StartHealth health = FleetTree.startHealth(launched, elapsed, 45_000);
-        if (health == FleetTree.StartHealth.WAITING) return;
-        railDeaconPending.remove(host.id);
-        if (health == FleetTree.StartHealth.FAILED) {
-            note(launched == null
-                    ? "The Deacon on " + host.name + " stopped right away. Check that claude is installed and signed in there."
-                    : "The Deacon's terminal opened on " + host.name + ", but claude didn't start in it.");
-        }
-        if (launched != null) main.post(() -> focusRemotePane(current, pending));
+        String pending = deaconFlow.pending(host.id);
+        DeaconFlow.Check check = deaconFlow.check(host.id, host.name, members, System.currentTimeMillis());
+        if (check == DeaconFlow.Check.NONE || check == DeaconFlow.Check.WAITING) return;
+        if (check == DeaconFlow.Check.FAILED) note(deaconFlow.of(host.id).error + ".");
+        boolean listed = false;
+        for (FleetTree.Member m : members) if (m.id.equals(pending)) listed = true;
+        if (listed) main.post(() -> focusRemotePane(current, pending));
     }
 
     private void railNewProject(SavedRemoteHost host, boolean live, Connection current, FleetTree.Member deacon) {
@@ -4564,14 +4554,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             json = new JSONObject().put("op", "pane.send").put("terminal", deacon.id).put("text", text).toString();
         } catch (JSONException impossible) { return; }
         // One send per tap: a second tap while this one is in flight does nothing.
-        if (!railProjectBusy.add(host.id)) return;
+        if (!deaconFlow.ask(host.id)) return;
         refreshSidebar(true);
         railAction(current, json, "reach the Deacon", reply -> {
-            railProjectBusy.remove(host.id);
+            deaconFlow.asked(host.id, null);
             refreshSidebar(true);
             focusRemotePane(current, deacon.id);
             closeRailDrawer();
-        }, () -> { railProjectBusy.remove(host.id); refreshSidebar(true); });
+        }, () -> { deaconFlow.asked(host.id, "it did not answer"); refreshSidebar(true); });
     }
 
     /** One tap reuses a live terminal in the worktree, or opens a plain shell there. */
