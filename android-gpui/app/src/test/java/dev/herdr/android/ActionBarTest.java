@@ -97,6 +97,15 @@ public final class ActionBarTest {
         assertTrue(bar.contains("idle ? chrome.onSurfaceVariant"));
     }
 
+    @Test public void overTheTerminalTheGridEndsAboveTheClusterAndOverThePanelNothingChanges() throws Exception {
+        String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(gta.contains("int below = shows && !overPanel ? cluster.getHeight() + dp(ActionBar.MARGIN_DP) : 0;"));
+        String panel = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/WorkPanel.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue("the header's targets reach below the 30 dp bar", panel.contains("stack.addView(tabs, new FrameLayout.LayoutParams(-1, reach, Gravity.TOP));"));
+    }
+
     @Test public void thePromptGetsNoControlWords() throws Exception {
         String composer = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/ComposerBar.java")), java.nio.charset.StandardCharsets.UTF_8);
