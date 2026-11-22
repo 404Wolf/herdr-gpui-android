@@ -664,7 +664,6 @@ final class RailController {
             }
             a.focusRemotePane(now, pin.key.address);
             Pins.shared(a).opened(pin.key);
-            a.closeRailDrawer();
             return;
         }
         // Another machine's pin (Wolf: macro's deacon pin "never loads"; it only said "open it there").
@@ -674,14 +673,12 @@ final class RailController {
             // Kept, not dropped: it opens (and is verified) once the switch settles.
             a.hostPicks.keep(new HostPick(pin.profile, pin.key.address, true, pin));
             a.note(HostPick.note(a.hostName(a.switchingTo), pin.machineName));
-            a.closeRailDrawer();
             return;
         }
         if (now != null && now.machine == null && pin.profile.equals(a.currentHostId) && !now.isClosed()) {
             // This profile's machine hasn't said who it is yet: the pin opens when it does (bindMachine).
             pinAwaitingHello = pin;
             a.note("Waiting for " + pin.machineName + " to answer…");
-            a.closeRailDrawer();
             return;
         }
         SavedRemoteHost host = pinHost(pin);
@@ -693,7 +690,6 @@ final class RailController {
         a.switchHost(host, pin.key.address);
         // Only a switch that started waits for its list (one already under way keeps its own target).
         pinArriving = a.switchingHost && host.id.equals(a.switchingTo) ? pin : null;
-        a.closeRailDrawer();
     }
 
     /** A pin opened while a profile's machine had not said who it is; opened when it does. */
@@ -782,7 +778,6 @@ final class RailController {
     private void openRailPane(SavedRemoteHost host, boolean live, Connection current, String paneId) {
         if (live && current != null) a.focusRemotePane(current, paneId);
         else switchToRailPane(host, paneId);
-        a.closeRailDrawer();
     }
 
     /** The machine header's ◆ (its Deacon) and + (New project, or Start Deacon first). */
@@ -834,7 +829,6 @@ final class RailController {
             sheet.add("Open", () -> {
                 if (holder.live && holder.connection != null) a.focusRemotePane(holder.connection, pane);
                 else switchToRailPane(holder.host, pane);
-                a.closeRailDrawer();
             });
             String cwd = holder.live ? paneCwd(holder.connection, pane) : "";
             if (!cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(a, "Path", cwd));
@@ -899,7 +893,7 @@ final class RailController {
     }
 
     private void railNewProject(SavedRemoteHost host, boolean live, Connection current, FleetTree.Member deacon) {
-        if (!live || current == null) { switchToRailPane(host, deacon.id); a.closeRailDrawer(); return; }
+        if (!live || current == null) { switchToRailPane(host, deacon.id); return; }
         railSendToDeacon(host, current, deacon, FleetTree.newProjectPrompt(host.name));
     }
 
@@ -915,7 +909,6 @@ final class RailController {
             deaconFlow.asked(host.id, null);
             refreshSidebar(true);
             a.focusRemotePane(current, deacon.id);
-            a.closeRailDrawer();
         }, () -> { deaconFlow.asked(host.id, "it did not answer"); refreshSidebar(true); });
     }
 
@@ -930,7 +923,7 @@ final class RailController {
         java.util.List<FleetTree.Member> now = FleetPanes.members(current.workspaces, current.tabs, current.panes,
                 FleetTree.Member::new);
         FleetTree.Member there = FleetTree.memberAt(now, wt.path);
-        if (there != null) { a.focusRemotePane(current, there.id); a.closeRailDrawer(); return; }
+        if (there != null) { a.focusRemotePane(current, there.id); return; }
         String key = host.id + "\n" + wt.path;
         if (!railWorktreeOpening.add(key)) {
             a.note("Opening " + FleetTree.lastSegment(wt.path) + "…");
@@ -947,7 +940,6 @@ final class RailController {
             String terminal = reply.optString("terminal", "");
             if (terminal.isEmpty()) { a.note("The computer did not return a terminal for a worktree."); return; }
             a.focusRemotePane(current, terminal);
-            a.closeRailDrawer();
         }, () -> railWorktreeOpening.remove(key));
     }
 
@@ -1072,7 +1064,6 @@ final class RailController {
                 return;
             }
             a.switchHost(holder.host);
-            a.closeRailDrawer();
         });
         holder.row.setOnLongClickListener(view -> {
             new ActionSheet(a, a.chrome, holder.host.name)
@@ -1276,7 +1267,6 @@ final class RailController {
                 } else if (deacon != null) {
                     if (live && current != null) a.focusRemotePane(current, deacon.id);
                     else switchToRailPane(host, deacon.id);
-                    a.closeRailDrawer();
                 } else if (!live) {
                     // The rail then shows that computer with its Start Deacon row.
                     a.switchHost(host);
@@ -1351,7 +1341,7 @@ final class RailController {
         }
         final int at = index;
         ActionSheet sheet = new ActionSheet(a, a.chrome, label)
-                .add("Open", () -> { a.focusRemotePane(target, firstPane); a.closeRailDrawer(); })
+                .add("Open", () -> { a.focusRemotePane(target, firstPane); })
                 .add("New Claude here", () -> a.runEdit(target, "New Claude", "op", "space.new", "space", space, "kind", "claude"))
                 .add("New Codex here", () -> a.runEdit(target, "New Codex", "op", "space.new", "space", space, "kind", "codex"))
                 .add("New shell here", () -> a.runEdit(target, "New shell", "op", "space.new", "space", space, "kind", "shell"))
@@ -1378,7 +1368,7 @@ final class RailController {
         String pane = holder.paneId;
         String cwd = paneCwd(target, pane);
         ActionSheet sheet = new ActionSheet(a, a.chrome, title)
-                .add("Open", () -> { a.focusRemotePane(target, pane); a.closeRailDrawer(); })
+                .add("Open", () -> { a.focusRemotePane(target, pane); })
                 .add("Interrupt (stop key)", () -> a.runEdit(target, "Interrupt", "op", "pane.interrupt", "terminal", pane));
         Runnable worktrees = holder.worktrees;
         if (worktrees != null) sheet.add("Worktrees…", worktrees);
@@ -1474,7 +1464,6 @@ final class RailController {
             } else {
                 switchToRailPane(holder.host, holder.paneId);
             }
-            a.closeRailDrawer();
         });
         holder.row.setOnLongClickListener(view -> { showPaneActions(holder); return true; });
         return holder;
