@@ -70,6 +70,15 @@ public final class WorkPanelLayoutTest {
         // The age moved into the tab row; bullets hang at their text.
         assertTrue(panel.contains("showAge(f.text"));
         assertTrue(panel.contains("first + Math.round(bodyPaint().measureText(marker))"));
+        // Text clears the bar below by 16 dp, mid-scroll too (review A6).
+        assertEquals(16, WorkPanel.BOTTOM_DP);
+        assertTrue(panel.contains("scroll.setPadding(0, 0, 0, dp(BOTTOM_DP));") && panel.contains("scroll.setClipToPadding(true);"));
+    }
+
+    @Test public void withNoChoiceTheUnfoldedSplitIsOnTheHinge() {
+        // The review's Fold is 949 dp wide: the default leaves the divider at 474.5 dp (A3).
+        WorkPanelLayout l = WorkPanelLayout.of(949, false, false, WorkPanelLayout.Choice.parse(""));
+        assertEquals(474.5f, 949 * (1 - l.share), 1e-3f);
     }
 
     @Test public void theChoiceIsKeptAsTextAndAnythingElseIsTheDefault() {
