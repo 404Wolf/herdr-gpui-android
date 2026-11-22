@@ -450,7 +450,7 @@ public final class HomeActivity extends Activity {
                     if (handle <= 0) failure = "Could not start the connection";
                 }
             } catch (Exception | LinkageError error) {
-                failure = error.getMessage() == null ? "Connection failed" : error.getMessage();
+                failure = ErrorWords.of(error, host.name);
             } finally {
                 if (secret != null) Arrays.fill(secret, '\0');
             }

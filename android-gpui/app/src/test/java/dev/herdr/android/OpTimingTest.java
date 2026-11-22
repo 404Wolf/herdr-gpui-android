@@ -37,12 +37,14 @@ public final class OpTimingTest {
         return new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/" + name + ".java")), StandardCharsets.UTF_8);
     }
 
-    @Test public void aFailedLookSaysTheCoresOwnWordsElseThatTheMachineCouldNotBeAsked() {
-        assertEquals("herdr-core protocol: \"denied\": exec refused",
-                OpTiming.reason("beads.detail", new IllegalStateException("herdr-core protocol: \"denied\": exec refused")));
-        assertEquals("can't reach the machine", OpTiming.reason("beads.detail", new IllegalArgumentException("x")));
-        assertEquals("can't reach the machine", OpTiming.reason("beads.detail", new IllegalStateException("  ")));
-        assertEquals(OpTiming.REASON_MAX, OpTiming.reason("usage.look", new IllegalStateException("x".repeat(300))).length());
+    @Test public void aFailedLookSaysWhatHappenedByItsKindNeverItsText() {
+        // The words come from the kind (ErrorWords), not from what the exception says.
+        assertEquals("the computer didn't allow it",
+                OpTiming.reason("beads.detail", new RemoteError(RemoteError.REFUSED, "denied", "herdr-core protocol: exec refused")));
+        assertEquals("the computer is busy; trying again",
+                OpTiming.reason("usage.look", new RemoteError(RemoteError.REFUSED, "unavailable", "16 execs are running already")));
+        assertEquals("Can't reach the computer", OpTiming.reason("beads.detail", new IllegalArgumentException("x")));
+        assertEquals("Can't reach the computer", OpTiming.reason("beads.detail", new IllegalStateException("unavailable: whatever")));
         // Untrusted daemon text: one line, no control characters, no paths.
         assertEquals("exec failed: … not found", OpTiming.clean("exec failed:\n/home/wolf/.config/x\u001b[31m not found"));
         assertEquals("cannot read …", OpTiming.clean("cannot read ~/beads/demo/.beads"));
