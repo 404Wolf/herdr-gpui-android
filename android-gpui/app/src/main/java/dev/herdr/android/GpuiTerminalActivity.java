@@ -137,7 +137,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private FrameLayout terminalRoot;
     LinearLayout sidebar, sidebarRows;
 
-    private ScrollView sidebarScroll;
+    ScrollView sidebarScroll;
     private ImageButton sidebarButton;
     /**
      * Wolf's item 83: the docked rail open, minimized to a strip or closed,

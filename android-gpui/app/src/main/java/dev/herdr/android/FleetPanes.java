@@ -76,9 +76,12 @@ final class FleetPanes {
             m.name = label(pane, "name");
             m.task = label(pane, "task");
             m.helper = label(pane, "helper");
-            // The core's view calls it group; a raw terminal record, herdr.group.
-            String group = label(pane, "group");
-            m.group = FleetTree.groupName(group.isEmpty() ? label(pane, "herdr.group") : group);
+            // herdr.group ?? group (factory-r8f.8): the core's view gives that as "group" and the
+            // older label as "old_group"; a raw terminal record has both under its labels.
+            String herdrGroup = label(pane, "herdr.group"), old = label(pane, "old_group");
+            if (old.isEmpty() && pane.optJSONObject("labels") != null) old = pane.optJSONObject("labels").optString("group", "").trim();
+            m.group = FleetTree.groupName(!herdrGroup.isEmpty() ? herdrGroup : label(pane, "group"));
+            m.oldGroup = FleetTree.groupName(old);
             out.add(m);
         }
         AgentNames.disambiguate(out);
