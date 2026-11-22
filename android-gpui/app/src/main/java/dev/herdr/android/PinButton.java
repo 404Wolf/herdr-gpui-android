@@ -17,7 +17,14 @@ import android.widget.ImageButton;
  * <name> on <machine>" or "Unpin …" and the pressed state.
  */
 final class PinButton {
-    static final int WIDTH_DP = 48, TARGET_DP = 48;
+    /**
+     * Its width beside the ⋮ (also {@link #WIDTH_DP} wide): narrow enough that the glyphs of
+     * "updated …", the pin and the ⋮ sit at the same small gap (Wolf 11-22); the 48 dp target
+     * reaches below the bar instead.
+     */
+    static final int WIDTH_DP = 32, TARGET_DP = 48;
+    /** The gap between "updated …" and the pin's glyph, the same as pin to ⋮ (32 - 20)/2 + (32 - 24)/2. */
+    static final int GLYPH_GAP_DP = 10;
 
     /** What it says: "Pin phone-rail on desktop", or why it can't yet. */
     static String described(boolean pinned, String name, String machine, String cant) {

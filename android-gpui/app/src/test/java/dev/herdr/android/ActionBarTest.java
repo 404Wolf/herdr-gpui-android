@@ -90,6 +90,13 @@ public final class ActionBarTest {
         assertEquals(ActionBar.DISABLED, items.get(0).style);
     }
 
+    @Test public void anIdleSlotKeepsASolidButtonAndAGreyIcon() throws Exception {
+        String bar = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/ActionBar.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertFalse("never see-through", bar.contains("setAlpha(0.38f)"));
+        assertTrue(bar.contains("idle ? chrome.onSurfaceVariant"));
+    }
+
     @Test public void thePromptGetsNoControlWords() throws Exception {
         String composer = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/ComposerBar.java")), java.nio.charset.StandardCharsets.UTF_8);

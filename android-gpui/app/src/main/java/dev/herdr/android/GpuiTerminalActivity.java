@@ -515,7 +515,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         workButton.setOnClickListener(v -> toggleWorkPanel(!workPanelOpen));
         tabRow.addView(workButton, new LinearLayout.LayoutParams(dp(56), -1));
         tabRow.addView(rail.pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
-        tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(48), -1));
+        tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(WorkPanelLayout.TOP_BAR_DP)));
         // Where this window is: machine › repo › worktree › window, and why
         // it wants Wolf. Tapping it shows the window's row in the rail.
@@ -1407,7 +1407,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Both bars are TOP_BAR_DP tall; 48 dp targets reach below them (PinButton.extendTouch,
         // WorkPanel.extendTargets), never by making the bar taller.
         to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
-        to.addView(tabMenu, new LinearLayout.LayoutParams(dp(48), -1));
+        to.addView(tabMenu, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
     }
 
     /** The terminal | panel divider (PanelDivider), and Wolf's split per orientation (factory-9zz.9). */
