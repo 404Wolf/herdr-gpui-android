@@ -56,6 +56,29 @@ public final class FleetSidebarTest {
         assertTrue(FleetTree.railAgentPadding(3, true) > workerTitle);
     }
 
+    @Test public void theLeadFoldIsATouchSizedButtonThatNamesWhatItHides() {
+        assertTrue(FleetTree.PM_CHEVRON_DP >= 48);
+        assertTrue(FleetTree.LEAD_ROW_DP >= 48);
+        // Denser agent rows (Wolf), still a comfortable tap; the fold buttons stay 48dp.
+        assertTrue(FleetTree.AGENT_ROW_DP >= 36 && FleetTree.AGENT_ROW_DP < FleetTree.LEAD_ROW_DP);
+        assertTrue(RailDisclosure.SQUARE_DP <= 24);
+        assertEquals("Show 3 rows under factory", FleetTree.foldSays("factory", false, 3, true, "k"));
+        assertEquals("Hide 1 row under factory", FleetTree.foldSays("factory", false, 1, false, "k"));
+        assertEquals("Show the Deacon's helpers", FleetTree.foldSays("Deacon", true, 0, true, "k"));
+        assertEquals("Hide workers under app", FleetTree.foldSays("app", false, 0, false, "k"));
+        // Nothing to fold, or not a lead row: no button, only the empty column.
+        assertNull(FleetTree.foldSays("factory", false, 0, true, null));
+        assertNull(FleetTree.foldSays(null, false, 2, true, "k"));
+        assertEquals("collapsed", FleetTree.foldState(true));
+        assertEquals("expanded", FleetTree.foldState(false));
+    }
+
+    @Test public void deaconHelpersStepPastTheDeaconsFoldColumnLikeWorkers() {
+        assertEquals(FleetTree.railAgentPadding(1, true) - FleetTree.railAgentPadding(0, false),
+                FleetTree.railAgentPadding(2, true) - FleetTree.railAgentPadding(1, false));
+        assertTrue(FleetTree.railAgentPadding(1, true) > FleetTree.railAgentPadding(0, false) + FleetTree.PM_CHEVRON_DP);
+    }
+
     @Test public void workersStartHiddenAndTheToggleSurvivesReloadByHostAndPmId() {
         FleetTree.Member pm = member(1, "pm", "app", "/repo", "idle");
         FleetTree.Member worker = member(2, "worker", "app", "/repo", "working");

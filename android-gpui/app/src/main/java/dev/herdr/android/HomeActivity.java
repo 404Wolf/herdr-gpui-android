@@ -1107,11 +1107,12 @@ public final class HomeActivity extends Activity {
         Row top = new Row(null);
         top.fold = machine.host.id + "/deacon";
         top.foldedByDefault = FleetTree.foldedByDefault(FleetTree.Fold.DEACON);
-        top.view = (guide, self) -> agentLine(guide, deacon, "Deacon " + deacon.id
+        top.view = (guide, self) -> agentLine(guide, deacon, "Deacon"
                 + (folded(self) && tree.deaconBlocked() ? "  !" : ""), self, null, "");
         for (FleetTree.Member helper : tree.helpers) {
             Agent agent = (Agent) helper;
-            top.kids.add(new Row((guide, self) -> agentLine(guide, agent, roleTag(agent), null, null, "")));
+            // A row is its name and its dot: no role word (factory-jmc).
+            top.kids.add(new Row((guide, self) -> agentLine(guide, agent, "", null, null, "")));
         }
         emit(deaconCard, top, "", true, 0);
         if (deacon.id.equals(machine.deaconPending)) {
@@ -1234,7 +1235,7 @@ public final class HomeActivity extends Activity {
         Row row;
         if (pm.labelledPm()) {
             Agent lead = (Agent) pm.pm;
-            String tag = "pm" + (tally.isEmpty() ? "" : "  " + tally);
+            String tag = tally;
             row = new Row((guide, self) -> {
                 View line = agentLine(guide, lead, tag, self, pm.name(), pm.where);
                 line.setOnLongClickListener(v -> { agentActions(lead, machine, pm.catalogs); return true; });
@@ -1311,7 +1312,7 @@ public final class HomeActivity extends Activity {
     private Row agentTree(String machineId, FleetTree.AgentNode node, String tagOverride) {
         Agent agent = (Agent) node.member;
         String key = machineId + "/a/" + agent.id;
-        Row row = new Row((guide, self) -> agentLine(guide, agent, tagOverride != null ? tagOverride : roleTag(agent),
+        Row row = new Row((guide, self) -> agentLine(guide, agent, tagOverride != null ? tagOverride : "",
                 self, null, node.where));
         row.fold = key;
         for (FleetTree.AgentNode kid : node.children) row.kids.add(agentTree(machineId, kid, null));
@@ -1484,19 +1485,14 @@ public final class HomeActivity extends Activity {
         return chip;
     }
 
-    private static boolean hasRole(Agent agent) {
-        return "deacon".equals(agent.role) || "pm".equals(agent.role) || "worker".equals(agent.role);
-    }
-
     /**
      * One agent in the tree: guide, fold toggle when it has children, status
-     * dot, title and, for the skill's agents or any agent that said something,
-     * its status in words, for how long, and its latest message.
+     * dot and its name (AgentNames), with its checkout below; its state is the
+     * dot, said in words only to a screen reader (factory-jmc).
      * {@code heading}, when given (a project's name), leads the row and the
      * agent's own title moves to the second line, after {@code where} (its
-     * checkout: a worktree or branch, never a row of its own). An untitled
-     * terminal reads as its harness and folder; its id only ever sits on the
-     * second line.
+     * checkout: a worktree or branch, never a row of its own). An agent with
+     * nothing to name it reads "no task label", dim; its id is never shown.
      */
     private View agentLine(String guide, Agent agent, String tag, Row fold, String heading, String where) {
         LinearLayout row = treeLine(guide, fold);
@@ -1504,9 +1500,11 @@ public final class HomeActivity extends Activity {
         LinearLayout lines = column();
         boolean lead = heading != null || "deacon".equals(agent.role) || "pm".equals(agent.role)
                 || tag.startsWith("deacon") || tag.startsWith("pm");
-        boolean untitled = agent.title.isEmpty() || RailTree.isTerminalId(agent.title);
-        String shown = heading != null ? heading : FleetPanes.displayTitle(agent);
-        TextView title = single(text(shown, 13, chrome.onSurface));
+        // Its name (AgentNames), never its terminal id; with nothing to name it, "no task label", dim.
+        String own = FleetPanes.displayTitle(agent);
+        boolean untitled = AgentNames.UNNAMED.equals(own);
+        String shown = heading != null ? heading : own;
+        TextView title = single(text(shown, 13, heading == null && untitled ? chrome.onSurfaceVariant : chrome.onSurface));
         title.setTypeface(mono(lead));
         lines.addView(title);
         List<String> second = new ArrayList<>();
@@ -1514,15 +1512,12 @@ public final class HomeActivity extends Activity {
         String changes = heading == null && !"deacon".equals(agent.role)
                 ? FleetTree.changes(agent.machine.git, agent.cwd) : "";
         if (!changes.isEmpty()) second.add(changes);
-        if (heading != null && !untitled && where.isEmpty()) second.add(agent.title);
-        String state = detail(agent);
-        if (!state.isEmpty()) second.add(state);
-        if (untitled) second.add(agent.id);
+        if (heading != null && !untitled && where.isEmpty()) second.add(own);
+        // No state words (the dot says it; the description says it) and no id (factory-jmc).
         String said = TextUtils.join(" · ", second);
         // The second line is always there (empty when there is nothing to say),
         // so a status or message arriving never changes the row's height.
-        TextView sub = single(text(said, 11, statusPriority(agent.status) <= 1 ? statusColor(agent.status)
-                : chrome.onSurfaceVariant));
+        TextView sub = single(text(said, 11, chrome.onSurfaceVariant));
         sub.setPadding(0, dp(1), 0, 0);
         sub.setTypeface(mono(false));
         lines.addView(sub);
@@ -1536,7 +1531,7 @@ public final class HomeActivity extends Activity {
         }
         row.setContentDescription(shown + (where.isEmpty() ? "" : ", " + where)
                 + (changes.isEmpty() ? "" : ", " + changes)
-                + (heading != null && !untitled ? ", " + agent.title : "") + ", "
+                + (heading != null && !untitled ? ", " + own : "") + ", "
                 + statusWord(agent.status, agent.waitKind)
                 + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
@@ -1555,7 +1550,8 @@ public final class HomeActivity extends Activity {
         if (machine != null && !catalogs.isEmpty()) sheet.add("Worktrees…", () -> showCatalogs(machine, catalogs));
         if (!agent.msg.isEmpty()) sheet.add("Copy message", () -> ActionSheet.copy(this, "Message", agent.msg));
         if (!agent.cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", agent.cwd));
-        sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", agent.id)).show();
+        // No terminal id (Wolf, factory-jmc): "i never need to see t3xz or the code since i do not use that".
+        sheet.show();
     }
 
     /** An agent in a flat list (Needs you, Working, the picker): breadcrumb title, no tree. */
@@ -1566,7 +1562,8 @@ public final class HomeActivity extends Activity {
         row.addView(dot(statusColor(agent.status)));
         LinearLayout lines = column();
         lines.addView(single(text(breadcrumb(agent), 12, chrome.onSurface)));
-        String said = detail(agent);
+        // What it says (a question it asks), not a state word: the dot is the state (factory-jmc).
+        String said = agent.msg;
         String changes = FleetTree.changes(agent.machine.git, agent.cwd);
         if (!changes.isEmpty()) said = said.isEmpty() ? changes : said + " · " + changes;
         if (!said.isEmpty()) {
@@ -1574,31 +1571,11 @@ public final class HomeActivity extends Activity {
                     : chrome.onSurfaceVariant)));
         }
         row.addView(lines, new LinearLayout.LayoutParams(0, -2, 1));
-        String tag = roleTag(agent);
-        if (!tag.isEmpty()) row.addView(tag(tag, chrome.onSurfaceVariant));
         row.setContentDescription(FleetPanes.displayTitle(agent) + ", " + statusWord(agent.status, agent.waitKind)
-                + (changes.isEmpty() ? "" : ", " + changes)
-                + (tag.isEmpty() ? "" : ", " + tag) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
+                + (changes.isEmpty() ? "" : ", " + changes) + (agent.msg.isEmpty() ? "" : ", " + agent.msg));
         row.setOnClickListener(v -> openAgent(agent));
         row.setOnLongClickListener(v -> { agentActions(agent); return true; });
         return row;
-    }
-
-    /** "deacon", "pm · billing", "worker", else the agent's harness. */
-    private static String roleTag(Agent agent) {
-        if ("pm".equals(agent.role)) return agent.project.isEmpty() ? "pm" : "pm · " + agent.project;
-        return hasRole(agent) ? agent.role : agent.kind;
-    }
-
-    /** The second line: "needs you: question · 12m · Run the migration?". */
-    private static String detail(Agent agent) {
-        if (!hasRole(agent) && agent.msg.isEmpty() && statusPriority(agent.status) > 1) return "";
-        List<String> parts = new ArrayList<>();
-        parts.add(statusWord(agent.status, agent.waitKind));
-        String since = age(agent.statusMs, System.currentTimeMillis());
-        if (!since.isEmpty()) parts.add(since);
-        if (!agent.msg.isEmpty()) parts.add(agent.msg);
-        return TextUtils.join(" · ", parts);
     }
 
     // ── Fleet actions (explicit taps only; rendering never starts anything) ──

@@ -475,6 +475,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         LinearLayout.LayoutParams badgeAt = new LinearLayout.LayoutParams(-2, -1);
         badgeAt.gravity = LinkBadge.GRAVITY;
         tabRow.addView(linkBox, badgeAt);
+        // The pin of the agent on screen, top right (factory-9zz.2): PinsRail keeps it and the rail's Pinned section.
+        pinsRail = new PinsRail(this, chrome, Pins.shared(this), this::openPin, () -> refreshSidebar(true), this::note);
+        usageFeed = UsageFeed.shared(this).attach(this);
+        usageFeed.watch(UsageFeed.Watch.RAIL, sidebarOpen && !railMinimized);
+        // Each look holds the core session's one worker, so typing would wait behind the rail's prefetch.
+        usageFeed.typing(() -> imeShown || (composer != null && composer.drafting()));
+        tabRow.addView(pinsRail.button().view(), new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         tabRow.addView(tabMenu, new LinearLayout.LayoutParams(dp(36), -1));
         content.addView(tabRow, new LinearLayout.LayoutParams(-1, dp(30)));
         // Where this window is: machine › repo › worktree › window, and why
@@ -488,6 +495,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
+        pinsRail.button().extendTouch(crumb);
         filePager = new FilePager(this, surface, chrome, this::readFile, actionWorker);
         content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
@@ -639,6 +647,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void setRailShown(RailPanel.Shown next) {
         if (sidebarOpen != next.open) sidebarSignature = null;
+        if (usageFeed != null) usageFeed.watch(UsageFeed.Watch.RAIL, next.open && !next.minimized);
         sidebarOpen = next.open;
         railOverlay = next.overlay;
         railMinimized = next.minimized;
@@ -1071,28 +1080,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             railButton.addView(sidebarBadge, new FrameLayout.LayoutParams(-2, -2,
                     android.view.Gravity.TOP | android.view.Gravity.END));
             pinned.addView(railButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
-            pinned.addView(iconButton(R.drawable.ic_bar_panes, "Panes",
-                    "Workspaces, tabs and panes for this host", view -> showPanes()));
         }
         ImageButton keyboard = iconButton(R.drawable.ic_bar_keyboard, "Keyboard",
                 "Show or hide the on-screen keyboard", view -> toggleKeyboard());
         // Input controls resolve on touch-up, in order with the keys they sit by.
         synchronousTouch(keyboard);
         pinned.addView(keyboard);
-        if (compact) {
-            // A compact bar keeps frequent controls and the keys in view; the
-            // rest live in one overflow menu, as platform toolbars do.
-            pinned.addView(iconButton(R.drawable.ic_bar_more, "More",
-                    "More terminal actions", view -> showMoreActions(view, false)));
-        } else {
-            pinned.addView(iconButton(R.drawable.ic_bar_view, "View",
-                    "Terminal display and keyboard options", view -> showDisplayOptions()));
-            pinned.addView(iconButton(R.drawable.ic_bar_session, "Session",
-                    shellMode() ? (debuggable() ? "Copy the screen, save a screenshot or return to the hosts"
-                            : "Copy the screen or return to the hosts")
-                            : "New tab, split, zoom or close this session's pane", view -> showSessionActions()));
-            pinned.addView(iconButton(R.drawable.ic_bar_close, "Close",
-                    "Close this terminal and return to the host list", view -> finish()));
+        if (!shellMode()) pinned.addView(quickShellButton());
+        // One bar at every width (factory-setup.29): rail, keyboard and >_. Spaces and panes,
+        // view, session, usage and back to hosts are in the top bar's ⋮, the only one; a raw
+        // shell has no top bar, so its ⋮ is here.
+        if (shellMode()) {
+            pinned.addView(iconButton(R.drawable.ic_bar_more, "More", "View, session and back to hosts",
+                    view -> showMoreActions(view, false)));
         }
         LinearLayout keys = new LinearLayout(this);
         keys.setOrientation(LinearLayout.HORIZONTAL);
@@ -1235,17 +1235,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         menu.getMenu().add(0, 1, MoreMenu.VIEW, "View options").setIcon(R.drawable.ic_bar_view).setIconTintList(tint);
         menu.getMenu().add(0, 2, MoreMenu.SESSION, "Session actions").setIcon(R.drawable.ic_bar_session)
                 .setIconTintList(tint);
-        menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Close terminal").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
+        menu.getMenu().add(0, 3, MoreMenu.CLOSE, "Back to hosts").setIcon(R.drawable.ic_bar_close).setIconTintList(tint);
+        // Panes is ⋮'s at every width now that the bar has no Panes button.
+        if (!shellMode()) {
+            menu.getMenu().add(0, 4, MoreMenu.PANES, "Spaces & panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
+        }
         if (navigation && !shellMode()) {
-            menu.getMenu().add(0, 4, MoreMenu.PANES, "Panes").setIcon(R.drawable.ic_bar_panes).setIconTintList(tint);
             menu.getMenu().add(0, 5, MoreMenu.HOSTS, "Hosts and agents").setIcon(R.drawable.ic_bar_hosts)
                     .setIconTintList(tint);
             menu.getMenu().add(0, 6, MoreMenu.GESTURES, "Gestures");
         }
         if (attachTarget() != null) menu.getMenu().add(0, 7, MoreMenu.ATTACH, "Attach image");
+        if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, "Usage").setIcon(R.drawable.ic_bar_usage).setIconTintList(tint);
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 7) showAttachSources();
+            if (item.getItemId() == 8) showUsage();
+            else if (item.getItemId() == 7) showAttachSources();
             else if (item.getItemId() == 1) showDisplayOptions();
             else if (item.getItemId() == 2) showSessionActions();
             else if (item.getItemId() == 4) showPanes();
@@ -1257,6 +1262,28 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return true;
         });
         menu.show();
+    }
+
+    /** The usage feed of the machine on screen (UsageFeed): kept answers, one look at a time. */
+    private UsageFeed usageFeed;
+
+    /** The connected machine's aswap accounts (UsageView), drawn from the feed of that same machine. */
+    private void showUsage() {
+        Connection opened;
+        synchronized (stateLock) { opened = connection; }
+        if (opened == null || opened.isClosed() || opened.remoteHandle <= 0 || opened.hostId == null || usageFeed == null) {
+            note("Usage needs a connected machine");
+            return;
+        }
+        UsageView.show(this, chrome, opened.hostId, opened.hostName, usageFeed);
+    }
+
+    /** One usage look at {@code hostId}'s core; blocks (the feed's own thread). Another machine on screen: HostSwitched. */
+    private String usageLook(String hostId) {
+        Connection now;
+        synchronized (stateLock) { now = connection; }
+        if (hostId == null || now == null || now.isClosed() || !hostId.equals(now.hostId)) throw new HostSwitched();
+        return RemoteNative.sessionAction(now.remoteHandle, "{\"op\":\"usage.look\"}");
     }
 
     /** A 48 dp icon button; its label is a tooltip and the overflow menu's text. */
@@ -2048,6 +2075,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void switchHost(SavedRemoteHost host, String pane, boolean picked) {
         if (host == null || switchingHost || host.id.equals(currentHostId)) return;
+        pendingShell.clear();
         if (host.expectedFingerprint.isEmpty()) {
             note("Trust " + host.name + " from Remote hosts first");
             return;
@@ -2620,6 +2648,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (tabStrip == null || destroyed) return;
         Connection current;
         synchronized (stateLock) { current = connection; }
+        if (usageFeed != null) {
+            String usageHost = current == null ? null : current.hostId;
+            usageFeed.select(usageHost, current != null && current.ready && !current.isClosed(), () -> usageLook(usageHost));
+        }
+        if (pinsRail != null) {
+            JSONObject shown = current == null ? null : PinsRail.paneOf(current.panes, current.paneId);
+            boolean agent = shown != null && !shellMode()
+                    && (!shown.optString("kind", "").isEmpty() || !shown.optString("role", "").isEmpty());
+            pinsRail.bindScreen(current == null ? null : current.machine, current != null && current.ready && !current.isClosed(),
+                    current != null && !current.ready && !current.isClosed(), current == null ? null : current.hostId,
+                    current == null ? null : current.hostName, current == null ? null : current.session,
+                    current == null ? null : current.panes, current == null ? "" : current.paneId, agent, railMembers);
+        }
         // A touch from now on carries this pane's stamp with its down.
         terminalTap.show(current == null ? "" : current.generation + ":" + current.paneId);
         if (composer != null) {
@@ -2674,7 +2715,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Rebuild only when what the bar shows changes. Agents retitle their
         // panes many times a second (spinners), and rebuilding then dropped
         // taps and yanked the strip back to the active tab mid-swipe.
-        String signature = ProjectBar.signature(projects, project, repo, chips, needYou, compact);
+        boolean ours = current.hostId != null && current.hostId.equals(pendingShell.hostId());
+        // Only a new shell ends the wait: an agent or another client's tab arriving meanwhile is not it.
+        boolean shellChanged = ours && pendingShell.observe(current.hostId, paneIds(current, true),
+                android.os.SystemClock.elapsedRealtime());
+        String pending = ours ? pendingShell.pill() : null;
+        if (shellChanged && pendingShell.state() == PendingShell.State.SLOW) {
+            tabStrip.announceForAccessibility(pendingShell.described(current.hostName));
+        }
+        String signature = ProjectBar.signature(projects, project, repo, chips, needYou, compact) + "|" + pending;
         // Everything drawn before the shown chip, and it: a change there moves it.
         String before = ProjectBar.drawn(project, repo, chips, shown);
         String activeId = shown >= 0 ? project.key + "#" + ProjectModel.windowId(project.windows.get(shown)) : "";
@@ -2733,6 +2782,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     + (c.active ? ", current" : "") + (w == project.lead ? "" : ". Hold and drag to reorder"));
             tabStrip.addView(chip);
             windowChips.add(chip);
+        }
+        if (pending != null) {
+            PendingShell.State shellState = pendingShell.state();
+            // Not a window yet: drawn as an inactive chip, one marker in its own words, red when it failed.
+            TextView pill = windowChip(pending, false, "", false);
+            pill.setTextColor(shellState == PendingShell.State.FAILED ? chrome.danger : chrome.onSurfaceVariant);
+            pill.setContentDescription(pendingShell.described(target.hostName));
+            // A tap only where there is something to choose: stop waiting, or retry / close.
+            if (shellState == PendingShell.State.FAILED) pill.setOnClickListener(v -> showPendingShellFailure(target));
+            else if (shellState == PendingShell.State.SLOW) pill.setOnClickListener(v -> showPendingShellWait(target));
+            else pill.setClickable(false);
+            tabStrip.addView(pill);
         }
         TextView add = windowChip("+", false, "", false);
         add.setContentDescription(project != null && project.led()
@@ -2810,7 +2871,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         new ActionSheet(this, chrome, w.name + " · shares its tab with another project")
-                .danger("Close this window (" + w.terminal + " only)", () ->
+                .danger("Close this window only", () ->
                         runEdit(target, "Close " + w.name, "op", "pane.kill", "terminal", w.terminal))
                 .show();
     }
@@ -2932,7 +2993,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private void updateCrumb(Connection current, String space) {
         if (crumb == null || crumbNote != null) return;
-        String title = "", status = "", cwd = "", spaceLabel = "", role = "", tabId = "", ownTitle = "";
+        String title = "", status = "", cwd = "", spaceLabel = "";
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
             JSONObject pane = panes.optJSONObject(i);
@@ -2941,22 +3002,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     chromeTitle(pane.optString("title", ""), current.paneId), current.paneId), pane);
             status = pane.optString("status", "");
             cwd = pane.optString("cwd", "");
-            role = FleetTree.role(pane.optString("role", ""));
-            tabId = pane.optString("tab_id", "");
-            ownTitle = HomeActivity.cleanTitle(chromeTitle(pane.optString("title", ""), current.paneId), current.paneId);
         }
-        // The pane's role badge, as the desktop's pane header: PM·t19, worker·<task>, Deacon·t6k.
-        // A worker's task is its own title, else a tab name that is not generic
-        // (several workers can share a tab like "general"), else its id.
-        String tabName = "";
-        JSONArray tabs = current.tabs;
-        for (int i = 0; tabs != null && i < tabs.length(); i++) {
-            JSONObject tab = tabs.optJSONObject(i);
-            if (tab != null && tabId.equals(tab.optString("id")) && space.equals(tab.optString("workspace_id"))) {
-                tabName = tab.optString("label", "");
-            }
+        // The agent's name (AgentNames), as its rail row says it: no role badge, no id (factory-jmc).
+        for (FleetTree.Member m : railMembers) {
+            if (m.id.equals(current.paneId) && !AgentNames.unnamed(m)) title = FleetPanes.displayTitle(m);
         }
-        String badge = FleetTree.roleBadge(role, current.paneId, FleetTree.workerTask(ownTitle, tabName, current.paneId));
         String named = RailTree.labels(current.workspaces, current.tabs, panes).get(space);
         if (named != null) spaceLabel = chromeTitle(named, space);
         String repo = RailTree.repoOfPath(cwd);
@@ -2966,11 +3016,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!spaceLabel.isEmpty()) parts.add(spaceLabel);
         if (!title.isEmpty()) parts.add(RailTree.withoutSpace(title, spaceLabel));
         android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder();
-        if (!badge.isEmpty()) {
-            text.append(badge, new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0);
-            text.setSpan(new android.text.style.ForegroundColorSpan(chrome.primary), 0, text.length(), 0);
-            text.append("   ");
-        }
         text.append(android.text.TextUtils.join("  ›  ", parts));
         String why = "blocked".equals(status) ? "needs you: waiting for your answer"
                 : "error".equals(status) ? "stopped with an error" : "";
@@ -3100,7 +3145,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 spaces.add(new String[] {item.optString("id"), chromeTitle(item.optString("label"), item.optString("id"))});
             }
         }
-        new ActionSheet(this, chrome, label)
+        java.util.List<TabMenu.Pane> inTab = TabMenu.panes(target.panes, space, tab);
+        ActionSheet sheet = new ActionSheet(this, chrome, TabMenu.title(label, inTab))
                 .add("Rename…", () -> ActionSheet.prompt(this, chrome, "Rename window", label,
                         name -> { if (stillOwned(owned, label)) runEdit(target, "Rename", "op", "tab.rename", "space", space, "tab", tab, "name", name); }))
                 .add("Split: new shell beside it", () -> { if (stillOwned(owned, label)) runEdit(target, "Split", "op", "tab.split",
@@ -3112,10 +3158,44 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                                 "tab", tab, "to", other[0]); });
                     }
                     pick.show();
-                })
-                .danger("Close window", () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
-                        "space", space, "tab", tab); })
-                .show();
+                });
+        // Closing a tab never ends an agent unasked: an agent tab offers only its explicit End (TabMenu).
+        String close = TabMenu.closeLabel(inTab);
+        Runnable closeTab = () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.close",
+                "space", space, "tab", tab); };
+        // A busy shell's close says what it stops, in a dialog (as End does); idle shells just close.
+        if (close != null && TabMenu.closeConfirms(inTab)) {
+            sheet.add(close, () -> sheetBuilder().setTitle(close.replace("…", "?"))
+                    .setMessage(TabMenu.stopMessage(inTab))
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Stop and close", (d, w) -> closeTab.run())
+                    .show());
+        } else if (close != null) {
+            sheet.add(close, closeTab);
+        }
+        String noClose = TabMenu.noCloseReason(inTab);
+        if (noClose != null) {
+            sheet.add("Close tab…", () -> sheetBuilder().setTitle("Close tab").setMessage(noClose)
+                    .setPositiveButton("OK", null).show());
+        }
+        java.util.List<java.util.List<String>> detach = TabMenu.detach(inTab);
+        if (detach != null) {
+            // The desktop's Park: the agents leave the tab and stay in the rail under their lead.
+            sheet.add(TabMenu.DETACH, () -> { if (stillOwned(owned, label)) runEdit(target, "Close " + label, "op", "tab.detach",
+                    "space", space, "tab", tab, "park", new JSONArray(detach.get(0)), "kill", new JSONArray(detach.get(1))); });
+        }
+        for (TabMenu.Pane agent : inTab) {
+            if (!agent.agent()) continue;
+            // Confirmed by its own dialog, which names the agent, its state and its task.
+            sheet.add(TabMenu.endLabel(agent), () -> sheetBuilder().setTitle(TabMenu.endLabel(agent))
+                    .setMessage(TabMenu.endMessage(agent, inTab.size() - 1))
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("End agent", (d, w) -> {
+                        if (stillOwned(owned, label)) runEdit(target, "End " + agent.title, "op", "pane.kill", "terminal", agent.id);
+                    })
+                    .show());
+        }
+        sheet.show();
     }
 
     private boolean stillOwned(java.util.function.BooleanSupplier owned, String label) {
@@ -3232,22 +3312,95 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         menu.getMenu().add(0, 2, 1, "Codex");
         menu.getMenu().add(0, 3, 2, "Shell");
         menu.setOnMenuItemClickListener(item -> {
-            if (place != null) {
-                String kind = item.getItemId() == 1 ? "claude" : item.getItemId() == 2 ? "codex" : "shell";
-                if (place[2] != null && place[2].startsWith("/")) {
-                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
-                            "folder", place[2], "kind", kind);
-                } else {
-                    runEdit(target, "New " + item.getTitle(), "op", "window.new", "space", place[0], "lead", place[1],
-                            "kind", kind);
-                }
-                return true;
-            }
-            String action = item.getItemId() == 1 ? "agent.claude" : item.getItemId() == 2 ? "agent.codex" : "tab.new";
-            runSessionAction(target, action, "New " + item.getTitle());
+            newWindow(target, place, item.getItemId() == 1 ? "claude" : item.getItemId() == 2 ? "codex" : "shell");
             return true;
         });
         menu.show();
+    }
+
+    /** One new window of {@code kind} (claude, codex or shell), placed as "+" places it. */
+    private void newWindow(Connection target, String[] place, String kind) {
+        newWindow(target, place, kind, null);
+    }
+
+    /** {@code failed}, when given, hears the core's refusal (the quick shell's pill). */
+    private void newWindow(Connection target, String[] place, String kind, java.util.function.Consumer<String> failed) {
+        String label = "New " + TabMenu.harness(kind) + (target.hostName == null ? "" : " on " + target.hostName);
+        if (place != null) {
+            if (place[2] != null && place[2].startsWith("/")) {
+                runEditOr(target, label, failed, "op", "window.new", "space", place[0], "lead", place[1], "folder", place[2], "kind", kind);
+            } else {
+                runEditOr(target, label, failed, "op", "window.new", "space", place[0], "lead", place[1], "kind", kind);
+            }
+            return;
+        }
+        runSessionAction(target, "claude".equals(kind) ? "agent.claude" : "codex".equals(kind) ? "agent.codex" : "tab.new", label, failed);
+    }
+
+    /** The quick shell's own pill while it starts, then why it didn't (PendingShell). */
+    private final PendingShell pendingShell = new PendingShell();
+
+    /** The view's terminal ids; {@code shellsOnly}: those with no agent kind. */
+    private static java.util.Set<String> paneIds(Connection target, boolean shellsOnly) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        JSONArray panes = target == null ? null : target.panes;
+        for (int i = 0; panes != null && i < panes.length(); i++) {
+            JSONObject pane = panes.optJSONObject(i);
+            if (pane != null && (!shellsOnly || pane.optString("kind", "").isEmpty())) ids.add(pane.optString("id"));
+        }
+        return ids;
+    }
+
+    /** ">_": a new shell, with a "shell ◌" pill at the strip's end until it shows up or fails. */
+    private void startQuickShell(Connection target) {
+        pendingShell.start(target.hostId, paneIds(target, false), android.os.SystemClock.elapsedRealtime());
+        tabSignature = "";
+        refreshTabStrip();
+        String host = target.hostId;
+        main.postDelayed(() -> {
+            // Only for this activity and the machine it was started on.
+            if (destroyed || host == null || !host.equals(currentHostId)) return;
+            tabSignature = "";
+            refreshTabStrip();
+        }, PendingShell.TIMEOUT_MS + 100);
+        newWindow(target, newWindowPlace(target), "shell", why -> {
+            pendingShell.failed(why);
+            tabSignature = "";
+            refreshTabStrip();
+            tabStrip.announceForAccessibility(pendingShell.described(target.hostName));
+        });
+    }
+
+    /** The slow pill's tap: it may still start, so the choice is only to stop showing the wait. */
+    private void showPendingShellWait(Connection target) {
+        new ActionSheet(this, chrome, "Still starting a shell on " + target.hostName)
+                .add("Keep waiting", () -> { })
+                .add("Stop waiting", () -> { pendingShell.clear(); tabSignature = ""; refreshTabStrip(); })
+                .show();
+    }
+
+    /** The failed pill's tap: why, then Retry or Close. Nothing was left running. */
+    private void showPendingShellFailure(Connection target) {
+        new ActionSheet(this, chrome, "Couldn't start a shell on " + target.hostName + ": " + pendingShell.reason())
+                .add("Retry", () -> { pendingShell.clear(); startQuickShell(target); })
+                .add("Close", () -> { pendingShell.clear(); tabSignature = ""; refreshTabStrip(); })
+                .show();
+    }
+
+    /** The toolbar's ">_": one tap, a new shell where "+" would put it; held, the same pick as "+". */
+    private ImageButton quickShellButton() {
+        StillPress[] still = new StillPress[1];
+        ImageButton shell = iconButton(R.drawable.ic_bar_shell, "New shell",
+                "New shell in a new tab. Hold for Claude or Codex", view -> {
+                    // A press that began a scroll or drag across the bar makes nothing.
+                    if (still[0] != null && !still[0].still()) return;
+                    Connection target;
+                    synchronized (stateLock) { target = connection; }
+                    if (target != null && !target.isClosed()) startQuickShell(target);
+                });
+        shell.setOnLongClickListener(view -> { showNewMenu(view); return true; });
+        still[0] = StillPress.on(shell);
+        return shell;
     }
 
     private void refreshSidebar(boolean force) {
@@ -3275,6 +3428,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         }
         if (current != null) signature.append(current.paneId);
         signature.append(currentHostId);
+        java.util.List<String> savedIds = new java.util.ArrayList<>();
+        for (SavedRemoteHost host : savedHosts) savedIds.add(host.id);
+        if (pinsRail != null) signature.append(pinsRail.signature(savedIds));
         if (!force && signature.toString().equals(sidebarSignature)) return;
         sidebarSignature = signature.toString();
         if (savedHosts.isEmpty()) {
@@ -3287,6 +3443,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // seconds and replacing a view under a finger cancels its tap.
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
+        // Pinned agents first, on any machine: the one-tap way to another machine's agent (factory-9zz.2).
+        if (pinsRail != null) order.add(pinsRail.section(savedIds));
         // The machine this terminal is on leads the rail; the others follow in
         // saved order, so the top of the rail always names where you are.
         java.util.List<SavedRemoteHost> hosts = new java.util.ArrayList<>(savedHosts);
@@ -3360,6 +3518,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         java.util.List<FleetTree.Member> members = FleetPanes.members(workspaces, tabs, panes, FleetTree.Member::new);
         railSpaceOf.clear();
         for (FleetTree.Member m : members) railSpaceOf.put(m.id, m.space);
+        if (live) {
+            // With the factory's issue/task/helper labels, so agents join their beads.
+            railMembers = BeadsModel.terms(workspaces, tabs, panes);
+        }
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
         FleetTree.PmTree tree = FleetTree.pmTree(fleet);
@@ -3418,7 +3580,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String hKey = railFold(railKey(host, "helpers"), FleetTree.Fold.DEACON);
             boolean hFolded = railFolded(hKey) && !containsMember(tree.helpers, selectedPane);
             String said = FleetPanes.displayTitle(deacon);
-            String sub = deacon.id + (FleetTree.genericName(said) || said.equals(deacon.id) ? "" : " · " + said);
+            // Its own name under "Deacon", never its terminal id (factory-jmc).
+            String sub = FleetTree.genericName(said) || AgentNames.UNNAMED.equals(said) ? "" : said;
             railAgent(host, live, current, deacon, "Deacon", sub, FleetTree.railAgentPadding(0, false),
                     tree.helpers.isEmpty() ? null : hKey, hFolded, 0, hFolded && tree.deaconBlocked(), selectedPane, order, keep);
             String pending = railDeaconPending.getOrDefault(host.id, "");
@@ -3430,7 +3593,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (!hFolded) {
                 for (FleetTree.Member helper : tree.helpers) {
-                    railAgent(host, live, current, helper, null, "", FleetTree.railAgentPadding(1, false),
+                    railAgent(host, live, current, helper, null, "", FleetTree.railAgentPadding(1, true),
                             null, false, 0, false, selectedPane, order, keep);
                 }
             }
@@ -3515,7 +3678,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void railPm(SavedRemoteHost host, boolean live, Connection current,
             FleetTree.PmRow pm, int depth, String selectedPane, java.util.List<View> order, java.util.Set<String> keep) {
         String key = pm.foldKey(host.id);
-        boolean folded = railFolds().folded(key);
+        // A PM with no workers has nothing to fold, so it is never folded: its Beads row shows.
+        boolean folded = pm.workerRows > 0 && railFolds().folded(key);
         String foldKey = pm.workerRows == 0 ? null : key;
         if (!pm.labelledPm()) {
             // Live and idle projects without a labelled PM keep a dimmed, direct terminal target.
@@ -3528,7 +3692,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             selectRailHeader(header, pm.contains(selectedPane));
             if (live && !pm.catalogs.isEmpty()) header.worktrees = () -> showRailCatalogs(host, current, pm.catalogs);
         } else {
-            String sub = pm.pm.id + (pm.where.isEmpty() ? "" : " · " + pm.where);
+            String sub = pm.where;
             RailPaneRow row = railAgent(host, live, current, pm.pm, pm.name(), sub, FleetTree.railAgentPadding(depth, false),
                     foldKey, folded, pm.workerRows, folded && pm.blocked(), selectedPane, order, keep);
             if (row != null) {
@@ -3546,6 +3710,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         for (FleetTree.AgentNode node : pm.workers) {
             railAgentTree(host, live, current, node, workerPadding, selectedPane, order, keep);
         }
+        // No beads here (Wolf): the rail is project and agent navigation; beads belong to Tasks.
     }
 
     private void selectRailHeader(RailWorkspaceRow holder, boolean selected) {
@@ -3658,31 +3823,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             row = createRailPaneRow();
             railPanes.put(paneKey, row);
         }
-        String title = lead != null ? lead : chromeTitle(FleetPanes.displayTitle(m), m.id);
+        // Its name (AgentNames), never its terminal id; "no task label" is drawn dim.
+        String title = lead != null ? lead : FleetPanes.displayTitle(m);
         String changes = lead == null ? FleetTree.changes(FleetPanes.LOOKS.get(host.id), m.cwd) : "";
         String shownSub = sub + (changes.isEmpty() ? "" : (sub.isEmpty() ? "" : " · ") + changes);
         row.foldKey = foldKey;
         row.worktrees = null;
-        String mark = lead == null ? null : foldKey == null ? "" : folded
-                ? workerRows > 0 ? "▸" + workerRows : "▸" : "▾";
-        int markWidth = dp(workerRows > 0 ? FleetTree.PM_CHEVRON_DP : FleetTree.RAIL_DEPTH_DP);
-        if (row.mark.getLayoutParams().width != markWidth) {
-            row.mark.getLayoutParams().width = markWidth;
-            row.mark.requestLayout();
-        }
-        row.mark.setVisibility(mark == null ? View.GONE : View.VISIBLE);
-        if (mark != null && !mark.contentEquals(row.mark.getText())) row.mark.setText(mark);
-        // The chevron is the row's only fold control, so a screen reader gets it as its own button.
-        String under = "deacon".equals(m.role) && "Deacon".equals(lead) ? "the Deacon's helpers" : "workers under " + lead;
-        String foldSays = foldKey == null ? null : workerRows == 0 ? (folded ? "Show " : "Hide ") + under
-                : (folded ? "Show " : "Hide ") + workerRows + (workerRows == 1 ? " row under " : " rows under ") + lead;
-        row.mark.setImportantForAccessibility(foldSays == null ? View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                : View.IMPORTANT_FOR_ACCESSIBILITY_YES);
-        row.mark.setFocusable(foldSays != null);
-        row.mark.setContentDescription(foldSays);
-        if (android.os.Build.VERSION.SDK_INT >= 30) {
-            row.mark.setStateDescription(foldSays == null ? null : folded ? "collapsed" : "expanded");
-        }
+        // A lead row's fold column (RailDisclosure): its own button, empty when nothing folds.
+        String foldSays = FleetTree.foldSays(lead, "deacon".equals(m.role) && "Deacon".equals(lead),
+                workerRows, folded, foldKey);
+        row.mark.setVisibility(lead == null ? View.GONE : View.VISIBLE);
+        row.mark.bind(foldSays != null, folded, foldSays);
+        row.row.setMinimumHeight(dp(lead == null ? FleetTree.AGENT_ROW_DP : FleetTree.LEAD_ROW_DP));
         if (!shownSub.contentEquals(row.sub.getText())) row.sub.setText(shownSub);
         row.sub.setVisibility(shownSub.isEmpty() ? View.GONE : View.VISIBLE);
         if (row.lead != (lead != null)) {
@@ -3724,10 +3876,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (!label.contentEquals(row.label.getText())) row.label.setText(label);
         if (!meta.contentEquals(row.meta.getText())) row.meta.setText(meta);
         row.meta.setTextColor(meta.contains("!") ? chrome.danger : chrome.onSurfaceVariant);
-        String mark = foldKey == null ? "▪" : folded ? "▸" : "▾";
-        if (!mark.contentEquals(row.mark.getText())) row.mark.setText(mark);
-        row.mark.setContentDescription((foldKey == null ? "Open " : folded ? "Show " : "Hide ") + label);
-        row.mark.setFocusable(true);
+        row.mark.bind(foldKey != null, folded, foldKey == null ? null : (folded ? "Show " : "Hide ") + "what is under " + label);
         int pad = dp(2 + 12 * depth);
         if (row.row.getPaddingLeft() != pad) {
             row.row.setPadding(pad, dp(2), dp(4), dp(2));
@@ -3748,6 +3897,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     /** A one-line rail action or state, reused by key. */
     private void railNote(SavedRemoteHost host, String id, String text, int color, int depth, Runnable action,
             java.util.List<View> order, java.util.Set<String> keep) {
+        int startDp = 10 + 12 * depth;
         String key = "fleetnote:" + host.id + "/" + id;
         keep.add(key);
         TextView note = railNotes.get(key);
@@ -3765,7 +3915,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             note.setContentDescription(text);
         }
         note.setTextColor(color);
-        note.setPadding(dp(10 + 12 * depth), dp(1), dp(6), dp(1));
+        note.setPadding(dp(startDp), dp(1), dp(6), dp(1));
+        note.setMinHeight(dp(action == null ? 28 : FleetTree.AGENT_ROW_DP));
         note.setOnClickListener(action == null ? null : v -> action.run());
         note.setClickable(action != null);
         order.add(note);
@@ -3779,6 +3930,36 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private final java.util.Set<String> railWorktreeOpening = new java.util.HashSet<>();
     /** Each terminal's space, for the rail's header long-press menus. */
     private final java.util.Map<String, String> railSpaceOf = new java.util.HashMap<>();
+    /** The pin button and the rail's Pinned section (PinsRail). */
+    private PinsRail pinsRail;
+
+    /**
+     * A pinned agent's row was tapped. P2 (t3jk) replaces this with the switch
+     * path for any machine; until then a pin on the machine on screen focuses
+     * its terminal, and another machine's pin says it opens there.
+     */
+    private void openPin(Pins.Pin pin) {
+        Connection now;
+        synchronized (stateLock) { now = connection; }
+        if (now != null && pin.key.machine.equals(now.machine)) {
+            // Only the very terminal that was pinned: listed now with its creation time, never a reused address.
+            Pins.Verify verdict = pin.ended() ? Pins.Verify.ENDED
+                    : Pins.verify(pin.key, now.remoteBoot, now.fingerprint, now.panes);
+            if (verdict != Pins.Verify.GO) {
+                note(PinsRail.refusal(verdict, pin));
+                return;
+            }
+            focusRemotePane(now, pin.key.address);
+            Pins.shared(this).opened(pin.key);
+            closeRailDrawer();
+            return;
+        }
+        note(pin.label.isEmpty() ? "That pin is on " + pin.machineName + ": open it there for now"
+                : pin.label + " is on " + pin.machineName + ": open it there for now");
+    }
+
+    /** The live machine's members as the rail last read them, with their names and labels (AgentNames). */
+    private java.util.List<? extends FleetTree.Member> railMembers = java.util.Collections.emptyList();
     private final java.util.Map<String, String> railDeaconPending = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Map<String, Long> railDeaconPendingAt = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Set<String> railDeaconBusy = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -3844,7 +4025,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             });
             String cwd = holder.live ? paneCwd(holder.connection, pane) : "";
             if (!cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", cwd));
-            sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", pane));
         }
         Runnable worktrees = holder.worktrees;
         if (worktrees != null) sheet.add("Worktrees…", worktrees);
@@ -4160,22 +4340,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row = new LinearLayout(this);
         holder.row.setOrientation(LinearLayout.HORIZONTAL);
         holder.row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        holder.row.setMinimumHeight(dp(28));
+        holder.row.setMinimumHeight(dp(FleetTree.LEAD_ROW_DP));
         holder.row.setSaveFromParentEnabled(false);
         holder.row.setFocusable(true);
         holder.row.setClickable(true);
-        holder.mark = railText("", 12, chrome.onSurfaceVariant);
-        // A separate fold target, even when the row opens a project terminal.
-        holder.mark.setGravity(android.view.Gravity.CENTER);
-        holder.mark.setMinWidth(dp(22));
-        holder.mark.setMinHeight(dp(28));
-        holder.mark.setBackground(railBackground(false));
+        // The same fold control as a PM row's (RailDisclosure), even when the row opens a project terminal.
+        holder.mark = new RailDisclosure(this, chrome);
         holder.mark.setOnClickListener(v -> {
             if (holder.foldKey != null) toggleRepo(holder.foldKey);
             else holder.row.performClick();
         });
-        LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(-2, -2);
-        markParams.setMarginEnd(dp(3));
+        holder.mark.offerOn(holder.row);
+        LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
+        markParams.setMarginEnd(dp(6));
         holder.row.addView(holder.mark, markParams);
         holder.label = railText("", 12, chrome.primary);
         holder.label.setTypeface(railMono(false));
@@ -4243,7 +4420,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             holder.row.setSelected(holdsSelection);
             holder.label.setTextColor(holdsSelection || !Boolean.TRUE.equals(holder.nested)
                     ? chrome.onSurface : chrome.primary);
-            holder.mark.setTextColor(holdsSelection ? chrome.primary : chrome.onSurfaceVariant);
         }
         String verb = holder.foldKey == null ? "Open " : holder.folded ? "Unfold " : "Fold ";
         String described = verb + (nested ? "worktree " : "space ") + label + ", " + windows
@@ -4415,8 +4591,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             sheet.add("Space “" + spaceLabel + "”…", () -> showSpaceSheet(target, space, spaceLabel, pane));
         }
         if (!cwd.isEmpty()) sheet.add("Copy path", () -> ActionSheet.copy(this, "Path", cwd));
-        sheet.add("Copy terminal id", () -> ActionSheet.copy(this, "Terminal id", pane))
-                .danger("Close terminal", () -> runEdit(target, "Close " + title, "op", "pane.kill", "terminal", pane))
+        // No terminal id here (Wolf, factory-jmc): "i never need to see t3xz or the code since i do not use that".
+        sheet.danger("Close terminal", () -> runEdit(target, "Close " + title, "op", "pane.kill", "terminal", pane))
                 .show();
     }
 
@@ -4455,17 +4631,17 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         holder.row.setSaveFromParentEnabled(false);
         holder.row.setBackground(railBackground(false));
         // A Deacon or PM row's chevron: it folds, the rest of the row focuses the agent.
-        holder.mark = railText("", 12, chrome.onSurfaceVariant);
-        holder.mark.setTypeface(railMono(false));
-        holder.mark.setGravity(android.view.Gravity.CENTER);
-        holder.mark.setMinHeight(dp(28));
-        holder.mark.setBackground(railBackground(false));
+        holder.mark = new RailDisclosure(this, chrome);
         holder.mark.setVisibility(View.GONE);
+        // Folds only; an empty column (nothing to fold) is the row, so it focuses.
         holder.mark.setOnClickListener(v -> {
             if (holder.foldKey != null) toggleRepo(holder.foldKey);
             else holder.row.performClick();
         });
-        holder.row.addView(holder.mark, new LinearLayout.LayoutParams(dp(FleetTree.RAIL_DEPTH_DP), -2));
+        holder.mark.offerOn(holder.row);
+        LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(FleetTree.PM_CHEVRON_DP), -1);
+        markParams.setMarginEnd(dp(6));
+        holder.row.addView(holder.mark, markParams);
         // Status as a small square mark (no ovals in the boxy rail).
         holder.dot = new View(this);
         holder.dot.setBackgroundColor(chrome.onSurfaceVariant);
@@ -4525,17 +4701,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             holder.row.setSelected(selected);
         }
         if (!title.contentEquals(holder.title.getText())) holder.title.setText(title);
-        String word = status == null || status.isEmpty() || "unknown".equals(status) ? "" : status;
-        // Blocked is a red "!" on the agent's own row, and on its PM's or the
-        // Deacon's row while the blocked work is folded under it.
-        boolean alarm = "blocked".equals(status) || "error".equals(status) || "question".equals(status) || bubbled;
-        String state = alarm ? (word.isEmpty() ? "!" : "! " + word) : word;
+        holder.title.setTextColor(AgentNames.UNNAMED.equals(title) ? chrome.onSurfaceVariant : chrome.onSurface);
+        // The dot is the state (Wolf: "the dot is enough"); no state word. A red "!" stays only on a
+        // PM's or the Deacon's row while blocked work is folded under it, where no dot shows it.
+        String state = bubbled ? "!" : "";
         if (!state.contentEquals(holder.state.getText())) holder.state.setText(state);
-        holder.state.setTextColor(alarm ? chrome.danger : selected ? chrome.onSurface : chrome.onSurfaceVariant);
+        holder.state.setTextColor(chrome.danger);
         CharSequence sub = holder.sub.getVisibility() == View.VISIBLE ? holder.sub.getText() : "";
         // A row description overrides its children, so the state has to be said here.
         String described = "Focus pane " + title + (sub.length() == 0 ? "" : ", " + sub)
-                + (word.isEmpty() ? "" : ", " + word)
+                + ", " + AgentNames.stateWords(status, "question".equals(status) ? "question" : "")
                 + (bubbled ? ", something under it needs you" : "")
                 + (holder.foldKey == null ? "" : ", long press for more");
         if (!described.contentEquals(holder.row.getContentDescription() == null
@@ -4577,7 +4752,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private static final class RailWorkspaceRow {
         LinearLayout row;
-        TextView mark, label, meta;
+        RailDisclosure mark;
+        TextView label, meta;
         SavedRemoteHost host;
         Connection connection;
         String workspaceId = "";
@@ -4598,7 +4774,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static final class RailPaneRow {
         LinearLayout row;
         View dot;
-        TextView mark, title, sub;
+        RailDisclosure mark;
+        TextView title, sub;
         TextView state;
         /** What a Deacon or PM row's chevron folds, or null. */
         String foldKey;
@@ -6442,6 +6619,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         attachWorker.shutdownNow();
         if (outbox != null) outbox.unlisten(outboxChanged);
         if (composer != null) composer.destroy();
+        if (usageFeed != null) usageFeed.detach(this);
         Dictation.pending(this).setListener(null);
         stopHostSampling();
         stopConnection();
@@ -6576,6 +6754,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * the layout is rewritten), which froze the app for up to 20 seconds.
      */
     private void runSessionAction(Connection target, String action, String label) {
+        runSessionAction(target, action, label, null);
+    }
+
+    /** {@code failed}, when given, also hears why it was not applied (on the main thread). */
+    private void runSessionAction(Connection target, String action, String label, java.util.function.Consumer<String> failed) {
         synchronized (stateLock) {
             if (current(target)) publish(target, label + "…");
         }
@@ -6591,16 +6774,21 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             final String reason = failure;
             main.post(() -> {
                 if (!destroyed) note("Could not apply " + label + ": " + reason);
+                if (!destroyed && failed != null) failed.accept(reason);
             });
         });
     }
 
     /** A layout edit (see core_session's TabEdit), applied like any session action. */
     private void runEdit(Connection target, String label, Object... fields) {
+        runEditOr(target, label, null, fields);
+    }
+
+    private void runEditOr(Connection target, String label, java.util.function.Consumer<String> failed, Object... fields) {
         try {
             JSONObject edit = new JSONObject();
             for (int i = 0; i + 1 < fields.length; i += 2) edit.put((String) fields[i], fields[i + 1]);
-            runSessionAction(target, edit.toString(), label);
+            runSessionAction(target, edit.toString(), label, failed);
         } catch (JSONException impossible) { }
     }
 
@@ -7382,6 +7570,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
+                        if (selected && pinsRail != null && current.machine != null) Pins.shared(this).observe(current.machine, current.panes);
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or
