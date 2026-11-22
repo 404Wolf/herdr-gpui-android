@@ -219,6 +219,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private long lastMoveAt;
     private volatile boolean flinging;
     private SurfaceView terminalSurface;
+    private TerminalSelection selection;
     private final Runnable flingStep = new Runnable() {
         @Override public void run() {
             if (!flinging || terminalSurface == null) return;
@@ -619,6 +620,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         root.addView(actionBar, clusterAt);
         root.getViewTreeObserver().addOnGlobalLayoutListener(() -> fitAroundCluster(actionBar));
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
+        // Select and copy in the terminal: its handles live over everything else (factory-9zz.4).
+        selection = new TerminalSelection(this, root, surface, new TerminalSelection.Host() {
+            @Override public boolean select(int kind, float x, float y) {
+                Connection now;
+                synchronized (stateLock) { now = connection; }
+                return now != null && nativeSelect(now.generation, kind, x, y);
+            }
+            @Override public void claimTouch() { claimRendererTouch(); }
+            @Override public void copy(String text) { ActionSheet.copy(GpuiTerminalActivity.this, "Terminal", text); }
+        });
         // Below 600 dp the rail is a modal drawer over this scrim, instead of
         // squeezing an already narrow terminal; Back or a tap outside closes it.
         railScrim = new View(this);
@@ -5138,6 +5149,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean dispatchTerminalTouch(MotionEvent event, int masked) {
         int count = event.getPointerCount();
         if (count < 1 || count > 16) return false;
+        // Selection first (factory-9zz.4): a long press, a handle drag or a tap that clears a
+        // shown selection is the activity's; none of it reaches the program, nor scrolls.
+        if (selection != null && selection.onTouch(event)) {
+            if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) rendererTouch.end();
+            return true;
+        }
         if (masked == MotionEvent.ACTION_UP) {
             tapX = touchDownX;
             tapY = touchDownY;
@@ -5709,6 +5726,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * (JSON, see ghost_bridge.rs), so the floating controls stay clear of the
      * caret, ghost text and dialogs. Any thread.
      */
+    /** The renderer's selection changed (gpui-rio touch_select, android.rs selection_changed). */
+    public void gpuiSelection(long expectedGeneration, String json) {
+        main.post(() -> {
+            synchronized (stateLock) {
+                if (destroyed || connection == null || connection.generation != expectedGeneration) return;
+            }
+            if (selection != null) selection.report(json);
+        });
+    }
+
     public void gpuiLayoutHint(long expectedGeneration, String json) {
         // The drawn grid's geometry, for a debug build's tap tests (logcat tag herdr-tap).
         if (debuggable()) android.util.Log.d("herdr-tap", "layout " + json);
@@ -7363,6 +7390,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private static native void nativeResumed();
     private static native void nativePaused();
     private static native void nativeSetTerminalTouchActive(boolean active);
+    /** A touch-selection step for the drawn pane (TerminalSelection kinds), in logical pixels. */
+    private static native boolean nativeSelect(long generation, int kind, float x, float y);
     private static native boolean nativeTouch(int action, int actionIndex, int[] ids, float[] xs, float[] ys,
             long tapStamp);
     private static native boolean nativeKey(long generation, int keyCode, int action, int metaState, int unicodeCodepoint);

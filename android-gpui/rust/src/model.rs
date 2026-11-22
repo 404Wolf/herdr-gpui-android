@@ -1226,6 +1226,23 @@ struct ShellPan {
     delta: f32,
 }
 
+/// A touch-selection step for the terminal view (factory-9zz.4), in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SelectStep {
+    /// A long press: the word under the finger.
+    Word { x: f32, y: f32 },
+    /// A handle dragged to the cell under the finger.
+    Move { handle: gpui_rio::touch_select::Handle, x: f32, y: f32 },
+    Clear,
+}
+
+/// The latest selection step, for the view of the pane it was queued for (as `ShellPan`).
+#[derive(Default)]
+struct ShellSelect {
+    target: (i64, u64),
+    step: Option<SelectStep>,
+}
+
 pub struct Mailbox {
     generation: i64,
     active: bool,
@@ -1242,6 +1259,8 @@ pub struct Mailbox {
     /// Pan steps for the terminal view drawing `shell`, which owns its own
     /// column offset; the view takes them (`take_shell_pan`).
     shell_pan: ShellPan,
+    /// The latest touch-selection step for the drawn pane's view (`take_select`).
+    shell_select: ShellSelect,
     pub follow: bool,
     /// Raw SSH shell drawn instead of a Herdr pane, or 0.
     shell: u64,
@@ -1338,6 +1357,7 @@ impl Default for Mailbox {
             pan: 0.,
             pan_limit: MAX_PAN,
             shell_pan: ShellPan::default(),
+            shell_select: ShellSelect::default(),
             // A fresh session tails its pane until the user scrolls back.
             follow: true,
             shell: 0,
@@ -1473,6 +1493,7 @@ impl Mailbox {
         // Steps meant for the view of another pane never move the new one.
         if shell != self.shell {
             self.shell_pan = ShellPan::default();
+            self.shell_select = ShellSelect::default();
         }
         self.shell = shell;
         self.frame_target = target;
@@ -1591,6 +1612,36 @@ impl Mailbox {
         self.revision = self.revision.wrapping_add(1);
         #[cfg(feature = "android-ui")]
         signal_change();
+    }
+
+    /// Queues a touch-selection step for the pane drawn now; only its view applies it. A
+    /// newer step replaces one not yet taken (a handle drag only needs its latest point).
+    /// False when no pane view is drawn or the step is not finite.
+    pub fn select(&mut self, generation: i64, step: SelectStep) -> bool {
+        let finite = match step {
+            SelectStep::Word { x, y } | SelectStep::Move { x, y, .. } => x.is_finite() && y.is_finite(),
+            SelectStep::Clear => true,
+        };
+        if !finite || self.shell == 0 || generation != self.generation {
+            return false;
+        }
+        self.shell_select = ShellSelect { target: (self.generation, self.shell), step: Some(step) };
+        self.revision = self.revision.wrapping_add(1);
+        #[cfg(feature = "android-ui")]
+        signal_change();
+        true
+    }
+
+    /// The step queued for the view of `shell` in `generation`, once; one for another pane is
+    /// dropped, never applied to the view asking.
+    pub fn take_select(&mut self, generation: i64, shell: u64) -> Option<SelectStep> {
+        if shell != 0 && self.shell_select.target == (generation, shell) {
+            return std::mem::take(&mut self.shell_select).step;
+        }
+        if self.shell_select.target != (self.generation, self.shell) {
+            self.shell_select = ShellSelect::default();
+        }
+        None
     }
 
     /// The pan steps queued since they were last taken, for the view of
@@ -2384,6 +2435,27 @@ mod tests {
         assert!(box_.set_shell(11, 8, None));
         box_.pan(24.);
         assert_eq!(box_.take_shell_pan(10, 8), 0.);
+    }
+
+    #[test]
+    fn a_selection_step_reaches_only_the_view_of_the_pane_it_was_queued_for() {
+        use gpui_rio::touch_select::Handle;
+        let mut box_ = Mailbox::default();
+        box_.set_active(10, true);
+        assert!(!box_.select(10, SelectStep::Word { x: 5., y: 5. }), "no pane view drawn");
+        box_.set_shell(10, 7, None);
+        assert!(!box_.select(10, SelectStep::Word { x: f32::NAN, y: 5. }));
+        assert!(!box_.select(9, SelectStep::Clear), "an old generation's step");
+        assert!(box_.select(10, SelectStep::Word { x: 5., y: 5. }));
+        // A newer step replaces one not yet taken: a drag needs only its latest point.
+        assert!(box_.select(10, SelectStep::Move { handle: Handle::End, x: 9., y: 5. }));
+        assert_eq!(box_.take_select(10, 8), None, "another pane's view never takes it");
+        assert_eq!(box_.take_select(10, 7), Some(SelectStep::Move { handle: Handle::End, x: 9., y: 5. }));
+        assert_eq!(box_.take_select(10, 7), None, "once");
+        // A switch to another pane drops a step meant for the old one.
+        assert!(box_.select(10, SelectStep::Clear));
+        assert!(box_.set_shell(10, 8, None));
+        assert_eq!(box_.take_select(10, 8), None);
     }
 
     #[test]

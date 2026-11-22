@@ -484,6 +484,63 @@ pub(crate) fn terminal_tapped(generation: i64, report: gpui_rio::tap::Report) ->
     .is_ok()
 }
 
+/// The JSON a selection report is handed to Java as (logical pixels), or `{}` when none.
+pub(crate) fn selection_json(report: Option<&gpui_rio::touch_select::Report>) -> String {
+    let Some(report) = report else {
+        return "{}".into();
+    };
+    let at = |p: Option<(f32, f32)>| p.map(|(x, y)| serde_json::json!({"x": x, "y": y}));
+    serde_json::json!({
+        "start": at(report.start),
+        "end": at(report.end),
+        "lineHeight": report.line_height,
+        "text": report.text,
+    })
+    .to_string()
+}
+
+/// Tells Java the selection changed (factory-9zz.4): its handles and text, or `{}` for none.
+pub(crate) fn selection_changed(generation: i64, report: Option<&gpui_rio::touch_select::Report>) -> bool {
+    let json = selection_json(report);
+    gpui_mobile::android::jni::with_env(|env| {
+        let activity = gpui_mobile::android::jni::activity(env)?;
+        let name = jni_mobile::strings::JNIString::from("gpuiSelection");
+        let signature =
+            jni_mobile::signature::RuntimeMethodSignature::from_str("(JLjava/lang/String;)V")
+                .map_err(|e| e.to_string())?;
+        let value = env.new_string(&json).map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            name,
+            signature.method_signature(),
+            &[jni_mobile::objects::JValue::Long(generation), jni_mobile::objects::JValue::Object(&value)],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .is_ok()
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_GpuiTerminalActivity_nativeSelect(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    generation: jlong,
+    kind: jint,
+    x: jfloat,
+    y: jfloat,
+) -> jboolean {
+    let step = match kind {
+        0 => model::SelectStep::Word { x, y },
+        1 => model::SelectStep::Move { handle: gpui_rio::touch_select::Handle::Start, x, y },
+        2 => model::SelectStep::Move { handle: gpui_rio::touch_select::Handle::End, x, y },
+        3 => model::SelectStep::Clear,
+        _ => return 0,
+    };
+    u8::from(model::mailbox().select(generation, step))
+}
+
 /// Tells Java where the drawn screen is busy (see `gpui_rio::ghost::LayoutHint`),
 /// so it floats its controls clear of the caret, ghost text and dialogs.
 pub(crate) fn layout_hint(generation: i64, json: &str) -> bool {

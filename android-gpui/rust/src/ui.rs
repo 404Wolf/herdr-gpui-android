@@ -97,6 +97,8 @@ impl TerminalView {
         self.attach_shell(state.shell, state.frame_target.clone(), cx);
         #[cfg(unix)]
         self.pan_shell(state.generation, cx);
+        #[cfg(unix)]
+        self.select_shell(state.generation, cx);
         #[cfg(not(unix))]
         let _ = cx;
         let new_generation = self.state.generation != state.generation;
@@ -230,6 +232,34 @@ impl TerminalView {
                 cx.notify();
             }
         });
+    }
+
+    /// Applies the latest touch-selection step to the drawn pane's view and tells the host
+    /// where its handles go (factory-9zz.4). Nothing of it reaches the program.
+    #[cfg(unix)]
+    fn select_shell(&mut self, generation: i64, cx: &mut Context<Self>) {
+        let Some((handle, terminal)) = &self.shell else {
+            return;
+        };
+        let Some(step) = model::mailbox().take_select(generation, *handle) else {
+            return;
+        };
+        let report = terminal.update(cx, |terminal, cx| {
+            let report = match step {
+                model::SelectStep::Word { x, y } => terminal.select_word_at(point(px(x), px(y))),
+                model::SelectStep::Move { handle, x, y } => terminal.select_move(handle, point(px(x), px(y))),
+                model::SelectStep::Clear => {
+                    terminal.select_clear();
+                    None
+                }
+            };
+            cx.notify();
+            report
+        });
+        #[cfg(target_os = "android")]
+        crate::android::selection_changed(generation, report.as_ref());
+        #[cfg(not(target_os = "android"))]
+        let _ = report;
     }
 
     #[cfg(unix)]
