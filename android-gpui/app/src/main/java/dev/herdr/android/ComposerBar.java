@@ -74,6 +74,8 @@ final class ComposerBar {
         default boolean queuedKnown(String id) { return queuedText(id) != null; }
         /** Sends Enter as a terminal key, with the toolbar's usual Enter behaviour. */
         void enterKey();
+        /** Types this pane's held messages now, oldest first, each once; false when none is held here. */
+        default boolean flushHeld() { return false; }
         /** Hides the on-screen keyboard, whichever view owns it. */
         void hideKeyboard();
         /** Scrolls the pane back to its live bottom, if it is scrolled into history. */
@@ -1765,6 +1767,12 @@ final class ComposerBar {
         }
         String outgoing = agent ? drafts.outgoing() : null;
         if (outgoing == null) {
+            // Nothing typed, messages held for this pane (Wolf 11-22): this tap types them now,
+            // oldest first, each once; the harness then takes them in its own way (Codex steers
+            // its running turn; Claude Code queues them and its send-now key, Enter on an empty
+            // prompt, sends them at once). Nothing held: Enter as before, which is that same
+            // send-now key for Claude's own queue and does nothing on an empty Codex prompt.
+            if (agent && host.flushHeld()) return;
             host.enterKey();
             return;
         }
