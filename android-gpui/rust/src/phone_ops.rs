@@ -49,6 +49,8 @@ const READ_SH: &str = include_str!("beads/read.sh");
 /// with its mtime and checksum from that machine's own clock, or "same" when the
 /// phone's `key` still matches. Read-only; at most 200 kB of text.
 const DOC_SH: &str = include_str!("docs/doc.sh");
+/// An agent's session file (factory-9zz.12), found from its labels only (history/history.sh).
+const HISTORY_SH: &str = include_str!("history/history.sh");
 /// Runs a vendored script ($1) with bd on that machine's login PATH when the
 /// core's own PATH lacks it (a service environment without the Nix profile),
 /// as USAGE_LOOK does for aswap; the scripts themselves stay byte for byte.
@@ -101,6 +103,11 @@ pub(crate) enum PhoneOp {
     /// `<project>/<agent>` under ~/deacon/work; `key` the `mtime:cksum` the
     /// phone already shows, so an unchanged doc comes back "same", without text.
     DocRead { name: String, key: Option<String> },
+    /// An agent's conversation from its own session file (factory-9zz.12): `kind` and `session`
+    /// are the terminal's `agent.kind`/`agent.session` labels; `path` the file found last time
+    /// (checked again there), `key` its `size:mtime` the phone keeps, so an unchanged file
+    /// comes back "same" without text.
+    AgentHistory { kind: crate::agent_history::Kind, session: String, path: Option<String>, key: Option<String> },
 }
 
 impl PhoneOp {
@@ -180,6 +187,22 @@ impl PhoneOp {
                     _ => return None,
                 };
                 Some(Self::DocRead { name, key })
+            }
+            "agent.history" => {
+                only(&["kind", "session", "path", "key"]).then_some(())?;
+                let kind = crate::agent_history::Kind::parse(value["kind"].as_str()?)?;
+                let session = value["session"].as_str().filter(|s| crate::agent_history::plain_session(s))?.to_owned();
+                let path = match &value["path"] {
+                    Value::Null => None,
+                    Value::String(p) if history_path(p, &session) => Some(p.clone()),
+                    _ => return None,
+                };
+                let key = match &value["key"] {
+                    Value::Null => None,
+                    Value::String(k) if doc_key(k) => Some(k.clone()),
+                    _ => return None,
+                };
+                Some(Self::AgentHistory { kind, session, path, key })
             }
             "tab.detach" => {
                 only(&["space", "tab", "park", "kill"]).then_some(())?;
@@ -270,12 +293,65 @@ impl PhoneOp {
                 let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
                 Ok(script_reply(&result)?.to_string())
             }
+            Self::AgentHistory { kind, session, path, key } => {
+                let tail = crate::agent_history::TAIL_BYTES.to_string();
+                let argv = json!(["sh", "-c", HISTORY_SH, "sh", kind.name(), session, path.as_deref().unwrap_or(""),
+                    key.as_deref().unwrap_or(""), tail]);
+                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                Ok(history_reply(*kind, &result)?.to_string())
+            }
             Self::DocRead { name, key } => {
                 let argv = json!(["sh", "-c", DOC_SH, "sh", name, key.as_deref().unwrap_or("")]);
                 let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
                 Ok(script_reply(&result)?.to_string())
             }
         }
+    }
+}
+
+/// A path history.sh found before: absolute, plain, ending in the session's own file name.
+fn history_path(path: &str, session: &str) -> bool {
+    path.len() <= 512
+        && path.starts_with('/')
+        && !path.split('/').any(|part| part == "..")
+        && !path.chars().any(char::is_control)
+        && path.ends_with(&format!("{session}.jsonl"))
+}
+
+/// history.sh's answer for the app: `{"unavailable":..}`, `{"same":true,"path","key"}`, or the
+/// rendered conversation `{"path","key","text","truncated"}`; never the raw file.
+fn history_reply(kind: crate::agent_history::Kind, result: &Value) -> Result<Value> {
+    if let Some(why) = exec_failure(result, "the history read") {
+        return Ok(json!({"queued":true,"error":why}));
+    }
+    let out = exec_text(result)?;
+    let mut lines = out.splitn(4, '\n');
+    let first = lines.next().unwrap_or("");
+    if let Some(why) = first.strip_prefix("unavailable") {
+        let why = match why.trim() {
+            "0" => "its session file is not on that machine",
+            "kind" => "no history for this harness",
+            _ => "more than one session file matches",
+        };
+        return Ok(json!({"queued":true,"unavailable":why}));
+    }
+    let path = first.strip_prefix("path ").unwrap_or("").to_owned();
+    let key = lines.next().and_then(|k| k.strip_prefix("key ")).unwrap_or("").to_owned();
+    match lines.next() {
+        Some("same") => Ok(json!({"queued":true,"same":true,"path":path,"key":key})),
+        Some("data") => {
+            let tail = lines.next().unwrap_or("");
+            // A file longer than what was read begins mid-line: that first piece is dropped.
+            let size = key.split_once(':').and_then(|(s, _)| s.parse::<usize>().ok()).unwrap_or(0);
+            let tail = if size > crate::agent_history::TAIL_BYTES {
+                tail.split_once('\n').map_or("", |(_, rest)| rest)
+            } else {
+                tail
+            };
+            let (text, cut) = crate::agent_history::bound(crate::agent_history::render(kind, tail), crate::agent_history::MAX_TEXT);
+            Ok(json!({"queued":true,"path":path,"key":key,"text":text,"truncated":cut || result["truncated"] == true}))
+        }
+        _ => Ok(json!({"queued":true,"error":"couldn't read the history's answer"})),
     }
 }
 
@@ -1100,5 +1176,89 @@ mod tests {
         assert!(say(127, "")["timing"]["exec_ms"].is_null());
         let failed = PhoneOp::UsageLook.run(|_, _| Err(Error::Closed));
         assert!(matches!(failed, Err(Error::Closed)));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn an_agents_history_is_asked_only_by_its_labels_and_a_path_it_found() {
+        use crate::agent_history::Kind;
+        let session = "01a1f1fe-268f-7ce3-9547-c422c66af57b";
+        assert_eq!(
+            PhoneOp::parse(&format!(r#"{{"op":"agent.history","kind":"codex","session":"{session}"}}"#)),
+            Some(PhoneOp::AgentHistory { kind: Kind::Codex, session: session.into(), path: None, key: None })
+        );
+        let path = format!("/home/wolf/.codex/sessions/2026/11/19/rollout-2026-11-19T04-08-47-{session}.jsonl");
+        assert!(PhoneOp::parse(&format!(r#"{{"op":"agent.history","kind":"codex","session":"{session}","path":"{path}","key":"12:34"}}"#)).is_some());
+        for bad in [
+            r#"{"op":"agent.history","kind":"gemini","session":"abc"}"#.to_string(),
+            r#"{"op":"agent.history","kind":"claude","session":"../x"}"#.to_string(),
+            format!(r#"{{"op":"agent.history","kind":"claude","session":"{session}","path":"/etc/passwd"}}"#),
+            format!(r#"{{"op":"agent.history","kind":"claude","session":"{session}","path":"/a/../{session}.jsonl"}}"#),
+            format!(r#"{{"op":"agent.history","kind":"claude","session":"{session}","key":"x"}}"#),
+            format!(r#"{{"op":"agent.history","kind":"claude","session":"{session}","extra":1}}"#),
+        ] {
+            assert_eq!(PhoneOp::parse(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_history_answer_is_rendered_and_never_the_raw_file() {
+        use crate::agent_history::Kind;
+        use base64::Engine as _;
+        let exec = |out: &str| json!({"code":0,"stdout":base64::engine::general_purpose::STANDARD.encode(out),"truncated":false});
+        let none = history_reply(Kind::Claude, &exec("unavailable 0\n")).unwrap();
+        assert_eq!(none["unavailable"], "its session file is not on that machine");
+        let two = history_reply(Kind::Claude, &exec("unavailable 2\n")).unwrap();
+        assert_eq!(two["unavailable"], "more than one session file matches");
+        let same = history_reply(Kind::Claude, &exec("path /h/.claude/projects/x/s.jsonl\nkey 10:20\nsame\n")).unwrap();
+        assert_eq!((same["same"].clone(), same["key"].clone()), (json!(true), json!("10:20")));
+        let file = r#"{"type":"user","message":{"role":"user","content":"hello"}}"#;
+        let data = history_reply(Kind::Claude, &exec(&format!("path /h/.claude/projects/x/s.jsonl\nkey 60:20\ndata\n{file}\n"))).unwrap();
+        assert_eq!(data["text"], "> hello\n", "a short file is read whole, its first line kept");
+        assert!(!data.to_string().contains("\"type\":\"user\""), "the raw JSON never leaves");
+        let long = history_reply(Kind::Claude, &exec(&format!("path p.jsonl\nkey 99999999:20\ndata\ncut{{\n{file}\n"))).unwrap();
+        assert_eq!(long["text"], "> hello\n", "a longer file's first, cut line is dropped");
+        let failed = history_reply(Kind::Claude, &json!({"code":1,"stdout":""})).unwrap();
+        assert!(failed["error"].as_str().unwrap().contains("exited with 1"));
+    }
+
+    /// history.sh itself, in a scratch HOME: found by labels only, one regular file or nothing.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn history_sh_finds_exactly_one_regular_file_and_never_follows_a_link() {
+        let home = std::env::temp_dir().join(format!("herdr-history-sh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(HISTORY_SH)
+                .arg("sh")
+                .args(args)
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let day = home.join(".codex/sessions/2026/11/19");
+        std::fs::create_dir_all(&day).unwrap();
+        assert_eq!(run(&["codex", "aaaa-1", "", "", "100"]), "unavailable 0\n");
+        let file = day.join("rollout-2026-11-19T04-08-47-aaaa-1.jsonl");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let first = run(&["codex", "aaaa-1", "", "", "100"]);
+        assert!(first.starts_with(&format!("path {}\nkey 8:", file.display())), "{first}");
+        assert!(first.ends_with("data\none\ntwo\n"), "{first}");
+        let key = first.lines().nth(1).unwrap().strip_prefix("key ").unwrap().to_string();
+        assert!(run(&["codex", "aaaa-1", &file.display().to_string(), &key, "100"]).ends_with("same\n"));
+        // A path outside that harness's folder is never read: it is found again.
+        assert!(run(&["codex", "aaaa-1", "/etc/passwd", "", "100"]).starts_with(&format!("path {}", file.display())));
+        std::fs::write(day.join("rollout-2026-11-20T00-00-00-aaaa-1.jsonl"), "x\n").unwrap();
+        assert_eq!(run(&["codex", "aaaa-1", "", "", "100"]), "unavailable 2\n", "two matches: neither");
+        let project = home.join(".claude/projects/-x");
+        std::fs::create_dir_all(&project).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", project.join("bbbb-2.jsonl")).unwrap();
+        assert_eq!(run(&["claude", "bbbb-2", "", "", "100"]), "unavailable 0\n", "a link is not a session file");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
