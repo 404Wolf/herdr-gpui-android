@@ -370,25 +370,37 @@ else
 fi
 
 # (e) Never over typing: a dialog that appears while the composer holds a draft waits for it.
-sheet_up() { find_ui 'Claude asks|review your answers' > /dev/null 2>&1; }
+sheet_up() { find_ui '(Claude|Codex|Gemini) asks|review your answers' > /dev/null 2>&1; }
 # Another agent (a relaunch reopens the last pane, not Home).
-# pr48.sh's way: the tab by its description, retried, else the overflow menu's Panes; done only
-# when the strip marks it current, so nothing later runs against the wrong pane.
+# Done only when the strip marks the pane current (or its sheet is up: the sheet is modal and
+# hides the strip from the dump), so nothing later runs against the wrong pane. Each way waits
+# for the switch to land before the next is tried: the tab chip, the rail row (a wide screen),
+# then the overflow menu's list of panes ('Spaces & panes', 'Panes' in older builds).
 pane_is() { dump && $ui find "$EMU_OUT/ui.xml" "Window [0-9]+, $1, (blocked, )?current" > /dev/null; }
+switched() { # name: up to 10 s
+    local end=$((SECONDS + 10))
+    while (( SECONDS < end )); do
+        pane_is "$1" && return 0
+        sheet_up && return 0
+        sleep 1
+    done
+    return 1
+}
 switch_to() { # name
-    local n
     sheet_up && a shell input keyevent KEYCODE_BACK && quiet 2
     pane_is "$1" && return 0
-    for n in 1 2 3; do
-        tap_ui "Window [0-9]+, $1[.,]" 8 > /dev/null || tap_ui "$1" 8 > /dev/null || true
-        quiet 4
-        pane_is "$1" && return 0
-        # A sheet opens only on the pane on screen, and it hides the strip from the dump.
-        sheet_up && return 0
-    done
-    tap_ui 'Panes, hosts and terminal actions' 10 > /dev/null && tap_ui '^Panes$' 10 > /dev/null && { quiet 1; tap_ui "$1" 15 > /dev/null; }
-    quiet 4
-    pane_is "$1" || { shot "switch-$1-fail"; return 1; }
+    tap_ui "Window [0-9]+, $1[.,]" 8 > /dev/null && switched "$1" && return 0
+    tap_ui "Focus pane $1" 5 > /dev/null && switched "$1" && return 0
+    if tap_ui 'Panes, hosts and terminal actions' 10 > /dev/null \
+        && tap_ui '^(Spaces & panes|Panes)$' 10 > /dev/null; then
+        quiet 2
+        tap_ui "$1" 15 > /dev/null && switched "$1" && return 0
+    fi
+    # One more tab tap: a busy guest can drop the first.
+    tap_ui "Window [0-9]+, $1[.,]" 8 > /dev/null && switched "$1" && return 0
+    shot "switch-$1-fail"
+    $ui list "$EMU_OUT/ui.xml" > "$EMU_OUT/switch-$1-fail.txt" 2>&1
+    return 1
 }
 if switch_to agent-r; then
     quiet 4
