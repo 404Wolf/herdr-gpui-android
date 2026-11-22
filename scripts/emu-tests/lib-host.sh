@@ -202,8 +202,11 @@ fp=$(ssh-keygen -lf "$work/ssh/host.pub" | awk '{print $2}')
 cat > "$work/hosts.json" << JSON
 {"format": "remote-for-herdr-hosts", "version": 1, "hosts": [{"transport": "tcp", "host": "10.0.2.2", "port": $SSH_PORT, "endpoint_id": "", "endpoint_ticket": "", "relay_url": "", "username": "$(id -un)", "session": "tbar", "expected_fingerprint": "$fp", "name": "tbhost", "shortcuts": "", "quickCommands": []}]}
 JSON
+# EMU_PALETTE: a provisioned palette's JSON (ProvisionedSettings "palette"), e.g. Wolf's OLED tokens.
+palette_field=""
+[[ -n "${EMU_PALETTE:-}" ]] && palette_field=",\"palette\":$EMU_PALETTE"
 cat > "$work/settings.json" << JSON
-{"format":"remote-for-herdr-settings","version":1,"capturable":true}
+{"format":"remote-for-herdr-settings","version":1,"capturable":true$palette_field}
 JSON
 files=/sdcard/Android/data/$pkg/files
 a shell mkdir -p "$files"
