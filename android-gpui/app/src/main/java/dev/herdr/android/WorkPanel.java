@@ -523,7 +523,7 @@ final class WorkPanel {
                 + (r.progress.isEmpty() ? "" : ", " + r.progress) + (r.open ? ". Tap to close its plan" : ". Tap to read its plan"));
         row.setOnClickListener(v -> {
             String id = r.node.bead.id;
-            if (!open.remove(id)) open.add(id);
+            if (!open.remove(id)) { open.add(id); openedAt.put(id, SystemClock.elapsedRealtime()); logged.remove(id); logged.remove(id + "/c"); }
             redraw(true);
             main.post(tick);
         });
@@ -538,12 +538,14 @@ final class WorkPanel {
         BeadsModel.Detail d = details.get(id);
         if (d == null) { box.addView(dim("Reading its plan…")); return box; }
         if (d.error != null) { box.addView(warn(d.error)); return box; }
+        logFirst(id, "plan");
         String doc = PanelModel.plan(d);
         String header = DocModel.beadHeader(id, d.title, null, null, d.updatedAt, d.rev);
         if (doc.isEmpty()) box.addView(dim(PanelModel.noPlan(r.node)));
         else box.addView(markdown(doc, header));
         if (d.maybeStale) box.addView(dim("from the store's export · checking it…"));
         BeadsModel.Comments c = comments.get(id);
+        if (c != null) logFirst(id + "/c", "comments");
         if (c != null && c.error != null) box.addView(warn("Can't read its comments: " + c.error));
         if (c != null && !c.list.isEmpty()) {
             box.addView(heading("Comments"));
@@ -634,6 +636,17 @@ final class WorkPanel {
         open.add(id);
         redraw(true);
         main.post(tick);
+    }
+
+    private final Map<String, Long> openedAt = new HashMap<>();
+    private final Set<String> logged = new HashSet<>();
+
+    /** The before-build's timing line (emulator only; not in any PR). */
+    private void logFirst(String key, String part) {
+        String id = key.endsWith("/c") ? key.substring(0, key.length() - 2) : key;
+        Long at = openedAt.get(id);
+        if (at == null || !logged.add(key)) return;
+        android.util.Log.i("herdr-ops", "panel.bead " + id + " " + part + " " + (SystemClock.elapsedRealtime() - at) + " ms after the tap (read now)");
     }
 
     private TextView heading(String text) {

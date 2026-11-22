@@ -155,13 +155,13 @@ public final class RailPanelTest {
         assertTrue(section(ui, "private void applySidebarDefault(", "private static SurfaceView findSurface(")
                 .contains("RailPanel.Shown.configured("));
         assertTrue(section(ui, "private void showRailOverlay(", "private RailPanel.Shown railShown(")
-                .contains(".floated(compactWindow())"));
+                .contains(".floated(railCompact())"));
         assertTrue(section(ui, "private void setSidebarOpen(", "private RailPanel storedRailPanel(")
-                .contains(".toggled(open, compactWindow())"));
+                .contains(".toggled(open, railCompact())"));
         assertTrue(section(ui, "private void setRailPanel(", "private void railKey(")
                 .contains("RailPanel.Shown.docked(next)"));
         assertTrue(section(ui, "private void applySidebarWidth(", "private void updateRailToggle(")
-                .contains("railShown().strip(compactWindow())"));
+                .contains("railShown().strip(railCompact())"));
         // The three fields change in one place only.
         for (String field : new String[] {"railOverlay = ", "railMinimized = ", "sidebarOpen = "}) {
             assertEquals(field, 1, count(ui, field));
