@@ -64,6 +64,16 @@ fn write_frame(socket: &mut impl Write, channel: u32, kind: u8, bytes: &[u8]) ->
     socket.write_all(bytes)?;
     Ok(())
 }
+/// The view after herdr-core refused to attach `terminal` and nothing else is attached: ready
+/// with no pane, and why, so the phone stops waiting for a landing that will not come.
+fn refused(view: &mut Value, terminal: &str, why: &str) {
+    view["state"] = json!("ready");
+    view["pane_id"] = json!("");
+    view["refused"] = json!({"terminal": terminal, "reason": why.chars().take(240).collect::<String>()});
+    view["status"] = json!("herdr-core refused that terminal");
+    bump(view);
+}
+
 /// How long the phone waits for an RPC: 15 s, or longer than the core itself was asked to
 /// take (`machine.exec`'s `timeout`, in seconds) plus a margin, so the phone never gives up on a
 /// command the computer is still allowed to run.
@@ -1355,6 +1365,10 @@ impl Connection<'_> {
         state.view["focused_pane"] = json!(terminal);
         state.view["state"] = json!("ready");
         state.view["status"] = json!("Connected to herdr-core");
+        // An attach that landed answers any earlier refusal.
+        if let Some(view) = state.view.as_object_mut() {
+            view.remove("refused");
+        }
         mark_focus(&mut state.view);
         bump(&mut state.view);
         Ok(())
@@ -2201,13 +2215,22 @@ fn serve(
                     log::warn!("switch {terminal} refused: {reason}");
                     #[cfg(not(feature = "android-ui"))]
                     let _ = reason;
+                    let why = reason.to_string();
                     connection.refresh()?;
-                    if !previous.is_empty()
+                    let back = !previous.is_empty()
                         && previous != terminal
-                        && let Err(Error::Protocol(_) | Error::Timeout { .. } | Error::Rpc { .. }) =
-                            connection.attach(&previous, cols, rows)
-                    {
+                        && connection.attach(&previous, cols, rows).map_or_else(
+                            |error| match error {
+                                Error::Protocol(_) | Error::Timeout { .. } | Error::Rpc { .. } => Ok(false),
+                                other => Err(other),
+                            },
+                            |()| Ok(true),
+                        )?;
+                    if !back {
                         connection.refresh()?;
+                        // Nothing to fall back to (a session opened for this switch, or the
+                        // previous pane refused too): say so, instead of "connecting" forever.
+                        refused(&mut lock(&owner.state).view, &terminal, &why);
                     }
                 }
                 Err(error) => return Err(error),
@@ -5534,6 +5557,17 @@ mod focus_review_tests {
             painted: false,
         };
         (connection, peer)
+    }
+
+    #[test]
+    fn a_refused_attach_with_nothing_to_fall_back_to_is_ready_with_no_pane_and_says_why() {
+        let mut view = json!({"state":"connecting","pane_id":"","revision":3});
+        refused(&mut view, "t1b6", &"x".repeat(500));
+        assert_eq!(view["state"], "ready");
+        assert_eq!(view["pane_id"], "");
+        assert_eq!(view["refused"]["terminal"], "t1b6");
+        assert_eq!(view["refused"]["reason"].as_str().unwrap().chars().count(), 240);
+        assert_ne!(view["revision"], 3, "the view changed, so the phone reads it");
     }
 
     #[test]
