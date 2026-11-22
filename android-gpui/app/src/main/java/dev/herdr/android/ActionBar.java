@@ -23,7 +23,7 @@ import java.util.List;
  * state machine is unchanged. Icons: Material Symbols vectors (res/drawable/ic_act_*).
  */
 final class ActionBar {
-    static final int BUTTON_DP = 40, TARGET_DP = 48, GAP_DP = 2, MARGIN_DP = 8, TEXT_SP = 12;
+    static final int BUTTON_DP = 48, TARGET_DP = 48, GAP_DP = 4, MARGIN_DP = 8, TEXT_SP = 12;
     /** The cluster's width: five equal slots. */
     static final int SLOTS_WIDTH_DP = 5 * TARGET_DP + 4 * GAP_DP;
 

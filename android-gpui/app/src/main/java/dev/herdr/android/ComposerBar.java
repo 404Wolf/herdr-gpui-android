@@ -1481,7 +1481,7 @@ final class ComposerBar {
             // draft and the queue's rows, never the old words.
             controls(loose);
             json = GhostText.json(GhostText.kind(kind), draft, marks, drafts.cuts(), clipLengths, parkedIds(),
-                    shownRows, queueOpen, selectedRow, cols, reserved(), GhostText.Colors.of(chrome));
+                    shownRows, queueOpen, selectedRow, cols, Collections.emptyList(), GhostText.Colors.of(chrome));
             QueueView.Row selected = queueOpen && selectedRow != null ? row(selectedRow) : null;
             // Its actions on the row itself: selecting one never changes the controls' line.
             if (selected != null) json = GhostText.withRowActions(json, selected.id, ControlLine.rowRungs(selected));
@@ -1497,29 +1497,6 @@ final class ComposerBar {
         return actions.view();
     }
 
-    /** The grid's columns, or 0 before its first layout. */
-    int columns() {
-        return layout == null ? 0 : layout.cols;
-    }
-
-    /** Cells at the prompt row's right that the icon cluster covers (0 when it floats over the panel). */
-    void reserveCells(int cells) {
-        int bounded = Math.max(0, Math.min(cells, 40));
-        if (bounded == reservedCells) return;
-        reservedCells = bounded;
-        pushGhost();
-    }
-
-    private int reservedCells;
-
-    /**
-     * The controls the renderer draws at the prompt: none (they are app icons), only an untappable
-     * blank as wide as the cluster where it covers the terminal, so the draft keeps clear of it.
-     */
-    private List<GhostText.Control> reserved() {
-        if (reservedCells <= 0) return Collections.emptyList();
-        return Collections.singletonList(new GhostText.Control(ControlLine.GAP_SEND, ControlLine.spaces(reservedCells), "dim"));
-    }
 
     /**
      * The field's input type: single-line, so the keyboard's action key sends;

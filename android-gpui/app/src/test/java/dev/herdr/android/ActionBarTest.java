@@ -74,7 +74,7 @@ public final class ActionBarTest {
     }
 
     @Test public void targetsAre48dpAndTheClusterTakesNoStrip() throws Exception {
-        assertTrue(ActionBar.TARGET_DP >= 48 && ActionBar.BUTTON_DP == 40);
+        assertTrue(ActionBar.TARGET_DP >= 48 && ActionBar.BUTTON_DP == 48 && ActionBar.GAP_DP == 4);
         String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
         assertTrue(gta.contains("new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.BOTTOM | android.view.Gravity.END);"));
@@ -100,7 +100,7 @@ public final class ActionBarTest {
     @Test public void thePromptGetsNoControlWords() throws Exception {
         String composer = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
                 "src/main/java/dev/herdr/android/ComposerBar.java")), java.nio.charset.StandardCharsets.UTF_8);
-        assertTrue(composer.contains("shownRows, queueOpen, selectedRow, cols, reserved(), GhostText.Colors.of(chrome));"));
+        assertTrue(composer.contains("shownRows, queueOpen, selectedRow, cols, Collections.emptyList(), GhostText.Colors.of(chrome));"));
         assertFalse(composer.contains("GhostText.withRungs(json, ladder)"));
     }
 }

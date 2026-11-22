@@ -529,7 +529,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         crumb.setVisibility(View.GONE);
         crumb.setOnClickListener(v -> { showRailOverlay(); revealSelectedRow(true); });
         content.addView(crumb, new LinearLayout.LayoutParams(-1, dp(20)));
-        rail.pinsRail.button().extendTouch(crumb);
+        rail.pinsRail.button().extendTouch(crumb, tabMenu);
         filePager = new FilePager(this, surface, chrome, this::readFileOrCopy, actionWorker);
         content.addView(filePager, new LinearLayout.LayoutParams(-1, 0, 1));
         keyGrid = new android.widget.GridLayout(this);
@@ -558,6 +558,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         column.addView(composer.keysOverlay(), new FrameLayout.LayoutParams(-1, dp(48)));
         column.addView(composer.targets(), new FrameLayout.LayoutParams(0, 0));
         filePager.setOnShownChanged(() -> {
+            if (!filePager.showingFile() && reopenPanelAfterFile) {
+                reopenPanelAfterFile = false;
+                toggleWorkPanel(true);
+            }
             composer.setCovered(filePager.showingFile());
             refreshOffer();
         });
@@ -1381,9 +1385,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     }
 
     /**
-     * Room for the icon cluster where it covers something, and nowhere else (Wolf: no strip):
-     * docked, the panel's text scrolls clear of it; on the cover or with the panel hidden it sits
-     * over the terminal, so the draft keeps clear of its width on the prompt row.
+     * Room for the icon cluster where it covers something, and nowhere else (Wolf: no strip
+     * across the app): docked, the panel's text scrolls clear of it and the terminal is
+     * untouched; over the terminal (the cover, or the panel hidden) the terminal's grid ends
+     * above the cluster's top (t2kg 11-22: the prompt row and footer must stay visible), and
+     * the black room left of the cluster holds its status words.
      */
     private void fitAroundCluster(View cluster) {
         boolean shows = cluster.getVisibility() == View.VISIBLE;
@@ -1391,15 +1397,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean overPanel = workPanel != null && workPanel.view().getVisibility() == View.VISIBLE
                 && cluster.getLeft() >= workPanel.view().getLeft();
         if (workPanel != null) workPanel.clearBottom(overPanel ? height : 0);
-        int cells = 0;
-        if (shows && !overPanel && terminalSurface != null && terminalSurface.getWidth() > 0 && composer != null) {
-            int cols = composer.columns();
-            if (cols > 0) {
-                float cell = terminalSurface.getWidth() / (float) cols;
-                cells = (int) Math.ceil((cluster.getWidth() + dp(ActionBar.MARGIN_DP)) / cell);
-            }
-        }
-        if (composer != null) composer.reserveCells(cells);
+        int below = shows && !overPanel ? height : 0;
+        View content = terminalColumn == null || terminalColumn.getChildCount() == 0 ? null : terminalColumn.getChildAt(0);
+        if (content == null) return;
+        FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) content.getLayoutParams();
+        if (at.bottomMargin == below) return;
+        at.bottomMargin = below;
+        content.setLayoutParams(at);
     }
 
     /**
@@ -1419,6 +1423,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // WorkPanel.extendTargets), never by making the bar taller.
         to.addView(pin, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
         to.addView(tabMenu, new LinearLayout.LayoutParams(dp(PinButton.WIDTH_DP), -1));
+        // Docked, the panel's header row is a 48 dp target strip drawn 30 dp tall: the glyphs
+        // sit in its top part (WorkPanel); in the tab row they are centred and reach below it.
+        int below = docked ? Math.max(0, dp(WorkPanel.TARGET_DP) - dp(WorkPanelLayout.TOP_BAR_DP)) : 0;
+        for (View v : new View[] {pin, tabMenu}) v.setPadding(v.getPaddingLeft(), 0, v.getPaddingRight(), below);
     }
 
     /** The terminal | panel divider (PanelDivider), and Wolf's split per orientation (factory-9zz.9). */
@@ -1481,12 +1489,32 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             @Override public void note(String text) { GpuiTerminalActivity.this.note(text); }
             @Override public void quote(String header, String text) { quoteToDraft(header, text); }
-            @Override public void openPath(String path) {
+            @Override public void openFile(String hostId, String path) {
                 Connection now;
                 synchronized (stateLock) { now = connection; }
-                if (now == null || filePager == null) return;
-                if (compactWindow()) toggleWorkPanel(false);
-                filePager.open(now.paneId, path, 0);
+                if (now == null || filePager == null || hostId == null) return;
+                // On the cover the panel covers the terminal: it steps aside and comes back when
+                // the file closes, as it was (WorkPanel keeps its tab and scroll).
+                if (compactWindow() && workPanelOpen) {
+                    toggleWorkPanel(false);
+                    reopenPanelAfterFile = true;
+                }
+                if (hostId.equals(now.hostId)) {
+                    filePager.open(now.paneId, path, 0);
+                    return;
+                }
+                // The doc's own machine (Wolf 11-22): read through that machine's mirror session,
+                // never the one on screen; nothing to read through says so.
+                HostSample mirror = hostSamples.get(hostId);
+                JSONArray panes = mirror == null ? null : mirror.panes;
+                String terminal = panes == null || panes.length() == 0 ? "" : panes.optJSONObject(0) == null ? ""
+                        : panes.optJSONObject(0).optString("id", "");
+                if (mirror == null || !mirror.connected || mirror.handle <= 0 || terminal.isEmpty()) {
+                    note("Can't reach " + hostName(hostId) + " to open that file now");
+                    return;
+                }
+                final long handle = mirror.handle;
+                filePager.open(terminal, path, 0, (t, p) -> readThrough(handle, t, p));
             }
             @Override public void openLink(String url) {
                 String lower = url == null ? "" : url.toLowerCase(java.util.Locale.ROOT);
@@ -3049,8 +3077,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         tabActive = activeId;
         tabStrip.removeAllViews();
         final Connection target = current;
-        tabStrip.addView(projectChip(project));
-        if (repo != null) {
+        // On the cover the breadcrumb below already names the project and repo (t42y C4/C5).
+        if (!compactWindow()) tabStrip.addView(projectChip(project));
+        if (repo != null && !compactWindow()) {
             TextView crumbText = new TextView(this);
             crumbText.setText(ProjectBar.crumbText(repo));
             crumbText.setTextSize(11);
@@ -5898,6 +5927,22 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         synchronized (stateLock) { target = connection; }
         return readFile(target, terminal, path, 0);
     }
+
+    /** One {@code file.read} through another machine's mirror session {@code handle}, as {@link #readFile}. */
+    private static String readThrough(long handle, String terminal, String path) {
+        try {
+            JSONObject read = new JSONObject().put("op", "file.read").put("terminal", terminal).put("path", path);
+            return RemoteNative.sessionAction(handle, read.toString());
+        } catch (JSONException impossible) {
+            return "{\"queued\":false}";
+        } catch (RuntimeException failed) {
+            String kind = RemoteError.kindOf(failed);
+            return "{\"queued\":false,\"error\":\"" + (kind.isEmpty() ? "failed" : kind) + "\"}";
+        }
+    }
+
+    /** The cover's panel stepped aside for a file opened from it: it comes back when the file closes. */
+    private boolean reopenPanelAfterFile;
 
     /** One {@code file.read} through {@code target}'s session; {@code limit} lines, 0 for the tap's whole read. */
     private String readFile(Connection target, String terminal, String path, int limit) {

@@ -44,6 +44,26 @@ public final class MdTextTest {
         assertTrue(md.text().contains("[this](javascript:alert(1))"));
     }
 
+    @Test public void barePathsAndPathCodeSpansOpenTheFile() {
+        MdText md = MdText.of("Details: /home/wolf/research/health-deploy-notes/. See `~/deacon/work/factory.md`, "
+                + "~/notes/a.txt and /tmp. Not and/or, 1/2, https://example.com/a/b, `rm -rf /x` or /.", null);
+        assertEquals(List.of("/home/wolf/research/health-deploy-notes/|/home/wolf/research/health-deploy-notes/",
+                "~/deacon/work/factory.md|~/deacon/work/factory.md", "~/notes/a.txt|~/notes/a.txt", "/tmp|/tmp"),
+                styled(md, MdText.Style.Kind.LOCAL));
+        assertEquals(List.of("https://example.com/a/b|https://example.com/a/b"), styled(md, MdText.Style.Kind.LINK));
+        // A link's own text never nests a path link.
+        assertTrue(styled(MdText.of("[/etc/hosts](https://example.com/h)", null), MdText.Style.Kind.LOCAL).isEmpty());
+    }
+
+    @Test public void thePanelOpensAFileOnTheMachineItsTextCameFrom() throws java.io.IOException {
+        String panel = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/WorkPanel.java")), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(panel.contains("void openFile(String hostId, String path);"));
+        assertTrue(panel.contains("view.setText(spans(md, hostId), TextView.BufferType.SPANNABLE);"));
+        assertTrue(panel.contains("case LOCAL: host.openFile(source, st.value); break;"));
+        assertFalse(panel.contains("openPath("));
+    }
+
     @Test public void codeFencesSketchesAndTablesAreVerbatimMonospace() {
         MdText md = MdText.of("```sh\nrm -rf **x**\n```\n\n+---+\n| a |\n+---+\n\n| a | bb |\n|---|---|\n| ccc | d |", null);
         assertEquals(List.of("rm -rf **x**", "+---+\n| a |\n+---+", "a    bb\nccc  d"), styled(md, MdText.Style.Kind.PRE));
