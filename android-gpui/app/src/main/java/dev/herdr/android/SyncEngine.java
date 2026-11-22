@@ -409,6 +409,11 @@ final class SyncEngine {
             }
         }
         entries.put(key, next);
+        // Asked again while this read was out (every draw asks): this answer is that answer.
+        if (next.state == Entry.State.FRESH) {
+            wanted.remove(key);
+            wantedAt.remove(key);
+        }
         if (next.state == Entry.State.FRESH || next.hasData()) {
             Entry keep = next;
             disk.execute(() -> {
