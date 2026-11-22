@@ -2306,6 +2306,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     switchingHost = false;
                     switchingTo = null;
                     if (destroyed || !hostResumed || hostEpoch.stale(epoch)) return;
+                    if (failure instanceof Refused) {
+                        // It answered and said no: not offline, so no cached view; stay here.
+                        note(host.name + " refused that terminal: " + ((Refused) failure).reason);
+                        return;
+                    }
                     // Unreachable: show it from the cache; the monitor keeps trying it.
                     switchHostOffline(host, forcedPane, picked);
                 });
@@ -2392,6 +2397,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             while (!landed && SystemClock.uptimeMillis() < until) {
                 state = new JSONObject(RemoteNative.poll(handle, 0, false));
                 landed = pane.equals(state.optString("pane_id")) && "ready".equals(state.optString("state"));
+                // herdr-core refused it (audit A3): say why now, never wait out the 20 s.
+                String refused = refusedReason(state, pane);
+                if (refused != null) {
+                    // Switching computers: its Deacon instead, once; else the reason.
+                    String deacon = machineSwitch ? FleetPanes.switchLanding(state, null) : "";
+                    if (deacon.isEmpty() || deacon.equals(pane) || refusedReason(state, deacon) != null) {
+                        throw new Refused(pane, refused);
+                    }
+                    pane = deacon;
+                    RemoteNative.focus(handle, pane);
+                    until = SystemClock.uptimeMillis() + 20_000;
+                    continue;
+                }
                 if (!landed) Thread.sleep(150);
             }
             if (!landed) break;
@@ -2400,6 +2418,25 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             pane = picked;
         }
         return pane;
+    }
+
+    /** herdr-core refused to attach the pane a switch was for, and there was nothing to land on instead. */
+    static final class Refused extends Exception {
+        final String pane, reason;
+
+        Refused(String pane, String reason) {
+            super("refused " + pane + ": " + reason);
+            this.pane = pane;
+            this.reason = reason;
+        }
+    }
+
+    /** Why herdr-core refused to attach {@code pane} on this session, or null (core_session `refused`). */
+    static String refusedReason(JSONObject state, String pane) {
+        JSONObject refused = state == null ? null : state.optJSONObject("refused");
+        if (refused == null || pane == null || !pane.equals(refused.optString("terminal", ""))) return null;
+        String reason = refused.optString("reason", "").trim();
+        return reason.isEmpty() ? "it gave no reason" : reason;
     }
 
     private void adoptHost(SavedRemoteHost host, long handle, String pane) {
