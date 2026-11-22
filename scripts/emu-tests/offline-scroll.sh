@@ -318,7 +318,8 @@ switch_to() { # name
 airplane() { a shell cmd connectivity airplane-mode "$1" > /dev/null 2>&1; }
 # The app's own log lines since the last mark, with epoch times ("1795316219.567 ...").
 mark_log() { a logcat -c > /dev/null 2>&1 || true; }
-app_log() { a logcat -d -v epoch -s herdr-net:I herdr-reconnect:I 2> /dev/null | tr -d '\r'; }
+# The app's own lines: the link, the reconnects, and where each drag went (herdr-scroll).
+app_log() { a logcat -d -v epoch -s herdr-net:I herdr-reconnect:I herdr-scroll:I 2> /dev/null | tr -d '\r'; }
 # Seconds between the last "network arrived" line and the first "live: first paint" after it.
 back_in() { # log-file -> seconds, or nothing
     python3 - "$1" << 'PY'
