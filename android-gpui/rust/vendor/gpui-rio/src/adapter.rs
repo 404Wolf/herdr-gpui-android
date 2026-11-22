@@ -375,6 +375,8 @@ macro_rules! __bind_gpui {
                     &self,
                     ghost: &$crate::ghost::Ghost,
                     placed: &[$crate::ghost::Placed],
+                    // The program's own background under each run, where it tinted it.
+                    tints: &[Option<Hsla>],
                     origin: Point<Pixels>,
                     font: &Font,
                     font_size: Pixels,
@@ -387,7 +389,7 @@ macro_rules! __bind_gpui {
                     let mut caret: Option<Point<Pixels>> = None;
                     // The keyboard's cursor, when the host says where it is in the draft.
                     let mut explicit: Option<Point<Pixels>> = None;
-                    for run in placed {
+                    for (i, run) in placed.iter().enumerate() {
                         // Cells, as the grid draws them: wide and combined characters too.
                         let len = $crate::ghost::cells(&run.text);
                         // The draft's lines are spread; everything else (controls, queue rows) is on its grid row.
@@ -408,7 +410,8 @@ macro_rules! __bind_gpui {
                             continue;
                         }
                         let width = self.cell.width * len;
-                        let back = if run.style == GhostStyle::Selected { colors.info } else { colors.background };
+                        let tint = tints.get(i).copied().flatten();
+                        let back = if run.style == GhostStyle::Selected { hex(colors.info) } else { tint.unwrap_or(hex(colors.background)) };
                         // The gap above a spread line is covered too, so none of the grid's own
                         // cells under the draft show through between its lines.
                         let above = if run.source.is_some() && run.row > self.geometry.first {
@@ -418,7 +421,7 @@ macro_rules! __bind_gpui {
                         };
                         window.paint_quad(fill(
                             Bounds::new(at - point(px(0.), above), size(width, self.cell.height + above)),
-                            hex(back),
+                            back,
                         ));
                         let color = match run.style {
                             GhostStyle::Text | GhostStyle::Partial => colors.text,
@@ -599,6 +602,27 @@ macro_rules! __bind_gpui {
                         .map(|ghost| $crate::ghost::place_all(ghost, anchor, &screen, previous))
                         .unwrap_or_default();
                     let placed = &layout.placed;
+                    // A run that is not the draft (the controls, their blanks, queue rows)
+                    // keeps the program's own tint under it: Codex's composer and Gemini's
+                    // input box are tinted, and a quad of the default background there
+                    // would read as a hole in their box (factory-setup.23/.36).
+                    let tints: Vec<Option<Hsla>> = placed
+                        .iter()
+                        .map(|run| {
+                            if run.source.is_some() || run.col >= cols {
+                                return None;
+                            }
+                            let line = self.rows.source(run.row)?;
+                            let square = grid.grid[Pos::new(line, Column(run.col + col_off))];
+                            let style = grid.grid.style_of(&square);
+                            let bg = if style.flags.contains(StyleFlags::INVERSE) {
+                                resolve_color(&grid, theme, style.fg)
+                            } else {
+                                resolve_color(&grid, theme, style.bg)
+                            };
+                            (bg != theme.background).then(|| rgb_color(bg))
+                        })
+                        .collect();
                     // Spread only at Claude's prompt (the program's own box), and only when the
                     // controls sit below the draft's first line (on the box's lower rule): the
                     // controls' rows, and Claude's status line below, never move.
@@ -757,7 +781,7 @@ macro_rules! __bind_gpui {
                         }
                     }
                     if let Some(ghost) = self.ghost.clone() {
-                        self.paint_ghost(&ghost, placed, bounds.origin, &font, font_size, window, cx);
+                        self.paint_ghost(&ghost, placed, &tints, bounds.origin, &font, font_size, window, cx);
                     }
                     if let Some(listener) = self.layout_listener.clone() {
                         let hint = $crate::ghost::LayoutHint {
