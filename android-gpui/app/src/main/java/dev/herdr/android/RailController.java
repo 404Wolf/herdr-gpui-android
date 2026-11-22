@@ -1179,7 +1179,7 @@ final class RailController {
             else if (holder.foldKey != null) toggleRepo(holder.foldKey);
         });
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.topMargin = dp(2);
+        params.topMargin = dp(FleetTree.GROUP_GAP_DP);
         holder.row.setLayoutParams(params);
         return holder;
     }

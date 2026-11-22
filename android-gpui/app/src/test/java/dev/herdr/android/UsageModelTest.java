@@ -123,11 +123,12 @@ public final class UsageModelTest {
     @Test public void aCachedAnswerShowsAsOldUntilThisOpensLookAnswers() {
         UsageModel.Look cached = UsageModel.parse(reply(WORK));
         UsageModel.Sheet sheet = new UsageModel.Sheet("demo");
-        assertEquals("asking…", sheet.updated(NOW * 1000));
+        assertEquals("", sheet.updated(NOW * 1000));
+        assertTrue(sheet.waiting());
         sheet.opened(cached, NOW * 1000 - 30 * 60_000);
         assertTrue(sheet.old());
         // What was kept shows at once, with its age, until this open's look answers.
-        assertEquals("updated 30m ago · asking…", sheet.updated(NOW * 1000));
+        assertEquals("updated 30m ago", sheet.updated(NOW * 1000));
         sheet.answered(UsageModel.parse(reply(WORK)), false, NOW * 1000);
         assertFalse(sheet.old());
         assertEquals("updated just now", sheet.updated(NOW * 1000 + 20_000));

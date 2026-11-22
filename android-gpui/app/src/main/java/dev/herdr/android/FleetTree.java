@@ -826,11 +826,13 @@ final class FleetTree {
     static final int PM_CHEVRON_DP = 28;
     /**
      * Row heights, tighter as Wolf's OLED preview has them, and a little
-     * tighter again (Wolf, 11-22): a Deacon or PM row is 36dp and an agent's 30dp. Each whole row (full height and width) is
+     * tighter again (Wolf, 11-22): a Deacon or PM row is 34dp and an agent's 36dp. Each whole row (full height and width) is
      * its own tap target, so no row needs a TouchDelegate reaching into its
      * neighbours; the lead's fold button is the row's height and 48dp wide.
      */
-    static final int LEAD_ROW_DP = 36, AGENT_ROW_DP = 36;
+    static final int LEAD_ROW_DP = 34, AGENT_ROW_DP = 36;
+    /** Above a group or repository header (Wolf, 11-22: a dp or two less between projects and groups). */
+    static final int GROUP_GAP_DP = 0;
 
     /**
      * What a screen reader hears for a lead row's fold control, or null when

@@ -64,7 +64,8 @@ public final class FleetSidebarTest {
         assertEquals(8f, RailDisclosure.ARROW_AT_DP, 0f);
         assertEquals(3f, RailDisclosure.ARM_DP, 0f);
         // Rows: 36dp for leads and agents alike (30dp agent rows were easy to mis-tap).
-        assertEquals(36, FleetTree.LEAD_ROW_DP);
+        assertEquals(34, FleetTree.LEAD_ROW_DP);
+        assertEquals(0, FleetTree.GROUP_GAP_DP);
         assertEquals(36, FleetTree.AGENT_ROW_DP);
         assertEquals(16, FleetTree.RAIL_DEPTH_DP);
         assertTrue(RailDisclosure.SQUARE_DP <= 24);

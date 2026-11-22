@@ -397,16 +397,19 @@ final class UsageModel {
             return shown != null && shown.kind == Kind.ACCOUNTS && !shown.accounts.isEmpty();
         }
 
+        /** Nothing to show yet and nothing wrong: the sheet draws its skeleton (Wolf: no words with dots). */
+        boolean waiting() {
+            return shown == null && failure == null;
+        }
+
         /**
-         * The header's right-hand words, the age of what shows: "asking…",
-         * "updated just now", "updated 4m ago", "updated 3h ago · asking…"
-         * while this open's look is out.
+         * The header's right-hand words, the age of what shows: "updated just
+         * now", "updated 4m ago"; nothing before the first look (the skeleton says it).
          */
         String updated(long nowMs) {
-            if (shown == null) return failure == null ? "asking…" : "";
+            if (shown == null) return "";
             long age = Math.max(0, nowMs - shownAt) / 1000;
-            String said = "updated " + (age < 60 ? "just now" : span(age) + " ago");
-            return fresh ? said : said + " · asking…";
+            return "updated " + (age < 60 ? "just now" : span(age) + " ago");
         }
 
         /** The note under the title, or "": why it is old, a whole-sheet state, or that aswap is stale. */

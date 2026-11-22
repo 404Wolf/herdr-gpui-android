@@ -92,6 +92,15 @@ final class WorkPanel {
     /** The panel's type (review P1-4): 14sp body on 20dp lines, 16dp sides, 14sp tabs. */
     static final float BODY_SP = 14f, TAB_SP = 14f;
     static final int LINE_DP = 20, SIDE_DP = 16, BOTTOM_DP = 64;
+    /**
+     * Tasks' own tokens (Wolf): small equal sides, dense rows, a round marker,
+     * each level indented by one step; the plan and "N closed" start at the title.
+     */
+    static final int TASKS_SIDE_DP = 12, TASK_ROW_DP = 36, TASK_PAD_DP = 4, MARK_DP = 8, MARK_GAP_DP = 10, INDENT_DP = 14,
+            TITLE_AT_DP = MARK_DP + MARK_GAP_DP;
+    /** Loading, drawn as what comes: a Tasks row (title and progress), a doc's lines, a plan's lines. */
+    static final Skeleton.Shape TASK_SHAPE = new Skeleton.Shape(TASK_ROW_DP + 2 * TASK_PAD_DP, TITLE_AT_DP, true),
+            TEXT_SHAPE = new Skeleton.Shape(LINE_DP, 0, false);
     private PauseWatch pauses;
 
     // What is on screen.
@@ -552,6 +561,8 @@ final class WorkPanel {
         styleTab(tasksTab, now == PanelModel.Tab.TASKS);
         int y = force ? scrollOf[now.ordinal()] : scroll.getScrollY();
         body.removeAllViews();
+        int side = dp(now == PanelModel.Tab.TASKS ? TASKS_SIDE_DP : SIDE_DP);
+        if (body.getPaddingLeft() != side) body.setPadding(side, body.getPaddingTop(), side, body.getPaddingBottom());
         showAge("", true);
         if (agent == null) body.addView(dim("Open an agent to see its overview and tasks."));
         else if (now == PanelModel.Tab.OVERVIEW) overview();
@@ -605,7 +616,7 @@ final class WorkPanel {
         DocModel.Read d = docs.get(key);
         String error = docErrors.get(key);
         if (d == null) {
-            body.addView(dim(error != null ? "Can't read the overview: " + error : "Reading " + DocModel.path(name) + "…"));
+            body.addView(error != null ? dim("Can't read the overview: " + error) : new Skeleton(activity, chrome, 8, TEXT_SHAPE));
             return;
         }
         if (d.missing) {
@@ -624,8 +635,9 @@ final class WorkPanel {
         Map<String, BeadsModel.ProjectBeads> byProject = BeadsModel.projectBeads(stores);
         BeadsModel.ProjectBeads mine = byProject.get(agent.project);
         useKeptStores();
-        if (stores.isEmpty() && storesAt < 0 && storesError == null) { body.addView(dim("Reading " + agent.project + "'s beads…")); return; }
-        if (storesKeptAt > 0) body.addView(dim("beads " + BeadCache.age(storesKeptAt, System.currentTimeMillis()) + " · refreshing…"));
+        if (stores.isEmpty() && storesAt < 0 && storesError == null) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
+        // Kept beads show at once, with how old they are (no dots while a newer read is out).
+        if (storesKeptAt > 0) body.addView(dim("beads from " + BeadCache.age(storesKeptAt, System.currentTimeMillis())));
         if (storesError != null) body.addView(warn("Can't read the beads now: " + storesError + (mine != null ? " · showing the last read" : "")));
         if (mine == null || mine.beads == null || mine.beads.isEmpty()) {
             body.addView(dim(mine != null && mine.error != null ? mine.error : "No epics or beads in " + agent.project + "'s store."));
@@ -650,7 +662,7 @@ final class WorkPanel {
             if (r.open) body.addView(plan(r));
             if (r.closedAfter > 0) {
                 TextView closed = dim(r.closedAfter + " closed");
-                closed.setPadding(dp(12 + 16 * (r.depth + 1) + 30), 0, 0, dp(4));
+                closed.setPadding(dp(INDENT_DP * (r.depth + 1) + TITLE_AT_DP), 0, 0, dp(TASK_PAD_DP));
                 body.addView(closed);
             }
         }
@@ -661,22 +673,18 @@ final class WorkPanel {
     private View row(PanelModel.Row r) {
         LinearLayout row = new LinearLayout(activity);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setMinimumHeight(dp(44));
-        row.setPadding(dp(16 * r.depth), 0, 0, 0);
-        boolean kids = !r.node.children.isEmpty() || r.node.closed > 0;
-        RailDisclosure fold = new RailDisclosure(activity, chrome);
-        fold.bind(kids, r.folded, kids ? (r.folded ? "Show" : "Hide") + " its beads" : null);
-        fold.setOnClickListener(v -> {
-            if (!folded.remove(r.node.bead.id)) folded.add(r.node.bead.id);
-            redraw(true);
-        });
-        row.addView(fold, new LinearLayout.LayoutParams(dp(36), dp(44)));
-        View mark = new View(activity);
+        row.setMinimumHeight(dp(TASK_ROW_DP));
+        row.setPadding(dp(INDENT_DP * r.depth), dp(TASK_PAD_DP), 0, dp(TASK_PAD_DP));
+        // A round marker in its status's colour (Wolf: circles, no disclosure triangles).
         String status = r.node.bead.status;
-        mark.setBackgroundColor("closed".equals(status) ? GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x66)
+        View mark = new View(activity);
+        android.graphics.drawable.GradientDrawable dot = new android.graphics.drawable.GradientDrawable();
+        dot.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        dot.setColor("closed".equals(status) ? GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x66)
                 : "in_progress".equals(status) ? chrome.status("working") : chrome.status("idle"));
-        LinearLayout.LayoutParams markAt = new LinearLayout.LayoutParams(dp(6), dp(6));
-        markAt.setMarginEnd(dp(8));
+        mark.setBackground(dot);
+        LinearLayout.LayoutParams markAt = new LinearLayout.LayoutParams(dp(MARK_DP), dp(MARK_DP));
+        markAt.setMarginEnd(dp(MARK_GAP_DP));
         row.addView(mark, markAt);
         LinearLayout words = new LinearLayout(activity);
         words.setOrientation(LinearLayout.VERTICAL);
@@ -685,53 +693,49 @@ final class WorkPanel {
         title.setEllipsize(TextUtils.TruncateAt.END);
         if (r.epic) title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         words.addView(title);
-        if (!r.progress.isEmpty()) words.addView(dim(r.progress));
+        if (!r.progress.isEmpty()) {
+            TextView progress = dim(r.progress);
+            progress.setPadding(0, 0, 0, 0);
+            words.addView(progress);
+        }
         row.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
         row.setBackground(ActionSheet.ripple(chrome));
         String id = r.node.bead.id;
+        boolean kids = !r.node.children.isEmpty() || r.node.closed > 0;
         List<FleetTree.Member> on = PanelModel.assignees(members, id, agent.project);
         row.setContentDescription(r.node.bead.title + ", " + status.replace('_', ' ')
                 + (r.progress.isEmpty() ? "" : ", " + r.progress)
-                + (on.size() == 1 ? ". Tap to read its plan and show the agent on it" : ". Tap to read its plan"));
-        // The title opens the plan (it stays open) and shows the one agent clearly on it; the chevron only folds.
+                + (r.open ? ". Tap to close it" : ". Tap to open its plan" + (kids && r.folded ? " and its beads" : "")
+                        + (on.size() == 1 ? " and show the agent on it" : "")));
+        // The title opens it (its plan, and its beads), and the same tap again closes it.
         row.setOnClickListener(v -> {
-            open.add(id);
-            // Timed from this tap, also for a bead already open (its first draw after the tap is logged).
-            openedAt.put(id, SystemClock.elapsedRealtime());
-            loggedPlan.remove(id);
-            loggedComments.remove(id);
+            if (PanelModel.toggle(id, kids, open, folded)) {
+                // Timed from this tap (its first draw after the tap is logged).
+                openedAt.put(id, SystemClock.elapsedRealtime());
+                loggedPlan.remove(id);
+                loggedComments.remove(id);
+                if (on.size() == 1) host.focus(on.get(0).id);
+            } else {
+                openedAt.remove(id);
+            }
             redraw(true);
             main.post(tick);
-            if (on.size() == 1) host.focus(on.get(0).id);
         });
-        if (r.open) {
-            TextView shut = ActionSheet.label(activity, "▴", 14, chrome.onSurfaceVariant);
-            shut.setGravity(Gravity.CENTER);
-            shut.setBackground(ActionSheet.ripple(chrome));
-            shut.setContentDescription("Close its plan");
-            shut.setOnClickListener(v -> {
-                open.remove(id);
-                openedAt.remove(id);
-                redraw(true);
-            });
-            row.addView(shut, new LinearLayout.LayoutParams(dp(44), dp(44)));
-        }
         return row;
     }
 
     private View plan(PanelModel.Row r) {
         LinearLayout box = new LinearLayout(activity);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(16 * r.depth + 44), dp(2), 0, dp(10));
+        box.setPadding(dp(INDENT_DP * r.depth + TITLE_AT_DP), dp(2), 0, dp(8));
         String id = r.node.bead.id, key = beadKey(id);
         // Who works on it, when it is more than one: named, each a tap away (one is focused on the tap itself).
         List<FleetTree.Member> on = PanelModel.assignees(members, id, agent.project);
         if (on.size() > 1) box.addView(workedOnBy(on));
         BeadCache.Entry kept = cache.get(key);
-        boolean busy = reading.equals(key);
         if (kept == null) {
             String error = beadErrors.get(key);
-            box.addView(error != null ? warn("Can't read it: " + error) : dim("Reading its plan…"));
+            box.addView(error != null ? warn("Can't read it: " + error) : new Skeleton(activity, chrome, 3, TEXT_SHAPE));
             return box;
         }
         BeadsModel.Detail d = BeadCache.detail(kept.text);
@@ -753,7 +757,7 @@ final class WorkPanel {
         if (c.error == null) logFirst(loggedComments, id, "comments", kept);
         // Honest freshness: how old this read is, and whether a newer one is on its way.
         String age = BeadCache.age(kept.atMs, System.currentTimeMillis())
-                + (d.maybeStale ? " · from the store's export" : "") + (busy ? " · refreshing…" : "");
+                + (d.maybeStale ? " · from the store's export" : "");
         box.addView(dim(age));
         return box;
     }

@@ -48,6 +48,9 @@ final class UsageView {
     private final Dialog dialog;
     private final TextView updated, note, footer;
     private final LinearLayout rows;
+    /** Before the first look: three account rows' shapes (a label line and a bar line). */
+    static final Skeleton.Shape LOADING_SHAPE = new Skeleton.Shape(56, 0, true);
+    private Skeleton loading;
     private final UsageModel.Sheet state;
     private boolean closed;
     /** When the sheet opened (elapsed clock), and whether its first fresh rows were logged. */
@@ -196,7 +199,13 @@ final class UsageView {
         ZoneId zone = ZoneId.systemDefault();
         View focused = rows.findFocus();
         Object focusKey = focused == null ? null : focused.getTag();
-        rows.removeAllViews();
+        // Waiting, the same skeleton stays (its pulse is not restarted by each render).
+        boolean waiting = state.waiting();
+        if (!(waiting && loading != null && rows.getChildCount() == 1 && rows.getChildAt(0) == loading)) rows.removeAllViews();
+        if (waiting && rows.getChildCount() == 0) {
+            if (loading == null) loading = new Skeleton(activity, chrome, 3, LOADING_SHAPE);
+            rows.addView(loading);
+        }
         boolean old = state.old();
         updated.setText(state.updated(System.currentTimeMillis()));
         String noteText = state.note(now, zone);
