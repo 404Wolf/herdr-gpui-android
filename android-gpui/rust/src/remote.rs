@@ -381,6 +381,36 @@ pub(crate) enum Operation {
     Frame(u32, u8, Vec<u8>),
     /// A held message for the attach `Compose::attach` only.
     Compose(Compose, mpsc::SyncSender<Typed>),
+    /// A bounded transcript read (`terminal.read`, feature `read-bounded`).
+    Read(ReadRequest, mpsc::SyncSender<Result<String>>),
+}
+/// The most rows and JSON-escaped bytes one transcript read asks for: the
+/// core formats only those rows, and the reply is bounded by `max_bytes`.
+pub(crate) const MAX_READ_LINES: usize = 5000;
+pub(crate) const MAX_READ_BYTES: usize = 1024 * 1024;
+/// A validated transcript read of one terminal of this session's own core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadRequest {
+    pub(crate) terminal: String,
+    pub(crate) lines: usize,
+    pub(crate) max_bytes: usize,
+}
+impl ReadRequest {
+    /// A relayed address (`machine/t7`) is refused: identity is proven only
+    /// over a direct link, so nothing read through a relay is cached.
+    pub(crate) fn new(terminal: &str, lines: usize, max_bytes: usize) -> Result<Self> {
+        let plain = !terminal.is_empty()
+            && terminal.len() <= 128
+            && !terminal.contains('/')
+            && !terminal.chars().any(char::is_control);
+        if !plain {
+            return Err(Error::StaleTarget);
+        }
+        if lines == 0 || lines > MAX_READ_LINES || max_bytes == 0 || max_bytes > MAX_READ_BYTES {
+            return Err(Error::Config);
+        }
+        Ok(Self { terminal: terminal.into(), lines, max_bytes })
+    }
 }
 /// A held message's bytes (the paste, then Enter), bound to one attach.
 pub(crate) struct Compose {
@@ -980,6 +1010,24 @@ pub(crate) fn compose_on(owner: &Session, attach: u64, text: &str, wait: Duratio
         // The session ended with the request still queued: never run.
         Err(mpsc::RecvTimeoutError::Disconnected) => Typed::Unwritten,
     }
+}
+/// Reads `terminal`'s screen and up to `lines` rows of history as text, cut to
+/// `max_bytes`, for the phone's offline transcript: one `terminal.read` with
+/// `stitch: false` (a full-screen program is never scrolled) on this session's
+/// connection, only when its core's hello offered `read-bounded` and
+/// `incarnation`. `{"supported":false}` otherwise, and nothing is asked;
+/// else `{"supported":true,"text":..,"truncated":..,"incarnation":..}` or
+/// `{"supported":true,"error":kind}`. Blocks: worker threads only.
+pub fn read_transcript(id: u64, terminal: &str, lines: usize, max_bytes: usize) -> Result<String> {
+    let request = ReadRequest::new(terminal, lines, max_bytes)?;
+    let owner = session(id)?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    owner
+        .commands
+        .try_send(Operation::Read(request, tx))
+        .map_err(|_| Error::Capacity)?;
+    rx.recv_timeout(crate::core_session::READ_WAIT + Duration::from_secs(5))
+        .map_err(|_| Error::Closed)?
 }
 /// Puts an image (or any file) beside `terminal` on its machine, over the
 /// session's own core connection, and returns where it landed:

@@ -1,0 +1,1918 @@
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index 452138c..72105b6 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -769,6 +769,29 @@ impl Terminal {
+         String::from_utf8_lossy(&self.format(ffi::FORMAT_PLAIN, None, false)).into_owned()
+     }
+ 
++    /// [`Terminal::plain_text`] of the screen and at most the last `history`
++    /// rows of scrollback above it: only those rows are formatted, so the
++    /// work does not grow with the history kept.
++    pub fn plain_tail(&self, history: usize) -> String {
++        let (cols, rows) = self.size();
++        let last = (cols.saturating_sub(1), rows.saturating_sub(1) as u32);
++        let available = self.history_rows();
++        let from = available.saturating_sub(u32::try_from(history).unwrap_or(u32::MAX));
++        let start = (history > 0 && available > 0 && !self.alt_screen())
++            .then(|| self.grid_ref(ffi::POINT_HISTORY, 0, from))
++            .flatten();
++        let sel = match start {
++            Some(start) => self
++                .grid_ref(ffi::POINT_ACTIVE, last.0, last.1)
++                .map(|end| ffi::Selection { size: size_of::<ffi::Selection>(), start, end, rectangle: false }),
++            None => self.select(ffi::POINT_ACTIVE, (0, 0), last),
++        };
++        match sel {
++            Some(sel) => String::from_utf8_lossy(&self.format(ffi::FORMAT_PLAIN, Some(&sel), false)).into_owned(),
++            None => String::new(),
++        }
++    }
++
+     fn grid_ref(&self, tag: i32, x: u16, y: u32) -> Option<ffi::GridRef> {
+         let point = ffi::Point { tag, value: ffi::PointValue { coord: ffi::Coord { x, y } } };
+         let mut out = ffi::GridRef { size: size_of::<ffi::GridRef>(), node: ptr::null_mut(), x: 0, y: 0 };
+diff --git a/crates/herdr-core/src/SKILL.md b/crates/herdr-core/src/SKILL.md
+index 53ad4ce..e86c786 100644
+--- a/crates/herdr-core/src/SKILL.md
++++ b/crates/herdr-core/src/SKILL.md
+@@ -148,6 +148,29 @@ queued on that terminal in the last hour (`server status`'s
+ `queue_keys_kept_ms`) isn't queued again (`repeated: true`); `--core <id>`
+ makes sure it's that core.
+ 
++Every terminal record (`hc get --json`, list, attach, events) has an
++`incarnation` (16 hex characters, new each time a program starts in it, saved;
++hello feature `incarnation`) and a `ctx` (`<core process>-<n>`, in memory: it
++moves when a person or an agent types into it, when its status report changes
++in state, kind, message or title, and when a program starts; never for a
++terminal's own replies, the terminal title or progress; also in `status`
++events). A guarded send (hello feature `send-guarded`) is `terminal.send` with
++`incarnation`, `if_ctx` and optionally `within_ms` (at most 15000, default
++10000, `hc send --incarnation I --if-ctx C --within-ms N`): it types only if the
++terminal still runs that incarnation (`replaced`), its `ctx` is still `if_ctx`
++(`context_changed`) and it isn't blocked (`blocked`; no `force`), and it never
++waits longer than `within_ms` for a person's typing or draft, or for its turn
++(`busy`). Those four refusals type nothing. It holds the terminal's input from
++that check to its submit key, so a person's keys wait and go in after it.
++`unknown` means a write failed or something other than the paste reached the
++program before the submit key: no submit key was sent and nothing is typed
++again, but the text may be sitting unsent in the program's input box, where a
++later Enter would submit it. Look before sending anything else. `hc read`
++takes `--max-bytes N` and `--stitch false` (hello feature `read-bounded`): the
++text is cut to N JSON-escaped bytes, oldest lines first (`truncated`), only
++the `--lines` rows asked for are formatted, and `incarnation` says which
++program was read.
++
+ A `warning` in the answer of `send`, `keys` or `interrupt` means the call went
+ through but core could not save its terminals just now (a full disk, say). It
+ keeps trying on its own: don't repeat the call. `hc server status` says the
+diff --git a/crates/herdr-core/src/api.rs b/crates/herdr-core/src/api.rs
+index b85237d..be1a82c 100644
+--- a/crates/herdr-core/src/api.rs
++++ b/crates/herdr-core/src/api.rs
+@@ -28,6 +28,9 @@ pub const FEATURES: &[&str] = &[
+     "resize_history",
+     "attach_credit",
+     "focus_by_use",
++    "incarnation",
++    "send-guarded",
++    "read-bounded",
+ ];
+ pub const FINISHED_LINES: usize = 1000;
+ /// A terminal's identity: fixed at start from whoever starts it.
+@@ -111,14 +114,14 @@ methods! { Ctx<'_>;
+         "Set or remove labels (free-form `key=value`, never interpreted).",
+         errors ["not_found", "machine_unknown", "invalid_params"];
+     "terminal.read" => terminal_read, ReadParams => ReadResult,
+-        "The screen plus `lines` of history as text, live or finished.",
++        "The screen plus `lines` of history as text, live or finished. Feature `read-bounded`: `max_bytes` bounds the JSON-escaped text (oldest lines dropped, `truncated`); `stitch: false` never scrolls a full-screen program; only the `lines` rows asked for are formatted; the result's `incarnation` is read under the same lock as the text.",
+         errors ["not_found", "machine_unknown"];
+     "terminal.attach" => terminal_attach, AttachParams => AttachResult,
+         "Open a raw stream to a live terminal on this framed connection (see `hello` with `framed`). Loss ends the stream even when kept; reattach after the restarted event.",
+         errors ["not_found", "machine_unknown", "finished", "unavailable", "needs_framed"];
+     "terminal.send" => terminal_send, SendParams => SendResult,
+-        "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min, counted from when it arrives, for them to send or clear it; a draft backspaced away is no draft, and one nobody typed on for 10 min, or whose viewer detached 1 min ago with none left, expires; terminal.get shows it as `draft`); keys a person presses meanwhile are held, then delivered. A send still waiting when its caller goes away (its `hc` was killed, its connection hung up) is dropped: nothing is typed. A client that only stops writing, as `hc connect` does when its stdin ends, still gets its answer. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed.",
+-        errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "drafting", "invalid_params", "config"];
++        "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min, counted from when it arrives, for them to send or clear it; a draft backspaced away is no draft, and one nobody typed on for 10 min, or whose viewer detached 1 min ago with none left, expires; terminal.get shows it as `draft`); keys a person presses meanwhile are held, then delivered. A send still waiting when its caller goes away (its `hc` was killed, its connection hung up) is dropped: nothing is typed. A client that only stops writing, as `hc connect` does when its stdin ends, still gets its answer. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed. Guarded (feature `send-guarded`, with `incarnation` and `if_ctx`, and `within_ms` at most 15000, default 10000): it types only if the terminal still runs that incarnation (else `replaced`), its `ctx` is still `if_ctx` (else `context_changed`: someone typed into it, or its status report changed) and it isn't blocked (`blocked`, `force` is not allowed), and it never waits longer than `within_ms` for a person or a draft (`busy`); those four refusals type nothing. A guarded send always types, whatever follows the inbox. It holds the terminal's input from that check until its submit key: a person's keys wait and go in after it. Every write goes to the program checked; if a write fails, or anything but the paste reached the program before the submit key, it answers `unknown` and sends no submit key: the text may be sitting unsent in the program's input box, where a later Enter would submit it. Its caller leaving before it types ends it, as for any send.",
++        errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "drafting", "invalid_params", "config", "replaced", "context_changed", "busy", "unknown", "needs_update"];
+     "terminal.queue" => terminal_queue, QueueParams => SendResult,
+         "Queue text in a terminal's inbox when its program follows it (terminal.inbox), as terminal.send would; otherwise fail with `not_following`. Never types, so a core that predates it refuses it as an unknown method. With a `key` already queued on that terminal within `queue_keys_kept_ms` (a retry after a lost answer), it isn't queued again and the answer says `repeated`; keys are kept with the terminal, across restarts. With `key_since` (when the key was first sent) before the terminal's keys go back, it may have been queued and forgotten: refused with `key_forgotten`, never queued again. With `core`, only that core queues it (`other_core` otherwise). This machine's terminals only.",
+         errors ["not_found", "machine_unknown", "not_following", "other_core", "key_forgotten", "invalid_params"];
+@@ -455,27 +458,47 @@ async fn terminal_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcErro
+ async fn terminal_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError> {
+     let id = resolve(core, &p.terminal)?;
+     core.saw(p.caller.as_deref(), id);
++    // `max_bytes` or `stitch: false` (feature `read-bounded`): only the rows asked for are formatted.
++    let bounded = p.max_bytes.is_some() || !p.stitch;
++    let incarnation = |core: &Core| core.lock().reg.terminals.get(&id).and_then(|t| t.incarnation.clone());
+     // A full-screen app keeps its history to itself: scroll it to read it.
+     let full_screen = core.lock().screens.get(&id).is_some_and(|s| s.alt_screen());
+     if full_screen && p.lines > 0 {
+         let lines = p.lines.min(FINISHED_LINES);
+-        let result = match core.stitch(id, lines).await {
+-            Some((text, complete)) => ReadResult { text, complete, how: "stitched".into(), why: None },
++        let stitched = if p.stitch {
++            let before = incarnation(core);
++            core.stitch(id, lines).await.map(|stitched| (stitched, before))
++        } else {
++            None
++        };
++        let result = match stitched {
++            Some(((text, complete), before)) => {
++                // Not one lock: the same incarnation before and after, or none is claimed.
++                let after = incarnation(core);
++                ReadResult {
++                    text,
++                    complete,
++                    how: "stitched".into(),
++                    why: None,
++                    truncated: false,
++                    incarnation: after.filter(|a| Some(a) == before.as_ref()),
++                }
++            }
+             None => {
+                 let st = core.lock();
+                 let text = st.screens.get(&id).map(|s| crate::stitch::text(&s.screen_rows())).unwrap_or_default();
+-                let why = st
+-                    .reg
+-                    .terminals
+-                    .get(&id)
++                let t = st.reg.terminals.get(&id);
++                let why = t
+                     .and_then(|t| t.status.as_ref())
++                    .filter(|_| p.stitch)
+                     .filter(|s| matches!(s.state.as_str(), "working" | "blocked" | "error"))
+                     .map(|s| s.state.clone());
+-                ReadResult { text, complete: false, how: "screen".into(), why }
++                let incarnation = t.and_then(|t| t.incarnation.clone());
++                ReadResult { text, complete: false, how: "screen".into(), why, truncated: false, incarnation }
+             }
+         };
+         core.flush_saved().await?;
+-        return Ok(result);
++        return Ok(bound(result, p.max_bytes));
+     }
+     let result = {
+         let st = core.lock();
+@@ -483,7 +506,10 @@ async fn terminal_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcEr
+         let lines = if t.is_live() { p.lines } else { p.lines.min(FINISHED_LINES) };
+         let rows = t.rows as usize;
+         let exact = t.screen == "exact";
+-        let text = core.screen_text(&st, id);
++        let text = match st.screens.get(&id) {
++            Some(screen) if bounded => Some(screen.plain_tail(lines)),
++            _ => core.screen_text(&st, id),
++        };
+         let mut complete = exact && text.is_some();
+         let text = text.unwrap_or_default();
+         let all: Vec<&str> = text.trim_end_matches('\n').lines().collect();
+@@ -501,10 +527,43 @@ async fn terminal_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcEr
+             complete,
+             how: if p.lines == 0 { "screen" } else { "history" }.into(),
+             why: None,
++            truncated: false,
++            incarnation: t.incarnation.clone(),
+         }
+     };
+     core.flush_saved().await?;
+-    Ok(result)
++    Ok(bound(result, p.max_bytes))
++}
++
++/// The JSON-escaped size of `line` as it goes on the wire (without its quotes).
++fn escaped_len(line: &str) -> usize {
++    serde_json::to_string(line).map_or(line.len(), |s| s.len() - 2)
++}
++
++/// Keeps the newest whole lines of `result.text` whose JSON-escaped text fits
++/// `max_bytes` (a newline is the two bytes `\n`); the oldest are dropped and
++/// the result says `truncated`. A last line that alone is too long is dropped
++/// too: a bound is a bound.
++pub(crate) fn bound(mut result: ReadResult, max_bytes: Option<usize>) -> ReadResult {
++    let Some(max) = max_bytes else { return result };
++    if escaped_len(&result.text) <= max {
++        return result;
++    }
++    let lines: Vec<&str> = result.text.split('\n').collect();
++    let (mut used, mut keep) = (0usize, 0usize);
++    for line in lines.iter().rev() {
++        // This line, and the newline that joins it to the one kept before it.
++        let cost = escaped_len(line) + if keep > 0 { 2 } else { 0 };
++        if used + cost > max {
++            break;
++        }
++        used += cost;
++        keep += 1;
++    }
++    result.text = lines[lines.len() - keep..].join("\n");
++    result.truncated = true;
++    result.complete = false;
++    result
+ }
+ 
+ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult, RpcError> {
+@@ -541,7 +600,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+         idle_ms: p.idle_ms,
+         desktop_group: core.desktop_group(conn, p.desktop_group.as_deref()),
+     };
+-    let channel = core.attach(conn, id, req)?;
++    let (channel, terminal) = core.attach_record(conn, id, req)?;
+     if let Some(credit) = p.credit {
+         // Still paused: nothing has gone out on it yet.
+         conn.with(|out| out.set_credit(channel, credit as usize));
+@@ -549,7 +608,7 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
+     attach_gate(p.resumed, p.credit).await;
+     Ok(AttachResult {
+         channel,
+-        terminal: Public(record(core, id)?),
++        terminal: Public(terminal),
+         resize_notifications: p.resize_notifications,
+         visibility_updates: p.visibility_updates,
+         focus_updates: p.focus_updates,
+@@ -601,23 +660,55 @@ async fn terminal_queue(core: Ctx<'_>, p: QueueParams) -> Result<SendResult, Rpc
+         key: p.key,
+         key_since: p.key_since,
+         core: None,
++        incarnation: None,
++        if_ctx: None,
++        within_ms: None,
+         caller: p.caller,
+     };
+     terminal_send(core, send).await
+ }
+ 
++/// The longest a guarded send may wait for a person, a draft or its turn.
++const WITHIN_MAX_MS: u64 = 15_000;
++const WITHIN_DEFAULT_MS: u64 = 10_000;
++
++/// The guard of a send, if it has one: `incarnation` and `if_ctx` come together,
++/// `within_ms` only with them.
++fn guard(p: &SendParams) -> Result<Option<crate::input::Guard>, RpcError> {
++    match (&p.incarnation, &p.if_ctx, p.within_ms) {
++        (None, None, None) => Ok(None),
++        (Some(incarnation), Some(if_ctx), within) => {
++            let within = within.unwrap_or(WITHIN_DEFAULT_MS);
++            if within > WITHIN_MAX_MS {
++                return Err(RpcError::invalid_params(format!("within_ms is at most {WITHIN_MAX_MS}")));
++            }
++            if p.force {
++                return Err(RpcError::invalid_params("a guarded send never forces: it refuses a blocked program"));
++            }
++            Ok(Some(crate::input::Guard {
++                incarnation: incarnation.clone(),
++                if_ctx: if_ctx.clone(),
++                within: Duration::from_millis(within),
++            }))
++        }
++        _ => Err(RpcError::invalid_params("incarnation and if_ctx go together (and within_ms only with them)")),
++    }
++}
++
+ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
+     let timeout = wait_timeout(core, p.timeout)?; // checked before anything is typed
++    guard(&p)?;
+     let id = resolve(core, &p.terminal)?;
+     let text = core.tagged(p.caller.as_deref(), id, &p.text, false);
+     let from = p.caller.clone().filter(|c| crate::terminals::parse_id(c).is_some() || c.contains('/'));
+     let only_if = p.only_if.map(|w| word(&w));
+     let since = p.key_since.unwrap_or_else(crate::runtime::now_ms);
+     let key = p.key.as_deref().map(|key| crate::inbox::QueueKey { key, since });
+-    let sent = core
+-        .send_or_queue(id, from, &text, p.force, only_if.as_deref(), p.inbox_only, key, &core.gone)
+-        .await
+-        .inspect_err(logged_if_dropped("terminal.send", &p.terminal, p.caller.as_deref()))?;
++    let sent = match guard(&p)? {
++        Some(guard) => core.send_guarded(id, &text, only_if.as_deref(), guard, &core.gone).await,
++        None => core.send_or_queue(id, from, &text, p.force, only_if.as_deref(), p.inbox_only, key, &core.gone).await,
++    }
++    .inspect_err(logged_if_dropped("terminal.send", &p.terminal, p.caller.as_deref()))?;
+     if let Some(child) = p.caller.as_deref().and_then(crate::terminals::parse_id) {
+         let mut st = core.lock();
+         if let Some(c) = st
+diff --git a/crates/herdr-core/src/api/run.rs b/crates/herdr-core/src/api/run.rs
+index e02eea2..e2968ac 100644
+--- a/crates/herdr-core/src/api/run.rs
++++ b/crates/herdr-core/src/api/run.rs
+@@ -51,6 +51,8 @@ pub(super) async fn terminal_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunR
+                 terminal: crate::terminals::address(id),
+                 caller: None,
+                 lines: if full_screen { 0 } else { FINISHED_LINES },
++                max_bytes: None,
++                stitch: true,
+             };
+             let text = tail(terminal_read(core, read).await.map(|r| r.text).unwrap_or_default(), id);
+             has_seen(core, caller.as_deref(), id);
+diff --git a/crates/herdr-core/src/api/types.rs b/crates/herdr-core/src/api/types.rs
+index 0fe60c3..f36d608 100644
+--- a/crates/herdr-core/src/api/types.rs
++++ b/crates/herdr-core/src/api/types.rs
+@@ -400,6 +400,25 @@ pub struct ReadParams {
+     #[arg(long, default_value_t = 0)]
+     #[serde(default)]
+     pub lines: usize,
++    /// Feature `read-bounded`: at most this many bytes of `text`, counted as
++    /// JSON-escaped (what goes on the wire). The oldest lines are dropped to
++    /// fit and the result says `truncated`.
++    #[arg(long, value_name = "BYTES")]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub max_bytes: Option<usize>,
++    /// Feature `read-bounded`: false never scrolls a full-screen program to
++    /// read its history (its screen is read as it is).
++    #[arg(long, action = clap::ArgAction::Set, default_value_t = true, value_name = "BOOL")]
++    #[serde(default = "stitch_by_default", skip_serializing_if = "is_true")]
++    pub stitch: bool,
++}
++
++fn stitch_by_default() -> bool {
++    true
++}
++
++fn is_true(b: &bool) -> bool {
++    *b
+ }
+ 
+ #[derive(Serialize, JsonSchema)]
+@@ -413,6 +432,13 @@ pub struct ReadResult {
+     /// is not scrolled in these states).
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub why: Option<String>,
++    /// `max_bytes` cut the text: older lines were dropped.
++    #[serde(default, skip_serializing_if = "is_false")]
++    pub truncated: bool,
++    /// The program's incarnation when the text was read, under the same lock
++    /// as the text. Absent for a terminal that never started a program.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub incarnation: Option<String>,
+ }
+ 
+ #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+@@ -605,6 +631,22 @@ pub struct SendParams {
+     #[arg(long, requires = "inbox_only")]
+     #[serde(skip)]
+     pub core: Option<String>,
++    /// Guarded send (feature `send-guarded`; needs `--if-ctx`): type only if
++    /// the terminal still runs this incarnation, else refuse with `replaced`.
++    #[arg(long, requires = "if_ctx", conflicts_with_all = ["force", "inbox_only"])]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub incarnation: Option<String>,
++    /// Guarded send: type only if the terminal's `ctx` is still this (nobody
++    /// has typed into it and its status report hasn't changed), else refuse
++    /// with `context_changed`.
++    #[arg(long, requires = "incarnation")]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub if_ctx: Option<String>,
++    /// Guarded send: the longest it waits for a person's typing or draft, or
++    /// for its turn, in ms (at most 15000, default 10000); then `busy`.
++    #[arg(long, requires = "incarnation", value_name = "MS")]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub within_ms: Option<u64>,
+     /// Who is sending (`HC_TERMINAL_ID`, else the calling process's parent), so a
+     /// bare wait from the same caller waits for this send's turn.
+     #[arg(skip)]
+diff --git a/crates/herdr-core/src/input.rs b/crates/herdr-core/src/input.rs
+index 9e33e97..2ce1c99 100644
+--- a/crates/herdr-core/src/input.rs
++++ b/crates/herdr-core/src/input.rs
+@@ -122,6 +122,11 @@ pub struct DraftView {
+ }
+ 
+ impl Gate {
++    /// An agent's input is going in right now: viewer input is held.
++    pub fn is_busy(&self) -> bool {
++        self.busy
++    }
++
+     /// A person pressed keys while an agent's input was going in.
+     pub fn has_held(&self) -> bool {
+         self.held_human
+@@ -978,6 +983,9 @@ impl Core {
+             t.check_program()?;
+             let prepared = prepare(&st, t)?;
+             st.gates.entry(id).or_default().busy = true;
++            if let Some(t) = st.reg.terminals.get_mut(&id) {
++                t.bump_ctx();
++            }
+             prepared
+         };
+         for step in steps {
+@@ -1197,6 +1205,244 @@ impl Core {
+     }
+ }
+ 
++
++/// The checks of a guarded `terminal.send` (see [`Core::send_guarded`]).
++pub struct Guard {
++    /// The incarnation the caller meant (else `replaced`).
++    pub incarnation: String,
++    /// The `ctx` the caller last saw (else `context_changed`).
++    pub if_ctx: String,
++    /// How long it may wait for human quiet, a draft or its turn (else `busy`).
++    pub within: Duration,
++}
++
++/// The program a guarded send checked at its fence. Every write it makes goes
++/// to exactly this holder link and program, or nowhere.
++struct Verified {
++    instance: String,
++    pid: u32,
++    incarnation: String,
++}
++
++impl Verified {
++    /// The link to the holder of terminal `id`, only while it still runs the
++    /// program that was verified (same holder, process and incarnation).
++    fn link<'a>(&self, st: &'a State, id: u32) -> Option<&'a crate::runtime::Link> {
++        let t = st.reg.terminals.get(&id).filter(|t| t.is_live())?;
++        let same = t.holder.as_deref() == Some(self.instance.as_str())
++            && t.pid == Some(self.pid)
++            && t.incarnation.as_deref() == Some(self.incarnation.as_str());
++        same.then(|| st.holders.iter().find(|l| l.instance == self.instance)).flatten()
++    }
++}
++
++fn refusal(kind: &str, message: String) -> RpcError {
++    RpcError::new(kind, message, "nothing was typed")
++}
++
++/// Nothing was typed, though a deadline passed: `busy`.
++fn busy(id: u32, within: Duration, why: &str) -> RpcError {
++    refusal(
++        "busy",
++        format!("{} was {why} for the whole {} ms it was given", crate::terminals::address(id), within.as_millis()),
++    )
++}
++
++/// The write went wrong, or the program it was for changed under it.
++fn unknown(id: u32, what: &str) -> RpcError {
++    RpcError::new(
++        "unknown",
++        format!("{}: {what}", crate::terminals::address(id)),
++        "the text may have been typed whole, partly, or not at all, and may be sitting unsent in the program's input \
++         box, where any later Enter would submit it; no submit key was sent after this and nothing was typed again. \
++         Look at the terminal before sending anything else",
++    )
++}
++
++impl Core {
++    /// The guarded send. Types `text` and submits it only if, at the moment of
++    /// typing, the terminal still runs the program the caller meant
++    /// (`guard.incarnation`), nobody and nothing has typed into it or changed
++    /// its status report since the caller read `guard.if_ctx`, and it isn't
++    /// blocked. Refusals (`replaced`, `context_changed`, `blocked`, `busy`)
++    /// type nothing.
++    ///
++    /// The fence is one critical section under the state lock, which every
++    /// viewer's input also takes: the checks, the new `ctx` and the input gate
++    /// closing happen together, so a person's keys either came first (the
++    /// `ctx` differs: refused) or are held until the submit key is out, and
++    /// delivered after it. The paste, the pause and a check that nothing but
++    /// the paste arrived (the `ctx` is still the one the paste made, the
++    /// program and its holder link are the ones verified, no keys were held)
++    /// all happen with the gate closed; a failure anywhere on the way answers
++    /// `unknown` and sends no submit key, and nothing is typed again.
++    pub async fn send_guarded(
++        &self,
++        id: u32,
++        text: &str,
++        only_if: Option<&str>,
++        guard: Guard,
++        gone: &Gone,
++    ) -> Result<Sent, RpcError> {
++        let arrived = Instant::now();
++        let deadline = tokio::time::Instant::now() + guard.within;
++        // The checks that need no waiting; the fence repeats them.
++        self.guard_check(id, &guard, only_if)?;
++        tokio::select! {
++            settled = self.settle(id, gone) => settled?,
++            () = tokio::time::sleep_until(deadline) => return Err(busy(id, guard.within, "still starting")),
++        }
++        let queue = self.lock().queues.entry(id).or_default().clone();
++        let _turn = tokio::select! {
++            turn = queue.lock() => turn,
++            () = gone.ended() => return Err(dropped(arrived)),
++            () = tokio::time::sleep_until(deadline) => return Err(busy(id, guard.within, "in use by another send")),
++        };
++        // Wait for a person to have paused, and for their draft to be sent or
++        // cleared, but never past the deadline. Quiet counts from a person's
++        // last real input (not from a terminal's replies).
++        loop {
++            self.guard_check(id, &guard, only_if)?;
++            let (left, draft) = {
++                let mut st = self.lock();
++                let draft = crate::viewers::draft(&mut st, id);
++                let left = st.gates.get(&id).and_then(|g| g.last_typed).map(|t| quiet().saturating_sub(t.elapsed()));
++                (left, draft)
++            };
++            let (nap, why) = match (left, draft) {
++                (Some(left), _) if !left.is_zero() => (left, "typed on by a person"),
++                (_, Some(_)) => (DRAFT_POLL, "holding a person's unsent draft"),
++                _ => break,
++            };
++            if tokio::time::Instant::now() >= deadline {
++                return Err(busy(id, guard.within, why));
++            }
++            let wake = (tokio::time::Instant::now() + nap).min(deadline);
++            tokio::select! {
++                () = tokio::time::sleep_until(wake) => {}
++                () = gone.ended() => return Err(dropped(arrived)),
++            }
++        }
++        // The fence.
++        let (verified, bytes, submit, gap, own, word, turn, reported) = {
++            let mut st = self.lock();
++            if gone.is_gone() {
++                return Err(dropped(arrived));
++            }
++            let (verified, word, turn, reported) = self.fence(&st, id, &guard, only_if)?;
++            let t = &st.reg.terminals[&id];
++            let screen = st.screens.get(&id).ok_or_else(|| refusal("finished", "it has finished".into()))?;
++            let submit = match &t.submit {
++                Some(key) => crate::keys::encode(screen, key)?,
++                None => b"\r".to_vec(),
++            };
++            let gap = t.paste_gap_ms.map_or(PASTE_GAP, Duration::from_millis);
++            let bytes = paste(screen.dec_mode(2004), text);
++            let t = st.reg.terminals.get_mut(&id).expect("checked");
++            t.bump_ctx();
++            let own = t.arrivals();
++            st.gates.entry(id).or_default().set_busy(true);
++            (verified, bytes, submit, gap, own, word, turn, reported)
++        };
++        // From here on it is finished, whatever the caller does.
++        let wrote = |bytes: &[u8]| self.lock().verified_write(&verified, id, bytes);
++        let mut failed = (!wrote(&bytes)).then_some("the paste could not be written to the program it was checked against");
++        if failed.is_none() {
++            tokio::time::sleep(gap).await;
++            // Nothing but our own paste may have arrived.
++            let ok = {
++                let st = self.lock();
++                // A person's held keys have not reached the program, and go in after the submit.
++                let same = st.reg.terminals.get(&id).is_some_and(|t| t.arrivals() == own);
++                verified.link(&st, id).is_some_and(|l| l.alive()) && same
++            };
++            if !ok {
++                failed = Some("something else reached the program, or the program changed, before the submit key");
++            } else if !wrote(&submit) {
++                failed = Some("the submit key could not be written to the program it was checked against");
++            }
++        }
++        {
++            let mut st = self.lock();
++            let gate = st.gates.entry(id).or_default();
++            gate.typed(failed.is_none());
++            let held = gate.set_busy(false);
++            if let Some(link) = verified.link(&st, id) {
++                link.input(id, &held);
++            }
++        }
++        match failed {
++            Some(what) => Err(unknown(id, what)),
++            None => {
++                let started = self.started_after(id, turn, reported).await;
++                Ok(Sent { status: word, turn, started, via: "typed", waiting: None, repeated: false })
++            }
++        }
++    }
++
++    /// The refusals of a guarded send that need no lock held beyond this look.
++    fn guard_check(&self, id: u32, guard: &Guard, only_if: Option<&str>) -> Result<(), RpcError> {
++        self.fence(&self.lock(), id, guard, only_if).map(drop)
++    }
++
++    /// The fence's checks. Returns the program verified and its status word,
++    /// turn and whether it reports status.
++    fn fence(
++        &self,
++        st: &State,
++        id: u32,
++        guard: &Guard,
++        only_if: Option<&str>,
++    ) -> Result<(Verified, Option<String>, u64, bool), RpcError> {
++        let at = crate::terminals::address(id);
++        let t = st
++            .reg
++            .terminals
++            .get(&id)
++            .filter(|t| t.is_live())
++            .ok_or_else(|| RpcError::new("finished", format!("{at} has finished"), format!("hc read {at}")))?;
++        t.check_program()?;
++        if t.incarnation.as_deref() != Some(guard.incarnation.as_str()) {
++            return Err(refusal(
++                "replaced",
++                format!("{at} runs another program now (incarnation {})", t.incarnation.as_deref().unwrap_or("none")),
++            ));
++        }
++        if t.ctx != guard.if_ctx {
++            return Err(refusal(
++                "context_changed",
++                format!("{at} changed since it was read: its ctx is {}, not {}", t.ctx, guard.if_ctx),
++            ));
++        }
++        let word = state_word(t);
++        if word.as_deref() == Some("blocked") {
++            return Err(refusal(
++                "blocked",
++                format!(
++                    "{at} is blocked ({}); typing would answer its dialog",
++                    t.status.as_ref().and_then(|s| s.kind.as_deref()).unwrap_or("waiting")
++                ),
++            ));
++        }
++        check_status(id, word.as_deref(), only_if)?;
++        let (Some(instance), Some(pid)) = (t.holder.clone(), t.pid) else {
++            return Err(refusal("unavailable", format!("{at} has no running program")));
++        };
++        if !st.holders.iter().any(|l| l.instance == instance) {
++            return Err(refusal("unavailable", format!("the holder of {at} is not connected")));
++        }
++        Ok((Verified { instance, pid, incarnation: guard.incarnation.clone() }, word, t.turn, t.reported))
++    }
++}
++
++impl State {
++    /// Writes to the program `at` verified, if it is still the one running
++    /// there and its holder link takes the bytes.
++    fn verified_write(&self, at: &Verified, id: u32, bytes: &[u8]) -> bool {
++        at.link(self, id).is_some_and(|l| l.try_input(id, bytes))
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/herdr-core/src/remote.rs b/crates/herdr-core/src/remote.rs
+index e079958..8f1d715 100644
+--- a/crates/herdr-core/src/remote.rs
++++ b/crates/herdr-core/src/remote.rs
+@@ -59,7 +59,32 @@ pub struct Line {
+     build: Option<String>,
+ }
+ 
++/// What a call's params ask of the core that gets it, as a hello feature: a
++/// core without it ignores the param (params are not checked for unknown
++/// fields) and would act as if it were absent: type unguarded, read unbounded.
++fn needed_feature(method: &str, params: &Value) -> Option<&'static str> {
++    let set = |k: &str| !params[k].is_null();
++    match method {
++        "terminal.send" if set("incarnation") || set("if_ctx") || set("within_ms") => Some("send-guarded"),
++        "terminal.read" if set("max_bytes") || params["stitch"] == false => Some("read-bounded"),
++        _ => None,
++    }
++}
++
+ impl Line {
++    /// Refuses a call whose guard or bound the core on this line would ignore (`needs_update`),
++    /// before anything is forwarded.
++    fn require(&self, name: &str, method: &str, params: &Value) -> Result<(), RpcError> {
++        match needed_feature(method, params) {
++            Some(feature) if !self.features.iter().any(|f| f == feature) => Err(RpcError::new(
++                "needs_update",
++                format!("{name}'s hc is older and ignores what {method} asks of it ({feature}); nothing was sent"),
++                format!("hc machine update {name}"),
++            )),
++            _ => Ok(()),
++        }
++    }
++
+     fn new(frames: mpsc::UnboundedSender<Vec<u8>>, hello: &Value) -> Arc<Line> {
+         let features = hello["features"].as_array().into_iter().flatten();
+         Arc::new(Line {
+@@ -1017,6 +1042,7 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
+             format!("hc machine update {}", m.name),
+         ));
+     }
++    line.require(&m.name, method, &params)?;
+     let reply = line.call(&m.name, method, params, deadline).await.map_err(|e| match e.kind.as_str() {
+         "unknown_method" => RpcError::new(
+             "needs_update",
+@@ -1049,6 +1075,7 @@ pub async fn forward_to(core: &Core, to: &To, method: &str, params: Value) -> Re
+                 .ok_or_else(|| RpcError::new("unavailable", format!("{name} is not connected"), "try again later"))?;
+             let calls_me = core.lock().peers.get(id).map(|p| p.calls_me.clone()).unwrap_or_default();
+             let deadline = deadline_for(core, method, &params);
++            line.require(name, method, &params)?;
+             let reply = line.call(name, method, params, deadline).await?;
+             Ok(if method.starts_with("doc.") { reply } else { localize(core, name, &[calls_me.as_str()], reply) })
+         }
+diff --git a/crates/herdr-core/src/remote/tests.rs b/crates/herdr-core/src/remote/tests.rs
+index 36f247f..56c4540 100644
+--- a/crates/herdr-core/src/remote/tests.rs
++++ b/crates/herdr-core/src/remote/tests.rs
+@@ -1385,3 +1385,38 @@ async fn a_relay_carries_a_legacy_viewers_input_and_never_rewrites_a_frame() {
+     drop(core);
+     let _ = std::fs::remove_dir_all(root);
+ }
++
++#[test]
++fn a_guard_or_bound_is_refused_for_a_core_that_would_ignore_it() {
++    use serde_json::json;
++    let (frames, mut sent) = tokio::sync::mpsc::unbounded_channel();
++    let features = |list: &[&str]| Line::new(frames.clone(), &json!({"features": list}));
++    let old = features(&["framed", "attach"]);
++    let new = features(&["send-guarded", "read-bounded"]);
++    let guarded = json!({"terminal": "t1", "text": "x", "incarnation": "i", "if_ctx": "c", "within_ms": 5000});
++    for (method, params) in [
++        ("terminal.send", guarded.clone()),
++        ("terminal.send", json!({"terminal": "t1", "text": "x", "incarnation": "i"})),
++        ("terminal.send", json!({"terminal": "t1", "text": "x", "within_ms": 5})),
++        ("terminal.read", json!({"terminal": "t1", "max_bytes": 1000})),
++        ("terminal.read", json!({"terminal": "t1", "stitch": false})),
++    ] {
++        let e = old.require("far", method, &params).expect_err(&format!("{method} {params}"));
++        assert_eq!(e.kind, "needs_update");
++        new.require("far", method, &params).expect("a core that has the feature gets it");
++    }
++    // Calls that ask for nothing new go to any core.
++    for (method, params) in [
++        ("terminal.send", json!({"terminal": "t1", "text": "x"})),
++        ("terminal.send", json!({"terminal": "t1", "text": "x", "incarnation": null})),
++        ("terminal.read", json!({"terminal": "t1", "lines": 5})),
++        ("terminal.read", json!({"terminal": "t1", "stitch": true})),
++        ("terminal.get", json!({"terminal": "t1", "max_bytes": 5})),
++    ] {
++        old.require("far", method, &params).expect("an old call is not refused");
++    }
++    // `read-bounded` is not `send-guarded`.
++    let only_send = features(&["send-guarded"]);
++    assert!(only_send.require("far", "terminal.read", &json!({"max_bytes": 1})).is_err());
++    assert!(sent.try_recv().is_err(), "nothing was forwarded");
++}
+diff --git a/crates/herdr-core/src/runtime.rs b/crates/herdr-core/src/runtime.rs
+index 4db6889..282b8cd 100644
+--- a/crates/herdr-core/src/runtime.rs
++++ b/crates/herdr-core/src/runtime.rs
+@@ -136,6 +136,17 @@ impl Link {
+             self.send(&proto::frame(proto::INPUT, id, bytes));
+         }
+     }
++
++    /// [`Link::input`] that says whether the frame was handed to the holder's
++    /// writer: false once the link is down (its writer thread ended on a write error).
++    pub fn try_input(&self, id: u32, bytes: &[u8]) -> bool {
++        bytes.is_empty() || self.writer.send(proto::frame(proto::INPUT, id, bytes)).is_ok()
++    }
++
++    /// Whether the link's writer is still there: an earlier frame that failed ended it.
++    pub fn alive(&self) -> bool {
++        self.writer.send(Vec::new()).is_ok()
++    }
+ }
+ 
+ const SAVE_SOON: Duration = Duration::from_secs(2);
+@@ -162,7 +173,16 @@ fn finish_reason(killed: bool, stopping: bool, host_shutdown: bool) -> &'static
+ 
+ impl Core {
+     pub fn start(paths: Paths, info: CoreInfo) -> io::Result<Arc<Core>> {
+-        let reg: Registry = read_state(&paths.state.join("terminals.json"))?;
++        let mut reg: Registry = read_state(&paths.state.join("terminals.json"))?;
++        // A core that predates `incarnation` left live terminals without one: give each its
++        // own now (a core switch keeps programs in their holders, so all of them lack it),
++        // saved by the first save after adoption. Every `ctx` is this process's own.
++        for t in reg.terminals.values_mut() {
++            if t.is_live() && t.incarnation.is_none() {
++                t.incarnation = Some(crate::terminals::new_incarnation());
++            }
++            t.bump_ctx();
++        }
+         let docs_path = paths.state.join("docs.json");
+         let docs = read_state(&docs_path).unwrap_or_else(|e| {
+             crate::log!("core: cannot load documents, starting empty: {e}");
+@@ -191,6 +211,10 @@ impl Core {
+             dirty: Default::default(),
+             save_due: Notify::new(),
+         });
++        // The backfilled incarnations are saved now, not with the next save that happens to
++        // come: a second restart before then must not hand out new ones (the phone would
++        // see every agent as replaced).
++        core.save(&core.lock());
+         core.attach_all()?;
+         Ok(core)
+     }
+@@ -678,6 +702,9 @@ impl Core {
+                 let restarted = t.reason.is_some();
+                 t.pid = Some(pid);
+                 t.program_started_ms = Some(now_ms());
++                // A new program: nothing decided about the old one holds for it.
++                t.incarnation = Some(crate::terminals::new_incarnation());
++                t.bump_ctx();
+                 t.reason = None;
+                 t.exit_code = None;
+                 t.signal = None;
+diff --git a/crates/herdr-core/src/runtime/tests.rs b/crates/herdr-core/src/runtime/tests.rs
+index 5a2343e..888052b 100644
+--- a/crates/herdr-core/src/runtime/tests.rs
++++ b/crates/herdr-core/src/runtime/tests.rs
+@@ -580,3 +580,649 @@ fn remove_root(root: impl AsRef<std::path::Path>) {
+         }
+     }
+ }
++
++// ---- guarded send, incarnation, ctx, bounded read ----
++
++mod guarded {
++    use super::*;
++    use crate::input::{Gone, Guard};
++    use crate::viewers::{AttachRequest, Display};
++    use std::future::{Future, poll_fn};
++    use std::task::Poll;
++
++    const INCARNATION: &str = "0123456789abcdef";
++
++    /// A core whose registry writer is instant: these tests run on a paused clock, where
++    /// the 10 s flush timeout would otherwise fire before the writer thread answers.
++    fn test_core() -> (Arc<Core>, PathBuf) {
++        let (mut core, root) = super::test_core();
++        Arc::get_mut(&mut core).unwrap().registry_writer = RegistryWriter::start(|_| Ok(())).unwrap();
++        (core, root)
++    }
++
++    /// A live terminal on a fake holder: what the holder is sent comes out of the receiver.
++    fn terminal(core: &Arc<Core>) -> (u32, mpsc::Receiver<Vec<u8>>) {
++        let (writer, frames) = mpsc::channel();
++        let (bye, _) = mpsc::channel();
++        let mut st = core.lock();
++        let id =
++            st.reg.create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, 0).unwrap();
++        let instance = format!("fake{id}");
++        let t = st.reg.terminals.get_mut(&id).unwrap();
++        t.holder = Some(instance.clone());
++        t.pid = Some(42);
++        t.incarnation = Some(INCARNATION.into());
++        st.screens.insert(id, Screen::new(80, 24, 1 << 20));
++        st.holders.push(Link { writer, pid: 0, instance, current: true, bye, bye_rx: None });
++        (id, frames)
++    }
++
++    fn request() -> AttachRequest {
++        AttachRequest {
++            observe: false,
++            resize_notifications: false,
++            visible: true,
++            visibility_updates: false,
++            focus_updates: false,
++            focused: false,
++            idle_ms: None,
++            history: 0,
++            resize_history: 0,
++            size: (80, 24),
++            display: Display::default(),
++            resumed: false,
++            desktop_group: None,
++        }
++    }
++
++    fn ctx(core: &Core, id: u32) -> String {
++        core.lock().reg.terminals[&id].ctx.clone()
++    }
++
++    fn guard(core: &Core, id: u32) -> Guard {
++        Guard { incarnation: INCARNATION.into(), if_ctx: ctx(core, id), within: Duration::from_secs(10) }
++    }
++
++    fn drain(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
++        // Not the empty frames that probe a link (`Link::alive`): they write nothing.
++        frames.try_iter().filter(|f| !f.is_empty()).collect()
++    }
++
++    fn input(id: u32, bytes: &[u8]) -> Vec<u8> {
++        proto::frame(proto::INPUT, id, bytes)
++    }
++
++    fn report(state: &'static str, message: &str, progress: Option<u8>) -> ghostty_vt::StatusReport {
++        ghostty_vt::StatusReport {
++            state,
++            kind: None,
++            progress,
++            id: String::new(),
++            app: String::new(),
++            title: String::new(),
++            message: message.into(),
++        }
++    }
++
++    /// Polls `send` once: it must have typed its paste and be pausing before the submit key.
++    async fn pause_after_paste<F: Future>(send: &mut std::pin::Pin<&mut F>) {
++        poll_fn(|cx| {
++            assert!(send.as_mut().poll(cx).is_pending(), "the paste must pause before submit");
++            Poll::Ready(())
++        })
++        .await;
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_guarded_send_types_a_paste_then_its_submit_and_moves_ctx() {
++        let (core, root) = test_core();
++        let gone = Gone::default();
++        let (id, frames) = terminal(&core);
++        let before = guard(&core, id);
++        let sent = core.send_guarded(id, "abc", None, before, &gone);
++        tokio::pin!(sent);
++        pause_after_paste(&mut sent).await;
++        assert_eq!(drain(&frames), vec![input(id, b"abc")]);
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        sent.await.unwrap();
++        assert_eq!(drain(&frames), vec![input(id, b"\r")]);
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_guarded_send_moves_ctx_so_the_same_ctx_cannot_send_twice() {
++        let (core, root) = test_core();
++        let gone = Gone::default();
++        let (id, frames) = terminal(&core);
++        let first = guard(&core, id);
++        let again = Guard { incarnation: first.incarnation.clone(), if_ctx: first.if_ctx.clone(), within: first.within };
++        let sending = core.send_guarded(id, "abc", None, first, &gone);
++        tokio::pin!(sending);
++        pause_after_paste(&mut sending).await;
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        sending.await.unwrap();
++        drain(&frames);
++        let e = core.send_guarded(id, "abc", None, again, &gone).await.err().unwrap();
++        assert_eq!(e.kind, "context_changed");
++        assert!(drain(&frames).is_empty());
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn refusals_type_nothing() {
++        let (core, root) = test_core();
++        let (id, frames) = terminal(&core);
++        let gone = Gone::default();
++        // Another program.
++        let mut g = guard(&core, id);
++        g.incarnation = "ffffffffffffffff".into();
++        assert_eq!(core.send_guarded(id, "x", None, g, &gone).await.err().unwrap().kind, "replaced");
++        // Another context.
++        let mut g = guard(&core, id);
++        g.if_ctx = "nonce-0".into();
++        assert_eq!(core.send_guarded(id, "x", None, g, &gone).await.err().unwrap().kind, "context_changed");
++        // Blocked on a dialog.
++        {
++            let mut st = core.lock();
++            let t = st.reg.terminals.get_mut(&id).unwrap();
++            crate::status::apply(t, &report("blocked", "Apply?", None));
++        }
++        let g = guard(&core, id);
++        assert_eq!(core.send_guarded(id, "x", None, g, &gone).await.err().unwrap().kind, "blocked");
++        // A status mismatch, as for any send.
++        {
++            let mut st = core.lock();
++            let t = st.reg.terminals.get_mut(&id).unwrap();
++            crate::status::apply(t, &report("idle", "", None));
++        }
++        let g = guard(&core, id);
++        assert_eq!(core.send_guarded(id, "x", Some("working"), g, &gone).await.err().unwrap().kind, "status_mismatch");
++        // Its caller gone before it types.
++        let (ended, _) = tokio::sync::watch::channel(true);
++        let g = guard(&core, id);
++        assert_eq!(core.send_guarded(id, "x", None, g, &Gone::watch(&ended)).await.err().unwrap().kind, "cancelled");
++        // A finished terminal.
++        core.lock().reg.terminals.get_mut(&id).unwrap().state = "finished".into();
++        let g = guard(&core, id);
++        assert_eq!(core.send_guarded(id, "x", None, g, &gone).await.err().unwrap().kind, "finished");
++        assert!(drain(&frames).is_empty(), "no refusal typed anything");
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn viewer_input_before_the_fence_refuses_and_after_it_waits_for_the_submit() {
++        let (core, root) = test_core();
++        let gone = Gone::default();
++        let (id, frames) = terminal(&core);
++        let person = Arc::new(crate::wire::Conn::default());
++        let channel = core.attach(&person, id, request()).unwrap();
++        drain(&frames);
++        // First: the person's key moved ctx before the send read it, and the send holds the old one.
++        let stale = guard(&core, id);
++        core.viewer_input(&person, channel, b"Z", false);
++        assert_eq!(drain(&frames), vec![input(id, b"Z")], "no send in progress: straight through");
++        let e = core.send_guarded(id, "abc", None, stale, &gone).await.err().unwrap();
++        assert_eq!(e.kind, "context_changed");
++        assert!(drain(&frames).is_empty());
++        // Second, on a terminal nobody has typed on: the key comes in the pause. It is held, the
++        // message goes whole, the key follows.
++        let (id, frames) = terminal(&core);
++        let channel = core.attach(&person, id, request()).unwrap();
++        drain(&frames);
++        let fresh = guard(&core, id);
++        let sending = core.send_guarded(id, "abc", None, fresh, &gone);
++        tokio::pin!(sending);
++        pause_after_paste(&mut sending).await;
++        assert_eq!(drain(&frames), vec![input(id, b"abc")]);
++        let during = ctx(&core, id);
++        core.viewer_input(&person, channel, b"Q", false);
++        assert_ne!(ctx(&core, id), during, "ctx moves at once, so the next decision on the old one is stale");
++        assert!(drain(&frames).is_empty(), "held");
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        sending.await.expect("a person's held keys do not fail the send");
++        assert_eq!(drain(&frames), vec![input(id, b"\r"), input(id, b"Q")]);
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_terminals_own_replies_do_not_move_ctx_but_a_person_does() {
++        let (core, root) = test_core();
++        let gone = Gone::default();
++        let (id, frames) = terminal(&core);
++        let person = Arc::new(crate::wire::Conn::default());
++        let channel = core.attach(&person, id, request()).unwrap();
++        drain(&frames);
++        let before = ctx(&core, id);
++        for _ in 0..50 {
++            // A program asking for the cursor position in a loop, and the viewer's emulator answering,
++            // as DATA (an older path) and as AUTOMATIC input.
++            core.output(&mut core.lock(), id, b"\x1b[6n");
++            core.viewer_input(&person, channel, b"\x1b[24;80R", false);
++            core.viewer_input(&person, channel, b"\x1b[?62;22c", true);
++            core.viewer_input(&person, channel, b"\x1b[I", true);
++            core.viewer_input(&person, channel, b"", false);
++        }
++        assert_eq!(ctx(&core, id), before);
++        let sent = core
++            .send_guarded(id, "go", None, guard(&core, id), &gone);
++        tokio::pin!(sent);
++        pause_after_paste(&mut sent).await;
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        sent.await.expect("a guarded send goes through while a program queries the cursor in a loop");
++        core.viewer_input(&person, channel, b"x", false);
++        assert_ne!(ctx(&core, id), before);
++        let after = ctx(&core, id);
++        core.viewer_input(&person, channel, b"\x1b[24;80R", false);
++        assert_eq!(ctx(&core, id), after);
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn the_status_hooks_report_moves_ctx_and_the_terminal_title_does_not() {
++        let (core, root) = test_core();
++        let (id, _frames) = terminal(&core);
++        let bytes = |body: &str| format!("\x1b]7501;{body}\x1b\\").into_bytes();
++        let b64 = |s: &str| {
++            use std::fmt::Write;
++            // Base64 of a short ASCII string, the way the status hook sends `msg`.
++            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++            let mut out = String::new();
++            for c in s.as_bytes().chunks(3) {
++                let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
++                for i in 0..4 {
++                    write!(out, "{}", if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' }).unwrap();
++                }
++            }
++            out
++        };
++        let feed = |body: String| core.output(&mut core.lock(), id, &bytes(&body));
++        let osc_title = |title: &str| core.output(&mut core.lock(), id, format!("\x1b]0;{title}\x07").as_bytes());
++        // The OSC title: Claude animates it while it works.
++        let c0 = ctx(&core, id);
++        for n in 0..20 {
++            osc_title(&format!("⠋ working {n}"));
++        }
++        assert_eq!(ctx(&core, id), c0, "the terminal title does not move ctx");
++        assert!(core.lock().reg.terminals[&id].title.contains("working"), "but it was seen");
++        feed("state=idle".into());
++        let c1 = ctx(&core, id);
++        assert_ne!(c1, c0, "the first report");
++        feed("state=idle".into());
++        assert_eq!(ctx(&core, id), c1, "the same report again");
++        feed("state=idle:progress=10".into());
++        assert_eq!(ctx(&core, id), c1, "progress alone");
++        feed(format!("state=idle:msg={}", b64("Ready")));
++        let c2 = ctx(&core, id);
++        assert_ne!(c2, c1, "the same state word with another message (E22)");
++        feed(format!("state=idle:msg={}:title={}", b64("Ready"), b64("Fix the build")));
++        let c3 = ctx(&core, id);
++        assert_ne!(c3, c2, "the report's own title");
++        feed("state=blocked:kind=question".into());
++        let c4 = ctx(&core, id);
++        assert_ne!(c4, c3, "state and kind");
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_status_change_before_the_submit_key_ends_in_unknown_with_no_submit() {
++        let (core, root) = test_core();
++        let gone = Gone::default();
++        let (id, frames) = terminal(&core);
++        let sending = core.send_guarded(id, "abc", None, guard(&core, id), &gone);
++        tokio::pin!(sending);
++        pause_after_paste(&mut sending).await;
++        assert_eq!(drain(&frames), vec![input(id, b"abc")]);
++        {
++            let mut st = core.lock();
++            let t = st.reg.terminals.get_mut(&id).unwrap();
++            crate::status::apply(t, &report("blocked", "Apply these changes?", None));
++        }
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        let e = sending.await.err().expect("the pre-submit check fails");
++        assert_eq!(e.kind, "unknown");
++        assert!(e.hint.contains("input box"), "{}", e.hint);
++        assert!(drain(&frames).is_empty(), "no submit key, and nothing typed again");
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn losing_the_holder_or_the_program_mid_paste_gives_unknown() {
++        for how in ["holder gone", "replaced", "link down before the paste", "link down after the paste"] {
++            let (core, root) = test_core();
++        let gone = Gone::default();
++            let (id, frames) = terminal(&core);
++            let (spare_id, spare) = {
++                // A second terminal and holder that must never receive what was for the first.
++                let (writer, frames) = mpsc::channel();
++                let (bye, _) = mpsc::channel();
++                let mut st = core.lock();
++                st.holders.push(Link { writer, pid: 0, instance: "other".into(), current: false, bye, bye_rx: None });
++                (0, frames)
++            };
++            let _ = spare_id;
++            let mut frames = Some(frames);
++            if how == "link down before the paste" {
++                drop(frames.take());
++            }
++            if how == "link down before the paste" {
++                let e = core.send_guarded(id, "abc", None, guard(&core, id), &gone).await.err().unwrap();
++                assert_eq!(e.kind, "unknown", "{how}");
++                remove_root(&root);
++                continue;
++            }
++            let sending = core.send_guarded(id, "abc", None, guard(&core, id), &gone);
++            tokio::pin!(sending);
++            pause_after_paste(&mut sending).await;
++            assert_eq!(drain(frames.as_ref().unwrap()), vec![input(id, b"abc")], "{how}");
++            match how {
++                "holder gone" => core.lock().holders.retain(|l| l.instance != format!("fake{id}")),
++                "replaced" => {
++                    // The program was replaced by another one on the same holder and address.
++                    let mut st = core.lock();
++                    let t = st.reg.terminals.get_mut(&id).unwrap();
++                    t.pid = Some(43);
++                    t.incarnation = Some("aaaaaaaaaaaaaaaa".into());
++                }
++                _ => drop(frames.take()),
++            }
++            tokio::time::advance(crate::input::PASTE_GAP).await;
++            let e = sending.await.err().unwrap_or_else(|| panic!("{how}: must not report success"));
++            assert_eq!(e.kind, "unknown", "{how}");
++            assert!(drain(&spare).is_empty(), "{how}: nothing went to another holder");
++            if let Some(frames) = &frames {
++                assert!(drain(frames).is_empty(), "{how}: no submit key");
++            }
++            remove_root(&root);
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn within_ms_gives_busy_with_nothing_typed() {
++        let (core, root) = test_core();
++        let gone = Gone::default();
++        let (id, frames) = terminal(&core);
++        let person = Arc::new(crate::wire::Conn::default());
++        let channel = core.attach(&person, id, request()).unwrap();
++        // A person typed just now: the send waits for them to pause, but not past its 1 s.
++        core.viewer_input(&person, channel, b"hel", false);
++        drain(&frames);
++        let mut g = guard(&core, id);
++        g.within = Duration::from_millis(1000);
++        let e = core.send_guarded(id, "abc", None, g, &gone).await.err().unwrap();
++        assert_eq!(e.kind, "busy");
++        assert!(drain(&frames).is_empty());
++        // Another send holding the terminal's input also makes it busy.
++        let (id2, frames2) = terminal(&core);
++        let first = core.send_guarded(id2, "one", None, guard(&core, id2), &gone);
++        tokio::pin!(first);
++        pause_after_paste(&mut first).await;
++        let mut g = guard(&core, id2);
++        g.within = Duration::from_millis(50);
++        let second = core.send_guarded(id2, "two", None, g, &gone).await.err().unwrap();
++        assert_eq!(second.kind, "busy");
++        first.await.unwrap();
++        assert_eq!(drain(&frames2), vec![input(id2, b"one"), input(id2, b"\r")]);
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn the_api_checks_the_guard_params_and_old_sends_are_unchanged() {
++        let (core, root) = test_core();
++        let (id, frames) = terminal(&core);
++        let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
++        let t = crate::terminals::address(id);
++        let ctx = ctx(&core, id);
++        for params in [
++            json!({"terminal": t, "text": "x", "incarnation": INCARNATION}),
++            json!({"terminal": t, "text": "x", "if_ctx": ctx}),
++            json!({"terminal": t, "text": "x", "within_ms": 100}),
++            json!({"terminal": t, "text": "x", "incarnation": INCARNATION, "if_ctx": ctx, "within_ms": 15001}),
++            json!({"terminal": t, "text": "x", "incarnation": INCARNATION, "if_ctx": ctx, "force": true}),
++        ] {
++            let e = crate::api::dispatch(&call, "terminal.send", params.clone()).await.err().expect("refused");
++            assert_eq!(e.kind, "invalid_params", "{params}");
++        }
++        assert!(drain(&frames).is_empty());
++        // No guard: as today, a paste, the gap, Enter.
++        let old = crate::api::dispatch(&call, "terminal.send", json!({"terminal": t, "text": "hi"}));
++        tokio::pin!(old);
++        poll_fn(|cx| {
++            assert!(old.as_mut().poll(cx).is_pending());
++            Poll::Ready(())
++        })
++        .await;
++        assert_eq!(drain(&frames), vec![input(id, b"hi")]);
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        let sent = old.await.unwrap();
++        assert_eq!(sent["via"], "typed");
++        assert_eq!(drain(&frames), vec![input(id, b"\r")]);
++        assert_ne!(super::guarded::ctx(&core, id), ctx, "an agent's send moves ctx");
++        // The guard through the API, in all three params, and the defaults.
++        let guarded = json!({"terminal": t, "text": "yo", "incarnation": INCARNATION, "if_ctx": super::guarded::ctx(&core, id)});
++        let call2 = crate::api::dispatch(&call, "terminal.send", guarded);
++        tokio::pin!(call2);
++        poll_fn(|cx| {
++            assert!(call2.as_mut().poll(cx).is_pending());
++            Poll::Ready(())
++        })
++        .await;
++        assert_eq!(drain(&frames), vec![input(id, b"yo")]);
++        tokio::time::advance(crate::input::PASTE_GAP).await;
++        call2.await.unwrap();
++        // The features are advertised.
++        for f in ["incarnation", "send-guarded", "read-bounded"] {
++            assert!(crate::api::FEATURES.contains(&f), "{f}");
++        }
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn incarnation_is_new_on_each_spawn_and_ctx_moves_with_it() {
++        let (core, root) = test_core();
++        let (id, _frames) = terminal(&core);
++        let mut st = core.lock();
++        let t = &st.reg.terminals[&id];
++        let (old, c0) = (t.incarnation.clone().unwrap(), t.ctx.clone());
++        // A restart (kept recovery) and a plain spawn both come through `spawn_result`.
++        for reason in [Some("exited"), None] {
++            st.reg.terminals.get_mut(&id).unwrap().reason = reason.map(Into::into);
++            let was = st.reg.terminals[&id].incarnation.clone();
++            core.spawn_result(&mut st, &format!("fake{id}"), id, Ok(77));
++            let t = &st.reg.terminals[&id];
++            let now = t.incarnation.clone().unwrap();
++            assert_eq!(now.len(), 16);
++            assert!(now.bytes().all(|b| b.is_ascii_hexdigit()));
++            assert_ne!(Some(now), was);
++        }
++        let t = &st.reg.terminals[&id];
++        assert_ne!(t.incarnation.as_deref(), Some(old.as_str()));
++        assert_ne!(t.ctx, c0);
++        drop(st);
++        remove_root(&root);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn list_get_attach_and_events_carry_incarnation_and_ctx() {
++        let (core, root) = test_core();
++        let (id, _frames) = terminal(&core);
++        let person = Arc::new(crate::wire::Conn::default());
++        let (_, record) = core.attach_record(&person, id, request()).unwrap();
++        let (inc, c) = (record.incarnation.clone().unwrap(), record.ctx.clone());
++        assert_eq!(inc, INCARNATION);
++        assert_eq!(c, ctx(&core, id), "taken with the first paint, in one critical section");
++        let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
++        let t = crate::terminals::address(id);
++        let got = crate::api::dispatch(&call, "terminal.get", json!({"terminal": t})).await.unwrap();
++        assert_eq!((got["incarnation"].as_str(), got["ctx"].as_str()), (Some(inc.as_str()), Some(c.as_str())));
++        let list = crate::api::dispatch(&call, "terminal.list", json!({})).await.unwrap();
++        assert_eq!(list["terminals"][0]["incarnation"], inc.as_str());
++        assert_eq!(list["terminals"][0]["ctx"], c.as_str());
++        let snapshot = core.snapshot(&core.lock(), &Default::default());
++        assert_eq!(snapshot["terminals"][0]["ctx"], c.as_str());
++        assert_eq!(snapshot["terminals"][0]["incarnation"], inc.as_str());
++        // The status event says the ctx the report made.
++        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
++        core.subscribe(&mut core.lock(), Default::default(), crate::events::Sink::Waiter(tx));
++        core.output(&mut core.lock(), id, b"\x1b]7501;state=working\x1b\\");
++        let mut seen = None;
++        while let Ok(ev) = rx.try_recv() {
++            if ev["type"] == "status" {
++                seen = Some(ev);
++            }
++        }
++        let ev = seen.expect("a status event");
++        assert_eq!(ev["data"]["ctx"], ctx(&core, id).as_str(), "{ev}");
++        remove_root(&root);
++    }
++
++    #[tokio::test]
++    async fn live_terminals_without_an_incarnation_get_one_on_first_load_and_keep_it_after() {
++        let root = std::env::temp_dir().join(format!("hc-backfill-{}", platform::random_hex()));
++        let paths = || Paths {
++            state: root.join("state"),
++            config: root.join("config.toml"),
++            socket: root.join("run/core.sock"),
++            holder_socket: root.join("run/core.holder.sock"),
++        };
++        paths().create_dirs().unwrap();
++        // A registry as an older core saved it: no `incarnation`, no `ctx`.
++        let mut reg = crate::terminals::Registry::default();
++        let new = || crate::terminals::NewTerminal { argv: vec!["sh".into()], cwd: "/".into(), ..Default::default() };
++        let now = crate::runtime::now_ms();
++        let live = reg.create(new(), now).unwrap();
++        let done = reg.create(new(), now).unwrap();
++        reg.finish(done, Some(0), None, "exited", now);
++        let mut value = serde_json::to_value(&reg).unwrap();
++        for t in value["terminals"].as_object_mut().unwrap().values_mut() {
++            let t = t.as_object_mut().unwrap();
++            t.remove("incarnation");
++            t.remove("ctx");
++        }
++        std::fs::write(paths().state.join("terminals.json"), value.to_string()).unwrap();
++        let core = Core::start(paths(), CoreInfo { id: "test".into(), name: "test".into() }).unwrap();
++        core.flush_saved().await.unwrap();
++        let on_disk = std::fs::read_to_string(paths().state.join("terminals.json")).unwrap();
++        assert!(on_disk.contains("\"incarnation\":\""), "the backfill is on disk after the first start: {on_disk}");
++        let first = {
++            let st = core.lock();
++            // `attach_all` finds no holder for the live record: it ended with its holder. The backfill
++            // is what is checked, before that, so read what the load itself did through the registry.
++            st.reg.terminals.get(&live).map(|t| t.incarnation.clone())
++        };
++        // (A live record with no holder is finished by `attach_all`; its incarnation is still the one
++        // the load gave it.)
++        let first = first.expect("the record is still there");
++        let inc = first.expect("a live record got an incarnation on load");
++        assert_eq!(inc.len(), 16);
++        assert!(inc.bytes().all(|b| b.is_ascii_hexdigit()));
++        assert_eq!(core.lock().reg.terminals[&done].incarnation, None, "a finished record gets none");
++        assert!(core.lock().reg.terminals[&live].ctx.contains('-'));
++        core.flush_saved().await.unwrap();
++        let saved = std::fs::read_to_string(paths().state.join("terminals.json")).unwrap();
++        assert!(saved.contains(&inc), "saved with the record");
++        drop(core);
++        // A second load keeps what was saved: backfill only fills a gap.
++        let again = Core::start(paths(), CoreInfo { id: "test".into(), name: "test".into() }).unwrap();
++        assert_eq!(again.lock().reg.terminals[&live].incarnation.as_deref(), Some(inc.as_str()));
++        drop(again);
++        // And a restart straight after the first, with no other save in between (the load
++        // saved the backfill itself): still the same one, never a new one.
++        let third = Core::start(paths(), CoreInfo { id: "test".into(), name: "test".into() }).unwrap();
++        assert_eq!(third.lock().reg.terminals[&live].incarnation.as_deref(), Some(inc.as_str()));
++        drop(third);
++        remove_root(&root);
++    }
++
++    // ---- K3 ----
++
++    fn read(max_bytes: Option<usize>, lines: usize, stitch: bool) -> crate::api::ReadParams {
++        crate::api::ReadParams { terminal: "t1".into(), caller: None, lines, max_bytes, stitch }
++    }
++
++    fn result(text: &str) -> crate::api::ReadResult {
++        crate::api::ReadResult {
++            text: text.into(),
++            complete: true,
++            how: "history".into(),
++            why: None,
++            truncated: false,
++            incarnation: None,
++        }
++    }
++
++    #[test]
++    fn max_bytes_bounds_the_escaped_text_and_drops_the_oldest_lines() {
++        let bound = crate::api::bound;
++        // No bound, or one that fits: untouched.
++        let r = bound(result("a\nb\nc"), None);
++        assert_eq!((r.text.as_str(), r.truncated), ("a\nb\nc", false));
++        let r = bound(result("a\nb\nc"), Some(7)); // a\nb\nc escapes to 7 bytes
++        assert_eq!((r.text.as_str(), r.truncated), ("a\nb\nc", false));
++        // One byte less: the oldest line goes.
++        let r = bound(result("a\nb\nc"), Some(6));
++        assert_eq!((r.text.as_str(), r.truncated, r.complete), ("b\nc", true, false));
++        // The bound counts escapes: a quote is two bytes, a newline two, a control character six.
++        let r = bound(result("\"\"\n\"\""), Some(5));
++        assert_eq!(r.text, "\"\"");
++        assert!(r.truncated);
++        let r = bound(result("x\u{1}"), Some(7)); // x + \u0001
++        assert_eq!((r.text.as_str(), r.truncated), ("x\u{1}", false));
++        // Whole lines only, newest kept: a last line too long on its own is dropped too.
++        let r = bound(result("short\nthis one is far too long"), Some(10));
++        assert_eq!((r.text.as_str(), r.truncated), ("", true));
++        let r = bound(result("old\nmiddle\nnew"), Some(9));
++        assert_eq!(r.text, "new");
++        for max in 0..40 {
++            let text = "alpha\n\"beta\"\ngamma\n\u{e9}t\u{e9}\ndelta";
++            let r = bound(result(text), Some(max));
++            assert!(serde_json::to_string(&r.text).unwrap().len() - 2 <= max.max(0), "{max}: {:?}", r.text);
++            assert!(text.ends_with(&r.text), "a tail of the lines: {:?}", r.text);
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_bounded_read_formats_only_the_rows_asked_for_and_reads_incarnation_with_them() {
++        let (core, root) = test_core();
++        let (id, _frames) = terminal(&core);
++        assert_eq!(crate::terminals::address(id), "t1");
++        {
++            let mut st = core.lock();
++            let lines: String = (1..=500).map(|n| format!("line {n}\r\n")).collect();
++            core.output(&mut st, id, lines.as_bytes());
++        }
++        let call = crate::api::Call { core: &core, conn: None, plain: None, gone: Default::default() };
++        let ask = |p: crate::api::ReadParams| {
++            let params = serde_json::to_value(&p).unwrap();
++            let call = &call;
++            async move { crate::api::dispatch(call, "terminal.read", params).await.unwrap() }
++        };
++        // An old call: all history asked for comes back, nothing new in the answer but the incarnation.
++        let all = ask(read(None, 1000, true)).await;
++        assert!(all["text"].as_str().unwrap().contains("line 1\n"));
++        assert!(all.get("truncated").is_none());
++        assert_eq!(all["incarnation"], INCARNATION);
++        // A bounded one: only 10 rows of history above the screen.
++        let some = ask(read(Some(1 << 20), 10, true)).await;
++        let text = some["text"].as_str().unwrap();
++        let rows = text.lines().count();
++        assert!(rows <= 24 + 10, "{rows}");
++        assert!(text.contains("line 500"), "the newest row is there");
++        assert!(!text.contains("line 400\n"), "rows beyond `lines` were never formatted");
++        assert_eq!(some["incarnation"], INCARNATION);
++        // And cut to bytes, oldest first.
++        let cut = ask(read(Some(40), 10, true)).await;
++        let text = cut["text"].as_str().unwrap();
++        assert!(serde_json::to_string(text).unwrap().len() - 2 <= 40, "{text:?}");
++        assert!(text.ends_with("line 500") || text.ends_with("line 500\n") || text.contains("line 500"));
++        assert_eq!(cut["truncated"], true);
++        assert_eq!(cut["complete"], false);
++        // `stitch: false` on a full-screen program reads its screen as it is, never scrolls it.
++        core.output(&mut core.lock(), id, b"\x1b[?1049h\x1b[Hfull screen app");
++        let screen = ask(read(Some(1 << 20), 200, false)).await;
++        assert_eq!(screen["how"], "screen");
++        assert!(screen["text"].as_str().unwrap().contains("full screen app"));
++        assert!(screen.get("why").is_none());
++        assert!(!core.lock().stitching.contains(&id));
++        remove_root(&root);
++    }
++}
+diff --git a/crates/herdr-core/src/status.rs b/crates/herdr-core/src/status.rs
+index 8505388..daaa4ac 100644
+--- a/crates/herdr-core/src/status.rs
++++ b/crates/herdr-core/src/status.rs
+@@ -95,7 +95,34 @@ fn stamp(t: &mut Terminal, was: Option<String>) {
+     }
+ }
+ 
++/// Whether two reports say the same: what moves a terminal's `ctx` is the
++/// report's state, kind, message and title (its progress and app name tick
++/// without anything having changed for a person).
++fn same_report(a: &Status, b: &Status) -> bool {
++    (&a.state, &a.kind, &a.msg, &a.title) == (&b.state, &b.kind, &b.msg, &b.title)
++}
++
++fn same_reports(a: Option<&Status>, b: Option<&Status>) -> bool {
++    match (a, b) {
++        (Some(a), Some(b)) => same_report(a, b),
++        (None, None) => true,
++        _ => false,
++    }
++}
++
+ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
++    let before = (t.status.clone(), t.records.clone());
++    let change = apply_report(t, r);
++    let moved = !same_reports(before.0.as_ref(), t.status.as_ref())
++        || before.1.len() != t.records.len()
++        || before.1.iter().any(|(id, s)| !same_reports(Some(s), t.records.get(id)));
++    if moved {
++        t.bump_ctx();
++    }
++    change
++}
++
++fn apply_report(t: &mut Terminal, r: &StatusReport) -> Change {
+     let (was_working, was_word) = (working(t), word(t));
+     let was = stuck(t).map(String::from);
+     t.reported = true;
+@@ -130,6 +157,9 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
+ pub fn reset(t: &mut Terminal) -> Change {
+     let (was_working, was_word) = (working(t), word(t));
+     let had = t.status.is_some() || !t.records.is_empty();
++    if had {
++        t.bump_ctx();
++    }
+     t.status = None;
+     t.records.clear();
+     stamp(t, was_word);
+diff --git a/crates/herdr-core/src/terminals.rs b/crates/herdr-core/src/terminals.rs
+index ece46a2..57501b8 100644
+--- a/crates/herdr-core/src/terminals.rs
++++ b/crates/herdr-core/src/terminals.rs
+@@ -124,6 +124,26 @@ pub struct Terminal {
+     /// The holder (its instance) that runs it.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub holder: Option<String>,
++    /// 16 random hex characters, new each time a program is successfully
++    /// started in it (created, restarted, kept recovery). Saved. A terminal
++    /// saved by an older core gets one when this core first loads it. Null
++    /// until its first program has started.
++    #[serde(default)]
++    pub incarnation: Option<String>,
++    /// `<nonce of this core process>-<counter>`: moves when a person or an
++    /// agent types into it (`send`, `keys`, a viewer's real input, never a
++    /// terminal's own replies), when its program's status report changes
++    /// (state, kind, message, title; not the terminal title, not progress)
++    /// and whenever a program starts. In memory only: a core restart gives a
++    /// new one (the saved value is never read back).
++    #[serde(default)]
++    pub ctx: String,
++    #[serde(skip)]
++    ctx_seq: u64,
++    /// How many of those moves were a person's keys held while an agent's
++    /// input went in (they reach the program only after it).
++    #[serde(skip)]
++    held_bumps: u64,
+     /// Template overrides: the key that submits a message, the stop key, the pause
+     /// between paste and submit.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -159,7 +179,38 @@ pub struct Terminal {
+     pub draft: Option<crate::input::DraftView>,
+ }
+ 
++/// This core process's own nonce: what makes a `ctx` from before a restart differ.
++fn process_nonce() -> &'static str {
++    static NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++    NONCE.get_or_init(|| crate::platform::random_hex()[..8].to_string())
++}
++
++/// 16 random hex characters.
++pub fn new_incarnation() -> String {
++    crate::platform::random_hex()[..16].to_string()
++}
++
+ impl Terminal {
++    /// Something happened that makes a decision taken on the old `ctx` stale.
++    pub fn bump_ctx(&mut self) {
++        self.ctx_seq += 1;
++        self.ctx = format!("{}-{}", process_nonce(), self.ctx_seq);
++    }
++
++    /// A person's keys, held while an agent's input goes in: `ctx` moves at once
++    /// (the next decision on the old one is stale), but they have not reached the program.
++    pub fn bump_ctx_held(&mut self) {
++        self.held_bumps += 1;
++        self.bump_ctx();
++    }
++
++    /// How many times something other than held keys moved `ctx`: what a
++    /// guarded send compares before its submit key to know nothing but its own
++    /// paste arrived (it has taken its own move into account).
++    pub fn arrivals(&self) -> u64 {
++        self.ctx_seq - self.held_bumps
++    }
++
+     pub fn id(&self) -> u32 {
+         parse_id(&self.address).expect("addresses are t<number>")
+     }
+@@ -330,8 +381,13 @@ impl Registry {
+                 template: new.template.map(|t| t.name),
+                 first_message: None,
+                 holder: None,
++                incarnation: None,
++                ctx: String::new(),
++                ctx_seq: 0,
++                held_bumps: 0,
+             },
+         );
++        self.terminals.get_mut(&id).expect("just made").bump_ctx();
+         Ok(id)
+     }
+ 
+diff --git a/crates/herdr-core/src/viewers.rs b/crates/herdr-core/src/viewers.rs
+index 580a677..dc961b5 100644
+--- a/crates/herdr-core/src/viewers.rs
++++ b/crates/herdr-core/src/viewers.rs
+@@ -230,6 +230,18 @@ impl Core {
+ 
+     /// Adds a viewer: queues the first paint, then every live byte follows in order.
+     pub fn attach(&self, conn: &Arc<Conn>, id: u32, req: AttachRequest) -> Result<u32, RpcError> {
++        self.attach_record(conn, id, req).map(|(channel, _)| channel)
++    }
++
++    /// [`Core::attach`], and the terminal's record as it was in the same
++    /// critical section that queued the first paint: its `incarnation` and
++    /// `ctx` are those of the program the paint shows.
++    pub fn attach_record(
++        &self,
++        conn: &Arc<Conn>,
++        id: u32,
++        req: AttachRequest,
++    ) -> Result<(u32, crate::terminals::Terminal), RpcError> {
+         let mut st = self.lock();
+         if let Some(t) = st.reg.terminals.get(&id) {
+             t.check_program()?;
+@@ -308,7 +320,7 @@ impl Core {
+                 out.mark_history_lost(channel);
+             }
+         });
+-        Ok(channel)
++        Ok((channel, st.reg.terminals[&id].clone()))
+     }
+ 
+     /// Program output: through the relay to the screen and every viewer,
+@@ -450,13 +462,14 @@ impl Core {
+         if first_task_finished {
+             t.first_task_turn = None;
+         }
+-        let (status, records, turn, reported) = (t.status.clone(), t.records.clone(), t.turn, t.reported);
++        let (status, records, turn, reported, ctx) =
++            (t.status.clone(), t.records.clone(), t.turn, t.reported, t.ctx.clone());
+         if change.status {
+             self.emit(
+                 st,
+                 "status",
+                 id,
+-                serde_json::json!({"status": status, "records": records, "reported": reported}),
++                serde_json::json!({"status": status, "records": records, "reported": reported, "ctx": ctx}),
+             );
+         }
+         if change.turn_ended {
+@@ -515,6 +528,12 @@ impl Core {
+                 peer: v.peer.clone(),
+             });
+             let person = !automatic && !bytes.is_empty();
++            let held = st.gates.get(&id).is_some_and(|g| g.is_busy());
++            if person && let Some(t) = st.reg.terminals.get_mut(&id) {
++                // Under the same lock as a guarded send's fence: either the send sees the
++                // new `ctx` and refuses, or these bytes are held until it has typed.
++                if held { t.bump_ctx_held() } else { t.bump_ctx() }
++            }
+             let now = st.gates.entry(id).or_default().input(bytes, human, person, by);
+             if let Some(link) = st.link(id) {
+                 link.input(id, &now);
+diff --git a/docs/commands.md b/docs/commands.md
+index 67b3a3c..7131662 100644
+--- a/docs/commands.md
++++ b/docs/commands.md
+@@ -495,9 +495,11 @@ Arguments:
+   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
+ 
+ Options:
+-      --json           JSON output even in a terminal
+-      --lines <LINES>  Lines of history above the screen [default: 0]
+-  -h, --help           Print help
++      --json               JSON output even in a terminal
++      --lines <LINES>      Lines of history above the screen [default: 0]
++      --max-bytes <BYTES>  Feature `read-bounded`: at most this many bytes of `text`, counted as JSON-escaped (what goes on the wire). The oldest lines are dropped to fit and the result says `truncated`
++      --stitch <BOOL>      Feature `read-bounded`: false never scrolls a full-screen program to read its history (its screen is read as it is) [default: true] [possible values: true, false]
++  -h, --help               Print help
+ ```
+ 
+ ## hc rm
+@@ -566,16 +568,19 @@ Arguments:
+   <TEXT>      Pasted, then submitted with Enter
+ 
+ Options:
+-      --force              Type even if the program is blocked (it may answer its dialog)
+-      --json               JSON output even in a terminal
+-      --if <STATUS>        Only type if the status is exactly this [possible values: idle, working]
+-      --wait               Then wait for the turn this send started
+-      --timeout <TIMEOUT>  With wait: seconds before it checks in (default: config, else 180)
+-      --inbox-only         Only queue it in the terminal's inbox: if its program doesn't follow its inbox, fail with `not_following` instead of typing. This machine's terminals only
+-      --key <KEY>          With --inbox-only: this message's key. Sent again with the same key (after a lost answer), it isn't queued twice
+-      --key-since <MS>     With --key: when it was first sent (ms since the epoch). A key the terminal may have forgotten since is refused, not queued again
+-      --core <CORE>        With --inbox-only: only if this core (its id, from `server status`) is the one running; another refuses (`other_core`)
+-  -h, --help               Print help
++      --force                      Type even if the program is blocked (it may answer its dialog)
++      --json                       JSON output even in a terminal
++      --if <STATUS>                Only type if the status is exactly this [possible values: idle, working]
++      --wait                       Then wait for the turn this send started
++      --timeout <TIMEOUT>          With wait: seconds before it checks in (default: config, else 180)
++      --inbox-only                 Only queue it in the terminal's inbox: if its program doesn't follow its inbox, fail with `not_following` instead of typing. This machine's terminals only
++      --key <KEY>                  With --inbox-only: this message's key. Sent again with the same key (after a lost answer), it isn't queued twice
++      --key-since <MS>             With --key: when it was first sent (ms since the epoch). A key the terminal may have forgotten since is refused, not queued again
++      --core <CORE>                With --inbox-only: only if this core (its id, from `server status`) is the one running; another refuses (`other_core`)
++      --incarnation <INCARNATION>  Guarded send (feature `send-guarded`; needs `--if-ctx`): type only if the terminal still runs this incarnation, else refuse with `replaced`
++      --if-ctx <IF_CTX>            Guarded send: type only if the terminal's `ctx` is still this (nobody has typed into it and its status report hasn't changed), else refuse with `context_changed`
++      --within-ms <MS>             Guarded send: the longest it waits for a person's typing or draft, or for its turn, in ms (at most 15000, default 10000); then `busy`
++  -h, --help                       Print help
+ ```
+ 
+ ## hc server
+diff --git a/schema/hc.openrpc.json b/schema/hc.openrpc.json
+index 15292ac..46109e1 100644
+--- a/schema/hc.openrpc.json
++++ b/schema/hc.openrpc.json
+@@ -863,9 +863,20 @@
+             "description": "\"screen\", \"history\", or \"stitched\" (a full-screen app, read by scrolling it).",
+             "type": "string"
+           },
++          "incarnation": {
++            "description": "The program's incarnation when the text was read, under the same lock\nas the text. Absent for a terminal that never started a program.",
++            "type": [
++              "string",
++              "null"
++            ]
++          },
+           "text": {
+             "type": "string"
+           },
++          "truncated": {
++            "description": "`max_bytes` cut the text: older lines were dropped.",
++            "type": "boolean"
++          },
+           "why": {
+             "description": "Why only the screen: \"working\", \"blocked\" or \"error\" (a full-screen app\nis not scrolled in these states).",
+             "type": [
+@@ -915,6 +926,11 @@
+             "minimum": 0,
+             "type": "integer"
+           },
++          "ctx": {
++            "default": "",
++            "description": "`<nonce of this core process>-<counter>`: moves when a person or an\nagent types into it (`send`, `keys`, a viewer's real input, never a\nterminal's own replies), when its program's status report changes\n(state, kind, message, title; not the terminal title, not progress)\nand whenever a program starts. In memory only: a core restart gives a\nnew one (the saved value is never read back).",
++            "type": "string"
++          },
+           "cwd": {
+             "type": "string"
+           },
+@@ -975,6 +991,14 @@
+             "description": "Which terminal the program believes it runs in (TERM_PROGRAM and\nversion), fixed at start; XTVERSION answers with it.",
+             "type": "string"
+           },
++          "incarnation": {
++            "default": null,
++            "description": "16 random hex characters, new each time a program is successfully\nstarted in it (created, restarted, kept recovery). Saved. A terminal\nsaved by an older core gets one when this core first loads it. Null\nuntil its first program has started.",
++            "type": [
++              "string",
++              "null"
++            ]
++          },
+           "keep": {
+             "default": false,
+             "description": "Replace a lost program with this machine’s shell, in place. Exit with a code and kill remain final.",
+@@ -1477,6 +1501,11 @@
+             "minimum": 0,
+             "type": "integer"
+           },
++          "ctx": {
++            "default": "",
++            "description": "`<nonce of this core process>-<counter>`: moves when a person or an\nagent types into it (`send`, `keys`, a viewer's real input, never a\nterminal's own replies), when its program's status report changes\n(state, kind, message, title; not the terminal title, not progress)\nand whenever a program starts. In memory only: a core restart gives a\nnew one (the saved value is never read back).",
++            "type": "string"
++          },
+           "cwd": {
+             "type": "string"
+           },
+@@ -1537,6 +1566,14 @@
+             "description": "Which terminal the program believes it runs in (TERM_PROGRAM and\nversion), fixed at start; XTVERSION answers with it.",
+             "type": "string"
+           },
++          "incarnation": {
++            "default": null,
++            "description": "16 random hex characters, new each time a program is successfully\nstarted in it (created, restarted, kept recovery). Saved. A terminal\nsaved by an older core gets one when this core first loads it. Null\nuntil its first program has started.",
++            "type": [
++              "string",
++              "null"
++            ]
++          },
+           "keep": {
+             "default": false,
+             "description": "Replace a lost program with this machine’s shell, in place. Exit with a code and kill remain final.",
+@@ -2797,7 +2834,7 @@
+       }
+     },
+     {
+-      "description": "The screen plus `lines` of history as text, live or finished.",
++      "description": "The screen plus `lines` of history as text, live or finished. Feature `read-bounded`: `max_bytes` bounds the JSON-escaped text (oldest lines dropped, `truncated`); `stitch: false` never scrolls a full-screen program; only the `lines` rows asked for are formatted; the result's `incarnation` is read under the same lock as the text.",
+       "errors": [
+         {
+           "code": -32000,
+@@ -2839,6 +2876,29 @@
+             "type": "integer"
+           }
+         },
++        {
++          "description": "Feature `read-bounded`: at most this many bytes of `text`, counted as\nJSON-escaped (what goes on the wire). The oldest lines are dropped to\nfit and the result says `truncated`.",
++          "name": "max_bytes",
++          "required": false,
++          "schema": {
++            "description": "Feature `read-bounded`: at most this many bytes of `text`, counted as\nJSON-escaped (what goes on the wire). The oldest lines are dropped to\nfit and the result says `truncated`.",
++            "format": "uint",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          }
++        },
++        {
++          "description": "Feature `read-bounded`: false never scrolls a full-screen program to\nread its history (its screen is read as it is).",
++          "name": "stitch",
++          "required": false,
++          "schema": {
++            "description": "Feature `read-bounded`: false never scrolls a full-screen program to\nread its history (its screen is read as it is).",
++            "type": "boolean"
++          }
++        },
+         {
+           "description": "The terminal: `t7`, a name, or `machine/t7`.",
+           "name": "terminal",
+@@ -3100,7 +3160,7 @@
+       }
+     },
+     {
+-      "description": "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min, counted from when it arrives, for them to send or clear it; a draft backspaced away is no draft, and one nobody typed on for 10 min, or whose viewer detached 1 min ago with none left, expires; terminal.get shows it as `draft`); keys a person presses meanwhile are held, then delivered. A send still waiting when its caller goes away (its `hc` was killed, its connection hung up) is dropped: nothing is typed. A client that only stops writing, as `hc connect` does when its stdin ends, still gets its answer. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed.",
++      "description": "Paste text and press Enter, once nobody has typed for ~3 s and no draft a person typed is left unsent (it waits up to 2 min, counted from when it arrives, for them to send or clear it; a draft backspaced away is no draft, and one nobody typed on for 10 min, or whose viewer detached 1 min ago with none left, expires; terminal.get shows it as `draft`); keys a person presses meanwhile are held, then delivered. A send still waiting when its caller goes away (its `hc` was killed, its connection hung up) is dropped: nothing is typed. A client that only stops writing, as `hc connect` does when its stdin ends, still gets its answer. Refuses a blocked program unless `force`. A program that follows its inbox (terminal.inbox) gets the text queued there instead: nothing is typed. Guarded (feature `send-guarded`, with `incarnation` and `if_ctx`, and `within_ms` at most 15000, default 10000): it types only if the terminal still runs that incarnation (else `replaced`), its `ctx` is still `if_ctx` (else `context_changed`: someone typed into it, or its status report changed) and it isn't blocked (`blocked`, `force` is not allowed), and it never waits longer than `within_ms` for a person or a draft (`busy`); those four refusals type nothing. A guarded send always types, whatever follows the inbox. It holds the terminal's input from that check until its submit key: a person's keys wait and go in after it. Every write goes to the program checked; if a write fails, or anything but the paste reached the program before the submit key, it answers `unknown` and sends no submit key: the text may be sitting unsent in the program's input box, where a later Enter would submit it. Its caller leaving before it types ends it, as for any send.",
+       "errors": [
+         {
+           "code": -32000,
+@@ -3164,6 +3224,41 @@
+             "kind": "config"
+           },
+           "message": "config"
++        },
++        {
++          "code": -32000,
++          "data": {
++            "kind": "replaced"
++          },
++          "message": "replaced"
++        },
++        {
++          "code": -32000,
++          "data": {
++            "kind": "context_changed"
++          },
++          "message": "context_changed"
++        },
++        {
++          "code": -32000,
++          "data": {
++            "kind": "busy"
++          },
++          "message": "busy"
++        },
++        {
++          "code": -32000,
++          "data": {
++            "kind": "unknown"
++          },
++          "message": "unknown"
++        },
++        {
++          "code": -32000,
++          "data": {
++            "kind": "needs_update"
++          },
++          "message": "needs_update"
+         }
+       ],
+       "name": "terminal.send",
+@@ -3207,6 +3302,30 @@
+             "description": "Only type if the status is exactly this."
+           }
+         },
++        {
++          "description": "Guarded send: type only if the terminal's `ctx` is still this (nobody\nhas typed into it and its status report hasn't changed), else refuse\nwith `context_changed`.",
++          "name": "if_ctx",
++          "required": false,
++          "schema": {
++            "description": "Guarded send: type only if the terminal's `ctx` is still this (nobody\nhas typed into it and its status report hasn't changed), else refuse\nwith `context_changed`.",
++            "type": [
++              "string",
++              "null"
++            ]
++          }
++        },
++        {
++          "description": "Guarded send (feature `send-guarded`; needs `--if-ctx`): type only if\nthe terminal still runs this incarnation, else refuse with `replaced`.",
++          "name": "incarnation",
++          "required": false,
++          "schema": {
++            "description": "Guarded send (feature `send-guarded`; needs `--if-ctx`): type only if\nthe terminal still runs this incarnation, else refuse with `replaced`.",
++            "type": [
++              "string",
++              "null"
++            ]
++          }
++        },
+         {
+           "description": "The terminal: `t7`, a name, or `machine/t7`.",
+           "name": "terminal",
+@@ -3247,6 +3366,20 @@
+             "description": "Then wait for the turn this send started.",
+             "type": "boolean"
+           }
++        },
++        {
++          "description": "Guarded send: the longest it waits for a person's typing or draft, or\nfor its turn, in ms (at most 15000, default 10000); then `busy`.",
++          "name": "within_ms",
++          "required": false,
++          "schema": {
++            "description": "Guarded send: the longest it waits for a person's typing or draft, or\nfor its turn, in ms (at most 15000, default 10000); then `busy`.",
++            "format": "uint64",
++            "minimum": 0,
++            "type": [
++              "integer",
++              "null"
++            ]
++          }
+         }
+       ],
+       "result": {

@@ -274,6 +274,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         outbox = OutboxCourier.shared(this);
         outbox.listen(outboxChanged);
         bindings = MachineBindings.shared(this);
+        transcripts = TranscriptKeeper.shared(this);
         snapshots = PaneSnapshots.shared(this);
         worker.setRemoveOnCancelPolicy(true);
         worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
@@ -2425,6 +2426,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private MachineBindings bindings;
     /** The live pane's one-tap offer: a held message for it, or a draft from before a restart. */
     private HeldOfferCard heldOffer;
+    /** Agents' transcripts: read while a direct link is up, offered offline where proven. */
+    private TranscriptKeeper transcripts;
+    /** The offline transcript's button, and what it was last looked up for. Main thread. */
+    private TextView transcriptButton;
+    private String transcriptQuery = "";
+    /** Counts lookups: an answer, or a tap, for an older one is stale. Main thread. */
+    private long transcriptSeq;
+    /** Whether the network is metered, checked at most every few seconds. Poll thread. */
+    private volatile boolean meteredNow;
+    private long meteredAt;
     /** The pane whose draft offer was put off ("Later"): it stays kept and comes back elsewhere. Main thread. */
     private String draftLater;
     /** What the offer was last refreshed for (pane, attach, paint), so polls repaint nothing. */
@@ -5506,6 +5517,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      */
     private void refreshOffer() {
         if (heldOffer == null || destroyed || outbox == null) return;
+        refreshTranscript(here());
         if (covered()) {
             heldOffer.hide();
             return;
@@ -5657,6 +5669,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (binding == null) return;
         if (binding.bound()) {
             current.machine = key;
+            // No transcript proof here: the panes may still be a resumed connection's. The poll
+            // publishes this connection's own list once it has one (TranscriptKeeper.mayPublish).
         } else {
             current.refusedBy = binding.refusedBy;
             String other = binding.refusedBy;
@@ -5664,6 +5678,111 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     + "; it works live only, and nothing is held for it"));
         }
         main.post(this::refreshQueued);
+    }
+
+    /**
+     * A direct link's list is also what proves a transcript offline (an old core's proves none):
+     * published once per list revision, and only this connection's own, after its hello. Poll
+     * thread.
+     */
+    private void publishTranscriptProof(Connection current, boolean ready) {
+        if (transcripts == null || !TranscriptKeeper.mayPublish(ready, current.machine != null, current.ownList,
+                current.featuresKnown, current.transcriptsListed, current.chromeRevision)) {
+            return;
+        }
+        current.transcriptsListed = current.chromeRevision;
+        transcripts.listed(current.machine, current.generation, current.panes);
+    }
+
+    /** Whether the phone's network is metered (other agents' transcripts are not read then). */
+    private boolean metered() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - meteredAt > 5_000) {
+            meteredAt = now;
+            android.net.ConnectivityManager connectivity = getSystemService(android.net.ConnectivityManager.class);
+            meteredNow = connectivity == null || connectivity.isActiveNetworkMetered();
+        }
+        return meteredNow;
+    }
+
+    /**
+     * Offline, the pane on screen's transcript, when the last direct list of its machine proves
+     * it is of the program that list showed there: one button, "transcript · as of 14:02". Live,
+     * or unproven, nothing. Main thread.
+     */
+    private void refreshTranscript(Here here) {
+        if (transcripts == null) return;
+        Connection c = here.connection;
+        boolean offline = !here.live && c != null && (c.offline || c.isClosed() || !c.ready);
+        // The connection is part of it: a reconnect to the same pane looks again.
+        String query = offline && here.machine != null && !here.pane.isEmpty()
+                ? c.generation + "/" + here.machine + "/" + here.pane : "";
+        if (query.equals(transcriptQuery)) return;
+        transcriptQuery = query;
+        // Any change hides the button at once: its listener is the old pane's.
+        long seq = ++transcriptSeq;
+        hideTranscriptButton();
+        if (query.isEmpty()) return;
+        MachineKey machine = here.machine;
+        String pane = here.pane;
+        String label = here.label.isEmpty() ? pane : here.label;
+        transcripts.offline(machine, pane, t -> main.post(() -> {
+            if (destroyed || seq != transcriptSeq) return;
+            showTranscriptButton(seq, machine, pane, label, t);
+        }));
+    }
+
+    private void hideTranscriptButton() {
+        if (transcriptButton == null) return;
+        transcriptButton.setVisibility(View.GONE);
+        transcriptButton.setOnClickListener(null);
+    }
+
+    /**
+     * Whether {@code t}, found by lookup {@code seq} for {@code machine}'s {@code pane}, is still
+     * the pane on screen's: no lookup since (any change of connection, machine or pane starts
+     * one), and the transcript is of that machine and pane. Main thread.
+     */
+    private boolean transcriptCurrent(long seq, MachineKey machine, String pane, Transcripts.Transcript t) {
+        return !destroyed && seq == transcriptSeq && t.key.machine.equals(machine) && t.key.address.equals(pane);
+    }
+
+    private void showTranscriptButton(long seq, MachineKey machine, String address, String pane,
+            Transcripts.Transcript t) {
+        if (terminalRoot == null) return;
+        if (t == null || !transcriptCurrent(seq, machine, address, t)) {
+            hideTranscriptButton();
+            return;
+        }
+        if (transcriptButton == null) {
+            transcriptButton = new TextView(this);
+            transcriptButton.setTextSize(12);
+            transcriptButton.setTextColor(chrome.onSurface);
+            transcriptButton.setPadding(dp(10), dp(5), dp(10), dp(5));
+            android.graphics.drawable.GradientDrawable pill = new android.graphics.drawable.GradientDrawable();
+            pill.setColor(chrome.control);
+            pill.setStroke(dp(1), chrome.outline);
+            pill.setCornerRadius(dp(14));
+            transcriptButton.setBackground(pill);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-2, -2,
+                    android.view.Gravity.TOP | android.view.Gravity.END);
+            params.setMargins(0, dp(58), dp(12), 0);
+            terminalRoot.addView(transcriptButton, params);
+        }
+        String when = OfflineSwitch.when(t.asOfMs, System.currentTimeMillis(), java.util.TimeZone.getDefault(),
+                android.text.format.DateFormat.is24HourFormat(this), java.util.Locale.getDefault());
+        transcriptButton.setText("≡ transcript · as of " + when);
+        transcriptButton.setContentDescription("Read " + pane + "'s " + Transcripts.label(when));
+        transcriptButton.setOnClickListener(v -> {
+            // Checked again on the tap: the selection may have moved since it was shown.
+            refreshTranscript(here());
+            if (!transcriptCurrent(seq, machine, address, t)) {
+                hideTranscriptButton();
+                return;
+            }
+            TranscriptScreen.show(this, chrome, pane, when, t);
+        });
+        transcriptButton.setVisibility(View.VISIBLE);
     }
 
     /** The poll's attach on screen and its first paint; the offer follows a change. Under stateLock. */
@@ -5674,8 +5793,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String signature = current.generation + "/" + pane + "/" + attach + "/" + painted + "/" + current.ready;
         current.attach = attach;
         current.painted = painted;
+        if (transcripts != null && current.ready && painted && current.machine != null && current.transcripts) {
+            // One bounded read at a time, off this thread: it returns at once.
+            transcripts.tick(new TranscriptKeeper.Link(current.remoteHandle, current.generation, current.machine,
+                    true, metered(), current.chromePane, state.optLong("output", 0), current.panes));
+        }
         // A hello the outbox was not yet read for is bound on a later poll.
         if (current.machine == null && current.ready && current.remoteBoot != null) bindMachine(current, current.remoteBoot);
+        publishTranscriptProof(current, current.ready);
         if (signature.equals(offerSignature)) return;
         offerSignature = signature;
         main.post(this::refreshOffer);
@@ -7054,6 +7179,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.workspaces = state.optJSONArray("workspaces");
                     current.tabs = state.optJSONArray("tabs");
                     current.panes = state.optJSONArray("panes");
+                    // A ready poll's list is this connection's own, not one inherited on resume.
+                    if (selected) current.ownList = true;
                     current.projectsOrder = state.optJSONObject("projects_order");
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
@@ -7082,10 +7209,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     }
                 }
                 current.chromePane = pane;
+                JSONObject features = state.optJSONObject("features");
+                if (features != null) {
+                    current.featuresKnown = true;
+                    current.transcripts = features.optBoolean("read_bounded") && features.optBoolean("incarnation");
+                }
                 if (selected && chromeChanged && current.machine != null) {
                     // A direct link's own list: held messages for a terminal not on it are gone.
                     outbox.observe(current.machine, terminals(current.panes));
                 }
+                publishTranscriptProof(current, selected);
                 final boolean scrolledBack = state.optLong("local_offset", 0) > 0;
                 main.post(() -> showLatest(scrolledBack));
                 current.renderedScroll = state.optLong("rendered_scroll", current.renderedScroll);
@@ -7804,6 +7937,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         /** The attach on screen (0: none) and whether it has painted, from the poll. */
         volatile long attach;
         volatile boolean painted;
+        /** Its core offers the bounded read and incarnations (its hello's features). */
+        volatile boolean transcripts;
+        /** Its hello's features were seen, and a ready poll gave its own list (not a resumed one). */
+        volatile boolean featuresKnown, ownList;
+        /** The list revision last published as transcript proof; -1: none yet. */
+        volatile long transcriptsListed = -1;
         volatile String paneId = launch.paneId;
         /** A pane switch asked for and not yet confirmed by the daemon, and until when to wait. */
         volatile String pendingPane = "";

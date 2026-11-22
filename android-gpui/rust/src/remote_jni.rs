@@ -406,6 +406,27 @@ pub extern "system" fn Java_dev_herdr_android_RemoteNative_compose(
     };
     result_string(&mut env, remote::compose(handle as u64, attach as u64, &text))
 }
+/// A bounded transcript read of the pane `terminal` (see `remote::read_transcript`).
+/// Blocks: Java calls it from a worker thread.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_herdr_android_RemoteNative_readTranscript(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    terminal: JString<'_>,
+    lines: jint,
+    max_bytes: jint,
+) -> jstring {
+    let Some(terminal) = read(&mut env, &terminal, 1024) else {
+        return std::ptr::null_mut();
+    };
+    let (Ok(lines), Ok(max_bytes)) = (usize::try_from(lines), usize::try_from(max_bytes)) else {
+        fail(&mut env, "Invalid or oversized remote argument");
+        return std::ptr::null_mut();
+    };
+    result_string(&mut env, remote::read_transcript(handle as u64, &terminal, lines, max_bytes))
+}
 /// `terminal.put` for an image the phone picked, snapped or pasted: its bytes
 /// go to the terminal's machine over the core connection; the reply names the
 /// path. Blocks: Java calls it from a worker thread.

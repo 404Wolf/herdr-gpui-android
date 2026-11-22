@@ -91,7 +91,8 @@
             pkgs.pkg-config
             pkgs.python3
             pkgs.socat
-            # A scratch herdr-core (hc) and sshd for the emulator tests, both from Nix.
+            # A scratch herdr-core (hc) and sshd for the emulator tests, both from Nix; the core
+            # offers read-bounded and incarnation (nix/herdr-core's guarded-send patch).
             (pkgs.callPackage ./nix/herdr-core { src = herdr-core-src; })
             pkgs.openssh
             pkgs.coreutils
