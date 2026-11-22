@@ -33,7 +33,8 @@ public final class HostPickTest {
         String head = gta.substring(start, gta.indexOf("pendingShell.clear();", start));
         // A switch in flight keeps the pick instead of returning with nothing done.
         assertTrue(head.contains("hostPicks.keep(new HostPick(host.id, pane, picked, null));"));
-        assertEquals(4, count(gta, "runWaitingPick();"));
+        // Four ends of a switch, and the refused one (audit A3).
+        assertEquals(5, count(gta, "runWaitingPick();"));
         String pin = gta.substring(gta.indexOf("private void openPin(Pins.Pin pin)"), gta.indexOf("private volatile Pins.Pin pinAwaitingHello;"));
         assertTrue(pin.contains("hostPicks.keep(new HostPick(pin.profile, pin.key.address, true, pin));"));
         assertTrue(pin.contains("pinAwaitingHello = pin;"));

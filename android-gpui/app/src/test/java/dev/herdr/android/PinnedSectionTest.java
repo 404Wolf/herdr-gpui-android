@@ -164,7 +164,7 @@ public final class PinnedSectionTest {
         assertTrue(rail.contains("private void openPin(Pins.Pin pin)"));
         // Only a proven list (the poll's selected: ready, pane and boot known) updates pins.
         assertTrue(rail.contains("if (selected && current.ownList && pinsRail != null && current.machine != null) {"));
-        assertTrue(rail.contains("Pins.shared(this).observe(current.machine, current.panes);\n                            checkPinArrival(current);"));
+        assertTrue(rail.contains("Pins.shared(this).relabel(current.machine, names);\n                            checkPinArrival(current);"));
         // Opening refuses an ended pin and a reused address: verified against the list now.
         int open = rail.indexOf("private void openPin(Pins.Pin pin)");
         String body = rail.substring(open, rail.indexOf("closeRailDrawer();", open));
