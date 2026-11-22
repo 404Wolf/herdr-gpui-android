@@ -52,6 +52,12 @@ final class UsageTiming {
         return "usage.sheet " + what + " rows " + sinceOpenMs + " ms after open";
     }
 
+    /** ": the main thread took 600 ms to run it, drawing 40 ms"; the wait left out when unknown. */
+    static String onMain(long waitedMs, long drawingMs) {
+        return waitedMs >= 0 ? ": the main thread took " + waitedMs + " ms to run it, drawing " + drawingMs + " ms"
+                : ": drawing " + drawingMs + " ms";
+    }
+
     static void log(String line) {
         android.util.Log.i("herdr-ops", line);
     }
