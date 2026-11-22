@@ -29,6 +29,16 @@ public final class RailDragTest {
         assertEquals(0f, RailDrag.scrollStep(10, 0, edge, max), 0f);
     }
 
+    @Test public void aStillFingerAtAnEdgeKeepsScrollingAndTheTargetFollows() throws IOException {
+        // Audit t483: the finger was kept in content terms, so scrolling moved it out of the edge zone.
+        String drag = source("RailDrag");
+        assertTrue(drag.contains("viewY = e.getY() - scroll.getScrollY();"));
+        assertTrue(drag.contains("return scrollStep(viewY, scroll.getHeight(), dp(EDGE_DP), dp(MAX_SCROLL_DP));"));
+        assertTrue(drag.contains("show(dragging, viewY + scroll.getScrollY());"));
+        assertTrue(drag.contains("if (scroll.getScrollY() == before) { scrolling = false; return; }"));
+        assertFalse(drag.contains("lastY"));
+    }
+
     @Test public void aDropIsDrawnAtOnceAsTheCoreWritesIt() throws Exception {
         JSONObject order = new JSONObject("{\"repos\":[\"mono\"],\"projects\":{},\"groups\":[\"herdr\"],\"future\":1}");
         RailOrder.Move m = new RailOrder.Move("groups", "agents", "herdr", false, Arrays.asList("herdr", "agents"));
