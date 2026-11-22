@@ -166,7 +166,7 @@ public final class OfflineNeverDimsTest {
         // A shell never holds or replays input: only a Herdr pane is resumable.
         assertTrue(body(terminal, "resumable").contains("!shellMode()"));
         String reconnect = body(terminal, "reconnectCurrentHost");
-        String shellBranch = reconnect.substring(0, reconnect.indexOf("if (reconnectRunning) return;"));
+        String shellBranch = reconnect.substring(0, reconnect.indexOf("if (reconnectRunning) {"));
         assertTrue(shellBranch.contains("startShell();"));
         assertTrue(!shellBranch.contains("pendingInput") && !shellBranch.contains("holdUnsent"));
     }

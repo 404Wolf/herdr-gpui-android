@@ -457,7 +457,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         linkBadge.setPadding(dp(6), 0, dp(2), 0);
         linkBadge.setOnClickListener(v -> toggleLinkActions());
         linkBox.addView(linkBadge, new LinearLayout.LayoutParams(-2, -1));
-        linkPrimary = linkAction(v -> useLinkAction(this::reconnectCurrentHost));
+        linkPrimary = linkAction(v -> useLinkAction(this::reconnectByHand));
         linkBox.addView(linkPrimary, linkActionParams());
         linkHosts = linkAction(v -> useLinkAction(() -> startActivity(new android.content.Intent(this,
                 RemoteHostsActivity.class).putExtra("skip_reopen", true))));
@@ -836,6 +836,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (opening > 0) RemoteNative.close(opening);
     }
 
+    /** The indicator's Reconnect: a new epoch of attempts, the first at once. Main thread. */
+    private void reconnectByHand() {
+        if (monitor == null || shellMode()) {
+            reconnectCurrentHost();
+            return;
+        }
+        monitor.retry();
+        showLinkDown();
+    }
+
     /** After a stale attempt ends: try the computer picked now, if one is wanted. Main thread. */
     private void retryCurrentHost() {
         if (destroyed || !hostResumed || monitor == null || !monitor.reconnecting()) return;
@@ -851,8 +861,18 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             startShell();
             return;
         }
-        if (reconnectRunning) return;
+        if (reconnectRunning) {
+            // A newer attempt replaces one still running: the network came back while it
+            // hung on the dead path (factory-9zz.1). Its handle closes, so it ends at once,
+            // and whatever it returns is ignored by its sequence number.
+            long hanging = reconnectHandle;
+            reconnectHandle = 0;
+            if (hanging > 0) RemoteNative.close(hanging);
+            android.util.Log.i("herdr-reconnect", "attempt " + reconnectSeq + " replaced");
+        }
         reconnectRunning = true;
+        final int seq = ++reconnectSeq;
+        final long startedAt = SystemClock.uptimeMillis();
         final String id = currentHostId;
         final int epoch = hostEpoch.now();
         clearLinkProblem();
@@ -869,6 +889,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             if (host == null) {
                 runOnUiThread(() -> {
+                    if (seq != reconnectSeq) return;
                     reconnectRunning = false;
                     if (destroyed || !hostResumed) return;
                     // A lookup for a computer no longer picked must not stop the
@@ -895,17 +916,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), false);
                 if (handle <= 0) throw new IllegalStateException("connection refused");
                 reconnectHandle = handle;
+                // Replaced while it read the store (its handle was not yet there to close).
+                if (seq != reconnectSeq) throw new IllegalStateException("replaced");
                 // Paused before the handle was published: attach nothing.
                 if (!hostResumed) throw new IllegalStateException("left the screen");
                 // Another computer was picked meanwhile (it closed the handle if it saw it).
                 if (hostEpoch.stale(epoch)) throw new IllegalStateException("another computer was picked");
                 // The same computer again: back to its remembered terminal, not its Deacon.
-                String chosen = awaitHostPane(handle, host.id, null, false);
-                reconnectHandle = 0;
+                String chosen = awaitHostPane(handle, host.id, null, false, ReconnectPolicy.ATTEMPT_MS);
+                if (seq == reconnectSeq) reconnectHandle = 0;
+                android.util.Log.i("herdr-reconnect", "attempt " + seq + ": " + chosen + " ready "
+                        + (SystemClock.uptimeMillis() - startedAt) + " ms after it began" + sinceNetwork());
                 final long readyHandle = handle;
                 final String readyPane = chosen;
                 final SavedRemoteHost readyHost = host;
                 runOnUiThread(() -> {
+                    if (seq != reconnectSeq) {
+                        // Replaced meanwhile: the newer attempt is the one that adopts.
+                        RemoteNative.close(readyHandle);
+                        return;
+                    }
                     reconnectRunning = false;
                     if (!hostResumed) {
                         // Left the screen while connecting: onResume opens it again.
@@ -930,10 +960,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 });
                 handle = 0;
             } catch (Exception | LinkageError failure) {
-                reconnectHandle = 0;
+                if (seq == reconnectSeq) reconnectHandle = 0;
                 if (handle != 0) RemoteNative.close(handle);
-                android.util.Log.i("herdr-reconnect", "attempt failed: " + failure);
+                android.util.Log.i("herdr-reconnect", "attempt " + seq + " failed after "
+                        + (SystemClock.uptimeMillis() - startedAt) + " ms: " + failure);
                 runOnUiThread(() -> {
+                    // Replaced: the newer attempt reports for itself.
+                    if (seq != reconnectSeq) return;
                     reconnectRunning = false;
                     // Left the screen meanwhile: onResume reconnects; say nothing.
                     if (!hostResumed) return;
@@ -943,7 +976,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         return;
                     }
                     if (monitor != null) {
-                        // Keep trying, quickly, while the terminal is on screen.
+                        // Keep trying while the terminal is on screen and the epoch lasts.
                         monitor.failed();
                         showLinkDown();
                     } else showLinkProblem("Reconnect failed. Check the host and network.");
@@ -2029,7 +2062,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 handle = RemoteNative.connectGrid(host.connectionJson(), credential, terminalGrid(), false);
                 if (handle <= 0) throw new IllegalStateException("connection refused");
                 // Another computer: its live Deacon unless a terminal there was picked.
-                String chosen = awaitHostPane(handle, host.id, forcedPane, true);
+                String chosen = awaitHostPane(handle, host.id, forcedPane, true, MACHINE_SWITCH_READY_MS);
                 final long readyHandle = handle;
                 final String readyPane = chosen;
                 runOnUiThread(() -> {
@@ -2063,19 +2096,34 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * computer's live Deacon (FleetTree.switchLanding) unless a live terminal
      * there was named; with no Deacon, the usual choice below applies.
      */
-    private String awaitHostPane(long handle, String hostId, String forcedPane, boolean machineSwitch) throws Exception {
-        long until = SystemClock.uptimeMillis() + 45_000;
+    /** How long a machine switch waits for the new host's list, as before reconnects were bounded. */
+    private static final long MACHINE_SWITCH_READY_MS = 45_000;
+
+    /** " (the network came back N ms ago)", when it did while the terminal was on screen; else "". */
+    private String sinceNetwork() {
+        long arrived = monitor == null ? 0 : monitor.arrivedAt();
+        return arrived <= 0 ? "" : " (network back " + (SystemClock.uptimeMillis() - arrived) + " ms ago)";
+    }
+
+    private String awaitHostPane(long handle, String hostId, String forcedPane, boolean machineSwitch,
+            long readyWithinMs) throws Exception {
+        long until = SystemClock.uptimeMillis() + readyWithinMs;
         JSONObject state = null;
+        boolean listed = false;
         while (SystemClock.uptimeMillis() < until) {
             state = new JSONObject(RemoteNative.poll(handle, 0, false));
             String phase = state.optString("state");
-            if ("closed".equals(phase)) throw new IllegalStateException("closed");
+            // Why it closed (a timeout, a refusal, a host key), not only that it did.
+            if ("closed".equals(phase)) throw new IllegalStateException("closed: " + state.optString("status"));
             // The pane list arrives with the first snapshot; an empty array is
             // not readiness.
-            JSONArray listed = state.optJSONArray("panes");
-            if ("ready".equals(phase) || listed != null && listed.length() > 0) break;
+            JSONArray panes = state.optJSONArray("panes");
+            listed = "ready".equals(phase) || panes != null && panes.length() > 0;
+            if (listed) break;
             Thread.sleep(150);
         }
+        // Past its time a dead path holds up nothing: the caller closes the handle.
+        if (!listed) throw new IllegalStateException("no answer within " + readyWithinMs / 1000 + " s");
         // A Deacon may be known only by its space's name: give the spaces a moment.
         for (long spaces = SystemClock.uptimeMillis() + 1_500; machineSwitch && !FleetPanes.hasSpaces(state)
                 && SystemClock.uptimeMillis() < spaces; ) {
@@ -2520,8 +2568,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private volatile java.util.Map<String, HomeCache.Entry> fleetCache = java.util.Collections.emptyMap();
     /** The terminal has been on screen before (later resumes reopen the pane last shown). */
     private boolean openedOnce;
-    /** One reconnect at a time. Main thread. */
+    /** A reconnect is running: the one numbered {@link #reconnectSeq}. Main thread. */
     private boolean reconnectRunning;
+    /**
+     * The latest reconnect's number. A newer attempt replaces a running one; the older one's
+     * result is then ignored. Written on the main thread, read by attempts on the worker.
+     */
+    private volatile int reconnectSeq;
     /**
      * Which computer was picked last: an attempt (reconnect or switch) that
      * began before another pick is stale and must not adopt its host.
@@ -5861,6 +5914,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String signature = current.generation + "/" + pane + "/" + attach + "/" + painted + "/" + current.ready;
         current.attach = attach;
         current.painted = painted;
+        if (painted && current.ready && !current.paintLogged) {
+            // How long the way back took, for the device check (factory-9zz.1).
+            current.paintLogged = true;
+            android.util.Log.i("herdr-reconnect", "live: first paint of " + pane + sinceNetwork());
+        }
         if (transcripts != null && current.ready && painted && current.machine != null && current.transcripts) {
             // One bounded read at a time, off this thread: it returns at once.
             transcripts.tick(new TranscriptKeeper.Link(current.remoteHandle, current.generation, current.machine,
@@ -6202,7 +6260,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // Herdr in front is Wolf looking at it (item 71): the attach that follows says so.
         markUsed();
         if (monitor == null && !launch.shell) {
-            monitor = new ConnectionMonitor(this, main, this::autoReconnect, this::showLinkDown, this::networkGone);
+            monitor = new ConnectionMonitor(this, main, new ConnectionMonitor.Listener() {
+                @Override public void attempt() { autoReconnect(); }
+                @Override public void changed() { showLinkDown(); }
+                @Override public void gone() { networkGone(); }
+                @Override public void exhausted() { showLinkDown(); }
+            });
         }
         if (monitor != null) monitor.start();
         loadFleetCache();
@@ -7637,7 +7700,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     java.util.Locale.getDefault()) : null;
             boolean down = monitor != null && monitor.reconnecting();
             boolean noNetwork = monitor != null && monitor.offline();
-            look = LinkBadge.look(down, noNetwork, linkProblem, cachedHost != null, when, waiting);
+            boolean stopped = monitor != null && monitor.exhausted();
+            look = LinkBadge.look(down, noNetwork, stopped, linkProblem, cachedHost != null, when, waiting);
         }
         boolean changed = look.shown != linkLook.shown;
         linkLook = look;
@@ -8039,6 +8103,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         volatile long fastUntil;
         /** Milliseconds since the link last said anything, as the last poll saw it. */
         volatile long quietMs;
+        /** Its first paint was logged. Under stateLock. */
+        boolean paintLogged;
         volatile long renderedScroll;
         /** Last offset {@link #fetchRows} asked for and when, guarded by the connection. */
         long fetchedOffset = -1, fetchedAt;

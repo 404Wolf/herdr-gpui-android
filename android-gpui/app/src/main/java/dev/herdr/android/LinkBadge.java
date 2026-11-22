@@ -85,7 +85,26 @@ final class LinkBadge {
      * @param waiting held messages in the whole queue, every computer and pane
      */
     static Look look(boolean down, boolean noNetwork, String problem, boolean cached, String when, int waiting) {
+        return look(down, noNetwork, false, problem, cached, when, waiting);
+    }
+
+    /** What the indicator says once a network's reconnect attempts are spent. */
+    static final String STOPPED = "offline · tap to reconnect";
+
+    /**
+     * As {@link #look(boolean, boolean, String, boolean, String, int)}; {@code stopped}: the
+     * attempts of this network are spent, and nothing more runs until a network arrives or the
+     * user taps Reconnect, which the indicator says in place of the copy's age.
+     */
+    static Look look(boolean down, boolean noNetwork, boolean stopped, String problem, boolean cached, String when,
+            int waiting) {
         boolean failed = problem != null && !problem.isEmpty();
+        if (down && stopped) {
+            String said = "Offline. Stopped trying to reconnect for now; it tries again when a network arrives."
+                    + (cached && when != null ? " Showing the last saved screen, from " + when + "; it may be outdated."
+                    : "") + " Tap to reconnect or open the hosts.";
+            return new Look(true, STOPPED, said, Tone.WARN, failed ? problem : "Stopped trying to reconnect.", RECONNECT);
+        }
         if (!down && !failed && !cached) {
             if (waiting <= 0) return HIDDEN;
             // Live, with messages held somewhere: the count alone, and a tap opens the queue.
