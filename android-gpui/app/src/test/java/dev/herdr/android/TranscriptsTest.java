@@ -410,7 +410,10 @@ public final class TranscriptsTest {
         assertEquals(4 * OfflineBudget.GIB, phone.totalBytes);
         assertEquals(2560 * OfflineBudget.MIB, phone.transcriptBytes);
         assertEquals(512 * OfflineBudget.MIB, phone.paneBytes);
-        assertEquals(1024 * OfflineBudget.MIB, phone.refBytes);
+        // The sync engine's 64 MiB comes out of the referenced files' 1 GiB (factory-9zz.14); the total is unchanged.
+        assertEquals(960 * OfflineBudget.MIB, phone.refBytes);
+        assertEquals(64 * OfflineBudget.MIB, phone.syncBytes);
+        assertEquals(phone.totalBytes, phone.transcriptBytes + phone.paneBytes + phone.refBytes + phone.syncBytes);
         assertEquals(8 * OfflineBudget.GIB, phone.freeFloorBytes);
         // 20 GB free: 2 % of it.
         assertEquals((long) (20e9 * 0.02), OfflineBudget.forFree(20_000_000_000L).totalBytes);
