@@ -94,6 +94,7 @@ impl Harness {
         match kind {
             PromptKind::Claude => self == Self::Claude,
             PromptKind::Codex => self == Self::Codex,
+            PromptKind::Gemini => self == Self::Gemini,
             PromptKind::Other => true,
         }
     }
@@ -1021,8 +1022,8 @@ pub fn prompt_kind(name: &str) -> crate::Result<PromptKind> {
     match name {
         "claude" => Ok(PromptKind::Claude),
         "codex" => Ok(PromptKind::Codex),
-        // Gemini has no prompt kind yet (factory-setup.36 adds one): read from the screen alone.
-        "gemini" | "other" => Ok(PromptKind::Other),
+        "gemini" => Ok(PromptKind::Gemini),
+        "other" => Ok(PromptKind::Other),
         _ => Err(crate::Error::InvalidCommand),
     }
 }
