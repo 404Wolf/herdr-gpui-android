@@ -12,7 +12,6 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.FrameLayout;
 
 import java.util.Collections;
-import java.util.function.Consumer;
 
 /**
  * The divider between the terminal and the docked work panel (factory-9zz.9):
@@ -23,31 +22,41 @@ import java.util.function.Consumer;
  * strip at the right edge (excluded from Android's Back gesture) takes a drag
  * inward that grows the panel from zero with the finger, kept at the width it
  * is let go at. TalkBack gets Hide and Show actions.
+ *
+ * <p>On the cover the same right-edge strip pulls the full-page panel in under
+ * the finger ({@link Moves#cover}), and the release settles it full or gone
+ * ({@link Moves#coverSettled}). No handle is drawn anywhere (Wolf: edge swipes
+ * only); the strips are invisible and excluded from Back only along the edge.
  */
 final class PanelDivider {
-    static final int TOUCH_DP = 24, GRIP_W_DP = 4, GRIP_H_DP = 36, EDGE_GRIP_H_DP = 48;
+    static final int TOUCH_DP = 24, GRIP_W_DP = 4, GRIP_H_DP = 36;
+
+    /** What the divider and the edge strip report to the activity. */
+    interface Moves {
+        /** A release, a reveal or a TalkBack action: the docked split to keep. */
+        void chose(WorkPanelLayout.Choice next);
+        /** The docked share while a finger is down, at most once a frame; NaN: back to the kept one. */
+        void live(float share);
+        /** The cover: how much of the full page shows while a finger pulls it in. */
+        void cover(float visible);
+        /** The cover: the release settles the page open (full) or gone. */
+        void coverSettled(boolean open);
+    }
 
     private final Activity activity;
     private final FrameLayout divider, edge;
-    private final Consumer<WorkPanelLayout.Choice> chose;
-    /** The share while a finger moves it; NaN when the gesture ends without a choice. */
-    private final Consumer<Float> live;
+    private final Moves moves;
     private float pendingShare = Float.NaN;
-    private boolean framePosted, revealing;
+    private boolean framePosted, revealing, cover;
     private final View line, grip;
     private final int gripColor, lineColor, dragColor;
     private WorkPanelLayout.Choice choice = WorkPanelLayout.Choice.DEFAULT;
     private float share;
     private int widthPx, originPx;
 
-    /**
-     * {@code chose} gets Wolf's new choice on a release, a reveal or a TalkBack
-     * action; {@code live} the share while his finger is down (NaN: back to the kept one).
-     */
-    PanelDivider(Activity activity, GpuiChrome chrome, Consumer<WorkPanelLayout.Choice> chose, Consumer<Float> live) {
+    PanelDivider(Activity activity, GpuiChrome chrome, Moves moves) {
         this.activity = activity;
-        this.chose = chose;
-        this.live = live;
+        this.moves = moves;
         divider = new FrameLayout(activity);
         line = new View(activity);
         line.setBackgroundColor(chrome.outline);
@@ -60,13 +69,15 @@ final class PanelDivider {
         divider.addView(grip, new FrameLayout.LayoutParams(dp(GRIP_W_DP), dp(GRIP_H_DP), Gravity.CENTER));
         divider.setContentDescription("Work panel divider: drag to resize, or all the way right to hide");
         divider.setVisibility(View.GONE);
+        // Invisible: no handle or peek strip (Wolf, 11-22); the swipe itself is the way in.
         edge = new FrameLayout(activity);
-        // Hidden, a visible handle at the right edge says the swipe is there (review P0-3).
-        edge.addView(pill(gripColor), new FrameLayout.LayoutParams(dp(GRIP_W_DP), dp(EDGE_GRIP_H_DP), Gravity.END | Gravity.CENTER_VERTICAL));
         edge.setContentDescription("Show the work panel");
         edge.setVisibility(View.GONE);
         // TalkBack's double-tap (a touch listener takes real taps first).
-        edge.setOnClickListener(v -> chose.accept(WorkPanelLayout.shownAgain(choice)));
+        edge.setOnClickListener(v -> {
+            if (cover) moves.coverSettled(true);
+            else moves.chose(WorkPanelLayout.shownAgain(choice));
+        });
         dragging();
         restoring();
         actions();
@@ -96,16 +107,36 @@ final class PanelDivider {
         framePosted = true;
         divider.postOnAnimation(() -> {
             framePosted = false;
-            if (!Float.isNaN(pendingShare)) live.accept(pendingShare);
+            if (Float.isNaN(pendingShare)) return;
+            if (cover) moves.cover(pendingShare);
+            else moves.live(pendingShare);
         });
+    }
+
+    /** The cover's pull is over: settled open or gone when it moved at all ({@code moved}). */
+    private void finishCover(boolean moved, boolean open) {
+        boolean was = revealing;
+        pendingShare = Float.NaN;
+        revealing = false;
+        if (moved || was) moves.coverSettled(open);
+    }
+
+    /** The finger's last horizontal speed, in dp/s (positive toward the right), and the tracker freed. */
+    private float velocityDp(android.view.VelocityTracker[] speed) {
+        if (speed[0] == null) return 0;
+        speed[0].computeCurrentVelocity(1000);
+        float vx = speed[0].getXVelocity() / density();
+        speed[0].recycle();
+        speed[0] = null;
+        return vx;
     }
 
     /** The gesture is over: no live share pending; {@code next} is kept, or null to fall back to the kept one. */
     private void finish(WorkPanelLayout.Choice next) {
         pendingShare = Float.NaN;
         revealing = false;
-        if (next != null) chose.accept(next);
-        else live.accept(Float.NaN);
+        if (next != null) moves.chose(next);
+        else moves.live(Float.NaN);
     }
 
     /**
@@ -130,7 +161,10 @@ final class PanelDivider {
             }
         }
         // A reveal in progress keeps its strip, so the gesture's own view never goes away under it.
-        edge.setVisibility(movable && layout.divider && (layout.hidden || revealing) ? View.VISIBLE : View.GONE);
+        // On the cover it is there while the page is away (and while it is being pulled in).
+        cover = layout.overlay;
+        boolean edgeShows = layout.divider ? layout.hidden || revealing : layout.overlay && (!layout.shown || revealing);
+        edge.setVisibility(movable && edgeShows ? View.VISIBLE : View.GONE);
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -168,10 +202,22 @@ final class PanelDivider {
     @SuppressLint("ClickableViewAccessibility")
     private void restoring() {
         float[] down = new float[2];
+        android.view.VelocityTracker[] speed = new android.view.VelocityTracker[1];
         edge.setOnTouchListener((v, e) -> {
             float xDp = (e.getRawX() - originPx) / density();
             int windowDp = Math.round(widthPx / density());
             float dx = (e.getRawX() - down[0]) / density(), dy = (e.getRawY() - down[1]) / density();
+            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                if (speed[0] != null) speed[0].recycle();
+                speed[0] = android.view.VelocityTracker.obtain();
+            }
+            if (speed[0] != null) {
+                // Raw coordinates: the strip itself does not move, but the page under the finger does.
+                MotionEvent raw = MotionEvent.obtain(e);
+                raw.setLocation(e.getRawX(), e.getRawY());
+                speed[0].addMovement(raw);
+                raw.recycle();
+            }
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     down[0] = e.getRawX();
@@ -179,21 +225,23 @@ final class PanelDivider {
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                     return true;
                 case MotionEvent.ACTION_MOVE:
-                    // Inward and mostly sideways: the panel grows from zero with the finger.
+                    // Inward and mostly sideways: the panel comes in from zero with the finger.
                     if (!revealing && !WorkPanelLayout.restores(dx, dy)) return true;
                     revealing = true;
-                    liveShare(WorkPanelLayout.dragged(WorkPanelLayout.snapped(xDp, windowDp), windowDp));
+                    liveShare(cover ? WorkPanelLayout.coverRevealed(xDp, windowDp)
+                            : WorkPanelLayout.dragged(WorkPanelLayout.snapped(xDp, windowDp), windowDp));
                     return true;
-                case MotionEvent.ACTION_UP:
-                    if (!revealing) {
-                        // A tap on the handle brings it back where it was.
-                        finish(Math.abs(dx) < 4 && Math.abs(dy) < 4 ? WorkPanelLayout.shownAgain(choice) : null);
-                        return true;
-                    }
-                    finish(WorkPanelLayout.revealed(WorkPanelLayout.snapped(xDp, windowDp), windowDp, share));
+                case MotionEvent.ACTION_UP: {
+                    float vx = velocityDp(speed);
+                    // A tap on the invisible strip does nothing (no handle to tap).
+                    if (!revealing) { finishCover(false, false); return true; }
+                    if (cover) finishCover(true, WorkPanelLayout.coverOpens(WorkPanelLayout.coverRevealed(xDp, windowDp), vx));
+                    else finish(WorkPanelLayout.revealed(WorkPanelLayout.snapped(xDp, windowDp), windowDp, share));
                     return true;
+                }
                 case MotionEvent.ACTION_CANCEL:
-                    finish(null);
+                    if (cover) finishCover(revealing, false);
+                    else finish(null);
                     return true;
                 default:
                     return true;
@@ -214,7 +262,7 @@ final class PanelDivider {
 
             @Override public boolean performAccessibilityAction(View host, int action, android.os.Bundle args) {
                 if (action == R.id.panel_hide_action) {
-                    chose.accept(new WorkPanelLayout.Choice(share, true));
+                    moves.chose(new WorkPanelLayout.Choice(share, true));
                     return true;
                 }
                 return super.performAccessibilityAction(host, action, args);

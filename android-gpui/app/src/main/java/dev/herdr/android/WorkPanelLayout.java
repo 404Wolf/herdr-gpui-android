@@ -12,7 +12,10 @@ package dev.herdr.android;
  * finger the whole way ({@link #live}), down to zero; released under
  * {@link #HIDE_BELOW_DP} it is hidden, else it stays exactly where it was
  * let go. Hidden, a drag in from the right edge grows it from zero with the
- * finger and keeps the width it is let go at. Pure: sizes in dp in, a layout out.
+ * finger and keeps the width it is let go at. On the cover there is no
+ * split: a pull in from the right edge brings the page in under the finger
+ * and it settles full or gone ({@link #coverOpens}); a drag or fling back
+ * toward the right sends it away. Pure: sizes in dp in, a layout out.
  */
 final class WorkPanelLayout {
     /** The app's top bar: the terminal's tab row and the panel's header are this tall, on one line (Wolf 11-22). */
@@ -157,6 +160,45 @@ final class WorkPanelLayout {
     /** An inward swipe from the right edge of {@code dxDp} (negative: leftward) brings a hidden panel back. */
     static boolean restores(float dxDp, float dyDp) {
         return dxDp <= -RESTORE_DP && Math.abs(dxDp) > Math.abs(dyDp) * 1.5f;
+    }
+
+    // ---- The cover (Wolf, 11-22): no split, a full page that follows the finger ----
+
+    /**
+     * A fling at least this fast (dp/s) decides on its own: toward the left
+     * opens the page, toward the right sends it away. Slower, the page settles
+     * on the side it is more than half on.
+     */
+    static final int COVER_FLING_DP_S = 600;
+    /** How long the page takes to settle full or away after the release. */
+    static final int COVER_SETTLE_MS = 180;
+
+    /** How much of the cover's page shows while a finger pulls it in from the right edge to {@code fingerXDp}. */
+    static float coverRevealed(float fingerXDp, int widthDp) {
+        if (widthDp <= 0) return 0;
+        return Math.max(0, Math.min(1, (widthDp - fingerXDp) / widthDp));
+    }
+
+    /** How much of the open page shows while a finger drags it {@code dxDp} toward the right. */
+    static float coverDismissing(float dxDp, int widthDp) {
+        if (widthDp <= 0) return 1;
+        return Math.max(0, Math.min(1, 1 - dxDp / widthDp));
+    }
+
+    /**
+     * Where a release leaves the cover's page: open (the full page) or off
+     * screen, from how much of it shows and the finger's speed ({@code vxDpS},
+     * positive toward the right). Never a partial page.
+     */
+    static boolean coverOpens(float visible, float vxDpS) {
+        if (vxDpS <= -COVER_FLING_DP_S) return true;
+        if (vxDpS >= COVER_FLING_DP_S) return false;
+        return visible >= 0.5f;
+    }
+
+    /** The page's offset from its open place, in px, while {@code visible} of it shows. */
+    static float coverOffset(float visible, int widthPx) {
+        return (1 - Math.max(0, Math.min(1, visible))) * widthPx;
     }
 
     /** The unfolded split: the panel takes the rail's room, so the rail is a drawer; a hidden panel gives it back. */

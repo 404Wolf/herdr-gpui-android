@@ -559,6 +559,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         filePager.setOnShownChanged(() -> {
             composer.setCovered(filePager.showingFile());
             refreshOffer();
+            // The viewer's own swipe owns the screen while it shows: the panel's edge strip steps aside.
+            applyWorkPanel();
         });
         column.addView(composer.field(), new FrameLayout.LayoutParams(-1, ComposerBar.FIELD_HEIGHT_PX,
                 android.view.Gravity.BOTTOM));
@@ -606,7 +608,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         workPanel = new WorkPanel(this, chrome, workPanelHost());
         root.addView(workPanel.view(), new FrameLayout.LayoutParams(0, -1, android.view.Gravity.END));
         workPanel.attach();
-        panelDivider = new PanelDivider(this, chrome, this::choosePanel, this::dragPanel);
+        panelDivider = new PanelDivider(this, chrome, new PanelDivider.Moves() {
+            @Override public void chose(WorkPanelLayout.Choice next) { choosePanel(next); }
+            @Override public void live(float share) { dragPanel(share); }
+            @Override public void cover(float visible) { coverDrag(visible); }
+            @Override public void coverSettled(boolean open) { coverSettle(open); }
+        });
         root.addView(panelDivider.divider(), new FrameLayout.LayoutParams(dp(PanelDivider.TOUCH_DP), -1, android.view.Gravity.START));
         root.addView(panelDivider.edge(), new FrameLayout.LayoutParams(dp(WorkPanelLayout.EDGE_DP), dp(WorkPanelLayout.EDGE_TALL_DP),
                 android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL));
@@ -1340,9 +1347,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int widthDp = getResources().getConfiguration().screenWidthDp;
         WorkPanelLayout.Choice choice = panelChoice();
         // A finger on the divider or the edge: the panel is exactly where it is, nothing kept yet.
-        WorkPanelLayout layout = Float.isNaN(panelLive) || shellMode() || widthDp < WorkPanelLayout.COVER_DP
-                ? WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen, choice) : WorkPanelLayout.live(widthDp, panelLive);
+        boolean cover = widthDp < WorkPanelLayout.COVER_DP;
+        boolean coverMoving = cover && !shellMode() && !Float.isNaN(coverLive);
+        WorkPanelLayout layout = Float.isNaN(panelLive) || shellMode() || cover
+                ? WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen || coverMoving, choice) : WorkPanelLayout.live(widthDp, panelLive);
         int rootWidth = root().getWidth();
+        // The cover's page follows the finger, then settles (coverSettle animates it); docked it never moves.
+        if (!coverSettling) {
+            float offset = coverMoving ? WorkPanelLayout.coverOffset(coverLive, rootWidth) : 0;
+            if (workPanel.view().getTranslationX() != offset) workPanel.view().setTranslationX(offset);
+        }
         // Docked, Wolf's divider sets the share (each side keeps its minimum: WorkPanelLayout.clamp).
         int width = layout.overlay ? -1 : Math.round(rootWidth * layout.share);
         FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) workPanel.view().getLayoutParams();
@@ -1357,7 +1371,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (panelDivider != null) {
             int[] origin = new int[2];
             root().getLocationOnScreen(origin);
-            panelDivider.place(!compactWindow(), layout, choice, rootWidth - (layout.shown ? width : 0), rootWidth, origin[0]);
+            panelDivider.place(filePager == null || !filePager.showingFile(), layout, choice,
+                    rootWidth - (layout.shown ? width : 0), rootWidth, origin[0]);
         }
         if (workButton != null) {
             workButton.setVisibility(layout.toggle ? View.VISIBLE : View.GONE);
@@ -1419,6 +1434,33 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private WorkPanelLayout.Choice panelChoice() {
         return WorkPanelLayout.Choice.parse(getSharedPreferences("terminal-display", MODE_PRIVATE).getString(panelChoiceKey(), ""));
+    }
+
+    /** The cover's page while a finger moves it: how much of it shows; NaN otherwise. */
+    private float coverLive = Float.NaN;
+    /** The page is animating to where the release left it: the layout leaves its offset alone. */
+    private boolean coverSettling;
+
+    /** The cover: the full page follows the finger (in from the right edge, or back toward it). */
+    private void coverDrag(float visible) {
+        coverLive = visible;
+        applyWorkPanel();
+    }
+
+    /** The cover: the release settles the page full or off screen, from where it is; no partial page. */
+    private void coverSettle(boolean open) {
+        if (workPanel == null) return;
+        if (Float.isNaN(coverLive)) coverLive = open ? 0 : 1;
+        View page = workPanel.view();
+        coverSettling = true;
+        page.animate().cancel();
+        page.animate().translationX(open ? 0 : root().getWidth()).setDuration(WorkPanelLayout.COVER_SETTLE_MS)
+                .withEndAction(() -> {
+                    coverSettling = false;
+                    coverLive = Float.NaN;
+                    page.setTranslationX(0);
+                    toggleWorkPanel(open);
+                }).start();
     }
 
     /** The panel's share while a finger drags it (PanelDivider, at most once a frame); NaN otherwise. */
@@ -1487,6 +1529,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             @Override public boolean typing() { return imeShown || (composer != null && composer.busy() != null); }
             @Override public void closed() { toggleWorkPanel(false); }
+            @Override public void coverDrag(float visible) { GpuiTerminalActivity.this.coverDrag(visible); }
+            @Override public void coverSettled(boolean open) { coverSettle(open); }
             @Override public void focus(String id) {
                 Connection now;
                 synchronized (stateLock) { now = connection; }

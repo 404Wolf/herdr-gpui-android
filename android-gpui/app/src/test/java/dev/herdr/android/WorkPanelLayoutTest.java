@@ -64,12 +64,12 @@ public final class WorkPanelLayoutTest {
         assertEquals(0.5f, WorkPanelLayout.released(WorkPanelLayout.snapped(FOLD / 2f - 9, FOLD), FOLD, 0.4f).share, 1e-6f);
     }
 
-    @Test public void theGripIsAVisiblePillAndTheHiddenPanelLeavesAHandle() throws IOException {
+    @Test public void theGripIsAVisiblePillAndTheEdgeDrawsNoHandle() throws IOException {
         String divider = new String(Files.readAllBytes(Paths.get("src/main/java/dev/herdr/android/PanelDivider.java")), StandardCharsets.UTF_8);
         assertEquals(4, PanelDivider.GRIP_W_DP);
         assertEquals(36, PanelDivider.GRIP_H_DP);
-        assertEquals(48, PanelDivider.EDGE_GRIP_H_DP);
-        assertTrue(divider.contains("edge.addView(pill(gripColor)"));
+        // No handle at the edge any more (Wolf: edge swipes only): the strip draws nothing.
+        assertFalse(divider.contains("edge.addView("));
         assertTrue(divider.contains("dragged(true);") && divider.contains("dragged(false);"));
     }
 
@@ -116,7 +116,7 @@ public final class WorkPanelLayoutTest {
         String gta = TerminalSource.text();
         assertTrue(gta.contains("\"work_panel_\" + (getResources().getConfiguration().orientation"));
         assertTrue(gta.contains("root().announceForAccessibility(next.hidden ? \"Work panel hidden\" : \"Work panel restored\");"));
-        assertTrue(gta.contains("new PanelDivider(this, chrome, this::choosePanel, this::dragPanel)"));
+        assertTrue(gta.contains("@Override public void live(float share) { dragPanel(share); }"));
         assertTrue(gta.contains(": WorkPanelLayout.live(widthDp, panelLive);"));
     }
 }
