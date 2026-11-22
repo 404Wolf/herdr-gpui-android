@@ -125,6 +125,7 @@ public final class GhostTextTest {
     @Test public void kindsTheRendererDoesNotKnowAreOther() {
         assertEquals("claude", GhostText.kind("claude"));
         assertEquals("codex", GhostText.kind("codex"));
+        assertEquals("gemini", GhostText.kind("gemini"));
         assertEquals("other", GhostText.kind("aider"));
         assertEquals("other", GhostText.kind(null));
     }

@@ -305,6 +305,10 @@ fn foreground_agent(terminal: &Value) -> Option<(u64, &str, PromptKind)> {
         PromptKind::Claude
     } else if agent.eq_ignore_ascii_case("codex") && matches(&["codex", "codex.exe"]) {
         PromptKind::Codex
+    } else if agent.eq_ignore_ascii_case("gemini") && matches(&["gemini", "gemini.exe", "node", "node.exe"]) {
+        // Gemini CLI is a Node program: its foreground process may be named `node`. The
+        // agent label must name Gemini, so a plain `node` never counts.
+        PromptKind::Gemini
     } else {
         return None;
     };
@@ -1333,6 +1337,20 @@ mod footer_tests {
         ] {
             state.observe_footer_foreground(Some(&report), at);
             assert_eq!(state.footer_kind(), PromptKind::Other);
+        }
+    }
+
+    /// Gemini CLI runs under Node: `gemini` or `node` count, only with Gemini's agent label.
+    #[test]
+    fn gemini_requires_its_agent_label_and_its_program_or_node() {
+        for program in ["gemini", "node"] {
+            let mut state = attached();
+            let at = confirm(&mut state, &terminal("gemini", program, 10), Instant::now());
+            assert_eq!(state.footer_kind(), PromptKind::Gemini, "{program}");
+            for report in [terminal("gemini", "nvim", 10), terminal("", "node", 10), terminal("claude", "node", 10)] {
+                state.observe_footer_foreground(Some(&report), at);
+                assert_eq!(state.footer_kind(), PromptKind::Other);
+            }
         }
     }
 }
