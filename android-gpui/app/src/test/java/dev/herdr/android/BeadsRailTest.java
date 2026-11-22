@@ -28,7 +28,7 @@ public final class BeadsRailTest {
     @Test public void backPopsTheBeadsLevelBeforeTheRailCloses() throws IOException {
         String rail = source("GpuiTerminalActivity");
         String back = section(rail, "public void onBackPressed()", "super.onBackPressed();");
-        assertTrue(back.indexOf("beadsRail.back()") < back.indexOf("hideSidebar()"));
+        assertTrue(back.indexOf("beadsRail.back()") < back.indexOf("if (filePager != null && filePager.hide())"));
         String edge = section(rail, "private void setEdgeBack(", "EdgeBack.unregister(");
         // The second callback: Back from anywhere but the left edge.
         String otherwise = edge.substring(edge.indexOf("}, () -> {"));
@@ -132,7 +132,7 @@ public final class BeadsRailTest {
 
     @Test public void theTapFocusesFirstThenShowsTheBeadFullyOpenAndSelectable() throws IOException {
         String rail = source("GpuiTerminalActivity");
-        String tap = section(rail, "holder.row.setOnClickListener(view -> {\n            if (holder.live) {", "holder.row.setOnLongClickListener(view -> { showPaneActions(holder)");
+        String tap = section(rail, "holder.row.setOnClickListener(view -> {\n            boolean bead = false;", "holder.row.setOnLongClickListener(view -> { showPaneActions(holder)");
         assertTrue(tap.indexOf("focusRemotePane(holder.connection, holder.paneId)") < tap.indexOf("beadsRail.tapped("));
         // The cover's drawer stays open on the bead (its terminal focused behind it); a drawer that closes
         // over it closes the bead, so reopened it shows the agents; Back from it is one step to the terminal.
@@ -142,9 +142,9 @@ public final class BeadsRailTest {
         String systemBack = section(rail, "public void onBackPressed()", "super.onBackPressed();");
         assertTrue(systemBack.indexOf("beadsRail.showingAgentsBead()") < systemBack.indexOf("beadsRail.back()"));
         String beads = source("BeadsRail");
-        String tapped = section(beads, "void tapped(", "/** detailId for an agent");
+        String tapped = section(beads, "boolean tapped(", "/** detailId for an agent");
         assertTrue(tapped.contains("!agent.isAgent()") && tapped.contains("\"pm\".equals(agent.role)"));
-        String open = section(beads, "void openFor(", "void tapped(");
+        String open = section(beads, "void openFor(", "boolean tapped(");
         assertTrue(open.contains("if (bead != null) showAll.add(bead);"));
         assertTrue(open.contains("if (bead != null) readDetail(bead);"));
         // Who works on it needs the stores: an agent's bead asks for them too, and says so while it waits.
