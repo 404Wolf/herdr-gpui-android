@@ -7147,7 +7147,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         return "";
     }
 
-    /** "claude" or "codex" for the pane on screen, from its agent.kind label. */
+    /** "claude", "codex" or "gemini" for the pane on screen, from its agent.kind label. */
     private static String agentKind(Connection current) {
         JSONArray panes = current.panes;
         for (int i = 0; panes != null && i < panes.length(); i++) {
@@ -7156,6 +7156,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             String kind = pane.optString("kind", "").toLowerCase(java.util.Locale.ROOT);
             if (kind.contains("claude")) return "claude";
             if (kind.contains("codex")) return "codex";
+            if (kind.contains("gemini")) return "gemini";
             return kind;
         }
         return "";

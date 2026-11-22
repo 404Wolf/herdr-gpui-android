@@ -42,6 +42,9 @@ pub fn cells(text: &str) -> usize {
 pub enum PromptKind {
     Claude,
     Codex,
+    /// Gemini CLI: ` > ` (`!` in shell mode, `*` in YOLO mode) one cell in, on a tinted
+    /// box between `▄` and `▀` rows, or between `─` rules where it cannot tint.
+    Gemini,
     #[default]
     Other,
 }
@@ -52,7 +55,37 @@ impl PromptKind {
             // Older Claude Code versions drew `>`.
             Self::Claude => &['❯', '>'],
             Self::Codex => &['›'],
+            Self::Gemini => &['>', '!', '*'],
             Self::Other => &[],
+        }
+    }
+
+    /// The column of the prompt's glyph: Gemini pads its box by one cell.
+    fn glyph_col(self) -> usize {
+        match self {
+            Self::Gemini => 1,
+            _ => 0,
+        }
+    }
+
+    /// Where wrapped input continues: two cells past the glyph's column.
+    fn indent(self) -> usize {
+        self.glyph_col() + 2
+    }
+
+    /// Whether the host's controls are set into a `─` rule under the prompt, like a box title
+    /// (Claude's frame). Codex and Gemini draw no such frame for them: their controls go bare,
+    /// spaced like their own key hints, at the right end of the prompt row.
+    fn ruled(self) -> bool {
+        !matches!(self, Self::Codex | Self::Gemini)
+    }
+
+    /// The host's own prompt glyph, for a draft drawn without the program's prompt.
+    fn host_glyph(self) -> &'static str {
+        match self {
+            Self::Codex => "›",
+            Self::Gemini => ">",
+            _ => "❯",
         }
     }
 }
@@ -220,22 +253,24 @@ pub fn locate(
     if glyphs.is_empty() || row >= rows.len() {
         return None;
     }
+    let (g, indent) = (kind.glyph_col(), kind.indent());
     for prompt_row in (row.saturating_sub(MAX_INPUT_ROWS)..=row).rev() {
         let cells = &rows[prompt_row];
         let at = |i: usize| cells.get(i).copied().unwrap_or(' ');
+        let pad = (0..g).all(|i| at(i).is_whitespace());
         // Claude Code follows its glyph with a no-break space (U+00A0), so
         // any whitespace counts, there and in the indent below.
-        if glyphs.contains(&at(0)) && at(1).is_whitespace() {
+        if pad && glyphs.contains(&at(g)) && at(g + 1).is_whitespace() {
             // The caret sits after the glyph, never on it.
-            return (prompt_row < row || col >= 2).then_some(Anchor {
+            return (prompt_row < row || col >= indent).then_some(Anchor {
                 prompt_row,
                 row,
                 col,
-                indent: 2,
+                indent,
             });
         }
         // Only wrapped input, indented under the prompt, lies between.
-        if !(at(0).is_whitespace() && at(1).is_whitespace()) {
+        if !(0..indent).all(|i| at(i).is_whitespace()) {
             return None;
         }
     }
@@ -554,8 +589,11 @@ fn free_tail(cells: &[char]) -> usize {
     cells.iter().rev().take_while(|c| c.is_whitespace()).count()
 }
 
-/// The controls as one line: ` a ─ b ─ c ──`, each control's cells marked.
-fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+/// The controls as one line: ` a ─ b ─ c ──` set into Claude's rule, each control's cells
+/// marked. Codex and Gemini draw no rule for them ([`PromptKind::ruled`]): the same cells,
+/// with blanks for the rule, so every slot stays where it is: `   a   b   c   `.
+fn control_line(controls: &[Control], kind: PromptKind) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+    let (between, end) = if kind.ruled() { (" ─ ", " ──") } else { ("   ", "   ") };
     let mut spans = Vec::new();
     let mut marks = Vec::new();
     let mut col = 0;
@@ -568,7 +606,7 @@ fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, us
     };
     for (i, control) in controls.iter().enumerate() {
         push(
-            if i == 0 { " " } else { " ─ " },
+            if i == 0 { " " } else { between },
             GhostStyle::Dim,
             &mut spans,
             &mut col,
@@ -580,7 +618,7 @@ fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, us
         marks.push((control.id.clone(), start, col));
     }
     if !controls.is_empty() {
-        push(" ──", GhostStyle::Dim, &mut spans, &mut col);
+        push(end, GhostStyle::Dim, &mut spans, &mut col);
     }
     (spans, marks)
 }
@@ -590,7 +628,11 @@ fn control_line(controls: &[Control]) -> (Vec<GhostSpan>, Vec<(String, usize, us
 /// decoration gives way first: the frame (` a ─ b ─ talk ──`), then the spaces between them;
 /// then "talk" is cut, to one cell at the least; then the queue's count ("≡12" to "≡"). Only on
 /// a grid too narrow even for `✕≡●` does the clear give way, then the queue; "talk" never.
-fn narrow_line(controls: &[Control], cols: usize) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
+fn narrow_line(
+    controls: &[Control],
+    cols: usize,
+    kind: PromptKind,
+) -> (Vec<GhostSpan>, Vec<(String, usize, usize)>) {
     let width = |c: &Control| -> usize { c.spans.iter().map(|s| cells(&s.text)).sum() };
     let Some(main) = controls
         .iter()
@@ -613,7 +655,7 @@ fn narrow_line(controls: &[Control], cols: usize) -> (Vec<GhostSpan>, Vec<(Strin
         if cols >= 8 && cols >= fixed + 2 {
             let mut line = others.clone();
             line.push(fit_control(main, cols - fixed));
-            return control_line(&line);
+            return control_line(&line, kind);
         }
         // Spaced, then tight.
         for (gap, least) in [(1, 2), (0, 1)] {
@@ -719,7 +761,7 @@ pub fn place_all(
         return Layout::default();
     }
     let width = |line: &[GhostSpan]| -> usize { line.iter().map(|s| cells(&s.text)).sum() };
-    let (mut line, mut marks) = control_line(&ghost.controls);
+    let (mut line, mut marks) = control_line(&ghost.controls, ghost.kind);
     let mut len = width(&line);
     // At the prompt the draft needs room beside the controls.
     let margin = if anchor.is_some() { 8 } else { 0 };
@@ -732,7 +774,7 @@ pub fn place_all(
         let lines: Vec<_> = ghost
             .rungs
             .iter()
-            .map(|rung| control_line(rung.as_slice()))
+            .map(|rung| control_line(rung.as_slice(), ghost.kind))
             .collect();
         let pick = lines
             .iter()
@@ -747,7 +789,7 @@ pub fn place_all(
     if len > 0 && !roomy {
         // The host's words are for a wider grid (it picks them from the last
         // layout hint, which lags a fold or a zoom): see [`narrow_line`].
-        (line, marks) = narrow_line(&ghost.controls, cols);
+        (line, marks) = narrow_line(&ghost.controls, cols, ghost.kind);
         len = width(&line);
     }
     let fits = len > 0 && len <= cols && marks.iter().any(|(_, start, end)| end > start);
@@ -755,7 +797,9 @@ pub fn place_all(
     // The row the controls go on, if any.
     let controls_row = match anchor {
         Some(anchor) if fits => {
-            let below = (anchor.row + 1..rows.min(anchor.row + 3)).find(|&r| rule(&screen[r]));
+            // Into Claude's rule under the prompt; Codex's and Gemini's go on the prompt row.
+            let below = (anchor.row + 1..rows.min(anchor.row + 3))
+                .find(|&r| ghost.kind.ruled() && rule(&screen[r]));
             Some(below.unwrap_or(anchor.row))
         }
         None if fits => previous
@@ -1005,7 +1049,7 @@ fn ghost_prompt(
         layout.placed.push(Placed {
             row,
             col: start,
-            text: "❯".to_owned(),
+            text: ghost.kind.host_glyph().to_owned(),
             style: GhostStyle::Text,
             source: None,
         });
@@ -1026,7 +1070,8 @@ fn ghost_prompt(
     // The rows the draft takes as it will be drawn, before the cap.
     let needed = wrap(&draft, 2, 2, &full).len().max(1);
     let lines = needed.min(GHOST_PROMPT_ROWS).min(free);
-    let ruled = free > lines;
+    // A rule above the host's prompt only in Claude's style.
+    let ruled = free > lines && ghost.kind.ruled();
     let top = bottom - lines;
     let first = if ruled { top - 1 } else { top };
     // The prompt's rows, blank on the program's background (they are blank there already).
@@ -1051,7 +1096,7 @@ fn ghost_prompt(
     layout.placed.push(Placed {
         row: top,
         col: 0,
-        text: "❯".to_owned(),
+        text: ghost.kind.host_glyph().to_owned(),
         style: GhostStyle::Text,
         source: None,
     });
@@ -1103,7 +1148,7 @@ fn row_actions(
         .iter()
         .filter(|rung| !rung.is_empty())
         .map(|rung| {
-            let (mut spans, marks) = control_line(rung);
+            let (mut spans, marks) = control_line(rung, ghost.kind);
             spans.pop(); // the line's closing rule: a row's actions end at the grid's edge
             (spans, marks)
         })
@@ -1674,7 +1719,11 @@ mod tests {
         let mut g = controls(ghost(vec![text(&"word ".repeat(8))]));
         g.kind = PromptKind::Codex;
         let layout = place_all(&g, anchor, &rows, None);
-        assert!(drawn(&layout, 1, 40).ends_with("send ──"));
+        // Codex draws no rules: its controls go bare, spaced like its own key hints (.23).
+        let row = drawn(&layout, 1, 40);
+        assert!(row.ends_with("type   talk   send"), "{row:?}");
+        assert!(!row.contains('─'), "{row:?}");
+        assert!(layout.placed.iter().all(|p| p.row != 3), "nothing over the footer text");
         let first_control = layout
             .controls
             .iter()
@@ -1689,6 +1738,81 @@ mod tests {
                 .filter(|p| p.row == 1 && p.style == GhostStyle::Text)
                 .all(|p| p.col + cells(&p.text) < first_control)
         );
+    }
+
+    /// Codex's controls keep the same cells as Claude's ruled line: no slot moves between skins.
+    #[test]
+    fn every_skin_puts_each_control_on_the_same_cells() {
+        let g = controls(ghost(vec![]));
+        let (claude, claude_marks) = control_line(&g.controls, PromptKind::Claude);
+        for kind in [PromptKind::Codex, PromptKind::Gemini] {
+            let (line, marks) = control_line(&g.controls, kind);
+            assert_eq!(marks, claude_marks, "{kind:?}");
+            let text: String = line.iter().map(|s| s.text.as_str()).collect();
+            let ruled: String = claude.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(cells(&text), cells(&ruled));
+            assert!(!text.contains('─'), "{kind:?}: {text:?}");
+        }
+    }
+
+    /// Gemini CLI's prompt (v0.70.0 InputPrompt): ` > ` one cell in, wrapped input under it at
+    /// column 3, inside a tinted box between `▄` and `▀` rows.
+    fn gemini_box(cols: usize) -> Vec<Vec<char>> {
+        let top = "▄".repeat(cols);
+        let bottom = "▀".repeat(cols);
+        screen(&["", &top, " > ", &bottom, " ~/w (main)   no sandbox   gemini-3-pro"], cols)
+    }
+
+    #[test]
+    fn geminis_caret_is_found_one_cell_in_and_its_wrapped_input_under_column_three() {
+        let rows = gemini_box(40);
+        let anchor = locate(&rows, Some((2, 3)), PromptKind::Gemini).expect("gemini's prompt");
+        assert_eq!((anchor.prompt_row, anchor.indent), (2, 3));
+        // Shell (`!`) and YOLO (`*`) modes keep the same shape.
+        for glyph in ["!", "*"] {
+            let rows = screen(&["", &format!(" {glyph} ls")], 40);
+            assert!(locate(&rows, Some((1, 5)), PromptKind::Gemini).is_some(), "{glyph}");
+        }
+        let wrapped = screen(&[" > first line", "   second line"], 40);
+        let anchor = locate(&wrapped, Some((1, 14)), PromptKind::Gemini).expect("wrapped");
+        assert_eq!(anchor.prompt_row, 0);
+        // The caret is never on the glyph or its pad.
+        assert!(locate(&rows, Some((2, 1)), PromptKind::Gemini).is_none());
+        // Claude's `❯`/`>` at column 0 is not Gemini's prompt, and Gemini's is not Claude's.
+        assert!(locate(&screen(&["> hi"], 40), Some((0, 4)), PromptKind::Gemini).is_none());
+        assert!(locate(&rows, Some((2, 3)), PromptKind::Claude).is_none());
+    }
+
+    #[test]
+    fn geminis_controls_go_bare_on_its_prompt_row_and_never_on_its_box_or_footer() {
+        let rows = gemini_box(48);
+        let anchor = locate(&rows, Some((2, 3)), PromptKind::Gemini);
+        let mut g = controls(ghost(vec![text("hello")]));
+        g.kind = PromptKind::Gemini;
+        let layout = place_all(&g, anchor, &rows, None);
+        assert!(layout.controls.iter().all(|c| c.row == 2), "{:?}", layout.controls);
+        let row = drawn(&layout, 2, 48);
+        assert!(row.ends_with("type   talk   send") && !row.contains('─'), "{row:?}");
+        assert!(layout.placed.iter().all(|p| p.row == 2), "nothing on the ▄/▀ rows or the footer");
+        assert!(layout.draft_shown);
+    }
+
+    #[test]
+    fn the_hosts_own_prompt_follows_the_skin() {
+        // No prompt on screen: the draft goes to the host's prompt, in the agent's style.
+        let rows = screen(&["output", "", "", "", ""], 40);
+        for (kind, glyph, ruled) in [
+            (PromptKind::Claude, "❯", true),
+            (PromptKind::Codex, "›", false),
+            (PromptKind::Gemini, ">", false),
+        ] {
+            let mut g = controls(ghost(vec![text("draft")]));
+            g.kind = kind;
+            let layout = place_all(&g, None, &rows, None);
+            assert!(layout.placed.iter().any(|p| p.text == glyph), "{kind:?}");
+            let rule = layout.placed.iter().any(|p| p.text.starts_with('─') && p.text.chars().all(|c| c == '─'));
+            assert_eq!(rule, ruled, "{kind:?}");
+        }
     }
 
     fn styled(t: &str, style: GhostStyle) -> GhostSpan {
@@ -2655,19 +2779,19 @@ mod tests {
             }
         }
         // The decoration goes first, then talk's words, then the queue's count.
-        let (line, marks) = narrow_line(&g.controls, 5);
+        let (line, marks) = narrow_line(&g.controls, 5, PromptKind::Claude);
         let drawn: String = line.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(drawn, "✕≡2●…");
         assert_eq!(marks.len(), 3);
         let mut big = g.clone();
         big.controls[2] = control("queue", "≡99+");
-        let (line, marks) = narrow_line(&big.controls, 5);
+        let (line, marks) = narrow_line(&big.controls, 5, PromptKind::Claude);
         let drawn: String = line.iter().map(|s| s.text.as_str()).collect();
         assert!(drawn.starts_with("✕≡●"), "the count gives way before a control: {drawn}");
         assert_eq!(drawn.chars().count(), 5);
         assert_eq!(marks.len(), 3);
         // Only under four cells does the clear give way, then the queue; the stop never.
-        let ids = |cols| -> Vec<String> { narrow_line(&g.controls, cols).1.into_iter().map(|m| m.0).collect() };
+        let ids = |cols| -> Vec<String> { narrow_line(&g.controls, cols, PromptKind::Claude).1.into_iter().map(|m| m.0).collect() };
         assert_eq!(ids(3), vec!["clear", "queue", "talk"]);
         assert_eq!(ids(2), vec!["queue", "talk"]);
         assert_eq!(ids(1), vec!["talk"]);
@@ -2841,7 +2965,7 @@ mod tests {
     #[test]
     fn wolf_ask4_the_slots_hold_down_to_the_barest_lines_width() {
         let barest = bar_ladder()[2].clone();
-        let (spans, _) = control_line(&barest);
+        let (spans, _) = control_line(&barest, PromptKind::Claude);
         let least: usize = spans.iter().map(|s| s.text.chars().count()).sum();
         for cols in least..=60 {
             let (rows, anchor) = claude_status_screen(cols);

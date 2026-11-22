@@ -79,7 +79,7 @@ fn detect(
             }
             anchor.row + 2
         }
-        PromptKind::Other => return None,
+        PromptKind::Gemini | PromptKind::Other => return None,
     };
     if start < screen.len().saturating_sub(FOOTER_ROWS) {
         return None;
@@ -98,7 +98,7 @@ fn detect(
             PromptKind::Codex => {
                 codex_status(text.trim(), end == first_end && shortcuts_at(end).is_some())
             }
-            PromptKind::Other => false,
+            PromptKind::Gemini | PromptKind::Other => false,
         };
         if matched {
             break;
@@ -138,7 +138,7 @@ fn detect(
                 end += 1;
             }
         }
-        PromptKind::Other => return None,
+        PromptKind::Gemini | PromptKind::Other => return None,
     }
     Some(start..end)
 }
