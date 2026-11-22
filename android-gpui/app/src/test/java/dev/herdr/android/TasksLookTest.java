@@ -43,11 +43,20 @@ public final class TasksLookTest {
         assertTrue(row.contains("PanelModel.toggle(id, kids, open, folded)"));
         assertEquals(12, WorkPanel.TASKS_SIDE_DP);
         assertTrue(panel.contains("body.setPadding(side, body.getPaddingTop(), side, body.getPaddingBottom());"));
-        // Dense: a 36 dp row with 4 dp above and below; the plan and "N closed" start at the title.
-        assertEquals(36, WorkPanel.TASK_ROW_DP);
-        assertEquals(4, WorkPanel.TASK_PAD_DP);
+        // Dense (Wolf: the gaps about 30% of before): a 24 dp row with 2 dp above and below,
+        // so a one-line title's gap to the next is about 6 dp, down from about 19.
+        assertEquals(24, WorkPanel.TASK_ROW_DP);
+        assertEquals(2, WorkPanel.TASK_PAD_DP);
         assertEquals(WorkPanel.MARK_DP + WorkPanel.MARK_GAP_DP, WorkPanel.TITLE_AT_DP);
         assertTrue(panel.contains("box.setPadding(dp(INDENT_DP * r.depth + TITLE_AT_DP)"));
+    }
+
+    @Test public void keptBeadsDrawFirstAndAnEmptyReadEndsTheSkeleton() throws IOException {
+        String panel = source("WorkPanel");
+        String tasks = panel.substring(panel.indexOf("private void tasks() {"), panel.indexOf("private View row(PanelModel.Row r) {"));
+        assertTrue(tasks.indexOf("useKeptStores();") < tasks.indexOf("BeadsModel.projectBeads(stores)"));
+        String sig = panel.substring(panel.indexOf("private String signature("), panel.indexOf("private void styleTab("));
+        assertTrue(sig.contains(".append(storesKeptAt).append('|').append(storesAt);"));
     }
 
     @Test public void loadingIsOneSkeletonNeverDots() throws IOException {
