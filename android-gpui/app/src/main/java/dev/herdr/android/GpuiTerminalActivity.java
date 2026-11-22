@@ -5910,6 +5910,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return RemoteNative.sessionAction(target.remoteHandle, read.toString());
         } catch (JSONException impossible) {
             return "{\"queued\":false}";
+        } catch (RuntimeException failed) {
+            // The session closed or is busy (RemoteError): a read that did not happen, never a
+            // crash of the thread asking (a background prefetch has no one to catch it).
+            String kind = RemoteError.kindOf(failed);
+            return "{\"queued\":false,\"error\":\"" + (kind.isEmpty() ? "failed" : kind) + "\"}";
         }
     }
 

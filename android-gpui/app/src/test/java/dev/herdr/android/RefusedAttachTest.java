@@ -18,4 +18,15 @@ public final class RefusedAttachTest {
         JSONObject bare = new JSONObject().put("refused", new JSONObject().put("terminal", "t1"));
         assertEquals("it gave no reason", HostLanding.refusedReason(bare, "t1"));
     }
+
+    @Test public void aFileReadOnAClosedSessionIsAnAnswerNotACrash() throws Exception {
+        // The phone crashed in prefetchRefs (11-22): sessionAction threw on a closed session
+        // inside the background prefetch, uncaught.
+        String gta = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                "src/main/java/dev/herdr/android/GpuiTerminalActivity.java")), java.nio.charset.StandardCharsets.UTF_8);
+        int read = gta.indexOf("private String readFile(Connection target, String terminal, String path, int limit) {");
+        int end = gta.indexOf("\n    }\n", read);
+        String body = gta.substring(read, end);
+        org.junit.Assert.assertTrue(body.contains("} catch (RuntimeException failed) {"));
+    }
 }
