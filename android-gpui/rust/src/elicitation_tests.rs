@@ -355,6 +355,10 @@ fn gemini_question_with_tabs() {
     assert_eq!(dialog.choices[0].description, "Relational database");
     // A pane the host knows as Claude or Codex never shows Gemini's dialog.
     assert_eq!(parse(&rows, PromptKind::Claude), None);
+    // A pane the host knows as Gemini (agent.kind) shows it, and never Claude's.
+    assert_eq!(parse(&rows, PromptKind::Gemini).map(|d| d.harness), Some(Harness::Gemini));
+    assert_eq!(parse(&screen(CLAUDE_Q1, &[]), PromptKind::Gemini), None);
+    assert_eq!(prompt_kind("gemini").ok(), Some(PromptKind::Gemini));
 }
 
 const GEMINI_MULTI: &str = "\
