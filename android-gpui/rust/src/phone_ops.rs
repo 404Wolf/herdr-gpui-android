@@ -39,6 +39,9 @@ exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 /// freshness marks under ~/.cache/herdr-beads).
 const STORES_SH: &str = include_str!("beads/stores.sh");
 const COMMENTS_SH: &str = include_str!("beads/comments.sh");
+/// The phone's own: DETAIL_SH then COMMENTS_SH in one exec (beads/read.sh), so a
+/// bead's plan and comments arrive together, and none is read for a bead with none.
+const READ_SH: &str = include_str!("beads/read.sh");
 /// The status doc read (that mod's doc.ts DOC_SH at 6046ee51): `~/deacon/work/<name>.md`
 /// with its mtime and checksum from that machine's own clock, or "same" when the
 /// phone's `key` still matches. Read-only; at most 200 kB of text.
@@ -80,6 +83,9 @@ pub(crate) enum PhoneOp {
     BeadsDetail { project: String, id: String, confirm: bool },
     /// One bead's comments (COMMENTS_SH), read when it is opened in Tasks.
     BeadsComments { project: String, id: String },
+    /// One bead's plan and comments together (READ_SH), for the Tasks tab:
+    /// one exec instead of two in a row; `confirm` as for BeadsDetail.
+    BeadsRead { project: String, id: String, confirm: bool },
     /// A status doc (DOC_SH): `name` is `_deacon`, `<project>` or
     /// `<project>/<agent>` under ~/deacon/work; `key` the `mtime:cksum` the
     /// phone already shows, so an unchanged doc comes back "same", without text.
@@ -123,6 +129,17 @@ impl PhoneOp {
                     _ => return None,
                 };
                 Some(Self::BeadsDetail { project, id, confirm })
+            }
+            "beads.read" => {
+                only(&["project", "id", "confirm"]).then_some(())?;
+                let project = value["project"].as_str().filter(|p| store_name(p))?.to_owned();
+                let id = value["id"].as_str().filter(|i| bead_id(i))?.to_owned();
+                let confirm = match &value["confirm"] {
+                    Value::Null => false,
+                    Value::Bool(b) => *b,
+                    _ => return None,
+                };
+                Some(Self::BeadsRead { project, id, confirm })
             }
             "beads.comments" => {
                 only(&["project", "id"]).then_some(())?;
@@ -189,6 +206,15 @@ impl PhoneOp {
                     argv.push(json!("confirm"));
                 }
                 let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                Ok(script_reply(&result)?.to_string())
+            }
+            Self::BeadsRead { project, id, confirm } => {
+                let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(READ_SH), json!(DETAIL_SH), json!(COMMENTS_SH)];
+                argv.extend([json!(STORE_ROOT), json!(REPOS_FILE), json!(project), json!(id)]);
+                if *confirm {
+                    argv.push(json!("confirm"));
+                }
+                let result = call("machine.exec", json!({"argv":argv,"timeout":15}))?;
                 Ok(script_reply(&result)?.to_string())
             }
             Self::BeadsComments { project, id } => {
@@ -666,6 +692,21 @@ mod tests {
             Ok(exec(0, ""))
         });
         assert_eq!(asked, vec![Some(json!("confirm"))]);
+        let mut both = Vec::new();
+        let _ = PhoneOp::BeadsRead { project: "factory".into(), id: "a-1".into(), confirm: true }.run(|_, params| {
+            both.push(params["argv"].clone());
+            Ok(exec(0, ""))
+        });
+        // One exec: the wrapper, then both vendored scripts as they are, then the store args and confirm.
+        assert_eq!(both.len(), 1);
+        assert_eq!((both[0][4].clone(), both[0][5].clone(), both[0][6].clone()), (json!(READ_SH), json!(DETAIL_SH), json!(COMMENTS_SH)));
+        assert_eq!(both[0].as_array().map(|a| a[7..].to_vec()), Some(vec![json!(STORE_ROOT), json!(REPOS_FILE), json!("factory"), json!("a-1"), json!("confirm")]));
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.read","project":"x","id":"x-1"}"#),
+            Some(PhoneOp::BeadsRead { project: "x".into(), id: "x-1".into(), confirm: false })
+        );
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.read","project":"../x","id":"x-1"}"#), None);
+        assert!(READ_SH.contains(r#"exec sh -c "$c" sh "$1" "$2" "$3" "$4""#) && !READ_SH.contains("rm "));
         let mut comments = Vec::new();
         let _ = PhoneOp::BeadsComments { project: "factory".into(), id: "a-1".into() }.run(|_, params| {
             comments.push(params["argv"].clone());
@@ -737,6 +778,7 @@ mod tests {
             r#"{"op":"beads.stores","known":[]}"#,
             r#"{"op":"beads.detail","project":"demo","id":"demo-1.2"}"#,
             r#"{"op":"beads.comments","project":"demo","id":"demo-1.2"}"#,
+            r#"{"op":"beads.read","project":"demo","id":"demo-1.2"}"#,
             r#"{"op":"doc.read","name":"factory/phone-rail"}"#,
             r#"{"op":"tab.detach","space":"s1","tab":"a","park":["t5"]}"#,
         ] {
