@@ -76,6 +76,9 @@ final class FleetPanes {
             m.name = label(pane, "name");
             m.task = label(pane, "task");
             m.helper = label(pane, "helper");
+            // The core's view calls it group; a raw terminal record, herdr.group.
+            String group = label(pane, "group");
+            m.group = FleetTree.groupName(group.isEmpty() ? label(pane, "herdr.group") : group);
             out.add(m);
         }
         AgentNames.disambiguate(out);

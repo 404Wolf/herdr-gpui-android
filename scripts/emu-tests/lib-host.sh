@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared setup for the emulator scripts here (toolbar.sh, railnav.sh, pinsui.sh, usage.sh), from pr48.sh: a scratch
+# Shared setup for the emulator scripts here (toolbar.sh, railnav.sh, pinsui.sh, usage.sh, groups.sh), from pr48.sh: a scratch
 # herdr-core and sshd from the android-emu shell in a short private directory, a provisioned host
 # "tbhost" at 10.0.2.2, and the device key created in the app and read back through its UI. The
 # sourcing script defines fixtures() (its terminals; $work/home is the scratch HOME) before
