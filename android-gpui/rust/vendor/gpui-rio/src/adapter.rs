@@ -190,6 +190,60 @@ macro_rules! __bind_gpui {
                 ) {
                     self.link_handler = Some(std::rc::Rc::new(handler));
                 }
+                /// Selects the word under `point` (a long press the host took: nothing of it
+                /// reached the program), and reports where the handles go.
+                pub fn select_word_at(&mut self, point: Point<Pixels>) -> Option<$crate::touch_select::Report> {
+                    let mut grid = self.session.grid().lock();
+                    let pos = self.position(point, &grid);
+                    let mut selection = Selection::new(SelectionType::Semantic, pos, Side::Left);
+                    selection.update(pos, Side::Right);
+                    grid.selection = Some(selection);
+                    drop(grid);
+                    self.selection_report()
+                }
+                /// Moves one end of the selection to the cell under `point`, keeping the
+                /// other where it is; either end may pass the other.
+                pub fn select_move(
+                    &mut self,
+                    handle: $crate::touch_select::Handle,
+                    point: Point<Pixels>,
+                ) -> Option<$crate::touch_select::Report> {
+                    let mut grid = self.session.grid().lock();
+                    let range = grid.selection.as_ref().and_then(|selection| selection.to_range(&*grid))?;
+                    let pos = self.position(point, &grid);
+                    let (anchor, anchor_side, moved_side) = match handle {
+                        $crate::touch_select::Handle::Start => (range.end, Side::Right, Side::Left),
+                        $crate::touch_select::Handle::End => (range.start, Side::Left, Side::Right),
+                    };
+                    let mut selection = Selection::new(SelectionType::Simple, anchor, anchor_side);
+                    selection.update(pos, moved_side);
+                    grid.selection = Some(selection);
+                    drop(grid);
+                    self.selection_report()
+                }
+                /// Drops the selection. True when there was one.
+                pub fn select_clear(&mut self) -> bool {
+                    self.session.grid().lock().selection.take().is_some()
+                }
+                /// The selection's handles and text, or None when nothing is selected.
+                pub fn selection_report(&self) -> Option<$crate::touch_select::Report> {
+                    let grid = self.session.grid().lock();
+                    let range = grid.selection.as_ref().and_then(|selection| selection.to_range(&*grid))?;
+                    let text = grid.selection_to_string().unwrap_or_default();
+                    let at = |pos: Pos, after: bool| -> Option<(f32, f32)> {
+                        let row = (0..self.rows.view_len()).find(|&r| self.rows.source(r) == Some(pos.row))?;
+                        let col = pos.col.0.checked_sub(self.first_column)? + usize::from(after);
+                        let x = f32::from(self.bounds.left()) + col as f32 * f32::from(self.cell.width);
+                        let y = f32::from(self.bounds.top()) + self.geometry.grid_top(row) + f32::from(self.cell.height);
+                        Some((x, y))
+                    };
+                    Some($crate::touch_select::Report {
+                        start: at(range.start, false),
+                        end: at(range.end, true),
+                        line_height: f32::from(self.cell.height),
+                        text: $crate::touch_select::bounded(text),
+                    })
+                }
                 /// Told what every lifted press did, once it was done: `Clicked` only
                 /// when the program was sent a click. A host that opens a keyboard on
                 /// a tap leaves it shut for a click. `stamp` is asked when a press

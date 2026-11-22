@@ -20,6 +20,7 @@ pub mod rows;
 mod session;
 #[doc(hidden)]
 pub mod tap;
+pub mod touch_select;
 
 pub use error::{Error, Result};
 pub use keys::{KeyPress, key_bytes};
