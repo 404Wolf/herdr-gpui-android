@@ -77,7 +77,7 @@ final class UsageView {
         LinearLayout sheet = new LinearLayout(activity);
         sheet.setOrientation(LinearLayout.VERTICAL);
         GradientDrawable shape = new GradientDrawable();
-        shape.setColor(chrome.surface);
+        shape.setColor(chrome.panel);
         float r = dp(16);
         shape.setCornerRadii(new float[] {r, r, r, r, 0, 0, 0, 0});
         sheet.setBackground(shape);
@@ -89,7 +89,7 @@ final class UsageView {
         android.widget.FrameLayout handle = new android.widget.FrameLayout(activity);
         View grip = new View(activity);
         GradientDrawable gripShape = new GradientDrawable();
-        gripShape.setColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x66));
+        gripShape.setColor(chrome.raised);
         gripShape.setCornerRadius(dp(2));
         grip.setBackground(gripShape);
         handle.addView(grip, new android.widget.FrameLayout.LayoutParams(dp(36), dp(4), Gravity.CENTER));
@@ -345,7 +345,7 @@ final class UsageView {
         Bar(float fill, int color) {
             super(activity);
             this.fill = fill;
-            track.setColor(GpuiChrome.withAlpha(chrome.onSurfaceVariant, 0x33));
+            track.setColor(chrome.raised);
             used.setColor(color);
             setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         }

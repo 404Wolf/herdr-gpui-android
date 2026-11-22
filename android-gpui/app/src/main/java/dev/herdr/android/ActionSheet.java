@@ -140,7 +140,7 @@ final class ActionSheet {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(0, 0, 0, dp(context, 6));
         GradientDrawable shape = new GradientDrawable();
-        shape.setColor(chrome.surface);
+        shape.setColor(chrome.panel);
         shape.setStroke(dp(context, 1), chrome.outline);
         shape.setCornerRadius(dp(context, 10));
         card.setBackground(shape);
@@ -167,7 +167,8 @@ final class ActionSheet {
     }
 
     static RippleDrawable ripple(GpuiChrome chrome) {
-        return new RippleDrawable(android.content.res.ColorStateList.valueOf(chrome.selected), null,
+        // A pressed row: the palette's hover fill (the selected container marks the row on screen).
+        return new RippleDrawable(android.content.res.ColorStateList.valueOf(chrome.hover), null,
                 new ColorDrawable(0xffffffff));
     }
 
