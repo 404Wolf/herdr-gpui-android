@@ -2208,6 +2208,8 @@ fn project(view: &mut Value, terminals: &Value, doc: &Value) -> Result<()> {
             // The repo a project sits under, when a label says so (item 61).
             "repo": label("repo").unwrap_or(""),
             "kind": kind.unwrap_or(""),
+            // Its hc name ("phone-rail"): what the phone's rows call it, never its id (factory-jmc).
+            "name": terminal["name"].as_str().filter(|n| !n.is_empty() && n.len() <= 128).unwrap_or(""),
             // The factory's join labels: the bead a worker is on, a helper's role (BeadsModel).
             "issue": label("issue").unwrap_or(""),
             "task": label("task").unwrap_or(""),
