@@ -311,7 +311,8 @@ fi
 kept=
 end=$((SECONDS + 60))
 while (( SECONDS < end )); do
-    kept=$(a shell "run-as $pkg sh -c 'cat no_backup/transcripts-v1/*/t*.txt 2>/dev/null'" 2> /dev/null | tr -d '\r')
+    # A transcript is a header (t*.head) beside its appended body (t*.body): header first.
+    kept=$(a shell "run-as $pkg sh -c 'cat no_backup/transcripts-v1/*/t*.head; echo; cat no_backup/transcripts-v1/*/t*.body' 2>/dev/null" 2> /dev/null | tr -d '\r')
     grep -q 'transcript line 299' <<< "$kept" && break
     sleep 3
 done
