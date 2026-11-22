@@ -126,6 +126,8 @@ public final class GhostTextTest {
         assertEquals("claude", GhostText.kind("claude"));
         assertEquals("codex", GhostText.kind("codex"));
         assertEquals("gemini", GhostText.kind("gemini"));
+        assertEquals("Antigravity's prompt box is Claude's shape", "claude", GhostText.kind("agy"));
+        assertEquals("claude", GhostText.kind("antigravity"));
         assertEquals("other", GhostText.kind("aider"));
         assertEquals("other", GhostText.kind(null));
     }

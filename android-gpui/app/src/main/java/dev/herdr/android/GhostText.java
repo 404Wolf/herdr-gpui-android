@@ -68,6 +68,9 @@ final class GhostText {
         if ("claude".equals(agent)) return "claude";
         if ("codex".equals(agent)) return "codex";
         if ("gemini".equals(agent)) return "gemini";
+        // Antigravity (agy) draws Claude's prompt box: a full-width rule above and below a
+        // `>` line at column 0 (agy 1.5.13, factory-t3p.1), so the controls go into its rule too.
+        if ("agy".equals(agent) || "antigravity".equals(agent)) return "claude";
         return "other";
     }
 
