@@ -141,7 +141,9 @@ public final class PinnedSectionTest {
                 StandardCharsets.UTF_8);
         assertTrue(rail.contains("tabRow.addView(pinsRail.button().view()"));
         assertTrue(rail.contains("pinsRail.button().extendTouch(crumb);"));
-        assertTrue(rail.contains("if (pinsRail != null) order.add(pinsRail.section(savedIds));"));
+        // Right under the machine chooser, the first host's row (Wolf, 9zz.10).
+        assertTrue(rail.contains("RailHostRow first = hosts.isEmpty() ? null : railHostRows.get(\"host:\" + hosts.get(0).id);"));
+        assertTrue(rail.contains("order.add(at + 1, pinsRail.section(savedIds));"));
         // Observed only from the proven list of the connection on screen, where seenLists is kept.
         int seen = rail.indexOf("seenLists.put(current.hostId");
         assertTrue(seen > 0 && rail.indexOf("Pins.shared(this).observe(current.machine, current.panes)", seen) - seen < 300);

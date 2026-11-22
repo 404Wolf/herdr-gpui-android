@@ -3428,8 +3428,6 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // seconds and replacing a view under a finger cancels its tap.
         java.util.List<View> order = new java.util.ArrayList<>();
         java.util.Set<String> keep = new java.util.HashSet<>();
-        // Pinned agents first, on any machine: the one-tap way to another machine's agent (factory-9zz.2).
-        if (pinsRail != null) order.add(pinsRail.section(savedIds));
         // The machine this terminal is on leads the rail; the others follow in
         // saved order, so the top of the rail always names where you are.
         java.util.List<SavedRemoteHost> hosts = new java.util.ArrayList<>(savedHosts);
@@ -3460,6 +3458,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }
             addHostRows(host, live, sample, workspaces, tabs, panes, current, order, keep);
             if (h + 1 < hosts.size()) order.add(railRule(host.id, keep));
+        }
+        // Pinned agents, on any machine, right under the machine chooser at the top (Wolf, 9zz.10):
+        // the one-tap way to another machine's agent (factory-9zz.2).
+        if (pinsRail != null) {
+            RailHostRow first = hosts.isEmpty() ? null : railHostRows.get("host:" + hosts.get(0).id);
+            int at = first == null ? -1 : order.indexOf(first.row);
+            order.add(at + 1, pinsRail.section(savedIds));
         }
         pruneRailRows(keep);
         commitRailOrder(order);
