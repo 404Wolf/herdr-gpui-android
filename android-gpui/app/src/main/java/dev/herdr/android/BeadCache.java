@@ -18,12 +18,21 @@ import java.util.Map;
  * The Tasks tab's last read of each bead (its plan and comments together, the
  * {@code beads.read} reply), kept in memory and on disk so a bead opens at
  * once, even after a restart, with how old the read is; the panel refreshes it
- * in the background. At most {@link #MAX} beads, each at most
- * {@link #MAX_CHARS}; the oldest go first. Only what the panel shows is kept.
+ * in the background. At most {@link #MAX} entries, a bead's at most
+ * {@link #MAX_CHARS} (a longer read keeps its plan and says its comments
+ * weren't kept) and a machine's stores listing at most {@link #MAX_LISTING_CHARS};
+ * the oldest go first. Only what the panel shows is kept.
  * Thread-safe: the panel's thread writes, the main thread reads.
  */
 final class BeadCache {
-    static final int MAX = 64, MAX_CHARS = 128 * 1024;
+    /**
+     * A real machine's listing is far over a bead's cap (server 173 KB, macro 674 KB on 11-22):
+     * under one cap for both, the listing was never kept and every first Tasks entry after a
+     * start waited on a cold read (factory-9zz.14).
+     */
+    static final int MAX = 64, MAX_CHARS = 128 * 1024, MAX_LISTING_CHARS = 4 * 1024 * 1024;
+    /** The most the file can hold: every bead at its cap, a few listings, UTF-8 and JSON escapes. */
+    static final long MAX_FILE_BYTES = ((long) MAX * MAX_CHARS + 4L * MAX_LISTING_CHARS) * 3;
     static final String FILE_NAME = "panel-beads.json";
 
     /** One kept read: the reply's text, when it was read (wall clock), and its store's fingerprint then. */
@@ -62,7 +71,7 @@ final class BeadCache {
     void load() {
         Map<String, Entry> read = new HashMap<>();
         try {
-            if (file.isFile() && file.length() <= (long) MAX * MAX_CHARS * 2) {
+            if (file.isFile() && file.length() <= MAX_FILE_BYTES) {
                 read = decode(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
             }
         } catch (IOException e) {
@@ -75,7 +84,8 @@ final class BeadCache {
 
     /** Keeps a read now, and writes the file atomically on {@code io}. */
     void put(String key, Entry entry, java.util.concurrent.Executor io) {
-        if (entry.text.length() > MAX_CHARS) return;
+        entry = bounded(key, entry);
+        if (entry == null) return;
         synchronized (this) {
             kept.put(key, entry);
             trim(kept);
@@ -95,6 +105,25 @@ final class BeadCache {
         } catch (IOException e) {
             // Kept in memory; the next read tries the disk again.
         }
+    }
+
+    /** Whether {@code key} is a machine's stores listing (see {@link #storesKey}). */
+    static boolean isListing(String key) {
+        return key.endsWith("\nstores\n");
+    }
+
+    /**
+     * {@code entry} as it may be kept: a listing whole up to its cap; a bead over its cap keeps
+     * its plan (comments say they weren't kept), so it is not dropped and read again every tick.
+     * Null when even that is over the cap.
+     */
+    static Entry bounded(String key, Entry entry) {
+        int cap = isListing(key) ? MAX_LISTING_CHARS : MAX_CHARS;
+        if (entry.text.length() <= cap) return entry;
+        if (isListing(key)) return null;
+        int split = entry.text.indexOf("\u0007\n");
+        String plan = split < 0 ? entry.text : entry.text.substring(0, split);
+        return plan.length() <= cap ? new Entry(plan, entry.atMs, entry.fp) : null;
     }
 
     static void trim(Map<String, Entry> kept) {
@@ -132,7 +161,7 @@ final class BeadCache {
                 if (e == null || key.split("\n", -1).length != 3) continue;
                 String t = e.optString("text", "");
                 long at = e.optLong("at", 0);
-                if (t.isEmpty() || t.length() > MAX_CHARS || at <= 0) continue;
+                if (t.isEmpty() || t.length() > (isListing(key) ? MAX_LISTING_CHARS : MAX_CHARS) || at <= 0) continue;
                 out.put(key, new Entry(t, at, e.optString("fp", "")));
             }
         } catch (JSONException e) {
