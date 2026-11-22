@@ -117,6 +117,11 @@ final class Pins {
                     asOfMs, pinnedMs);
         }
 
+        Pin labelled(String name) {
+            return new Pin(key, incarnation, seenIncarnation, profile, session, name, machineName, seen, status,
+                    asOfMs, pinnedMs);
+        }
+
         Pin opened() {
             return new Pin(key, seenIncarnation != null ? seenIncarnation : incarnation, seenIncarnation, profile,
                     session, label, machineName, seen, status, asOfMs, pinnedMs);
@@ -276,6 +281,25 @@ final class Pins {
             // pin says changed (after a restart it may show an older, never a newer, time).
             if (!same(pin, next)) changed = true;
             pins.set(i, next);
+        }
+        if (changed) save();
+    }
+
+    /**
+     * The live machine's agents by address and the names their rows show now (AgentNames): a
+     * pin's stored label follows, so a pin made under an old name (a deacon once shown by its
+     * conversation's title) reads right on every machine. Only listed pins of {@code machine}.
+     */
+    synchronized void relabel(MachineKey machine, java.util.Map<String, String> names) {
+        if (!loaded || machine == null || names == null) return;
+        boolean changed = false;
+        for (int i = 0; i < pins.size(); i++) {
+            Pin pin = pins.get(i);
+            if (!pin.key.machine.equals(machine) || pin.ended()) continue;
+            String name = names.get(pin.key.address);
+            if (name == null || name.isEmpty() || AgentNames.UNNAMED.equals(name) || name.equals(pin.label)) continue;
+            pins.set(i, pin.labelled(name));
+            changed = true;
         }
         if (changed) save();
     }

@@ -3670,6 +3670,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (live) {
             // With the factory's issue/task/helper labels, so agents join their beads.
             railMembers = BeadsModel.terms(workspaces, tabs, panes);
+            MachineKey machine = current == null ? null : current.machine;
+            if (machine != null && current.ownList) {
+                java.util.Map<String, String> names = new java.util.HashMap<>();
+                for (FleetTree.Member m : railMembers) if (!AgentNames.unnamed(m)) names.put(m.id, AgentNames.of(m));
+                Pins.shared(this).relabel(machine, names);
+            }
         }
         if (live && current != null) maybeRailGitLook(host, current, members);
         FleetTree.Fleet fleet = FleetTree.build(members, FleetPanes.LOOKS.get(host.id));
@@ -4116,8 +4122,47 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             closeRailDrawer();
             return;
         }
-        note(pin.label.isEmpty() ? "That pin is on " + pin.machineName + ": open it there for now"
-                : pin.label + " is on " + pin.machineName + ": open it there for now");
+        // Another machine's pin (Wolf: macro's deacon pin "never loads"; it only said "open it there").
+        // Its profile is a hint; the machine that profile is bound to decides, and the terminal is
+        // checked again on arrival (pinArriving), never another one in its place.
+        SavedRemoteHost host = pinHost(pin);
+        if (host == null) {
+            note((pin.label.isEmpty() ? "That pin" : pin.label) + " is on " + pin.machineName
+                    + ", which this phone has no confirmed profile for");
+            return;
+        }
+        switchHost(host, pin.key.address);
+        // Only a switch that started waits for its list (one already under way keeps its own target).
+        pinArriving = switchingHost && host.id.equals(switchingTo) ? pin : null;
+        closeRailDrawer();
+    }
+
+    /** A pin opened on another machine, to verify against that machine's first own list. */
+    private volatile Pins.Pin pinArriving;
+
+    /** The saved profile bound to the pin's machine (the pin's own profile first), or null. */
+    private SavedRemoteHost pinHost(Pins.Pin pin) {
+        if (bindings == null) return null;
+        SavedRemoteHost found = null;
+        for (SavedRemoteHost h : savedHosts) {
+            if (!pin.key.machine.equals(bindings.machine(h.id, h.connectionRevision))) continue;
+            if (h.id.equals(pin.profile)) return h;
+            if (found == null) found = h;
+        }
+        return found;
+    }
+
+    /** Poll thread, under stateLock: the first own list of the machine a pin was opened on. */
+    private void checkPinArrival(Connection current) {
+        Pins.Pin pin = pinArriving;
+        if (pin == null || current.machine == null || !pin.key.machine.equals(current.machine)) return;
+        pinArriving = null;
+        Pins.Verify verdict = Pins.verify(pin.key, current.remoteBoot, current.fingerprint, current.panes);
+        main.post(() -> {
+            if (destroyed) return;
+            if (verdict == Pins.Verify.GO) Pins.shared(this).opened(pin.key);
+            else note(PinsRail.refusal(verdict, pin));
+        });
     }
 
     /** The live machine's members as the rail last read them, with their names and labels (AgentNames). */
@@ -7803,7 +7848,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                     current.title = state.optString("title", current.hostName);
                     if (current.hostId != null && current.panes != null && current.workspaces != null) {
                         seenLists.put(current.hostId, new JSONArray[] {current.workspaces, current.tabs, current.panes});
-                        if (selected && current.ownList && pinsRail != null && current.machine != null) Pins.shared(this).observe(current.machine, current.panes);
+                        if (selected && current.ownList && pinsRail != null && current.machine != null) {
+                            Pins.shared(this).observe(current.machine, current.panes);
+                            checkPinArrival(current);
+                        }
                     }
                 }
                 // Reset for the daemon-confirmed pane, not a queued focus or

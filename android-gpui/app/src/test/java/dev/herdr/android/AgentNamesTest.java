@@ -29,6 +29,17 @@ public final class AgentNamesTest {
         return m;
     }
 
+    @Test public void aDeaconIsCalledDeaconNotItsConversationsTitle() {
+        // macro's deacon t1b6 (11-22): no hc name, role=deacon, Codex's title "Restart stuck Herdr agents | deacon".
+        FleetTree.Member m = agent("t1b6", "", "", "", "Restart stuck Herdr agents | deacon");
+        m.role = "deacon";
+        assertEquals("deacon", AgentNames.of(m));
+        m.name = "server-deacon";
+        assertEquals("its own hc name still wins", "server-deacon", AgentNames.of(m));
+        FleetTree.Member worker = agent("t3x9", "", "", "", "Restart stuck Herdr agents");
+        assertEquals("a worker without a name still falls back to its title", "Restart stuck Herdr agents", AgentNames.of(worker));
+    }
+
     @Test public void aRowIsItsShortNameNeverItsId() {
         assertEquals("phone-rail", AgentNames.of(agent("t3qx", "phone-rail", "phone-rail", "", "Phone-rail lane B")));
         // No name: the task label, as written.

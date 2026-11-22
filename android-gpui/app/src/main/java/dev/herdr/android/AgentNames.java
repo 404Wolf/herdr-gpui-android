@@ -10,7 +10,8 @@ import java.util.regex.Pattern;
  *
  * <p>The first of these that is not an alias: a helper's own purpose (its
  * helper= role and its task, "design-review: right-panel"); the terminal's
- * name ("phone-rail"); its task= label; its title. Else "no task label",
+ * name ("phone-rail"); a deacon's role ("deacon"); its task= label;
+ * its title (never for a deacon). Else "no task label",
  * drawn dim: a name is never invented. An alias is an address or short id
  * ("t3xz", "server/t1z", "ab12"), as the desktop's agents.ts reads it.
  */
@@ -54,6 +55,11 @@ final class AgentNames {
             boolean usableTask = !task.isEmpty() && !alias(task) && !beadId(task);
             return usableTask ? helper + ": " + task : helper;
         }
+        // A deacon is known by its role, never by its harness's conversation title (Wolf:
+        // macro's deacon showed as "Restart stuck Herdr agents"). Its own hc name still wins.
+        String own = m.name == null ? "" : m.name.trim();
+        boolean ownName = !own.isEmpty() && !alias(own) && !beadId(own) && !harness(own);
+        if (!ownName && "deacon".equals(m.role)) return "deacon";
         for (String candidate : new String[] {m.name, task, m.title}) {
             if (candidate == null) continue;
             String c = candidate.trim();
