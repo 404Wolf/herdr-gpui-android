@@ -215,7 +215,10 @@ final class ActionBar {
         b.setImageResource(icon(item));
         b.setScaleType(android.widget.ImageView.ScaleType.CENTER);
         boolean recording = "talk".equals(item.id) && icon(item) == R.drawable.ic_act_stop;
-        int tint = recording ? 0xFFFFFFFF : "send".equals(item.id) ? chrome.onSurface
+        // Wolf: a slot with nothing to do keeps its solid grey button and draws its icon light
+        // grey (never a see-through button); Clear with something to clear is pale yellow.
+        boolean idle = DISABLED.equals(item.style);
+        int tint = recording ? 0xFFFFFFFF : idle ? chrome.onSurfaceVariant : "send".equals(item.id) ? chrome.onSurface
                 : ControlLine.CANCEL.equals(item.id) || "warn".equals(item.style) ? chrome.warning : chrome.onSurface;
         b.setImageTintList(android.content.res.ColorStateList.valueOf(tint));
         // A 40 dp visual inside the 48 dp target; opaque, so it reads over the panel's text.
@@ -228,10 +231,7 @@ final class ActionBar {
         android.graphics.drawable.InsetDrawable visual = new android.graphics.drawable.InsetDrawable(shape, inset);
         b.setBackground(new android.graphics.drawable.RippleDrawable(
                 android.content.res.ColorStateList.valueOf(GpuiChrome.withAlpha(chrome.onSurface, 0x33)), visual, null));
-        if (DISABLED.equals(item.style)) {
-            b.setEnabled(false);
-            b.setAlpha(0.38f);
-        }
+        if (idle) b.setEnabled(false);
         b.setContentDescription(act.describe(item.id));
         if (android.os.Build.VERSION.SDK_INT >= 26) b.setTooltipText(item.label);
         b.setOnClickListener(v -> act.tap(item.id));

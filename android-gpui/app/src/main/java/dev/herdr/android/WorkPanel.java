@@ -166,7 +166,10 @@ final class WorkPanel {
         age = ActionSheet.label(activity, "", 12, chrome.onSurfaceVariant);
         age.setSingleLine(true);
         age.setVisibility(View.GONE);
-        tabs.addView(age, new LinearLayout.LayoutParams(-2, -2));
+        // "updated …" to the pin's glyph: the same small gap as the pin to the ⋮ (Wolf 11-22).
+        LinearLayout.LayoutParams ageAt = new LinearLayout.LayoutParams(-2, -2);
+        ageAt.setMarginEnd(dp(PinButton.GLYPH_GAP_DP - (PinButton.WIDTH_DP - 20) / 2));
+        tabs.addView(age, ageAt);
         close = ActionSheet.label(activity, "×", 20, chrome.onSurfaceVariant);
         close.setGravity(Gravity.CENTER);
         close.setBackground(ActionSheet.ripple(chrome));
