@@ -825,12 +825,12 @@ final class FleetTree {
     /** The Deacon's and a PM's fold column ({@link RailDisclosure}): a 48dp touch target. */
     static final int PM_CHEVRON_DP = 48;
     /**
-     * Row heights, tighter as Wolf's OLED preview has them: a Deacon or PM row
-     * is 40dp and an agent's 32dp. Each whole row (full height and width) is
+     * Row heights, tighter as Wolf's OLED preview has them, and a little
+     * tighter again (Wolf, 11-22): a Deacon or PM row is 36dp and an agent's 30dp. Each whole row (full height and width) is
      * its own tap target, so no row needs a TouchDelegate reaching into its
      * neighbours; the lead's fold button is the row's height and 48dp wide.
      */
-    static final int LEAD_ROW_DP = 40, AGENT_ROW_DP = 32;
+    static final int LEAD_ROW_DP = 36, AGENT_ROW_DP = 30;
 
     /**
      * What a screen reader hears for a lead row's fold control, or null when

@@ -31,7 +31,7 @@ final class PinnedSection {
     /** The machine tag's length: a compact name, cut with "…". */
     static final int MACHINE_CHARS = 12;
     /** As tight as the rail's lead rows (Wolf's OLED preview); the whole row is the tap target. */
-    static final int ROW_DP = 40;
+    static final int ROW_DP = FleetTree.LEAD_ROW_DP;
 
     /** One drawn row. */
     static final class Row {
