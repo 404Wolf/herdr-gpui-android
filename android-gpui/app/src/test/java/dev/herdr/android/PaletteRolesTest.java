@@ -24,6 +24,10 @@ public final class PaletteRolesTest {
         assertTrue(sheet.contains("shape.setColor(chrome.panel);"));
         assertTrue(sheet.contains("ColorStateList.valueOf(chrome.hover)"));
         assertTrue(read("PinnedSection").contains("row.setBackgroundColor(chrome.selected);"));
+        // The window chip on screen: the selected container with the surface's text, not the accent.
+        String gta = read("GpuiTerminalActivity");
+        assertTrue(gta.contains("shape.setColor(active ? chrome.selected : chrome.background);"));
+        assertTrue(gta.contains("chip.setTextColor(idle && !active ? chrome.onSurfaceVariant : chrome.onSurface);"));
         // No hand-mixed tints left for these surfaces.
         assertFalse(usage.contains("withAlpha(chrome.onSurfaceVariant, 0x33)"));
         assertFalse(panel.contains("withAlpha(chrome.onSurfaceVariant, 0x33)"));
