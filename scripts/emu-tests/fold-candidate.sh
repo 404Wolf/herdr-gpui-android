@@ -90,13 +90,21 @@ FOLDABLE=0
 [[ "${EMU_DEVICE:-}" == *fold* ]] && FOLDABLE=1
 posture() { # unfolded|cover
     if (( FOLDABLE )); then
-        local want=2076x2152 now
-        [[ $1 == cover ]] && want=1080x2424
-        if [[ $1 == cover ]]; then a emu fold > /dev/null; else a emu unfold > /dev/null; fi
-        quiet 6
+        local want=2076x2152 angle=180 now how i
+        [[ $1 == cover ]] && want=1080x2424 angle=0
+        # The hinge as a person moves it: the console's fold, then its hinge sensor. Each answer
+        # goes to postures-log.txt, since a refused fold once looked like a posture bug.
+        for how in "emu $([[ $1 == cover ]] && echo fold || echo unfold)" "emu sensor set hinge-angle0 $angle"; do
+            echo "posture $1: adb $how -> $(a $how 2>&1 | tr -d '\r' | tr '\n' ' ')" >> "$EMU_OUT/postures-log.txt"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                now=$(a shell wm size 2> /dev/null | tr -d '\r' | tail -1 | sed 's/.*: //')
+                [[ $now == "$want" ]] && break 2
+                sleep 1
+            done
+        done
+        quiet 5
         # A hinge with no device states folds nothing: fail loudly, not as a wrong-posture pass.
-        now=$(a shell wm size 2> /dev/null | tr -d '\r' | tail -1 | sed 's/.*: //')
-        [[ $now == "$want" ]] || { record fold-hinge FAIL "asked for $1, the display is $now ($(a shell cmd device_state print-state 2> /dev/null | tr -d '\r'))"; exit 1; }
+        [[ $now == "$want" ]] || { shot "fold-hinge-$1"; record fold-hinge FAIL "asked for $1, the display is $now (state $(a shell cmd device_state print-state 2> /dev/null | tr -d '\r'), $(a emu sensor get hinge-angle0 2>&1 | tr -d '\r' | head -1))"; exit 1; }
     elif [[ $1 == cover ]]; then size 1080x2400
     else size 2076x2152
     fi
@@ -129,6 +137,8 @@ back_closes_menus() { a shell input keyevent KEYCODE_BACK; quiet 2; front; }
 go_to() { # name (the PM's row is its project's: "Open demo")
     front
     pane_now "$1" && return 0
+    # Its tab when the space's tab row shows it; else the rail.
+    if tap_ui "^Window [0-9]+, $1," 3 > /dev/null; then quiet 4; pane_now "$1" && return 0; fi
     local row="Focus pane $1|^$1|, $1"
     [[ $1 == demo-pm ]] && row='^Open demo'
     tap_ui 'Show the host and workspace sidebar|Show it in the rail' 15 > /dev/null || true
@@ -249,6 +259,8 @@ if [[ -n "$task" ]] && a shell am task resize "$task" 0 0 1400 2000 > /dev/null 
 else
     record narrow-splits INFO "this guest could not narrow the window (no freeform resize); not checked"
 fi
+a shell settings put global enable_freeform_support 0 > /dev/null 2>&1
+a shell settings put global force_resizable_activities 0 > /dev/null 2>&1
 open_pm > /dev/null 2>&1 || true
 
 # ---- fold transitions in one live session (Wolf's spec, 11-23), on the emulated hinge ----
