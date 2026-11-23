@@ -123,6 +123,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean hostStarted;
     /** The keyboard was showing at the last insets; its showing is a use (item 71). */
     private boolean imeShown;
+    /** The bottom inset the root is laid out with (bars, cutout and keyboard), px: the cluster rides from it. */
+    private int laidOutBottom;
+    /** The composer's icon cluster (ActionBar) as the root holds it. */
+    private View clusterView;
     /** The window's size in dp when last configured: a fold or turn changes it (item 71). */
     private final int[] screenDp = new int[2];
     private volatile boolean hostResumed;
@@ -417,11 +421,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 android.graphics.Insets bounds = insets.getInsets(WindowInsets.Type.systemBars()
                         | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
                 view.setPadding(bounds.left, bounds.top, bounds.right, bounds.bottom);
+                laidOutBottom = bounds.bottom;
                 boolean ime = insets.isVisible(WindowInsets.Type.ime());
                 if (!ime && imeShown) keyboardRaisedByApp = false;   // put away: the next one is the user's
                 if (ime && !imeShown) markUsed();
                 imeShown = ime;
                 if (composer != null) composer.imeVisible(ime);
+                applyKeyboardCluster();
             } else {
                 // Pre-R edge-to-edge uses adjustResize for IME and stable bars for our padding.
                 view.setPadding(insets.getStableInsetLeft(), insets.getStableInsetTop(),
@@ -563,6 +569,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 toggleWorkPanel(true);
             }
             composer.setCovered(filePager.showingFile());
+            applyKeyboardCluster();
             refreshOffer();
             // The viewer's own swipe owns the screen while it shows: the panel's edge strip steps aside.
             applyWorkPanel();
@@ -629,7 +636,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         FrameLayout.LayoutParams clusterAt = new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.BOTTOM | android.view.Gravity.END);
         clusterAt.setMargins(0, 0, dp(ActionBar.MARGIN_DP), dp(ActionBar.MARGIN_DP));
         root.addView(actionBar, clusterAt);
+        clusterView = actionBar;
         root.getViewTreeObserver().addOnGlobalLayoutListener(() -> fitAroundCluster(actionBar));
+        if (Build.VERSION.SDK_INT >= 30) rideKeyboard(root, actionBar);
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> { if (r - l != or - ol) v.post(this::applyWorkPanel); });
         // Select and copy in the terminal: its handles live over everything else (factory-9zz.4).
         selection = new TerminalSelection(this, root, surface, new TerminalSelection.Host() {
@@ -1335,6 +1344,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         terminalContent.removeView(shortcutBar);
         shortcutBar = createShortcutBar();
         terminalContent.addView(shortcutBar, index, new LinearLayout.LayoutParams(-1, dp(48)));
+        applyKeyboardCluster();
     }
 
     /** Actions a compact toolbar keeps out of view, with the labels the wide one tooltips. */
@@ -1522,13 +1532,59 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         boolean overPanel = workPanel != null && workPanel.view().getVisibility() == View.VISIBLE
                 && cluster.getLeft() >= workPanel.view().getLeft();
         if (workPanel != null) workPanel.clearCluster(overPanel && shows ? cluster : null);
-        int below = shows && !overPanel ? cluster.getHeight() + dp(ActionBar.MARGIN_DP) : 0;
+        boolean overlay = keyboardOverlay();
+        int below = shows && !overPanel ? KeyboardCluster.belowTerminal(overlay,
+                cluster.getHeight() + dp(ActionBar.MARGIN_DP), overlay ? composer.promptFooterPx() : Float.NaN) : 0;
         View content = terminalColumn == null || terminalColumn.getChildCount() == 0 ? null : terminalColumn.getChildAt(0);
         if (content == null) return;
         FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) content.getLayoutParams();
         if (at.bottomMargin == below) return;
         at.bottomMargin = below;
         content.setLayoutParams(at);
+    }
+
+    /** The keyboard is up on an agent's pane: the cluster overlays the session (KeyboardCluster). */
+    private boolean keyboardOverlay() {
+        return composer != null && KeyboardCluster.overlay(imeShown, composer.agentPane(),
+                filePager != null && filePager.showingFile());
+    }
+
+    /**
+     * With the keyboard up on an agent's pane the bottom toolbar steps aside and the cluster sits
+     * over the session just above the keyboard (Wolf 11-23); the terminal is lifted only to keep
+     * the prompt's row clear of it. Main thread.
+     */
+    private void applyKeyboardCluster() {
+        if (shortcutBar == null || composer == null) return;
+        boolean shown = KeyboardCluster.toolbarShown(imeShown, composer.agentPane(),
+                filePager != null && filePager.showingFile());
+        int visibility = shown ? View.VISIBLE : View.GONE;
+        if (shortcutBar.getVisibility() != visibility) shortcutBar.setVisibility(visibility);
+        if (clusterView != null) fitAroundCluster(clusterView);
+    }
+
+    /** While the keyboard moves, the cluster stays on its top edge (it is laid out for where it ends). */
+    @android.annotation.TargetApi(30)
+    private void rideKeyboard(View root, View cluster) {
+        root.setWindowInsetsAnimationCallback(new android.view.WindowInsetsAnimation.Callback(
+                android.view.WindowInsetsAnimation.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+            @Override public WindowInsets onProgress(WindowInsets insets,
+                    java.util.List<android.view.WindowInsetsAnimation> running) {
+                boolean keyboard = false;
+                for (android.view.WindowInsetsAnimation a : running) {
+                    if ((a.getTypeMask() & WindowInsets.Type.ime()) != 0) keyboard = true;
+                }
+                if (!keyboard) return insets;
+                float now = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
+                        | WindowInsets.Type.ime()).bottom;
+                cluster.setTranslationY(KeyboardCluster.ride(laidOutBottom, now));
+                return insets;
+            }
+
+            @Override public void onEnd(android.view.WindowInsetsAnimation animation) {
+                cluster.setTranslationY(0);
+            }
+        });
     }
 
     /**
@@ -4205,6 +4261,9 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 queueComposerInput("{\"type\":\"keys\",\"keys\":[\"enter\"]}");
             }
 
+            @Override public void promptMoved() {
+                applyKeyboardCluster();
+            }
             @Override public boolean flushHeld() {
                 return GpuiTerminalActivity.this.flushHeld();
             }

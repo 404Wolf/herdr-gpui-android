@@ -76,6 +76,8 @@ final class ComposerBar {
         void enterKey();
         /** Types this pane's held messages now, oldest first, each once; false when none is held here. */
         default boolean flushHeld() { return false; }
+        /** The renderer laid the prompt out again (its rows may have moved). */
+        default void promptMoved() { }
         /** Hides the on-screen keyboard, whichever view owns it. */
         void hideKeyboard();
         /** Scrolls the pane back to its live bottom, if it is scrolled into history. */
@@ -585,6 +587,7 @@ final class ComposerBar {
         ClusterPlacement.Hint hint = ClusterPlacement.Hint.parse(json);
         if (hint == null) return;
         layout = hint;
+        host.promptMoved();
         // A selected row scrolled out of the drawn rows: its actions are nowhere to tap.
         if (selectedRow != null && !drawnRow(hint, selectedRow)) selectedRow = null;
         place();
@@ -747,6 +750,7 @@ final class ComposerBar {
         agent = isAgent(kind);
         if (!agent && typing) stopTyping();
         apply();
+        host.promptMoved();
     }
 
     /**
@@ -901,6 +905,24 @@ final class ComposerBar {
 
     /** Whether the keyboard is up, typing into the draft. */
     boolean typing() { return typing; }
+
+    /** Whether the pane on screen is an agent's (its composer, not a shell's key bar). */
+    boolean agentPane() { return agent; }
+
+    /**
+     * How far the bottom of the prompt's last row (the draft's, else the prompt's first) is above
+     * the terminal surface's bottom, in pixels; NaN before the renderer's first layout hint.
+     */
+    float promptFooterPx() {
+        View surface = host.surface();
+        if (layout == null || surface == null || surface.getHeight() <= 0) return Float.NaN;
+        // The prompt's first row, its caret row, and every row the draft is drawn on.
+        int last = layout.guard;
+        if (layout.targetsTop < layout.rows) last = Math.max(last, layout.targetsTop);
+        for (int[] span : layout.draftSpans) if (span.length > 0) last = Math.max(last, span[0]);
+        last = Math.min(last, Math.max(0, layout.rows - 1));
+        return surface.getHeight() - layout.rows().bottom(last) * density;
+    }
 
     /** Our own Shift+Enter newline is being inserted: it is not a typed Enter. */
     private boolean insertingNewline;
