@@ -37,6 +37,9 @@ BD
         > "$EMU_OUT/hc-lobby.log" 2>&1 || return 1
 }
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# lib-host.sh moves HOME to a scratch home; the emulator console's auth token is in this one, and
+# without it every `adb emu` command answers "KO: unknown command".
+console_home=$HOME
 # shellcheck source=lib-host.sh
 . "$here/lib-host.sh"
 
@@ -95,7 +98,7 @@ posture() { # unfolded|cover
         # The hinge as a person moves it: the console's fold, then its hinge sensor. Each answer
         # goes to postures-log.txt, since a refused fold once looked like a posture bug.
         for how in "emu $([[ $1 == cover ]] && echo fold || echo unfold)" "emu sensor set hinge-angle0 $angle"; do
-            echo "posture $1: adb $how -> $(a $how 2>&1 | tr -d '\r' | tr '\n' ' ')" >> "$EMU_OUT/postures-log.txt"
+            echo "posture $1: adb $how -> $(HOME=$console_home a $how 2>&1 | tr -d '\r' | tr '\n' ' ')" >> "$EMU_OUT/postures-log.txt"
             for i in 1 2 3 4 5 6 7 8 9 10; do
                 now=$(a shell wm size 2> /dev/null | tr -d '\r' | tail -1 | sed 's/.*: //')
                 [[ $now == "$want" ]] && break 2
@@ -104,7 +107,7 @@ posture() { # unfolded|cover
         done
         quiet 5
         # A hinge with no device states folds nothing: fail loudly, not as a wrong-posture pass.
-        [[ $now == "$want" ]] || { shot "fold-hinge-$1"; record fold-hinge FAIL "asked for $1, the display is $now (state $(a shell cmd device_state print-state 2> /dev/null | tr -d '\r'), $(a emu sensor get hinge-angle0 2>&1 | tr -d '\r' | head -1))"; exit 1; }
+        [[ $now == "$want" ]] || { shot "fold-hinge-$1"; record fold-hinge FAIL "asked for $1, the display is $now (state $(a shell cmd device_state print-state 2> /dev/null | tr -d '\r'), $(HOME=$console_home a emu sensor get hinge-angle0 2>&1 | tr -d '\r' | head -1))"; exit 1; }
     elif [[ $1 == cover ]]; then size 1080x2400
     else size 2076x2152
     fi
