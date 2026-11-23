@@ -118,4 +118,27 @@ public final class FoldEdgeTest {
         // The emulator's qualification reads each posture's inputs from the log.
         assertTrue(gta.contains("\"work panel: \""));
     }
+    @Test public void theCoverAndTheUnfoldedScreenKeepTheirOwnSplit() throws IOException {
+        // Cover and unfolded portrait shared 'work_panel_port': a state kept on the cover could
+        // reach the unfolded screen. Each posture has its own key now; the old keys stay the
+        // unfolded screen's, so Wolf's saved width carries over there and only there.
+        assertEquals("work_panel_port", WorkPanelLayout.choiceKey(false, false));
+        assertEquals("work_panel_land", WorkPanelLayout.choiceKey(false, true));
+        assertEquals("work_panel_cover_port", WorkPanelLayout.choiceKey(true, false));
+        assertEquals("work_panel_cover_land", WorkPanelLayout.choiceKey(true, true));
+        java.util.Map<String, String> prefs = new java.util.HashMap<>();
+        prefs.put("work_panel_port", "0.400");
+        prefs.put(WorkPanelLayout.choiceKey(true, false), "hidden:0.000");
+        // The full page open on the cover...
+        WorkPanelLayout cover = WorkPanelLayout.of(COVER, true, false, true,
+                WorkPanelLayout.Choice.parse(prefs.get(WorkPanelLayout.choiceKey(true, false))));
+        assertTrue(cover.overlay && cover.shown);
+        // ...then unfolded: a normal split at the unfolded screen's own saved width.
+        WorkPanelLayout open = WorkPanelLayout.of(UNFOLDED, false, false, true,
+                WorkPanelLayout.Choice.parse(prefs.get(WorkPanelLayout.choiceKey(false, false))));
+        assertFalse(open.overlay);
+        assertTrue(open.shown && open.divider);
+        assertEquals(0.4f, open.share, 1e-6f);
+        assertTrue(source("GpuiTerminalActivity").contains("WorkPanelLayout.choiceKey(coverPosture(),"));
+    }
 }
