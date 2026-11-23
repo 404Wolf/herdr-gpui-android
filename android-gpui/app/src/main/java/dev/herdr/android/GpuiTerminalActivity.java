@@ -786,26 +786,35 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         railScrim.setVisibility(drawer && sidebarOpen ? View.VISIBLE : View.GONE);
         // An open drawer is the only thing Back closes here; otherwise Back leaves the terminal.
         backOwner.setOwned(drawer && sidebarOpen);
-        setEdgeBack(!sidebarOpen);
+        // On unless the drawer is open (BackOwner closes it): a docked rail keeps the right edge's reveal.
+        setEdgeBack(!(drawer && sidebarOpen));
     }
 
     /**
      * The system takes every left-edge swipe for Back and ignores exclusion
      * requests (d62d747), so the drawer gesture rides on Back itself: Android
      * 14's BackEvent says which edge the swipe came from. Left edge opens the
-     * rail; anything else leaves the terminal as Back always did.
+     * rail (when it is closed); the right edge's lower half brings a hidden
+     * work panel in under the finger (panelEdgeStarted); anything else leaves
+     * the terminal as Back always did.
      */
     private void setEdgeBack(boolean wanted) {
         if (Build.VERSION.SDK_INT < 34 || wanted == (edgeBack != null)) return;
         if (wanted) {
-            edgeBack = EdgeBack.register(this, () -> {
-                if (composer != null && composer.hideKeyboard()) return;
-                if (workPanelBack()) return;
-                if (shellMode()) leaveByBack(); else showRailOverlay();
-            }, () -> {
+            Runnable back = () -> {
                 if (composer != null && composer.hideKeyboard()) return;
                 if (workPanelBack()) return;
                 if (filePager == null || !filePager.back()) leaveByBack();
+            };
+            edgeBack = EdgeBack.register(this, () -> {
+                if (sidebarOpen) { back.run(); return; }
+                if (composer != null && composer.hideKeyboard()) return;
+                if (workPanelBack()) return;
+                if (shellMode()) leaveByBack(); else showRailOverlay();
+            }, back, new EdgeBack.Right() {
+                @Override public boolean started(float x, float y) { return panelEdgeStarted(x, y); }
+                @Override public void moved(float x) { panelEdgeMoved(x); }
+                @Override public void ended(float x, boolean invoked) { panelEdgeEnded(x, invoked); }
             });
         } else {
             EdgeBack.unregister(this, edgeBack);
@@ -821,17 +830,40 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     @android.annotation.TargetApi(34)
     private static final class EdgeBack {
-        static Object register(android.app.Activity activity, Runnable leftEdge, Runnable otherwise) {
+        /** The right edge's swipe, when it is the panel's: taken at its start, then followed to its end. */
+        interface Right {
+            boolean started(float x, float y);
+            void moved(float x);
+            void ended(float x, boolean invoked);
+        }
+
+        static Object register(android.app.Activity activity, Runnable leftEdge, Runnable otherwise, Right right) {
             android.window.OnBackAnimationCallback callback = new android.window.OnBackAnimationCallback() {
-                private boolean fromLeft;
+                private boolean fromLeft, toPanel;
+                private float lastX;
                 @Override public void onBackStarted(android.window.BackEvent event) {
                     fromLeft = event.getSwipeEdge() == android.window.BackEvent.EDGE_LEFT;
+                    lastX = event.getTouchX();
+                    toPanel = event.getSwipeEdge() == android.window.BackEvent.EDGE_RIGHT
+                            && right.started(event.getTouchX(), event.getTouchY());
                 }
-                @Override public void onBackCancelled() { fromLeft = false; }
-                @Override public void onBackInvoked() {
-                    boolean left = fromLeft;
+                @Override public void onBackProgressed(android.window.BackEvent event) {
+                    if (!toPanel) return;
+                    lastX = event.getTouchX();
+                    right.moved(lastX);
+                }
+                @Override public void onBackCancelled() {
                     fromLeft = false;
-                    (left ? leftEdge : otherwise).run();
+                    // Let go short of Back: the panel still keeps where it was let go (or hides at the edge).
+                    if (toPanel) right.ended(lastX, false);
+                    toPanel = false;
+                }
+                @Override public void onBackInvoked() {
+                    boolean left = fromLeft, panel = toPanel;
+                    fromLeft = false;
+                    toPanel = false;
+                    if (panel) right.ended(lastX, true);
+                    else (left ? leftEdge : otherwise).run();
                 }
             };
             activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
@@ -1330,14 +1362,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         // it too, for TalkBack and anyone the gesture doesn't suit, on the unfolded screen as on
         // the cover: a panel hidden there always has a visible way back (11-23).
         if (!shellMode()) {
-            boolean cover = getResources().getConfiguration().screenWidthDp < WorkPanelLayout.COVER_DP;
+            boolean cover = coverPosture();
             boolean panelShown = cover ? workPanelOpen : !panelChoice().hidden;
             menu.getMenu().add(0, 9, MoreMenu.USAGE, panelShown ? "Hide overview and tasks" : "Overview and tasks");
         }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
             if (item.getItemId() == 9) {
-                if (getResources().getConfiguration().screenWidthDp < WorkPanelLayout.COVER_DP) toggleWorkPanel(!workPanelOpen);
+                if (coverPosture()) toggleWorkPanel(!workPanelOpen);
                 else choosePanel(WorkPanelLayout.toggled(panelChoice()));
             }
             else if (item.getItemId() == 8) showUsage();
@@ -1369,10 +1401,11 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         int widthDp = getResources().getConfiguration().screenWidthDp;
         WorkPanelLayout.Choice choice = panelChoice();
         // A finger on the divider or the edge: the panel is exactly where it is, nothing kept yet.
-        boolean cover = widthDp < WorkPanelLayout.COVER_DP;
+        boolean cover = coverPosture();
         boolean coverMoving = cover && !shellMode() && !Float.isNaN(coverLive);
         WorkPanelLayout layout = Float.isNaN(panelLive) || shellMode() || cover
-                ? WorkPanelLayout.of(widthDp, shellMode(), workPanelOpen || coverMoving, choice) : WorkPanelLayout.live(widthDp, panelLive);
+                ? WorkPanelLayout.of(widthDp, cover, shellMode(), workPanelOpen || coverMoving, choice)
+                : WorkPanelLayout.live(widthDp, panelLive);
         int rootWidth = root().getWidth();
         // The cover's page follows the finger, then settles (coverSettle animates it); docked it never moves.
         if (!coverSettling) {
@@ -1401,6 +1434,80 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     private View root() {
         return (View) railColumns.getParent();
+    }
+
+    /**
+     * The cover's full-page panel, or the split: the display's width decides
+     * (WorkPanelLayout.onCover), so an unfolded window narrowed by split
+     * screen still splits (fold regressions, 11-23).
+     */
+    private boolean coverPosture() {
+        int window = getResources().getConfiguration().screenWidthDp;
+        int display = 0;
+        if (Build.VERSION.SDK_INT >= 30) {
+            display = Math.round(getWindowManager().getMaximumWindowMetrics().getBounds().width()
+                    / getResources().getDisplayMetrics().density);
+        }
+        return WorkPanelLayout.onCover(window, display);
+    }
+
+    /** A right-edge Back swipe is bringing the panel in (panelEdgeStarted), and onto the cover's page or the split. */
+    private boolean edgeRevealing, edgeOnCover;
+
+    /**
+     * The right edge's Back swipe (EdgeBack): the Fold keeps its edges for
+     * Back whatever a view excludes (d62d747), so the panel's way in rides on
+     * Back itself, as the rail's does on the left. It takes the swipe when the
+     * panel is away (hidden unfolded, closed on the cover) and the swipe starts
+     * in the lower half above the icon cluster; anywhere else Back stays Back.
+     * Coordinates are the screen's.
+     */
+    private boolean panelEdgeStarted(float x, float y) {
+        edgeRevealing = false;
+        if (workPanel == null || terminalRoot == null || shellMode()) return false;
+        if (filePager != null && filePager.showingFile()) return false;
+        boolean cover = coverPosture();
+        boolean away = cover ? !workPanelOpen : panelChoice().hidden;
+        if (!away) return false;
+        int[] origin = new int[2];
+        root().getLocationOnScreen(origin);
+        float density = getResources().getDisplayMetrics().density;
+        if (!WorkPanelLayout.takesEdgeBack((y - origin[1]) / density, Math.round(root().getHeight() / density))) return false;
+        edgeRevealing = true;
+        edgeOnCover = cover;
+        return true;
+    }
+
+    /** The finger at {@code x} (the screen's): the panel comes in from zero under it, as the edge strip's does. */
+    private void panelEdgeMoved(float x) {
+        if (!edgeRevealing) return;
+        int[] origin = new int[2];
+        root().getLocationOnScreen(origin);
+        float density = getResources().getDisplayMetrics().density;
+        float xDp = (x - origin[0]) / density;
+        int widthDp = Math.round(root().getWidth() / density);
+        if (edgeOnCover) coverDrag(WorkPanelLayout.coverRevealed(xDp, widthDp));
+        else dragPanel(WorkPanelLayout.dragged(WorkPanelLayout.snapped(xDp, widthDp), widthDp));
+    }
+
+    /**
+     * The swipe let go at {@code x}: the split keeps the width it was let go at
+     * (hidden again within HIDE_BELOW_DP of the edge); the cover's page settles
+     * full or gone, full when Back would have gone back ({@code invoked}).
+     */
+    private void panelEdgeEnded(float x, boolean invoked) {
+        if (!edgeRevealing) return;
+        edgeRevealing = false;
+        int[] origin = new int[2];
+        root().getLocationOnScreen(origin);
+        float density = getResources().getDisplayMetrics().density;
+        float xDp = (x - origin[0]) / density;
+        int widthDp = Math.round(root().getWidth() / density);
+        if (edgeOnCover) {
+            coverSettle(invoked || WorkPanelLayout.coverOpens(WorkPanelLayout.coverRevealed(xDp, widthDp), 0));
+        } else {
+            choosePanel(WorkPanelLayout.revealed(WorkPanelLayout.snapped(xDp, widthDp), widthDp, panelChoice().share));
+        }
     }
 
     /**
@@ -1517,7 +1624,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private boolean workPanelBack() {
         if (workPanel == null || !workPanel.shown()) return false;
         if (workPanel.back()) return true;
-        if (workPanelOpen && compactWindow()) {
+        if (workPanelOpen && coverPosture()) {
             toggleWorkPanel(false);
             return true;
         }

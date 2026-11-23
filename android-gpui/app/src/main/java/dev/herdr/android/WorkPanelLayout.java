@@ -104,10 +104,35 @@ final class WorkPanelLayout {
         this.hidden = hidden;
     }
 
+    /**
+     * The cover's full page, or the split: the display decides, not the
+     * window (fold regressions of 11-23). An unfolded window narrowed by
+     * split screen or a freeform window still splits; only the cover display
+     * itself (under {@link #COVER_DP}) gets the page. {@code displayWidthDp}
+     * 0 (unknown, before API 30): the window's width decides, as before.
+     */
+    static boolean onCover(int windowWidthDp, int displayWidthDp) {
+        return (displayWidthDp > 0 ? displayWidthDp : windowWidthDp) < COVER_DP;
+    }
+
+    /**
+     * A Back swipe from the right edge starting {@code yDp} down a window
+     * {@code heightDp} tall brings the hidden panel in: the lower half, where
+     * the thumb is, above the icon cluster. Anywhere else it stays Back.
+     */
+    static boolean takesEdgeBack(float yDp, int heightDp) {
+        return heightDp > 0 && yDp >= heightDp / 2f && yDp <= heightDp - EDGE_CLEAR_DP;
+    }
+
     /** At {@code widthDp}; {@code open}: the cover's panel was opened; {@code choice}: the divider's. */
     static WorkPanelLayout of(int widthDp, boolean shell, boolean open, Choice choice) {
+        return of(widthDp, widthDp < COVER_DP, shell, open, choice);
+    }
+
+    /** As {@link #of(int, boolean, boolean, Choice)}, with {@code cover} from {@link #onCover}. */
+    static WorkPanelLayout of(int widthDp, boolean cover, boolean shell, boolean open, Choice choice) {
         if (shell) return new WorkPanelLayout(false, false, false, 0, false, false);
-        if (widthDp < COVER_DP) return new WorkPanelLayout(open, true, true, 1, false, false);
+        if (cover) return new WorkPanelLayout(open, true, true, 1, false, false);
         Choice c = choice == null ? Choice.DEFAULT : choice;
         float fallback = widthDp <= SPLIT_DP ? 0.5f : 0.3f;
         float share = clamp(c.share > 0 ? c.share : fallback, widthDp);

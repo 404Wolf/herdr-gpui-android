@@ -199,13 +199,15 @@ final class PanelDivider {
 
     @SuppressLint("ClickableViewAccessibility")
     private void dragging() {
-        float[] down = new float[1];
+        // before: the share at the touch's start, which a hide keeps (the live one is a sliver by then).
+        float[] down = new float[1], before = new float[1];
         divider.setOnTouchListener((v, e) -> {
             float xDp = (e.getRawX() - originPx) / density();
             int windowDp = Math.round(widthPx / density());
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     down[0] = e.getRawX();
+                    before[0] = share;
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                     dragged(true);
                     return true;
@@ -217,7 +219,7 @@ final class PanelDivider {
                     dragged(false);
                     // A tap is no drag: nothing changes.
                     if (Math.abs(e.getRawX() - down[0]) < dp(4)) { finish(null); return true; }
-                    finish(WorkPanelLayout.released(WorkPanelLayout.snapped(xDp, windowDp), windowDp, share));
+                    finish(WorkPanelLayout.released(WorkPanelLayout.snapped(xDp, windowDp), windowDp, before[0]));
                     return true;
                 case MotionEvent.ACTION_CANCEL:
                     dragged(false);
@@ -231,7 +233,7 @@ final class PanelDivider {
 
     @SuppressLint("ClickableViewAccessibility")
     private void restoring() {
-        float[] down = new float[2];
+        float[] down = new float[2], before = new float[1];
         android.view.VelocityTracker[] speed = new android.view.VelocityTracker[1];
         edge.setOnTouchListener((v, e) -> {
             float xDp = (e.getRawX() - originPx) / density();
@@ -252,6 +254,7 @@ final class PanelDivider {
                 case MotionEvent.ACTION_DOWN:
                     down[0] = e.getRawX();
                     down[1] = e.getRawY();
+                    before[0] = share;
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                     return true;
                 case MotionEvent.ACTION_MOVE:
@@ -266,7 +269,7 @@ final class PanelDivider {
                     // A tap on the invisible strip does nothing (no handle to tap).
                     if (!revealing) { finishCover(false, false); return true; }
                     if (cover) finishCover(true, WorkPanelLayout.coverOpens(WorkPanelLayout.coverRevealed(xDp, windowDp), vx));
-                    else finish(WorkPanelLayout.revealed(WorkPanelLayout.snapped(xDp, windowDp), windowDp, share));
+                    else finish(WorkPanelLayout.revealed(WorkPanelLayout.snapped(xDp, windowDp), windowDp, before[0]));
                     return true;
                 }
                 case MotionEvent.ACTION_CANCEL:
