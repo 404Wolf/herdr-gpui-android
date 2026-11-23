@@ -123,7 +123,7 @@ go_to() { # name (the PM's row is its project's: "Open demo")
     if find_ui 'No Deacon on this computer|Start Deacon' > /dev/null 2>&1; then back_closes_menus; fi
     pane_now "$1"
 }
-pane_now() { dump > /dev/null 2>&1 && grep -q "$1" <<< "$($ui text "$EMU_OUT/ui.xml" "Window [0-9]+, $1|› $1" 2> /dev/null)"; }
+pane_now() { dump > /dev/null 2>&1 && grep -q "$1" <<< "$($ui text "$EMU_OUT/ui.xml" "Window [0-9]+, $1,|›\\s+$1(\\.|$)" 2> /dev/null)"; }
 focused_activity() { a shell dumpsys activity activities 2> /dev/null | sed -n 's/.*topResumedActivity=.*{[^ ]* [^ ]* \([^ ]*\) .*/\1/p' | head -1; }
 
 # The keyboard up on an agent's pane: the cluster over the session, just above the keyboard, no
