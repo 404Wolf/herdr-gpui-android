@@ -144,6 +144,13 @@ final class PanelDivider {
         else moves.live(Float.NaN);
     }
 
+    /** A fold or turn mid-gesture: nothing of it carries into the new posture (the touch's own CANCEL may come later). */
+    void cancelGesture() {
+        pendingShare = Float.NaN;
+        revealing = false;
+        dragged(false);
+    }
+
     /**
      * Where things are now: the docked panel's left edge ({@code panelLeftPx}),
      * the window's width, the choice it came from; {@code movable} false hides

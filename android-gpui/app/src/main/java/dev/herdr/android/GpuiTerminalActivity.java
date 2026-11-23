@@ -1407,6 +1407,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 ? WorkPanelLayout.of(widthDp, cover, shellMode(), workPanelOpen || coverMoving, choice)
                 : WorkPanelLayout.live(widthDp, panelLive);
         int rootWidth = root().getWidth();
+        if (Float.isNaN(panelLive) && Float.isNaN(coverLive)) {
+            String inputs = "cover=" + cover + " windowDp=" + widthDp + " displayDp=" + displayWidthDp()
+                    + " rootPx=" + rootWidth + " saved=" + choice.stored() + " coverOpen=" + workPanelOpen
+                    + " shown=" + layout.shown + " overlay=" + layout.overlay + " share=" + layout.share;
+            if (!inputs.equals(panelLogged)) {
+                panelLogged = inputs;
+                android.util.Log.i("herdr-gpui", "work panel: " + inputs);
+            }
+        }
         // The cover's page follows the finger, then settles (coverSettle animates it); docked it never moves.
         if (!coverSettling) {
             float offset = coverMoving ? WorkPanelLayout.coverOffset(coverLive, rootWidth) : 0;
@@ -1442,13 +1451,42 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
      * screen still splits (fold regressions, 11-23).
      */
     private boolean coverPosture() {
-        int window = getResources().getConfiguration().screenWidthDp;
-        int display = 0;
-        if (Build.VERSION.SDK_INT >= 30) {
-            display = Math.round(getWindowManager().getMaximumWindowMetrics().getBounds().width()
-                    / getResources().getDisplayMetrics().density);
-        }
-        return WorkPanelLayout.onCover(window, display);
+        return WorkPanelLayout.onCover(getResources().getConfiguration().screenWidthDp, displayWidthDp());
+    }
+
+    /** The display's width now, dp (0 before API 30): read fresh on every call, never kept. */
+    private int displayWidthDp() {
+        if (Build.VERSION.SDK_INT < 30) return 0;
+        return Math.round(getWindowManager().getMaximumWindowMetrics().getBounds().width()
+                / getResources().getDisplayMetrics().density);
+    }
+
+    /** What the panel's layout was last derived from, as logged (one line per change, never per frame). */
+    private String panelLogged = "";
+
+    /**
+     * A fold, unfold or turn (Wolf 11-23: a restart brought the split back, so
+     * suspect a mode kept across postures): no gesture of the old posture
+     * carries over, and the layout is derived again from the new window, now
+     * and once it has its new size. Cover or split is never kept, only
+     * derived (coverPosture); workPanelOpen (the cover's page) and the saved
+     * split are the only state that crosses, by design.
+     */
+    private void postureChanged() {
+        if (terminalRoot == null || workPanel == null) return;
+        panelLive = Float.NaN;
+        coverLive = Float.NaN;
+        edgeRevealing = false;
+        if (panelDivider != null) panelDivider.cancelGesture();
+        applyWorkPanel();
+        View r = root();
+        r.getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override public void onGlobalLayout() {
+                r.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                applyWorkPanel();
+            }
+        });
+        r.requestLayout();
     }
 
     /** A right-edge Back swipe is bringing the panel in (panelEdgeStarted), and onto the cover's page or the split. */
@@ -2271,6 +2309,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (screenDp[0] != 0) markUsed();
             screenDp[0] = configuration.screenWidthDp;
             screenDp[1] = configuration.screenHeightDp;
+            postureChanged();
         }
         if (terminalRoot != null) terminalRoot.post(() -> {
             // Folding to the cover crosses 600 dp: the bar swaps inline actions
