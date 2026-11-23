@@ -237,7 +237,8 @@ note_posture() { # step expected-posture panel-state
     surf=$(surface_bounds) || surf=none
     prefs=$(a shell "run-as $pkg cat shared_prefs/terminal-display.xml" 2> /dev/null | tr -d '\r\n' | grep -o 'work_panel[^<]*<[^>]*>[^<]*' | tr '\n' ' ')
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$wm" "$ds" "$div" "$surf" "$prefs" >> "$POSTURES"
-    a logcat -d -v epoch 2> /dev/null | grep -E 'herdr-(panel|posture|fold|ops)' | tail -20 >> "$EMU_OUT/postures-log.txt"
+    a logcat -d -v epoch 2> /dev/null | grep -E 'herdr-(panel|posture|fold)|work panel:' | sed "s/^/$1 /" >> "$EMU_OUT/postures-log.txt"
+    a logcat -c
     shot "posture-$1"
     # Unfolded must split (a divider); the cover must not (its page is full width when shown).
     if [[ $2 == unfolded && $3 == open && $div == none ]]; then
