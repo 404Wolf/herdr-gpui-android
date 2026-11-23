@@ -6,7 +6,7 @@ command -v bd >/dev/null 2>&1 || { printf '\035nobd\n'; exit 0; }
 found=""
 listed() {
   command -v beads-stores >/dev/null 2>&1 || return 1
-  found=$(beads-stores list --root "$root" ${repos:+--repos "$repos"} 2>/dev/null) || return 1
+  found=$(beads-stores list --no-terminals --root "$root" ${repos:+--repos "$repos"} 2>/dev/null) || return 1
 }
 # The repo stores (keys repo:...) beads-stores lists, else repos.json's: one dir a line.
 repo_dirs() {

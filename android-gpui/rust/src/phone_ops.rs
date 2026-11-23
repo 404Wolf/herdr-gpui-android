@@ -34,7 +34,7 @@ exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 /// exactly as the Work panel does; BeadsModel parses their output. STORES_SH
 /// is home-manager-conf users/wolf/programs/herdr-core/app/factory/src/feed.ts
 /// at 5e6c79eb; DETAIL_SH (its fast read of the store's export, with the
-/// revision and "fresh"/"maybe") and COMMENTS_SH are that feed.ts at 088b768f
+/// revision and "fresh"/"maybe") and COMMENTS_SH are that feed.ts at 51c4ffbb
 /// (factory/beads-stores-reader), which try the project's root store, then each
 /// repo store the machine's `beads-stores list` names (else repos.json's). They
 /// never write a store (DETAIL_SH keeps its own answers and freshness marks
@@ -1011,7 +1011,8 @@ mod tests {
 
     /// A bead in a store only the machine's discovery knows (no repos.json entry, not under the
     /// root): one beads.read finds its plan and its comments there, through the vendored
-    /// DETAIL_SH and COMMENTS_SH asking `beads-stores list`; a `skip:` candidate is never read.
+    /// DETAIL_SH and COMMENTS_SH asking `beads-stores list --no-terminals` (no core call from
+    /// inside the phone's exec); a `skip:` candidate is never read.
     #[cfg(unix)]
     #[test]
     fn a_bead_read_finds_its_bead_in_a_discovered_store() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -1041,7 +1042,7 @@ mod tests {
         script(
             "beads-stores",
             format!(
-                "printf 'repo:clone\\t{s}\\tskip:export-only\\t-\\n'\nprintf 'repo:macro-bots\\t{f}\\tfound\\t-\\n'\n",
+                "[ \"$2\" = --no-terminals ] || exit 9\nprintf 'repo:clone\\t{s}\\tskip:export-only\\t-\\n'\nprintf 'repo:macro-bots\\t{f}\\tfound\\t-\\n'\n",
                 s = skipped.display(),
                 f = found.display(),
             ),
