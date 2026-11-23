@@ -126,10 +126,19 @@ impl Error {
     /// The core's own kind of a refusal ("unavailable" when its exec slots are full, ...).
     pub fn core_kind(&self) -> Option<&str> {
         match self {
+            // herdr-core answers "unavailable" both for a machine it cannot reach and for one
+            // too busy to take the call; only its message tells them apart ("<name> is
+            // unreachable: ..."), so the two are told apart here, at the boundary.
+            Self::Rpc { kind, message } if kind == "unavailable" && unreachable(message) => Some("unreachable"),
             Self::Rpc { kind, .. } if !kind.is_empty() => Some(kind),
             _ => None,
         }
     }
+}
+
+/// herdr-core's message for a machine it cannot reach: "<name> is unreachable: <why>".
+fn unreachable(message: &str) -> bool {
+    message.split_once(" is unreachable").is_some_and(|(name, _)| !name.is_empty() && !name.contains(' '))
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -1041,7 +1050,7 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
     }
     let owner = session(id)?;
     let (tx, rx) = mpsc::sync_channel(1);
-    let wait = Duration::from_secs(20);
+    let wait = action_wait(action);
     owner
         .commands
         .try_send(Operation::Action(action.into(), tx, Some(Instant::now() + wait)))
@@ -1049,9 +1058,15 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
     action_reply(rx.recv_timeout(wait))
 }
 
-/// How long `session_action` waits for `action`: 20 s (stub).
-fn action_wait(_action: &str) -> Duration {
-    Duration::from_secs(20)
+/// How long `session_action` waits for `action`: 20 s, or longer for a phone op whose command may
+/// run longer on the machine (beads.dump: 60 s), so a slow read is not called busy while it still
+/// runs: its exec's timeout, the core's RPC margin, and time to get through the session's queue.
+fn action_wait(action: &str) -> Duration {
+    const LEAST: Duration = Duration::from_secs(20);
+    const MARGIN: Duration = Duration::from_secs(10);
+    crate::phone_ops::PhoneOp::parse(action)
+        .and_then(|op| op.exec_secs())
+        .map_or(LEAST, |secs| (Duration::from_secs(secs) + MARGIN).max(LEAST))
 }
 
 /// An action's answer: the session's own, or Busy when it was still queued or running at the

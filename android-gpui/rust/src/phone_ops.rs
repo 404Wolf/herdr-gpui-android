@@ -215,6 +215,22 @@ impl PhoneOp {
     }
 
     /// The op changed the layout or labels, so the view must be read again.
+    /// How long the op's command may run on the machine (its `machine.exec` timeout), seconds;
+    /// None for an op that runs none. The caller waits at least this long for the answer.
+    pub(crate) fn exec_secs(&self) -> Option<u64> {
+        match self {
+            Self::MachinesList | Self::TabDetach { .. } => None,
+            Self::BeadsDump { .. } => Some(60),
+            Self::BeadsStores { .. } => Some(20),
+            Self::BeadsRead { .. } => Some(15),
+            Self::UsageLook
+            | Self::BeadsDetail { .. }
+            | Self::BeadsComments { .. }
+            | Self::AgentHistory { .. }
+            | Self::DocRead { .. } => Some(10),
+        }
+    }
+
     pub(crate) fn edits(&self) -> bool {
         matches!(self, Self::TabDetach { .. })
     }
@@ -225,10 +241,11 @@ impl PhoneOp {
     /// `{"queued":true,"error":".."}` when aswap failed; a look's reply also
     /// carries `timing` (`rpc_ms`, the core's `exec_ms`) for the timing log.
     pub(crate) fn run(&self, mut call: impl FnMut(&str, Value) -> Result<Value>) -> Result<String> {
+        let timeout = self.exec_secs().unwrap_or(10);
         match self {
             Self::UsageLook => {
                 let asked = std::time::Instant::now();
-                let result = call("machine.exec", json!({"argv":["sh","-c",USAGE_LOOK],"timeout":10}))?;
+                let result = call("machine.exec", json!({"argv":["sh","-c",USAGE_LOOK],"timeout":timeout}))?;
                 let mut reply = usage_reply(&result)?;
                 // Where the wait went, for the phone's timing log: the round trip, and the core's own run of aswap.
                 reply["timing"] = json!({
@@ -244,13 +261,13 @@ impl PhoneOp {
             Self::BeadsStores { known } => {
                 let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(STORES_SH), json!(STORE_ROOT), json!(REPOS_FILE)];
                 argv.extend(known.iter().map(|k| json!(k)));
-                let result = call("machine.exec", json!({"argv":argv,"timeout":20}))?;
+                let result = call("machine.exec", json!({"argv":argv,"timeout":timeout}))?;
                 Ok(script_reply(&result)?.to_string())
             }
             Self::BeadsDump { known, on } => {
                 let mut argv = vec![json!("sh"), json!("-c"), json!(WITH_LOGIN_PATH), json!("sh"), json!(DUMP_SH), json!(STORE_ROOT), json!(REPOS_FILE)];
                 argv.extend(known.iter().map(|k| json!(k)));
-                let mut params = json!({"argv":argv,"timeout":60});
+                let mut params = json!({"argv":argv,"timeout":timeout});
                 if let Some(on) = on {
                     params["on"] = json!(on);
                 }
@@ -276,7 +293,7 @@ impl PhoneOp {
                 if *confirm {
                     argv.push(json!("confirm"));
                 }
-                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                let result = call("machine.exec", json!({"argv":argv,"timeout":timeout}))?;
                 Ok(script_reply(&result)?.to_string())
             }
             Self::BeadsRead { project, id, confirm } => {
@@ -285,24 +302,24 @@ impl PhoneOp {
                 if *confirm {
                     argv.push(json!("confirm"));
                 }
-                let result = call("machine.exec", json!({"argv":argv,"timeout":15}))?;
+                let result = call("machine.exec", json!({"argv":argv,"timeout":timeout}))?;
                 Ok(script_reply(&result)?.to_string())
             }
             Self::BeadsComments { project, id } => {
                 let argv = json!(["sh", "-c", WITH_LOGIN_PATH, "sh", COMMENTS_SH, STORE_ROOT, REPOS_FILE, project, id]);
-                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                let result = call("machine.exec", json!({"argv":argv,"timeout":timeout}))?;
                 Ok(script_reply(&result)?.to_string())
             }
             Self::AgentHistory { kind, session, path, key } => {
                 let tail = crate::agent_history::TAIL_BYTES.to_string();
                 let argv = json!(["sh", "-c", HISTORY_SH, "sh", kind.name(), session, path.as_deref().unwrap_or(""),
                     key.as_deref().unwrap_or(""), tail]);
-                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                let result = call("machine.exec", json!({"argv":argv,"timeout":timeout}))?;
                 Ok(history_reply(*kind, &result)?.to_string())
             }
             Self::DocRead { name, key } => {
                 let argv = json!(["sh", "-c", DOC_SH, "sh", name, key.as_deref().unwrap_or("")]);
-                let result = call("machine.exec", json!({"argv":argv,"timeout":10}))?;
+                let result = call("machine.exec", json!({"argv":argv,"timeout":timeout}))?;
                 Ok(script_reply(&result)?.to_string())
             }
         }

@@ -220,7 +220,15 @@ final class PanelSync {
             JSONObject ask = op("beads.dump");
             put(ask, "known", new JSONArray(BeadsMirror.known(kept == null ? "" : kept.text)));
             if (!key.name.isEmpty()) put(ask, "on", key.name);
-            JSONObject reply = reply(op.apply(ask.toString()));
+            String on = key.name.isEmpty() ? here.get() : key.name;
+            JSONObject reply;
+            try {
+                reply = reply(op.apply(ask.toString()));
+            } catch (HostSwitched gone) {
+                throw gone;
+            } catch (RuntimeException e) {
+                return SyncEngine.Fetched.failed(OpTiming.reason("sync", e, on));
+            }
             String text = textOf(reply);
             if (text == null) return SyncEngine.Fetched.failed(errorOf(reply));
             BeadsMirror.Dump dump = BeadsMirror.parseDump(text);
@@ -234,7 +242,14 @@ final class PanelSync {
             JSONObject ask = op("doc.read");
             put(ask, "name", key.name);
             if (kept != null && kept.hasData() && !kept.fp.isEmpty()) put(ask, "key", kept.fp);
-            JSONObject reply = reply(op.apply(ask.toString()));
+            JSONObject reply;
+            try {
+                reply = reply(op.apply(ask.toString()));
+            } catch (HostSwitched gone) {
+                throw gone;
+            } catch (RuntimeException e) {
+                return SyncEngine.Fetched.failed(OpTiming.reason("sync", e, here.get()));
+            }
             String text = textOf(reply);
             if (text == null) return SyncEngine.Fetched.failed(errorOf(reply));
             DocModel.Read read = DocModel.parse(text);

@@ -68,7 +68,7 @@ final class OpTiming {
     /** As {@link #reason(String, RuntimeException)}, naming {@code machine} ("" when not known). */
     static String reason(String op, RuntimeException failure, String machine) {
         // By the failure's kind (ErrorWords), never its text (audit E).
-        String reason = ErrorWords.of(failure, "");
+        String reason = ErrorWords.of(failure, machine == null ? "" : machine);
         try {
             android.util.Log.w("herdr-ops", op + " failed: " + RemoteError.kindOf(failure)
                     + (failure instanceof RemoteError && !((RemoteError) failure).coreKind.isEmpty() ? "/" + ((RemoteError) failure).coreKind : ""));

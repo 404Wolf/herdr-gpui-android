@@ -35,6 +35,8 @@ final class ErrorWords {
     static String refused(String coreKind, String on) {
         switch (coreKind == null ? "" : coreKind) {
             case "unavailable": return on + " is busy; trying again";
+            // The core could not reach that machine at all (the native layer tells it from busy).
+            case "unreachable": return "Can't reach " + on;
             case "not_found": return "That isn't on " + on + " any more";
             case "denied": case "forbidden": return on + " didn't allow it";
             case "conflict": return "Something changed on " + on + " meanwhile; try again";

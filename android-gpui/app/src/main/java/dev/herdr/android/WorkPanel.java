@@ -581,6 +581,7 @@ final class WorkPanel {
     private void run(JSONObject op, java.util.function.Consumer<JSONObject> done) {
         inFlight = true;
         String asked = hostId;
+        String on = machine;
         String json = op.toString();
         thread.execute(() -> {
             JSONObject reply;
@@ -590,7 +591,7 @@ final class WorkPanel {
                 reply = null;
             } catch (RuntimeException | JSONException e) {
                 reply = new JSONObject();
-                put(reply, "error", OpTiming.reason("panel", e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e)));
+                put(reply, "error", OpTiming.reason("panel", e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e), on));
             } catch (LinkageError e) {
                 reply = null;
             }
