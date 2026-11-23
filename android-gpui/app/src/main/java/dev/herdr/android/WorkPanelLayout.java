@@ -32,6 +32,30 @@ final class WorkPanelLayout {
     static final int RESTORE_DP = 8;
     /** The right-edge zone that takes the restoring swipe: narrow, and short enough to exclude from Back. */
     static final int EDGE_DP = 20, EDGE_TALL_DP = 200;
+    /** The cluster's room at the bottom right: the strip stays above it, so its buttons keep their taps. */
+    static final int EDGE_CLEAR_DP = 72;
+
+    /**
+     * The restoring strip's distance from the window's bottom, dp: its
+     * {@link #EDGE_TALL_DP} (all of Android's Back exclusion for one edge)
+     * centred in the lower half, where the thumb is (the missing panel of
+     * 11-23: mid-height was out of reach), never over the icon cluster.
+     */
+    static int edgeBottomDp(int heightDp) {
+        if (heightDp <= 0) return EDGE_CLEAR_DP;
+        int centred = heightDp / 4 - EDGE_TALL_DP / 2;
+        return Math.max(EDGE_CLEAR_DP, Math.min(centred, Math.max(EDGE_CLEAR_DP, heightDp - EDGE_TALL_DP)));
+    }
+
+    /**
+     * The ⋮ menu's "Overview and tasks" on the unfolded screen (the missing
+     * panel of 11-23): a hidden panel comes back at the share it had, a shown
+     * one is hidden, the same as the divider's own hide; no width is invented.
+     */
+    static Choice toggled(Choice c) {
+        Choice now = c == null ? Choice.DEFAULT : c;
+        return now.hidden ? shownAgain(now) : new Choice(now.share, true);
+    }
 
     /** Wolf's own split, as the divider left it: the panel's share, and whether it is hidden. */
     static final class Choice {
@@ -102,6 +126,20 @@ final class WorkPanelLayout {
 
     static WorkPanelLayout of(int widthDp, boolean shell, boolean open) {
         return of(widthDp, shell, open, Choice.DEFAULT);
+    }
+
+    /**
+     * The divider's left edge, px: centred on the panel's edge, but never past
+     * the window's right side, so a panel left a few dp wide still has a
+     * whole divider to grab (factory-9zz.9, the missing panel of 11-23).
+     */
+    static int dividerLeft(int panelLeftPx, int windowPx, int touchPx) {
+        return Math.max(0, Math.min(panelLeftPx - touchPx / 2, windowPx - touchPx));
+    }
+
+    /** The divider is within Back's edge zone ({@code backPx} of the right side): it needs an exclusion. */
+    static boolean dividerAtEdge(int dividerLeftPx, int windowPx, int touchPx, int backPx) {
+        return windowPx > 0 && dividerLeftPx + touchPx > windowPx - backPx;
     }
 
     /** Each side keeps its minimum; a window too narrow for both splits it evenly. */
