@@ -85,4 +85,20 @@ public final class MdTextTest {
         assertEquals("First **para**.", md.sourceOf(at, at + 3));
         assertEquals("First **para**.\n\nSecond para.", md.sourceOf(at, md.text().length()));
     }
+
+    /** t2kg 11-23: the drive-backups Overview's Links lines (one path per line, no blank lines between). */
+    @Test public void linesOfLinksStayOnTheirOwnLinesAndEachPathOpens() {
+        MdText md = MdText.of("### Links\nPlan and limits: /home/wolf/drive-backups/HANDOFF.md\n"
+                + "Goals: /home/wolf/drive-backups/GOALS.md\n"
+                + "Archive work brief: /home/wolf/deacon/work/backup-catalog/BRIEF.md\n"
+                + "ZFS list brief: /home/wolf/drive-backups/zfs-export/BRIEF.md\n"
+                + "Tasks: bd show dbk-drive-backups (store /home/wolf/beads/drive-backups)\n", null);
+        assertTrue(md.text().contains("HANDOFF.md\nGoals: "));
+        assertEquals(List.of("/home/wolf/drive-backups/HANDOFF.md|/home/wolf/drive-backups/HANDOFF.md",
+                "/home/wolf/drive-backups/GOALS.md|/home/wolf/drive-backups/GOALS.md",
+                "/home/wolf/deacon/work/backup-catalog/BRIEF.md|/home/wolf/deacon/work/backup-catalog/BRIEF.md",
+                "/home/wolf/drive-backups/zfs-export/BRIEF.md|/home/wolf/drive-backups/zfs-export/BRIEF.md",
+                "/home/wolf/beads/drive-backups|/home/wolf/beads/drive-backups"),
+                styled(md, MdText.Style.Kind.LOCAL));
+    }
 }
