@@ -1327,13 +1327,19 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (attachTarget() != null) menu.getMenu().add(0, 7, MoreMenu.ATTACH, "Attach image");
         if (!shellMode()) menu.getMenu().add(0, 8, MoreMenu.USAGE, "Usage").setIcon(R.drawable.ic_bar_usage).setIconTintList(tint);
         // The Work panel opens from the right edge (Wolf 11-22: no Work button); the menu offers
-        // it too, for TalkBack and anyone the gesture doesn't suit.
-        if (!shellMode() && compactWindow()) {
-            menu.getMenu().add(0, 9, MoreMenu.USAGE, workPanelOpen ? "Hide overview and tasks" : "Overview and tasks");
+        // it too, for TalkBack and anyone the gesture doesn't suit, on the unfolded screen as on
+        // the cover: a panel hidden there always has a visible way back (11-23).
+        if (!shellMode()) {
+            boolean cover = getResources().getConfiguration().screenWidthDp < WorkPanelLayout.COVER_DP;
+            boolean panelShown = cover ? workPanelOpen : !panelChoice().hidden;
+            menu.getMenu().add(0, 9, MoreMenu.USAGE, panelShown ? "Hide overview and tasks" : "Overview and tasks");
         }
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 9) toggleWorkPanel(!workPanelOpen);
+            if (item.getItemId() == 9) {
+                if (getResources().getConfiguration().screenWidthDp < WorkPanelLayout.COVER_DP) toggleWorkPanel(!workPanelOpen);
+                else choosePanel(WorkPanelLayout.toggled(panelChoice()));
+            }
             else if (item.getItemId() == 8) showUsage();
             else if (item.getItemId() == 7) showAttachSources();
             else if (item.getItemId() == 1) showDisplayOptions();
@@ -1498,7 +1504,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         if (was != next.hidden) root().announceForAccessibility(next.hidden ? "Work panel hidden" : "Work panel restored");
         applySidebarWidth();
         rail.refreshSidebar(true);
-        if (next.hidden) note("Work panel hidden · swipe in from the right edge to bring it back");
+        if (next.hidden) note("Work panel hidden · swipe in from the right edge, or ⋮ › Overview and tasks, to bring it back");
     }
 
     /** The cover's Work button and the panel's ×. */
