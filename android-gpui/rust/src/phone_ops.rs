@@ -1007,6 +1007,90 @@ mod tests {
         Ok(())
     }
 
+    /// The discovery contract (home-manager-conf modules/beads/SPEC.md): when the machine has
+    /// `beads-stores`, DUMP_SH exports exactly the stores it lists (a found in-repo store with no
+    /// repos.json entry included), in its order and under its keys; when it is missing or fails,
+    /// today's walk of the root and repos.json, so a machine never shows fewer stores than before.
+    #[cfg(unix)]
+    #[test]
+    fn the_dump_script_reads_the_stores_the_machine_discovers() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join(format!("herdr-discover-{}", std::process::id()));
+        let root = dir.join("beads");
+        let found = dir.join("code/macro-bots/.beads");
+        let bin = dir.join("bin");
+        for store in [root.join("alpha/.beads"), found.clone()] {
+            std::fs::create_dir_all(store.join("embeddeddolt/db/.dolt/noms"))?;
+            std::fs::write(store.join("embeddeddolt/db/.dolt/noms/manifest"), "5:x:root")?;
+        }
+        std::fs::create_dir_all(&bin)?;
+        let script = |name: &str, body: &str| -> std::io::Result<()> {
+            let file = bin.join(name);
+            std::fs::write(&file, format!("#!/bin/sh\n{body}"))?;
+            std::process::Command::new("chmod").arg("+x").arg(&file).status().map(|_| ())
+        };
+        // bd answers with the store it was pointed at, so each frame says which directory it read.
+        script("bd", "printf '{\"dir\":\"%s\"}\\n' \"$BEADS_DIR\"\n")?;
+        let run = |stores: Option<&str>| -> std::result::Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+            let _ = std::fs::remove_file(bin.join("beads-stores"));
+            if let Some(body) = stores {
+                script("beads-stores", body)?;
+            }
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(DUMP_SH)
+                .arg("sh")
+                .arg(&root)
+                .arg(dir.join("none.json"))
+                .env("PATH", format!("{}:/usr/bin:/bin:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+                .output()?;
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut frames = Vec::new();
+            for chunk in text.split('\u{1e}').skip(1) {
+                let key = chunk.lines().next().unwrap_or("").to_owned();
+                let enc = chunk.lines().nth(2).unwrap_or("");
+                let body = chunk.lines().nth(3).unwrap_or("");
+                let read = if enc == "\u{1d}plain" {
+                    String::from_utf8(base64::engine::general_purpose::STANDARD.decode(body)?)?
+                } else {
+                    let mut gunzip = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg("base64 -d | gzip -dc")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()?;
+                    std::io::Write::write_all(&mut gunzip.stdin.take().ok_or("no stdin")?, body.as_bytes())?;
+                    String::from_utf8(gunzip.wait_with_output()?.stdout)?
+                };
+                frames.push((key, read.trim().to_owned()));
+            }
+            Ok(frames)
+        };
+        let alpha = (String::from("alpha"), format!("{{\"dir\":\"{}/alpha/.beads\"}}", root.display()));
+        // The machine's own list: its keys, its directories, its order, and the root and repos
+        // file it was asked about.
+        let listed = format!(
+            "[ \"$1 $2 $3 $4 $5\" = 'list --root {r} --repos {f}' ] || exit 9\n\
+             printf 'alpha\\t{r}/alpha/.beads\\troot\\t-\\n'\n\
+             printf 'repo:macro-bots\\t{b}\\tfound\\t{m}\\n'\n",
+            r = root.display(),
+            f = dir.join("none.json").display(),
+            b = found.display(),
+            m = dir.join("code/macro-bots").display(),
+        );
+        assert_eq!(
+            run(Some(&listed))?,
+            vec![alpha.clone(), (String::from("repo:macro-bots"), format!("{{\"dir\":\"{}\"}}", found.display()))]
+        );
+        // Missing, or failing (an older or broken generation): today's walk, today's keys.
+        assert_eq!(run(None)?, vec![alpha.clone()]);
+        assert_eq!(run(Some("echo half\nexit 3\n"))?, vec![alpha]);
+        // It answered and found nothing: nothing, not the walk.
+        assert_eq!(run(Some("exit 0\n"))?, vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     #[test]
     fn a_status_doc_is_read_by_a_plain_name_under_deacon_work_only() {
         assert_eq!(PhoneOp::parse(r#"{"op":"doc.read","name":"_deacon"}"#), Some(PhoneOp::DocRead { name: "_deacon".into(), key: None }));

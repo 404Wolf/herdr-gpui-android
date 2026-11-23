@@ -1,8 +1,8 @@
 
 # The phone's whole-store mirror (factory-9zz.14): every beads store's `bd export` (each issue
-# with its plan, labels, dependencies and comments), read-only. Stores are found as STORES_SH
-# finds them and fingerprinted by content (below); a store whose name=fingerprint is among the args
-# answers "same". Per store: \x1e<store>\n\x1c<fingerprint>\n, then \x1fsame\n, or
+# with its plan, labels, dependencies and comments), read-only. Stores are those the machine's
+# beads-stores lists, else found as STORES_SH finds them, and fingerprinted by content (below); a
+# store whose name=fingerprint is among the args answers "same". Per store: \x1e<store>\n\x1c<fingerprint>\n, then \x1fsame\n, or
 # \x1d<encoding>\n<base64 of the export, gzip'd when gzip is there>\n\x1f<bd's exit code>\n, or
 # \x1d-\n<bd's error output>\n\x1f<code>\n when bd failed. "\x1dnobd\n" alone when bd is missing.
 root="$1"; repos="$2"; shift 2
@@ -41,6 +41,17 @@ store() {
   if [ "$enc" = gzip ]; then gzip -c < "$out" | base64 | tr -d '\n'; else base64 < "$out" | tr -d '\n'; fi
   printf '\n\0370\n'
 }
+# The machine's own discovery (home-manager-conf modules/beads/SPEC.md) when it has it: its
+# keys, directories and order, in-repo stores with no repos.json entry included. Missing or
+# failing (an older generation): today's walk below, with today's keys.
+if command -v beads-stores >/dev/null 2>&1 && list=$(beads-stores list --root "$root" --repos "$repos" 2>/dev/null); then
+  while IFS='	' read -r key path _; do
+    [ -n "$key" ] && [ -d "$path" ] && store "$key" "$path" "$@"
+  done <<EOF
+$list
+EOF
+  exit 0
+fi
 if [ -d "$root" ]; then
   for d in "$root"/*/; do
     [ -d "$d.beads" ] || continue
