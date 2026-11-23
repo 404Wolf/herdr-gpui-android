@@ -43,8 +43,9 @@ store() {
 }
 # The machine's own discovery (home-manager-conf modules/beads/SPEC.md) when it has it: its
 # keys, directories and order, in-repo stores with no repos.json entry included. Missing or
-# failing (an older generation): today's walk below, with today's keys.
-if command -v beads-stores >/dev/null 2>&1 && list=$(beads-stores list --root "$root" --repos "$repos" 2>/dev/null); then
+# failing (an older generation): today's walk below, with today's keys. --no-terminals: it
+# runs inside this core's exec, so it must not call that core back (hc ls).
+if command -v beads-stores >/dev/null 2>&1 && list=$(beads-stores list --no-terminals --root "$root" --repos "$repos" 2>/dev/null); then
   while IFS='	' read -r key path source _; do
     case "$source" in skip:*) continue ;; esac
     [ -n "$key" ] && [ -d "$path" ] && store "$key" "$path" "$@"

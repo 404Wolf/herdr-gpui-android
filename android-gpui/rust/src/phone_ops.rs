@@ -1130,9 +1130,10 @@ mod tests {
         };
         let alpha = (String::from("alpha"), format!("{{\"dir\":\"{}/alpha/.beads\"}}", root.display()));
         // The machine's own list: its keys, its directories, its order, and the root and repos
-        // file it was asked about; a skipped candidate ("skip:<reason>") is never read.
+        // file it was asked about, with no core call from inside the phone's own exec
+        // (--no-terminals); a skipped candidate ("skip:<reason>") is never read.
         let listed = format!(
-            "[ \"$1 $2 $3 $4 $5\" = 'list --root {r} --repos {f}' ] || exit 9\n\
+            "[ \"$1 $2 $3 $4 $5 $6\" = 'list --no-terminals --root {r} --repos {f}' ] || exit 9\n\
              printf 'alpha\\t{r}/alpha/.beads\\troot\\t-\\n'\n\
              printf 'repo:clone\\t{b}\\tskip:export-only\\t-\\n'\n\
              printf 'repo:macro-bots\\t{b}\\tfound\\t{m}\\n'\n",
