@@ -483,7 +483,7 @@ final class WorkPanel {
         }
         if (!agent.hasTasks()) return;
         SyncEngine.Priority beads = overview ? SyncEngine.Priority.PREFETCH : SyncEngine.Priority.VISIBLE;
-        if (deacon()) sync.everywhere(beads);
+        if (deacon()) sync.beads(PanelSync.HERE, beads);
         else syncStores(beads);
     }
 
@@ -900,52 +900,47 @@ final class WorkPanel {
     }
 
     /**
-     * The deacon's Tasks (Wolf, 11-22: "every task everywhere"): each machine
-     * its core reaches, then each project there with open work, folded to one
-     * row until tapped; unfolded, that project's tree as Tasks draws it, every
-     * bead opening from that machine's mirror.
+     * The deacon's Tasks: its own machine's epics and beads, wherever the phone runs
+     * (Wolf, 11-23, superseding 11-22's "every task everywhere"). The deacon on screen is
+     * always a terminal of the machine on screen (FleetPanes leaves other machines' panes
+     * out), so that machine's mirror is the whole of it: no other machine's section and no
+     * other machine's errors. Each project with open work is one row, folded until tapped;
+     * unfolded, its tree as Tasks draws it, every bead opening from the mirror.
      */
     private void deaconTasks() {
-        List<PanelSync.Beads> all = sync.everywhere(SyncEngine.Priority.VISIBLE);
-        if (all.get(0).loading()) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
+        PanelSync.Beads b = sync.beads(PanelSync.HERE, SyncEngine.Priority.VISIBLE);
+        if (b.loading()) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
         long nowMs = System.currentTimeMillis();
-        for (int i = 0; i < all.size(); i++) {
-            PanelSync.Beads b = all.get(i);
-            body.addView(heading(b.machine.isEmpty() ? machine : b.machine));
-            if (b.loading()) { body.addView(new Skeleton(activity, chrome, 2, TASK_SHAPE)); continue; }
-            if (b.error != null) body.addView(warn("Can't read its beads now: " + b.error + (b.mirror.isEmpty() ? "" : " · showing the last read")));
-            else if (b.atMs > 0 && nowMs - b.atMs > BEADS_AGE_SHOWN_MS) body.addView(dim("beads from " + BeadCache.age(b.atMs, nowMs)));
-            Map<String, BeadsModel.Store> machineStores = b.stores();
-            // Only the machine on screen has live members to show on a bead.
-            List<? extends FleetTree.Member> who = i == 0 ? members : java.util.Collections.<FleetTree.Member>emptyList();
-            int shown = 0;
-            for (Map.Entry<String, BeadsModel.ProjectBeads> p : BeadsModel.projectBeads(machineStores).entrySet()) {
-                List<BeadsModel.Bead> beads = p.getValue().beads;
-                int live = 0, working = 0;
-                for (BeadsModel.Bead bead : beads) {
-                    if (!BeadsModel.isClosed(bead)) live++;
-                    if ("in_progress".equals(bead.status)) working++;
-                }
-                if (live == 0 && p.getValue().error == null) continue;
-                shown++;
-                String scope = b.machine + "\n" + p.getKey();
-                boolean unfolded = deaconProjects.contains(scope);
-                body.addView(projectRow(p.getKey(), live + " open" + (working > 0 ? " · " + working + " in progress" : ""), unfolded, scope));
-                if (!unfolded) continue;
-                if (p.getValue().error != null) body.addView(warn(p.getValue().error));
-                String project = p.getKey();
-                Where at = new Where(project, deaconOpen.computeIfAbsent(scope, k -> new HashSet<>()),
-                        deaconFolded.computeIfAbsent(scope, k -> new HashSet<>()), who,
-                        id -> b.bead(storeIn(project, id, machineStores), id),
-                        id -> scope + "\n" + id, false);
-                for (PanelModel.Row r : PanelModel.rows(BeadsModel.beadTree(beads), at.folded, at.open)) {
-                    PanelModel.Row deeper = new PanelModel.Row(r.node, r.depth + 1, r.epic, r.folded, r.open, r.progress, r.closedAfter);
-                    body.addView(row(deeper, at));
-                    if (r.open) body.addView(plan(deeper, at));
-                }
+        if (b.error != null) body.addView(warn("Can't read its beads now: " + b.error + (b.mirror.isEmpty() ? "" : " · showing the last read")));
+        else if (b.atMs > 0 && nowMs - b.atMs > BEADS_AGE_SHOWN_MS) body.addView(dim("beads from " + BeadCache.age(b.atMs, nowMs)));
+        Map<String, BeadsModel.Store> machineStores = b.stores();
+        int shown = 0;
+        for (Map.Entry<String, BeadsModel.ProjectBeads> p : BeadsModel.projectBeads(machineStores).entrySet()) {
+            List<BeadsModel.Bead> beads = p.getValue().beads;
+            int live = 0, working = 0;
+            for (BeadsModel.Bead bead : beads) {
+                if (!BeadsModel.isClosed(bead)) live++;
+                if ("in_progress".equals(bead.status)) working++;
             }
-            if (shown == 0) body.addView(dim("No open beads on " + (b.machine.isEmpty() ? machine : b.machine) + "."));
+            if (live == 0 && p.getValue().error == null) continue;
+            shown++;
+            String scope = b.machine + "\n" + p.getKey();
+            boolean unfolded = deaconProjects.contains(scope);
+            body.addView(projectRow(p.getKey(), live + " open" + (working > 0 ? " · " + working + " in progress" : ""), unfolded, scope));
+            if (!unfolded) continue;
+            if (p.getValue().error != null) body.addView(warn(p.getValue().error));
+            String project = p.getKey();
+            Where at = new Where(project, deaconOpen.computeIfAbsent(scope, k -> new HashSet<>()),
+                    deaconFolded.computeIfAbsent(scope, k -> new HashSet<>()), members,
+                    id -> b.bead(storeIn(project, id, machineStores), id),
+                    id -> scope + "\n" + id, false);
+            for (PanelModel.Row r : PanelModel.rows(BeadsModel.beadTree(beads), at.folded, at.open)) {
+                PanelModel.Row deeper = new PanelModel.Row(r.node, r.depth + 1, r.epic, r.folded, r.open, r.progress, r.closedAfter);
+                body.addView(row(deeper, at));
+                if (r.open) body.addView(plan(deeper, at));
+            }
         }
+        if (shown == 0) body.addView(dim("No open beads on " + (b.machine.isEmpty() ? machine : b.machine) + "."));
     }
 
     private static String storeIn(String project, String id, Map<String, BeadsModel.Store> stores) {

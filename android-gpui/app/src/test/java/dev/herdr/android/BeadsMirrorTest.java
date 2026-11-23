@@ -122,46 +122,39 @@ public final class BeadsMirrorTest {
         DocModel.Read read = DocModel.parse(got.text);
         assertEquals("# Hi", read.text);
         assertEquals(5000, read.now);
-        // Machines: the connected, lasting ones only.
-        answer[0] = new JSONObject().put("queued", true).put("machines", new org.json.JSONArray(
-                "[{\"name\":\"laptop\",\"state\":\"connected\"},{\"name\":\"gone\",\"state\":\"unreachable\"},"
-                + "{\"name\":\"box\",\"state\":\"connected\",\"temporary\":true}]")).toString();
-        got = f.get(SyncEngine.Kind.MACHINES).fetch(new SyncEngine.Key(a, SyncEngine.Kind.MACHINES, ""), null);
-        assertEquals(List.of("laptop"), PanelSync.connectedMachines(got.text));
     }
 
-    /** End to end on the engine: the deacon's Tasks list this machine, then every connected one. */
-    @Test public void theDeaconSeesEveryMachinesBeads() throws Exception {
+    /**
+     * End to end on the engine: the deacon's Tasks are its own machine's mirror (Wolf, 11-23:
+     * "Server deacon -> server, Macro deacon -> macro"); nothing asks which other machines
+     * there are, and no other machine is read.
+     */
+    @Test public void theDeaconSeesOnlyItsOwnMachinesBeads() throws Exception {
         SyncEngineTest.Rig r = new SyncEngineTest.Rig();
-        String here = chunk("factory", "1.1", EXPORT), there = chunk("zulip", "2.2", EXPORT);
-        String machines = "[{\"name\":\"server\",\"state\":\"connected\"},{\"name\":\"laptop\",\"state\":\"connected\"}]";
-        r.fetchers.put(SyncEngine.Kind.BEADS, (key, kept) -> SyncEngine.Fetched.data(
-                BeadsMirror.merge("", BeadsMirror.parseDump(key.name.isEmpty() ? here : there)), "", key.name.isEmpty() ? "server" : key.name));
-        r.fetchers.put(SyncEngine.Kind.MACHINES, (key, kept) -> SyncEngine.Fetched.data(machines, "", "server"));
-        // The rig's engine was built with the old map; build one on these fetchers.
+        String here = chunk("factory", "1.1", EXPORT);
+        List<SyncEngine.Key> asked = new ArrayList<>();
+        r.fetchers.put(SyncEngine.Kind.BEADS, (key, kept) -> {
+            asked.add(key);
+            return SyncEngine.Fetched.data(BeadsMirror.merge("", BeadsMirror.parseDump(here)), "", "server");
+        });
         SyncEngine engine = new SyncEngine(r.fetchers, new SyncEngine.Store() {
             @Override public SyncEngine.Entry load(SyncEngine.Key key) { return null; }
             @Override public void save(SyncEngine.Key key, SyncEngine.Entry entry) { }
         }, () -> false, r.main::add, r.net::add, r.disk::add, () -> r.now, line -> { });
         PanelSync sync = new PanelSync(engine, new String[] {"server"});
         sync.select(SyncEngineTest.A, "server");
-        int[] changes = {0};
-        sync.onChange(() -> changes[0]++);
         assertTrue(sync.beads(PanelSync.HERE, SyncEngine.Priority.VISIBLE).loading());
         for (int i = 0; i < 3; i++) {
-            sync.everywhere(SyncEngine.Priority.VISIBLE);
+            sync.beads(PanelSync.HERE, SyncEngine.Priority.VISIBLE);
             r.settle();
         }
-        List<PanelSync.Beads> all = sync.everywhere(SyncEngine.Priority.VISIBLE);
-        assertEquals(2, all.size());
-        assertEquals("server", all.get(0).machine);
-        assertTrue(all.get(0).stores().containsKey("factory"));
-        assertEquals("laptop", all.get(1).machine);
-        assertTrue(all.get(1).stores().containsKey("zulip"));
-        assertNotNull(all.get(1).bead("zulip", "demo-1.1"));
-        assertTrue(changes[0] >= 3);
-        long v = sync.version();
-        assertEquals(v, sync.version());
+        PanelSync.Beads mine = sync.beads(PanelSync.HERE, SyncEngine.Priority.VISIBLE);
+        assertEquals("server", mine.machine);
+        assertTrue(mine.stores().containsKey("factory"));
+        assertNotNull(mine.bead("factory", "demo-1.1"));
+        assertEquals(1, asked.size());
+        assertEquals(PanelSync.HERE, asked.get(0).name);
+        assertEquals("only beads and docs are kept", 2, SyncEngine.Kind.values().length);
     }
 
     @Test public void filesKeepEachKeyApartAndStayInTheBudget() throws Exception {

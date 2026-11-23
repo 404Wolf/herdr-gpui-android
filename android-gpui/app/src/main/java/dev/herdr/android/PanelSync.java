@@ -5,7 +5,6 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -19,14 +18,14 @@ import java.util.function.Function;
  * The right panel's reads through the {@link SyncEngine} (factory-9zz.14): what WorkPanel's
  * readStores / useKeptStores / readBead / readDoc and its BeadCache calls become. The machine
  * on screen's whole beads mirror ({@code beads.dump}) draws the Tasks tree and opens every
- * bead with no read; Overview's doc is kept between starts; the deacon's Tasks read every
- * machine its core knows through that core. Everything is keyed by the proven machine.
+ * bead with no read; Overview's doc is kept between starts; the deacon's Tasks are its own
+ * machine's mirror only. Everything is keyed by the proven machine.
  *
  * <p>Main thread only, as the engine. {@link #version()} grows with every change the panel
  * shows, for WorkPanel's redraw signature.
  */
 final class PanelSync {
-    /** The machine's own beads ("" name), as the deacon's relayed ones are named by machine. */
+    /** The machine's own beads ("" name); a name is another machine read through this one's core. */
     static final String HERE = "";
     private static final BeadsMirror EMPTY = BeadsMirror.of("");
 
@@ -164,7 +163,7 @@ final class PanelSync {
         }
     }
 
-    /** The machine on screen's beads ({@code from} HERE), or those the deacon's machine relays {@code from} another. */
+    /** The machine on screen's beads ({@code from} HERE), or another machine's read through its core. */
     Beads beads(String from, SyncEngine.Priority priority) {
         if (machine == null) return new Beads("", BeadsMirror.of(""), 0, null, false);
         SyncEngine.Key key = key(SyncEngine.Kind.BEADS, from);
@@ -172,42 +171,6 @@ final class PanelSync {
         String name = e != null && !e.source.isEmpty() ? e.source : from.isEmpty() ? machineName[0] : from;
         BeadsMirror mirror = e != null && e.value instanceof BeadsMirror ? (BeadsMirror) e.value : EMPTY;
         return new Beads(name, mirror, e == null ? 0 : e.atMs, e == null ? null : e.error, engine.reading(key));
-    }
-
-    /**
-     * The deacon's Tasks: the machine on screen's beads, then every other machine its core
-     * knows and reaches, each read through it. A machine it can't reach is left out; one whose
-     * read failed shows its last beads and why.
-     */
-    List<Beads> everywhere(SyncEngine.Priority priority) {
-        List<Beads> out = new ArrayList<>();
-        out.add(beads(HERE, priority));
-        for (String other : machines(priority)) {
-            if (other.equals(machineName[0])) continue;
-            out.add(beads(other, priority == SyncEngine.Priority.VISIBLE ? SyncEngine.Priority.PREFETCH : priority));
-        }
-        return out;
-    }
-
-    /** The machines the core on screen knows and has connected (machines.list), by name. */
-    List<String> machines(SyncEngine.Priority priority) {
-        if (machine == null) return Collections.emptyList();
-        SyncEngine.Entry e = engine.want(key(SyncEngine.Kind.MACHINES, HERE), priority);
-        return e == null ? Collections.emptyList() : connectedMachines(e.text);
-    }
-
-    static List<String> connectedMachines(String text) {
-        List<String> out = new ArrayList<>();
-        try {
-            JSONArray all = new JSONArray(text.isEmpty() ? "[]" : text);
-            for (int i = 0; i < all.length(); i++) {
-                JSONObject m = all.optJSONObject(i);
-                if (m != null && "connected".equals(m.optString("state")) && !m.optBoolean("temporary")) out.add(m.optString("name"));
-            }
-        } catch (JSONException e) {
-            // Nothing kept that reads: no other machines.
-        }
-        return out;
     }
 
     // ---- Overview ----
@@ -281,12 +244,6 @@ final class PanelSync {
                 return SyncEngine.Fetched.data(withNow(kept.text, read.now), kept.fp, here.get());
             }
             return SyncEngine.Fetched.data(text, read.key == null ? "" : read.key, here.get());
-        });
-        out.put(SyncEngine.Kind.MACHINES, (key, kept) -> {
-            JSONObject reply = reply(op.apply(op("machines.list").toString()));
-            if (!reply.optBoolean("queued", false) || reply.has("error")) return SyncEngine.Fetched.failed(errorOf(reply));
-            JSONArray machines = reply.optJSONArray("machines");
-            return SyncEngine.Fetched.data(machines == null ? "[]" : machines.toString(), "", here.get());
         });
         return out;
     }
