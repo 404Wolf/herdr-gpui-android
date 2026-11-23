@@ -30,6 +30,11 @@ import java.util.Collections;
  */
 final class PanelDivider {
     static final int TOUCH_DP = 24, GRIP_W_DP = 4, GRIP_H_DP = 36;
+    /** How far in from the screen's edge Back's gesture reaches; a divider this near is excluded from it. */
+    static final int BACK_EDGE_DP = 32;
+    /** The divider's Back exclusion at the edge: this tall around its grip, inside Android's 200 dp per edge. */
+    static final int EXCLUDED_DP = 160;
+    private boolean dividerExcluded;
 
     /** What the divider and the edge strip report to the activity. */
     interface Moves {
@@ -154,10 +159,17 @@ final class PanelDivider {
         divider.setVisibility(showDivider ? View.VISIBLE : View.GONE);
         if (showDivider) {
             FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) divider.getLayoutParams();
-            int left = panelLeftPx - dp(TOUCH_DP) / 2;
+            // A panel dragged nearly to the edge keeps its exact width (Wolf), but its divider
+            // stays whole on screen and, there, out of Back's edge: it can always be grabbed again.
+            int left = WorkPanelLayout.dividerLeft(panelLeftPx, windowPx, dp(TOUCH_DP));
             if (at != null && at.leftMargin != left) {
                 at.leftMargin = left;
                 divider.setLayoutParams(at);
+            }
+            boolean atEdge = WorkPanelLayout.dividerAtEdge(left, windowPx, dp(TOUCH_DP), dp(BACK_EDGE_DP));
+            if (atEdge != dividerExcluded && Build.VERSION.SDK_INT >= 29) {
+                dividerExcluded = atEdge;
+                divider.setSystemGestureExclusionRects(atEdge ? Collections.singletonList(gripRect()) : Collections.emptyList());
             }
         }
         // A reveal in progress keeps its strip, so the gesture's own view never goes away under it.
@@ -165,6 +177,24 @@ final class PanelDivider {
         cover = layout.overlay;
         boolean edgeShows = layout.divider ? layout.hidden || revealing : layout.overlay && (!layout.shown || revealing);
         edge.setVisibility(movable && edgeShows ? View.VISIBLE : View.GONE);
+        // The strip sits where the thumb is: the lower half, above the icon cluster.
+        if (edge.getParent() instanceof View && edge.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            int heightDp = Math.round(((View) edge.getParent()).getHeight() / density());
+            FrameLayout.LayoutParams at = (FrameLayout.LayoutParams) edge.getLayoutParams();
+            int bottom = dp(WorkPanelLayout.edgeBottomDp(heightDp));
+            if (at.bottomMargin != bottom || at.gravity != (Gravity.END | Gravity.BOTTOM)) {
+                at.gravity = Gravity.END | Gravity.BOTTOM;
+                at.bottomMargin = bottom;
+                edge.setLayoutParams(at);
+            }
+        }
+    }
+
+    /** The divider's middle, {@link #EXCLUDED_DP} tall, in its own coordinates. */
+    private Rect gripRect() {
+        int h = divider.getHeight() > 0 ? divider.getHeight() : activity.getResources().getDisplayMetrics().heightPixels;
+        int half = dp(EXCLUDED_DP) / 2, mid = h / 2;
+        return new Rect(0, Math.max(0, mid - half), dp(TOUCH_DP), Math.min(h, mid + half));
     }
 
     @SuppressLint("ClickableViewAccessibility")
