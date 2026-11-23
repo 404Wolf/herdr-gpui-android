@@ -511,6 +511,15 @@ final class WorkPanel {
         storesKeptAt = b.atMs > 0 && System.currentTimeMillis() - b.atMs > BEADS_AGE_SHOWN_MS ? b.atMs : 0;
     }
 
+    /**
+     * A failed beads read in words: why, and when a last good read is kept (it still draws
+     * below), how old it is, so a retrying error never hides what is shown or its age.
+     */
+    static String beadsTrouble(String error, boolean kept, long atMs, long nowMs) {
+        String why = "Can't read the beads now: " + error;
+        return kept && atMs > 0 ? why + " · showing the beads " + BeadCache.age(atMs, nowMs) : why;
+    }
+
     /** The mirror has this bead: it opens with no read of its own. */
     private boolean mirrored(String id) {
         return beadsNow != null && beadsNow.bead(storeOf(id), id) != null;
@@ -740,8 +749,11 @@ final class WorkPanel {
         BeadsModel.ProjectBeads mine = byProject.get(agent.project);
         if (stores.isEmpty() && storesAt < 0 && storesError == null) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
         // Kept beads show at once, with how old they are (no dots while a newer read is out).
-        if (storesKeptAt > 0) body.addView(dim("beads from " + BeadCache.age(storesKeptAt, System.currentTimeMillis())));
-        if (storesError != null) body.addView(warn("Can't read the beads now: " + storesError + (mine != null ? " · showing the last read" : "")));
+        if (storesError != null) {
+            body.addView(warn(beadsTrouble(storesError, mine != null && beadsNow != null, beadsNow == null ? 0 : beadsNow.atMs, System.currentTimeMillis())));
+        } else if (storesKeptAt > 0) {
+            body.addView(dim("beads from " + BeadCache.age(storesKeptAt, System.currentTimeMillis())));
+        }
         if (mine == null || mine.beads == null || mine.beads.isEmpty()) {
             body.addView(dim(mine != null && mine.error != null ? mine.error : "No epics or beads in " + agent.project + "'s store."));
             return;
@@ -911,7 +923,7 @@ final class WorkPanel {
         PanelSync.Beads b = sync.beads(PanelSync.HERE, SyncEngine.Priority.VISIBLE);
         if (b.loading()) { body.addView(new Skeleton(activity, chrome, 6, TASK_SHAPE)); return; }
         long nowMs = System.currentTimeMillis();
-        if (b.error != null) body.addView(warn("Can't read its beads now: " + b.error + (b.mirror.isEmpty() ? "" : " · showing the last read")));
+        if (b.error != null) body.addView(warn(beadsTrouble(b.error, !b.mirror.isEmpty(), b.atMs, nowMs)));
         else if (b.atMs > 0 && nowMs - b.atMs > BEADS_AGE_SHOWN_MS) body.addView(dim("beads from " + BeadCache.age(b.atMs, nowMs)));
         Map<String, BeadsModel.Store> machineStores = b.stores();
         int shown = 0;

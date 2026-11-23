@@ -80,6 +80,21 @@ public final class TasksLookTest {
         assertFalse(sync.contains("machines.list") || sync.contains("connectedMachines"));
     }
 
+    /**
+     * Wolf, 11-23 ("cannot read beads now, the computer is busy; trying again"): while a read
+     * fails and is retried, the last good beads still draw and the error says how old they are.
+     */
+    @Test public void aFailingReadKeepsTheLastBeadsAndSaysTheirAge() throws IOException {
+        long now = 10_000_000;
+        assertEquals("Can't read the beads now: the computer is busy; trying again · showing the beads read 5m ago",
+                WorkPanel.beadsTrouble("the computer is busy; trying again", true, now - 5 * 60_000, now));
+        assertEquals("Can't read the beads now: x · showing the beads read just now", WorkPanel.beadsTrouble("x", true, now - 1000, now));
+        assertEquals("nothing kept: the error alone", "Can't read the beads now: x", WorkPanel.beadsTrouble("x", false, now, now));
+        String panel = source("WorkPanel");
+        assertFalse(panel.contains("\" · showing the last read\""));
+        assertTrue(panel.contains("warn(beadsTrouble(b.error, !b.mirror.isEmpty(), b.atMs, nowMs))"));
+    }
+
     @Test public void loadingIsOneSkeletonNeverDots() throws IOException {
         for (String name : new String[] {"WorkPanel", "UsageView", "UsageModel"}) {
             String s = source(name);
