@@ -34,7 +34,7 @@ final class PanelModel {
             return DocModel.nameFor(role, project, name);
         }
 
-        /** An agent with a project has its project's Tasks; the deacon has every machine's (factory-9zz.14). */
+        /** An agent with a project has its project's Tasks; the deacon has its own machine's (Wolf, 11-23). */
         boolean hasTasks() {
             return "deacon".equals(role) || project != null && !project.isEmpty();
         }

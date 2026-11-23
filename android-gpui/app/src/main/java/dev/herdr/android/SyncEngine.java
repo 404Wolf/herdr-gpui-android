@@ -44,9 +44,7 @@ final class SyncEngine {
         /** A machine's whole beads mirror ({@code beads.dump}); name "" here, else the machine it was relayed from. */
         BEADS(30_000, 4 * 1024 * 1024 * 3),
         /** An agent's status doc ({@code doc.read}); name the doc's. */
-        DOC(10_000, 256 * 1024),
-        /** The machines the connected core knows ({@code machines.list}); name "". */
-        MACHINES(60_000, 64 * 1024);
+        DOC(10_000, 256 * 1024);
 
         /** Older than this, an entry is read again when asked for. */
         final long ttlMs;

@@ -42,7 +42,7 @@ public final class PanelModelTest {
         assertNull(PanelModel.agentOf(members, "t9"));
         PanelModel.Agent deacon = new PanelModel.Agent("t1", "deacon", "", "deacon", null, "Deacon");
         assertEquals("_deacon", deacon.doc());
-        // The deacon's Tasks: every task on every machine (factory-9zz.14).
+        // The deacon's Tasks: its own machine's tasks (Wolf, 11-23).
         assertTrue(deacon.hasTasks());
         assertEquals(PanelModel.Tab.TASKS, PanelModel.tab(PanelModel.Tab.TASKS, deacon));
         assertEquals(PanelModel.Tab.TASKS, PanelModel.tab(PanelModel.Tab.TASKS, pm));

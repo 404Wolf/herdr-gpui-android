@@ -69,6 +69,17 @@ public final class TasksLookTest {
         assertFalse(panel.contains("DOC_MS") || panel.contains("STORES_MS"));
     }
 
+    /** Wolf, 11-23: the deacon's Tasks are its own machine's only; no other machine's section or error. */
+    @Test public void theDeaconsTasksAreItsOwnMachineOnly() throws IOException {
+        String panel = source("WorkPanel");
+        String deacon = panel.substring(panel.indexOf("private void deaconTasks()"), panel.indexOf("private static String storeIn("));
+        assertTrue(deacon.contains("sync.beads(PanelSync.HERE, SyncEngine.Priority.VISIBLE)"));
+        assertFalse(panel.contains("everywhere("));
+        assertFalse(deacon.contains("heading("));
+        String sync = source("PanelSync");
+        assertFalse(sync.contains("machines.list") || sync.contains("connectedMachines"));
+    }
+
     @Test public void loadingIsOneSkeletonNeverDots() throws IOException {
         for (String name : new String[] {"WorkPanel", "UsageView", "UsageModel"}) {
             String s = source(name);
