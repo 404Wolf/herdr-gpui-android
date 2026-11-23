@@ -104,4 +104,15 @@ public final class HeldScrollTest {
         assertEquals(HeldScroll.Edge.NONE, HeldScroll.edge(3, false, 0, true, true));
         assertEquals(HeldScroll.Edge.NONE, HeldScroll.edge(3, false, 0, false, true));
     }
+
+    @Test public void wolf1124OfflineHistory_aLinkInDoubtLooksUpTheSavedTranscript() {
+        // Just offline: the link is still "ready" but in doubt; its saved history must be found.
+        assertTrue(HeldScroll.savedTranscriptWanted(true, false, false, true, true));
+        // Plainly offline, closed, or not attached yet: as before.
+        assertTrue(HeldScroll.savedTranscriptWanted(false, true, false, true, false));
+        assertTrue(HeldScroll.savedTranscriptWanted(false, false, true, true, false));
+        assertTrue(HeldScroll.savedTranscriptWanted(false, false, false, false, false));
+        // A live pane whose link is sound: no saved copy.
+        assertFalse(HeldScroll.savedTranscriptWanted(true, false, false, true, false));
+    }
 }
