@@ -86,4 +86,36 @@ public final class FoldEdgeTest {
         assertTrue(hidden.hidden);
         assertEquals(0.42f, WorkPanelLayout.toggled(hidden).share, 0f);
     }
+    @Test public void foldingAndUnfoldingDerivesTheModeAgainEveryTime() {
+        // One session: cover, unfolded, cover, unfolded, the panel open and hidden. The layout
+        // keeps no mode of its own: each posture gets its own answer from the same inputs.
+        for (boolean hidden : new boolean[] {false, true}) {
+            WorkPanelLayout.Choice choice = new WorkPanelLayout.Choice(0.4f, hidden);
+            for (int round = 0; round < 2; round++) {
+                WorkPanelLayout cover = WorkPanelLayout.of(COVER, WorkPanelLayout.onCover(COVER, COVER), false, true, choice);
+                assertTrue(cover.overlay);
+                WorkPanelLayout open = WorkPanelLayout.of(UNFOLDED, WorkPanelLayout.onCover(UNFOLDED, UNFOLDED), false, true, choice);
+                assertFalse("the cover's open page never carries into the split", open.overlay);
+                assertEquals(!hidden, open.shown);
+                assertTrue(open.divider);
+            }
+        }
+    }
+
+    @Test public void aPostureChangeDropsTheOldPosturesGestureAndLaysOutAgain() throws IOException {
+        String gta = source("GpuiTerminalActivity");
+        int at = gta.indexOf("public void onConfigurationChanged(");
+        String config = gta.substring(at, gta.indexOf("\n    }\n", at));
+        assertTrue("every fold, unfold or turn", config.contains("postureChanged();"));
+        int p = gta.indexOf("private void postureChanged()");
+        assertTrue(p > 0);
+        String body = gta.substring(p, gta.indexOf("\n    }\n", p));
+        for (String reset : new String[] {"panelLive = Float.NaN;", "coverLive = Float.NaN;", "edgeRevealing = false;",
+                "panelDivider.cancelGesture();", "addOnGlobalLayoutListener"}) {
+            assertTrue(reset, body.contains(reset));
+        }
+        assertTrue(source("PanelDivider").contains("void cancelGesture()"));
+        // The emulator's qualification reads each posture's inputs from the log.
+        assertTrue(gta.contains("\"work panel: \""));
+    }
 }
