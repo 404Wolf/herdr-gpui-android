@@ -105,18 +105,20 @@ open_pm() {
 back_closes_menus() { a shell input keyevent KEYCODE_BACK; quiet 2; }
 # To an agent by its rail row: the rail opened, the demo project unfolded when the row is hidden,
 # the row tapped, and the drawer closed again when it stays over the terminal.
-go_to() { # name
+go_to() { # name (the PM's row is its project's: "Open demo")
     pane_now "$1" && return 0
+    local row="Focus pane $1|^$1|, $1"
+    [[ $1 == demo-pm ]] && row='^Open demo'
     tap_ui 'Show the host and workspace sidebar|Show it in the rail' 15 > /dev/null || true
     quiet 3
     local i
     # Groups, projects and repos fold: unfold what hides the row, a level at a time.
     for i in 1 2 3 4; do
-        find_ui "Focus pane $1|^$1" > /dev/null 2>&1 && break
+        find_ui "$row" > /dev/null 2>&1 && break
         tap_ui '^Unfold |^Show [0-9]+ rows? under' 5 > /dev/null || break
         quiet 2
     done
-    tap_ui "Focus pane $1|^$1|, $1" 15 > /dev/null || { shot "goto-$1-fail"; return 1; }
+    tap_ui "$row" 15 > /dev/null || { shot "goto-$1-fail"; return 1; }
     quiet 5
     if find_ui 'No Deacon on this computer|Start Deacon' > /dev/null 2>&1; then back_closes_menus; fi
     pane_now "$1"
