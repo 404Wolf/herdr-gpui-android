@@ -75,6 +75,18 @@ sys.exit(1)
 PY
 }
 size() { a shell wm size "$1" > /dev/null; quiet 6; }
+# A posture: on a foldable AVD (EMU_DEVICE=pixel_9_pro_fold) the emulator's own hinge, else the
+# inner or cover screen's size.
+FOLDABLE=0
+[[ "${EMU_DEVICE:-}" == *fold* ]] && FOLDABLE=1
+posture() { # unfolded|cover
+    if (( FOLDABLE )); then
+        if [[ $1 == cover ]]; then a emu fold > /dev/null; else a emu unfold > /dev/null; fi
+        quiet 6
+    elif [[ $1 == cover ]]; then size 1080x2400
+    else size 2076x2152
+    fi
+}
 width() { a shell wm size | sed -n 's/.*: \([0-9]*\)x\([0-9]*\).*/\1/p' | tail -1; }
 height() { a shell wm size | sed -n 's/.*: \([0-9]*\)x\([0-9]*\).*/\2/p' | tail -1; }
 open_pm() {
@@ -97,7 +109,13 @@ go_to() { # name
     pane_now "$1" && return 0
     tap_ui 'Show the host and workspace sidebar|Show it in the rail' 15 > /dev/null || true
     quiet 3
-    find_ui "$1" > /dev/null 2>&1 || { tap_ui '^demo$' 10 > /dev/null; quiet 3; }
+    local i
+    # Groups, projects and repos fold: unfold what hides the row, a level at a time.
+    for i in 1 2 3 4; do
+        find_ui "Focus pane $1|^$1" > /dev/null 2>&1 && break
+        tap_ui '^Unfold ' 5 > /dev/null || break
+        quiet 2
+    done
     tap_ui "Focus pane $1|^$1|, $1" 15 > /dev/null || { shot "goto-$1-fail"; return 1; }
     quiet 5
     if find_ui 'No Deacon on this computer|Start Deacon' > /dev/null 2>&1; then back_closes_menus; fi
@@ -138,7 +156,7 @@ keyboard_check() { # posture
 }
 
 # ---- unfolded ----
-size 2076x2152
+posture unfolded
 open_pm || { shot connect-fail; record connect FAIL "could not open demo-pm"; exit 1; }
 record connect PASS "demo-pm open on the inner screen ($(width)x$(height))"
 shot unfolded-overview
@@ -208,8 +226,59 @@ else
 fi
 open_pm > /dev/null 2>&1 || true
 
+# ---- posture changes in one live session (Wolf 11-23: a restart restored the split) ----
+POSTURES="$EMU_OUT/postures.tsv"
+printf 'step\tposture\tpanel\twm_size\tdevice_state\tdivider\tsurface\tpanel_prefs\n' > "$POSTURES"
+note_posture() { # step expected-posture panel-state
+    local wm ds div surf prefs
+    wm=$(a shell wm size 2> /dev/null | tr -d '\r' | tail -1 | sed 's/.*: //')
+    ds=$(a shell cmd device_state print-state 2> /dev/null | tr -d '\r' | tr '\n' ' ')
+    div=$(bounds 'Work panel divider') || div=none
+    surf=$(surface_bounds) || surf=none
+    prefs=$(a shell "run-as $pkg cat shared_prefs/terminal-display.xml" 2> /dev/null | tr -d '\r\n' | grep -o 'work_panel[^<]*<[^>]*>[^<]*' | tr '\n' ' ')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$wm" "$ds" "$div" "$surf" "$prefs" >> "$POSTURES"
+    a logcat -d -v epoch 2> /dev/null | grep -E 'herdr-(panel|posture|fold|ops)' | tail -20 >> "$EMU_OUT/postures-log.txt"
+    shot "posture-$1"
+    # Unfolded must split (a divider); the cover must not (its page is full width when shown).
+    if [[ $2 == unfolded && $3 == open && $div == none ]]; then
+        record "posture-$1" FAIL "unfolded with the panel open but no split (posture-$1.png, postures.tsv)"
+    elif [[ $2 == cover && $div != none ]]; then
+        record "posture-$1" FAIL "the cover shows a split divider (posture-$1.png)"
+    else
+        record "posture-$1" PASS "$2, panel $3: divider $div, surface $surf"
+    fi
+}
+show_panel() { # unfolded: the panel open through ⋮ › Overview and tasks when it is hidden
+    bounds 'Work panel divider' > /dev/null && return 0
+    tap_ui 'Panes, hosts and terminal actions' 10 > /dev/null && tap_ui 'Overview and tasks' 10 > /dev/null
+    quiet 3
+}
+hide_panel() {
+    local db dl dr
+    db=$(bounds 'Work panel divider') || return 0
+    read -r dl _ dr _ <<< "$db"
+    a shell input swipe $(((dl + dr) / 2)) $(($(height) / 2)) $(($(width) - 2)) $(($(height) / 2)) 600
+    quiet 3
+}
+a logcat -c
+posture unfolded; go_to demo-pm > /dev/null 2>&1 || true; show_panel
+note_posture p0-unfolded unfolded open
+n=1
+for state in open hidden; do
+    if [[ $state == hidden ]]; then hide_panel; note_posture "p$n-unfolded-hidden" unfolded hidden; n=$((n + 1)); fi
+    for p in cover unfolded cover unfolded; do
+        posture "$p"
+        note_posture "p$n-$p-$state" "$p" "$([[ $p == cover ]] && echo any || echo "$state")"
+        n=$((n + 1))
+    done
+done
+# Control: a cold restart, unfolded, with the panel shown again.
+show_panel
+a shell am force-stop "$pkg"; quiet 2; open_pm > /dev/null 2>&1 || true; show_panel
+note_posture control-restart unfolded open
+
 # ---- the cover ----
-size 1080x2400
+posture cover
 W=$(width); H=$(height)
 shot cover-terminal
 tap_ui 'Show the host and workspace sidebar' 10 > /dev/null && { quiet 3; shot cover-drawer; back_closes_menus; }
@@ -231,7 +300,7 @@ if wait_ui 'Claude asks' 30 > /dev/null; then quiet 2; shot cover-question; reco
 else shot cover-question-fail; record cover-question WARN "no question sheet on the cover"; fi
 back_closes_menus
 
-a shell wm size reset
+(( FOLDABLE )) || a shell wm size reset
 if [[ -s "$EMU_OUT/anr.log" ]]; then
     record anr WARN "$(wc -l < "$EMU_OUT/anr.log") ANR dialog(s) were dismissed with Wait during the run (anr.log)"
 fi

@@ -119,7 +119,7 @@ timeout -k 1s 15s adb server-status > /dev/null || die "ADB server did not start
 
 HOME="$emu_home" avdmanager create avd --name herdr-test \
     --package 'system-images;android-34;google_apis;x86_64' \
-    --device pixel_6 <<< 'no' > "$EMU_OUT/avdmanager.log" 2>&1 \
+    --device "${EMU_DEVICE:-pixel_6}" <<< 'no' > "$EMU_OUT/avdmanager.log" 2>&1 \
     || die "Could not create AVD. See avdmanager.log."
 
 (
