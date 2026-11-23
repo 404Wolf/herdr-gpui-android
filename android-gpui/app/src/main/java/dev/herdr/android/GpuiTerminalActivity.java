@@ -1596,8 +1596,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private PanelDivider panelDivider;
 
     private String panelChoiceKey() {
-        return "work_panel_" + (getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-                ? "land" : "port");
+        return WorkPanelLayout.choiceKey(coverPosture(),
+                getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE);
     }
 
     private WorkPanelLayout.Choice panelChoice() {

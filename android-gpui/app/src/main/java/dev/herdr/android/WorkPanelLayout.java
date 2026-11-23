@@ -57,6 +57,16 @@ final class WorkPanelLayout {
         return now.hidden ? shownAgain(now) : new Choice(now.share, true);
     }
 
+    /**
+     * Where the split is kept: per posture, then per orientation. The cover
+     * and the unfolded screen never share one (cover and unfolded portrait
+     * shared 'work_panel_port' until 11-23). The old keys stay the unfolded
+     * screen's, so the width Wolf saved there carries over, and only there.
+     */
+    static String choiceKey(boolean cover, boolean landscape) {
+        return "work_panel_" + (cover ? "cover_" : "") + (landscape ? "land" : "port");
+    }
+
     /** Wolf's own split, as the divider left it: the panel's share, and whether it is hidden. */
     static final class Choice {
         /** The panel's share of the width; 0 for the default (half unfolded, 30% wider). */
