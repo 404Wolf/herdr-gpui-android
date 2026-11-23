@@ -805,7 +805,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             }, () -> {
                 if (composer != null && composer.hideKeyboard()) return;
                 if (workPanelBack()) return;
-                if (filePager == null || !filePager.hide()) leaveByBack();
+                if (filePager == null || !filePager.back()) leaveByBack();
             });
         } else {
             EdgeBack.unregister(this, edgeBack);
@@ -856,7 +856,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return;
         }
         if (workPanelBack()) return;
-        if (filePager != null && filePager.hide()) return;
+        if (filePager != null && filePager.back()) return;
         super.onBackPressed();
     }
 
@@ -1560,7 +1560,12 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                         return;
                     }
                     String saved = copy.reply();
-                    filePager.open(DOC_FILES, path, 0, (t, p) -> saved);
+                    // A folder's entries open from their own saved copies, when there are any.
+                    filePager.open(DOC_FILES, path, 0, (t, p) -> {
+                        if (p.equals(path)) return saved;
+                        RefFiles.Copy entry = refFiles.open(docMachine, DOC_FILES, p, System.currentTimeMillis());
+                        return entry == null ? "{\"queued\":false,\"error\":\"not_saved\"}" : entry.reply();
+                    });
                     return;
                 }
                 final long handle = mirror.handle;
