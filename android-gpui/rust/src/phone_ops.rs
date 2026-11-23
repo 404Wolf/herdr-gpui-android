@@ -31,12 +31,12 @@ const USAGE_LOOK: &str = r#"command -v aswap >/dev/null 2>&1 && exec aswap list 
 exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 
 /// The desktop factory mod's scripts, byte for byte, so the phone reads beads
-/// exactly as the Work panel does; BeadsModel parses their output. STORES_SH
-/// is home-manager-conf users/wolf/programs/herdr-core/app/factory/src/feed.ts
-/// at 5e6c79eb; DETAIL_SH (its fast read of the store's export, with the
-/// revision and "fresh"/"maybe") and COMMENTS_SH are that feed.ts at 51c4ffbb
-/// (factory/beads-stores-reader), which try the project's root store, then each
-/// repo store the machine's `beads-stores list` names (else repos.json's). They
+/// exactly as the Work panel does; BeadsModel parses their output. STORES_SH,
+/// DETAIL_SH (its fast read of the store's export, with the revision and
+/// "fresh"/"maybe") and COMMENTS_SH are home-manager-conf
+/// users/wolf/programs/herdr-core/app/factory/src/feed.ts at 51c4ffbb
+/// (factory/beads-stores-reader): they read the stores the machine's
+/// `beads-stores list --no-terminals` names, else the root and repos.json. They
 /// never write a store (DETAIL_SH keeps its own answers and freshness marks
 /// under ~/.cache/herdr-beads).
 const STORES_SH: &str = include_str!("beads/stores.sh");
@@ -389,7 +389,9 @@ fn store_name(name: &str) -> bool {
         && name.len() <= 128
         && bare != "."
         && bare != ".."
-        && bare.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        && !bare.starts_with('~')
+        // `~`: beads-stores' key for two checkouts with one name, repo:<base>~<8 hex>.
+        && bare.chars().all(|c| c.is_ascii_alphanumeric() || "._-~".contains(c))
 }
 
 /// A status doc's name under ~/deacon/work: `_deacon`, `<project>` or `<project>/<agent>`,
@@ -420,10 +422,10 @@ fn bead_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && !id.starts_with('-') && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
 }
 
-/// `project=fingerprint` (a find -printf %T@ time).
+/// `project=fingerprint`: a find -printf %T@ time, DUMP_SH's cksum.size, or STORES_SH's cksum-size.
 fn known_pair(pair: &str) -> bool {
     pair.split_once('=').is_some_and(|(project, fp)| {
-        store_name(project) && !fp.is_empty() && fp.len() <= 32 && fp.chars().all(|c| c.is_ascii_digit() || c == '.')
+        store_name(project) && !fp.is_empty() && fp.len() <= 32 && fp.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
     })
 }
 
@@ -891,6 +893,17 @@ mod tests {
             assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.dump",{bad}}}"#)), None, "{bad}");
         }
         assert_eq!(PhoneOp::parse(&format!(r#"{{"op":"beads.dump","on":"{}"}}"#, "m".repeat(65))), None);
+        // beads-stores' keys for two checkouts with one name (SPEC.md: repo:<base>~<8 hex>), and
+        // STORES_SH's fingerprint (cksum, then size): the next poll's known args must still parse.
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.dump","known":["repo:macro~1a2b3c4d=2091239757.147"]}"#),
+            Some(PhoneOp::BeadsDump { known: vec!["repo:macro~1a2b3c4d=2091239757.147".into()], on: None })
+        );
+        assert_eq!(
+            PhoneOp::parse(r#"{"op":"beads.stores","known":["factory=2091239757-1473"]}"#),
+            Some(PhoneOp::BeadsStores { known: vec!["factory=2091239757-1473".into()] })
+        );
+        assert_eq!(PhoneOp::parse(r#"{"op":"beads.dump","known":["repo:~=1"]}"#), None);
         let mut seen = Vec::new();
         let reply = PhoneOp::BeadsDump { known: vec!["a=1.2".into()], on: Some("server".into()) }
             .run(|method, params| {
@@ -1005,6 +1018,63 @@ mod tests {
         // A write (new bytes): exported again.
         std::fs::write(root.join("alpha/.beads/embeddeddolt/db/.dolt/noms/manifest"), "5:alpha:next")?;
         assert!(!run(&[&format!("alpha={fp}")])?.contains("\u{1f}same"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// beads.stores (STORES_SH, the desktop's list) reads the same stores as the mirror: those
+    /// `beads-stores list --no-terminals` names, in its order, a `skip:` candidate never read.
+    #[cfg(unix)]
+    #[test]
+    fn the_stores_list_reads_the_stores_the_machine_discovers() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("herdr-discover-list-{}", std::process::id()));
+        let root = dir.join("beads");
+        let found = dir.join("code/macro-bots/.beads");
+        let skipped = dir.join("code/clone/.beads");
+        let bin = dir.join("bin");
+        for d in [&root.join("alpha/.beads"), &found, &skipped, &bin] {
+            std::fs::create_dir_all(d)?;
+        }
+        let script = |name: &str, body: String| -> std::io::Result<()> {
+            let file = bin.join(name);
+            std::fs::write(&file, format!("#!/bin/sh\n{body}"))?;
+            std::process::Command::new("chmod").arg("+x").arg(&file).status().map(|_| ())
+        };
+        script("bd", "printf '[{\"dir\":\"%s\"}]' \"$BEADS_DIR\"\n".into())?;
+        script(
+            "beads-stores",
+            format!(
+                "[ \"$2\" = --no-terminals ] || exit 9\n\
+                 printf 'alpha\\t{r}/alpha/.beads\\troot\\t-\\n'\n\
+                 printf 'repo:clone\\t{s}\\tskip:export-only\\t-\\n'\n\
+                 printf 'repo:macro-bots\\t{f}\\tfound\\t-\\n'\n",
+                r = root.display(),
+                s = skipped.display(),
+                f = found.display(),
+            ),
+        )?;
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(STORES_SH)
+            .arg("sh")
+            .arg(&root)
+            .arg(dir.join("none.json"))
+            .env("PATH", format!("{}:/usr/bin:/bin:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+            .output()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let frames: Vec<(&str, &str)> = text
+            .split('\u{1e}')
+            .skip(1)
+            .map(|chunk| (chunk.lines().next().unwrap_or(""), chunk.lines().nth(2).unwrap_or("")))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![
+                ("alpha", format!("[{{\"dir\":\"{}/alpha/.beads\"}}]", root.display()).as_str()),
+                ("repo:macro-bots", format!("[{{\"dir\":\"{}\"}}]", found.display()).as_str()),
+            ],
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
