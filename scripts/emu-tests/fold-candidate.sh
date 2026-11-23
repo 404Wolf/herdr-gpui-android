@@ -226,57 +226,114 @@ else
 fi
 open_pm > /dev/null 2>&1 || true
 
-# ---- posture changes in one live session (Wolf 11-23: a restart restored the split) ----
+# ---- fold transitions in one live session (Wolf's spec, 11-23), on the emulated hinge ----
+# (1) Folding with the inner split visible: the panel closes and the cover shows the terminal.
+# (2) On the cover the panel is a full page (only after an explicit reveal) or hidden; never a split.
+# (3) Unfolding with the cover's page open: the inner split at once, same tab and agent, the saved
+#     inner width; never full screen on the inner display.
+# (4) Repeated fold/unfold cycles without a restart keep to (1)-(3).
 POSTURES="$EMU_OUT/postures.tsv"
-printf 'step\tposture\tpanel\twm_size\tdevice_state\tdivider\tsurface\tpanel_prefs\n' > "$POSTURES"
-note_posture() { # step expected-posture panel-state
-    local wm ds div surf prefs
+printf 'step\twm_size\tdevice_state\tdivider\tsurface\tpanel\ttab\tagent\tprefs\n' > "$POSTURES"
+divider_x() { local db dl dr; db=$(bounds 'Work panel divider') || { echo none; return; }; read -r dl _ dr _ <<< "$db"; echo $(((dl + dr) / 2)); }
+# The panel as drawn: none (no Overview tab), split (a divider), full (its tab row starts at the
+# screen's left with no divider), or partial (anything else).
+panel_state() {
+    local ob ol div
+    ob=$(bounds '^Overview|Overview, ') || { echo none; return; }
+    div=$(divider_x)
+    [[ $div != none ]] && { echo split; return; }
+    read -r ol _ _ _ <<< "$ob"
+    (( ol < 120 )) && echo full || echo partial
+}
+selected_tab() { dump > /dev/null 2>&1; grep -o '[A-Za-z]*, selected tab' "$EMU_OUT/ui.xml" | head -1 | cut -d, -f1; }
+agent_now() { dump > /dev/null 2>&1; grep -o 'Window [0-9]*, [^,"]*, [^"]*current' "$EMU_OUT/ui.xml" | head -1 | cut -d, -f2 | tr -d ' '; }
+log_step() { # step
+    local wm ds prefs
     wm=$(a shell wm size 2> /dev/null | tr -d '\r' | tail -1 | sed 's/.*: //')
     ds=$(a shell cmd device_state print-state 2> /dev/null | tr -d '\r' | tr '\n' ' ')
-    div=$(bounds 'Work panel divider') || div=none
-    surf=$(surface_bounds) || surf=none
     prefs=$(a shell "run-as $pkg cat shared_prefs/terminal-display.xml" 2> /dev/null | tr -d '\r\n' | grep -o 'work_panel[^<]*<[^>]*>[^<]*' | tr '\n' ' ')
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$wm" "$ds" "$div" "$surf" "$prefs" >> "$POSTURES"
+    STEP_DIV=$(divider_x); STEP_PANEL=$(panel_state); STEP_TAB=$(selected_tab); STEP_AGENT=$(agent_now)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$wm" "$ds" "$STEP_DIV" "$(surface_bounds || echo none)" \
+        "$STEP_PANEL" "$STEP_TAB" "$STEP_AGENT" "$prefs" >> "$POSTURES"
     a logcat -d -v epoch 2> /dev/null | grep -E 'herdr-(panel|posture|fold)|work panel:' | sed "s/^/$1 /" >> "$EMU_OUT/postures-log.txt"
     a logcat -c
     shot "posture-$1"
-    # Unfolded must split (a divider); the cover must not (its page is full width when shown).
-    if [[ $2 == unfolded && $3 == open && $div == none ]]; then
-        record "posture-$1" FAIL "unfolded with the panel open but no split (posture-$1.png, postures.tsv)"
-    elif [[ $2 == cover && $div != none ]]; then
-        record "posture-$1" FAIL "the cover shows a split divider (posture-$1.png)"
-    else
-        record "posture-$1" PASS "$2, panel $3: divider $div, surface $surf"
-    fi
 }
-show_panel() { # unfolded: the panel open through ⋮ › Overview and tasks when it is hidden
+show_panel() { # unfolded: the split through ⋮ › Overview and tasks when it is hidden
     bounds 'Work panel divider' > /dev/null && return 0
-    tap_ui 'Panes, hosts and terminal actions' 10 > /dev/null && tap_ui 'Overview and tasks' 10 > /dev/null
+    tap_ui 'Panes, hosts and terminal actions' 10 > /dev/null && tap_ui '^Overview and tasks$' 10 > /dev/null
     quiet 3
 }
-hide_panel() {
-    local db dl dr
-    db=$(bounds 'Work panel divider') || return 0
-    read -r dl _ dr _ <<< "$db"
-    a shell input swipe $(((dl + dr) / 2)) $(($(height) / 2)) $(($(width) - 2)) $(($(height) / 2)) 600
+cover_reveal() { # the cover's explicit reveal: in from the right edge's lower half, let go far in
+    local w h y x
+    w=$(width); h=$(height); y=$((h * 3 / 4))
+    a shell input motionevent DOWN $((w - 2)) $y
+    for x in $((w - 40)) $((w - 200)) $((w - 400)) $((w - 600)) $((w - 800)); do a shell input motionevent MOVE "$x" "$y"; sleep 0.12; done
+    a shell input motionevent UP $((w - 800)) "$y"
     quiet 3
+}
+cover_ok() { # step: the cover is never a split; with no reveal, the terminal
+    if [[ $STEP_PANEL == split || $STEP_PANEL == partial ]]; then
+        record "$1" FAIL "the cover shows a $STEP_PANEL panel (posture-$1.png, postures.tsv)"; return 1
+    fi
+    return 0
 }
 a logcat -c
+(( FOLDABLE )) || record fold-hinge WARN "not a foldable AVD (EMU_DEVICE=${EMU_DEVICE:-}): postures are emulated with wm size"
 posture unfolded; go_to demo-pm > /dev/null 2>&1 || true; show_panel
-note_posture p0-unfolded unfolded open
-n=1
-for state in open hidden; do
-    if [[ $state == hidden ]]; then hide_panel; note_posture "p$n-unfolded-hidden" unfolded hidden; n=$((n + 1)); fi
-    for p in cover unfolded cover unfolded; do
-        posture "$p"
-        note_posture "p$n-$p-$state" "$p" "$([[ $p == cover ]] && echo any || echo "$state")"
-        n=$((n + 1))
-    done
+log_step s0-unfolded-split
+inner_width=$STEP_DIV
+[[ $STEP_PANEL == split ]] || record s0-split FAIL "no inner split to start from (posture-s0-unfolded-split.png)"
+
+# Sequence 1: split open, fold -> closed on the cover, the terminal shown.
+posture cover
+log_step s1-folded
+if cover_ok s1-folded; then
+    if [[ $STEP_PANEL == none ]] && surface_bounds > /dev/null; then record s1-fold-closes PASS "folding closed the panel; the cover shows the terminal"
+    else record s1-fold-closes FAIL "after folding the panel is '$STEP_PANEL' (posture-s1-folded.png)"; fi
+fi
+
+# Sequence 2: the cover's full page (explicit reveal, Tasks selected) -> unfold -> the split,
+# same tab and agent, the saved inner width.
+cover_reveal
+tap_ui '^Tasks' 10 > /dev/null || true
+quiet 2
+log_step s2-cover-page
+before_tab=$STEP_TAB; before_agent=$STEP_AGENT
+cover_ok s2-cover-page && { [[ $STEP_PANEL == full ]] && record s2-cover-full PASS "the reveal gives a full page (tab $before_tab)" \
+    || record s2-cover-full FAIL "the reveal gave '$STEP_PANEL', not a full page (posture-s2-cover-page.png)"; }
+posture unfolded
+log_step s2-unfolded
+if [[ $STEP_PANEL != split ]]; then
+    record s2-unfold-splits FAIL "unfolding the cover's page gave '$STEP_PANEL', not the split (posture-s2-unfolded.png)"
+elif [[ "$STEP_TAB" != "$before_tab" || "$STEP_AGENT" != "$before_agent" ]]; then
+    record s2-unfold-splits FAIL "the split came back but tab/agent changed: '$before_tab'/'$before_agent' -> '$STEP_TAB'/'$STEP_AGENT'"
+elif [[ $inner_width != none ]] && (( STEP_DIV - inner_width > 24 || inner_width - STEP_DIV > 24 )); then
+    record s2-unfold-splits FAIL "the split's divider at x=$STEP_DIV, not the saved inner width x=$inner_width"
+else
+    record s2-unfold-splits PASS "the split at once (divider x=$STEP_DIV, saved $inner_width), tab $STEP_TAB, agent $STEP_AGENT"
+fi
+
+# Sequence 3: repeated cycles, no restart: fold with the split open, unfold from the cover's
+# page and from a closed cover. The cover is never a split; the inner display never a full page.
+for i in 1 2 3; do
+    show_panel
+    posture cover; log_step "s3-$i-folded"
+    cover_ok "s3-$i-folded" && { [[ $STEP_PANEL == none ]] || record "s3-$i-folded" FAIL "folding left the panel '$STEP_PANEL'"; }
+    (( i % 2 )) && cover_reveal
+    posture unfolded; log_step "s3-$i-unfolded"
+    if [[ $STEP_PANEL == full || $STEP_PANEL == partial ]]; then
+        record "s3-$i-unfolded" FAIL "the inner display shows the panel as '$STEP_PANEL' (posture-s3-$i-unfolded.png)"
+    elif (( i % 2 )) && [[ $STEP_PANEL != split ]]; then
+        record "s3-$i-unfolded" FAIL "unfolding the cover's page gave '$STEP_PANEL', not the split"
+    else
+        record "s3-$i-unfolded" PASS "cycle $i: unfolded with panel '$STEP_PANEL' (divider $STEP_DIV)"
+    fi
 done
-# Control: a cold restart, unfolded, with the panel shown again.
-show_panel
+# Control: a cold restart, unfolded.
 a shell am force-stop "$pkg"; quiet 2; open_pm > /dev/null 2>&1 || true; show_panel
-note_posture control-restart unfolded open
+log_step control-restart
+record control-restart INFO "after a cold restart: panel '$STEP_PANEL', divider $STEP_DIV"
 
 # ---- the cover ----
 posture cover
