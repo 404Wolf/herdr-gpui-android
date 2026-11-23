@@ -1782,6 +1782,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
 
     /** The edge rule has answered the gesture now running: once per drag or fling. Main thread. */
     private boolean edgeSaid;
+    /** The lookup a drag back in doubt waits on: its history opens when it answers. Main thread. */
+    private long openWhenFound;
     /** The gesture now running has logged where its steps go. Main thread. */
     private boolean routeSaid;
 
@@ -1801,7 +1803,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         stopFling();
         if (edge == HeldScroll.Edge.OPEN_HISTORY) {
             transcriptOpen.run();
-        } else if (doubt && edge == HeldScroll.Edge.SCREEN_ONLY) {
+            return;
+        }
+        if (doubt && transcriptOpen == null) {
+            // Just offline: the saved history may not have been looked up yet. Look now, and
+            // open it when it answers, so this drag is not left at "connecting".
+            refreshTranscript(here());
+            openWhenFound = transcriptSeq;
+        }
+        if (doubt && edge == HeldScroll.Edge.SCREEN_ONLY) {
             note(HeldScroll.DOUBT_NOTE);
         } else {
             note(edge == HeldScroll.Edge.SCREEN_ONLY ? HeldScroll.SCREEN_ONLY_NOTE : HeldScroll.NO_OLDER_NOTE);
@@ -5062,7 +5072,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private void refreshTranscript(Here here) {
         if (transcripts == null) return;
         Connection c = here.connection;
-        boolean offline = !here.live && c != null && (c.offline || c.isClosed() || !c.ready);
+        boolean offline = c != null && HeldScroll.savedTranscriptWanted(here.live, c.offline, c.isClosed(), c.ready,
+                linkInDoubt(c));
         // The connection is part of it: a reconnect to the same pane looks again.
         String query = offline && here.machine != null && !here.pane.isEmpty()
                 ? c.generation + "/" + here.machine + "/" + here.pane : "";
@@ -5136,6 +5147,10 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         transcriptHistory = !t.screen;
         transcriptButton.setOnClickListener(v -> { if (transcriptOpen != null) transcriptOpen.run(); });
         transcriptButton.setVisibility(View.VISIBLE);
+        if (openWhenFound == seq) {
+            openWhenFound = 0;
+            if (transcriptHistory) transcriptOpen.run();
+        }
     }
 
     /** The poll's attach on screen and its first paint; the offer follows a change. Under stateLock. */

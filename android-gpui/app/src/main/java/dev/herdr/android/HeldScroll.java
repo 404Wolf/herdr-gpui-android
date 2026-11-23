@@ -49,6 +49,18 @@ final class HeldScroll {
         return suspect && !shell ? sink.local(lines) : sink.live(lines);
     }
 
+    /**
+     * Whether the pane on screen should offer its saved transcript: not live, its link plainly
+     * down, closed or not attached yet, or a live pane whose link is in doubt ({@code doubt}: the
+     * phone just lost its network). In doubt nothing is sent, so a drag back must find the saved
+     * history then too, not only once the link is given up (Wolf 11-23: swiping up offline did
+     * nothing but "connecting").
+     */
+    static boolean savedTranscriptWanted(boolean live, boolean offline, boolean closed, boolean ready,
+            boolean doubt) {
+        return doubt || !live && (offline || closed || !ready);
+    }
+
     /** What a step on the phone's own rows should add, once per gesture, when it did not move. */
     enum Edge {
         /** It moved, went down, or was already said this gesture: nothing more. */
