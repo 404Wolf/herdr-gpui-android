@@ -46,4 +46,17 @@ public final class ErrorWordsTest {
         String reason = timing.substring(timing.indexOf("static String reason("), timing.indexOf("static final long BUSY_FIRST_MS"));
         assertFalse(reason.contains("getMessage()"));
     }
+
+    @Test public void t4g3BusyBeads_anUnreachableMachineIsNeverBusyAndIsNamed() {
+        // herdr-core says "unavailable" for both; the Rust boundary tells unreachable apart.
+        assertEquals("server is busy; trying again", say(RemoteError.REFUSED, "unavailable"));
+        assertEquals("Can't reach server", say(RemoteError.REFUSED, "unreachable"));
+        assertFalse(ErrorWords.retries(new RemoteError(RemoteError.REFUSED, "unreachable", "")));
+        assertTrue(ErrorWords.retries(new RemoteError(RemoteError.REFUSED, "unavailable", "")));
+        // Timed out is its own words, neither busy nor unreachable.
+        assertTrue(say(RemoteError.TIMEOUT, "").contains("didn't answer in time"));
+        // The panel's and the sync's reasons name the machine.
+        assertEquals("Can't reach laptop", OpTiming.reason("sync",
+                new RemoteError(RemoteError.REFUSED, "unreachable", "laptop is unreachable"), "laptop"));
+    }
 }

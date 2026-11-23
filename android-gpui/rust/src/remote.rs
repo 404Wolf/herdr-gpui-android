@@ -1049,6 +1049,11 @@ pub fn session_action(id: u64, action: &str) -> Result<String> {
     action_reply(rx.recv_timeout(wait))
 }
 
+/// How long `session_action` waits for `action`: 20 s (stub).
+fn action_wait(_action: &str) -> Duration {
+    Duration::from_secs(20)
+}
+
 /// An action's answer: the session's own, or Busy when it was still queued or running at the
 /// wait's end (audit A4: a busy session is not a closed one), or Closed when the session ended.
 fn action_reply(reply: std::result::Result<Result<String>, mpsc::RecvTimeoutError>) -> Result<String> {
@@ -1277,6 +1282,28 @@ mod last_use_tests {
         assert_eq!((refused.kind(), refused.core_kind()), (ErrorKind::Refused, Some("unavailable")));
         assert_eq!(Error::Rpc { kind: String::new(), message: "x".into() }.core_kind(), None);
         assert_eq!(Error::Busy.core_kind(), None);
+    }
+
+    /// t4g3's busy-beads diagnosis: an unreachable machine is not a busy one.
+    #[test]
+    fn an_unreachable_machine_is_told_apart_from_a_busy_one() {
+        let unreachable = Error::Rpc {
+            kind: "unavailable".into(),
+            message: "laptop is unreachable: cannot reach laptop: ssh: connect to host 100.72.43.48 port 22: Connection timed out".into(),
+        };
+        assert_eq!(unreachable.core_kind(), Some("unreachable"));
+        let busy = Error::Rpc { kind: "unavailable".into(), message: "16 execs are running already".into() };
+        assert_eq!(busy.core_kind(), Some("unavailable"));
+    }
+
+    /// An op waits at least as long as its own command may run on the machine (beads.dump: 60 s),
+    /// never the 20 s every action used to get.
+    #[test]
+    fn an_action_waits_as_long_as_its_command_may_run() {
+        assert!(action_wait(r#"{"op":"beads.dump","known":[]}"#) >= Duration::from_secs(65));
+        assert!(action_wait(r#"{"op":"beads.stores","known":[]}"#) >= Duration::from_secs(25));
+        assert_eq!(action_wait("tab.new"), Duration::from_secs(20));
+        assert_eq!(action_wait(r#"{"op":"machines.list"}"#), Duration::from_secs(20));
     }
 
     #[test]

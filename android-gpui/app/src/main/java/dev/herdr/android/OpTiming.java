@@ -62,6 +62,11 @@ final class OpTiming {
      * machine could not be asked. Logged under "herdr-ops" for diagnosis.
      */
     static String reason(String op, RuntimeException failure) {
+        return reason(op, failure, "");
+    }
+
+    /** As {@link #reason(String, RuntimeException)}, naming {@code machine} ("" when not known). */
+    static String reason(String op, RuntimeException failure, String machine) {
         // By the failure's kind (ErrorWords), never its text (audit E).
         String reason = ErrorWords.of(failure, "");
         try {
