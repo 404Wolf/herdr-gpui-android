@@ -89,6 +89,17 @@ work.mkdir(parents=True, exist_ok=True)
 ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
 manifest = ET.parse(root / 'app/src/main/AndroidManifest.xml')
 manifest.getroot().set('package', settings[0])
+# Gradle's manifest merger fills ${applicationId}; aapt2 does not. Left as is, the capture
+# provider's authority was the literal '${applicationId}.capture', so the camera's write grant
+# for content://<package>.capture/... found no provider and the camera refused to save.
+for element in manifest.iter():
+    for key, text in element.attrib.items():
+        if '${' not in text:
+            continue
+        text = text.replace('${applicationId}', settings[0])
+        if '${' in text:
+            raise SystemExit('Unknown manifest placeholder in ' + key + '=' + text + '; use Gradle.')
+        element.set(key, text)
 manifest.write(work / 'AndroidManifest.xml', encoding='utf-8', xml_declaration=True)
 PY
 }
