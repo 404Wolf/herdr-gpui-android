@@ -45,7 +45,8 @@ store() {
 # keys, directories and order, in-repo stores with no repos.json entry included. Missing or
 # failing (an older generation): today's walk below, with today's keys.
 if command -v beads-stores >/dev/null 2>&1 && list=$(beads-stores list --root "$root" --repos "$repos" 2>/dev/null); then
-  while IFS='	' read -r key path _; do
+  while IFS='	' read -r key path source _; do
+    case "$source" in skip:*) continue ;; esac
     [ -n "$key" ] && [ -d "$path" ] && store "$key" "$path" "$@"
   done <<EOF
 $list

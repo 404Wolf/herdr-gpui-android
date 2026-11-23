@@ -34,9 +34,11 @@ exec "${SHELL:-/bin/sh}" -lc 'exec aswap list --json'"#;
 /// exactly as the Work panel does; BeadsModel parses their output. STORES_SH
 /// is home-manager-conf users/wolf/programs/herdr-core/app/factory/src/feed.ts
 /// at 5e6c79eb; DETAIL_SH (its fast read of the store's export, with the
-/// revision and "fresh"/"maybe") and COMMENTS_SH are the beads mod's feed.ts at
-/// 6046ee51. They never write a store (DETAIL_SH keeps its own answers and
-/// freshness marks under ~/.cache/herdr-beads).
+/// revision and "fresh"/"maybe") and COMMENTS_SH are that feed.ts at 088b768f
+/// (factory/beads-stores-reader), which try the project's root store, then each
+/// repo store the machine's `beads-stores list` names (else repos.json's). They
+/// never write a store (DETAIL_SH keeps its own answers and freshness marks
+/// under ~/.cache/herdr-beads).
 const STORES_SH: &str = include_str!("beads/stores.sh");
 /// The phone's whole-store mirror (factory-9zz.14): each changed store's `bd export`, read-only,
 /// fingerprinted by its Dolt manifest's bytes so an unchanged store costs no bd at all.
@@ -1007,6 +1009,66 @@ mod tests {
         Ok(())
     }
 
+    /// A bead in a store only the machine's discovery knows (no repos.json entry, not under the
+    /// root): one beads.read finds its plan and its comments there, through the vendored
+    /// DETAIL_SH and COMMENTS_SH asking `beads-stores list`; a `skip:` candidate is never read.
+    #[cfg(unix)]
+    #[test]
+    fn a_bead_read_finds_its_bead_in_a_discovered_store() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("herdr-discover-read-{}", std::process::id()));
+        let found = dir.join("code/macro-bots/.beads");
+        let skipped = dir.join("code/clone/.beads");
+        let bin = dir.join("bin");
+        for d in [&found, &skipped, &bin, &dir.join("beads")] {
+            std::fs::create_dir_all(d)?;
+        }
+        let script = |name: &str, body: String| -> std::io::Result<()> {
+            let file = bin.join(name);
+            std::fs::write(&file, format!("#!/bin/sh\n{body}"))?;
+            std::process::Command::new("chmod").arg("+x").arg(&file).status().map(|_| ())
+        };
+        // bd knows mb-1 only in the discovered store; reading the skipped one would be a failure.
+        script(
+            "bd",
+            format!(
+                "case \"$BEADS_DIR\" in {s}) echo read-skipped; exit 7;; {f}) ;; *) exit 1;; esac\n\
+                 case \"$1\" in show) echo '[{{\"id\":\"mb-1\",\"title\":\"Teammates\",\"comment_count\":1}}]';; \
+                 comments) echo '[{{\"text\":\"kept\",\"author\":\"a\"}}]';; esac\n",
+                s = skipped.display(),
+                f = found.display(),
+            ),
+        )?;
+        script(
+            "beads-stores",
+            format!(
+                "printf 'repo:clone\\t{s}\\tskip:export-only\\t-\\n'\nprintf 'repo:macro-bots\\t{f}\\tfound\\t-\\n'\n",
+                s = skipped.display(),
+                f = found.display(),
+            ),
+        )?;
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(READ_SH)
+            .arg("sh")
+            .arg(DETAIL_SH)
+            .arg(COMMENTS_SH)
+            .arg(dir.join("beads"))
+            .arg(dir.join("none.json"))
+            .arg("teammates")
+            .arg("mb-1")
+            .env("PATH", format!("{}:/usr/bin:/bin:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+            .env("HOME", &dir)
+            .env_remove("XDG_CACHE_HOME")
+            .output()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let (plan, comments) = text.split_once("\u{7}\n").ok_or("no comments part")?;
+        assert!(plan.contains("\"Teammates\"") && !plan.contains("\u{1f}missing"), "{text}");
+        assert!(comments.contains("\"kept\"") && comments.ends_with("\u{1f}ok\n"), "{text}");
+        assert!(!text.contains("read-skipped"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// The discovery contract (home-manager-conf modules/beads/SPEC.md): when the machine has
     /// `beads-stores`, DUMP_SH exports exactly the stores it lists (a found in-repo store with no
     /// repos.json entry included), in its order and under its keys; when it is missing or fails,
@@ -1068,10 +1130,11 @@ mod tests {
         };
         let alpha = (String::from("alpha"), format!("{{\"dir\":\"{}/alpha/.beads\"}}", root.display()));
         // The machine's own list: its keys, its directories, its order, and the root and repos
-        // file it was asked about.
+        // file it was asked about; a skipped candidate ("skip:<reason>") is never read.
         let listed = format!(
             "[ \"$1 $2 $3 $4 $5\" = 'list --root {r} --repos {f}' ] || exit 9\n\
              printf 'alpha\\t{r}/alpha/.beads\\troot\\t-\\n'\n\
+             printf 'repo:clone\\t{b}\\tskip:export-only\\t-\\n'\n\
              printf 'repo:macro-bots\\t{b}\\tfound\\t{m}\\n'\n",
             r = root.display(),
             f = dir.join("none.json").display(),
