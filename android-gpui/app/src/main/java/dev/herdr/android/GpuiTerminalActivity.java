@@ -1394,14 +1394,26 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
     private WorkPanel workPanel;
     private long workPanelRevision = -1;
     private boolean workPanelOpen;
+    /** The posture the panel was last laid out in (null: not yet): a change is a fold or unfold. */
+    private Boolean panelCover;
 
     /** Docked at the right from 640 dp (the unfolded split, or beside the rail when wider); over all on the cover. */
     private void applyWorkPanel() {
         if (workPanel == null || terminalRoot == null) return;
         int widthDp = getResources().getConfiguration().screenWidthDp;
+        // A fold or unfold since the last layout: Wolf's transitions (WorkPanelLayout.crossed).
+        boolean cover = coverPosture();
+        if (panelCover != null && panelCover != cover) {
+            WorkPanelLayout.Choice inner = cover ? null : panelChoice();
+            WorkPanelLayout.Fold crossed = WorkPanelLayout.crossed(panelCover, cover, workPanelOpen, inner);
+            workPanelOpen = crossed.coverOpen;
+            if (!cover && crossed.inner != inner) {
+                getSharedPreferences("terminal-display", MODE_PRIVATE).edit().putString(panelChoiceKey(), crossed.inner.stored()).apply();
+            }
+        }
+        panelCover = cover;
         WorkPanelLayout.Choice choice = panelChoice();
         // A finger on the divider or the edge: the panel is exactly where it is, nothing kept yet.
-        boolean cover = coverPosture();
         boolean coverMoving = cover && !shellMode() && !Float.isNaN(coverLive);
         WorkPanelLayout layout = Float.isNaN(panelLive) || shellMode() || cover
                 ? WorkPanelLayout.of(widthDp, cover, shellMode(), workPanelOpen || coverMoving, choice)

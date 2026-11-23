@@ -67,6 +67,32 @@ final class WorkPanelLayout {
         return "work_panel_" + (cover ? "cover_" : "") + (landscape ? "land" : "port");
     }
 
+    /** The panel after a fold or unfold: the cover's page open or not, and the inner display's split. */
+    static final class Fold {
+        final boolean coverOpen;
+        final Choice inner;
+
+        Fold(boolean coverOpen, Choice inner) {
+            this.coverOpen = coverOpen;
+            this.inner = inner;
+        }
+    }
+
+    /**
+     * Wolf's fold transitions (11-23). Folding closes Overview: the cover
+     * shows the terminal, and its page opens again only on an explicit
+     * reveal. Unfolding with the cover's page open gives the inner split at
+     * once, at the inner display's saved width (shown again if it was hidden
+     * there), never a full page; the cover's page is closed behind it.
+     * Otherwise nothing changes. Tabs and agent are the panel's own and stay.
+     */
+    static Fold crossed(boolean wasCover, boolean nowCover, boolean coverOpen, Choice inner) {
+        Choice kept = inner == null ? Choice.DEFAULT : inner;
+        if (wasCover == nowCover) return new Fold(coverOpen, kept);
+        if (nowCover) return new Fold(false, kept);
+        return new Fold(false, coverOpen && kept.hidden ? shownAgain(kept) : kept);
+    }
+
     /** Wolf's own split, as the divider left it: the panel's share, and whether it is hidden. */
     static final class Choice {
         /** The panel's share of the width; 0 for the default (half unfolded, 30% wider). */
