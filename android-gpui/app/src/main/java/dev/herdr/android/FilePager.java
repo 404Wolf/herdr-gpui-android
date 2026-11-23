@@ -75,7 +75,7 @@ final class FilePager extends FrameLayout {
         back = label(context, "‹", 18);
         back.setPadding(dp(10), 0, dp(10), 0);
         back.setContentDescription("Back to the terminal");
-        back.setOnClickListener(v -> hide());
+        back.setOnClickListener(v -> back());
         title = label(context, "", 13);
         title.setEllipsize(TextUtils.TruncateAt.START);
         where = label(context, "", 12);
@@ -88,6 +88,14 @@ final class FilePager extends FrameLayout {
         list.setDivider(null);
         list.setFastScrollEnabled(true);
         list.setAdapter(adapter);
+        // A folder's row opens that entry in place; Back comes back to the folder (t2kg 11-23).
+        list.setOnItemClickListener((parent, view, row, id) -> {
+            FileDocument doc = document;
+            String child = doc == null ? null : doc.child(row);
+            if (child == null || openTerminal == null || openThrough == null) return;
+            trail.push(new Step(openTerminal, openThrough, doc, list.getFirstVisiblePosition()));
+            read(openTerminal, child, 0, openThrough);
+        });
         page.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
         addView(page, new LayoutParams(-1, -1));
 
@@ -129,6 +137,52 @@ final class FilePager extends FrameLayout {
     /** As {@link #open(String, String, int)}, read through {@code through} (another machine's session). */
     void open(String terminal, String path, int line, BiFunction<String, String, String> through) {
         if (terminal == null || terminal.isEmpty() || path == null || path.isEmpty()) return;
+        trail.clear();
+        read(terminal, path, line, through);
+    }
+
+    /** What was open before a folder's entry: Back returns to it, scrolled where it was. */
+    private static final class Step {
+        final String terminal;
+        final BiFunction<String, String, String> through;
+        final FileDocument document;
+        final int scroll;
+
+        Step(String terminal, BiFunction<String, String, String> through, FileDocument document, int scroll) {
+            this.terminal = terminal;
+            this.through = through;
+            this.document = document;
+            this.scroll = scroll;
+        }
+    }
+
+    /** Folders walked into from the one first opened; bounded so a deep walk cannot grow it without end. */
+    private final java.util.ArrayDeque<Step> trail = new java.util.ArrayDeque<>();
+    private static final int TRAIL_MAX = 32;
+    /** The terminal and reader of what is open, for a folder's entries. */
+    private String openTerminal;
+    private BiFunction<String, String, String> openThrough;
+
+    /**
+     * Back: to the folder an entry was opened from, else closes the page. False when the page
+     * was not showing.
+     */
+    boolean back() {
+        if (!shown) return false;
+        Step step = trail.poll();
+        if (step == null) return hide();
+        ++request;
+        openTerminal = step.terminal;
+        openThrough = step.through;
+        setDocument(step.document);
+        list.setSelection(step.scroll);
+        return true;
+    }
+
+    private void read(String terminal, String path, int line, BiFunction<String, String, String> through) {
+        while (trail.size() > TRAIL_MAX) trail.removeLast();
+        openTerminal = terminal;
+        openThrough = through;
         final int ticket = ++request;
         title.setText(path);
         where.setText("reading…");
@@ -176,6 +230,9 @@ final class FilePager extends FrameLayout {
             where.setText(FileDocument.savedNote(when, next));
         } else if (next.error != null) {
             where.setText(next.error);
+        } else if (next.folder()) {
+            int n = next.entries.size();
+            where.setText((n == 1 ? "1 item" : n + " items") + (next.more ? " · first " + n : "") + " · folder");
         } else {
             String count = next.total > next.lines.size()
                     ? next.lines.size() + " of " + next.total + " lines" : next.total + " lines";
@@ -348,6 +405,15 @@ final class FilePager extends FrameLayout {
                 row.setBackgroundColor(0);
                 return row;
             }
+            if (doc.folder()) {
+                FileDocument.Entry e = doc.entries.get(position);
+                row.setText(doc.lines.get(position));
+                row.setTextColor(e.dir ? chrome.primary : chrome.onSurface);
+                row.setPadding(dp(10), dp(8), dp(10), dp(8));
+                row.setBackgroundColor(0);
+                return row;
+            }
+            row.setPadding(dp(4), 0, dp(6), 0);
             String text = doc.lines.get(position);
             int digits = Math.max(3, String.valueOf(doc.lines.size()).length());
             String number = String.valueOf(position + 1);

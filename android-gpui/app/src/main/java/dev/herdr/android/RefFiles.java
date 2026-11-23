@@ -160,6 +160,9 @@ final class RefFiles {
         } catch (JSONException malformed) {
             return false;
         }
+        // A folder's listing is read live only: its copy would need its own format, and a saved
+        // empty "file" in its place would mislead.
+        if (reply.optBoolean("folder", false)) return false;
         String path = reply.optString("path", "");
         // Unresolved (a failed read of a relative name): kept under the request itself.
         if (!path.startsWith("/")) path = requested.startsWith("/") ? requested : aliasKey(terminal, requested);

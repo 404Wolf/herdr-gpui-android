@@ -915,11 +915,22 @@ impl Connection<'_> {
         if let Some(machine) = machine {
             params["on"] = json!(machine);
         }
-        let result = self.call("file.read", params)?;
         let shown = if path.starts_with('/') {
             path.clone()
         } else {
-            cwd.map_or(path.clone(), |cwd| format!("{}/{path}", cwd.trim_end_matches('/')))
+            cwd.clone().map_or(path.clone(), |cwd| format!("{}/{path}", cwd.trim_end_matches('/')))
+        };
+        let result = match self.call("file.read", params) {
+            Ok(result) => result,
+            // Not a regular file: a folder opens as its listing (t2kg 11-23), read on the same
+            // machine; anything else, or a path that is no folder either, keeps file.read's error.
+            Err(Error::Rpc { kind, message }) if kind == "invalid_params" && shown.starts_with('/') => {
+                return match self.list_folder(&shown, machine)? {
+                    Some(entries) => Ok(entries),
+                    None => Err(Error::Rpc { kind, message }),
+                };
+            }
+            Err(error) => return Err(error),
         };
         Ok(json!({
             "queued": true,
@@ -928,6 +939,20 @@ impl Connection<'_> {
             "lines": result["lines"],
             "last": result["last"],
         }))
+    }
+    /// A folder for the file view: its entries (name, folder or not, size, modified time),
+    /// folders first then by name, at most FOLDER_ENTRIES, read with one exec on `machine`.
+    /// None when `folder` is not one. The path is an argument, never part of the script.
+    fn list_folder(&mut self, folder: &str, machine: Option<&str>) -> Result<Option<Value>> {
+        let mut exec = json!({"argv":["sh","-c",LIST_FOLDER,"sh",folder],"timeout":10});
+        if let Some(machine) = machine {
+            exec["on"] = json!(machine);
+        }
+        let result = self.call_slow("machine.exec", exec)?;
+        if result["code"] != 0 {
+            return Ok(None);
+        }
+        Ok(Some(folder_reply(folder, &exec_stdout(&result)?)))
     }
     /// Changes herdr-app's layout document, which the desktop app reads too,
     /// so a rename or reorder made here shows there. Retries on a version race.
@@ -1836,6 +1861,45 @@ fn transcript_reply(result: &Value, max_bytes: usize) -> Result<Value> {
 /// A put sends up to 8 MiB (about 11 MB of base64) down the phone's link.
 pub(crate) const PUT_WAIT: Duration = Duration::from_secs(60);
 /// The phone's git look, one `sh -c` over the folders it shows (see git_look).
+/// Entries a folder listing shows; more says so.
+const FOLDER_ENTRIES: usize = 500;
+/// One line per entry, `type<TAB>size<TAB>mtime<TAB>name` (GNU find); exit 3 when `$1` is no
+/// folder. A find without -printf (macOS) falls back to names, a trailing / marking folders.
+const LIST_FOLDER: &str = r#"[ -d "$1" ] || exit 3
+cd -- "$1" || exit 3
+find . -mindepth 1 -maxdepth 1 -printf '%y\t%s\t%T@\t%P\n' 2>/dev/null | head -n 2000 && exit 0
+ls -1Ap | head -n 2000"#;
+
+/// The file view's reply for a folder: `{"queued":true,"path","folder":true,"entries":[{"name",
+/// "dir","size","mtime"}],"more"}`, folders first, then by name. Names with control
+/// characters (a line break inside a name) are left out rather than shown wrong.
+fn folder_reply(folder: &str, out: &str) -> Value {
+    let mut entries: Vec<(bool, String, Option<u64>, Option<f64>)> = Vec::new();
+    for line in out.lines() {
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        let (dir, size, mtime, name) = match fields.as_slice() {
+            [kind, size, mtime, name] => (*kind == "d", size.parse().ok(), mtime.parse().ok(), (*name).to_owned()),
+            [name] => match name.strip_suffix('/') {
+                Some(folder) => (true, None, None, folder.to_owned()),
+                None => (false, None, None, (*name).to_owned()),
+            },
+            _ => continue,
+        };
+        if name.is_empty() || name == "." || name == ".." || name.chars().any(char::is_control) {
+            continue;
+        }
+        entries.push((dir, name, size, mtime));
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let more = entries.len() > FOLDER_ENTRIES;
+    entries.truncate(FOLDER_ENTRIES);
+    let entries: Vec<Value> = entries
+        .into_iter()
+        .map(|(dir, name, size, mtime)| json!({"name":name,"dir":dir,"size":size,"mtime":mtime.map(|m| m as i64)}))
+        .collect();
+    json!({"queued":true,"path":folder,"folder":true,"entries":entries,"more":more})
+}
+
 const GIT_LOOK: &str = r#"seen='
 '
 tab=$(printf '\t')
@@ -5988,5 +6052,50 @@ mod focus_review_tests {
         connection.sync_focus().unwrap();
         let frames = frames(&mut peer);
         assert_eq!(frames.last(), Some(&(2, WINDOW_FOCUS, vec![1])));
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    fn names(reply: &Value) -> Vec<String> {
+        reply["entries"].as_array().into_iter().flatten().filter_map(|e| e["name"].as_str().map(str::to_owned)).collect()
+    }
+
+    #[test]
+    fn a_folder_lists_folders_first_then_by_name_with_size_and_time() {
+        let out = "f\t120\t1795394359.5\tissues.jsonl\nd\t4096\t1795394000.0\tbackup\nf\t9\t1795394001.0\t.gitignore\n";
+        let reply = folder_reply("/home/wolf/beads/drive-backups", out);
+        assert_eq!(reply["folder"], true);
+        assert_eq!(reply["queued"], true);
+        assert_eq!(reply["path"], "/home/wolf/beads/drive-backups");
+        assert_eq!(names(&reply), ["backup", ".gitignore", "issues.jsonl"]);
+        assert_eq!(reply["entries"][0]["dir"], true);
+        assert_eq!(reply["entries"][2]["size"], 120);
+        assert_eq!(reply["entries"][2]["mtime"], 1795394359);
+        assert_eq!(reply["more"], false);
+    }
+
+    #[test]
+    fn without_gnu_find_the_names_still_list_and_a_name_with_a_control_character_is_left_out() {
+        let reply = folder_reply("/x", "b.txt\nsub/\nbad\u{7}name\n");
+        assert_eq!(names(&reply), ["sub", "b.txt"]);
+        assert_eq!(reply["entries"][0]["dir"], true);
+        assert!(reply["entries"][1]["size"].is_null());
+    }
+
+    #[test]
+    fn a_long_folder_is_bounded_and_says_so() {
+        let out: String = (0..FOLDER_ENTRIES + 7).map(|n| format!("f\t1\t1\tf{n:04}\n")).collect();
+        let reply = folder_reply("/x", &out);
+        assert_eq!(names(&reply).len(), FOLDER_ENTRIES);
+        assert_eq!(reply["more"], true);
+    }
+
+    #[test]
+    fn the_folder_path_reaches_the_script_as_an_argument_never_as_script_text() {
+        assert!(LIST_FOLDER.contains("\"$1\""));
+        assert!(!LIST_FOLDER.contains("{"));
     }
 }
