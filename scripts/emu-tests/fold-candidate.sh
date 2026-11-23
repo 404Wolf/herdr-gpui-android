@@ -87,12 +87,23 @@ open_pm() {
     quiet 2
     tap_ui 'lobby-shell' 30 > /dev/null || return 1
     quiet 8
-    tap_ui 'Show the host and workspace sidebar|Show it in the rail' 20 > /dev/null || true
-    quiet 3
-    tap_ui 'Focus pane demo-pm' 20 > /dev/null || tap_ui '^demo$' 10 > /dev/null || return 1
-    quiet 6
+    go_to demo-pm || return 1
+    quiet 4
 }
 back_closes_menus() { a shell input keyevent KEYCODE_BACK; quiet 2; }
+# To an agent by its rail row: the rail opened, the demo project unfolded when the row is hidden,
+# the row tapped, and the drawer closed again when it stays over the terminal.
+go_to() { # name
+    pane_now "$1" && return 0
+    tap_ui 'Show the host and workspace sidebar|Show it in the rail' 15 > /dev/null || true
+    quiet 3
+    find_ui "$1" > /dev/null 2>&1 || { tap_ui '^demo$' 10 > /dev/null; quiet 3; }
+    tap_ui "Focus pane $1|^$1|, $1" 15 > /dev/null || { shot "goto-$1-fail"; return 1; }
+    quiet 5
+    if find_ui 'No Deacon on this computer|Start Deacon' > /dev/null 2>&1; then back_closes_menus; fi
+    pane_now "$1"
+}
+pane_now() { dump > /dev/null 2>&1 && grep -q "$1" <<< "$($ui text "$EMU_OUT/ui.xml" "Window [0-9]+, $1|› $1" 2> /dev/null)"; }
 focused_activity() { a shell dumpsys activity activities 2> /dev/null | sed -n 's/.*topResumedActivity=.*{[^ ]* [^ ]* \([^ ]*\) .*/\1/p' | head -1; }
 
 # The keyboard up on an agent's pane: the cluster over the session, just above the keyboard, no
@@ -134,11 +145,11 @@ shot unfolded-overview
 tap_ui 'Show the host and workspace sidebar' 10 > /dev/null && { quiet 3; shot unfolded-drawer; back_closes_menus; }
 keyboard_check unfolded
 # A question sheet (Claude's AskUserQuestion, fake-ask.py).
-tap_ui 'Window [0-9]+, agent-q' 10 > /dev/null || tap_ui 'Focus pane agent-q' 10 > /dev/null || true
+go_to agent-q || true
 if wait_ui 'Claude asks' 30 > /dev/null; then quiet 2; shot unfolded-question; record unfolded-question PASS "the sheet opened"
 else shot unfolded-question-fail; record unfolded-question WARN "no question sheet (unfolded-question-fail.png)"; fi
 back_closes_menus
-tap_ui 'Window [0-9]+, demo-pm' 10 > /dev/null || true
+go_to demo-pm || true
 quiet 4
 
 # (a) The panel away: the right edge's lower half grows it from zero under the finger; the
@@ -215,7 +226,7 @@ shot cover-panel-full
 if find_ui 'Overview|Tasks' > /dev/null 2>&1; then record cover-page PASS "the full page settled open (cover-panel-mid.png, cover-panel-full.png)"
 else record cover-page FAIL "no full page after the cover's edge swipe (cover-panel-full.png)"; fi
 back_closes_menus
-tap_ui 'Window [0-9]+, agent-q' 10 > /dev/null || true
+go_to agent-q || true
 if wait_ui 'Claude asks' 30 > /dev/null; then quiet 2; shot cover-question; record cover-question PASS "the sheet opened"
 else shot cover-question-fail; record cover-question WARN "no question sheet on the cover"; fi
 back_closes_menus
