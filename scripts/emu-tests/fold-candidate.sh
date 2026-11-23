@@ -113,7 +113,7 @@ go_to() { # name
     # Groups, projects and repos fold: unfold what hides the row, a level at a time.
     for i in 1 2 3 4; do
         find_ui "Focus pane $1|^$1" > /dev/null 2>&1 && break
-        tap_ui '^Unfold ' 5 > /dev/null || break
+        tap_ui '^Unfold |^Show [0-9]+ rows? under' 5 > /dev/null || break
         quiet 2
     done
     tap_ui "Focus pane $1|^$1|, $1" 15 > /dev/null || { shot "goto-$1-fail"; return 1; }
