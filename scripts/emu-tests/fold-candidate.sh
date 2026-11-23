@@ -62,15 +62,24 @@ for n in ET.parse(sys.argv[1]).iter("node"):
 sys.exit(1)
 PY
 }
-# Bounds of the terminal's SurfaceView.
+# Bounds of the terminal's SurfaceView. UI Automator reports it as a plain android.view.View with
+# no text, description or children, right after the breadcrumb ("Showing host › ..."); the
+# window-wide touch layer before it is the same kind of leaf, so order picks the terminal.
 surface_bounds() {
     dump > /dev/null 2>&1 || return 1
     python3 - "$EMU_OUT/ui.xml" << 'PY'
 import re, sys, xml.etree.ElementTree as ET
+seen = False
 for n in ET.parse(sys.argv[1]).iter("node"):
-    if n.get("class") == "android.view.SurfaceView":
-        print(*re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds")).groups())
-        sys.exit(0)
+    if (n.get("content-desc") or "").startswith("Showing "):
+        seen = True
+        continue
+    if not seen or n.get("class") not in ("android.view.SurfaceView", "android.view.View") or len(n):
+        continue
+    if n.get("text") or n.get("content-desc") or n.get("resource-id"):
+        continue
+    print(*re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds")).groups())
+    sys.exit(0)
 sys.exit(1)
 PY
 }
@@ -81,8 +90,13 @@ FOLDABLE=0
 [[ "${EMU_DEVICE:-}" == *fold* ]] && FOLDABLE=1
 posture() { # unfolded|cover
     if (( FOLDABLE )); then
+        local want=2076x2152 now
+        [[ $1 == cover ]] && want=1080x2424
         if [[ $1 == cover ]]; then a emu fold > /dev/null; else a emu unfold > /dev/null; fi
         quiet 6
+        # A hinge with no device states folds nothing: fail loudly, not as a wrong-posture pass.
+        now=$(a shell wm size 2> /dev/null | tr -d '\r' | tail -1 | sed 's/.*: //')
+        [[ $now == "$want" ]] || { record fold-hinge FAIL "asked for $1, the display is $now ($(a shell cmd device_state print-state 2> /dev/null | tr -d '\r'))"; exit 1; }
     elif [[ $1 == cover ]]; then size 1080x2400
     else size 2076x2152
     fi
@@ -102,10 +116,18 @@ open_pm() {
     go_to demo-pm || return 1
     quiet 4
 }
-back_closes_menus() { a shell input keyevent KEYCODE_BACK; quiet 2; }
+# Back with nothing open leaves the app (an unfolded rail is not a menu): bring the task back
+# without a restart, so later steps act on the app and not the launcher.
+front() {
+    [[ "$(focused_activity)" == "$pkg"/* ]] && return 0
+    a shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1
+    quiet 4
+}
+back_closes_menus() { a shell input keyevent KEYCODE_BACK; quiet 2; front; }
 # To an agent by its rail row: the rail opened, the demo project unfolded when the row is hidden,
 # the row tapped, and the drawer closed again when it stays over the terminal.
 go_to() { # name (the PM's row is its project's: "Open demo")
+    front
     pane_now "$1" && return 0
     local row="Focus pane $1|^$1|, $1"
     [[ $1 == demo-pm ]] && row='^Open demo'
@@ -130,6 +152,7 @@ focused_activity() { a shell dumpsys activity activities 2> /dev/null | sed -n '
 # toolbar, the prompt's row above the cluster.
 keyboard_check() { # posture
     local p=$1 sb cb
+    front
     tap_ui 'Type a message, or put the keyboard away' 15 > /dev/null || { record "$p-keyboard" FAIL "no Type button"; return; }
     if ! wait_ime 20; then record "$p-keyboard" FAIL "the keyboard did not come up"; return; fi
     a shell input text 'draft%sfrom%sthe%sfold%scheck'

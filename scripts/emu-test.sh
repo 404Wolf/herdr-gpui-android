@@ -121,6 +121,16 @@ HOME="$emu_home" avdmanager create avd --name herdr-test \
     --package 'system-images;android-34;google_apis;x86_64' \
     --device "${EMU_DEVICE:-pixel_6}" <<< 'no' > "$EMU_OUT/avdmanager.log" 2>&1 \
     || die "Could not create AVD. See avdmanager.log."
+# The android-34 image ships the hinge's device states and display layout for pixel_fold only.
+# Without them a pixel_9_pro_fold AVD has one DEFAULT state, so `adb emu fold` turns nothing off.
+# Both AVDs number their two displays alike, so the pixel_fold files serve the newer Fold too.
+emu_device=${EMU_DEVICE:-pixel_6}
+fold_misc="$ANDROID_HOME/system-images/android-34/google_apis/x86_64/data/misc/pixel_fold"
+if [[ $emu_device == *fold* && $emu_device != pixel_fold && -d $fold_misc ]]; then
+    mkdir -p "$ANDROID_AVD_HOME/herdr-test.avd/data/misc"
+    cp -r "$fold_misc" "$ANDROID_AVD_HOME/herdr-test.avd/data/misc/$emu_device"
+    chmod -R u+w "$ANDROID_AVD_HOME/herdr-test.avd/data/misc/$emu_device"
+fi
 
 (
     cd "$emu_home"
