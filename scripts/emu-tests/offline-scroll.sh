@@ -161,6 +161,20 @@ hc run --bg --label agent.kind=codex --name agent-f -- python3 "$work/fullscreen
 hc run --bg --label agent.kind=claude --name shell-a -- sh -c \
     'i=0; while [ $i -lt 200 ]; do printf "shell line %03d\n" $i; i=$((i + 1)); done; printf "$ "; exec cat' \
     > "$EMU_OUT/hc-a.log" 2>&1 || { record setup FAIL "hc run shell-a (see hc-a.log)"; exit 1; }
+# A full-screen Claude Code agent with a real session file (factory-9zz.12): its history is what
+# agent.history renders from the file, found by the terminal's agent.kind and agent.session labels.
+hsession=0f3c2a10-7e6b-4c1d-9a55-3e2d1b0c9f88
+mkdir -p "$work/home/.claude/projects/-emu-project"
+python3 - "$work/home/.claude/projects/-emu-project/$hsession.jsonl" << 'PY'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    for n in range(60):
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "history question %02d" % n}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "history answer %02d from the session file" % n}]}}) + "\n")
+PY
+hc run --bg --label agent.kind=claude --label "agent.session=$hsession" --name agent-h -- python3 "$work/fullscreen.py" \
+    > "$EMU_OUT/hc-h.log" 2>&1 || { record setup FAIL "hc run agent-h (see hc-h.log)"; exit 1; }
 hc ls > "$EMU_OUT/terminals.json" 2>&1
 mem_pid=
 record setup PASS "ssh $SSH_PORT"
@@ -454,6 +468,55 @@ else
     app_log > "$EMU_OUT/app-back-1.log"
     shot not-back
     record reconnect-time FAIL "not live within 30 s of airplane mode off (app-back-1.log, not-back.png)"
+fi
+
+# (E-H) Wolf 11-23: a full-screen Claude agent with a saved history. While live, its history is
+# kept from its session file; airplane mode on, a drag back within a second (the link is still in
+# doubt, or already given up) opens that history, not a note; Back, and a drag on the held frame
+# opens it again.
+history_open() { wait_ui 'history answer 59 from the session file' "${1:-8}" > /dev/null; }
+if switch_to agent-h || { quiet 5; switch_to agent-h; }; then
+    end=$((SECONDS + 60)); kept=
+    while (( SECONDS < end )); do
+        kept=$(a shell "run-as $pkg sh -c 'cat no_backup/transcripts-v1/*/t*.body'" 2> /dev/null | tr -d '\r')
+        grep -q 'history answer 59 from the session file' <<< "$kept" && break
+        sleep 3
+    done
+    printf '%s\n' "$kept" > "$EMU_OUT/history-kept.txt"
+    if grep -q 'history answer 59 from the session file' <<< "$kept"; then
+        record history-kept PASS "agent-h's session file kept as its history while live (history-kept.txt)"
+    else
+        record history-kept FAIL "no history of agent-h kept within 60 s (history-kept.txt)"
+    fi
+    mark_log
+    airplane enable
+    sleep 1
+    drag_back
+    if history_open 8; then
+        shot history-at-once
+        record history-drag-at-once PASS "a drag right after airplane mode opened the saved history (history-at-once.png)"
+    else
+        shot history-at-once-fail
+        app_log > "$EMU_OUT/app-history-at-once.log"
+        record history-drag-at-once FAIL "a drag right after airplane mode did not open the saved history (history-at-once-fail.png, app-history-at-once.log)"
+    fi
+    a shell input keyevent KEYCODE_BACK
+    quiet 4
+    drag_back
+    if history_open 8; then
+        shot history-held
+        record history-held-drag PASS "a drag on the held frame opened the saved history (history-held.png)"
+        a shell input keyevent KEYCODE_BACK
+    else
+        shot history-held-fail
+        app_log > "$EMU_OUT/app-history-held.log"
+        record history-held-drag FAIL "a drag on the held frame did not open the saved history (history-held-fail.png)"
+    fi
+    airplane disable
+    wait_live 30 || record history-back FAIL "not live within 30 s after the history check"
+else
+    shot history-open-fail
+    record history-kept FAIL "could not switch to agent-h (history-open-fail.png)"
 fi
 
 # (E-S1) A main-screen pane with history: held offline, a drag moves it. Its tab sits beside
