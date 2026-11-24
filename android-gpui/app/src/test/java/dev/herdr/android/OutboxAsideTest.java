@@ -66,6 +66,23 @@ public final class OutboxAsideTest {
         assertTrue(again.message(head.id).aside);
     }
 
+    /** t4g1 S1: the tap never writes the file on the UI's thread; the courier's thread saves it. */
+    @Test public void theCourierSavesAMoveAsideOnItsOwnThread() {
+        java.util.List<Runnable> queued = new java.util.ArrayList<>();
+        File file = new File(dir.getRoot(), Outbox.FILE_NAME);
+        OutboxCourier courier = new OutboxCourier(file, queued::add, (handle, attach, text) -> text);
+        queued.remove(0).run(); // its load
+        Outbox.Message head = hold(courier.outbox(), "m1", DictationToken.of("clip-1"));
+        hold(courier.outbox(), "m2", "second");
+        assertTrue(courier.outbox().save());
+        assertTrue(courier.moveAside(head.id));
+        assertTrue("in memory at once", courier.outbox().message(head.id).aside);
+        assertFalse("not yet on disk", fresh().message(head.id).aside);
+        assertEquals(1, queued.size());
+        queued.remove(0).run();
+        assertTrue(fresh().message(head.id).aside);
+    }
+
     @Test public void onlyAPendingMessageThatWaitsForItsDictationCanBeMovedAside() {
         Outbox outbox = fresh();
         Outbox.Message plain = hold(outbox, "m1", "plain words");

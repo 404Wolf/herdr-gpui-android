@@ -21,6 +21,8 @@ public final class PhoneWhisper {
     });
     private static volatile LocalModel.Result status = new LocalModel.Result(LocalModel.State.NOT_PROVISIONED, null);
     private static volatile boolean checking;
+    /** The native engine loaded (in {@link #prepare}, off the main thread); read, never loaded, elsewhere. */
+    private static volatile boolean engine;
 
     private PhoneWhisper() {}
 
@@ -32,17 +34,18 @@ public final class PhoneWhisper {
         LOCAL.execute(() -> {
             long t = System.nanoTime();
             LocalModel.Result r = LocalModel.check(app.getExternalFilesDir(null), spec, app.getNoBackupFilesDir());
+            engine = r.state == LocalModel.State.OK && LocalWhisper.load();
             status = r;
             Log.i(TAG, "dictation: the phone's model is " + r.state.name().toLowerCase(java.util.Locale.ROOT)
                     + " (" + (System.nanoTime() - t) / 1_000_000 + " ms)"
-                    + (r.state == LocalModel.State.OK && !LocalWhisper.load() ? ", but this build has no engine" : ""));
+                    + (r.state == LocalModel.State.OK && !engine ? ", but this build has no engine" : ""));
         });
     }
 
     /** The model's state now; {@link LocalModel.State#OK} only once verified. */
     public static LocalModel.State state() {
         LocalModel.Result r = status;
-        if (r.state == LocalModel.State.OK && !LocalWhisper.load()) return LocalModel.State.NOT_PROVISIONED;
+        if (r.state == LocalModel.State.OK && !engine) return LocalModel.State.NOT_PROVISIONED;
         return r.state;
     }
 
@@ -58,7 +61,7 @@ public final class PhoneWhisper {
     public static OnDeviceRecognizer.Factory factory(OnDeviceRecognizer.Factory fallback) {
         return cb -> {
             LocalModel.Result r = status;
-            if (r.state == LocalModel.State.OK && LocalWhisper.load()) {
+            if (r.state == LocalModel.State.OK && engine) {
                 return new WhisperRecognizer(() -> LocalWhisper.open(r.file, WhisperRecognizer.threads()), LOCAL, cb);
             }
             return fallback == null ? null : fallback.start(cb);
@@ -68,7 +71,7 @@ public final class PhoneWhisper {
     /** The engine for a saved clip, or null when the model is not verified. */
     public static PendingDictations.LocalTranscriber transcriber() {
         LocalModel.Result r = status;
-        if (r.state != LocalModel.State.OK || !LocalWhisper.load()) return null;
+        if (r.state != LocalModel.State.OK || !engine) return null;
         File model = r.file;
         return audio -> {
             try (LocalWhisper w = LocalWhisper.open(model, WhisperRecognizer.threads())) {

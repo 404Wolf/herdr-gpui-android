@@ -58,6 +58,14 @@ public final class DictationRowsTest {
         assertEquals("keep waiting", ControlLine.rowActions(one).get(3).spans[0]);
     }
 
+    /** t4g1 M1: a moved-aside message says it comes back at its place once transcribed. */
+    @Test public void aMovedAsideMessageSaysWhereItGoesBack() {
+        Outbox.Message aside = new Outbox.Message("m1", new Outbox.Target(null, "h", "", "", "t1", null, "", ""),
+                "fix " + DictationToken.of("c1"), new Outbox.Composed(1, -1, -1), Outbox.State.PENDING, null, false, 0,
+                "", true);
+        assertEquals("◌ moved aside · back at its place once transcribed", QueueView.state(aside, "t1", 1, false));
+    }
+
     @Test public void aSavedClipOffersThePhoneOnlyWithAModelAndShowsItsProposal() throws Exception {
         QueueView view = new QueueView();
         List<PendingClip> clips = Collections.singletonList(clip("c1"));
