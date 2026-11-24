@@ -74,4 +74,12 @@ if "$BIN/llvm-readelf" -d "$LIB" | grep -q 'Shared library: \[libc++_shared.so\]
     install -m 0644 "$CPP" "$DEST/libc++_shared.so"
 fi
 sha256sum "$DEST/libherdr_gpui_android.so"
+# The phone's Whisper beside it (DICTATION.md): whisper.cpp from the pinned source. A shell
+# without that source builds an APK without it, said here rather than failing.
+if [[ -n "${WHISPER_CPP_SRC:-}" ]]; then
+    HERDR_ANDROID_ABI="$ABI" "$ROOT/scripts/build-whisper.sh"
+else
+    rm -f "$DEST/libherdr_whisper.so"
+    echo 'WHISPER_CPP_SRC unset: this build has no phone Whisper (nix develop .#android-emu sets it).' >&2
+fi
 printf '\nBuilt actual GPUI %s Android library: %s\n' "$ABI" "$DEST/libherdr_gpui_android.so"

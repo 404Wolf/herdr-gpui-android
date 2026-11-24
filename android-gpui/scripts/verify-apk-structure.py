@@ -61,6 +61,8 @@ def check_apks(paths, abi='arm64-v8a'):
     native_check = native_verifier()
     expected_library = f'lib/{abi}/libherdr_gpui_android.so'
     expected_runtime = f'lib/{abi}/libc++_shared.so'
+    # The phone's Whisper (scripts/build-whisper.sh): optional, a plain runtime library.
+    whisper_library = f'lib/{abi}/libherdr_whisper.so'
     owners = {}
     native_entries = []
     dex_entries = []
@@ -106,7 +108,7 @@ def check_apks(paths, abi='arm64-v8a'):
     require(resource_tables > 0, 'No compiled resources.arsc found in the APK set')
     native_names = [name for name, _ in native_entries]
     require(expected_library in native_names, f'Actual GPUI {abi} native library missing')
-    allowed = {expected_library, expected_runtime}
+    allowed = {expected_library, expected_runtime, whisper_library}
     require(set(native_names) <= allowed, 'Unexpected JNI library or ABI')
     for name, data in native_entries:
         native_check.verify_elf(data, runtime=name != expected_library, abi=abi)
