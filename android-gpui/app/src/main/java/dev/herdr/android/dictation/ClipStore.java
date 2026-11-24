@@ -84,6 +84,15 @@ final class ClipStore {
     private final File dir;
     private final java.util.function.LongSupplier clock;
     private final List<Entry> entries = new ArrayList<>();
+    /**
+     * Text the phone proposed for a waiting clip ("Transcribe on this phone"), by clip id: saved
+     * in the index, never offered or placed, until the user takes it ({@link #useProposal}).
+     */
+    private final java.util.Map<String, String> proposals = new java.util.HashMap<>();
+    /** Clips the courier is uploading now (charged, not yet answered). Not saved. */
+    private final Set<String> uploading = new HashSet<>();
+    /** Clips the phone is transcribing now. Not saved: a kill just ends the run. */
+    private final Set<String> here = new HashSet<>();
     /** Bytes held by recordings not yet kept or discarded. */
     private long recording;
 
@@ -331,16 +340,80 @@ final class ClipStore {
             Entry e = entries.get(i);
             if (!e.clip.id.equals(id) || e.text != null) continue;
             int n = e.attempts + 1;
-            // Held (cleared by the user) or parked since the courier's list was made: not sent.
-            if (e.parked() || e.kept()) return -2;
+            // Held (cleared by the user) or parked since the courier's list was made, or being
+            // transcribed on the phone right now: not sent.
+            if (e.parked() || e.kept() || here.contains(id)) return -2;
             entries.set(i, new Entry(e.clip, e.bytes, null, e.keptUntil, n, e.parkedFlag));
             if (!save()) {
                 entries.set(i, e);
                 return -1;
             }
+            uploading.add(id);
             return n;
         }
         return -1;
+    }
+
+    /** The courier's upload of {@code id} is over (whatever came of it). */
+    synchronized void uploaded(String id) {
+        uploading.remove(id);
+    }
+
+    /**
+     * The phone starts transcribing {@code id} for the user: false when it is not a waiting or
+     * parked clip with its audio (transcribed, held, gone), or is being uploaded or transcribed
+     * here already. One run per clip at a time.
+     */
+    synchronized boolean claimHere(String id) {
+        if (uploading.contains(id) || here.contains(id)) return false;
+        for (Entry e : entries) {
+            if (!e.clip.id.equals(id)) continue;
+            if (e.text != null || e.kept() || !audio(id).isFile()) return false;
+            here.add(id);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The phone's run on {@code id} ended: its text (non-null) is saved as the clip's proposal;
+     * null leaves the clip as it was. False when the proposal could not be saved or the clip
+     * was transcribed (by the desktop) meanwhile.
+     */
+    synchronized boolean endHere(String id, String text) {
+        here.remove(id);
+        if (text == null) return false;
+        for (Entry e : entries) {
+            if (!e.clip.id.equals(id)) continue;
+            if (e.text != null || e.kept()) return false;
+            String before = proposals.put(id, text);
+            if (save()) return true;
+            if (before == null) proposals.remove(id);
+            else proposals.put(id, before);
+            return false;
+        }
+        return false;
+    }
+
+    /** The phone's proposed text for {@code id}, or null. */
+    synchronized String proposal(String id) {
+        return proposals.get(id);
+    }
+
+    /** The user kept waiting for the desktop: the proposal goes, the clip stays. */
+    synchronized void dismissProposal(String id) {
+        if (proposals.remove(id) != null) save();
+    }
+
+    /**
+     * The user took the phone's proposal: it becomes the clip's text, exactly as a desktop final
+     * would (the audio goes only once that is saved). False when there is none, or the clip was
+     * transcribed already.
+     */
+    synchronized boolean useProposal(String id) {
+        String text = proposals.get(id);
+        if (text == null || here.contains(id) || uploading.contains(id)) return false;
+        return transcribed(id, text);
     }
 
     /** The charged upload never reached the desktop's decoder: it does not count. */
@@ -492,8 +565,10 @@ final class ClipStore {
             Entry e = entries.get(i);
             if (!e.clip.id.equals(id) || e.text != null || e.kept()) continue;
             entries.set(i, new Entry(e.clip, e.bytes, text == null ? "" : text));
+            String proposed = proposals.remove(id);
             if (!save()) {
                 entries.set(i, e);
+                if (proposed != null) proposals.put(id, proposed);
                 return false;
             }
             //noinspection ResultOfMethodCallIgnored
@@ -506,6 +581,7 @@ final class ClipStore {
     /** Forgets a clip: its text was taken, or the user dropped it. */
     synchronized void remove(String id) {
         if (!entries.removeIf(e -> e.clip.id.equals(id))) return;
+        proposals.remove(id);
         save();
         //noinspection ResultOfMethodCallIgnored
         audio(id).delete();
@@ -513,6 +589,7 @@ final class ClipStore {
 
     private synchronized void load() {
         entries.clear();
+        proposals.clear();
         Set<String> expired = new HashSet<>();
         String text = read(new File(dir, INDEX));
         if (text != null) {
@@ -535,6 +612,9 @@ final class ClipStore {
                             o.getLong("created"), o.getLong("duration"));
                     entries.add(new Entry(clip, bytes, clipText, keptUntil, o.optInt("attempts", 0),
                             o.optBoolean("parked", false)));
+                    if (clipText == null && o.has("proposal") && !o.isNull("proposal")) {
+                        proposals.put(id, o.getString("proposal"));
+                    }
                 }
             } catch (JSONException damaged) {
                 entries.clear();
@@ -586,6 +666,8 @@ final class ClipStore {
                 if (e.kept()) o.put("keptUntil", e.keptUntil);
                 if (e.attempts > 0) o.put("attempts", e.attempts);
                 if (e.parkedFlag) o.put("parked", true);
+                String proposed = proposals.get(e.clip.id);
+                if (proposed != null && e.text == null) o.put("proposal", proposed);
                 list.put(o);
             }
             write(new File(dir, INDEX), list.toString());

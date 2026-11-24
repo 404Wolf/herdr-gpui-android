@@ -48,6 +48,17 @@ public final class PendingDictations {
          * and {@link #onTranscribed} gave it an empty text so its chip goes too.
          */
         default void onNothing(PendingClip clip, DictationException.Reason reason) { }
+
+        /**
+         * "Transcribe on this phone" for {@code clip} ended: {@code text} is its proposal (see
+         * {@link #proposal}), or null with {@code error} saying why it failed. Never placed.
+         */
+        default void onTranscribedHere(PendingClip clip, String text, String error) { }
+    }
+
+    /** The phone's own engine for a saved clip's audio: its text, or null when it failed. */
+    public interface LocalTranscriber {
+        String transcribe(File audio) throws IOException;
     }
 
     /** Turns one clip's audio into text; an IOException means "try again later". */
@@ -261,6 +272,75 @@ public final class PendingDictations {
         return store.parked();
     }
 
+    /**
+     * The user's "Transcribe on this phone" for waiting or parked clip {@code id}: {@code engine}
+     * runs on {@code background} and its text becomes the clip's proposal, shown with Use it /
+     * Keep waiting; nothing is placed and no audio deleted until {@link #useProposal}. False when
+     * the clip cannot be (held, transcribed, being uploaded or already transcribed here). Never
+     * called by the app on its own: only for the user's tap. Main thread.
+     */
+    public boolean transcribeHere(String id, LocalTranscriber engine, Executor background) {
+        PendingClip clip = find(id);
+        if (clip == null || engine == null || !store.claimHere(id)) return false;
+        File audio = store.audio(id);
+        changed();
+        background.execute(() -> {
+            String text = null;
+            String error = null;
+            long t = System.nanoTime();
+            try {
+                text = engine.transcribe(audio);
+                if (text == null) error = "failed";
+            } catch (IOException | RuntimeException e) {
+                error = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            }
+            boolean saved = store.endHere(id, text == null ? null : text.trim());
+            if (text != null && !saved) {
+                // Transcribed by the desktop meanwhile, or the index could not be written.
+                error = store.proposal(id) == null && find(id) == null ? "already transcribed" : "not saved";
+                text = null;
+            }
+            log.accept("dictation: a " + clip.durationMs / 1000 + " s clip transcribed on the phone in "
+                    + (System.nanoTime() - t) / 1_000_000 + " ms" + (text == null ? ", failed" : ", proposed"));
+            String said = text == null ? null : text.trim();
+            String why = error;
+            main.execute(() -> {
+                changed();
+                Listener l = listener;
+                if (l != null) l.onTranscribedHere(clip, said, why);
+            });
+        });
+        return true;
+    }
+
+    /** The phone's proposed text for clip {@code id}, or null. */
+    public String proposal(String id) {
+        return store.proposal(id);
+    }
+
+    /**
+     * The user's Use it: the proposal becomes the clip's text and is placed like a desktop final,
+     * once (its audio deleted only after it is stored). Main thread.
+     */
+    public boolean useProposal(String id) {
+        if (!store.useProposal(id)) return false;
+        offer();
+        return true;
+    }
+
+    /** The user's Keep waiting: the proposal goes; the clip waits for the desktop. Main thread. */
+    public void dismissProposal(String id) {
+        store.dismissProposal(id);
+        changed();
+    }
+
+    /** A clip this store still has waiting (or parked), or null. */
+    private PendingClip find(String id) {
+        for (PendingClip c : store.untranscribed()) if (c.id.equals(id)) return c;
+        for (PendingClip c : store.parked()) if (c.id.equals(id)) return c;
+        return null;
+    }
+
     /** The user's retry of a parked recording: it waits for the desktop again. Main thread. */
     public void retry(String id) {
         if (!store.unpark(id)) return;
@@ -327,6 +407,7 @@ public final class PendingDictations {
             try {
                 text = transcriber.transcribe(clip, store.audio(clip.id));
             } catch (UploadFailure f) {
+                store.uploaded(clip.id);
                 if (f.kind == UploadFailure.Kind.NOTHING) {
                     nothing(clip, f);
                     continue;
@@ -340,9 +421,11 @@ public final class PendingDictations {
                 failed(clip, f, line(sent, sentMs, waiting.size() - sent, started));
                 return;
             } catch (IOException e) {
+                store.uploaded(clip.id);
                 failed(clip, e, line(sent, sentMs, waiting.size() - sent, started));
                 return;
             }
+            store.uploaded(clip.id);
             sent++;
             sentMs += clip.durationMs;
             log.accept("dictation: sent a " + clip.durationMs / 1000 + " s clip in "
