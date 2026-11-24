@@ -201,9 +201,20 @@ final class Outbox {
         final long sentAt;
         /** What the phone knows, in words, for the row; "" when its state says it all. */
         final String known;
+        /**
+         * The user moved it aside while its dictation waits for a transcriber: it no longer holds
+         * its lane, and is never offered until its text is in (then it takes its place again).
+         */
+        final boolean aside;
 
         Message(String id, Target target, String text, Composed composed, State state, Reason reason,
                 boolean tapRequired, long sentAt, String known) {
+            this(id, target, text, composed, state, reason, tapRequired, sentAt, known, false);
+        }
+
+        Message(String id, Target target, String text, Composed composed, State state, Reason reason,
+                boolean tapRequired, long sentAt, String known, boolean aside) {
+            this.aside = aside && DictationToken.in(text);
             this.id = id;
             this.target = target;
             this.host = target.profileId;
@@ -254,6 +265,13 @@ final class Outbox {
          * is never sent, shown or counted; it goes for good after the window.
          */
         long clearedUntil;
+        /** Saved: moved aside by the user (see {@link Message#aside}). */
+        boolean aside;
+
+        /** Aside counts only while its dictation still waits: once filled, it is in line again. */
+        boolean waitsAside() {
+            return aside && DictationToken.in(text);
+        }
 
         Entry(String id, Target target, String text, Composed composed, State state) {
             this.id = id;
@@ -264,7 +282,7 @@ final class Outbox {
         }
 
         Message view() {
-            return new Message(id, target, text, composed, state, reason, tapRequired, sentAt, known);
+            return new Message(id, target, text, composed, state, reason, tapRequired, sentAt, known, waitsAside());
         }
 
         /** Sent, and still keeping its text for Copy and Send again; out of every lane's way. */
@@ -564,7 +582,7 @@ final class Outbox {
     /** The head of {@code e}'s lane: its oldest message not cleared and not already sent. */
     private Entry head(Entry e) {
         for (Entry other : entries) {
-            if (other.clearedUntil > 0 || other.settled()) continue;
+            if (other.clearedUntil > 0 || other.settled() || (other.waitsAside() && other != e)) continue;
             if (sameLane(other, e)) return other;
         }
         return null;
@@ -578,11 +596,62 @@ final class Outbox {
     synchronized Message offer(Live live) {
         if (live == null || live.address.isEmpty() || (live.machine == null)) return null;
         for (Entry e : entries) {
-            if (e.clearedUntil > 0 || e.settled() || !inLane(e, live)) continue;
+            if (e.clearedUntil > 0 || e.settled() || !inLane(e, live) || e.waitsAside()) continue;
             if (e.state != State.PENDING || DictationToken.in(e.text)) return null;
             return e.view();
         }
         return null;
+    }
+
+    /** A lane held by a dictation waiting for a transcriber: its message, clip, and how many wait behind. */
+    static final class Blocked {
+        final String messageId;
+        final String clipId;
+        final int behind;
+
+        Blocked(String messageId, String clipId, int behind) {
+            this.messageId = messageId;
+            this.clipId = clipId;
+            this.behind = behind;
+        }
+    }
+
+    /**
+     * Whether the lane of {@code live} is held at its head by a message whose dictation has not
+     * been transcribed, with messages waiting behind it; null otherwise (factory-9zz.16: said
+     * on screen, never worked around silently).
+     */
+    synchronized Blocked blocked(Live live) {
+        if (live == null || live.address.isEmpty() || live.machine == null) return null;
+        Entry head = null;
+        int behind = 0;
+        for (Entry e : entries) {
+            if (e.clearedUntil > 0 || e.settled() || !inLane(e, live) || e.waitsAside()) continue;
+            if (head == null) {
+                if (e.state != State.PENDING || !DictationToken.in(e.text)) return null;
+                head = e;
+            } else {
+                behind++;
+            }
+        }
+        if (head == null || behind == 0) return null;
+        java.util.List<String> clips = DictationToken.ids(head.text);
+        return new Blocked(head.id, clips.isEmpty() ? null : clips.get(0), behind);
+    }
+
+    /**
+     * The user's "move the clip aside": pending message {@code id}, waiting for its dictation,
+     * stops holding its lane. Nothing is sent by this; the rest are only offered for their tap.
+     * Save after. False when it is not such a message.
+     */
+    synchronized boolean moveAside(String id) {
+        Entry e = find(id);
+        if (e == null || e.state != State.PENDING || e.clearedUntil > 0 || !DictationToken.in(e.text) || e.aside) {
+            return false;
+        }
+        e.aside = true;
+        version++;
+        return true;
     }
 
     /**
@@ -950,7 +1019,8 @@ final class Outbox {
                             .put("wire_text", e.attemptText == null ? "" : e.attemptText))
                     .put("known", e.known)
                     .put("sent", e.sentAt == 0 ? JSONObject.NULL : new JSONObject().put("wall_ms", e.sentAt))
-                    .put("cleared_until", e.clearedUntil);
+                    .put("cleared_until", e.clearedUntil)
+                    .put("aside", e.aside);
             list.put(item);
         }
         return new JSONObject().put("v", 2).put("messages", list).put("settled", new JSONArray(settled)).toString();
@@ -1007,6 +1077,7 @@ final class Outbox {
                 JSONObject sent = item.optJSONObject("sent");
                 entry.sentAt = sent == null ? 0 : sent.optLong("wall_ms", 0);
                 entry.clearedUntil = item.optLong("cleared_until", 0);
+                entry.aside = item.optBoolean("aside", false);
                 into.add(entry);
             }
             return true;
