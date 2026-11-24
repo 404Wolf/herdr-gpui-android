@@ -77,7 +77,8 @@ sha256sum "$DEST/libherdr_gpui_android.so"
 # The phone's Whisper beside it (DICTATION.md): whisper.cpp from the pinned source. A shell
 # without that source builds an APK without it, said here rather than failing.
 if [[ -n "${WHISPER_CPP_SRC:-}" ]]; then
-    HERDR_ANDROID_ABI="$ABI" "$ROOT/scripts/build-whisper.sh"
+    # bash, not the shebang: a Nix build sandbox has no /usr/bin/env.
+    HERDR_ANDROID_ABI="$ABI" bash "$ROOT/scripts/build-whisper.sh"
 else
     rm -f "$DEST/libherdr_whisper.so"
     echo 'WHISPER_CPP_SRC unset: this build has no phone Whisper (nix develop .#android-emu sets it).' >&2
