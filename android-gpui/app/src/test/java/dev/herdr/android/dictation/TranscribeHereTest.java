@@ -36,6 +36,38 @@ public final class TranscribeHereTest {
         worker.shutdownNow();
     }
 
+    /** Runs everything the worker has been given. */
+    private void drain() {
+        try {
+            worker.submit(() -> { }).get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** t4g1 S2: Use it writes the index on the worker, never on the caller's (UI) thread. */
+    @Test public void useItIsSavedOnTheWorkerNotTheCallersThread() throws Exception {
+        ClipStore store = store();
+        PendingClip clip = record(store);
+        PendingDictations p = courier(store, AWAY);
+        assertTrue(p.transcribeHere(clip.id, audio -> "words", now));
+        CountDownLatch hold = new CountDownLatch(1);
+        worker.execute(() -> {
+            try {
+                hold.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                // The test ends.
+            }
+        });
+        assertTrue(p.useProposal(clip.id));
+        assertEquals("nothing written yet", "words", store.proposal(clip.id));
+        assertTrue(store.audio(clip.id).isFile());
+        hold.countDown();
+        drain();
+        assertEquals(List.of(clip.id + "=words"), placed);
+        assertFalse(store.audio(clip.id).exists());
+    }
+
     private ClipStore store() {
         return new ClipStore(new File(dir.getRoot(), "pending"));
     }
@@ -81,6 +113,7 @@ public final class TranscribeHereTest {
         assertEquals("hello there", store().proposal(clip.id));
 
         assertTrue(p.useProposal(clip.id));
+        drain();
         assertEquals(List.of(clip.id + "=hello there"), placed);
         assertFalse("the audio goes once its text is stored", store.audio(clip.id).exists());
         assertFalse("exactly once", p.useProposal(clip.id));
@@ -94,6 +127,7 @@ public final class TranscribeHereTest {
         PendingDictations p = courier(store, AWAY);
         assertTrue(p.transcribeHere(clip.id, audio -> "maybe wrong", now));
         p.dismissProposal(clip.id);
+        drain();
         assertNull(p.proposal(clip.id));
         assertTrue(store.audio(clip.id).isFile());
         assertEquals(1, store.untranscribed().size());

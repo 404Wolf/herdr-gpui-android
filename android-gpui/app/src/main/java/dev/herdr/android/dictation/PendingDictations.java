@@ -347,15 +347,22 @@ public final class PendingDictations {
      * once (its audio deleted only after it is stored). Main thread.
      */
     public boolean useProposal(String id) {
-        if (!store.useProposal(id)) return false;
-        offer();
+        if (store.proposal(id) == null) return false;
+        // The index is written on the worker, never the UI's thread; the text is then placed
+        // like a desktop final, through the listener.
+        worker.execute(() -> {
+            if (store.useProposal(id)) main.execute(this::offer);
+            else main.execute(this::changed);
+        });
         return true;
     }
 
     /** The user's Keep waiting: the proposal goes; the clip waits for the desktop. Main thread. */
     public void dismissProposal(String id) {
-        store.dismissProposal(id);
-        changed();
+        worker.execute(() -> {
+            store.dismissProposal(id);
+            main.execute(this::changed);
+        });
     }
 
     /** A clip this store still has waiting (or parked), or null. */

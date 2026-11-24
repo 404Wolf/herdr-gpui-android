@@ -49,7 +49,28 @@ public class LocalWhisperTest {
             // Silence is no speech, not an error.
             String quiet = whisper.transcribe(new byte[16000 * 2], 16000 * 2);
             assertNotNull(quiet);
+            // t4g1 B1: a length past the array is refused, never read out of bounds.
+            assertNull(whisper.transcribe(pcm, pcm.length + 4096));
+            assertNull(whisper.transcribe(pcm, -2));
+            // t4g1 S5: an abort just before a run is not lost; the run after it works again.
+            whisper.abort();
+            assertNull("aborted before it began", whisper.transcribe(pcm, pcm.length));
+            assertEquals(fromFile, whisper.transcribe(pcm, pcm.length));
+            // t4g1 M2: a file past the bound is not read into memory.
+            assertNull(whisper.transcribe(clip, pcm.length - 2));
+            assertEquals(fromFile, whisper.transcribe(clip, pcm.length));
         }
+    }
+
+    /** t4g1 B2: Whisper's bytes are decoded as UTF-8 in Java, a split character replaced, never a JNI abort. */
+    @Test
+    public void whispersTextIsDecodedAsUtf8WithReplacement() {
+        byte[] emoji = "ok \uD83D\uDE00 done".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        assertEquals("ok \uD83D\uDE00 done", LocalWhisper.text(emoji));
+        byte[] split = java.util.Arrays.copyOf(emoji, 5); // "ok " and half of the emoji
+        assertEquals("ok \uFFFD", LocalWhisper.text(split));
+        assertNull(LocalWhisper.text(null));
+        assertEquals("", LocalWhisper.text("  \n".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
 
     @Test

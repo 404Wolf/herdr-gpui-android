@@ -178,11 +178,13 @@ final class OutboxCourier {
      */
     boolean moveAside(String id) {
         if (!outbox.moveAside(id)) return false;
-        if (!outbox.save()) {
-            outbox.unmoveAside(id);
-            return false;
-        }
         changed();
+        // Saved on the courier's thread (never the UI's); a save that fails takes it back.
+        thread.execute(() -> {
+            if (outbox.save()) return;
+            outbox.unmoveAside(id);
+            changed();
+        });
         return true;
     }
 

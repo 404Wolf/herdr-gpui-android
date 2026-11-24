@@ -267,6 +267,7 @@ final class QueueView {
                 if (m.reason == Outbox.Reason.GONE) return cover ? "✗" : "✗ needs you · " + m.pane + " gone";
                 return cover ? "?" : "? may have been sent · needs you";
             default:
+                if (m.aside) return cover ? "◌↷" : "◌ moved aside · back at its place once transcribed";
                 if (m.awaitsDictation) return cover ? "◌" : "◌ waits for desktop";
                 if (m.unverified()) return cover ? "◌?" : "◌ held · destination not verified";
                 return cover ? "◌" + place : "◌ held " + ordinal(place) + " · tap Send";

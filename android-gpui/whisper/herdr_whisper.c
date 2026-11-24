@@ -2,7 +2,9 @@
 // English (base.en), greedy decoding, no timestamps, CPU only. Audio is PCM16 little-endian mono
 // 16 kHz, as the app records it; it is converted to float here and never leaves the process.
 // A transcription can be aborted from another thread (LocalWhisper.abort): whisper.cpp polls the
-// flag between decoder steps.
+// flag between decoder steps; an abort that comes before a run stops that run, and the flag is
+// cleared after each run. The text goes back as UTF-8 bytes (Whisper's segments may split a
+// character, and emit ones Modified UTF-8 cannot carry): Java decodes them, with replacement.
 #include <jni.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -58,12 +60,12 @@ JNIEXPORT void JNICALL Java_dev_herdr_android_dictation_LocalWhisper_close(JNIEn
     free(w);
 }
 
-// The text of PCM16 samples, or NULL when whisper failed or was aborted.
-static jstring transcribe(JNIEnv *env, struct herdr_whisper *w, const int16_t *pcm, size_t n, int threads) {
+// The text of PCM16 samples as UTF-8 bytes, or NULL when whisper failed or was aborted.
+static jbyteArray transcribe(JNIEnv *env, struct herdr_whisper *w, const int16_t *pcm, size_t n, int threads) {
+    if (atomic_exchange(&w->abort, 0) != 0) return NULL;
     float *samples = malloc((n > 0 ? n : 1) * sizeof *samples);
     if (samples == NULL) return NULL;
     for (size_t i = 0; i < n; i++) samples[i] = (float) pcm[i] / 32768.0f;
-    atomic_store(&w->abort, 0);
     struct whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     p.n_threads = threads > 0 ? threads : 4;
     p.language = "en";
@@ -78,7 +80,7 @@ static jstring transcribe(JNIEnv *env, struct herdr_whisper *w, const int16_t *p
     p.abort_callback_user_data = w;
     int rc = whisper_full(w->ctx, p, samples, (int) n);
     free(samples);
-    if (rc != 0 || atomic_load(&w->abort) != 0) return NULL;
+    if (atomic_exchange(&w->abort, 0) != 0 || rc != 0) return NULL;
     size_t cap = 256, len = 0;
     char *text = malloc(cap);
     if (text == NULL) return NULL;
@@ -100,28 +102,31 @@ static jstring transcribe(JNIEnv *env, struct herdr_whisper *w, const int16_t *p
         len += add;
         text[len] = '\0';
     }
-    jstring out = (*env)->NewStringUTF(env, text);
+    jbyteArray out = (*env)->NewByteArray(env, (jsize) len);
+    if (out != NULL) (*env)->SetByteArrayRegion(env, out, 0, (jsize) len, (const jbyte *) text);
     free(text);
     return out;
 }
 
-JNIEXPORT jstring JNICALL Java_dev_herdr_android_dictation_LocalWhisper_transcribePcm(JNIEnv *env, jclass cls,
+JNIEXPORT jbyteArray JNICALL Java_dev_herdr_android_dictation_LocalWhisper_transcribePcm(JNIEnv *env, jclass cls,
         jlong handle, jbyteArray pcm, jint length, jint threads) {
     (void) cls;
     struct herdr_whisper *w = (struct herdr_whisper *) (intptr_t) handle;
-    if (w == NULL || pcm == NULL || length < 0) return NULL;
+    // Never past the array: a length it does not hold is refused, not read.
+    if (w == NULL || pcm == NULL || length < 0 || length > (*env)->GetArrayLength(env, pcm)) return NULL;
     jbyte *bytes = (*env)->GetByteArrayElements(env, pcm, NULL);
     if (bytes == NULL) return NULL;
-    jstring out = transcribe(env, w, (const int16_t *) bytes, (size_t) length / 2, threads);
+    jbyteArray out = transcribe(env, w, (const int16_t *) bytes, (size_t) length / 2, threads);
     (*env)->ReleaseByteArrayElements(env, pcm, bytes, JNI_ABORT);
     return out;
 }
 
-JNIEXPORT jstring JNICALL Java_dev_herdr_android_dictation_LocalWhisper_transcribeFile(JNIEnv *env, jclass cls,
-        jlong handle, jstring file, jint threads) {
+JNIEXPORT jbyteArray JNICALL Java_dev_herdr_android_dictation_LocalWhisper_transcribeFile(JNIEnv *env, jclass cls,
+        jlong handle, jstring file, jlong max_bytes, jint threads) {
     (void) cls;
     struct herdr_whisper *w = (struct herdr_whisper *) (intptr_t) handle;
-    if (w == NULL || file == NULL) return NULL;
+    if (w == NULL || file == NULL || max_bytes < 0) return NULL;
+    size_t max_samples = (size_t) max_bytes / 2;
     const char *path = (*env)->GetStringUTFChars(env, file, NULL);
     if (path == NULL) return NULL;
     FILE *f = fopen(path, "rb");
@@ -130,6 +135,12 @@ JNIEXPORT jstring JNICALL Java_dev_herdr_android_dictation_LocalWhisper_transcri
     size_t cap = 1 << 20, n = 0;
     int16_t *pcm = malloc(cap * sizeof *pcm);
     while (pcm != NULL) {
+        if (n > max_samples) {
+            // Past the bound (a recording is at most 15 minutes): not read into memory.
+            free(pcm);
+            pcm = NULL;
+            break;
+        }
         if (n == cap) {
             int16_t *grown = realloc(pcm, cap * 2 * sizeof *pcm);
             if (grown == NULL) {
@@ -146,7 +157,7 @@ JNIEXPORT jstring JNICALL Java_dev_herdr_android_dictation_LocalWhisper_transcri
     }
     fclose(f);
     if (pcm == NULL) return NULL;
-    jstring out = transcribe(env, w, pcm, n, threads);
+    jbyteArray out = transcribe(env, w, pcm, n, threads);
     free(pcm);
     return out;
 }

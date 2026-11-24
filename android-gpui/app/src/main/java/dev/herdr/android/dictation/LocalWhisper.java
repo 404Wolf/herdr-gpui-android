@@ -46,18 +46,30 @@ public final class LocalWhisper implements AutoCloseable {
         return h == 0 ? null : new LocalWhisper(h, threads);
     }
 
-    /** PCM16 mono 16 kHz audio's text (trimmed; empty when it heard no speech), or null on failure or abort. */
+    /**
+     * PCM16 mono 16 kHz audio's text (trimmed; empty when it heard no speech), or null on failure,
+     * on an abort (one that came before the run too), or when {@code length} is not within
+     * {@code pcm}.
+     */
     synchronized String transcribe(byte[] pcm, int length) {
-        if (handle == 0) return null;
-        String text = transcribePcm(handle, pcm, length, threads);
-        return text == null ? null : text.trim();
+        if (handle == 0 || pcm == null || length < 0 || length > pcm.length) return null;
+        return text(transcribePcm(handle, pcm, length, threads));
     }
 
-    /** The same for a raw PCM16 file (a saved clip). */
+    /** The same for a raw PCM16 file (a saved clip), at most a recording's bound. */
     synchronized String transcribe(File pcm) {
+        return transcribe(pcm, ClipStore.MAX_CLIP_BYTES);
+    }
+
+    /** {@link #transcribe(File)} with a bound: a longer file is not read (null). */
+    synchronized String transcribe(File pcm, long maxBytes) {
         if (handle == 0) return null;
-        String text = transcribeFile(handle, pcm.getAbsolutePath(), threads);
-        return text == null ? null : text.trim();
+        return text(transcribeFile(handle, pcm.getAbsolutePath(), maxBytes, threads));
+    }
+
+    /** Whisper's UTF-8, decoded with replacement (a split character never fails the text). */
+    static String text(byte[] utf8) {
+        return utf8 == null ? null : new String(utf8, java.nio.charset.StandardCharsets.UTF_8).trim();
     }
 
     /** Guards the handle between {@link #abort} (any thread) and {@link #close}. */
@@ -83,9 +95,9 @@ public final class LocalWhisper implements AutoCloseable {
 
     private static native long open(String model);
 
-    private static native String transcribePcm(long handle, byte[] pcm, int length, int threads);
+    private static native byte[] transcribePcm(long handle, byte[] pcm, int length, int threads);
 
-    private static native String transcribeFile(long handle, String file, int threads);
+    private static native byte[] transcribeFile(long handle, String file, long maxBytes, int threads);
 
     private static native void abort(long handle);
 
