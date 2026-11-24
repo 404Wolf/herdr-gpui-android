@@ -670,10 +670,20 @@ final class Outbox {
      * that doubt, and a sent one stays sent. True when anything changed.
      */
     synchronized boolean observe(MachineKey machine, Map<String, Long> terminals) {
+        return observe(machine, null, terminals);
+    }
+
+    /**
+     * As {@link #observe(MachineKey, Map)}, by a link in {@code session} (null: any): a message
+     * typed in another session on this machine is that session's, and this list never marks it
+     * gone (a re-confirmed binding shares the machine with older sessionless messages, 11-24).
+     */
+    synchronized boolean observe(MachineKey machine, String session, Map<String, Long> terminals) {
         if (machine == null || terminals == null) return false;
         boolean changed = false;
         for (Entry e : entries) {
             if (e.state != State.PENDING || !machine.equals(e.target.machine)) continue;
+            if (session != null && !e.target.session.equals(session)) continue;
             boolean listed = terminals.containsKey(e.target.address);
             Long created = listed ? terminals.get(e.target.address) : null;
             boolean replaced = created != null && e.target.createdMs != null && !created.equals(e.target.createdMs);

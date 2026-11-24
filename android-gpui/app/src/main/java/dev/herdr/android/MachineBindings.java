@@ -25,25 +25,64 @@ final class MachineBindings {
     /** Revisions remembered; the oldest binding goes first beyond this. */
     static final int MAX_BINDINGS = 64;
 
+    /** What a refused binding collides with: another revision's binding, or a held message. */
+    enum Kind { BINDING, HELD }
+
     /** What a revision's hello established. */
     static final class Binding {
         final String profile, revision, session, name;
         final MachineKey machine;
         /** The profile whose binding this one collides with, or null when it is bound. */
         final String refusedBy;
+        /** For a refused binding: the colliding session ("" when it was saved without one), and its kind. */
+        final String refusedSession;
+        final Kind refusedKind;
+        /** Bound because the person re-confirmed it ({@link #reconfirm}): a later hello keeps it. */
+        final boolean confirmed;
 
         Binding(String profile, String revision, String session, String name, MachineKey machine, String refusedBy) {
+            this(profile, revision, session, name, machine, refusedBy, null, null, false);
+        }
+
+        Binding(String profile, String revision, String session, String name, MachineKey machine, String refusedBy,
+                String refusedSession, Kind refusedKind, boolean confirmed) {
             this.profile = profile;
             this.revision = revision;
             this.session = session;
             this.name = name;
             this.machine = machine;
             this.refusedBy = refusedBy;
+            this.refusedSession = refusedBy == null ? null : refusedSession == null ? "" : refusedSession;
+            this.refusedKind = refusedBy == null ? null : refusedKind == null ? Kind.BINDING : refusedKind;
+            this.confirmed = refusedBy == null && confirmed;
         }
 
         boolean bound() {
             return refusedBy == null;
         }
+    }
+
+    /**
+     * The refused banner (Wolf's Fold, 11-24): which saved computer or held message this one
+     * collides with, its session, and the machine's core id and host key, shortened, with the way
+     * out. Null for a bound binding.
+     */
+    static String refusal(Binding b) {
+        if (b == null || b.bound()) return null;
+        String with = b.refusedKind == Kind.HELD ? "a message held for " + b.refusedBy : "saved computer " + b.refusedBy;
+        return "This computer reports the same Herdr as " + b.refusedBy + " (" + with + ", session \""
+                + b.refusedSession + "\"; core " + prefix(b.machine.core) + ", host key " + prefix(hostKey(b.machine))
+                + "); it works live only. ⋮ › Re-confirm this computer";
+    }
+
+    private static String hostKey(MachineKey machine) {
+        String key = machine.hostKey;
+        int colon = key.indexOf(':');
+        return colon >= 0 ? key.substring(colon + 1) : key;
+    }
+
+    private static String prefix(String value) {
+        return value.length() <= 8 ? value : value.substring(0, 8);
     }
 
     private static MachineBindings shared;
@@ -83,8 +122,10 @@ final class MachineBindings {
                 String revision = item.optString("revision", "");
                 if (machine == null || profile.isEmpty() || revision.isEmpty()) continue;
                 String refused = item.optString("refused_by", "");
+                Kind kind = "held".equals(item.optString("refused_kind", "")) ? Kind.HELD : Kind.BINDING;
                 bindings.add(new Binding(profile, revision, item.optString("session", ""), item.optString("name", ""),
-                        machine, refused.isEmpty() ? null : refused));
+                        machine, refused.isEmpty() ? null : refused, item.optString("refused_session", ""), kind,
+                        item.optBoolean("confirmed", false)));
             }
         } catch (JSONException damaged) {
             bindings.clear();
@@ -112,23 +153,69 @@ final class MachineBindings {
         }
         String ownSession = session == null ? "" : session;
         String ownName = name == null ? "" : name;
-        String refusedBy = null;
+        Binding previous = find(profile, revision);
+        // Re-confirmed by the person for this very machine and session: kept, not asked again.
+        if (previous != null && previous.confirmed && previous.machine.equals(machine)
+                && previous.session.equals(ownSession)) {
+            return previous;
+        }
+        Binding next = collision(profile, revision, ownSession, ownName, machine, held, null);
+        if (next == null) next = new Binding(profile, revision, ownSession, ownName, machine, null);
+        if (previous != null && same(previous, next)) return previous;
+        return record(previous, next, held);
+    }
+
+    /**
+     * The person's "Re-confirm this computer", from the live hello of {@code profile} at
+     * {@code revision}: binds it to {@code machine} when everything it collides with is stale,
+     * that is a binding of a revision that is no longer its profile's saved one ({@code current}
+     * says which are), or a binding or held message saved with no session. A real duplicate (a
+     * saved profile, or a held message, of another named session on this machine) stays refused.
+     * The stale bindings are kept as they are and no held message changes: those of another
+     * session stay that session's (Outbox's lanes and observe go by session).
+     */
+    synchronized Binding reconfirm(String profile, String revision, String session, String name, MachineKey machine,
+            java.util.Collection<Outbox.Message> held, java.util.function.BiPredicate<String, String> current) {
+        if (profile == null || profile.isEmpty() || revision == null || revision.isEmpty() || machine == null
+                || current == null) {
+            return null;
+        }
+        String ownSession = session == null ? "" : session;
+        String ownName = name == null ? "" : name;
+        Binding previous = find(profile, revision);
+        Binding real = collision(profile, revision, ownSession, ownName, machine, held, current);
+        if (real != null) return previous != null && !previous.bound() ? previous : real;
+        Binding next = new Binding(profile, revision, ownSession, ownName, machine, null, null, null, true);
+        return record(previous, next, held);
+    }
+
+    /**
+     * The first collision of a hello, as a refused binding, or null. With {@code current}, only a
+     * real one: stale bindings and sessionless entries are let through (see {@link #reconfirm}).
+     */
+    private Binding collision(String profile, String revision, String ownSession, String ownName, MachineKey machine,
+            java.util.Collection<Outbox.Message> held, java.util.function.BiPredicate<String, String> current) {
         for (Binding other : bindings) {
             if (other.profile.equals(profile) && other.revision.equals(revision)) continue;
-            if (other.bound() && other.machine.equals(machine) && !other.session.equals(ownSession)) {
-                refusedBy = other.name.isEmpty() ? "another saved computer" : other.name;
-                break;
+            if (!other.bound() || !other.machine.equals(machine) || other.session.equals(ownSession)) continue;
+            if (current != null && (other.session.isEmpty() || ownSession.isEmpty()
+                    || !current.test(other.profile, other.revision))) {
+                continue;
             }
+            String by = other.name.isEmpty() ? "another saved computer" : other.name;
+            return new Binding(profile, revision, ownSession, ownName, machine, by, other.session, Kind.BINDING, false);
         }
         for (Outbox.Message m : held) {
-            if (refusedBy != null) break;
-            if (machine.equals(m.target.machine) && !m.target.session.equals(ownSession)) {
-                refusedBy = m.target.profileName.isEmpty() ? "another saved computer" : m.target.profileName;
-            }
+            if (!machine.equals(m.target.machine) || m.target.session.equals(ownSession)) continue;
+            if (current != null && (m.target.session.isEmpty() || ownSession.isEmpty())) continue;
+            String by = m.target.profileName.isEmpty() ? "another saved computer" : m.target.profileName;
+            return new Binding(profile, revision, ownSession, ownName, machine, by, m.target.session, Kind.HELD, false);
         }
-        Binding next = new Binding(profile, revision, ownSession, ownName, machine, refusedBy);
-        Binding previous = find(profile, revision);
-        if (previous != null && same(previous, next)) return previous;
+        return null;
+    }
+
+    /** Records {@code next} in place of {@code previous}, evicts the oldest beyond the cap, saves. */
+    private Binding record(Binding previous, Binding next, java.util.Collection<Outbox.Message> held) {
         if (previous != null) bindings.remove(previous);
         bindings.add(next);
         java.util.Set<MachineKey> referenced = new java.util.HashSet<>();
@@ -148,7 +235,9 @@ final class MachineBindings {
 
     private static boolean same(Binding a, Binding b) {
         return a.machine.equals(b.machine) && a.session.equals(b.session) && a.name.equals(b.name)
-                && java.util.Objects.equals(a.refusedBy, b.refusedBy);
+                && java.util.Objects.equals(a.refusedBy, b.refusedBy)
+                && java.util.Objects.equals(a.refusedSession, b.refusedSession) && a.refusedKind == b.refusedKind
+                && a.confirmed == b.confirmed;
     }
 
     /**
@@ -181,7 +270,11 @@ final class MachineBindings {
         for (Binding b : bindings) {
             JSONObject item = new JSONObject().put("profile", b.profile).put("revision", b.revision)
                     .put("session", b.session).put("name", b.name).put("machine", b.machine.json());
-            if (b.refusedBy != null) item.put("refused_by", b.refusedBy);
+            if (b.refusedBy != null) {
+                item.put("refused_by", b.refusedBy).put("refused_session", b.refusedSession)
+                        .put("refused_kind", b.refusedKind == Kind.HELD ? "held" : "binding");
+            }
+            if (b.confirmed) item.put("confirmed", true);
             list.put(item);
         }
         return new JSONObject().put("v", 1).put("bindings", list).toString();

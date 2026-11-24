@@ -1334,9 +1334,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             boolean panelShown = cover ? workPanelOpen : !panelChoice().hidden;
             menu.getMenu().add(0, 9, MoreMenu.USAGE, panelShown ? "Hide overview and tasks" : "Overview and tasks");
         }
+        // A refused binding's way out (11-24), only while it is refused.
+        if (here().refusedBy != null) menu.getMenu().add(0, 10, MoreMenu.VIEW, "Re-confirm this computer");
         menu.setForceShowIcon(true);
         menu.setOnMenuItemClickListener(item -> {
-            if (item.getItemId() == 9) {
+            if (item.getItemId() == 10) {
+                showReconfirm();
+            }
+            else if (item.getItemId() == 9) {
                 if (getResources().getConfiguration().screenWidthDp < WorkPanelLayout.COVER_DP) toggleWorkPanel(!workPanelOpen);
                 else choosePanel(WorkPanelLayout.toggled(panelChoice()));
             }
@@ -1353,6 +1358,70 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             return true;
         });
         menu.show();
+    }
+
+    /**
+     * "Re-confirm this computer" (Wolf's Fold, 11-24): what the refused profile collides with,
+     * then the person's choice. Only from a live hello: the core id it reports now and the host
+     * key this link authenticated, never a saved guess.
+     */
+    private void showReconfirm() {
+        Connection c;
+        boolean live;
+        String boot;
+        synchronized (stateLock) {
+            c = connection;
+            live = c != null && c.ready && !c.isClosed() && !c.offline;
+            boot = c == null ? null : c.remoteBoot;
+        }
+        if (c == null || c.hostId == null || c.connectionRevision == null || bindings == null || outbox == null) return;
+        MachineKey key = live ? MachineKey.of(boot, c.fingerprint) : null;
+        if (key == null) {
+            note("Connect to " + c.hostName + " first: re-confirming uses its live answer");
+            return;
+        }
+        MachineBindings.Binding was = bindings.binding(c.hostId, c.connectionRevision);
+        String why = was == null || was.bound() ? "" : MachineBindings.refusal(was).replace(" ⋮ › Re-confirm this computer", "");
+        new ActionSheet(this, chrome, why + " Re-confirming makes " + c.hostName + " this Herdr for this phone,"
+                + " if what it collides with is stale. Held messages keep the computer they were typed for.")
+                .add("Re-confirm: this is " + c.hostName, () -> reconfirm(c, key))
+                .add("Keep it live only", () -> { })
+                .show();
+    }
+
+    /** The person's tap: binds off the main thread (a disk write), then says what happened. */
+    private void reconfirm(Connection c, MachineKey key) {
+        java.util.List<SavedRemoteHost> hosts = savedHosts;
+        Thread worker = new Thread(() -> {
+            MachineBindings.Binding binding = bindings.reconfirm(c.hostId, c.connectionRevision, c.session, c.hostName,
+                    key, outbox.outbox().all(), (profile, revision) -> {
+                        for (SavedRemoteHost h : hosts) {
+                            if (h.id.equals(profile) && h.connectionRevision.equals(revision)) return true;
+                        }
+                        return false;
+                    });
+            boolean bound = binding != null && binding.bound();
+            android.util.Log.w("herdr-bindings", "re-confirm " + c.hostName + " (session \"" + c.session + "\") at " + key + ": "
+                    + (bound ? "bound" : "still refused, " + (binding == null ? "no binding" : binding.refusedKind + " "
+                            + binding.refusedBy + " (session \"" + binding.refusedSession + "\")")));
+            if (bound) {
+                synchronized (stateLock) {
+                    if (connection == c && !c.isClosed()) {
+                        c.machine = key;
+                        c.refusedBy = null;
+                        c.refusedWords = null;
+                    }
+                }
+            }
+            main.post(() -> {
+                if (destroyed) return;
+                note(bound ? "Re-confirmed " + c.hostName + ": messages can be held for it again"
+                        : "Still refused: another saved computer really reaches this Herdr in another session");
+                refreshQueued();
+            });
+        }, "herdr-reconfirm");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /** The usage feed of the machine on screen (UsageFeed): kept answers, one look at a time. */
@@ -4719,7 +4788,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             if (liveHere && !awaits) return typeLiveOnly(text);
             note(here.relayed ? "Open that computer directly to hold messages for it; the draft is kept"
                     : here.refusedBy != null ? "This computer reports the same Herdr as " + here.refusedBy
-                            + "; it works live only. The draft is kept"
+                            + "; it works live only. The draft is kept. ⋮ › Re-confirm this computer"
                     : "Not connected, and this computer was never reached from this profile; the draft is kept");
             return false;
         }
@@ -5022,9 +5091,13 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
             // publishes this connection's own list once it has one (TranscriptKeeper.mayPublish).
         } else {
             current.refusedBy = binding.refusedBy;
-            String other = binding.refusedBy;
-            main.post(() -> note("This computer reports the same Herdr as " + other
-                    + "; it works live only, and nothing is held for it"));
+            current.refusedWords = MachineBindings.refusal(binding);
+            // What it collides with, by identity (11-24): never a message's words.
+            android.util.Log.w("herdr-bindings", "refused: " + current.hostName + " (session \"" + current.session + "\") reaches "
+                    + key + ", as " + binding.refusedKind + " " + binding.refusedBy + " (session \""
+                    + binding.refusedSession + "\")");
+            String words = current.refusedWords;
+            main.post(() -> note(words));
         }
         main.post(this::refreshQueued);
     }
@@ -6766,7 +6839,7 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 }
                 if (selected && chromeChanged && current.machine != null) {
                     // A direct link's own list: held messages for a terminal not on it are gone.
-                    outbox.observe(current.machine, terminals(current.panes));
+                    outbox.observe(current.machine, current.session, terminals(current.panes));
                 }
                 publishTranscriptProof(current, selected);
                 final boolean scrolledBack = state.optLong("local_offset", 0) > 0;
@@ -7503,6 +7576,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         volatile MachineKey machine;
         /** The profile this one's machine collides with (a refused binding), or null. */
         volatile String refusedBy;
+        /** That refusal in words, with what it collides with (MachineBindings.refusal). */
+        volatile String refusedWords;
         /** The attach on screen (0: none) and whether it has painted, from the poll. */
         volatile long attach;
         volatile boolean painted;
