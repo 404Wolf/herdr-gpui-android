@@ -38,4 +38,32 @@ final class RecognizerChoice {
     static boolean foreignCapture(int baseline, int now) {
         return now > baseline;
     }
+
+    /** The phone's language as a BCP 47 tag ("en-GB"), else "en-US" when it has none. */
+    static String language(java.util.Locale locale) {
+        if (locale == null || locale.getLanguage().isEmpty()) return "en-US";
+        return locale.toLanguageTag();
+    }
+
+    /** A recognizer error (SpeechRecognizer.ERROR_*) in words, for the log and the status. */
+    static String errorName(int error) {
+        switch (error) {
+            case 1: return "network timeout (1)";
+            case 2: return "network error (2)";
+            case 3: return "audio error (3)";
+            case 4: return "server error (4)";
+            case 5: return "client error (5)";
+            case 6: return "heard no speech in time (6)";
+            case 7: return "no match (7)";
+            case 8: return "busy (8)";
+            case 9: return "no microphone permission (9)";
+            case 10: return "too many requests (10)";
+            case 11: return "server disconnected (11)";
+            case 12: return "it does not support this language (12)";
+            case 13: return "its language model is not downloaded (13)";
+            case 14: return "it cannot check this language (14)";
+            case 15: return "the request was cut short (15)";
+            default: return "error " + error;
+        }
+    }
 }

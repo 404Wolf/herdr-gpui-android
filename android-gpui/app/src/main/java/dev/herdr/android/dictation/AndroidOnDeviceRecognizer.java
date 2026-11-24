@@ -145,7 +145,7 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
         closeQuietly(old);
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, RecognizerChoice.language(java.util.Locale.getDefault()))
                 .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
                 .putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, source)
@@ -326,8 +326,9 @@ final class AndroidOnDeviceRecognizer implements OnDeviceRecognizer {
             } else if (quiet) {
                 if (!listen()) fail("could not restart");
             } else {
-                Log.i(TAG, "dictation: the phone's recognizer failed, error " + error);
-                fail("error " + error);
+                String why = RecognizerChoice.errorName(error);
+                Log.i(TAG, "dictation: the phone's recognizer failed: " + why);
+                fail(why);
             }
         }
     }
