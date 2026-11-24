@@ -86,6 +86,7 @@ public final class ReconfirmBindingTest {
         Outbox outbox = outbox();
         outbox.add("h1", serverTarget("", "t1b6"), "first", new Outbox.Composed(1_000, 50, 3));
         outbox.add("h2", serverTarget("", "t1b6"), "second", new Outbox.Composed(2_000, 60, 3));
+        outbox.save();
         List<String> before = describe(outbox.all());
 
         MachineBindings bindings = fresh();

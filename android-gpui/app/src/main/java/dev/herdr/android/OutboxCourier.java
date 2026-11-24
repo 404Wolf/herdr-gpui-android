@@ -141,9 +141,17 @@ final class OutboxCourier {
         }
     }
 
-    /** A direct link to {@code machine} lists these live terminals; pending ones not there are gone. */
+    /** {@link #observe(MachineKey, String, java.util.Map)} by a link of any session. */
     void observe(MachineKey machine, java.util.Map<String, Long> terminals) {
-        if (!outbox.observe(machine, terminals)) return;
+        observe(machine, null, terminals);
+    }
+
+    /**
+     * A direct link to {@code machine} in {@code session} lists these live terminals; pending ones
+     * of that session not there are gone.
+     */
+    void observe(MachineKey machine, String session, java.util.Map<String, Long> terminals) {
+        if (!outbox.observe(machine, session, terminals)) return;
         thread.execute(outbox::save);
         changed();
     }
