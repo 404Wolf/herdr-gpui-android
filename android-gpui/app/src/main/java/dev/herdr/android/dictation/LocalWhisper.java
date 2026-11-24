@@ -1,0 +1,85 @@
+package dev.herdr.android.dictation;
+
+import java.io.File;
+
+/**
+ * whisper.cpp on the phone's CPU (libherdr_whisper, built from the pinned whisper.cpp source by
+ * scripts/build-whisper.sh): the English base.en model in a separate, checksum-verified file
+ * ({@link LocalModel}). Used only when the desktop's Whisper is unavailable, or for a saved clip
+ * the user asks to transcribe on the phone. Never touches the network.
+ *
+ * <p>One transcription at a time per instance; {@link #abort} may be called from any thread.
+ * Calls block for seconds: never on the main thread.
+ */
+public final class LocalWhisper implements AutoCloseable {
+    /** The model is English-only: said wherever its text is shown. */
+    public static final String LANGUAGE_NOTE = "English only";
+
+    private static volatile boolean loaded;
+
+    /** Loads the native library once; false when this build has none. */
+    static synchronized boolean load() {
+        if (loaded) return true;
+        try {
+            String path = System.getProperty("herdr.whisper.lib");
+            if (path != null && !path.isEmpty()) System.load(path);
+            else System.loadLibrary("herdr_whisper");
+            loaded = true;
+        } catch (UnsatisfiedLinkError | SecurityException e) {
+            loaded = false;
+        }
+        return loaded;
+    }
+
+    private volatile long handle;
+    private final int threads;
+
+    private LocalWhisper(long handle, int threads) {
+        this.handle = handle;
+        this.threads = threads;
+    }
+
+    /** The engine for {@code model}, or null when the library or the model does not load. */
+    static LocalWhisper open(File model, int threads) {
+        if (model == null || !model.isFile() || !load()) return null;
+        long h = open(model.getAbsolutePath());
+        return h == 0 ? null : new LocalWhisper(h, threads);
+    }
+
+    /** PCM16 mono 16 kHz audio's text (trimmed; empty when it heard no speech), or null on failure or abort. */
+    synchronized String transcribe(byte[] pcm, int length) {
+        if (handle == 0) return null;
+        String text = transcribePcm(handle, pcm, length, threads);
+        return text == null ? null : text.trim();
+    }
+
+    /** The same for a raw PCM16 file (a saved clip). */
+    synchronized String transcribe(File pcm) {
+        if (handle == 0) return null;
+        String text = transcribeFile(handle, pcm.getAbsolutePath(), threads);
+        return text == null ? null : text.trim();
+    }
+
+    /** Stops a transcription in progress (it returns null); any thread. */
+    void abort() {
+        long h = handle;
+        if (h != 0) abort(h);
+    }
+
+    @Override
+    public synchronized void close() {
+        if (handle == 0) return;
+        close(handle);
+        handle = 0;
+    }
+
+    private static native long open(String model);
+
+    private static native String transcribePcm(long handle, byte[] pcm, int length, int threads);
+
+    private static native String transcribeFile(long handle, String file, int threads);
+
+    private static native void abort(long handle);
+
+    private static native void close(long handle);
+}
