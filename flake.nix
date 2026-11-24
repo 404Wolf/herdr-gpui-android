@@ -96,7 +96,11 @@
             (pkgs.callPackage ./nix/herdr-core { src = herdr-core-src; })
             pkgs.openssh
             pkgs.coreutils
+            # The phone's Whisper (scripts/build-whisper.sh): whisper.cpp built from this pinned
+            # source with the NDK above.
+            pkgs.cmake
           ];
+          WHISPER_CPP_SRC = "${pkgs.whisper-cpp.src}";
           ANDROID_HOME = sdkRoot;
           ANDROID_SDK_ROOT = sdkRoot;
           ANDROID_NDK_HOME = "${sdkRoot}/ndk/${ndkVersion}";
