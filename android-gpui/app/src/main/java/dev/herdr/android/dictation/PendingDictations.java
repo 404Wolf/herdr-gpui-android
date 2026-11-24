@@ -313,6 +313,30 @@ public final class PendingDictations {
         return true;
     }
 
+    /** The phone's proposals, by clip id (a copy). */
+    public java.util.Map<String, String> proposals() {
+        return store.proposals();
+    }
+
+    /** The clips the phone is transcribing now (a copy). */
+    public java.util.Set<String> transcribingHere() {
+        return store.transcribingHere();
+    }
+
+    /**
+     * The user's retry of a recording waiting for the desktop: a parked one waits again, and
+     * the courier tries now, whatever the desktop was last seen doing. Main thread.
+     */
+    public void retryNow(String id) {
+        if (store.unpark(id)) changed();
+        worker.execute(() -> {
+            degraded = false;
+            degradedUntil = 0;
+            retryMs = FIRST_RETRY_MS;
+            reschedule(0);
+        });
+    }
+
     /** The phone's proposed text for clip {@code id}, or null. */
     public String proposal(String id) {
         return store.proposal(id);

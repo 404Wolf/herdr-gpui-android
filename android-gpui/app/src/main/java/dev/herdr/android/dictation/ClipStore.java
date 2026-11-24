@@ -395,6 +395,16 @@ final class ClipStore {
         return false;
     }
 
+    /** Every proposal now, by clip id. */
+    synchronized java.util.Map<String, String> proposals() {
+        return new java.util.HashMap<>(proposals);
+    }
+
+    /** The clips the phone is transcribing now. */
+    synchronized Set<String> transcribingHere() {
+        return new HashSet<>(here);
+    }
+
     /** The phone's proposed text for {@code id}, or null. */
     synchronized String proposal(String id) {
         return proposals.get(id);

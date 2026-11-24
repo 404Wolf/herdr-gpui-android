@@ -654,6 +654,14 @@ final class Outbox {
         return true;
     }
 
+    /** Takes back a {@link #moveAside} that could not be saved. */
+    synchronized void unmoveAside(String id) {
+        Entry e = find(id);
+        if (e == null || !e.aside) return;
+        e.aside = false;
+        version++;
+    }
+
     /**
      * How many messages of the lane of {@code live} are not settled (pending, being sent, or
      * needing the user): a new Send there waits behind them instead of overtaking.

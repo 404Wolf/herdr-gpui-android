@@ -4187,6 +4187,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (outbox != null) outbox.resend(id);
             }
 
+            @Override public Outbox.Blocked blockedLane() {
+                Here at = here();
+                return outbox == null || at.host.isEmpty() ? null : outbox.outbox().blocked(at.lane());
+            }
+
+            @Override public boolean moveAside(String id) {
+                return outbox != null && outbox.moveAside(id);
+            }
+
             @Override public java.util.List<String> clearableQueued() {
                 // The rows the pane shows, by the same machine and terminal identity.
                 Here at = here();
@@ -5051,6 +5060,15 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 @Override public void onNothing(dev.herdr.android.dictation.PendingClip clip,
                         dev.herdr.android.dictation.DictationException.Reason reason) {
                     if (composer != null) composer.nothingHeard(reason);
+                }
+
+                @Override public void onTranscribedHere(dev.herdr.android.dictation.PendingClip clip, String text,
+                        String error) {
+                    note(text != null
+                            ? (text.isEmpty() ? "This phone heard no speech in that recording; it is kept"
+                                    : "Heard on this phone (English only): use it or keep waiting, on its row")
+                            : "This phone could not transcribe it (" + error + "); the recording is kept");
+                    if (composer != null) composer.setWaiting(Dictation.pending(GpuiTerminalActivity.this).count());
                 }
             };
 

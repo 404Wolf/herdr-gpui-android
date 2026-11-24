@@ -91,6 +91,10 @@ final class ComposerBar {
         String takeQueued(String id);
         /** "send again" on a message that may have been sent. */
         void resendQueued(String id);
+        /** The pane's lane held by a dictation waiting for a transcriber, or null (factory-9zz.16). */
+        default Outbox.Blocked blockedLane() { return null; }
+        /** "move aside" on that message: the rest of its lane is offered again; false if not. */
+        default boolean moveAside(String id) { return false; }
         /** What the composer's clear takes: the pane's queued messages but one being sent. */
         List<String> clearableQueued();
         /** A queued message's text, cleared or not; null when there is none. */
@@ -1308,8 +1312,16 @@ final class ComposerBar {
         pushGhost();
     }
 
+    /** What the rows show of the dictation side: a held lane, the phone's proposals and runs. */
+    private QueueView.Dictations dictations() {
+        dev.herdr.android.dictation.PendingDictations pending = Dictation.pending(context);
+        return new QueueView.Dictations(host.blockedLane(), pending.proposals(), pending.transcribingHere(),
+                dev.herdr.android.dictation.PhoneWhisper.available());
+    }
+
     /** Every row of the pane's queue, none hidden behind "+N more". */
     private List<QueueView.Row> allRows() {
+        queue.dictations(dictations());
         return queue.all(drafts.pane(), queuedMessages, looseClips(), parkedHere(), linkDown,
                 layout == null ? Integer.MAX_VALUE : layout.cols, android.os.SystemClock.uptimeMillis());
     }
@@ -1345,8 +1357,36 @@ final class ComposerBar {
                 host.resendQueued(r.id);
                 break;
             case "row-retry":
-                Dictation.pending(context).retry(r.id);
+                if (r.kind == QueueView.Kind.PARKED) Dictation.pending(context).retry(r.id);
+                else if (r.clipId != null) Dictation.pending(context).retryNow(r.clipId);
                 host.notice("Sending the recording to the desktop again");
+                break;
+            case "row-here": {
+                // factory-9zz.16: only for the user's tap; the text comes back as a proposal.
+                dev.herdr.android.dictation.PendingDictations.LocalTranscriber engine =
+                        dev.herdr.android.dictation.PhoneWhisper.transcriber();
+                boolean started = r.clipId != null && engine != null && Dictation.pending(context)
+                        .transcribeHere(r.clipId, engine, dev.herdr.android.dictation.PhoneWhisper.executor());
+                host.notice(started ? "Transcribing on this phone (English only); its text comes back for you to use"
+                        : engine == null ? "This phone has no verified Whisper model"
+                        : "That recording can't be transcribed here now");
+                break;
+            }
+            case "row-use":
+                if (r.clipId != null && Dictation.pending(context).useProposal(r.clipId)) {
+                    host.notice("Using the phone's text; nothing is sent until you tap Send");
+                } else {
+                    host.notice("That text is no longer there");
+                }
+                break;
+            case "row-wait":
+                if (r.clipId != null) Dictation.pending(context).dismissProposal(r.clipId);
+                host.notice("Waiting for the desktop; the recording is kept");
+                break;
+            case "row-aside":
+                host.notice(host.moveAside(r.id)
+                        ? "Moved aside: the messages behind it can be sent, each with its tap"
+                        : "It no longer holds the queue");
                 break;
             case "row-edit":
                 queue.forget(r.id);
@@ -1477,6 +1517,7 @@ final class ComposerBar {
             List<PendingClip> loose = looseClips();
             int cols = layout == null ? Integer.MAX_VALUE : layout.cols;
             long now = android.os.SystemClock.uptimeMillis();
+            queue.dictations(dictations());
             shownRows = queue.rows(drafts.pane(), queuedMessages, loose, parkedHere(), linkDown, cols, queueOpen,
                     selectedRow, now);
             // The controls are app buttons now (ActionBar, Wolf 11-22): the prompt keeps only the
