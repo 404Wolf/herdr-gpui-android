@@ -163,6 +163,28 @@ public final class ServerDictationEngineTest {
         assertEquals(PHONE_WORDS, run.listener.finalText);
     }
 
+    /** factory-9zz.16: the phone's Whisper costs nothing while the desktop answers. */
+    @Test public void aLazyPhoneEngineNeverRunsWhileTheDesktopAnswers() throws Exception {
+        server = new FakeServer(Behaviour.fast(READY_GPU));
+        FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 0);
+        phone.lazy = true;
+        Run run = dictate(server.uri(), phone, 300);
+        run.awaitEnd();
+        assertEquals(DESKTOP_WORDS, run.listener.finalText);
+        assertFalse("never asked for its text", phone.needed);
+        assertFalse(phone.answered);
+    }
+
+    @Test public void aLazyPhoneEngineGivesItsTextWhenTheDesktopIsUnreachable() throws Exception {
+        FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 50);
+        phone.lazy = true;
+        Run run = dictate(closedPort(), phone, 300);
+        run.awaitEnd();
+        assertTrue(phone.needed);
+        assertPhoneText(run);
+        assertKeptWithAllAudio(run);
+    }
+
     @Test public void anUnreachableDesktopGivesThePhonesText() throws Exception {
         Run run = dictate(closedPort(), new FakeRecognizer(PHONE_WORDS, 50), 300);
         run.awaitEnd();
