@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL="$(realpath "${1:?usage: test-whisper.sh MODEL}")"
 echo "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f  $MODEL" | sha256sum -c --quiet
-"$ROOT/scripts/build-whisper.sh" --host "$ROOT/build/whisper-host"
+bash "$ROOT/scripts/build-whisper.sh" --host "$ROOT/build/whisper-host"
 cd "$ROOT"
 HERDR_WHISPER_LIB="$ROOT/build/whisper-host/libherdr_whisper.so" HERDR_WHISPER_MODEL="$MODEL" \
     HERDR_WHISPER_SAMPLE="$WHISPER_CPP_SRC/samples/jfk.wav" \
