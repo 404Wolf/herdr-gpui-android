@@ -5,6 +5,7 @@ import dev.herdr.android.dictation.DictationEngine;
 import dev.herdr.android.dictation.NoopDictationEngine;
 import dev.herdr.android.dictation.OnDeviceRecognizers;
 import dev.herdr.android.dictation.PendingDictations;
+import dev.herdr.android.dictation.PhoneWhisper;
 import dev.herdr.android.dictation.ServerDictationEngine;
 import java.net.URI;
 
@@ -22,8 +23,11 @@ public final class Dictation {
         ProvisionedSettings settings = ProvisionedSettings.get(context);
         URI url = settings.dictationUrl;
         if (url == null) return new NoopDictationEngine();
+        // The phone's Whisper (a verified, provisioned model) when there is one, else the
+        // trusted Android recognizer, else none: decided per session, once the check is done.
+        PhoneWhisper.prepare(context, settings.dictationLocalModel);
         return new ServerDictationEngine(context, url, pending(context),
-                OnDeviceRecognizers.factory(context, settings.dictationRecognizers),
+                PhoneWhisper.factory(OnDeviceRecognizers.factory(context, settings.dictationRecognizers)),
                 settings.dictationFinalTimeoutMs);
     }
 

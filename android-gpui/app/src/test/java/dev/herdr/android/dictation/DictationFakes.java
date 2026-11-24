@@ -239,6 +239,9 @@ public final class DictationFakes {
         volatile boolean ended;
         /** Its final (or failure) has been handed to the engine. */
         volatile boolean answered;
+        /** Like the phone's Whisper: works out its final only once the engine says it is needed. */
+        boolean lazy;
+        volatile boolean needed;
         private Callback callback;
 
         public FakeRecognizer(String text, long finalDelayMs) {
@@ -260,8 +263,17 @@ public final class DictationFakes {
             if (first && partial != null) callback.onPartial(partial);
         }
 
-        @Override public void endOfAudio() {
+        @Override public synchronized void needed() {
+            needed = true;
+            if (lazy && ended) answer();
+        }
+
+        @Override public synchronized void endOfAudio() {
             ended = true;
+            if (!lazy || needed) answer();
+        }
+
+        private void answer() {
             Thread t = new Thread(() -> {
                 try {
                     Thread.sleep(finalDelayMs);

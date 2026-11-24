@@ -60,17 +60,25 @@ public final class LocalWhisper implements AutoCloseable {
         return text == null ? null : text.trim();
     }
 
+    /** Guards the handle between {@link #abort} (any thread) and {@link #close}. */
+    private final Object handleLock = new Object();
+
     /** Stops a transcription in progress (it returns null); any thread. */
     void abort() {
-        long h = handle;
-        if (h != 0) abort(h);
+        synchronized (handleLock) {
+            if (handle != 0) abort(handle);
+        }
     }
 
+    /** Waits for a transcription in progress (abort it first to stop it). */
     @Override
     public synchronized void close() {
-        if (handle == 0) return;
-        close(handle);
-        handle = 0;
+        long h;
+        synchronized (handleLock) {
+            h = handle;
+            handle = 0;
+        }
+        if (h != 0) close(h);
     }
 
     private static native long open(String model);

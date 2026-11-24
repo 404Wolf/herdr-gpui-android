@@ -28,6 +28,9 @@ import org.json.JSONObject;
  *                         for before the phone's own is used, 1000..60000
  *  "dictationRecognizers": ["package/class", ...],  speech services trusted to
  *                         read piped audio, besides the on-device recognizer
+ *  "dictationLocalModel": {"file": "ggml-base.en-q5_1.bin", "sha256": "<64 hex>"},
+ *                         the phone's own Whisper model, a file beside this one, used
+ *                         only when its SHA-256 matches (dictation.LocalModel)
  *  "palette": {...}}      replaces Default: see model::set_default_palette_json
  * </pre>
  *
@@ -57,10 +60,13 @@ final class ProvisionedSettings {
     final long dictationFinalTimeoutMs;
     /** Speech service components ("package/class") trusted with piped audio; may be empty. */
     final java.util.List<String> dictationRecognizers;
+    /** The phone's Whisper model; null when not provisioned (or malformed). */
+    final dev.herdr.android.dictation.LocalModel.Spec dictationLocalModel;
 
     private ProvisionedSettings(float fontSize, float uiScale, Boolean capturable, String paletteJson,
             float scrollSpeed, URI dictationUrl, long dictationFinalTimeoutMs,
-            java.util.List<String> dictationRecognizers) {
+            java.util.List<String> dictationRecognizers, dev.herdr.android.dictation.LocalModel.Spec dictationLocalModel) {
+        this.dictationLocalModel = dictationLocalModel;
         this.dictationUrl = dictationUrl;
         this.dictationRecognizers = dictationRecognizers;
         this.dictationFinalTimeoutMs = dictationFinalTimeoutMs;
@@ -80,7 +86,7 @@ final class ProvisionedSettings {
 
     private static ProvisionedSettings read(Context context) {
         ProvisionedSettings none = new ProvisionedSettings(0, 1, null, null, DEFAULT_SCROLL_SPEED, null,
-                ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS, java.util.Collections.emptyList());
+                ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS, java.util.Collections.emptyList(), null);
         File dir = context.getExternalFilesDir(null);
         File file = dir == null ? null : new File(dir, FILE_NAME);
         if (file == null || !file.isFile() || file.length() > MAX_BYTES) return none;
@@ -107,7 +113,8 @@ final class ProvisionedSettings {
                     speed >= 0.5 && speed <= 3 ? (float) speed : DEFAULT_SCROLL_SPEED,
                     ServerDictationEngine.parseUrl(root.optString("dictationUrl", null)),
                     budget >= 1000 && budget <= 60000 ? budget : ServerDictationEngine.DEFAULT_FINAL_BUDGET_MS,
-                    components(root.optJSONArray("dictationRecognizers")));
+                    components(root.optJSONArray("dictationRecognizers")),
+                    dev.herdr.android.dictation.LocalModel.Spec.parse(root.optJSONObject("dictationLocalModel")));
         } catch (IOException | JSONException | RuntimeException unreadable) {
             return none;
         }

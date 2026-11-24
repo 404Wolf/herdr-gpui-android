@@ -36,4 +36,20 @@ public interface OnDeviceRecognizer {
 
     /** Stops at once; no more callbacks. */
     void cancel();
+
+    /**
+     * The engine needs this recognizer's text: the desktop is out of the session. A streaming
+     * recognizer already works as it hears; one that transcribes at the end (the phone's
+     * Whisper, which costs seconds of CPU) starts only now, so it never runs while the desktop
+     * answers. Main thread.
+     */
+    default void needed() { }
+
+    /**
+     * How long its final may take, from {@link #needed} or stop, for {@code audioMs} of audio;
+     * 0 for the engine's default.
+     */
+    default long finalBudgetMs(long audioMs) {
+        return 0;
+    }
 }

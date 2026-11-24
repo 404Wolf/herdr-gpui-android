@@ -349,7 +349,7 @@ public final class ServerDictationEngine implements DictationEngine {
             if (offline) {
                 if (local != null) {
                     listener.onState(State.TRANSCRIBING);
-                    main.postDelayed(onDeviceTimeout, timeouts.onDeviceFinalMs);
+                    main.postDelayed(onDeviceTimeout, onDeviceBudgetMs());
                     deliverLocalIfDone();
                 } else {
                     keepIfDone();
@@ -429,11 +429,12 @@ public final class ServerDictationEngine implements DictationEngine {
                     + (cause == null ? "" : ", " + cause.getClass().getSimpleName() + ": " + cause.getMessage())
                     + ") " + sinceStart() + (local != null ? ", the phone transcribes" : ", recording for later"));
             if (local != null) {
+                local.needed();
                 // The phone's own words replace the desktop's on screen.
                 shownPartial = !localPartial.isEmpty();
                 listener.onPartial(localPartial);
                 if (stopping) {
-                    main.postDelayed(onDeviceTimeout, timeouts.onDeviceFinalMs);
+                    main.postDelayed(onDeviceTimeout, onDeviceBudgetMs());
                     deliverLocalIfDone();
                 } else {
                     listener.onState(State.ON_DEVICE);
@@ -470,6 +471,13 @@ public final class ServerDictationEngine implements DictationEngine {
             if (local == null) return;
             localFinal = text == null ? "" : text;
             deliverLocalIfDone();
+        }
+
+        /** Main thread: how long the phone's final may take; a Whisper run grows with the audio. */
+        private long onDeviceBudgetMs() {
+            OnDeviceRecognizer l = local;
+            long own = l == null ? 0 : l.finalBudgetMs(recording.durationMs());
+            return Math.max(timeouts.onDeviceFinalMs, own);
         }
 
         /** Main thread: the phone's recognizer stopped working. */
