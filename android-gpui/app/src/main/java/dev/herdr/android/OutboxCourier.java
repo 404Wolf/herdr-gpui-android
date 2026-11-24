@@ -164,6 +164,20 @@ final class OutboxCourier {
         return 1;
     }
 
+    /**
+     * "move aside" (factory-9zz.16): message {@code id}, waiting for its dictation, stops holding
+     * its lane, saved first; nothing is sent by it. False when it is not such a message.
+     */
+    boolean moveAside(String id) {
+        if (!outbox.moveAside(id)) return false;
+        if (!outbox.save()) {
+            outbox.unmoveAside(id);
+            return false;
+        }
+        changed();
+        return true;
+    }
+
     /** "Send again" on a message that needs the user or was sent: pending again, a tap away. */
     void resend(String id) {
         if (!outbox.resend(id)) return;

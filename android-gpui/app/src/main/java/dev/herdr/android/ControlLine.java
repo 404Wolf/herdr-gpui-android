@@ -255,7 +255,25 @@ final class ControlLine {
         if (row.kind == QueueView.Kind.MESSAGE && row.messageState == Outbox.State.NEEDS_YOU) {
             out.add(new GhostText.Control("row-again", "send again", "warn"));
         }
+        if (row.kind == QueueView.Kind.BLOCKED) {
+            // factory-9zz.16: a lane held by a dictation; each way out is the user's, none silent.
+            out.add(new GhostText.Control("row-retry", "retry", "warn"));
+            if (row.proposal != null) {
+                out.add(new GhostText.Control("row-use", "use phone's text", "bright"));
+            } else if (row.onPhone) {
+                out.add(new GhostText.Control("row-here", "on phone", "bright"));
+            }
+            out.add(new GhostText.Control("row-aside", "move aside", "warn"));
+            out.add(new GhostText.Control("row-back", "keep waiting", "dim"));
+            return out;
+        }
         if (row.kind == QueueView.Kind.PARKED) out.add(new GhostText.Control("row-retry", "retry", "warn"));
+        if (row.proposal != null) {
+            out.add(new GhostText.Control("row-use", "use it", "bright"));
+            out.add(new GhostText.Control("row-wait", "keep waiting", "dim"));
+        } else if (row.onPhone) {
+            out.add(new GhostText.Control("row-here", "on phone", "bright"));
+        }
         if (row.kind == QueueView.Kind.MESSAGE) out.add(new GhostText.Control("row-edit", "edit", "bright"));
         out.add(new GhostText.Control("row-drop", "drop", "danger"));
         out.add(new GhostText.Control("row-back", "back", "dim"));

@@ -27,7 +27,35 @@ final class QueueView {
     /** Rows left showing while the list is collapsed: the queue is never invisible. */
     static final int COLLAPSED_ROWS = 2;
 
-    enum Kind { MESSAGE, SENT, CLIP, PARKED, LINK, MORE }
+    enum Kind { MESSAGE, SENT, CLIP, PARKED, LINK, MORE, BLOCKED }
+
+    /**
+     * What the dictation side knows, for the rows (factory-9zz.16): the lane held by a waiting
+     * dictation, the phone's proposals by clip id, the clips the phone is transcribing now, and
+     * whether the phone has a verified model ("on phone").
+     */
+    static final class Dictations {
+        final Outbox.Blocked blocked;
+        final Map<String, String> proposals;
+        final Set<String> busyHere;
+        final boolean onPhone;
+
+        Dictations(Outbox.Blocked blocked, Map<String, String> proposals, Set<String> busyHere, boolean onPhone) {
+            this.blocked = blocked;
+            this.proposals = proposals;
+            this.busyHere = busyHere;
+            this.onPhone = onPhone;
+        }
+
+        static final Dictations NONE = new Dictations(null, Collections.emptyMap(), Collections.emptySet(), false);
+    }
+
+    private Dictations dictations = Dictations.NONE;
+
+    /** Sets what the next rows show of the dictation side. */
+    void dictations(Dictations d) {
+        dictations = d == null ? Dictations.NONE : d;
+    }
 
     /** One row above the prompt. */
     static final class Row {
@@ -43,9 +71,23 @@ final class QueueView {
         final boolean actionable;
         /** The message's own state, for its actions; null for other rows. */
         final Outbox.State messageState;
+        /** A clip row's or a held lane's recording; null for other rows. */
+        final String clipId;
+        /** The phone's proposed text for the clip, shown for use it / keep waiting; null if none. */
+        final String proposal;
+        /** "on phone" may be offered: a verified model, and the clip is not being transcribed. */
+        final boolean onPhone;
 
         Row(String id, Kind kind, String text, String state, String stateStyle, boolean actionable,
                 Outbox.State messageState) {
+            this(id, kind, text, state, stateStyle, actionable, messageState, null, null, false);
+        }
+
+        Row(String id, Kind kind, String text, String state, String stateStyle, boolean actionable,
+                Outbox.State messageState, String clipId, String proposal, boolean onPhone) {
+            this.clipId = clipId;
+            this.proposal = proposal;
+            this.onPhone = onPhone;
             this.id = id;
             this.kind = kind;
             this.text = text;
@@ -165,20 +207,25 @@ final class QueueView {
                     cover ? "✓" : "✓ sent", "info", false, null));
         }
         int place = 0;
+        Dictations d = dictations;
         for (Outbox.Message m : messages) {
+            if (d.blocked != null && m.id.equals(d.blocked.messageId) && m.pane.equals(pane)) {
+                int n = d.blocked.behind;
+                boolean busy = d.blocked.clipId != null && d.busyHere.contains(d.blocked.clipId);
+                all.add(new Row(m.id, Kind.BLOCKED, n + (n == 1 ? " message" : " messages")
+                        + " waiting behind a dictation that is waiting for a transcriber",
+                        cover ? "◌" + n : busy ? "◌ transcribing on this phone…" : "◌ held · choose",
+                        "warn", true, null, d.blocked.clipId,
+                        d.blocked.clipId == null ? null : d.proposals.get(d.blocked.clipId),
+                        d.onPhone && !busy && d.blocked.clipId != null));
+            }
             boolean waitsInLine = m.state == Outbox.State.PENDING && m.pane.equals(pane);
             if (waitsInLine) place++;
             all.add(new Row(m.id, Kind.MESSAGE, QueuedMessages.PROMPT + QueuedMessages.oneLine(m.text),
                     state(m, pane, place, cover), style(m), m.state != Outbox.State.SENDING, m.state));
         }
-        for (PendingClip clip : clips) {
-            all.add(new Row(clip.id, Kind.CLIP, DictationToken.of(clip.id),
-                    cover ? "◌" : "◌ waits for desktop", "tag", true, null));
-        }
-        for (PendingClip clip : parked) {
-            all.add(new Row(clip.id, Kind.PARKED, DictationToken.of(clip.id),
-                    cover ? "✗ retry" : "✗ not transcribed yet · retry", "warn", true, null));
-        }
+        for (PendingClip clip : clips) all.add(clipRow(clip, Kind.CLIP, cover, d));
+        for (PendingClip clip : parked) all.add(clipRow(clip, Kind.PARKED, cover, d));
         if (linkDown > 0) {
             all.add(new Row("link", Kind.LINK, "◌ " + linkDown + (linkDown == 1 ? " input" : " inputs")
                     + " typed while reconnecting", cover ? "◌" : "sends when back", "warn", false, null));
@@ -191,6 +238,22 @@ final class QueueView {
             shown.set(0, new Row("more", Kind.MORE, "+" + hidden + " more ▲", "", "tag", true, null));
         }
         return Collections.unmodifiableList(shown);
+    }
+
+    /** A waiting or parked recording: its proposal when the phone has one, else its state. */
+    private static Row clipRow(PendingClip clip, Kind kind, boolean cover, Dictations d) {
+        String proposal = d.proposals.get(clip.id);
+        boolean busy = d.busyHere.contains(clip.id);
+        if (proposal != null) {
+            return new Row(clip.id, kind, "“" + QueuedMessages.oneLine(proposal) + "”",
+                    cover ? "?" : "? heard on this phone (English only) · use it?", "warn", true, null,
+                    clip.id, proposal, false);
+        }
+        String state = busy ? (cover ? "◌…" : "◌ transcribing on this phone…")
+                : kind == Kind.PARKED ? (cover ? "✗ retry" : "✗ not transcribed yet · retry")
+                : (cover ? "◌" : "◌ waits for desktop");
+        return new Row(clip.id, kind, DictationToken.of(clip.id), state, kind == Kind.PARKED ? "warn" : "tag",
+                true, null, clip.id, null, d.onPhone && !busy);
     }
 
     /** A message's state in a few words, or a glyph at cover width. */
