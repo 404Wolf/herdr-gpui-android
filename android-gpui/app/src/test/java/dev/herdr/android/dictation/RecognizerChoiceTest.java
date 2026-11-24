@@ -42,4 +42,16 @@ public final class RecognizerChoiceTest {
         assertFalse("ours ended", RecognizerChoice.foreignCapture(1, 0));
         assertTrue(RecognizerChoice.foreignCapture(1, 2));
     }
+
+    /** factory-9zz.16: the phone's own language, else en-US; errors said by name, not number. */
+    @Test public void theLanguageIsThePhonesAndErrorsAreNamed() {
+        assertEquals("de-DE", RecognizerChoice.language(java.util.Locale.GERMANY));
+        assertEquals("en-GB", RecognizerChoice.language(java.util.Locale.UK));
+        assertEquals("en-US", RecognizerChoice.language(java.util.Locale.ROOT));
+        assertEquals("en-US", RecognizerChoice.language(null));
+        assertEquals("its language model is not downloaded (13)", RecognizerChoice.errorName(13));
+        assertEquals("it does not support this language (12)", RecognizerChoice.errorName(12));
+        assertEquals("no microphone permission (9)", RecognizerChoice.errorName(9));
+        assertEquals("error 99", RecognizerChoice.errorName(99));
+    }
 }

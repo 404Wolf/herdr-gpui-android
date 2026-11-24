@@ -164,6 +164,47 @@ mic ──▶ recording (app storage, always)
   `HerdrDictation` says which path each session took (reasons and timings,
   never text).
 
+## The phone's Whisper (factory-9zz.16)
+
+Some phones (the Fold on GrapheneOS) have no recognizer of their own that reads piped
+audio: no on-device service, and the system one streams to the same desktop. Their fallback
+is whisper.cpp in the app, with a separate model file:
+
+- **The engine:** `libherdr_whisper.so`, whisper.cpp v1.9.2 (MIT, the flake's pinned
+  nixpkgs source, `WHISPER_CPP_SRC`) and a small JNI shim (`whisper/`), built for the APK by
+  `scripts/build-whisper.sh` from `build-native.sh`. CPU only; about 2.9 MB on arm64-v8a.
+- **The model is not in the APK.** It is provisioned beside the settings, in the app's
+  external files directory (only adb or the app can write there), and named in
+  `remote-for-herdr-settings.json`:
+  `"dictationLocalModel": {"file": "ggml-base.en-q5_1.bin", "sha256": "4baf70dd…dd2f"}`.
+  It is `ggml-base.en-q5_1.bin` from
+  `https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en-q5_1.bin`
+  (59,721,011 bytes, SHA-256 `4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f`,
+  MIT: OpenAI's Whisper weights converted by whisper.cpp). The app never downloads it: it
+  hashes the file once (then remembers its size and time) and uses it only on a match.
+- **When it runs:** only when the desktop is out of a live session (the engine asks for
+  its text: `OnDeviceRecognizer.needed`; it costs nothing while the desktop answers; its final
+  may take 10 s plus the audio's length), or when the user taps **on phone** on a saved
+  recording. English only (base.en), said wherever its text is shown.
+- **A saved recording transcribed on the phone is a proposal.** Its row reads
+  `“…” ? heard on this phone (English only) · use it?` with **use it** / **keep waiting**.
+  Only use it places the text (exactly once per recording) and only then is the audio deleted;
+  keep waiting drops the proposal and the recording waits for the desktop. The desktop's text,
+  if it comes first, wins. A recording being uploaded is never transcribed here, and one being
+  transcribed here is never uploaded.
+- **A queue held by a dictation says so.** When the head of a pane's queue is a message whose
+  dictation waits for a transcriber, one row reads
+  `N messages waiting behind a dictation that is waiting for a transcriber`, with **retry**
+  (the courier now), **on phone** (with a model), **move aside** (that message stops holding
+  the queue; the rest are offered, each still for its tap; once its text is in, it takes its
+  place again) and **keep waiting**. Nothing is sent, skipped or dropped by itself.
+- The Android recognizer, where one is trusted, now listens in the phone's language (else
+  en-US), and its errors are logged by name ("its language model is not downloaded (13)").
+- Tests: `LocalWhisperTest` (the host build of the same shim on whisper.cpp's JFK sample;
+  `scripts/test-whisper.sh MODEL`), `LocalModelTest`, `WhisperRecognizerTest`,
+  `TranscribeHereTest`, `OutboxAsideTest`, `DictationRowsTest`, and the lazy-recognizer cases in
+  `ServerDictationEngineTest`.
+
 ## Long dictations and a slow desktop: never resent without end
 
 On 15 November 2026 one 124.6 s clip was uploaded four times in two minutes. Each upload was cut off by `backend_slow`, and every new live session reset the courier's wait. Now:
