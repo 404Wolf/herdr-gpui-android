@@ -430,6 +430,7 @@ public final class ServerDictationEngine implements DictationEngine {
                     + ") " + sinceStart() + (local != null ? ", the phone transcribes" : ", recording for later"));
             if (local != null) {
                 local.needed();
+                listener.onPhoneWords(local.streams());
                 // The phone's own words replace the desktop's on screen.
                 shownPartial = !localPartial.isEmpty();
                 listener.onPartial(localPartial);

@@ -93,6 +93,8 @@ final class ComposerBar {
         String takeQueued(String id);
         /** "send again" on a message that may have been sent. */
         void resendQueued(String id);
+        /** A pane's title for a notice ("PM herdr"); its address when unknown. */
+        default String paneName(String pane) { return pane; }
         /** The pane's lane held by a dictation waiting for a transcriber, or null (factory-9zz.16). */
         default Outbox.Blocked blockedLane() { return null; }
         /** "move aside" on that message: the rest of its lane is offered again; false if not. */
@@ -309,6 +311,8 @@ final class ComposerBar {
      * reads "talk offline" until the next dictation, a send or a pane switch.
      */
     private boolean transcribedOnPhone;
+    /** False while the phone's Whisper transcribes the session (words every few seconds). */
+    private boolean phoneStreams = true;
     /**
      * Why the last dictation heard nothing (a silenced mic, or the desktop's code), said after
      * "talk" until the next dictation, a send or a pane switch; null for nothing to say.
@@ -357,6 +361,15 @@ final class ComposerBar {
 
         @Override public void clipLength(String clipId, long durationMs) {
             clipLengths.put(clipId, durationMs);
+        }
+
+        @Override public void phoneWords(boolean asItHears) {
+            phoneStreams = asItHears;
+            pushGhost();
+        }
+
+        @Override public String paneName(String hostId, String pane) {
+            return host.paneName(pane);
         }
 
         @Override public void transcribedOnPhone() {
@@ -1458,12 +1471,23 @@ final class ComposerBar {
     private List<GhostText.Control> talks() {
         long elapsed = recordingSince == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - recordingSince;
         return talks(dictationState, DraftChips.clock(elapsed), finishing, desktopError, transcribedOnPhone,
-                nothingHeard);
+                nothingHeard, phoneStreams);
     }
 
     static List<GhostText.Control> talks(DictationEngine.State state, String clock, boolean finishing,
             boolean desktopError, boolean transcribedOnPhone,
             dev.herdr.android.dictation.DictationException.Reason nothingHeard) {
+        return talks(state, clock, finishing, desktopError, transcribedOnPhone, nothingHeard, true);
+    }
+
+    /**
+     * {@code phoneStreams} false: the phone's Whisper transcribes this session, whose words come
+     * every few seconds and in full at stop (factory-9zz.16): said, so an empty draft never
+     * looks broken.
+     */
+    static List<GhostText.Control> talks(DictationEngine.State state, String clock, boolean finishing,
+            boolean desktopError, boolean transcribedOnPhone,
+            dev.herdr.android.dictation.DictationException.Reason nothingHeard, boolean phoneStreams) {
         List<GhostText.Control> out = new java.util.ArrayList<>();
         switch (state) {
             case CONNECTING:
@@ -1476,10 +1500,18 @@ final class ComposerBar {
                 out.add(new GhostText.Control("talk", "stop", "danger"));
                 break;
             case TRANSCRIBING:
-                out.add(new GhostText.Control("talk", finishing ? "finishing…" : "transcribing…", "info"));
+                out.add(new GhostText.Control("talk", finishing ? "finishing…"
+                        : phoneStreams ? "transcribing…" : "transcribing on this phone…", "info"));
                 out.add(new GhostText.Control("talk", "…", "info"));
                 break;
             case ON_DEVICE: {
+                if (!phoneStreams) {
+                    out.add(new GhostText.Control("talk", "on this phone · words every few seconds · rec " + clock,
+                            "warn"));
+                    out.add(new GhostText.Control("talk", "phone " + clock, "warn"));
+                    out.add(new GhostText.Control("talk", "stop", "warn"));
+                    break;
+                }
                 // The phone transcribes: the warning colour says offline when the words cannot.
                 out.add(new GhostText.Control("talk", (desktopError ? "desktop error" : "offline") + " · rec " + clock,
                         "warn"));
@@ -1760,6 +1792,11 @@ final class ComposerBar {
         boolean wasRecording = recording(dictationState);
         dictationState = state;
         if (!dictating()) Dictation.release(this);
+        // A new session, or one over: the next is a streaming one until the engine says not.
+        if (state == DictationEngine.State.CONNECTING || state == DictationEngine.State.IDLE
+                || state == DictationEngine.State.PENDING) {
+            phoneStreams = true;
+        }
         if (state != DictationEngine.State.TRANSCRIBING) finishing = false;
         boolean recording = recording(state);
         if (recording && !wasRecording) recordingSince = android.os.SystemClock.elapsedRealtime();
