@@ -178,9 +178,11 @@ public final class ServerDictationEngineTest {
     @Test public void aLazyPhoneEngineGivesItsTextWhenTheDesktopIsUnreachable() throws Exception {
         FakeRecognizer phone = new FakeRecognizer(PHONE_WORDS, 50);
         phone.lazy = true;
+        phone.streams = false;
         Run run = dictate(closedPort(), phone, 300);
         run.awaitEnd();
         assertTrue(phone.needed);
+        assertEquals("the composer is told its words come later", Boolean.FALSE, run.listener.phoneWords);
         assertPhoneText(run);
         assertKeptWithAllAudio(run);
     }
@@ -735,6 +737,12 @@ public final class ServerDictationEngineTest {
         final CountDownLatch ended = new CountDownLatch(1);
         volatile String finalText;
         volatile boolean onDevice;
+        /** What the engine said of the phone's words (null: nothing said). */
+        volatile Boolean phoneWords;
+
+        @Override public void onPhoneWords(boolean asItHears) {
+            phoneWords = asItHears;
+        }
         volatile int finals;
         volatile PendingClip pendingClip;
         volatile long endedAt;

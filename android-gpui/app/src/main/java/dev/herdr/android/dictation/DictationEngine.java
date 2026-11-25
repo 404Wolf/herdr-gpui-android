@@ -88,6 +88,13 @@ public interface DictationEngine {
         default void onFinishing(double tailSeconds) { }
 
         /**
+         * The phone transcribes this session (the desktop is out): {@code asItHears} false when
+         * its words come only every few seconds or at stop (the phone's Whisper), true when they
+         * stream. Before the ON_DEVICE state.
+         */
+        default void onPhoneWords(boolean asItHears) { }
+
+        /**
          * Asked right after onFinal: whether its text is durably stored. Only then is the
          * recording deleted; otherwise it is kept as a parked clip, with no expiry, shown "not
          * transcribed yet · retry".

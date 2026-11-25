@@ -62,7 +62,7 @@ public final class PhoneWhisper {
         return cb -> {
             LocalModel.Result r = status;
             if (r.state == LocalModel.State.OK && engine) {
-                return new WhisperRecognizer(() -> LocalWhisper.open(r.file, WhisperRecognizer.threads()), LOCAL, cb);
+                return new WhisperRecognizer(() -> WhisperRecognizer.local(r.file), LOCAL, cb);
             }
             return fallback == null ? null : fallback.start(cb);
         };
