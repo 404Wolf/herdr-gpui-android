@@ -241,6 +241,11 @@ public final class DictationFakes {
         volatile boolean answered;
         /** Like the phone's Whisper: works out its final only once the engine says it is needed. */
         boolean lazy;
+        boolean streams = true;
+
+        @Override public boolean streams() {
+            return streams;
+        }
         volatile boolean needed;
         private Callback callback;
 

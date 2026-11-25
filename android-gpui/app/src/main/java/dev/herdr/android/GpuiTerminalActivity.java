@@ -4187,6 +4187,14 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 if (outbox != null) outbox.resend(id);
             }
 
+            @Override public String paneName(String pane) {
+                Connection current;
+                synchronized (stateLock) {
+                    current = connection;
+                }
+                return paneTitle(current, pane);
+            }
+
             @Override public Outbox.Blocked blockedLane() {
                 Here at = here();
                 return outbox == null || at.host.isEmpty() ? null : outbox.outbox().blocked(at.lane());
