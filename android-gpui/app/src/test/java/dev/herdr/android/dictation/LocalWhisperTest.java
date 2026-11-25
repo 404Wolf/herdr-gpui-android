@@ -62,6 +62,29 @@ public class LocalWhisperTest {
         }
     }
 
+    /**
+     * factory-9zz.16, the Fold 11-25: a 43 s dictation. Whisper reads 30 s windows; the whole
+     * recording's words must come back, not only the first window's.
+     */
+    @Test
+    public void aDictationLongerThanOneWindowIsTranscribedWhole() throws Exception {
+        System.setProperty("herdr.whisper.lib", need("HERDR_WHISPER_LIB").getAbsolutePath());
+        File model = need("HERDR_WHISPER_MODEL");
+        byte[] wav = Files.readAllBytes(need("HERDR_WHISPER_SAMPLE").toPath());
+        byte[] one = Arrays.copyOfRange(wav, 44, wav.length);
+        byte[] four = new byte[one.length * 4];
+        for (int i = 0; i < 4; i++) System.arraycopy(one, 0, four, i * one.length, one.length);
+        try (LocalWhisper whisper = LocalWhisper.open(model, 4)) {
+            assertNotNull(whisper);
+            String said = whisper.transcribe(four, four.length);
+            assertNotNull(said);
+            String lower = said.toLowerCase(Locale.ROOT);
+            int n = 0;
+            for (int at = lower.indexOf("your country"); at >= 0; at = lower.indexOf("your country", at + 1)) n++;
+            assertTrue("all four sayings (" + n + "): " + said, n >= 8);
+        }
+    }
+
     /** t4g1 B2: Whisper's bytes are decoded as UTF-8 in Java, a split character replaced, never a JNI abort. */
     @Test
     public void whispersTextIsDecodedAsUtf8WithReplacement() {
