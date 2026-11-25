@@ -83,4 +83,34 @@ public final class WhisperChunksTest {
         r.endOfAudio();
         assertEquals(List.of(12, 13), runs);
     }
+
+    /** t4g1 (6): a piece carries only its own new audio, byte for byte; the final all of it. */
+    @Test public void eachPieceCarriesOnlyItsNewAudioAndTheFinalAllOfIt() {
+        List<byte[]> got = new ArrayList<>();
+        WhisperRecognizer r = new WhisperRecognizer(() -> new WhisperRecognizer.Transcriber() {
+            @Override public String transcribe(byte[] pcm, int length) {
+                got.add(java.util.Arrays.copyOf(pcm, length));
+                return "w";
+            }
+
+            @Override public void abort() { }
+
+            @Override public void close() { }
+        }, now, callback);
+        r.needed();
+        byte[] chunk = new byte[ClipStore.BYTES_PER_SECOND / 10];
+        java.io.ByteArrayOutputStream all = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < 250; i++) {
+            java.util.Arrays.fill(chunk, (byte) i);
+            r.write(chunk, chunk.length);
+            all.write(chunk, 0, chunk.length);
+        }
+        r.endOfAudio();
+        byte[] whole = all.toByteArray();
+        assertEquals(3, got.size());
+        int piece = WhisperRecognizer.PIECE_BYTES;
+        assertTrue(java.util.Arrays.equals(java.util.Arrays.copyOfRange(whole, 0, piece), got.get(0)));
+        assertTrue(java.util.Arrays.equals(java.util.Arrays.copyOfRange(whole, piece, 2 * piece), got.get(1)));
+        assertTrue("the final reads everything, past the first buffer's size", java.util.Arrays.equals(whole, got.get(2)));
+    }
 }

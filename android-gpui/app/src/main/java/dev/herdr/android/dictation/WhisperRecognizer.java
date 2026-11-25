@@ -1,6 +1,5 @@
 package dev.herdr.android.dictation;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.util.concurrent.Executor;
 
@@ -37,7 +36,9 @@ final class WhisperRecognizer implements OnDeviceRecognizer {
     private final Engine engine;
     private final Executor background;
     private final Callback callback;
-    private final ByteArrayOutputStream audio = new ByteArrayOutputStream();
+    /** Guarded by this: the session's audio, {@code size} bytes of it (grown by doubling). */
+    private byte[] audio = new byte[PIECE_BYTES];
+    private int size;
     /** Guarded by this. */
     private boolean ended, wanted, finalStarted, pieceRunning;
     /** Guarded by this: where the next piece starts, and the pieces' words so far. */
@@ -95,23 +96,29 @@ final class WhisperRecognizer implements OnDeviceRecognizer {
         byte[] piece = null;
         synchronized (this) {
             if (over || ended) return;
-            if (audio.size() + length > MAX_BYTES) {
+            if (size + (long) length > MAX_BYTES) {
                 over = true;
                 callback.onError("too long for the phone");
                 return;
             }
-            audio.write(chunk, 0, length);
+            if (size + length > audio.length) {
+                audio = java.util.Arrays.copyOf(audio, (int) Math.min(MAX_BYTES, Math.max(size + length, 2L * audio.length)));
+            }
+            System.arraycopy(chunk, 0, audio, size, length);
+            size += length;
             piece = nextPiece();
         }
         if (piece != null) runPiece(piece);
     }
 
-    /** Guarded by this: the audio since the last piece, once there is enough and none is running. */
+    /**
+     * Guarded by this: the audio since the last piece (only that is copied), once there is enough
+     * and none is running.
+     */
     private byte[] nextPiece() {
-        if (!wanted || ended || finalStarted || pieceRunning || audio.size() - pieceFrom < PIECE_BYTES) return null;
-        byte[] all = audio.toByteArray();
-        byte[] piece = java.util.Arrays.copyOfRange(all, pieceFrom, all.length);
-        pieceFrom = all.length;
+        if (!wanted || ended || finalStarted || pieceRunning || size - pieceFrom < PIECE_BYTES) return null;
+        byte[] piece = java.util.Arrays.copyOfRange(audio, pieceFrom, size);
+        pieceFrom = size;
         pieceRunning = true;
         return piece;
     }
@@ -166,7 +173,7 @@ final class WhisperRecognizer implements OnDeviceRecognizer {
     private void runIfReady() {
         if (!ended || !wanted || finalStarted || over) return;
         finalStarted = true;
-        byte[] pcm = audio.toByteArray();
+        byte[] pcm = java.util.Arrays.copyOf(audio, size);
         background.execute(() -> {
             if (over) {
                 closeSession();
