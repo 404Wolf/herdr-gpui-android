@@ -574,7 +574,9 @@ final class Outbox {
             return a.target.machine == null && b.target.machine == null
                     && a.target.profileId.equals(b.target.profileId);
         }
-        return a.target.machine.equals(b.target.machine)
+        // A lane is one session's, as inLane says: a message typed in another session on the
+        // same machine (or saved with none by an older build) never heads this one (11-25).
+        return a.target.machine.equals(b.target.machine) && a.target.session.equals(b.target.session)
                 && (a.target.createdMs == null || b.target.createdMs == null
                         || a.target.createdMs.equals(b.target.createdMs));
     }

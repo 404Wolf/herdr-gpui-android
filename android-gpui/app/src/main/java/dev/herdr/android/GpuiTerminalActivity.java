@@ -4845,12 +4845,16 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 return;
             }
             outbox.send(id, lane, tap.handle, tap.attach, text, true, outcome -> {
-                if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it waits in the queue");
+                if (outcome == null) note(NOT_TRIED);
+                else if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it waits in the queue");
                 else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
             });
         };
         return true;
     }
+
+    /** A send the outbox did not try (not its lane's head, or its attempt not saved): never silent. */
+    private static final String NOT_TRIED = "Not sent: it is not this pane's next message, or could not be saved; it still waits";
 
     /** A held message to type at once, waiting for its draft's clear to be on disk. Main thread. */
     private String immediateId;
@@ -4944,7 +4948,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
         String wire = HeldWords.wire(m.text, m.composed.wallMs, java.util.TimeZone.getDefault(),
                 !here.status.isEmpty(), false);
         outbox.send(id, here.lane(), tap.handle, tap.attach, wire, false, outcome -> {
-            if (outcome == Outbox.Outcome.WRITTEN) note("Sent · check it arrived");
+            if (outcome == null) note(NOT_TRIED);
+            else if (outcome == Outbox.Outcome.WRITTEN) note("Sent · check it arrived");
             else if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it still waits");
             else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
             main.post(this::refreshOffer);
@@ -4985,7 +4990,8 @@ public final class GpuiTerminalActivity extends GpuiInputActivity implements Sur
                 flushNext(tap, sent + 1);
                 return;
             }
-            if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it still waits");
+            if (outcome == null) note(NOT_TRIED);
+            else if (outcome == Outbox.Outcome.UNWRITTEN) note("Not sent: the pane was not live; it still waits");
             else if (outcome == Outbox.Outcome.UNSURE) note("It may have been sent, or may sit unsent in the input box");
             refreshOffer();
         }));
