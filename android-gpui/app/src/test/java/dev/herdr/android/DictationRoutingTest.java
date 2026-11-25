@@ -65,6 +65,16 @@ public final class DictationRoutingTest {
             drafts.append(pane, text);
         }
 
+        @Override public String paneName(String hostId, String pane) {
+            return "PM " + pane;
+        }
+
+        Boolean phoneWords;
+
+        @Override public void phoneWords(boolean asItHears) {
+            phoneWords = asItHears;
+        }
+
         @Override public void clipLength(String clipId, long durationMs) { }
 
         boolean saves = true;
@@ -124,6 +134,27 @@ public final class DictationRoutingTest {
         assertEquals(Arrays.asList("B:beta"), c.sent);
         assertFalse(c.routing.sendPending());
         assertTrue("the text joined A's draft", c.drafts.switchTo("A").contains("alpha"));
+    }
+
+    /** factory-9zz.16: text that lands in another pane's draft says where, so it never looks lost. */
+    @Test public void textForAPaneSwitchedAwayFromSaysWhereItWent() {
+        Composer c = new Composer();
+        DictationEngine.Listener a = c.dictateOnAThenSwitchToB();
+        a.onFinal("alpha", true);
+        assertTrue(c.notices.toString(), c.notices.contains("Dictation added to PM A's draft"));
+        Composer here = new Composer();
+        here.drafts.switchTo("A");
+        DictationEngine.Listener same = here.routing.listener("A");
+        same.onFinal("words", true);
+        for (String n : here.notices) assertFalse(n, n.startsWith("Dictation added to"));
+    }
+
+    /** factory-9zz.16: the composer learns whether the phone's words come as it hears or later. */
+    @Test public void thePhonesKindOfWordsReachesTheComposer() {
+        Composer c = new Composer();
+        c.drafts.switchTo("A");
+        c.routing.listener("A").onPhoneWords(false);
+        assertEquals(Boolean.FALSE, c.phoneWords);
     }
 
     @Test public void theOldPanesQueuedClipSendsTheEnterPressedOnTheNewPane() throws Exception {

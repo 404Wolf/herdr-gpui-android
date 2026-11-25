@@ -46,6 +46,14 @@ public interface OnDeviceRecognizer {
     default void needed() { }
 
     /**
+     * Whether its words come as it hears them (a streaming recognizer); false for one that gives
+     * words only every few seconds or at the end (the phone's Whisper), which the status says.
+     */
+    default boolean streams() {
+        return true;
+    }
+
+    /**
      * How long its final may take, from {@link #needed} or stop, for {@code audioMs} of audio;
      * 0 for the engine's default.
      */

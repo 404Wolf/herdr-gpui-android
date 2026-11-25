@@ -45,6 +45,14 @@ final class DictationRouting {
 
         void clipLength(String clipId, long durationMs);
 
+        /** A pane's name for a notice ("PM herdr"); its address when unknown. */
+        default String paneName(String hostId, String pane) {
+            return pane;
+        }
+
+        /** The phone transcribes the session; its words come as it hears ({@code true}) or later. */
+        default void phoneWords(boolean asItHears) { }
+
         /** The text just placed on screen is the phone's: say so ("talk offline"). */
         void transcribedOnPhone();
 
@@ -215,8 +223,10 @@ final class DictationRouting {
                     if (onDevice) bar.transcribedOnPhone();
                     bar.showText(drafts.dictationFinal(text, cuts));
                 } else if (!text.isEmpty()) {
-                    // Switched away while it finished: it joins the end of its own pane's draft.
+                    // Switched away while it finished: it joins the end of its own pane's draft,
+                    // and says so, so it never looks lost (factory-9zz.16).
                     bar.appendDictation(originHost, pane, text, cuts);
+                    bar.notice("Dictation added to " + bar.paneName(originHost, pane) + "'s draft");
                 }
                 // Saved before the engine deletes the recording; not saved, it keeps it.
                 stored = bar.persistNow();
@@ -241,6 +251,11 @@ final class DictationRouting {
                 bar.finishing();
             }
 
+            @Override public void onPhoneWords(boolean asItHears) {
+                if (gone()) return;
+                bar.phoneWords(asItHears);
+            }
+
             @Override public void onState(DictationEngine.State state) {
                 if (gone()) return;
                 bar.setDictationState(state);
@@ -255,7 +270,10 @@ final class DictationRouting {
                 forget();
                 bar.setDictationState(DictationEngine.State.IDLE);
                 if (owner.equals(here())) bar.showText(drafts.dictationEnded());
-                else if (!lastPartial.isEmpty()) bar.appendDictation(originHost, pane, lastPartial, null);
+                else if (!lastPartial.isEmpty()) {
+                    bar.appendDictation(originHost, pane, lastPartial, null);
+                    bar.notice("Dictation added to " + bar.paneName(originHost, pane) + "'s draft");
+                }
                 if (error.reason().nothingHeard()) {
                     // Said where the mic is, in "talk": no note over the terminal.
                     bar.nothingHeard(error.reason());
